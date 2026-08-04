@@ -19,6 +19,7 @@ gateway-transport = { path = "crates/gateway-transport" }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
+bytes = "1"
 figment = { version = "0.10", features = ["env", "toml"] }
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json"] }

@@ -17,6 +17,7 @@ gateway-transport.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+bytes.workspace = true
 figment.workspace = true
 futures.workspace = true
 reqwest.workspace = true

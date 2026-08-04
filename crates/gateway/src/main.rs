@@ -10,6 +10,7 @@ mod credentials;
 mod error;
 mod routes;
 mod state;
+mod streaming;
 mod usage;
 
 use std::collections::HashMap;

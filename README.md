@@ -5,9 +5,8 @@ Axond instead of at provider APIs directly, and get one place to hold
 provider keys, route model names, meter usage, and emit telemetry.
 
 > **Status: early scaffold.** The architecture, config surface, and the
-> core ↔ transport seam are in place, with a working non-streaming
-> OpenAI-compatible path. Streaming relay, cross-provider failover, OTel
-> export, and the Postgres/Tinybird/Redis backends are on the roadmap below.
+> core ↔ transport seam are in place, with a working OpenAI-compatible path,
+> buffered and streamed. Cross-provider failover, OTel export, and the Postgres/Tinybird/Redis backends are on the roadmap below.
 
 ## Why
 
@@ -88,7 +87,7 @@ runtime-neutral.
 
 ## Roadmap
 
-- [ ] Streaming (SSE) relay end-to-end (`gateway-core` already decodes SSE)
+- [x] Streaming (SSE) relay end-to-end (see [ADR 0005](./docs/adr/0005-streaming-relay.md))
 - [ ] Ordered failover across targets + per-target circuit health
 - [ ] OpenTelemetry traces (per-upstream-attempt spans, TTFT), metrics, logs
 - [ ] Usage sinks: Postgres, Tinybird, ClickHouse, OTLP
