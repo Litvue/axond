@@ -2,8 +2,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use gateway_core::{AnthropicAdapter, OpenAiCompatibleAdapter, OpenAiFlavor, ProviderAdapter};
+use gateway_core::{
+    AnthropicAdapter, CircuitBreaker, OpenAiCompatibleAdapter, OpenAiFlavor, ProviderAdapter,
+};
 use gateway_transport::HttpDispatcher;
 
 use crate::budget::BudgetStore;
@@ -20,6 +23,11 @@ pub struct Inner {
     pub dispatcher: HttpDispatcher,
     pub usage: UsageFanout,
     pub budget: Box<dyn BudgetStore>,
+    /// Per-target circuit breaker, keyed by the target's qualified model
+    /// (`provider/model`). In-memory and per-replica, consistent with running
+    /// stateless by default (ADR 0002); distinct from the per-credential health
+    /// that lives on `Credentials` (ADR 0008).
+    pub target_circuits: CircuitBreaker,
     /// Inbound gateway-key secret → (namespace, subject). Empty ⇒ unauthenticated.
     pub inbound_keys: HashMap<String, InboundKey>,
 }
@@ -41,6 +49,10 @@ impl AppState {
     ) -> Result<Self, CredentialError> {
         let credentials = Credentials::from_env(&config, env)?;
         let dispatcher = HttpDispatcher::new(reqwest::Client::new());
+        let target_circuits = CircuitBreaker::new(
+            config.failover.failure_threshold,
+            Duration::from_secs(config.failover.cooldown_seconds),
+        );
         let mut inbound_keys = HashMap::new();
         for k in &config.gateway_key {
             if let Some(secret) = env.get(&k.env).filter(|v| !v.is_empty()) {
@@ -59,6 +71,7 @@ impl AppState {
             dispatcher,
             usage,
             budget,
+            target_circuits,
             inbound_keys,
         })))
     }

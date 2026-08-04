@@ -141,9 +141,9 @@ pub(super) fn record_request(record: &UsageRecord, ttft_ms: Option<u64>) {
 
 /// Publish a target's circuit state. Ordered failover (which owns the breaker)
 /// calls this on every transition; the gauge exists here so the metric set is
-/// defined in one place.
-#[allow(dead_code)]
-pub fn record_circuit_state(target_provider: &str, state: CircuitState) {
+/// defined in one place. Dimensioned by the full target (provider + model),
+/// matching the breaker's per-target key.
+pub fn record_circuit_state(target_provider: &str, target_model: &str, state: CircuitState) {
     let Some(instruments) = INSTRUMENTS.get() else {
         return;
     };
@@ -154,9 +154,9 @@ pub fn record_circuit_state(target_provider: &str, state: CircuitState) {
     };
     instruments.circuit_state.record(
         value,
-        &[KeyValue::new(
-            "axond.target.provider",
-            target_provider.to_owned(),
-        )],
+        &[
+            KeyValue::new("axond.target.provider", target_provider.to_owned()),
+            KeyValue::new("axond.target.model", target_model.to_owned()),
+        ],
     );
 }

@@ -76,6 +76,9 @@ pub struct UsageRecord {
     pub cost_microdollars: u64,
     pub catalog_version: u64,
     pub latency_ms: u64,
+    /// Upstream target attempts made for this request across the alias's
+    /// targets; the retry count is one less. `1` when the first target served.
+    pub attempts: u32,
 }
 
 impl UsageRecord {

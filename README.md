@@ -6,8 +6,8 @@ provider keys, route model names, meter usage, and emit telemetry.
 
 > **Status: early scaffold.** The architecture, config surface, and the
 > core ↔ transport seam are in place, with a working OpenAI-compatible path,
-> buffered and streamed, and OTLP telemetry. Cross-provider failover and the
-> Postgres/Tinybird/Redis backends are on the roadmap below.
+> buffered and streamed, ordered failover across targets, and OTLP telemetry.
+> The Postgres/Tinybird/Redis backends are on the roadmap below.
 
 ## Why
 
@@ -57,6 +57,7 @@ cp axond.example.toml axond.toml      # edit providers/models/namespaces
 export GW_PLATFORM_OPENAI_API_KEY=sk-...
 export GW_PLATFORM_OPENAI_API_KEY_OVERFLOW=sk-...   # second key in the openai pool
 export GW_PLATFORM_ANTHROPIC_API_KEY=sk-ant-...
+export GW_PLATFORM_AZURE_OPENAI_API_KEY=...         # gpt-4o's failover target
 export GW_ACME_OPENAI_API_KEY=sk-...                # the example's BYOK namespace
 
 cargo run -p axond                    # or: just run
@@ -117,6 +118,24 @@ a namespace boundary: a BYOK namespace uses its own pool, or the whole platform
 pool when it opts into `allow_platform_fallback`. See
 [ADR 0006](./docs/adr/0006-credential-pools-per-namespace-provider.md).
 
+## Failover across targets
+
+An alias's `targets` are tried in configured order. Credential-pool dispatch is
+the *inner* loop (rotate keys within one target); target failover is the *outer*
+loop: a **retryable** upstream failure — a 5xx, a transport error, a fully
+rate-limited pool, an unavailable model — advances to the next target, while a
+4xx-class error that would just fail again is returned as-is. Each target carries
+its own in-memory, per-replica circuit breaker: consecutive target-scoped
+failures trip it, a tripped target is skipped for a cooldown, then re-offered as a
+single half-open probe that closes on success. A pool-wide `429` is
+credential-scoped and never trips the target's breaker. The walk is bounded by
+both `failover.max_attempts` and `failover.overall_timeout_ms` so failover cannot
+amplify latency without limit. Streaming can fail over only while opening the
+upstream; once the relay emits its first byte a mid-stream failure is a terminal
+`error` event. The serving target and total attempt count land on the usage
+record and on the per-attempt spans. See
+[ADR 0008](./docs/adr/0008-target-failover-and-circuit-scope.md).
+
 ## Telemetry
 
 Off by default: with no OTLP endpoint the process only writes JSON logs to
@@ -145,7 +164,7 @@ crates/
                       primitives (circuit breaker, failover, catalog/pricing).
                       No HTTP client, no runtime, no config, no secrets.
   gateway-transport   The HTTP half: pooled reqwest client, credential
-                      injection, timeouts (retries/failover next).
+                      injection, timeouts.
   gateway             The binary: config, namespaced credential resolution,
                       routes, UsageSink + BudgetStore wiring.
 ```
@@ -156,7 +175,7 @@ runtime-neutral.
 ## Roadmap
 
 - [x] Streaming (SSE) relay end-to-end (see [ADR 0005](./docs/adr/0005-streaming-relay.md))
-- [ ] Ordered failover across targets + per-target circuit health
+- [x] Ordered failover across targets + per-target circuit health (see [ADR 0008](./docs/adr/0008-target-failover-and-circuit-scope.md))
 - [x] OpenTelemetry traces (per-upstream-attempt spans, TTFT), metrics, logs
 - [ ] Usage sinks: Postgres, Tinybird, ClickHouse, OTLP
 - [ ] Budget backends: in-memory (present) → Redis / Postgres, reserve-then-reconcile

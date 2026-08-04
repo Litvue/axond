@@ -28,6 +28,7 @@ docker run -d --name "$container" \
   -e GW_PLATFORM_OPENAI_API_KEY=smoke-placeholder \
   -e GW_PLATFORM_OPENAI_API_KEY_OVERFLOW=smoke-placeholder \
   -e GW_PLATFORM_ANTHROPIC_API_KEY=smoke-placeholder \
+  -e GW_PLATFORM_AZURE_OPENAI_API_KEY=smoke-placeholder \
   -e GW_ACME_OPENAI_API_KEY=smoke-placeholder \
   -v "${repo_root}/axond.example.toml:/etc/axond/axond.toml:ro" \
   "$image" >/dev/null

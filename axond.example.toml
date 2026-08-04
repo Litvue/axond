@@ -39,6 +39,13 @@ id = "anthropic"
 kind = "anthropic"
 base_url = "https://api.anthropic.com/v1"
 
+# An OpenAI-compatible deployment (Azure OpenAI, a vLLM endpoint, …). Used below
+# as a failover target for the `gpt-4o` alias.
+[[provider]]
+id = "azure-openai"
+kind = "openai-compatible"
+base_url = "https://example.openai.azure.com/openai/v1"
+
 # ── Credential pool policy ────────────────────────────────────────────────────
 # Applies to every (namespace, provider) pair that binds more than one
 # credential (see below).
@@ -55,6 +62,24 @@ base_url = "https://api.anthropic.com/v1"
 [credential_pool]
 strategy = "weighted"
 failure_threshold = 2
+cooldown_seconds = 30
+
+# ── Failover across targets ───────────────────────────────────────────────────
+# The OUTER loop around credential-pool dispatch. An alias's `targets` are tried
+# in configured order; a RETRYABLE upstream failure (5xx, transport, a fully
+# rate-limited pool, an unavailable model) advances to the next target, while a
+# 4xx-class error that would just fail again is returned as-is. Each target has
+# its own in-memory, per-replica circuit breaker: `failure_threshold` consecutive
+# target-scoped failures trip it, the target is skipped for `cooldown_seconds`,
+# then re-offered as a single half-open probe that closes on success. A pool-wide
+# `429` is credential-scoped (see `[credential_pool]`) and never trips the
+# target's breaker. `max_attempts` and `overall_timeout_ms` bound the walk so
+# failover cannot amplify latency without limit.
+
+[failover]
+max_attempts = 3
+overall_timeout_ms = 30000
+failure_threshold = 3
 cooldown_seconds = 30
 
 # ── Credentials ───────────────────────────────────────────────────────────────
@@ -87,6 +112,12 @@ namespace = "platform"
 provider = "anthropic"
 env = "GW_PLATFORM_ANTHROPIC_API_KEY"
 
+[[credential]]
+namespace = "platform"
+provider = "azure-openai"
+env = "GW_PLATFORM_AZURE_OPENAI_API_KEY"
+id = "azure-openai-primary"
+
 # A BYOK namespace has its own pool. Pool walks never cross a namespace
 # boundary: `allow_platform_fallback` is decided before selection, so a BYOK
 # request either uses acme's keys or (when opted in) the platform pool — never a
@@ -107,7 +138,8 @@ env = "GW_ACME_OPENAI_API_KEY"
 
 # ── Models (aliases) ──────────────────────────────────────────────────────────
 # Callers send the alias (`gpt-4o`), never `provider/model`. Targets are tried
-# in order (failover across targets is on the roadmap).
+# in configured order, failing over to the next on a retryable upstream failure
+# (see `[failover]`). List a fallback provider/model as a second target here.
 #
 # Each target MUST carry a `price` (micro-dollars per million tokens). Pricing is
 # what lets budgets be denominated in currency rather than raw tokens — cost is
@@ -118,6 +150,9 @@ env = "GW_ACME_OPENAI_API_KEY"
 name = "gpt-4o"
 targets = [
   { provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2_500_000, output_microdollars_per_million = 10_000_000 } },
+  # Failover target: served only when the primary returns a retryable failure
+  # or its circuit is open.
+  { provider = "azure-openai", model = "gpt-4o", price = { input_microdollars_per_million = 2_500_000, output_microdollars_per_million = 10_000_000 } },
 ]
 
 [[model]]
