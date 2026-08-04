@@ -15,6 +15,7 @@ gateway-core.workspace = true
 gateway-transport.workspace = true
 
 anyhow.workspace = true
+arc-swap.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true

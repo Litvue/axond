@@ -17,6 +17,7 @@ gateway-core = { path = "crates/gateway-core" }
 gateway-transport = { path = "crates/gateway-transport" }
 
 anyhow = "1"
+arc-swap = "1.7"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
 bytes = "1"

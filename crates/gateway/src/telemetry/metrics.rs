@@ -33,6 +33,8 @@ struct Instruments {
     circuit_state: Gauge<u64>,
     usage_written: Counter<u64>,
     usage_dropped: Counter<u64>,
+    config_reloads: Counter<u64>,
+    config_generation: Gauge<u64>,
 }
 
 static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
@@ -98,6 +100,16 @@ impl Instruments {
                 .u64_counter("axond.usage.records_dropped")
                 .with_description(
                     "Usage records discarded rather than delaying requests, by sink and reason.",
+                )
+                .build(),
+            config_reloads: meter
+                .u64_counter("axond.config.reloads")
+                .with_description("Config reload attempts, by trigger and outcome.")
+                .build(),
+            config_generation: meter
+                .u64_gauge("axond.config.generation")
+                .with_description(
+                    "Config generation this replica is serving: 0 at boot, +1 per applied reload.",
                 )
                 .build(),
         }
@@ -176,6 +188,23 @@ pub fn record_usage_dropped(sink: &'static str, reason: &'static str, count: u64
             KeyValue::new("axond.drop_reason", reason),
         ],
     );
+}
+
+/// Publish a reload attempt and the generation now serving. A rejected
+/// candidate still reports the generation, so the pair says both "a reload was
+/// tried" and "this is what is actually running" (ADR 0011).
+pub fn record_config_reload(trigger: &'static str, outcome: &'static str, generation: u64) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.config_reloads.add(
+        1,
+        &[
+            KeyValue::new("axond.reload.trigger", trigger),
+            KeyValue::new("axond.reload.outcome", outcome),
+        ],
+    );
+    instruments.config_generation.record(generation, &[]);
 }
 
 /// Publish a target's circuit state. Ordered failover (which owns the breaker)

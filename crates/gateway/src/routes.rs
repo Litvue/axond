@@ -34,7 +34,7 @@ use crate::budget::{Admission, BudgetKey};
 use crate::config::{Model, Provider, ProviderKind, Target};
 use crate::credentials::{CredentialPlan, CredentialSource};
 use crate::error::GatewayError;
-use crate::state::{AppState, InboundKey, adapter_for};
+use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::streaming::{self, StreamContext};
 use crate::telemetry;
 use crate::usage::{Status, UsageRecord};
@@ -63,7 +63,7 @@ async fn readyz() -> &'static str {
 
 async fn list_models(State(state): State<AppState>) -> Json<Value> {
     let data: Vec<Value> = state
-        .0
+        .config()
         .config
         .model
         .iter()
@@ -75,10 +75,13 @@ async fn list_models(State(state): State<AppState>) -> Json<Value> {
 /// Resolve the caller's namespace + subject from the bearer token. When no
 /// gateway keys are configured the gateway is open (dev mode) and uses the
 /// default namespace.
-fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<InboundKey, GatewayError> {
-    if state.0.inbound_keys.is_empty() {
+fn authenticate(
+    snapshot: &ConfigSnapshot,
+    headers: &HeaderMap,
+) -> Result<InboundKey, GatewayError> {
+    if snapshot.inbound_keys.is_empty() {
         return Ok(InboundKey {
-            namespace: state.0.config.default_namespace().to_string(),
+            namespace: snapshot.config.default_namespace().to_string(),
             subject: "anonymous".to_string(),
         });
     }
@@ -87,8 +90,7 @@ fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<InboundKey, Gat
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(GatewayError::Unauthorized)?;
-    state
-        .0
+    snapshot
         .inbound_keys
         .get(token)
         .cloned()
@@ -100,8 +102,11 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, GatewayError> {
-    let caller = authenticate(&state, &headers)?;
-    let cfg = &state.0.config;
+    // One snapshot for the whole request: a reload that lands mid-request
+    // cannot change the alias, credential, or circuit this request resolved.
+    let snapshot = state.config();
+    let caller = authenticate(&snapshot, &headers)?;
+    let cfg = &snapshot.config;
 
     let streamed = body.get("stream").and_then(Value::as_bool) == Some(true);
 
@@ -128,10 +133,11 @@ async fn chat_completions(
     }
 
     if streamed {
-        return stream_with_failover(&state, &caller, model, alias, body, budget_key).await;
+        return stream_with_failover(&state, &snapshot, &caller, model, alias, body, budget_key)
+            .await;
     }
 
-    let outcome = dispatch_with_failover(&state, &caller, model, &body).await?;
+    let outcome = dispatch_with_failover(&state, &snapshot, &caller, model, &body).await?;
     let served = &outcome.served;
     match outcome.result {
         Ok(response) => {
@@ -221,11 +227,12 @@ struct FailoverOutcome {
 /// usage to record.
 async fn dispatch_with_failover(
     state: &AppState,
+    snapshot: &ConfigSnapshot,
     caller: &InboundKey,
     model: &Model,
     body: &Value,
 ) -> Result<FailoverOutcome, GatewayError> {
-    let cfg = &state.0.config;
+    let cfg = &snapshot.config;
     let policy = FailoverPolicy;
     let deadline = Instant::now() + Duration::from_millis(cfg.failover.overall_timeout_ms);
     let max_attempts = cfg.failover.max_attempts;
@@ -239,12 +246,11 @@ async fn dispatch_with_failover(
             continue;
         };
         let circuit_key = target_key(target);
-        if let CircuitDecision::Skip = state.0.target_circuits.allow(&circuit_key) {
+        if let CircuitDecision::Skip = snapshot.target_circuits.allow(&circuit_key) {
             walk.skipped_open.push(circuit_key);
             continue;
         }
-        let Some(plan) = state
-            .0
+        let Some(plan) = snapshot
             .credentials
             .plan(cfg, &caller.namespace, &provider.id)
         else {
@@ -261,7 +267,7 @@ async fn dispatch_with_failover(
             UsageRecord::credential_source_str(plan.source),
         );
         let started = Instant::now();
-        let attempt = dispatch_over_pool(state, provider, &plan, &target.model, req_body)
+        let attempt = dispatch_over_pool(state, snapshot, provider, &plan, &target.model, req_body)
             .instrument(attempt_span.clone())
             .await;
         let latency_ms = started.elapsed().as_millis() as u64;
@@ -289,7 +295,7 @@ async fn dispatch_with_failover(
         };
         match attempt.result {
             Ok(response) => {
-                record_target_success(state, target, &circuit_key);
+                record_target_success(snapshot, target, &circuit_key);
                 return Ok(FailoverOutcome {
                     result: Ok(response),
                     served,
@@ -299,7 +305,7 @@ async fn dispatch_with_failover(
                 });
             }
             Err(err) => {
-                record_target_failure(state, target, &circuit_key, &err);
+                record_target_failure(snapshot, target, &circuit_key, &err);
                 let has_next = index + 1 < walk.total
                     && walk.attempts < max_attempts
                     && Instant::now() < deadline;
@@ -337,13 +343,14 @@ async fn dispatch_with_failover(
 /// hands off to the relay the moment one succeeds.
 async fn stream_with_failover(
     state: &AppState,
+    snapshot: &ConfigSnapshot,
     caller: &InboundKey,
     model: &Model,
     alias: String,
     body: Value,
     budget_key: BudgetKey,
 ) -> Result<Response, GatewayError> {
-    let cfg = &state.0.config;
+    let cfg = &snapshot.config;
     let policy = FailoverPolicy;
     let deadline = Instant::now() + Duration::from_millis(cfg.failover.overall_timeout_ms);
     let max_attempts = cfg.failover.max_attempts;
@@ -358,12 +365,11 @@ async fn stream_with_failover(
             continue;
         };
         let circuit_key = target_key(target);
-        if let CircuitDecision::Skip = state.0.target_circuits.allow(&circuit_key) {
+        if let CircuitDecision::Skip = snapshot.target_circuits.allow(&circuit_key) {
             walk.skipped_open.push(circuit_key);
             continue;
         }
-        let Some(plan) = state
-            .0
+        let Some(plan) = snapshot
             .credentials
             .plan(cfg, &caller.namespace, &provider.id)
         else {
@@ -423,7 +429,7 @@ async fn stream_with_failover(
 
         match opened {
             Ok(bytes) => {
-                record_target_success(state, target, &circuit_key);
+                record_target_success(snapshot, target, &circuit_key);
                 telemetry::record_routing(
                     &ctx.namespace,
                     &ctx.subject,
@@ -441,7 +447,7 @@ async fn stream_with_failover(
                 ));
             }
             Err(err) => {
-                record_target_failure(state, target, &circuit_key, &err);
+                record_target_failure(snapshot, target, &circuit_key, &err);
                 let has_next = index + 1 < walk.total
                     && walk.attempts < max_attempts
                     && Instant::now() < deadline;
@@ -527,12 +533,12 @@ fn auth_scheme(kind: ProviderKind) -> AuthScheme {
     }
 }
 
-fn record_target_success(state: &AppState, target: &Target, circuit_key: &str) {
-    state.0.target_circuits.record_success(circuit_key);
+fn record_target_success(snapshot: &ConfigSnapshot, target: &Target, circuit_key: &str) {
+    snapshot.target_circuits.record_success(circuit_key);
     telemetry::metrics::record_circuit_state(
         &target.provider,
         &target.model,
-        state.0.target_circuits.state(circuit_key),
+        snapshot.target_circuits.state(circuit_key),
     );
 }
 
@@ -541,17 +547,17 @@ fn record_target_success(state: &AppState, target: &Target, circuit_key: &str) {
 /// `404` names a missing deployment, not an unhealthy target — both fail over
 /// without opening the target's breaker.
 fn record_target_failure(
-    state: &AppState,
+    snapshot: &ConfigSnapshot,
     target: &Target,
     circuit_key: &str,
     err: &TransportError,
 ) {
     if as_provider_error(err).affects_provider_health() && !is_credential_exhausted(err) {
-        state.0.target_circuits.record_failure(circuit_key);
+        snapshot.target_circuits.record_failure(circuit_key);
         telemetry::metrics::record_circuit_state(
             &target.provider,
             &target.model,
-            state.0.target_circuits.state(circuit_key),
+            snapshot.target_circuits.state(circuit_key),
         );
     }
 }
@@ -579,6 +585,7 @@ struct PooledAttempt {
 /// separate concern and is not attempted here.
 async fn dispatch_over_pool(
     state: &AppState,
+    snapshot: &ConfigSnapshot,
     provider: &Provider,
     plan: &CredentialPlan,
     target_model: &str,
@@ -612,14 +619,14 @@ async fn dispatch_over_pool(
             .await;
         match result {
             Ok(response) => {
-                state.0.credentials.record_success(lease);
+                snapshot.credentials.record_success(lease);
                 return PooledAttempt {
                     result: Ok(response),
                     credential_id: lease.id.clone(),
                 };
             }
             Err(err) if is_credential_exhausted(&err) => {
-                state.0.credentials.record_failure(lease);
+                snapshot.credentials.record_failure(lease);
                 tracing::warn!(
                     provider = %provider.id,
                     credential = %lease.id,

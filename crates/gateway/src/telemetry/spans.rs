@@ -71,6 +71,37 @@ pub fn finish_upstream_attempt(
     }
 }
 
+/// Outcome recorded on an applied config reload.
+pub const RELOAD_APPLIED: &str = "applied";
+/// Outcome recorded on a rejected candidate config.
+pub const RELOAD_REJECTED: &str = "rejected";
+
+/// A span covering one reload attempt: validating the candidate and, when it
+/// passes, publishing it. Rooted rather than nested — a reload is triggered by a
+/// signal or a watcher, never by a request.
+pub fn config_reload_span(trigger: &'static str) -> Span {
+    tracing::info_span!(
+        target: "axond.config",
+        "axond.config.reload",
+        axond.reload.trigger = trigger,
+        axond.reload.outcome = Empty,
+        axond.config.generation = Empty,
+    )
+}
+
+/// Close out a reload span with its outcome and the generation now serving,
+/// and count the attempt.
+pub fn finish_config_reload(
+    span: &Span,
+    trigger: &'static str,
+    outcome: &'static str,
+    generation: u64,
+) {
+    span.record("axond.reload.outcome", outcome);
+    span.record("axond.config.generation", generation);
+    metrics::record_config_reload(trigger, outcome, generation);
+}
+
 /// Fold the canonical usage record into the active server span and the
 /// dimensioned metrics. Called once per terminated request, from the same place
 /// the usage record is emitted, so spans, metrics, and sinks cannot disagree.

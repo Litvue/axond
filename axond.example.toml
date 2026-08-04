@@ -161,6 +161,29 @@ targets = [
   { provider = "anthropic", model = "claude-3-7-sonnet-latest", price = { input_microdollars_per_million = 3_000_000, output_microdollars_per_million = 15_000_000 } },
 ]
 
+# ── Config hot-reload ─────────────────────────────────────────────────────────
+# SIGHUP always reloads this file: `kill -HUP <pid>`. The candidate goes through
+# the FULL boot-time validation, and any error (bad TOML, an alias pointing at an
+# undefined provider, a credential whose env var is unset) rejects the candidate
+# and leaves the running config serving. The swap is atomic, and each request
+# holds one snapshot for its whole life, so nothing in flight is affected.
+#
+# The process environment is re-read on every reload — that is how a newly
+# referenced credential env var resolves without a restart. It must be set on the
+# gateway's own process (systemd EnvironmentFile, container env, envFrom).
+#
+# `watch` additionally reloads whenever this file's CONTENTS change (an in-place
+# edit or a Kubernetes ConfigMap symlink swap; a touched-but-identical file
+# reloads nothing). Off by default: a signal is an explicit operator action.
+#
+# `[server] bind` and `[[usage_sink]]` changes are reported with a warning and
+# otherwise ignored — the socket is already bound and sinks own live connections,
+# so both need a restart. See docs/adr/0011-config-hot-reload.md.
+
+[reload]
+watch = false
+poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
+
 # ── Usage sinks (optional) ────────────────────────────────────────────────────
 # Where the canonical usage record for each terminated request goes. Omit
 # entirely for the no-datastore default: one JSON line per record on stdout.
