@@ -3,6 +3,11 @@
 # Structure lives here; SECRETS DO NOT. Keys are referenced by the *name* of an
 # environment variable (`env = "..."`) and read at startup — never inlined.
 # Copy to `axond.toml` (gitignored) and set the referenced env vars.
+#
+# Telemetry is environment-only, so it looks the same here as in every other
+# OTel service: unset means JSON logs on stdout and nothing exported; set
+# OTEL_EXPORTER_OTLP_ENDPOINT (OTLP/HTTP, e.g. http://collector:4318) to turn on
+# traces and metrics. See docs/adr/0005-telemetry-model.md.
 
 [server]
 bind = "0.0.0.0:8080"

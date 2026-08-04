@@ -1,8 +1,9 @@
 //! Axond — a stateless, single-binary, self-hosted AI gateway.
 //!
-//! Boot sequence: load + validate config (fail fast, delta B2), snapshot the
-//! environment for credential resolution, build shared state with the default
-//! no-datastore usage sink and budget store, then serve.
+//! Boot sequence: install telemetry (logs always, OTLP only when configured),
+//! load + validate config (fail fast, delta B2), snapshot the environment for
+//! credential resolution, build shared state with the default no-datastore
+//! usage sink and budget store, then serve.
 
 mod budget;
 mod config;
@@ -11,6 +12,7 @@ mod error;
 mod routes;
 mod state;
 mod streaming;
+mod telemetry;
 mod usage;
 
 use std::collections::HashMap;
@@ -22,12 +24,8 @@ use usage::{StdoutSink, UsageFanout, UsageSink};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .json()
-        .init();
+    // Held until shutdown so the exporters flush; a no-op when telemetry is off.
+    let _telemetry = telemetry::init().map_err(|e| anyhow::anyhow!("telemetry: {e}"))?;
 
     let config_path = std::env::var("AXOND_CONFIG").unwrap_or_else(|_| "axond.toml".to_string());
     let config = Config::load(&config_path)
@@ -44,9 +42,9 @@ async fn main() -> anyhow::Result<()> {
     let bind = config.server.bind;
     let state = AppState::new(config, &env, usage, budget)
         .map_err(|e| anyhow::anyhow!("credential validation failed: {e}"))?;
-    let app = routes::router(state);
+    let app = routes::router(state).layer(telemetry::TelemetryLayer);
 
-    tracing::info!(%bind, "axond listening");
+    tracing::info!(%bind, otlp = telemetry::is_exporting(), "axond listening");
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
