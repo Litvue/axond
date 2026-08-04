@@ -25,6 +25,10 @@ pub struct Config {
     pub model: Vec<Model>,
     #[serde(default)]
     pub credential: Vec<Credential>,
+    /// Pool-wide policy for `(namespace, provider)` pairs that bind more than
+    /// one credential: how a credential is picked and when a bad one is parked.
+    #[serde(default)]
+    pub credential_pool: CredentialPool,
     /// Inbound gateway keys. Each binds a secret (resolved from `env`) to a
     /// namespace. When empty, the gateway is unauthenticated and every request
     /// uses the default namespace — intended for local dev only.
@@ -101,11 +105,73 @@ pub struct Target {
 
 /// Explicit (namespace, provider) → env-var binding. Declared, never inferred
 /// from a mangled namespace id (assessment delta A/§5.1).
+///
+/// Several entries may share a `(namespace, provider)` pair; together they form
+/// that pair's credential pool (ADR 0006).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Credential {
     pub namespace: String,
     pub provider: String,
     pub env: String,
+    /// Stable label for attribution. Defaults to the env-var *name*, which is a
+    /// reference rather than a secret, so it is safe to log and to carry on a
+    /// usage record.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Relative share of pool traffic under the `weighted` strategy. Ignored by
+    /// `round-robin`.
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+}
+
+impl Credential {
+    /// The attribution label for this credential — never its value.
+    pub fn label(&self) -> &str {
+        self.id.as_deref().unwrap_or(self.env.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CredentialPool {
+    #[serde(default)]
+    pub strategy: SelectionStrategy,
+    /// Consecutive credential-scoped failures (rate limit / quota) that park a
+    /// single credential. The pool's other credentials keep serving.
+    #[serde(default = "default_credential_failure_threshold")]
+    pub failure_threshold: u32,
+    /// How long a parked credential waits before a half-open probe.
+    #[serde(default = "default_credential_cooldown_seconds")]
+    pub cooldown_seconds: u64,
+}
+
+impl Default for CredentialPool {
+    fn default() -> Self {
+        Self {
+            strategy: SelectionStrategy::default(),
+            failure_threshold: default_credential_failure_threshold(),
+            cooldown_seconds: default_credential_cooldown_seconds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SelectionStrategy {
+    #[default]
+    RoundRobin,
+    Weighted,
+}
+
+fn default_weight() -> u32 {
+    1
+}
+
+fn default_credential_failure_threshold() -> u32 {
+    2
+}
+
+fn default_credential_cooldown_seconds() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -170,7 +236,42 @@ impl Config {
                 }
             }
         }
+        if self.credential_pool.failure_threshold == 0 {
+            return Err(ConfigError::Invalid(
+                "credential_pool.failure_threshold must be at least 1".into(),
+            ));
+        }
+        if self.credential_pool.cooldown_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "credential_pool.cooldown_seconds must be at least 1".into(),
+            ));
+        }
+        let mut labels: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
         for c in &self.credential {
+            if c.env.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "credential for namespace `{}` provider `{}` has an empty `env`",
+                    c.namespace, c.provider
+                )));
+            }
+            if c.weight == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "credential `{}` has weight 0; remove it instead",
+                    c.label()
+                )));
+            }
+            let pool = labels
+                .entry((c.namespace.as_str(), c.provider.as_str()))
+                .or_default();
+            if pool.contains(&c.label()) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate credential id `{}` for namespace `{}` provider `{}`",
+                    c.label(),
+                    c.namespace,
+                    c.provider
+                )));
+            }
+            pool.push(c.label());
             if !namespaces.contains_key(c.namespace.as_str()) {
                 return Err(ConfigError::Invalid(format!(
                     "credential references undefined namespace `{}`",
@@ -300,6 +401,79 @@ targets = []
 "#;
         assert!(matches!(
             Config::from_toml_str(toml),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_a_pool_of_credentials_for_one_namespace_and_provider() {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+{VALID}
+
+[credential_pool]
+strategy = "weighted"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K1"
+weight = 3
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K2"
+id = "overflow"
+"#
+        ))
+        .expect("valid pool");
+        assert_eq!(cfg.credential_pool.strategy, SelectionStrategy::Weighted);
+        assert_eq!(cfg.credential[0].label(), "K1");
+        assert_eq!(cfg.credential[1].label(), "overflow");
+        assert_eq!(cfg.credential[1].weight, 1);
+    }
+
+    #[test]
+    fn rejects_a_pool_with_duplicate_credential_ids() {
+        let toml = format!(
+            r#"
+{VALID}
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K1"
+id = "same"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K2"
+id = "same"
+"#
+        );
+        assert!(matches!(
+            Config::from_toml_str(&toml),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_zero_weighted_credential() {
+        let toml = format!(
+            r#"
+{VALID}
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K1"
+weight = 0
+"#
+        );
+        assert!(matches!(
+            Config::from_toml_str(&toml),
             Err(ConfigError::Invalid(_))
         ));
     }

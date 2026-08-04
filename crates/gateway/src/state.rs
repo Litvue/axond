@@ -8,7 +8,7 @@ use gateway_transport::HttpDispatcher;
 
 use crate::budget::BudgetStore;
 use crate::config::{Config, ProviderKind};
-use crate::credentials::Credentials;
+use crate::credentials::{CredentialError, Credentials};
 use crate::usage::UsageFanout;
 
 #[derive(Clone)]
@@ -31,13 +31,15 @@ pub struct InboundKey {
 }
 
 impl AppState {
+    /// Fails when a declared credential's env var is missing or empty — the
+    /// credential graph is validated at boot, not at request time.
     pub fn new(
         config: Config,
         env: &HashMap<String, String>,
         usage: UsageFanout,
         budget: Box<dyn BudgetStore>,
-    ) -> Self {
-        let credentials = Credentials::from_env(&config, env);
+    ) -> Result<Self, CredentialError> {
+        let credentials = Credentials::from_env(&config, env)?;
         let dispatcher = HttpDispatcher::new(reqwest::Client::new());
         let mut inbound_keys = HashMap::new();
         for k in &config.gateway_key {
@@ -51,14 +53,14 @@ impl AppState {
                 );
             }
         }
-        AppState(Arc::new(Inner {
+        Ok(AppState(Arc::new(Inner {
             config,
             credentials,
             dispatcher,
             usage,
             budget,
             inbound_keys,
-        }))
+        })))
     }
 }
 
