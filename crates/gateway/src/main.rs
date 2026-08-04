@@ -42,7 +42,8 @@ async fn main() -> anyhow::Result<()> {
     let budget: Box<dyn BudgetStore> = Box::new(NoBudget);
 
     let bind = config.server.bind;
-    let state = AppState::new(config, &env, usage, budget);
+    let state = AppState::new(config, &env, usage, budget)
+        .map_err(|e| anyhow::anyhow!("credential validation failed: {e}"))?;
     let app = routes::router(state);
 
     tracing::info!(%bind, "axond listening");

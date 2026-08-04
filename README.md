@@ -67,7 +67,47 @@ Point any OpenAI-compatible SDK at `http://localhost:8080/v1` as its base URL.
 TOML owns all structure; the environment owns secrets (referenced by name) and
 may override scalars. See [`axond.example.toml`](./axond.example.toml) for
 the annotated surface: `server`, `namespace`, `provider`, `credential`,
-`gateway_key`, and `model`.
+`credential_pool`, `gateway_key`, and `model`.
+
+Every env var a `[[credential]]` references must be set and non-empty at boot, or
+the gateway refuses to start.
+
+### Credential pools
+
+Several `[[credential]]` entries may name the same `(namespace, provider)` pair;
+together they are that pair's pool. Each entry takes an optional `id` (the
+attribution label — defaults to the env-var *name*, never the secret) and a
+`weight`.
+
+```toml
+[credential_pool]
+strategy = "weighted"        # or "round-robin" (default)
+failure_threshold = 2        # 429s that park one credential
+cooldown_seconds = 30        # wait before a half-open probe
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "GW_PLATFORM_OPENAI_API_KEY"
+id = "openai-primary"
+weight = 3
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "GW_PLATFORM_OPENAI_API_KEY_OVERFLOW"
+id = "openai-overflow"
+weight = 1
+```
+
+A credential that answers `429` (rate limit / exhausted quota) is skipped and the
+request retries the **same** target with the next credential in the pool —
+credential rotation, not target failover. Repeated 429s park that credential
+alone; the target stays available to every other key. The credential that served
+a request is attributed on its usage record as `credential_id`. Pools never cross
+a namespace boundary: a BYOK namespace uses its own pool, or the whole platform
+pool when it opts into `allow_platform_fallback`. See
+[ADR 0005](./docs/adr/0005-credential-pools-per-namespace-provider.md).
 
 ## Architecture
 
@@ -93,7 +133,7 @@ runtime-neutral.
 - [ ] Usage sinks: Postgres, Tinybird, ClickHouse, OTLP
 - [ ] Budget backends: in-memory (present) → Redis / Postgres, reserve-then-reconcile
 - [ ] Native Anthropic `/v1/messages` passthrough; `/v1/embeddings`, `/v1/responses`
-- [ ] Multiple credentials per provider (pooling, weighted, skip-on-429)
+- [x] Multiple credentials per provider (pooling, weighted, skip-on-429)
 - [ ] Config hot-reload (SIGHUP / watched files) for zero-restart BYOK onboarding
 - [ ] Provider-SDK compatibility + record/replay + SSE soak tests
 

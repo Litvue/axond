@@ -15,13 +15,13 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use gateway_core::{ModelPrice, ProviderRequest, Surface, Usage};
-use gateway_transport::{AuthScheme, Upstream};
+use gateway_core::{ModelPrice, ProviderError, ProviderRequest, ProviderResponse, Surface, Usage};
+use gateway_transport::{AuthScheme, TransportError, Upstream};
 use serde_json::{Value, json};
 
 use crate::budget::{Admission, BudgetKey};
-use crate::config::ProviderKind;
-use crate::credentials::CredentialSource;
+use crate::config::{Provider, ProviderKind};
+use crate::credentials::{CredentialPlan, CredentialSource};
 use crate::error::GatewayError;
 use crate::state::{AppState, InboundKey, adapter_for};
 use crate::streaming::{self, StreamContext};
@@ -113,10 +113,12 @@ async fn chat_completions(
         .provider(&target_provider)
         .ok_or_else(|| GatewayError::UnknownModel(alias.clone()))?;
 
-    let resolved = state
+    // The pool for this (namespace, provider), ordered by the selection
+    // strategy with unhealthy credentials skipped.
+    let plan = state
         .0
         .credentials
-        .resolve(cfg, &caller.namespace, &provider.id)
+        .plan(cfg, &caller.namespace, &provider.id)
         .ok_or_else(|| GatewayError::NoCredential {
             namespace: caller.namespace.clone(),
             provider: provider.id.clone(),
@@ -136,37 +138,45 @@ async fn chat_completions(
     // Rewrite only the model field; everything else is byte-passthrough.
     body["model"] = Value::String(target_model.clone());
 
-    let auth = match provider.kind {
-        ProviderKind::Anthropic => AuthScheme::Header("x-api-key"),
-        ProviderKind::Openai | ProviderKind::OpenaiCompatible => AuthScheme::Bearer,
-    };
-    let upstream = Upstream {
-        base_url: provider.base_url.clone(),
-        api_key: resolved.secret,
-        auth,
-    };
-
-    let adapter = adapter_for(provider.kind);
-    let request = ProviderRequest {
-        model: target_model.clone(),
-        body,
-    };
-
     if streamed {
+        // The stream path uses the first credential in the pool; per-credential
+        // rotation mid-stream (skip-on-429) is a follow-up, like streaming
+        // failover (#3).
+        let lease = plan
+            .attempts
+            .first()
+            .ok_or_else(|| GatewayError::NoCredential {
+                namespace: caller.namespace.clone(),
+                provider: provider.id.clone(),
+            })?;
+        let auth = match provider.kind {
+            ProviderKind::Anthropic => AuthScheme::Header("x-api-key"),
+            ProviderKind::Openai | ProviderKind::OpenaiCompatible => AuthScheme::Bearer,
+        };
+        let upstream = Upstream {
+            base_url: provider.base_url.clone(),
+            api_key: lease.secret.clone(),
+            auth,
+        };
         let ctx = StreamContext {
             namespace: caller.namespace.clone(),
             subject: caller.subject.clone(),
             alias,
             target_provider,
-            target_model,
-            source: resolved.source,
+            target_model: target_model.clone(),
+            source: plan.source,
+            credential_id: lease.id.clone(),
             price,
             budget_key,
+        };
+        let request = ProviderRequest {
+            model: target_model,
+            body,
         };
         return streaming::relay(
             state.clone(),
             ctx,
-            adapter,
+            adapter_for(provider.kind),
             upstream,
             Surface::ChatCompletions,
             request,
@@ -175,19 +185,10 @@ async fn chat_completions(
     }
 
     let started = Instant::now();
-    let result = state
-        .0
-        .dispatcher
-        .dispatch(
-            adapter.as_ref(),
-            &upstream,
-            Surface::ChatCompletions,
-            request,
-        )
-        .await;
+    let attempt = dispatch_over_pool(&state, provider, &plan, &target_model, body).await;
     let latency_ms = started.elapsed().as_millis() as u64;
 
-    match result {
+    match attempt.result {
         Ok(response) => {
             let usage = to_usage(&response.usage);
             let cost = price.cost_microdollars(usage);
@@ -199,7 +200,8 @@ async fn chat_completions(
                     alias: &alias,
                     target_provider: &target_provider,
                     target_model: &target_model,
-                    source: resolved.source,
+                    source: plan.source,
+                    credential_id: &attempt.credential_id,
                     status: Status::Ok,
                     input_tokens: response.usage.input_tokens,
                     output_tokens: response.usage.output_tokens,
@@ -222,7 +224,8 @@ async fn chat_completions(
                     alias: &alias,
                     target_provider: &target_provider,
                     target_model: &target_model,
-                    source: resolved.source,
+                    source: plan.source,
+                    credential_id: &attempt.credential_id,
                     status: Status::UpstreamError,
                     input_tokens: 0,
                     output_tokens: 0,
@@ -234,6 +237,95 @@ async fn chat_completions(
             Err(err.into())
         }
     }
+}
+
+/// The upstream attempt that terminated the request, plus the credential that
+/// made it (for attribution).
+struct PooledAttempt {
+    result: Result<ProviderResponse, TransportError>,
+    credential_id: String,
+}
+
+/// Walk the credential pool: dispatch with the first credential, and on a
+/// credential-scoped failure (rate limit / quota) park that credential and
+/// retry the *same* target with the next one. Target-level failover is a
+/// separate concern and is not attempted here.
+async fn dispatch_over_pool(
+    state: &AppState,
+    provider: &Provider,
+    plan: &CredentialPlan,
+    target_model: &str,
+    body: Value,
+) -> PooledAttempt {
+    let adapter = adapter_for(provider.kind);
+    let mut exhausted: Option<PooledAttempt> = None;
+
+    for lease in &plan.attempts {
+        let upstream = Upstream {
+            base_url: provider.base_url.clone(),
+            api_key: lease.secret.clone(),
+            auth: match provider.kind {
+                ProviderKind::Anthropic => AuthScheme::Header("x-api-key"),
+                ProviderKind::Openai | ProviderKind::OpenaiCompatible => AuthScheme::Bearer,
+            },
+        };
+        let request = ProviderRequest {
+            model: target_model.to_string(),
+            body: body.clone(),
+        };
+        let result = state
+            .0
+            .dispatcher
+            .dispatch(
+                adapter.as_ref(),
+                &upstream,
+                Surface::ChatCompletions,
+                request,
+            )
+            .await;
+        match result {
+            Ok(response) => {
+                state.0.credentials.record_success(lease);
+                return PooledAttempt {
+                    result: Ok(response),
+                    credential_id: lease.id.clone(),
+                };
+            }
+            Err(err) if is_credential_exhausted(&err) => {
+                state.0.credentials.record_failure(lease);
+                tracing::warn!(
+                    provider = %provider.id,
+                    credential = %lease.id,
+                    "credential is rate-limited or out of quota; trying the next in the pool"
+                );
+                exhausted = Some(PooledAttempt {
+                    result: Err(err),
+                    credential_id: lease.id.clone(),
+                });
+            }
+            Err(err) => {
+                return PooledAttempt {
+                    result: Err(err),
+                    credential_id: lease.id.clone(),
+                };
+            }
+        }
+    }
+
+    exhausted.unwrap_or_else(|| PooledAttempt {
+        result: Err(ProviderError::InvalidRequest("empty credential pool".into()).into()),
+        credential_id: String::new(),
+    })
+}
+
+/// A `429` (rate limit or exhausted quota) is attributable to the *credential*,
+/// so it parks that key and falls to the next. Every other upstream failure is
+/// the target's problem, not the key's.
+fn is_credential_exhausted(err: &TransportError) -> bool {
+    let TransportError::Provider(ProviderError::Dependency(failures)) = err else {
+        return false;
+    };
+    failures.iter().any(|failure| failure.status == Some(429))
 }
 
 fn to_usage(u: &gateway_core::ModelUsage) -> Usage {
@@ -296,6 +388,7 @@ struct RecordArgs<'a> {
     target_provider: &'a str,
     target_model: &'a str,
     source: CredentialSource,
+    credential_id: &'a str,
     status: Status,
     input_tokens: u64,
     output_tokens: u64,
@@ -313,6 +406,7 @@ async fn record_usage(state: &AppState, args: RecordArgs<'_>) {
         target_provider: args.target_provider.to_string(),
         target_model: args.target_model.to_string(),
         credential_source: UsageRecord::credential_source_str(args.source),
+        credential_id: args.credential_id.to_string(),
         status: args.status,
         input_tokens: args.input_tokens,
         output_tokens: args.output_tokens,
@@ -333,6 +427,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
     use tower::util::ServiceExt;
 
     fn test_state() -> AppState {
@@ -360,6 +455,7 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
             UsageFanout::new(sinks),
             Box::new(NoBudget),
         )
+        .expect("no credentials to resolve")
     }
 
     #[tokio::test]
@@ -408,5 +504,113 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// Collects records so attribution can be asserted.
+    #[derive(Clone, Default)]
+    struct CapturingSink(Arc<Mutex<Vec<UsageRecord>>>);
+
+    #[async_trait::async_trait]
+    impl UsageSink for CapturingSink {
+        fn name(&self) -> &'static str {
+            "capture"
+        }
+
+        async fn record(&self, record: &UsageRecord) {
+            self.0.lock().unwrap().push(record.clone());
+        }
+    }
+
+    /// A stand-in provider that rate-limits one key and serves the other, so the
+    /// pool walk is exercised over real HTTP.
+    async fn rate_limiting_upstream(exhausted_key: &'static str) -> String {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |headers: HeaderMap| async move {
+                let authorized = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("Bearer "))
+                    .unwrap_or_default()
+                    != exhausted_key;
+                if authorized {
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "chatcmpl-1",
+                            "choices": [],
+                            "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
+                        })),
+                    )
+                } else {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(json!({ "error": { "message": "rate limit exceeded" } })),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_credential_falls_to_the_next_and_is_attributed() {
+        let base_url = rate_limiting_upstream("sk-exhausted").await;
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "{base_url}"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K1"
+id = "openai-a"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K2"
+id = "openai-b"
+
+[[model]]
+name = "gpt-4o"
+targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }} }}]
+"#
+        ))
+        .unwrap();
+        let env: HashMap<String, String> = [("K1", "sk-exhausted"), ("K2", "sk-good")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let captured = CapturingSink::default();
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(captured.clone())];
+        let state = AppState::new(cfg, &env, UsageFanout::new(sinks), Box::new(NoBudget)).unwrap();
+
+        let body = serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []})).unwrap();
+        let resp = router(state)
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let records = captured.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].credential_id, "openai-b");
+        assert_eq!(records[0].credential_source, "platform");
     }
 }

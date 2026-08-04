@@ -43,6 +43,9 @@ pub struct UsageRecord {
     pub target_provider: String,
     pub target_model: String,
     pub credential_source: &'static str,
+    /// Label of the specific credential in the pool that served the request —
+    /// never the secret. Makes per-key spend and error rates attributable.
+    pub credential_id: String,
     pub status: Status,
     pub input_tokens: u64,
     pub output_tokens: u64,

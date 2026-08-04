@@ -5,6 +5,10 @@
 # in and pointed at with AXOND_CONFIG. A gateway that will not answer /healthz
 # is not shippable, so a failed probe fails the whole smoke.
 #
+# Boot refuses a credential whose env var is unset, so every env var the example
+# config references is supplied with a placeholder. Nothing here is dispatched
+# upstream, so the values are never used as keys.
+#
 # Usage: ops/docker-smoke.sh <image-ref>
 set -euo pipefail
 
@@ -21,6 +25,10 @@ trap cleanup EXIT
 docker run -d --name "$container" \
   -p "${host_port}:8080" \
   -e AXOND_CONFIG=/etc/axond/axond.toml \
+  -e GW_PLATFORM_OPENAI_API_KEY=smoke-placeholder \
+  -e GW_PLATFORM_OPENAI_API_KEY_OVERFLOW=smoke-placeholder \
+  -e GW_PLATFORM_ANTHROPIC_API_KEY=smoke-placeholder \
+  -e GW_ACME_OPENAI_API_KEY=smoke-placeholder \
   -v "${repo_root}/axond.example.toml:/etc/axond/axond.toml:ro" \
   "$image" >/dev/null
 
