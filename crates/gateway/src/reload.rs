@@ -17,10 +17,11 @@
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::config::{Config, ConfigError, Reload};
+use crate::config::{Config, ConfigError, Reload, UsageSinkConfig};
 use crate::credentials::CredentialError;
 use crate::state::{AppState, ConfigSnapshot};
 use crate::telemetry;
@@ -38,16 +39,36 @@ pub enum ReloadError {
     Credentials(#[from] CredentialError),
 }
 
+/// What the process committed to at startup and cannot redo while serving, so a
+/// candidate is compared against what is *in effect* rather than against the
+/// previous candidate.
+struct Boot {
+    bind: SocketAddr,
+    usage_sink: Vec<UsageSinkConfig>,
+}
+
 /// Owns the config path and the state whose snapshot it replaces.
 pub struct Reloader {
     path: String,
     state: AppState,
+    boot: Boot,
+    /// The file contents the last reload acted on — and the lock that serializes
+    /// reloads. Shared between the triggers so the watcher does not repeat what a
+    /// signal just applied, and two triggers cannot race the generation counter.
+    seen: Mutex<Option<Vec<u8>>>,
 }
 
 impl Reloader {
     pub fn new(path: impl Into<String>, state: AppState) -> Self {
+        let path = path.into();
+        let booted = state.config();
         Self {
-            path: path.into(),
+            seen: Mutex::new(std::fs::read(&path).ok()),
+            boot: Boot {
+                bind: booted.config.server.bind,
+                usage_sink: booted.config.usage_sink.clone(),
+            },
+            path,
             state,
         }
     }
@@ -56,12 +77,54 @@ impl Reloader {
     /// credential env-var exported after boot (a new BYOK tenant's key) resolves
     /// without a restart.
     pub fn reload(&self, trigger: &'static str) -> Result<ReloadSummary, ReloadError> {
-        let env: HashMap<String, String> = std::env::vars().collect();
-        self.reload_with_env(trigger, &env)
+        self.reload_with_env(trigger, &std::env::vars().collect())
     }
 
-    /// The reload proper, against an explicit environment snapshot.
+    /// An unconditional reload, against an explicit environment snapshot.
     pub fn reload_with_env(
+        &self,
+        trigger: &'static str,
+        env: &HashMap<String, String>,
+    ) -> Result<ReloadSummary, ReloadError> {
+        let mut seen = self.lock_seen();
+        *seen = std::fs::read(&self.path).ok();
+        self.apply(trigger, env)
+    }
+
+    /// Reload only if the file's bytes differ from what the last reload acted on.
+    /// The watcher's entry point: an edit its operator then `SIGHUP`s is applied
+    /// once, not once per trigger.
+    pub fn reload_if_changed_with_env(
+        &self,
+        trigger: &'static str,
+        env: &HashMap<String, String>,
+    ) -> Option<Result<ReloadSummary, ReloadError>> {
+        let mut seen = self.lock_seen();
+        // A momentarily unreadable path (mid rename) is not a change.
+        let current = std::fs::read(&self.path).ok()?;
+        if seen.as_deref() == Some(current.as_slice()) {
+            return None;
+        }
+        *seen = Some(current);
+        Some(self.apply(trigger, env))
+    }
+
+    fn reload_if_changed(
+        &self,
+        trigger: &'static str,
+    ) -> Option<Result<ReloadSummary, ReloadError>> {
+        self.reload_if_changed_with_env(trigger, &std::env::vars().collect())
+    }
+
+    /// Only ever held across synchronous work, so a poisoned guard carries no
+    /// torn state: a reload reads, then publishes, and holds nothing else.
+    fn lock_seen(&self) -> MutexGuard<'_, Option<Vec<u8>>> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn apply(
         &self,
         trigger: &'static str,
         env: &HashMap<String, String>,
@@ -72,7 +135,8 @@ impl Reloader {
 
         match self.candidate(env, current.generation + 1) {
             Ok(candidate) => {
-                let summary = ReloadSummary::between(&current.config, &candidate.config);
+                let summary =
+                    ReloadSummary::between(&self.boot, &current.config, &candidate.config);
                 let generation = candidate.generation;
                 self.state.publish(candidate);
                 telemetry::finish_config_reload(
@@ -171,7 +235,7 @@ impl std::fmt::Display for Delta {
 }
 
 impl ReloadSummary {
-    fn between(before: &Config, after: &Config) -> Self {
+    fn between(boot: &Boot, before: &Config, after: &Config) -> Self {
         Self {
             namespaces: Delta::between(
                 before.namespace.iter().map(|n| n.id.clone()),
@@ -193,8 +257,8 @@ impl ReloadSummary {
                 before.gateway_key.iter().map(|k| k.env.clone()),
                 after.gateway_key.iter().map(|k| k.env.clone()),
             ),
-            bind_changed: before.server.bind != after.server.bind,
-            usage_sinks_changed: before.usage_sink != after.usage_sink,
+            bind_changed: boot.bind != after.server.bind,
+            usage_sinks_changed: boot.usage_sink != after.usage_sink,
         }
     }
 
@@ -263,25 +327,17 @@ async fn signal_loop(reloader: Arc<Reloader>) {
 }
 
 /// Watch by comparing the file's bytes rather than its mtime, so an editor's
-/// in-place write and a Kubernetes ConfigMap's symlink swap both register, and a
-/// touched-but-identical file does not. A momentarily unreadable path (mid
-/// rename) is skipped, not treated as a change.
+/// in-place write and a Kubernetes ConfigMap's symlink swap both register, while
+/// a touched-but-identical file — or an edit a `SIGHUP` already applied — does
+/// not. The comparison lives on the `Reloader`, shared with the signal path.
 async fn watch_loop(reloader: Arc<Reloader>) {
-    let mut seen = tokio::fs::read(&reloader.path).await.ok();
     loop {
         let settings = reloader.watch_settings();
         tokio::time::sleep(Duration::from_millis(settings.poll_interval_ms)).await;
         if !settings.watch {
             continue;
         }
-        let Ok(current) = tokio::fs::read(&reloader.path).await else {
-            continue;
-        };
-        if seen.as_deref() == Some(current.as_slice()) {
-            continue;
-        }
-        seen = Some(current);
-        let _ = reloader.reload(TRIGGER_WATCH);
+        let _ = reloader.reload_if_changed(TRIGGER_WATCH);
     }
 }
 
@@ -521,8 +577,10 @@ default = true
         assert!(state.config().config.model("acme-fast").is_none());
     }
 
+    /// The warning names what the *process* is doing, so it stays true for as
+    /// long as the file disagrees with the socket that is actually bound.
     #[tokio::test]
-    async fn process_level_changes_are_reported_rather_than_applied() {
+    async fn process_level_changes_are_reported_on_every_reload_rather_than_applied() {
         let file = ConfigFile::new(PLATFORM_ONLY);
         let state = state_from(&file);
         let reloader = Reloader::new(file.path(), state.clone());
@@ -533,9 +591,43 @@ default = true
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &HashMap::new())
             .expect("candidate is valid");
-
         assert!(summary.bind_changed);
         assert!(summary.is_empty());
+
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &HashMap::new())
+            .expect("candidate is valid");
+        assert!(summary.bind_changed);
+        assert_eq!(state.config().generation, 2);
+    }
+
+    /// Both triggers share one view of what has been acted on, so the watcher
+    /// does not re-apply the edit an operator signalled.
+    #[tokio::test]
+    async fn the_watcher_does_not_repeat_a_reload_the_signal_already_applied() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state.clone());
+
+        file.rewrite(WITH_BYOK_TENANT);
+        reloader
+            .reload_with_env(TRIGGER_SIGNAL, &tenant_env())
+            .expect("candidate is valid");
+        assert_eq!(state.config().generation, 1);
+
+        assert!(
+            reloader
+                .reload_if_changed_with_env(TRIGGER_WATCH, &tenant_env())
+                .is_none()
+        );
+        assert_eq!(state.config().generation, 1);
+
+        file.rewrite(PLATFORM_ONLY);
+        reloader
+            .reload_if_changed_with_env(TRIGGER_WATCH, &HashMap::new())
+            .expect("the file changed")
+            .expect("candidate is valid");
+        assert_eq!(state.config().generation, 2);
     }
 
     #[tokio::test]

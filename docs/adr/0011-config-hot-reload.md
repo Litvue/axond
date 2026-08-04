@@ -89,10 +89,21 @@ policy to save a `tokio::time::sleep` loop is a bad trade. The watcher reads
 `[reload]` from the *current* snapshot each pass, so watching can itself be
 turned on, retuned, or turned off by a `SIGHUP` reload.
 
+**Reloads are serialized, and the file is read once per applied reload.** The
+triggers are independent tasks, so the read-current, build-candidate,
+publish-with-`generation + 1` sequence is taken under one mutex: the generation
+counter stays monotonic, and the newest read always wins. The same lock holds the
+bytes the last reload acted on, which the watcher compares against — so an
+operator who edits the file *and* signals gets one reload, not one per trigger,
+and watching being turned on does not re-apply the edit that turned it on.
+
 **Process-level changes are reported, not applied.** `[server] bind` and
 `[[usage_sink]]` differences are logged as warnings naming the restart
 requirement, so an operator is told rather than left wondering why their edit did
-nothing.
+nothing. They are compared against what the process bound and connected **at
+boot**, not against the previous candidate: the config in the snapshot is the
+file's opinion, and the warning has to keep being true for as long as the file
+and the running socket disagree.
 
 **Reload outcomes are observable** on the ADR 0007 stack: an
 `axond.config.reload` span with `axond.reload.trigger` / `axond.reload.outcome`,
