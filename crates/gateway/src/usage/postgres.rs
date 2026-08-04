@@ -1,0 +1,422 @@
+//! The durable usage sink: batched multi-row inserts into a versioned table.
+//!
+//! The schema is the expensive part of this sink — it lands in an adopter's own
+//! database and is read by their billing queries — so it is treated as an API:
+//! it lives in [`ops/postgres/usage_v1.sql`](../../../../ops/postgres/usage_v1.sql),
+//! every row carries `schema_version`, and a change to the row shape is a new
+//! versioned file rather than an edit (ADR 0009).
+//!
+//! One connection serves the sink, driven by the single flush task that
+//! [`super::BatchedSink`] owns. A failed write drops the connection so the next
+//! batch reconnects; the batch itself is retried once and then dropped and
+//! counted, because the alternative — unbounded retention — trades the request
+//! path for records nobody can read yet.
+
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use tokio_postgres::types::ToSql;
+use tokio_postgres::{Client, Config};
+use tokio_postgres_rustls::MakeRustlsConnect;
+
+use super::{ObservedRecord, SinkFailure, UsageRecord, UsageSink, UsageSinkError};
+
+/// The DDL for the current schema version, shared with operators who apply it
+/// themselves. The table and the serialized record are one schema with one
+/// version — [`UsageRecord::SCHEMA_VERSION`] — not two that can drift.
+const SCHEMA_DDL: &str = include_str!("../../../../ops/postgres/usage_v1.sql");
+
+/// The table name the shipped DDL uses; substituted when the sink is configured
+/// with another one.
+const DEFAULT_TABLE: &str = "axond_usage";
+
+/// Columns written per row, in parameter order. `reasoning_tokens`,
+/// `cache_read_tokens`, and `cache_write_tokens` exist in the table but are not
+/// written: the canonical record does not carry them yet.
+const COLUMNS: [&str; 19] = [
+    "schema_version",
+    "request_id",
+    "trace_id",
+    "namespace",
+    "subject",
+    "model",
+    "target_provider",
+    "target_model",
+    "credential_source",
+    "credential_id",
+    "status",
+    "input_tokens",
+    "output_tokens",
+    "cost_microdollars",
+    "catalog_version",
+    "latency_ms",
+    "attempts",
+    "started_at",
+    "recorded_at",
+];
+
+/// The wire protocol carries a 16-bit parameter count, so one statement can
+/// bind at most 65535 values.
+const MAX_BIND_PARAMETERS: usize = u16::MAX as usize;
+
+/// Rows one INSERT can carry. Batches larger than this are split.
+pub const MAX_ROWS_PER_STATEMENT: usize = MAX_BIND_PARAMETERS / COLUMNS.len();
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone)]
+pub struct PostgresSinkSettings {
+    pub table: String,
+    /// Apply the shipped DDL at boot. Off by default: in most deployments the
+    /// gateway's role has no DDL rights, and schema changes are the operator's
+    /// to sequence.
+    pub create_table: bool,
+}
+
+pub struct PostgresSink {
+    table: String,
+    config: Config,
+    /// `None` until the first write and after any failure, so a broken
+    /// connection is replaced rather than reused.
+    client: tokio::sync::Mutex<Option<Client>>,
+}
+
+impl PostgresSink {
+    /// Connect, validate the table name, and optionally create the table.
+    ///
+    /// Failing here means the process refuses to boot, which is the point: a
+    /// usage sink that cannot write is a silent data-loss bug, and the config
+    /// graph is validated at boot rather than at request time.
+    pub async fn connect(
+        dsn: &str,
+        settings: PostgresSinkSettings,
+    ) -> Result<Self, UsageSinkError> {
+        validate_table_name(&settings.table)
+            .map_err(|message| UsageSinkError::invalid("postgres", message))?;
+        let mut config: Config = dsn
+            .parse()
+            .map_err(|e| UsageSinkError::invalid("postgres", format!("unparsable DSN: {e}")))?;
+        config.connect_timeout(CONNECT_TIMEOUT);
+        config.application_name(crate::telemetry::SERVICE_NAME);
+
+        let sink = Self {
+            table: settings.table,
+            config,
+            client: tokio::sync::Mutex::new(None),
+        };
+        let client = sink.connect_client().await?;
+        if settings.create_table {
+            client.batch_execute(&sink.schema_ddl()).await?;
+        }
+        *sink.client.lock().await = Some(client);
+        Ok(sink)
+    }
+
+    /// The shipped DDL, retargeted at the configured table.
+    fn schema_ddl(&self) -> String {
+        SCHEMA_DDL.replace(DEFAULT_TABLE, &self.table)
+    }
+
+    async fn connect_client(&self) -> Result<Client, tokio_postgres::Error> {
+        // `sslmode` in the DSN decides whether the connector is used; supplying
+        // one always means managed Postgres works without a second build.
+        let (client, connection) = self.config.connect(tls_connector()).await?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!(error = %e, "postgres usage connection closed");
+            }
+        });
+        Ok(client)
+    }
+
+    /// Insert one statement's worth of rows, reconnecting once if the
+    /// connection was stale.
+    async fn insert_chunk(&self, chunk: &[ObservedRecord]) -> Result<(), SinkFailure> {
+        let sql = insert_sql(&self.table, chunk.len());
+        let values: Vec<Vec<Box<dyn ToSql + Sync + Send>>> = chunk.iter().map(row).collect();
+        let params: Vec<&(dyn ToSql + Sync)> = values
+            .iter()
+            .flatten()
+            .map(|value| value.as_ref() as &(dyn ToSql + Sync))
+            .collect();
+
+        let mut guard = self.client.lock().await;
+        let mut last_error: Option<tokio_postgres::Error> = None;
+        for _ in 0..2 {
+            let client = match guard.take() {
+                Some(client) if !client.is_closed() => client,
+                _ => match self.connect_client().await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        last_error = Some(e);
+                        continue;
+                    }
+                },
+            };
+            match client.execute(sql.as_str(), &params).await {
+                Ok(_) => {
+                    *guard = Some(client);
+                    return Ok(());
+                }
+                // The connection is discarded either way: a statement that
+                // failed on a live connection is a schema or data problem, and
+                // retrying it on the same connection cannot help.
+                Err(e) => last_error = Some(e),
+            }
+        }
+        Err(SinkFailure::new(last_error.map_or_else(
+            || "insert failed".to_owned(),
+            |e| e.to_string(),
+        )))
+    }
+}
+
+#[async_trait]
+impl UsageSink for PostgresSink {
+    fn name(&self) -> &'static str {
+        "postgres"
+    }
+
+    async fn record(&self, record: &UsageRecord) {
+        let batch = [ObservedRecord::now(record.clone())];
+        if let Err(e) = self.record_batch(&batch).await {
+            tracing::warn!(error = %e, "usage record not persisted");
+        }
+    }
+
+    async fn record_batch(&self, batch: &[ObservedRecord]) -> Result<(), SinkFailure> {
+        for chunk in batch.chunks(MAX_ROWS_PER_STATEMENT) {
+            self.insert_chunk(chunk).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Rustls with the Mozilla root bundle, built once. The process-default crypto
+/// provider is installed here because `reqwest` configures its own explicitly
+/// and so leaves the default unset.
+fn tls_connector() -> MakeRustlsConnect {
+    static CONNECTOR: OnceLock<MakeRustlsConnect> = OnceLock::new();
+    CONNECTOR
+        .get_or_init(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            MakeRustlsConnect::with_webpki_roots()
+        })
+        .clone()
+}
+
+/// A multi-row `INSERT` with one parameter set per row.
+fn insert_sql(table: &str, rows: usize) -> String {
+    let mut sql = String::with_capacity(64 + rows * COLUMNS.len() * 5);
+    sql.push_str("INSERT INTO ");
+    sql.push_str(table);
+    sql.push_str(" (");
+    sql.push_str(&COLUMNS.join(", "));
+    sql.push_str(") VALUES ");
+    for row in 0..rows {
+        if row > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('(');
+        for column in 0..COLUMNS.len() {
+            if column > 0 {
+                sql.push_str(", ");
+            }
+            sql.push('$');
+            sql.push_str(&(row * COLUMNS.len() + column + 1).to_string());
+        }
+        sql.push(')');
+    }
+    sql
+}
+
+/// Bind values for one row, in `COLUMNS` order. Counts are `u64` in the record
+/// and `bigint` on the wire, so an implausible value saturates rather than
+/// wrapping into a negative row.
+fn row(observed: &ObservedRecord) -> Vec<Box<dyn ToSql + Sync + Send>> {
+    let record = &observed.record;
+    let recorded_at = observed.observed_at;
+    let started_at = recorded_at
+        .checked_sub(Duration::from_millis(record.latency_ms))
+        .unwrap_or(recorded_at);
+    vec![
+        Box::new(record.schema_version as i32),
+        Box::new(record.request_id.clone()),
+        Box::new(record.trace_id.clone()),
+        Box::new(record.namespace.clone()),
+        Box::new(record.subject.clone()),
+        Box::new(record.model.clone()),
+        Box::new(record.target_provider.clone()),
+        Box::new(record.target_model.clone()),
+        Box::new(record.credential_source.to_owned()),
+        Box::new(record.credential_id.clone()),
+        Box::new(record.status.as_str().to_owned()),
+        Box::new(bigint(record.input_tokens)),
+        Box::new(bigint(record.output_tokens)),
+        Box::new(bigint(record.cost_microdollars)),
+        Box::new(bigint(record.catalog_version)),
+        Box::new(bigint(record.latency_ms)),
+        Box::new(record.attempts as i64),
+        Box::new(started_at),
+        Box::new(recorded_at),
+    ]
+}
+
+fn bigint(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// Table names come from config and are interpolated into SQL, so the accepted
+/// shape is narrow: an optional schema qualifier, lowercase identifiers only.
+pub fn validate_table_name(table: &str) -> Result<(), String> {
+    let parts: Vec<&str> = table.split('.').collect();
+    if parts.len() > 2 {
+        return Err(format!(
+            "`{table}` is not a valid table name: at most one schema qualifier"
+        ));
+    }
+    for part in parts {
+        let valid = !part.is_empty()
+            && part.len() <= 63
+            && part.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+            && part
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !valid {
+            return Err(format!(
+                "`{table}` is not a valid table name: use lowercase letters, digits, and underscores"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::sample_record;
+    use super::*;
+
+    fn observed() -> ObservedRecord {
+        ObservedRecord::now(sample_record())
+    }
+
+    #[test]
+    fn the_row_shape_matches_the_shipped_ddl() {
+        for column in COLUMNS {
+            assert!(
+                SCHEMA_DDL.contains(column),
+                "column `{column}` is written but not declared in usage_v1.sql"
+            );
+        }
+        assert_eq!(UsageRecord::SCHEMA_VERSION, 1);
+        assert!(SCHEMA_DDL.contains("version 1"));
+    }
+
+    #[test]
+    fn every_column_is_bound_once_per_row() {
+        let batch = [observed(), observed()];
+        let bound: usize = batch.iter().map(|o| row(o).len()).sum();
+        assert_eq!(bound, COLUMNS.len() * 2);
+        let sql = insert_sql("axond_usage", 2);
+        assert!(sql.starts_with("INSERT INTO axond_usage (schema_version, request_id"));
+        assert!(sql.contains(&format!("${}", COLUMNS.len() * 2)));
+        assert!(!sql.contains(&format!("${}", COLUMNS.len() * 2 + 1)));
+    }
+
+    #[test]
+    fn a_batch_never_exceeds_the_parameter_limit() {
+        const _: () = assert!(MAX_ROWS_PER_STATEMENT * COLUMNS.len() <= MAX_BIND_PARAMETERS);
+        let oversized: Vec<ObservedRecord> = (0..MAX_ROWS_PER_STATEMENT + 7)
+            .map(|_| observed())
+            .collect();
+        let chunks: Vec<usize> = oversized
+            .chunks(MAX_ROWS_PER_STATEMENT)
+            .map(<[ObservedRecord]>::len)
+            .collect();
+        assert_eq!(chunks, vec![MAX_ROWS_PER_STATEMENT, 7]);
+    }
+
+    #[test]
+    fn started_at_precedes_the_recorded_instant_by_the_latency() {
+        let mut record = sample_record();
+        record.latency_ms = 250;
+        let observed = ObservedRecord::now(record);
+        let values = row(&observed);
+        assert_eq!(values.len(), COLUMNS.len());
+        let started = observed
+            .observed_at
+            .checked_sub(Duration::from_millis(250))
+            .expect("in range");
+        assert!(started < observed.observed_at);
+    }
+
+    #[test]
+    fn the_ddl_is_retargeted_at_the_configured_table() {
+        let ddl = SCHEMA_DDL.replace(DEFAULT_TABLE, "billing.usage");
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS billing.usage"));
+        assert!(!ddl.contains("CREATE TABLE IF NOT EXISTS axond_usage"));
+    }
+
+    #[test]
+    fn table_names_that_could_carry_sql_are_rejected() {
+        assert!(validate_table_name("axond_usage").is_ok());
+        assert!(validate_table_name("billing.axond_usage").is_ok());
+        for bad in [
+            "",
+            "Axond_Usage",
+            "usage; drop table users",
+            "usage\"",
+            "a.b.c",
+            "9usage",
+        ] {
+            assert!(validate_table_name(bad).is_err(), "accepted `{bad}`");
+        }
+    }
+
+    /// Round-trips a batch through a real database when one is offered. Skipped
+    /// (not failed) otherwise, so the suite stays runnable with no datastore —
+    /// the same posture as the gateway itself.
+    #[tokio::test]
+    async fn a_batch_lands_in_postgres() {
+        let Ok(dsn) = std::env::var("AXOND_TEST_POSTGRES_DSN") else {
+            return;
+        };
+        let table = "axond_usage_test";
+        let sink = PostgresSink::connect(
+            &dsn,
+            PostgresSinkSettings {
+                table: table.to_owned(),
+                create_table: true,
+            },
+        )
+        .await
+        .expect("connect");
+        {
+            let guard = sink.client.lock().await;
+            let client = guard.as_ref().expect("connected");
+            client
+                .execute(&format!("TRUNCATE {table}"), &[])
+                .await
+                .expect("truncate");
+        }
+
+        let batch: Vec<ObservedRecord> = (0..3).map(|_| observed()).collect();
+        sink.record_batch(&batch).await.expect("insert");
+
+        let guard = sink.client.lock().await;
+        let client = guard.as_ref().expect("connected");
+        let rows = client
+            .query(
+                &format!("SELECT schema_version, namespace, cost_microdollars, latency_ms, recorded_at - started_at FROM {table}"),
+                &[],
+            )
+            .await
+            .expect("select");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].get::<_, i32>(0), UsageRecord::SCHEMA_VERSION as i32);
+        assert_eq!(rows[0].get::<_, &str>(1), "acme");
+        assert_eq!(rows[0].get::<_, i64>(2), 640);
+        assert_eq!(rows[0].get::<_, i64>(3), 812);
+    }
+}

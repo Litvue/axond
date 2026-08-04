@@ -9,9 +9,12 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use gateway_core::ModelPrice;
 use serde::Deserialize;
+
+use crate::usage::{BatchSettings, MAX_ROWS_PER_STATEMENT, validate_table_name};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -37,6 +40,10 @@ pub struct Config {
     /// uses the default namespace — intended for local dev only.
     #[serde(default)]
     pub gateway_key: Vec<GatewayKey>,
+    /// Where raw usage records go. Empty means the no-datastore default: one
+    /// JSON line per record on stdout (ADR 0002).
+    #[serde(default)]
+    pub usage_sink: Vec<UsageSinkConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -229,6 +236,97 @@ fn default_target_cooldown_seconds() -> u64 {
     30
 }
 
+/// One usage destination. `kind` decides which of the remaining fields apply;
+/// they are validated as a set at boot, so a Postgres sink without a DSN (or a
+/// batch size the wire protocol cannot carry) refuses to start.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageSinkConfig {
+    pub kind: UsageSinkKind,
+    /// `postgres`: name of the env var holding the connection string. The DSN is
+    /// a secret, so it is referenced rather than inlined, like every credential.
+    #[serde(default)]
+    pub dsn_env: Option<String>,
+    /// `postgres`: destination table. Defaults to `axond_usage`, matching the
+    /// shipped DDL.
+    #[serde(default)]
+    pub table: Option<String>,
+    /// `postgres`: apply the shipped DDL at boot. Off by default — most
+    /// deployments give the gateway's role no DDL rights.
+    #[serde(default)]
+    pub create_table: bool,
+    /// Records buffered before the fan-out starts dropping (`postgres`).
+    #[serde(default = "default_buffer_capacity")]
+    pub buffer_capacity: usize,
+    /// Rows per write (`postgres`).
+    #[serde(default = "default_max_batch")]
+    pub max_batch: usize,
+    /// How long a partial batch waits before it is written anyway (`postgres`).
+    #[serde(default = "default_flush_interval_ms")]
+    pub flush_interval_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UsageSinkKind {
+    Stdout,
+    Postgres,
+    Otlp,
+}
+
+impl UsageSinkKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Postgres => "postgres",
+            Self::Otlp => "otlp",
+        }
+    }
+}
+
+impl Default for UsageSinkConfig {
+    fn default() -> Self {
+        Self {
+            kind: UsageSinkKind::Stdout,
+            dsn_env: None,
+            table: None,
+            create_table: false,
+            buffer_capacity: default_buffer_capacity(),
+            max_batch: default_max_batch(),
+            flush_interval_ms: default_flush_interval_ms(),
+        }
+    }
+}
+
+impl UsageSinkConfig {
+    pub fn table(&self) -> String {
+        self.table
+            .clone()
+            .unwrap_or_else(|| DEFAULT_USAGE_TABLE.to_owned())
+    }
+
+    pub fn batch_settings(&self) -> BatchSettings {
+        BatchSettings {
+            capacity: self.buffer_capacity,
+            max_batch: self.max_batch,
+            flush_interval: Duration::from_millis(self.flush_interval_ms),
+        }
+    }
+}
+
+const DEFAULT_USAGE_TABLE: &str = "axond_usage";
+
+fn default_buffer_capacity() -> usize {
+    10_000
+}
+
+fn default_max_batch() -> usize {
+    500
+}
+
+fn default_flush_interval_ms() -> u64 {
+    1_000
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayKey {
     /// Env var holding the inbound key secret.
@@ -366,6 +464,46 @@ impl Config {
                     "gateway_key references undefined namespace `{}`",
                     k.namespace
                 )));
+            }
+        }
+        self.validate_usage_sinks()?;
+        Ok(())
+    }
+
+    /// A sink's fields only make sense together, so they are checked as a set:
+    /// a Postgres sink needs a DSN reference and a table name that is safe to
+    /// interpolate, and its batch has to fit one statement's parameter budget.
+    fn validate_usage_sinks(&self) -> Result<(), ConfigError> {
+        for sink in &self.usage_sink {
+            let kind = sink.kind.as_str();
+            if sink.buffer_capacity == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "usage_sink `{kind}`: buffer_capacity must be at least 1"
+                )));
+            }
+            if sink.max_batch == 0 || sink.max_batch > MAX_ROWS_PER_STATEMENT {
+                return Err(ConfigError::Invalid(format!(
+                    "usage_sink `{kind}`: max_batch must be between 1 and {MAX_ROWS_PER_STATEMENT}"
+                )));
+            }
+            if sink.flush_interval_ms == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "usage_sink `{kind}`: flush_interval_ms must be at least 1"
+                )));
+            }
+            if sink.kind == UsageSinkKind::Postgres {
+                match sink.dsn_env.as_deref().map(str::trim) {
+                    Some(dsn_env) if !dsn_env.is_empty() => {}
+                    _ => {
+                        return Err(ConfigError::Invalid(
+                            "usage_sink `postgres`: `dsn_env` must name the env var holding the connection string"
+                                .into(),
+                        ));
+                    }
+                }
+                validate_table_name(&sink.table()).map_err(|message| {
+                    ConfigError::Invalid(format!("usage_sink `postgres`: {message}"))
+                })?;
             }
         }
         Ok(())
@@ -577,6 +715,90 @@ weight = 0
             Config::from_toml_str(&toml),
             Err(ConfigError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn accepts_declared_usage_sinks_and_defaults_their_batching() {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+{VALID}
+
+[[usage_sink]]
+kind = "postgres"
+dsn_env = "AXOND_USAGE_POSTGRES_DSN"
+table = "billing.axond_usage"
+create_table = true
+max_batch = 250
+
+[[usage_sink]]
+kind = "otlp"
+"#
+        ))
+        .expect("valid sinks");
+        assert_eq!(cfg.usage_sink[0].kind, UsageSinkKind::Postgres);
+        assert_eq!(cfg.usage_sink[0].table(), "billing.axond_usage");
+        assert_eq!(cfg.usage_sink[0].max_batch, 250);
+        assert_eq!(cfg.usage_sink[0].buffer_capacity, default_buffer_capacity());
+        assert_eq!(cfg.usage_sink[1].table(), "axond_usage");
+    }
+
+    #[test]
+    fn no_usage_sink_is_the_no_datastore_default() {
+        assert!(Config::from_toml_str(VALID).unwrap().usage_sink.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_postgres_sink_without_a_dsn_reference() {
+        let toml = format!(
+            r#"
+{VALID}
+
+[[usage_sink]]
+kind = "postgres"
+"#
+        );
+        assert!(matches!(
+            Config::from_toml_str(&toml),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_table_name_that_is_not_a_bare_identifier() {
+        let toml = format!(
+            r#"
+{VALID}
+
+[[usage_sink]]
+kind = "postgres"
+dsn_env = "DSN"
+table = "usage\"; drop table users --"
+"#
+        );
+        assert!(matches!(
+            Config::from_toml_str(&toml),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_batch_sizes_the_wire_protocol_cannot_carry() {
+        for bad in ["max_batch = 0", "max_batch = 100000", "buffer_capacity = 0"] {
+            let toml = format!(
+                r#"
+{VALID}
+
+[[usage_sink]]
+kind = "postgres"
+dsn_env = "DSN"
+{bad}
+"#
+            );
+            assert!(
+                matches!(Config::from_toml_str(&toml), Err(ConfigError::Invalid(_))),
+                "accepted `{bad}`"
+            );
+        }
     }
 
     #[test]

@@ -23,7 +23,7 @@ centralizes that:
 - **Model aliases, not topology.** Callers send `gpt-4o`; the gateway resolves it
   to a concrete provider + deployment. Change providers without touching callers.
 - **Usage + budgets behind traits.** Raw usage records fan out to pluggable sinks
-  (stdout today; Postgres/Tinybird/ClickHouse/OTLP planned); spend budgets —
+  (stdout by default; batched Postgres and OTLP opt-in); spend budgets —
   denominated in currency, computed from per-model pricing — are checked on a
   separate, request-path store.
 - **Telemetry first.** One canonical usage record per request drives sinks,
@@ -76,7 +76,7 @@ Point any OpenAI-compatible SDK at `http://localhost:8080/v1` as its base URL.
 TOML owns all structure; the environment owns secrets (referenced by name) and
 may override scalars. See [`axond.example.toml`](./axond.example.toml) for
 the annotated surface: `server`, `namespace`, `provider`, `credential`,
-`credential_pool`, `gateway_key`, and `model`.
+`credential_pool`, `gateway_key`, `model`, and `usage_sink`.
 
 Every env var a `[[credential]]` references must be set and non-empty at boot, or
 the gateway refuses to start.
@@ -136,6 +136,36 @@ upstream; once the relay emits its first byte a mid-stream failure is a terminal
 record and on the per-attempt spans. See
 [ADR 0008](./docs/adr/0008-target-failover-and-circuit-scope.md).
 
+## Usage sinks
+
+Every terminated request — including failures, cancellations, and partial
+streams — produces one canonical usage record. With no `[[usage_sink]]`
+configured the record is written as one JSON line on stdout and the process
+touches no datastore. Durable destinations are opt-in:
+
+```toml
+[[usage_sink]]
+kind = "postgres"
+dsn_env = "AXOND_USAGE_POSTGRES_DSN"   # the DSN is a secret: referenced, never inlined
+create_table = true                   # or apply ops/postgres/usage_v1.sql yourself
+
+[[usage_sink]]
+kind = "otlp"                         # usage as OTel log records, on the existing exporter
+```
+
+A configured sink connects at boot, so a bad DSN or an unreachable database
+refuses to start rather than dropping records later. From then on the sink is off
+the request path: records are buffered per sink and written in batches, and a
+slow or failing destination **drops with a count** rather than stalling a
+request. Drops are visible on `axond.usage.records_dropped{sink,reason}` and
+writes on `axond.usage.records_written` — alert on the former.
+
+The Postgres row shape is a published, versioned interface: see
+[`docs/usage-schema.md`](./docs/usage-schema.md) for the columns, the change
+policy, and the delivery guarantees, and
+[ADR 0009](./docs/adr/0009-durable-usage-sinks.md) for why. Tinybird and
+ClickHouse fit the same seam and are deferred to post-beta.
+
 ## Telemetry
 
 Off by default: with no OTLP endpoint the process only writes JSON logs to
@@ -177,7 +207,7 @@ runtime-neutral.
 - [x] Streaming (SSE) relay end-to-end (see [ADR 0005](./docs/adr/0005-streaming-relay.md))
 - [x] Ordered failover across targets + per-target circuit health (see [ADR 0008](./docs/adr/0008-target-failover-and-circuit-scope.md))
 - [x] OpenTelemetry traces (per-upstream-attempt spans, TTFT), metrics, logs
-- [ ] Usage sinks: Postgres, Tinybird, ClickHouse, OTLP
+- [x] Usage sinks: Postgres (batched, versioned schema) + OTLP; Tinybird / ClickHouse post-beta
 - [ ] Budget backends: in-memory (present) → Redis / Postgres, reserve-then-reconcile
 - [ ] Native Anthropic `/v1/messages` passthrough; `/v1/embeddings`, `/v1/responses`
 - [x] Multiple credentials per provider (pooling, weighted, skip-on-429)

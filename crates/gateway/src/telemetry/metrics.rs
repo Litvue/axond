@@ -31,6 +31,8 @@ struct Instruments {
     cost: Counter<u64>,
     upstream_errors: Counter<u64>,
     circuit_state: Gauge<u64>,
+    usage_written: Counter<u64>,
+    usage_dropped: Counter<u64>,
 }
 
 static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
@@ -88,6 +90,16 @@ impl Instruments {
                 .u64_gauge("axond.upstream.circuit_state")
                 .with_description("Per-target circuit state: 0 closed, 1 half-open, 2 open.")
                 .build(),
+            usage_written: meter
+                .u64_counter("axond.usage.records_written")
+                .with_description("Usage records a sink accepted, by sink.")
+                .build(),
+            usage_dropped: meter
+                .u64_counter("axond.usage.records_dropped")
+                .with_description(
+                    "Usage records discarded rather than delaying requests, by sink and reason.",
+                )
+                .build(),
         }
     }
 }
@@ -137,6 +149,33 @@ pub(super) fn record_request(record: &UsageRecord, ttft_ms: Option<u64>) {
     if record.status.is_error() {
         instruments.upstream_errors.add(1, &attributes);
     }
+}
+
+/// Usage records a sink durably accepted. Counted by the batching fan-out, so
+/// it reflects acknowledged writes rather than enqueues.
+pub fn record_usage_written(sink: &'static str, count: u64) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .usage_written
+        .add(count, &[KeyValue::new("axond.usage_sink", sink)]);
+}
+
+/// Usage records the gateway gave up on. `reason` is the bounded vocabulary of
+/// [`crate::usage::DropReason`], so the durability contract is measurable:
+/// requests are never stalled, and what that costs is visible here.
+pub fn record_usage_dropped(sink: &'static str, reason: &'static str, count: u64) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.usage_dropped.add(
+        count,
+        &[
+            KeyValue::new("axond.usage_sink", sink),
+            KeyValue::new("axond.drop_reason", reason),
+        ],
+    );
 }
 
 /// Publish a target's circuit state. Ordered failover (which owns the breaker)
