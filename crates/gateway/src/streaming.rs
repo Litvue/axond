@@ -2,8 +2,8 @@
 //!
 //! The relay decodes the upstream stream with `gateway-core` (`SseDecoder` +
 //! the provider's `ProviderStreamDecoder`) and re-emits OpenAI-shaped chunks,
-//! so a streamed Anthropic target reaches the caller in the same wire shape as
-//! a streamed OpenAI one. Bytes are forwarded event-by-event as they decode:
+//! so a target reaches the caller in the OpenAI chunk shape whichever wire it
+//! spoke upstream. Bytes are forwarded event-by-event as they decode:
 //! nothing buffers a whole response, and the outbound body inherits the
 //! client's backpressure because axum only polls it as the socket drains.
 //!
@@ -77,7 +77,8 @@ pub async fn relay(
 
     let relay = Relay {
         bytes,
-        sse: SseDecoder::default(),
+        carry: Vec::new(),
+        sse: Some(SseDecoder::default()),
         decoder,
         pending: VecDeque::new(),
         phase: Phase::Streaming,
@@ -109,7 +110,10 @@ enum Phase {
 
 struct Relay {
     bytes: ByteStream,
-    sse: SseDecoder,
+    /// Trailing bytes of a UTF-8 sequence split across upstream chunks.
+    carry: Vec<u8>,
+    /// Taken at end of stream, where `finish` reports a truncated event.
+    sse: Option<SseDecoder>,
     decoder: Box<dyn ProviderStreamDecoder>,
     pending: VecDeque<Bytes>,
     phase: Phase,
@@ -144,8 +148,12 @@ impl Relay {
     async fn poll_upstream(&mut self) {
         match self.bytes.next().await {
             Some(Ok(chunk)) => {
-                let text = String::from_utf8_lossy(&chunk).into_owned();
-                match self.sse.push(&text) {
+                let text = self.decode_utf8(&chunk);
+                let pushed = match self.sse.as_mut() {
+                    Some(sse) => sse.push(&text),
+                    None => Ok(Vec::new()),
+                };
+                match pushed {
                     Ok(events) => {
                         for event in events {
                             match self.decoder.decode(event) {
@@ -161,15 +169,56 @@ impl Relay {
                 }
             }
             Some(Err(err)) => self.phase = Phase::Failed(err.to_string()),
-            None => match self.decoder.finish() {
-                Ok(decoded) => {
-                    self.emit(decoded);
-                    if !matches!(self.phase, Phase::Finished) {
-                        self.phase = Phase::Finished;
-                    }
-                }
-                Err(err) => self.phase = Phase::Failed(err.to_string()),
-            },
+            None => self.finish_upstream(),
+        }
+    }
+
+    /// Chunk boundaries fall wherever the socket puts them, so a multi-byte
+    /// character can straddle two chunks: only the valid prefix is decoded and
+    /// the remainder waits for the next chunk. Genuinely invalid bytes are
+    /// replaced rather than stalling the stream.
+    fn decode_utf8(&mut self, chunk: &[u8]) -> String {
+        self.carry.extend_from_slice(chunk);
+        match std::str::from_utf8(&self.carry) {
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&self.carry).into_owned();
+                self.carry.clear();
+                text
+            }
+            Err(err) if err.error_len().is_none() => {
+                let rest = self.carry.split_off(err.valid_up_to());
+                let text = String::from_utf8_lossy(&self.carry).into_owned();
+                self.carry = rest;
+                text
+            }
+            Err(_) => {
+                let text = String::from_utf8_lossy(&self.carry).into_owned();
+                self.carry.clear();
+                text
+            }
+        }
+    }
+
+    /// An upstream that ends mid-event is a truncated answer, not a complete
+    /// one: `SseDecoder::finish` reports the leftover so the caller gets an
+    /// error rather than a `[DONE]` it would read as success.
+    fn finish_upstream(&mut self) {
+        if let Some(sse) = self.sse.take()
+            && let Err(err) = sse.finish()
+        {
+            self.phase = Phase::Failed(err.to_string());
+            return;
+        }
+        if !self.carry.is_empty() {
+            self.phase = Phase::Failed("stream ended mid-character".to_owned());
+            return;
+        }
+        match self.decoder.finish() {
+            Ok(decoded) => {
+                self.emit(decoded);
+                self.phase = Phase::Finished;
+            }
+            Err(err) => self.phase = Phase::Failed(err.to_string()),
         }
     }
 
@@ -420,6 +469,28 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             .expect("request")
     }
 
+    fn context() -> StreamContext {
+        StreamContext {
+            namespace: "platform".to_owned(),
+            subject: "anonymous".to_owned(),
+            alias: "gpt-4o".to_owned(),
+            target_provider: "openai".to_owned(),
+            target_model: "gpt-4o".to_owned(),
+            source: CredentialSource::Platform,
+            price: ModelPrice {
+                input_microdollars_per_million: 1_000_000,
+                output_microdollars_per_million: 2_000_000,
+                reasoning_microdollars_per_million: None,
+                cache_read_microdollars_per_million: None,
+                cache_write_microdollars_per_million: None,
+            },
+            budget_key: BudgetKey {
+                namespace: "platform".to_owned(),
+                subject: "anonymous".to_owned(),
+            },
+        }
+    }
+
     /// The ledger is written from a detached settlement task; poll briefly
     /// rather than racing it.
     async fn settled(ledger: &Ledger) -> Value {
@@ -496,6 +567,58 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         }
         assert!(relayed.contains("event: error"));
         assert!(relayed.ends_with("data: [DONE]\n\n"));
+
+        let record = settled(&ledger).await;
+        assert_eq!(record["status"], "upstream_error");
+    }
+
+    #[tokio::test]
+    async fn multibyte_characters_survive_a_chunk_boundary() {
+        let mut relay = Relay {
+            bytes: Box::pin(futures::stream::empty()),
+            carry: Vec::new(),
+            sse: Some(SseDecoder::default()),
+            decoder: gateway_core::OpenAiCompatibleAdapter::openai()
+                .stream_decoder(Surface::ChatCompletions)
+                .expect("decoder"),
+            pending: VecDeque::new(),
+            phase: Phase::Streaming,
+            accounting: Accounting::new(
+                state_for("http://127.0.0.1:1", Arc::new(Ledger::default())),
+                context(),
+                Instant::now(),
+            ),
+        };
+        let text = "héllo — 日本語";
+        let bytes = text.as_bytes();
+        let mut decoded = String::new();
+        for chunk in bytes.chunks(3) {
+            decoded.push_str(&relay.decode_utf8(chunk));
+        }
+        assert_eq!(decoded, text);
+        assert!(relay.carry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_truncated_final_event_is_reported_rather_than_completed() {
+        let ledger = Arc::new(Ledger::default());
+        let base_url = upstream_serving(concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\"",
+        ))
+        .await;
+        let resp = router(state_for(&base_url, ledger.clone()))
+            .oneshot(stream_request())
+            .await
+            .expect("response");
+
+        let mut body = resp.into_body().into_data_stream();
+        let mut relayed = String::new();
+        while let Some(chunk) = body.next().await {
+            relayed.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+        }
+        assert!(relayed.contains("event: error"));
+        assert!(relayed.contains("incomplete"));
 
         let record = settled(&ledger).await;
         assert_eq!(record["status"], "upstream_error");

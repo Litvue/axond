@@ -34,7 +34,10 @@ would reach an OpenAI-compatible client as `message_delta` frames. Re-emitting
 gives the caller the same shape the buffered path already produces, keeps the
 `[DONE]` sentinel well-defined even when a provider drops the connection
 without one, and costs one decode of a stream we must parse anyway to get
-usage.
+usage. Only the OpenAI-compatible upstream shape is reachable today: the
+transport still posts to `{base_url}/chat/completions` for every target, so a
+native Anthropic endpoint needs the per-adapter URL seam that arrives with its
+transport.
 
 **No response-level buffering; backpressure is the socket's.** The response
 body is a stream that decodes one upstream chunk at a time and yields the
@@ -47,6 +50,12 @@ without limit.
 owned by the response body. A client hang-up drops the body, which drops the
 `reqwest` response and aborts the in-flight upstream request — bounded by the
 drop itself rather than by a timer, and with no task left running to leak.
+
+**A truncated stream is a failure, not a completion.** Chunk boundaries are
+arbitrary, so bytes are accumulated until they form valid UTF-8 before being
+handed to the decoder, and end-of-stream runs `SseDecoder::finish`: leftover
+bytes mean the provider cut the answer off mid-event, which is reported as an
+error rather than closed with a `[DONE]` the client would read as success.
 
 **Usage comes out of the stream's terminal event.** Providers report usage in
 the last frames (OpenAI under `stream_options.include_usage`, Anthropic in
@@ -78,7 +87,8 @@ there.
 ## Consequences
 
 - Streaming works end-to-end on `/v1/chat/completions`, in the OpenAI chat
-  chunk shape, for both OpenAI-compatible and Anthropic targets.
+  chunk shape, against OpenAI-compatible upstreams; the Anthropic decoding side
+  is in place and becomes reachable with the native Anthropic transport.
 - The buffered path is untouched: the route only branches on `stream`.
 - Re-emission normalizes framing, so provider-specific comment lines and
   heartbeats from upstream are not forwarded. Clients that depend on a
