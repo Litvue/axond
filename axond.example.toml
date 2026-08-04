@@ -228,3 +228,49 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 
 # [[usage_sink]]
 # kind = "stdout"
+
+# ---------------------------------------------------------------------------
+# Budget — spend caps on the request path
+# ---------------------------------------------------------------------------
+# Omit this section entirely and there is no cap and no datastore, which is the
+# default. A cap is per (namespace, subject) and denominated in micro-dollars,
+# priced from the model's `price` above.
+#
+# Enforcement holds an estimate before dispatch and settles it against the real
+# cost afterwards, so concurrent in-flight requests cannot collectively overshoot
+# the cap. A failed or cancelled request is charged the spend it actually
+# consumed — not zero, and not the reserved estimate. See
+# docs/adr/0010-shared-budget-backends-and-charging-policy.md.
+
+# [budget]
+# # none (default) | in-memory | redis | postgres.
+# # `in-memory` holds state per replica, so a fleet enforces one ceiling EACH;
+# # `redis` and `postgres` share one cap across replicas atomically.
+# backend = "redis"
+# # The cap, in micro-dollars. 10_000_000 µ$ = $10.
+# limit_microdollars = 10_000_000
+# # Env var holding the connection string (redis:// or rediss:// for Redis, a
+# # libpq DSN for Postgres). The DSN is a secret, so it is referenced by name.
+# dsn_env = "AXOND_BUDGET_REDIS_URL"
+# # What to do when the store is unreachable. deny (default) rejects with 503
+# # rather than silently serving an unenforced cap; allow serves and warns.
+# on_unavailable = "deny"
+# # How long a hold survives a replica that died mid-request. Should exceed the
+# # longest expected request.
+# reservation_ttl_seconds = 300
+# # Redis only: key namespace for budget state. Defaults to `axond:budget`.
+# key_prefix = "axond:budget"
+
+# The Postgres backend reuses the client the usage sink already brings, for
+# deployments that would rather not run Redis. Apply
+# ops/postgres/budget_v1.sql first, or let the gateway do it with
+# `create_table = true`.
+
+# [budget]
+# backend = "postgres"
+# limit_microdollars = 10_000_000
+# dsn_env = "AXOND_BUDGET_POSTGRES_DSN"
+# # Base table; the reservation table is `<table>_reservation`. `schema.table`
+# # is allowed. Defaults to `axond_budget`.
+# table = "axond_budget"
+# create_table = false

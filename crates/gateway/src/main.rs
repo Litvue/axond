@@ -23,7 +23,7 @@ mod usage;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use budget::{BudgetStore, NoBudget};
+use budget::BudgetStore;
 use config::Config;
 use state::AppState;
 use usage::UsageFanout;
@@ -40,15 +40,18 @@ async fn main() -> anyhow::Result<()> {
     let env: HashMap<String, String> = std::env::vars().collect();
 
     // No-datastore defaults: usage to stdout, budget always-allow. Durable
-    // usage sinks and Redis / in-memory budget are opt-in via config. Sinks are
-    // connected here, so a misconfigured datastore fails at boot rather than
-    // discarding records at request time.
+    // usage sinks and shared (Redis / Postgres) budget backends are opt-in via
+    // config. Both are connected here, so a misconfigured datastore fails at
+    // boot rather than discarding records — or denying every request — later.
     let usage = UsageFanout::new(
         usage::build_sinks(&config.usage_sink, &env)
             .await
             .map_err(|e| anyhow::anyhow!("usage sink configuration failed: {e}"))?,
     );
-    let budget: Box<dyn BudgetStore> = Box::new(NoBudget);
+    let budget: Box<dyn BudgetStore> = budget::build(&config.budget, &env)
+        .await
+        .map_err(|e| anyhow::anyhow!("budget configuration failed: {e}"))?;
+    tracing::info!(backend = budget.name(), "budget enforcement");
 
     let bind = config.server.bind;
     let watching = config.reload.watch;

@@ -19,6 +19,8 @@ pub enum GatewayError {
     NoCredential { namespace: String, provider: String },
     #[error("budget exceeded for model `{0}`")]
     BudgetExceeded(String),
+    #[error("budget store is unavailable")]
+    BudgetUnavailable,
     #[error("unauthorized")]
     Unauthorized,
     #[error("{0} is not implemented yet")]
@@ -37,6 +39,9 @@ impl GatewayError {
             Self::UnknownModel(_) => StatusCode::NOT_FOUND,
             Self::NoCredential { .. } => StatusCode::BAD_GATEWAY,
             Self::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
+            // Fail-closed: the cap cannot be enforced, so the request is a
+            // dependency failure rather than an over-cap caller (ADR 0010).
+            Self::BudgetUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
@@ -59,6 +64,7 @@ impl GatewayError {
             Self::UnknownModel(_) => "unknown_model",
             Self::NoCredential { .. } => "no_credential",
             Self::BudgetExceeded(_) => "budget_exceeded",
+            Self::BudgetUnavailable => "budget_unavailable",
             Self::Unauthorized => "unauthorized",
             Self::NotImplemented(_) => "not_implemented",
             Self::BadRequest(_) => "bad_request",

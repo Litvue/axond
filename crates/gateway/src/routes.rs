@@ -30,7 +30,7 @@ use gateway_transport::{AuthScheme, TransportError, Upstream};
 use serde_json::{Value, json};
 use tracing::Instrument;
 
-use crate::budget::{Admission, BudgetKey};
+use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, Target};
 use crate::credentials::{CredentialPlan, CredentialSource};
 use crate::error::GatewayError;
@@ -120,30 +120,53 @@ async fn chat_completions(
         .model(&alias)
         .ok_or_else(|| GatewayError::UnknownModel(alias.clone()))?;
 
-    // Budget is denominated in micro-dollars. Reserve a conservative cost
-    // estimate from the first target's price before dispatch; reconcile against
-    // the real cost — priced at whichever target actually served — after.
+    // Budget is denominated in micro-dollars. Hold a conservative cost estimate
+    // from the first target's price before dispatch; settle the hold against the
+    // real cost — priced at whichever target actually served — after.
     let budget_key = BudgetKey {
         namespace: caller.namespace.clone(),
         subject: caller.subject.clone(),
     };
-    let estimated_cost = estimate_cost_microdollars(&body, &model.targets[0].price);
-    if state.0.budget.reserve(&budget_key, estimated_cost).await == Admission::Denied {
-        return Err(GatewayError::BudgetExceeded(alias));
-    }
+    let estimate = estimate_usage(&body);
+    let estimated_cost = model.targets[0].price.cost_microdollars(estimate);
+    let reservation = match state.0.budget.reserve(&budget_key, estimated_cost).await {
+        Admission::Allowed(reservation) => reservation,
+        Admission::Denied(Denial::Exceeded) => return Err(GatewayError::BudgetExceeded(alias)),
+        Admission::Denied(Denial::StoreUnavailable) => return Err(GatewayError::BudgetUnavailable),
+    };
 
     if streamed {
-        return stream_with_failover(&state, &snapshot, &caller, model, alias, body, budget_key)
-            .await;
+        return stream_with_failover(
+            &state,
+            &snapshot,
+            &caller,
+            model,
+            alias,
+            body,
+            BudgetHold {
+                key: budget_key,
+                reservation,
+                estimated_input_tokens: estimate.input_tokens,
+            },
+        )
+        .await;
     }
 
-    let outcome = dispatch_with_failover(&state, &snapshot, &caller, model, &body).await?;
+    let outcome = match dispatch_with_failover(&state, &snapshot, &caller, model, &body).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            // Nothing reached a provider, so nothing was consumed: the whole
+            // estimate goes back rather than lingering until it expires.
+            state.0.budget.release(&budget_key, &reservation).await;
+            return Err(err);
+        }
+    };
     let served = &outcome.served;
     match outcome.result {
         Ok(response) => {
             let usage = to_usage(&response.usage);
             let cost = served.price.cost_microdollars(usage);
-            state.0.budget.commit(&budget_key, cost).await;
+            state.0.budget.settle(&budget_key, &reservation, cost).await;
             record_usage(
                 &state,
                 RecordArgs {
@@ -166,10 +189,13 @@ async fn chat_completions(
             Ok(Json(response.body).into_response())
         }
         Err(err) => {
-            // Failure still cost provider tokens in principle, but we have no
-            // authoritative usage from a failed call, so cost is recorded as 0
-            // and nothing is committed against the budget (reconciliation of
-            // partial/failed spend is a follow-up).
+            // The charging policy is "what was actually consumed" (ADR 0010),
+            // and a buffered failure reports no usage at all: providers do not
+            // return a usage block with an error, and nothing was relayed to
+            // measure. Spend is therefore genuinely unknowable and charged as
+            // zero — the streamed path, which can measure what it relayed,
+            // charges its partial spend.
+            state.0.budget.release(&budget_key, &reservation).await;
             record_usage(
                 &state,
                 RecordArgs {
@@ -348,7 +374,7 @@ async fn stream_with_failover(
     model: &Model,
     alias: String,
     body: Value,
-    budget_key: BudgetKey,
+    hold: BudgetHold,
 ) -> Result<Response, GatewayError> {
     let cfg = &snapshot.config;
     let policy = FailoverPolicy;
@@ -404,7 +430,9 @@ async fn stream_with_failover(
             credential_id: lease.id.clone(),
             trace_id: telemetry::trace_id(),
             price: target.price,
-            budget_key: budget_key.clone(),
+            budget_key: hold.key.clone(),
+            reservation: hold.reservation.clone(),
+            estimated_input_tokens: hold.estimated_input_tokens,
             attempts: 0,
         };
 
@@ -465,10 +493,23 @@ async fn stream_with_failover(
         if let Some((mut ctx, started)) = last_ctx {
             ctx.attempts = walk.attempts;
             streaming::settle_upstream_error(state.clone(), ctx, started);
+        } else {
+            state.0.budget.release(&hold.key, &hold.reservation).await;
         }
         return Err(err.into());
     }
+    state.0.budget.release(&hold.key, &hold.reservation).await;
     Err(walk.into_error())
+}
+
+/// The budget reservation a request is dispatched under, plus the input-token
+/// estimate it was priced from. The streaming relay needs both: the hold to
+/// settle, and the estimate to price a stream that ends before the provider
+/// reports authoritative usage.
+struct BudgetHold {
+    key: BudgetKey,
+    reservation: Reservation,
+    estimated_input_tokens: u64,
 }
 
 /// Mutable bookkeeping shared by the buffered and streaming failover walks: how
@@ -686,12 +727,11 @@ async fn responses() -> Result<Json<Value>, GatewayError> {
     Err(GatewayError::NotImplemented("/v1/responses"))
 }
 
-/// Conservative pre-dispatch cost estimate in micro-dollars: input tokens from
-/// the request body (~4 chars/token) plus a reserved output allowance
-/// (`max_tokens` when present, else a default), priced with the target's
-/// `ModelPrice`. Reserve-then-reconcile replaces this with the real cost on
-/// commit.
-fn estimate_cost_microdollars(body: &Value, price: &ModelPrice) -> u64 {
+/// Conservative pre-dispatch usage estimate: input tokens from the request body
+/// (~4 chars/token) plus a reserved output allowance (`max_tokens` when present,
+/// else a default). Priced with a target's `ModelPrice` it becomes the held
+/// estimate, which settlement replaces with the real cost.
+fn estimate_usage(body: &Value) -> Usage {
     const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1_024;
     let input_tokens = (serde_json::to_string(body).map(|s| s.len()).unwrap_or(0) / 4) as u64;
     let output_tokens = body
@@ -699,13 +739,13 @@ fn estimate_cost_microdollars(body: &Value, price: &ModelPrice) -> u64 {
         .or_else(|| body.get("max_completion_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
-    price.cost_microdollars(Usage {
+    Usage {
         input_tokens,
         output_tokens,
         reasoning_tokens: 0,
         cache_read_tokens: 0,
         cache_write_tokens: 0,
-    })
+    }
 }
 
 /// Monotonic per-process request id. The trace it belongs to travels in the
@@ -1065,6 +1105,182 @@ targets = [
             .header("content-type", "application/json")
             .body(Body::from(body))
             .unwrap()
+    }
+
+    /// Records what each request held and what it settled for, so the charging
+    /// policy is asserted through the real request path.
+    #[derive(Default, Clone)]
+    struct RecordingBudget(Arc<Mutex<Vec<(u64, u64)>>>);
+
+    #[async_trait::async_trait]
+    impl crate::budget::BudgetStore for RecordingBudget {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+        async fn reserve(&self, _key: &BudgetKey, estimated_microdollars: u64) -> Admission {
+            self.0.lock().unwrap().push((estimated_microdollars, 0));
+            Admission::Allowed(Reservation {
+                id: "recording".to_owned(),
+                estimate_microdollars: estimated_microdollars,
+            })
+        }
+        async fn settle(
+            &self,
+            _key: &BudgetKey,
+            _reservation: &Reservation,
+            actual_microdollars: u64,
+        ) {
+            if let Some(last) = self.0.lock().unwrap().last_mut() {
+                last.1 = actual_microdollars;
+            }
+        }
+    }
+
+    /// One target, one credential, and the budget store under test.
+    fn budgeted_state(base_url: &str, budget: Box<dyn crate::budget::BudgetStore>) -> AppState {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "{base_url}"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K1"
+
+[[model]]
+name = "gpt-4o"
+targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 1000000 }} }}]
+"#
+        ))
+        .unwrap();
+        let env = HashMap::from([("K1".to_owned(), "sk-test".to_owned())]);
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        AppState::new(cfg, &env, UsageFanout::new(sinks), budget).unwrap()
+    }
+
+    /// The reserved estimate is a ceiling, not the charge: a completed request
+    /// settles the cost of the usage the provider reported.
+    #[tokio::test]
+    async fn a_buffered_response_settles_its_measured_cost() {
+        let (base_url, _) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let budget = RecordingBudget::default();
+        let state = budgeted_state(&base_url, Box::new(budget.clone()));
+
+        let resp = router(state).oneshot(chat_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ledger = budget.0.lock().unwrap();
+        let (estimated, settled) = ledger[0];
+        // 10 input + 5 output tokens at 1 µ$ each.
+        assert_eq!(settled, 15);
+        assert!(
+            estimated > settled,
+            "the estimate should be the conservative ceiling ({estimated} vs {settled})"
+        );
+    }
+
+    /// A buffered failure reports no usage at all, so the spend is unknowable
+    /// and charged as zero — and the hold is released rather than left to
+    /// expire (ADR 0010).
+    #[tokio::test]
+    async fn a_buffered_upstream_failure_charges_nothing_and_releases_its_hold() {
+        let (base_url, _) = controllable_upstream(
+            Arc::new(AtomicBool::new(false)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let budget = RecordingBudget::default();
+        let state = budgeted_state(&base_url, Box::new(budget.clone()));
+
+        let resp = router(state).oneshot(chat_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let ledger = budget.0.lock().unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].1, 0);
+    }
+
+    /// The two denials are different answers to the caller: over-cap is the
+    /// caller's problem, an unenforceable cap is the gateway's.
+    #[tokio::test]
+    async fn a_denied_request_never_reaches_the_provider() {
+        struct Denying(Denial);
+
+        #[async_trait::async_trait]
+        impl crate::budget::BudgetStore for Denying {
+            fn name(&self) -> &'static str {
+                "denying"
+            }
+            async fn reserve(&self, _key: &BudgetKey, _estimated: u64) -> Admission {
+                Admission::Denied(self.0)
+            }
+            async fn settle(&self, _key: &BudgetKey, _reservation: &Reservation, _actual: u64) {}
+        }
+
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        for (denial, expected) in [
+            (Denial::Exceeded, StatusCode::TOO_MANY_REQUESTS),
+            (Denial::StoreUnavailable, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let state = budgeted_state(&base_url, Box::new(Denying(denial)));
+            let resp = router(state).oneshot(chat_request()).await.unwrap();
+            assert_eq!(resp.status(), expected);
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// The cap is per `(namespace, subject)`, and two gateways sharing one store
+    /// see each other's spend — the fleet enforces one cap, not one per replica.
+    #[tokio::test]
+    async fn two_replicas_sharing_one_store_enforce_a_single_cap() {
+        let (base_url, _) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        // `max_tokens` bounds the reserved output allowance, so the estimate is
+        // small and known: 16 output tokens plus the body's input estimate.
+        let capped_request = || {
+            let body =
+                serde_json::to_vec(&json!({"model": "gpt-4o", "messages": [], "max_tokens": 16}))
+                    .unwrap();
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let shared = Arc::new(crate::budget::InMemoryBudget::new(30));
+
+        struct Shared(Arc<crate::budget::InMemoryBudget>);
+
+        #[async_trait::async_trait]
+        impl crate::budget::BudgetStore for Shared {
+            fn name(&self) -> &'static str {
+                "shared"
+            }
+            async fn reserve(&self, key: &BudgetKey, estimated: u64) -> Admission {
+                self.0.reserve(key, estimated).await
+            }
+            async fn settle(&self, key: &BudgetKey, reservation: &Reservation, actual: u64) {
+                self.0.settle(key, reservation, actual).await;
+            }
+        }
+
+        let replica_a = router(budgeted_state(&base_url, Box::new(Shared(shared.clone()))));
+        let replica_b = router(budgeted_state(&base_url, Box::new(Shared(shared))));
+
+        let first = replica_a.oneshot(capped_request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        // The 15 µ$ the other replica settled leaves no room for a second
+        // estimate under the shared cap.
+        let second = replica_b.oneshot(capped_request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

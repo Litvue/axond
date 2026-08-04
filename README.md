@@ -249,7 +249,7 @@ runtime-neutral.
 - [x] Ordered failover across targets + per-target circuit health (see [ADR 0008](./docs/adr/0008-target-failover-and-circuit-scope.md))
 - [x] OpenTelemetry traces (per-upstream-attempt spans, TTFT), metrics, logs
 - [x] Usage sinks: Postgres (batched, versioned schema) + OTLP; Tinybird / ClickHouse post-beta
-- [ ] Budget backends: in-memory (present) → Redis / Postgres, reserve-then-reconcile
+- [x] Budget backends: shared Redis / Postgres, held reservations, partial charging (see [ADR 0010](./docs/adr/0010-shared-budget-backends-and-charging-policy.md))
 - [ ] Native Anthropic `/v1/messages` passthrough; `/v1/embeddings`, `/v1/responses`
 - [x] Multiple credentials per provider (pooling, weighted, skip-on-429)
 - [x] Config hot-reload (SIGHUP / watched files) for zero-restart BYOK onboarding (see [ADR 0011](./docs/adr/0011-config-hot-reload.md))

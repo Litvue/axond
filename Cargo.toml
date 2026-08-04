@@ -27,6 +27,7 @@ opentelemetry = "=0.32.0"
 opentelemetry-http = "=0.32.0"
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["http-proto", "trace", "metrics", "logs"] }
 opentelemetry_sdk = "=0.32.1"
+redis = { version = "=1.4.1", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "connection-manager", "script"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 secrecy = { version = "0.10", features = ["serde"] }

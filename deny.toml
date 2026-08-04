@@ -32,6 +32,9 @@ allow = [
     "Zlib",
     # Mozilla's baked-in CA root bundle (webpki-roots) ships under CDLA-Permissive-2.0.
     "CDLA-Permissive-2.0",
+    # xxhash-rust, via the Redis budget backend (ADR 0010). Boost is a standard
+    # permissive licence: OSI approved, FSF free, no attribution on binaries.
+    "BSL-1.0",
 ]
 confidence-threshold = 0.9
 
