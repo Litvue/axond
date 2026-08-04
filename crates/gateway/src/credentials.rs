@@ -6,7 +6,7 @@
 //! a pure function of the snapshot so it is testable without mutating the global
 //! environment (assessment §5.1).
 //!
-//! A pool holds one *or more* credentials for the same pair (ADR 0005). A
+//! A pool holds one *or more* credentials for the same pair (ADR 0006). A
 //! request gets an ordered plan of attempts: the selection strategy decides who
 //! goes first, per-credential health parks a credential that keeps returning
 //! rate-limit/quota errors, and the caller walks the plan on such a failure.

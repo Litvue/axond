@@ -107,7 +107,7 @@ pub struct Target {
 /// from a mangled namespace id (assessment delta A/§5.1).
 ///
 /// Several entries may share a `(namespace, provider)` pair; together they form
-/// that pair's credential pool (ADR 0005).
+/// that pair's credential pool (ADR 0006).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Credential {
     pub namespace: String,
