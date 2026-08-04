@@ -160,3 +160,48 @@ name = "claude-sonnet"
 targets = [
   { provider = "anthropic", model = "claude-3-7-sonnet-latest", price = { input_microdollars_per_million = 3_000_000, output_microdollars_per_million = 15_000_000 } },
 ]
+
+# ── Usage sinks (optional) ────────────────────────────────────────────────────
+# Where the canonical usage record for each terminated request goes. Omit
+# entirely for the no-datastore default: one JSON line per record on stdout.
+#
+# Sinks connect at boot, so a bad DSN or an unreachable database refuses to
+# start. After that they are off the request path: records are buffered per sink
+# and written in batches, and a slow or failing destination DROPS with a count
+# (`axond.usage.records_dropped{sink,reason}`) rather than stalling a request.
+# See docs/usage-schema.md and docs/adr/0009-durable-usage-sinks.md.
+
+# [[usage_sink]]
+# kind = "postgres"
+# # Env var holding the connection string. The DSN is a secret, so it is
+# # referenced by name, never inlined here. `sslmode=require` in the DSN turns on
+# # TLS (rustls, webpki roots) for managed Postgres.
+# dsn_env = "AXOND_USAGE_POSTGRES_DSN"
+# # Destination table; `schema.table` is allowed. Defaults to `axond_usage`.
+# table = "axond_usage"
+# # Apply ops/postgres/usage_v1.sql at boot. Off by default — most deployments
+# # give the gateway's role no DDL rights and sequence migrations themselves.
+# create_table = false
+# # Records buffered before the sink starts dropping. Trades memory for the
+# # length of a destination stall it can absorb.
+# buffer_capacity = 10_000
+# # Rows per INSERT, and how long a partial batch waits for company.
+# max_batch = 500
+# flush_interval_ms = 1_000
+
+# Usage as OTel log records (event `axond.usage`) on the exporter telemetry
+# already installed — for keeping usage in the same backend as traces and
+# metrics. Requires OTEL_EXPORTER_OTLP_ENDPOINT; the SDK's batch log processor
+# does the buffering, so the batching keys above do not apply.
+
+# [[usage_sink]]
+# kind = "otlp"
+
+# Both may be declared at once: each sink buffers independently, so a stalled
+# database cannot delay the OTLP export or vice versa.
+
+# Stdout is implied when no sink is declared; declare it explicitly to keep the
+# JSONL stream alongside a durable sink.
+
+# [[usage_sink]]
+# kind = "stdout"
