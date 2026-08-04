@@ -1,0 +1,32 @@
+name: Dependency audit
+
+# Required CI only sees the advisory database on the day a change is proposed.
+# This scheduled run re-evaluates the released main branch against newly
+# disclosed advisories and yanked crates, so a quiet week still surfaces a
+# finding.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: Advisory and supply-chain audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Install pinned policy tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+      - name: Check advisories, licenses, bans, and sources
+        run: cargo deny --locked --all-features check

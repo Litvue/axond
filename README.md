@@ -8,7 +8,6 @@ provider keys, route model names, meter usage, and emit telemetry.
 > core ↔ transport seam are in place, with a working non-streaming
 > OpenAI-compatible path. Streaming relay, cross-provider failover, OTel
 > export, and the Postgres/Tinybird/Redis backends are on the roadmap below.
-> Names (crate + repo) are not yet final.
 
 ## Why
 
@@ -100,6 +99,42 @@ runtime-neutral.
 - [ ] Provider-SDK compatibility + record/replay + SSE soak tests
 
 See [`docs/adr`](./docs/adr) for the decisions behind these.
+
+## Development
+
+Toolchain is pinned in [`rust-toolchain.toml`](./rust-toolchain.toml). The checks
+that CI enforces:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo doc --workspace --no-deps --all-features --locked   # RUSTDOCFLAGS=-D warnings
+cargo deny --locked --all-features check                  # advisories, licenses, sources
+bash ops/docker-smoke.sh "$(docker build -q .)"           # image boots and serves /healthz
+```
+
+## Releases
+
+Releases are automated with [release-please](https://github.com/googleapis/release-please)
+off [Conventional Commits](https://www.conventionalcommits.org/) — the same
+pipeline shape as the sibling `actord` and `custodian` repos:
+
+- Merges to `main` keep a release PR open; merging it tags `v<major>.<minor>.<patch>`,
+  updates [`CHANGELOG.md`](./CHANGELOG.md), and bumps the workspace version.
+- Cutting a release builds, per tagged commit: cross-platform binaries
+  (`x86_64` gnu + static musl Linux, `aarch64` macOS, `x86_64` Windows) with
+  SHA-256 checksums, and a signed + SBOM-attested OCI image at
+  `ghcr.io/litvue/axond`. All artifacts carry SLSA build provenance; the image
+  is signed keylessly with cosign and verified before the release completes.
+- PR titles are gated to Conventional Commits, and a daily job re-audits the
+  released `main` against new advisories.
+
+The release PR is authored by the org-wide release GitHub App
+(`RELEASE_PLEASE_APP_ID` / `RELEASE_PLEASE_APP_PRIVATE_KEY`, the same
+organization config `actord` and `custodian` use) so that it triggers CI; if the
+repo is outside the App's scope the pipeline falls back to `GITHUB_TOKEN` and the
+release PR is not CI-validated until it merges.
 
 ## License
 
