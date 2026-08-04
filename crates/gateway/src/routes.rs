@@ -18,6 +18,7 @@ use axum::{Json, Router};
 use gateway_core::{ModelPrice, ProviderError, ProviderRequest, ProviderResponse, Surface, Usage};
 use gateway_transport::{AuthScheme, TransportError, Upstream};
 use serde_json::{Value, json};
+use tracing::Instrument;
 
 use crate::budget::{Admission, BudgetKey};
 use crate::config::{Provider, ProviderKind};
@@ -25,6 +26,7 @@ use crate::credentials::{CredentialPlan, CredentialSource};
 use crate::error::GatewayError;
 use crate::state::{AppState, InboundKey, adapter_for};
 use crate::streaming::{self, StreamContext};
+use crate::telemetry;
 use crate::usage::{Status, UsageRecord};
 
 pub fn router(state: AppState) -> Router {
@@ -166,6 +168,7 @@ async fn chat_completions(
             target_model: target_model.clone(),
             source: plan.source,
             credential_id: lease.id.clone(),
+            trace_id: telemetry::trace_id(),
             price,
             budget_key,
         };
@@ -173,6 +176,14 @@ async fn chat_completions(
             model: target_model,
             body,
         };
+        telemetry::record_routing(
+            &ctx.namespace,
+            &ctx.subject,
+            &ctx.alias,
+            &ctx.target_provider,
+            &ctx.target_model,
+            UsageRecord::credential_source_str(ctx.source),
+        );
         return streaming::relay(
             state.clone(),
             ctx,
@@ -184,10 +195,33 @@ async fn chat_completions(
         .await;
     }
 
+    // One child span per upstream attempt. The credential pool may make several
+    // attempts against the same target; ordered failover (#3) will fan these
+    // into distinct per-attempt children.
+    let attempt_span = telemetry::upstream_attempt_span(
+        0,
+        &target_provider,
+        &target_model,
+        UsageRecord::credential_source_str(plan.source),
+    );
     let started = Instant::now();
-    let attempt = dispatch_over_pool(&state, provider, &plan, &target_model, body).await;
+    let attempt = dispatch_over_pool(&state, provider, &plan, &target_model, body)
+        .instrument(attempt_span.clone())
+        .await;
     let latency_ms = started.elapsed().as_millis() as u64;
-
+    // A non-streamed response arrives whole, so the first token lands with the
+    // last one; the streaming relay reports the real first chunk.
+    let ttft_ms = attempt.result.is_ok().then_some(latency_ms);
+    telemetry::finish_upstream_attempt(
+        &attempt_span,
+        if attempt.result.is_ok() {
+            telemetry::ATTEMPT_OK
+        } else {
+            telemetry::ATTEMPT_ERROR
+        },
+        latency_ms,
+        ttft_ms,
+    );
     match attempt.result {
         Ok(response) => {
             let usage = to_usage(&response.usage);
@@ -207,6 +241,8 @@ async fn chat_completions(
                     output_tokens: response.usage.output_tokens,
                     cost_microdollars: cost,
                     latency_ms,
+                    ttft_ms,
+                    attempts: 1,
                 },
             )
             .await;
@@ -231,6 +267,8 @@ async fn chat_completions(
                     output_tokens: 0,
                     cost_microdollars: 0,
                     latency_ms,
+                    ttft_ms,
+                    attempts: 1,
                 },
             )
             .await;
@@ -374,8 +412,9 @@ fn estimate_cost_microdollars(body: &Value, price: &ModelPrice) -> u64 {
     })
 }
 
-/// Monotonic per-process request id. A real deploy layers this behind the
-/// inbound `traceparent` so the id joins the OTel trace.
+/// Monotonic per-process request id. The trace it belongs to travels in the
+/// record's `trace_id`, which a caller's whole agent loop shares. `pub` so the
+/// streaming relay can stamp the same id on its settled usage record.
 pub fn next_request_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -394,12 +433,19 @@ struct RecordArgs<'a> {
     output_tokens: u64,
     cost_microdollars: u64,
     latency_ms: u64,
+    /// Time to the first token, when one was produced.
+    ttft_ms: Option<u64>,
+    /// Upstream attempts made; the retry count is one less.
+    attempts: u32,
 }
 
 async fn record_usage(state: &AppState, args: RecordArgs<'_>) {
+    let ttft_ms = args.ttft_ms;
+    let attempts = args.attempts;
     let record = UsageRecord {
         schema_version: UsageRecord::SCHEMA_VERSION,
         request_id: next_request_id(),
+        trace_id: telemetry::trace_id(),
         namespace: args.caller.namespace.clone(),
         subject: args.caller.subject.clone(),
         model: args.alias.to_string(),
@@ -414,6 +460,7 @@ async fn record_usage(state: &AppState, args: RecordArgs<'_>) {
         catalog_version: 0,
         latency_ms: args.latency_ms,
     };
+    telemetry::record_request(&record, ttft_ms, attempts);
     state.0.usage.record(&record).await;
 }
 

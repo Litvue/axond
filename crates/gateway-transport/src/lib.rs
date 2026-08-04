@@ -16,7 +16,10 @@ use std::pin::Pin;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use gateway_core::{ProviderAdapter, ProviderError, ProviderRequest, ProviderResponse, Surface};
+use opentelemetry::global;
+use opentelemetry_http::HeaderInjector;
 use secrecy::{ExposeSecret, SecretString};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Raw upstream response bytes, yielded as they arrive. Dropping the stream
 /// aborts the in-flight upstream request.
@@ -84,6 +87,7 @@ impl HttpDispatcher {
         };
 
         let resp = req
+            .headers(trace_context_headers())
             .send()
             .await
             .map_err(|e| TransportError::Http(e.to_string()))?;
@@ -148,5 +152,37 @@ impl HttpDispatcher {
         Ok(Box::pin(resp.bytes_stream().map(|chunk| {
             chunk.map_err(|e| TransportError::Http(e.to_string()))
         })))
+    }
+}
+
+/// Inject the active span's W3C context (`traceparent`/`tracestate`) into the
+/// upstream request so the caller's trace continues past the gateway. With no
+/// tracer installed the global propagator is a no-op and no headers are added.
+fn trace_context_headers() -> reqwest::header::HeaderMap {
+    let context = tracing::Span::current().context();
+    let mut headers = reqwest::header::HeaderMap::new();
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&context, &mut HeaderInjector(&mut headers))
+    });
+    // The W3C propagator emits `tracestate` unconditionally; an empty one says
+    // nothing, so it is not worth a header.
+    let empty: Vec<_> = headers
+        .iter()
+        .filter(|(_, value)| value.is_empty())
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in empty {
+        headers.remove(name);
+    }
+    headers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_propagator_means_no_outbound_headers() {
+        assert!(trace_context_headers().is_empty());
     }
 }

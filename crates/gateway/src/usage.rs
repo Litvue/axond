@@ -28,12 +28,36 @@ pub enum Status {
     Rejected,
 }
 
+impl Status {
+    /// Stable, low-cardinality label — the same vocabulary the serialized record
+    /// uses, so a metric dimension and a usage row agree.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::UpstreamError => "upstream_error",
+            Self::ClientCancelled => "client_cancelled",
+            Self::Partial => "partial",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    /// Whether the outcome counts against the upstream error rate.
+    pub fn is_error(self) -> bool {
+        matches!(self, Self::UpstreamError)
+    }
+}
+
 /// Neutral, versioned usage vocabulary (delta A3). No product-specific terms:
 /// this schema lands in customers' own tables, so it is treated as an API.
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageRecord {
     pub schema_version: u32,
+    /// Unique per request, so rows can be de-duplicated. Distinct from
+    /// `trace_id`, which one caller trace shares across many requests.
     pub request_id: String,
+    /// Set when the request was traced, joining the row to the caller's trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
     pub namespace: String,
     /// Authenticated caller / gateway-key id.
     pub subject: String,

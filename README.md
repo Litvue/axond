@@ -6,7 +6,8 @@ provider keys, route model names, meter usage, and emit telemetry.
 
 > **Status: early scaffold.** The architecture, config surface, and the
 > core ↔ transport seam are in place, with a working OpenAI-compatible path,
-> buffered and streamed. Cross-provider failover, OTel export, and the Postgres/Tinybird/Redis backends are on the roadmap below.
+> buffered and streamed, and OTLP telemetry. Cross-provider failover and the
+> Postgres/Tinybird/Redis backends are on the roadmap below.
 
 ## Why
 
@@ -116,6 +117,26 @@ a namespace boundary: a BYOK namespace uses its own pool, or the whole platform
 pool when it opts into `allow_platform_fallback`. See
 [ADR 0006](./docs/adr/0006-credential-pools-per-namespace-provider.md).
 
+## Telemetry
+
+Off by default: with no OTLP endpoint the process only writes JSON logs to
+stdout, and no exporter, tracer, meter, or propagator is installed. Point it at
+a collector to turn on traces and metrics:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318   # OTLP/HTTP only
+```
+
+Every request produces one `http.server.request` span with a child
+`axond.upstream.attempt` span per upstream call, carrying the alias, resolved
+target, namespace, `credential_source`, status, retry count, tokens, cost, and
+time-to-first-token. An inbound `traceparent` is joined rather than replaced, and
+the context is injected into the upstream request, so a caller's trace runs
+end-to-end. Metrics are `axond.http.server.*` (route/status) plus
+`axond.request.*` and `axond.upstream.*` (namespace/alias/target/status). Spans
+never carry credentials, prompts, or completions. See
+[ADR 0007](./docs/adr/0007-telemetry-model.md).
+
 ## Architecture
 
 ```
@@ -136,7 +157,7 @@ runtime-neutral.
 
 - [x] Streaming (SSE) relay end-to-end (see [ADR 0005](./docs/adr/0005-streaming-relay.md))
 - [ ] Ordered failover across targets + per-target circuit health
-- [ ] OpenTelemetry traces (per-upstream-attempt spans, TTFT), metrics, logs
+- [x] OpenTelemetry traces (per-upstream-attempt spans, TTFT), metrics, logs
 - [ ] Usage sinks: Postgres, Tinybird, ClickHouse, OTLP
 - [ ] Budget backends: in-memory (present) → Redis / Postgres, reserve-then-reconcile
 - [ ] Native Anthropic `/v1/messages` passthrough; `/v1/embeddings`, `/v1/responses`
