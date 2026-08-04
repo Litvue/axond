@@ -1,0 +1,77 @@
+# 4. CI and release pipeline
+
+Date: 2026-08-04
+
+## Status
+
+Accepted
+
+## Context
+
+Axond is developed as a public open-source project under the Litvue org and is
+meant to be dogfooded by the company. Two sibling Rust services — `actord` and
+`custodian` — already run a mature GitHub Actions setup (release-please, a
+lane-per-check CI matrix with an aggregate gate, a `cargo-deny` policy, and a
+signed/attested release fan-out). Reusing that shape keeps the three repos
+consistent and avoids reinventing supply-chain posture per project.
+
+Axond differs from those two in scope: it ships **one** binary (`axond`) and
+**one** container image, not a multi-service pipeline. So the pattern is ported,
+not copied — the release fan-out is sized to a single-binary gateway.
+
+## Decision
+
+**Release automation is release-please, driven by Conventional Commits.** Merges
+to `main` keep a release PR open; merging it tags `v<major>.<minor>.<patch>`,
+updates `CHANGELOG.md`, and bumps the single `workspace.package.version` via a
+`toml` extra-file. Pre-1.0 uses `bump-minor-pre-major` +
+`bump-patch-for-minor-pre-major`, matching the siblings, so the first automated
+release off `0.0.0` is a patch. `Cargo.lock` is re-synced on the release PR so
+`--locked` builds stay green after the version bump.
+
+**CI is one job per concern** (`fmt`, `clippy`, `build`, `tests`, `docs`,
+`dependency-policy`, `static-binary`, `docker-smoke`) behind a single required
+`CI-Success` gate. All Rust invocations are `--locked`; the toolchain is pinned
+to the `rust-toolchain.toml` channel. The `static-binary` lane asserts the musl
+build is actually static (accepting `static-pie linked`, the modern musl
+default, as well as `statically linked`), and `docker-smoke` boots the image
+against the example config and probes `/healthz` + `/v1/models`.
+
+**Release artifacts, per tagged commit:**
+
+- Cross-platform binaries (`x86_64` gnu + static musl Linux, `aarch64` macOS,
+  `x86_64` Windows), each with a SHA-256 checksum and an SPDX SBOM.
+- A single-arch OCI image at `ghcr.io/litvue/axond`, tagged by version and short
+  SHA (no `latest`).
+- SLSA build provenance and SBOM **attestations** for every binary and for the
+  image, plus a keyless **cosign** signature on the image digest. The release
+  job verifies the signature and provenance before completing, and the image is
+  smoke-tested before it is signed.
+
+**Supply-chain policy (`deny.toml`)** is enforced in CI and re-run daily against
+`main`. Advisories and unmaintained crates fail; the license allowlist is the
+permissive set plus `CDLA-Permissive-2.0` (Mozilla's CA bundle in
+`webpki-roots`). `wildcards = "allow"` because the workspace's own path crates
+read as wildcards and pinning them would drift from the single
+release-please-managed version; external floating ranges are caught in review.
+
+**PR titles are gated to Conventional Commits** so release-please can classify
+every merge.
+
+Release publication is tied to a release-please-created release or an explicit
+`workflow_dispatch` against an existing, matching tag — never an untagged or
+dirty worktree — and the signing identity is pinned to this workflow on
+`refs/heads/main` or a `refs/tags/v*` ref.
+
+## Consequences
+
+- Versioning and changelog are mechanical and tied to commit discipline; a
+  sloppy commit type produces a wrong bump, so the PR-title gate is load-bearing.
+- Consumers can verify provenance and signatures for both the binaries and the
+  image, and reconstruct the dependency set from the attached SBOMs.
+- The release PR only triggers downstream CI when a GitHub App token or release
+  PAT is configured (`RELEASE_PLEASE_APP_ID`/`RELEASE_PLEASE_APP_PRIVATE_KEY` or
+  `RELEASE_PLEASE_TOKEN`); with the `GITHUB_TOKEN` fallback the release PR is not
+  CI-validated until merge.
+- The pipeline currently publishes a single `linux/amd64` image; multi-arch is a
+  later addition, not a rewrite.
