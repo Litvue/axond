@@ -8,7 +8,7 @@ Accepted
 
 ## Context
 
-Tollgate has two credential audiences at once:
+Axond has two credential audiences at once:
 
 1. The operator's **platform** keys (the company running the gateway supplies
    its own provider keys).

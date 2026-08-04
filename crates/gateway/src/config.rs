@@ -132,7 +132,7 @@ impl Config {
         };
         let cfg: Config = Figment::new()
             .merge(Toml::file(path))
-            .merge(Env::prefixed("TOLLGATE_").split("__"))
+            .merge(Env::prefixed("AXOND_").split("__"))
             .extract()
             .map_err(|e| ConfigError::Load(e.to_string()))?;
         cfg.validate()?;
@@ -216,7 +216,7 @@ impl Config {
     }
 
     /// Parse + validate from an in-memory TOML string (tests, and the planned
-    /// `tollgate --check` config linter).
+    /// `axond --check` config linter).
     #[allow(dead_code)]
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
         use figment::{

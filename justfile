@@ -1,4 +1,4 @@
-# Tollgate developer commands. Run `just` to list.
+# Axond developer commands. Run `just` to list.
 
 default:
     @just --list
@@ -18,14 +18,14 @@ clippy:
 test:
     cargo test --all-features
 
-# Run the gateway against ./tollgate.toml (copy tollgate.example.toml first).
+# Run the gateway against ./axond.toml (copy axond.example.toml first).
 run:
-    cargo run -p tollgate
+    cargo run -p axond
 
 # Static single-binary release build (musl).
 build-static:
-    cargo build --release --target x86_64-unknown-linux-musl -p tollgate
+    cargo build --release --target x86_64-unknown-linux-musl -p axond
 
 # Build the distroless container image.
 docker:
-    docker build -t tollgate:dev .
+    docker build -t axond:dev .

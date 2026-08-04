@@ -1,4 +1,4 @@
-//! HTTP transport for the Tollgate gateway.
+//! HTTP transport for the Axond gateway.
 //!
 //! `gateway-core` is I/O-free: it encodes/decodes provider wire formats but
 //! never touches the network. This crate is the missing half — it owns the

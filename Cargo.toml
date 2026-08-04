@@ -10,7 +10,7 @@ members = [
 version = "0.0.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/OWNER/tollgate"
+repository = "https://github.com/OWNER/axond"
 
 [workspace.dependencies]
 gateway-core = { path = "crates/gateway-core" }

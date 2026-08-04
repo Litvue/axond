@@ -52,7 +52,7 @@ async fn list_models(State(state): State<AppState>) -> Json<Value> {
         .config
         .model
         .iter()
-        .map(|m| json!({ "id": m.name, "object": "model", "owned_by": "tollgate" }))
+        .map(|m| json!({ "id": m.name, "object": "model", "owned_by": "axond" }))
         .collect();
     Json(json!({ "object": "list", "data": data }))
 }

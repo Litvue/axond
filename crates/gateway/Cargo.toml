@@ -1,13 +1,13 @@
 [package]
-name = "tollgate"
+name = "axond"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Tollgate — a stateless, single-binary, self-hosted AI gateway: one place for provider keys, model routing, usage, and telemetry."
+description = "Axond — a stateless, single-binary, self-hosted AI gateway: one place for provider keys, model routing, usage, and telemetry."
 
 [[bin]]
-name = "tollgate"
+name = "axond"
 path = "src/main.rs"
 
 [dependencies]

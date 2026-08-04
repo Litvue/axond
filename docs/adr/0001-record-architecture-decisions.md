@@ -8,7 +8,7 @@ Accepted
 
 ## Context
 
-Tollgate is a greenfield extraction of a provider-proxy that previously lived
+Axond is a greenfield extraction of a provider-proxy that previously lived
 inside a private monorepo. Several load-bearing decisions (passthrough vs.
 canonical schema, the usage/quota split, namespaced credentials) are expensive
 to reverse once they land in callers' code and customers' data tables. As an

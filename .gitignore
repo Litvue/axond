@@ -3,6 +3,6 @@
 *.pdb
 
 # Local config / secrets — never commit real keys
-/tollgate.toml
+/axond.toml
 /.env
 *.env

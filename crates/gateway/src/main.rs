@@ -1,4 +1,4 @@
-//! Tollgate — a stateless, single-binary, self-hosted AI gateway.
+//! Axond — a stateless, single-binary, self-hosted AI gateway.
 //!
 //! Boot sequence: load + validate config (fail fast, delta B2), snapshot the
 //! environment for credential resolution, build shared state with the default
@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config_path =
-        std::env::var("TOLLGATE_CONFIG").unwrap_or_else(|_| "tollgate.toml".to_string());
+        std::env::var("AXOND_CONFIG").unwrap_or_else(|_| "axond.toml".to_string());
     let config = Config::load(&config_path)
         .map_err(|e| anyhow::anyhow!("failed to load config from `{config_path}`: {e}"))?;
 
@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(config, &env, usage, budget);
     let app = routes::router(state);
 
-    tracing::info!(%bind, "tollgate listening");
+    tracing::info!(%bind, "axond listening");
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app).await?;
     Ok(())

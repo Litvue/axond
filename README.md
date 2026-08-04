@@ -1,7 +1,7 @@
-# Tollgate
+# Axond
 
 A stateless, single-binary, self-hosted **AI gateway**. Point your agents at
-Tollgate instead of at provider APIs directly, and get one place to hold
+Axond instead of at provider APIs directly, and get one place to hold
 provider keys, route model names, meter usage, and emit telemetry.
 
 > **Status: early scaffold.** The architecture, config surface, and the
@@ -13,7 +13,7 @@ provider keys, route model names, meter usage, and emit telemetry.
 ## Why
 
 Teams building on LLMs end up scattering provider keys across services, hard-coding
-`provider/model` strings, and bolting on usage tracking per app. Tollgate
+`provider/model` strings, and bolting on usage tracking per app. Axond
 centralizes that:
 
 - **One place for keys.** Provider credentials live in the gateway's config as
@@ -51,9 +51,9 @@ centralizes that:
 ## Quick start
 
 ```bash
-cp tollgate.example.toml tollgate.toml      # edit providers/models/namespaces
+cp axond.example.toml axond.toml      # edit providers/models/namespaces
 export GW_PLATFORM_OPENAI_API_KEY=sk-...     # secrets by env, referenced from config
-cargo run -p tollgate                        # or: just run
+cargo run -p axond                        # or: just run
 ```
 
 ```bash
@@ -67,7 +67,7 @@ Point any OpenAI-compatible SDK at `http://localhost:8080/v1` as its base URL.
 ## Configuration
 
 TOML owns all structure; the environment owns secrets (referenced by name) and
-may override scalars. See [`tollgate.example.toml`](./tollgate.example.toml) for
+may override scalars. See [`axond.example.toml`](./axond.example.toml) for
 the annotated surface: `server`, `namespace`, `provider`, `credential`,
 `gateway_key`, and `model`.
 

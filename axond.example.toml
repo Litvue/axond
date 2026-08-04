@@ -1,8 +1,8 @@
-# Tollgate example configuration.
+# Axond example configuration.
 #
 # Structure lives here; SECRETS DO NOT. Keys are referenced by the *name* of an
 # environment variable (`env = "..."`) and read at startup — never inlined.
-# Copy to `tollgate.toml` (gitignored) and set the referenced env vars.
+# Copy to `axond.toml` (gitignored) and set the referenced env vars.
 
 [server]
 bind = "0.0.0.0:8080"

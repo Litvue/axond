@@ -8,7 +8,7 @@ Accepted
 
 ## Context
 
-Tollgate is distributed as a single self-hosted binary. The competing
+Axond is distributed as a single self-hosted binary. The competing
 self-hosted gateways generally assume a datastore (Postgres and/or Redis) just
 to boot, which raises the operational floor for the common case: a company
 routing its own traffic through its own keys.

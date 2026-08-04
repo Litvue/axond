@@ -36,4 +36,4 @@ jobs:
       - name: install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: build static binary
-        run: cargo build --release --target x86_64-unknown-linux-musl -p tollgate
+        run: cargo build --release --target x86_64-unknown-linux-musl -p axond

@@ -7,9 +7,9 @@ RUN rustup target add x86_64-unknown-linux-musl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-RUN cargo build --release --target x86_64-unknown-linux-musl -p tollgate
+RUN cargo build --release --target x86_64-unknown-linux-musl -p axond
 
 FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/tollgate /tollgate
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/axond /axond
 EXPOSE 8080
-ENTRYPOINT ["/tollgate"]
+ENTRYPOINT ["/axond"]
