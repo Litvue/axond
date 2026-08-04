@@ -1,0 +1,521 @@
+//! Server-sent-events relay for streamed completions.
+//!
+//! The relay decodes the upstream stream with `gateway-core` (`SseDecoder` +
+//! the provider's `ProviderStreamDecoder`) and re-emits OpenAI-shaped chunks,
+//! so a streamed Anthropic target reaches the caller in the same wire shape as
+//! a streamed OpenAI one. Bytes are forwarded event-by-event as they decode:
+//! nothing buffers a whole response, and the outbound body inherits the
+//! client's backpressure because axum only polls it as the socket drains.
+//!
+//! Accounting is attached to the body, not to the handler: a client that hangs
+//! up mid-stream drops the body, which drops the upstream response (cancelling
+//! the in-flight request) and commits the spend accrued so far. See ADR 0005.
+
+use std::collections::VecDeque;
+use std::convert::Infallible;
+use std::time::Instant;
+
+use axum::body::Body;
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::Response;
+use bytes::Bytes;
+use futures::StreamExt;
+use gateway_core::{
+    ModelPrice, ModelUsage, ProviderAdapter, ProviderRequest, ProviderStreamDecoder,
+    ProviderStreamEvent, SseDecoder, Surface,
+};
+use gateway_transport::{ByteStream, Upstream};
+use serde_json::{Value, json};
+
+use crate::budget::BudgetKey;
+use crate::credentials::CredentialSource;
+use crate::error::GatewayError;
+use crate::routes::next_request_id;
+use crate::state::AppState;
+use crate::usage::{Status, UsageRecord};
+
+/// Everything the relay needs to attribute a streamed request once it ends.
+pub struct StreamContext {
+    pub namespace: String,
+    pub subject: String,
+    pub alias: String,
+    pub target_provider: String,
+    pub target_model: String,
+    pub source: CredentialSource,
+    pub price: ModelPrice,
+    pub budget_key: BudgetKey,
+}
+
+/// Open the upstream stream and return the client-facing SSE response.
+///
+/// An upstream that fails before any byte is relayed becomes a typed error
+/// response (the caller never saw a `200`); an upstream that fails mid-stream
+/// is surfaced as a terminal `error` event followed by `[DONE]`.
+pub async fn relay(
+    state: AppState,
+    ctx: StreamContext,
+    adapter: Box<dyn ProviderAdapter>,
+    upstream: Upstream,
+    surface: Surface,
+    request: ProviderRequest,
+) -> Result<Response, GatewayError> {
+    let started = Instant::now();
+    let decoder = adapter.stream_decoder(surface)?;
+    let bytes = match state
+        .0
+        .dispatcher
+        .dispatch_stream(adapter.as_ref(), &upstream, surface, request)
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let mut accounting = Accounting::new(state, ctx, started);
+            accounting.settle(Status::UpstreamError);
+            return Err(err.into());
+        }
+    };
+
+    let relay = Relay {
+        bytes,
+        sse: SseDecoder::default(),
+        decoder,
+        pending: VecDeque::new(),
+        phase: Phase::Streaming,
+        accounting: Accounting::new(state, ctx, started),
+    };
+
+    let body = Body::from_stream(futures::stream::unfold(relay, |mut relay| async move {
+        relay.next_chunk().await.map(|chunk| (chunk, relay))
+    }));
+
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    Ok(response)
+}
+
+enum Phase {
+    Streaming,
+    Failed(String),
+    Finished,
+    Ended,
+}
+
+struct Relay {
+    bytes: ByteStream,
+    sse: SseDecoder,
+    decoder: Box<dyn ProviderStreamDecoder>,
+    pending: VecDeque<Bytes>,
+    phase: Phase,
+    accounting: Accounting,
+}
+
+impl Relay {
+    async fn next_chunk(&mut self) -> Option<Result<Bytes, Infallible>> {
+        loop {
+            if let Some(chunk) = self.pending.pop_front() {
+                return Some(Ok(chunk));
+            }
+            match &self.phase {
+                Phase::Streaming => self.poll_upstream().await,
+                Phase::Failed(message) => {
+                    let message = message.clone();
+                    self.pending.push_back(error_event(&message));
+                    self.pending.push_back(done_event());
+                    self.accounting.settle(Status::UpstreamError);
+                    self.phase = Phase::Ended;
+                }
+                Phase::Finished => {
+                    self.pending.push_back(done_event());
+                    self.accounting.settle(Status::Ok);
+                    self.phase = Phase::Ended;
+                }
+                Phase::Ended => return None,
+            }
+        }
+    }
+
+    async fn poll_upstream(&mut self) {
+        match self.bytes.next().await {
+            Some(Ok(chunk)) => {
+                let text = String::from_utf8_lossy(&chunk).into_owned();
+                match self.sse.push(&text) {
+                    Ok(events) => {
+                        for event in events {
+                            match self.decoder.decode(event) {
+                                Ok(decoded) => self.emit(decoded),
+                                Err(err) => {
+                                    self.phase = Phase::Failed(err.to_string());
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => self.phase = Phase::Failed(err.to_string()),
+                }
+            }
+            Some(Err(err)) => self.phase = Phase::Failed(err.to_string()),
+            None => match self.decoder.finish() {
+                Ok(decoded) => {
+                    self.emit(decoded);
+                    if !matches!(self.phase, Phase::Finished) {
+                        self.phase = Phase::Finished;
+                    }
+                }
+                Err(err) => self.phase = Phase::Failed(err.to_string()),
+            },
+        }
+    }
+
+    /// Frame decoded events for the client. `Done` carries the stream's
+    /// authoritative usage; the `[DONE]` sentinel itself is written once, from
+    /// the terminal phase, so a provider that ends the connection without one
+    /// still gets a well-formed close.
+    fn emit(&mut self, events: Vec<ProviderStreamEvent>) {
+        for event in events {
+            match event {
+                ProviderStreamEvent::Data { event, data } => {
+                    self.pending.push_back(data_event(event.as_deref(), &data));
+                }
+                ProviderStreamEvent::Done(usage) => {
+                    self.accounting.usage = usage;
+                    self.phase = Phase::Finished;
+                }
+            }
+        }
+    }
+}
+
+fn data_event(name: Option<&str>, data: &Value) -> Bytes {
+    let payload = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_owned());
+    match name {
+        Some(name) => Bytes::from(format!("event: {name}\ndata: {payload}\n\n")),
+        None => Bytes::from(format!("data: {payload}\n\n")),
+    }
+}
+
+fn done_event() -> Bytes {
+    Bytes::from_static(b"data: [DONE]\n\n")
+}
+
+fn error_event(message: &str) -> Bytes {
+    let payload = json!({ "error": { "type": "upstream_stream_error", "message": message } });
+    Bytes::from(format!(
+        "event: error\ndata: {}\n\n",
+        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned())
+    ))
+}
+
+/// Terminal accounting for one streamed request: exactly one usage record and
+/// exactly one budget commit, whichever way the stream ends.
+///
+/// The `Drop` arm is the cancellation path — a dropped body means the client
+/// went away, so the spend accrued up to that point is still charged. Partial
+/// spend is committed through the existing `BudgetStore::commit`; a dedicated
+/// reserve/release lifecycle belongs with the durable backends (#6).
+struct Accounting {
+    state: AppState,
+    ctx: StreamContext,
+    started: Instant,
+    usage: ModelUsage,
+    settled: bool,
+}
+
+impl Accounting {
+    fn new(state: AppState, ctx: StreamContext, started: Instant) -> Self {
+        Self {
+            state,
+            ctx,
+            started,
+            usage: ModelUsage::default(),
+            settled: false,
+        }
+    }
+
+    fn settle(&mut self, status: Status) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        let state = self.state.clone();
+        let usage = self.usage;
+        let latency_ms = self.started.elapsed().as_millis() as u64;
+        let cost = self.ctx.price.cost_microdollars(gateway_core::Usage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+        });
+        let record = UsageRecord {
+            schema_version: UsageRecord::SCHEMA_VERSION,
+            request_id: next_request_id(),
+            namespace: self.ctx.namespace.clone(),
+            subject: self.ctx.subject.clone(),
+            model: self.ctx.alias.clone(),
+            target_provider: self.ctx.target_provider.clone(),
+            target_model: self.ctx.target_model.clone(),
+            credential_source: UsageRecord::credential_source_str(self.ctx.source),
+            status,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cost_microdollars: cost,
+            catalog_version: 0,
+            latency_ms,
+        };
+        let budget_key = self.ctx.budget_key.clone();
+        spawn_settlement(async move {
+            state.0.budget.commit(&budget_key, cost).await;
+            state.0.usage.record(&record).await;
+        });
+    }
+}
+
+impl Drop for Accounting {
+    fn drop(&mut self) {
+        self.settle(Status::ClientCancelled);
+    }
+}
+
+/// Settlement outlives the request body, so it runs detached. Outside a
+/// runtime (process teardown) there is nothing left to settle onto.
+fn spawn_settlement<F>(future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(future);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::post;
+    use futures::StreamExt;
+    use serde_json::json;
+    use tower::util::ServiceExt;
+
+    use crate::budget::{Admission, BudgetStore};
+    use crate::config::Config;
+    use crate::routes::router;
+    use crate::usage::{UsageFanout, UsageSink};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Ledger {
+        records: Mutex<Vec<Value>>,
+        commits: Mutex<Vec<u64>>,
+    }
+
+    struct LedgerSink(Arc<Ledger>);
+
+    #[async_trait]
+    impl UsageSink for LedgerSink {
+        fn name(&self) -> &'static str {
+            "ledger"
+        }
+        async fn record(&self, record: &UsageRecord) {
+            let value = serde_json::to_value(record).expect("record serializes");
+            self.0.records.lock().expect("ledger").push(value);
+        }
+    }
+
+    struct LedgerBudget(Arc<Ledger>);
+
+    #[async_trait]
+    impl BudgetStore for LedgerBudget {
+        fn name(&self) -> &'static str {
+            "ledger"
+        }
+        async fn reserve(&self, _key: &BudgetKey, _estimated_microdollars: u64) -> Admission {
+            Admission::Allowed
+        }
+        async fn commit(&self, _key: &BudgetKey, actual_microdollars: u64) {
+            self.0
+                .commits
+                .lock()
+                .expect("ledger")
+                .push(actual_microdollars);
+        }
+    }
+
+    /// A fake upstream that replies with a fixed SSE body.
+    async fn upstream_serving(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            post(move || async move {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from(body),
+                )
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn state_for(base_url: &str, ledger: Arc<Ledger>) -> AppState {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "{base_url}"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "GW_TEST_OPENAI_KEY"
+
+[[model]]
+name = "gpt-4o"
+targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000 }} }}]
+"#
+        ))
+        .expect("config");
+        let env = HashMap::from([("GW_TEST_OPENAI_KEY".to_owned(), "sk-test".to_owned())]);
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(LedgerSink(ledger.clone()))];
+        AppState::new(
+            cfg,
+            &env,
+            UsageFanout::new(sinks),
+            Box::new(LedgerBudget(ledger)),
+        )
+    }
+
+    fn stream_request() -> Request<Body> {
+        let body = json!({
+            "model": "gpt-4o",
+            "stream": true,
+            "stream_options": { "include_usage": true },
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).expect("body")))
+            .expect("request")
+    }
+
+    /// The ledger is written from a detached settlement task; poll briefly
+    /// rather than racing it.
+    async fn settled(ledger: &Ledger) -> Value {
+        for _ in 0..100 {
+            if let Some(record) = ledger.records.lock().expect("ledger").first() {
+                return record.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no usage record was settled");
+    }
+
+    const OPENAI_STREAM: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    #[tokio::test]
+    async fn relays_events_and_settles_one_usage_record() {
+        let ledger = Arc::new(Ledger::default());
+        let base_url = upstream_serving(OPENAI_STREAM).await;
+        let resp = router(state_for(&base_url, ledger.clone()))
+            .oneshot(stream_request())
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let mut body = resp.into_body().into_data_stream();
+        let mut relayed = String::new();
+        while let Some(chunk) = body.next().await {
+            relayed.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+        }
+        assert_eq!(relayed.matches("data: ").count(), 4);
+        assert!(relayed.contains("\"content\":\"hel\""));
+        assert!(relayed.ends_with("data: [DONE]\n\n"));
+
+        let record = settled(&ledger).await;
+        assert_eq!(ledger.records.lock().expect("ledger").len(), 1);
+        assert_eq!(record["status"], "ok");
+        assert_eq!(record["input_tokens"], 11);
+        assert_eq!(record["output_tokens"], 3);
+        // 11 input @ 1 µ$/token + 3 output @ 2 µ$/token.
+        assert_eq!(record["cost_microdollars"], 17);
+        assert_eq!(*ledger.commits.lock().expect("ledger"), vec![17]);
+    }
+
+    #[tokio::test]
+    async fn mid_stream_upstream_failure_becomes_a_terminal_error_event() {
+        let ledger = Arc::new(Ledger::default());
+        let base_url = upstream_serving(concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {not json}\n\n",
+        ))
+        .await;
+        let resp = router(state_for(&base_url, ledger.clone()))
+            .oneshot(stream_request())
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut body = resp.into_body().into_data_stream();
+        let mut relayed = String::new();
+        while let Some(chunk) = body.next().await {
+            relayed.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+        }
+        assert!(relayed.contains("event: error"));
+        assert!(relayed.ends_with("data: [DONE]\n\n"));
+
+        let record = settled(&ledger).await;
+        assert_eq!(record["status"], "upstream_error");
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_settles_the_stream_as_cancelled() {
+        let ledger = Arc::new(Ledger::default());
+        let base_url = upstream_serving(OPENAI_STREAM).await;
+        let resp = router(state_for(&base_url, ledger.clone()))
+            .oneshot(stream_request())
+            .await
+            .expect("response");
+
+        let mut body = resp.into_body().into_data_stream();
+        body.next().await.expect("first chunk").expect("chunk");
+        drop(body);
+
+        let record = settled(&ledger).await;
+        assert_eq!(record["status"], "client_cancelled");
+        assert_eq!(ledger.commits.lock().expect("ledger").len(), 1);
+    }
+}

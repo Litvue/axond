@@ -4,13 +4,15 @@
 //! forwards the caller's body to a same-shaped upstream and only rewrites the
 //! `model` field to the resolved target. Cross-provider translation (e.g.
 //! routing an OpenAI request to Anthropic) reuses `gateway-core`'s adapters and
-//! is wired in as failover lands. Native routes (`/v1/messages`) and streaming
-//! exist as typed `501`s rather than missing routes (delta B3).
+//! is wired in as failover lands. A `stream: true` request takes the SSE relay
+//! in [`crate::streaming`]; native routes (`/v1/messages`) exist as typed
+//! `501`s rather than missing routes (delta B3).
 
 use std::time::Instant;
 
 use axum::extract::State;
 use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use gateway_core::{ModelPrice, ProviderRequest, Surface, Usage};
@@ -22,6 +24,7 @@ use crate::config::ProviderKind;
 use crate::credentials::CredentialSource;
 use crate::error::GatewayError;
 use crate::state::{AppState, InboundKey, adapter_for};
+use crate::streaming::{self, StreamContext};
 use crate::usage::{Status, UsageRecord};
 
 pub fn router(state: AppState) -> Router {
@@ -84,13 +87,11 @@ async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(mut body): Json<Value>,
-) -> Result<Json<Value>, GatewayError> {
+) -> Result<Response, GatewayError> {
     let caller = authenticate(&state, &headers)?;
     let cfg = &state.0.config;
 
-    if body.get("stream").and_then(Value::as_bool) == Some(true) {
-        return Err(GatewayError::NotImplemented("streaming (SSE relay)"));
-    }
+    let streamed = body.get("stream").and_then(Value::as_bool) == Some(true);
 
     let alias = body
         .get("model")
@@ -151,6 +152,28 @@ async fn chat_completions(
         body,
     };
 
+    if streamed {
+        let ctx = StreamContext {
+            namespace: caller.namespace.clone(),
+            subject: caller.subject.clone(),
+            alias,
+            target_provider,
+            target_model,
+            source: resolved.source,
+            price,
+            budget_key,
+        };
+        return streaming::relay(
+            state.clone(),
+            ctx,
+            adapter,
+            upstream,
+            Surface::ChatCompletions,
+            request,
+        )
+        .await;
+    }
+
     let started = Instant::now();
     let result = state
         .0
@@ -185,7 +208,7 @@ async fn chat_completions(
                 },
             )
             .await;
-            Ok(Json(response.body))
+            Ok(Json(response.body).into_response())
         }
         Err(err) => {
             // Failure still cost provider tokens in principle, but we have no
@@ -261,7 +284,7 @@ fn estimate_cost_microdollars(body: &Value, price: &ModelPrice) -> u64 {
 
 /// Monotonic per-process request id. A real deploy layers this behind the
 /// inbound `traceparent` so the id joins the OTel trace.
-fn next_request_id() -> String {
+pub fn next_request_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     format!("req_{:016x}", COUNTER.fetch_add(1, Ordering::Relaxed))

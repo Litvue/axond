@@ -50,6 +50,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "bytes",
  "figment",
  "futures",
  "gateway-core",
@@ -362,6 +363,8 @@ dependencies = [
 name = "gateway-transport"
 version = "0.0.0"
 dependencies = [
+ "bytes",
+ "futures",
  "gateway-core",
  "reqwest",
  "secrecy",
