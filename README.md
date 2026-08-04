@@ -135,7 +135,7 @@ the context is injected into the upstream request, so a caller's trace runs
 end-to-end. Metrics are `axond.http.server.*` (route/status) plus
 `axond.request.*` and `axond.upstream.*` (namespace/alias/target/status). Spans
 never carry credentials, prompts, or completions. See
-[ADR 0005](./docs/adr/0005-telemetry-model.md).
+[ADR 0007](./docs/adr/0007-telemetry-model.md).
 
 ## Architecture
 

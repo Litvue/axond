@@ -1,4 +1,4 @@
-# 5. Telemetry model: span shape, propagation, metrics, and a default-off exporter
+# 7. Telemetry model: span shape, propagation, metrics, and a default-off exporter
 
 Date: 2026-08-04
 
