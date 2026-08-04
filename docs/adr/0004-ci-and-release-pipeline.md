@@ -69,9 +69,9 @@ dirty worktree — and the signing identity is pinned to this workflow on
   sloppy commit type produces a wrong bump, so the PR-title gate is load-bearing.
 - Consumers can verify provenance and signatures for both the binaries and the
   image, and reconstruct the dependency set from the attached SBOMs.
-- The release PR only triggers downstream CI when a GitHub App token or release
-  PAT is configured (`RELEASE_PLEASE_APP_ID`/`RELEASE_PLEASE_APP_PRIVATE_KEY` or
-  `RELEASE_PLEASE_TOKEN`); with the `GITHUB_TOKEN` fallback the release PR is not
-  CI-validated until merge.
+- The release PR only triggers downstream CI when the org-wide release GitHub
+  App (`RELEASE_PLEASE_APP_ID`/`RELEASE_PLEASE_APP_PRIVATE_KEY`, shared with
+  `actord` and `custodian`) authors it; if the repo is outside the App's scope
+  the `GITHUB_TOKEN` fallback leaves the release PR un-CI-validated until merge.
 - The pipeline currently publishes a single `linux/amd64` image; multi-arch is a
   later addition, not a rewrite.

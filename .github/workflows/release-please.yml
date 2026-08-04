@@ -54,10 +54,11 @@ jobs:
       - uses: googleapis/release-please-action@v5
         id: release
         with:
-          # An App token or the repository's release PAT makes the release PR
-          # and lockfile-sync commit trigger `ci.yml`. The GITHUB_TOKEN fallback
-          # can create the PR but does not trigger downstream workflow runs.
-          token: ${{ steps.app-token.outputs.token || secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          # The org-wide release GitHub App token makes the release PR and the
+          # lockfile-sync commit trigger `ci.yml`; the GITHUB_TOKEN fallback can
+          # create the PR but does not trigger downstream workflow runs, so the
+          # release PR is un-CI-validated until it merges to main.
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
@@ -69,7 +70,7 @@ jobs:
         if: ${{ steps.release.outputs.pr }}
         with:
           ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
-          token: ${{ steps.app-token.outputs.token || secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
       - name: Sync Cargo.lock
         if: ${{ steps.release.outputs.pr }}
         run: |

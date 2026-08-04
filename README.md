@@ -130,9 +130,11 @@ pipeline shape as the sibling `actord` and `custodian` repos:
 - PR titles are gated to Conventional Commits, and a daily job re-audits the
   released `main` against new advisories.
 
-Configure `RELEASE_PLEASE_APP_ID` / `RELEASE_PLEASE_APP_PRIVATE_KEY` (or a
-`RELEASE_PLEASE_TOKEN`) so the release PR triggers CI; without it the pipeline
-falls back to `GITHUB_TOKEN` and the release PR is not CI-validated until merge.
+The release PR is authored by the org-wide release GitHub App
+(`RELEASE_PLEASE_APP_ID` / `RELEASE_PLEASE_APP_PRIVATE_KEY`, the same
+organization config `actord` and `custodian` use) so that it triggers CI; if the
+repo is outside the App's scope the pipeline falls back to `GITHUB_TOKEN` and the
+release PR is not CI-validated until it merges.
 
 ## License
 
