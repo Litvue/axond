@@ -176,6 +176,14 @@ async fn chat_completions(
             model: target_model,
             body,
         };
+        telemetry::record_routing(
+            &ctx.namespace,
+            &ctx.subject,
+            &ctx.alias,
+            &ctx.target_provider,
+            &ctx.target_model,
+            UsageRecord::credential_source_str(ctx.source),
+        );
         return streaming::relay(
             state.clone(),
             ctx,

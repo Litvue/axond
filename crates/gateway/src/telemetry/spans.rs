@@ -96,3 +96,31 @@ pub fn record_request(record: &UsageRecord, ttft_ms: Option<u64>, attempts: u32)
     }
     metrics::record_request(record, ttft_ms);
 }
+
+/// Record what a request resolved to, before it is dispatched. A streamed
+/// request outlives its server span, so this is the only chance the span gets to
+/// say where the stream went; the buffered path fills the same fields from the
+/// usage record instead.
+pub fn record_routing(
+    namespace: &str,
+    subject: &str,
+    alias: &str,
+    target_provider: &str,
+    target_model: &str,
+    credential_source: &'static str,
+) {
+    let span = Span::current();
+    span.record("axond.namespace", namespace);
+    span.record("axond.subject", subject);
+    span.record("gen_ai.request.model", alias);
+    span.record("axond.target.provider", target_provider);
+    span.record("axond.target.model", target_model);
+    span.record("axond.credential_source", credential_source);
+}
+
+/// The same fold for a streamed request. Streams settle from the response body,
+/// which outlives the handler and therefore the server span, so there is no span
+/// left to record onto — the metrics and the record's `trace_id` carry it.
+pub fn record_streamed(record: &UsageRecord, ttft_ms: Option<u64>) {
+    metrics::record_request(record, ttft_ms);
+}

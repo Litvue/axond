@@ -26,12 +26,14 @@ use gateway_core::{
 };
 use gateway_transport::{ByteStream, Upstream};
 use serde_json::{Value, json};
+use tracing::Instrument;
 
 use crate::budget::BudgetKey;
 use crate::credentials::CredentialSource;
 use crate::error::GatewayError;
 use crate::routes::next_request_id;
 use crate::state::AppState;
+use crate::telemetry;
 use crate::usage::{Status, UsageRecord};
 
 /// Everything the relay needs to attribute a streamed request once it ends.
@@ -65,12 +67,32 @@ pub async fn relay(
 ) -> Result<Response, GatewayError> {
     let started = Instant::now();
     let decoder = adapter.stream_decoder(surface)?;
-    let bytes = match state
+    // The attempt span covers opening the stream, which is where a failed
+    // stream fails; the relayed body outlives it, so its TTFT is reported
+    // through the metrics at settlement instead.
+    let attempt_span = telemetry::upstream_attempt_span(
+        0,
+        &ctx.target_provider,
+        &ctx.target_model,
+        UsageRecord::credential_source_str(ctx.source),
+    );
+    let opened = state
         .0
         .dispatcher
         .dispatch_stream(adapter.as_ref(), &upstream, surface, request)
-        .await
-    {
+        .instrument(attempt_span.clone())
+        .await;
+    telemetry::finish_upstream_attempt(
+        &attempt_span,
+        if opened.is_ok() {
+            telemetry::ATTEMPT_OK
+        } else {
+            telemetry::ATTEMPT_ERROR
+        },
+        started.elapsed().as_millis() as u64,
+        None,
+    );
+    let bytes = match opened {
         Ok(bytes) => bytes,
         Err(err) => {
             let mut accounting = Accounting::new(state, ctx, started);
@@ -234,6 +256,7 @@ impl Relay {
         for event in events {
             match event {
                 ProviderStreamEvent::Data { event, data } => {
+                    self.accounting.mark_first_token();
                     self.pending.push_back(data_event(event.as_deref(), &data));
                 }
                 ProviderStreamEvent::Done(usage) => {
@@ -277,6 +300,9 @@ struct Accounting {
     ctx: StreamContext,
     started: Instant,
     usage: ModelUsage,
+    /// Time to the first relayed token, which for a stream is the number a
+    /// caller actually feels.
+    ttft_ms: Option<u64>,
     settled: bool,
 }
 
@@ -287,8 +313,14 @@ impl Accounting {
             ctx,
             started,
             usage: ModelUsage::default(),
+            ttft_ms: None,
             settled: false,
         }
+    }
+
+    fn mark_first_token(&mut self) {
+        self.ttft_ms
+            .get_or_insert_with(|| self.started.elapsed().as_millis() as u64);
     }
 
     fn settle(&mut self, status: Status) {
@@ -324,6 +356,7 @@ impl Accounting {
             catalog_version: 0,
             latency_ms,
         };
+        telemetry::record_streamed(&record, self.ttft_ms);
         let budget_key = self.ctx.budget_key.clone();
         spawn_settlement(async move {
             state.0.budget.commit(&budget_key, cost).await;

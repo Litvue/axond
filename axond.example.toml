@@ -7,7 +7,7 @@
 # Telemetry is environment-only, so it looks the same here as in every other
 # OTel service: unset means JSON logs on stdout and nothing exported; set
 # OTEL_EXPORTER_OTLP_ENDPOINT (OTLP/HTTP, e.g. http://collector:4318) to turn on
-# traces and metrics. See docs/adr/0005-telemetry-model.md.
+# traces and metrics. See docs/adr/0007-telemetry-model.md.
 
 [server]
 bind = "0.0.0.0:8080"

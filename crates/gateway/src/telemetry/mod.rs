@@ -1,6 +1,6 @@
 //! Telemetry: traces, metrics, and log correlation.
 //!
-//! Three properties shape this module (ADR 0005):
+//! Three properties shape this module (ADR 0007):
 //!
 //! * **Off by default.** With no `OTEL_EXPORTER_OTLP_ENDPOINT` the process
 //!   installs no tracer or meter provider, so the OpenTelemetry globals stay
@@ -19,8 +19,8 @@ mod spans;
 
 pub use http::TelemetryLayer;
 pub use spans::{
-    ATTEMPT_ERROR, ATTEMPT_OK, finish_upstream_attempt, record_request, trace_id,
-    upstream_attempt_span,
+    ATTEMPT_ERROR, ATTEMPT_OK, finish_upstream_attempt, record_request, record_routing,
+    record_streamed, trace_id, upstream_attempt_span,
 };
 
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -35,8 +35,15 @@ and TTFT. Each attempt (`axond.upstream.attempt`) carries where it was sent and
 how that one call went. Ordered failover therefore adds *attempts*, not a new
 span shape: N children under one server span, the last one holding the status the
 caller saw. TTFT is recorded on both; for a non-streamed response the first token
-arrives with the last, so it equals the attempt latency, and the streaming relay
-reports the real first chunk.
+arrives with the last, so it equals the attempt latency, while the streaming
+relay times the first relayed chunk.
+
+A streamed request is the one case where the server span cannot hold the outcome:
+its accounting is attached to the response body, which by design outlives the
+handler (ADR 0005), so by settlement time the span has closed. The span therefore
+records what the request *resolved to* before dispatch, and the terminal
+status/tokens/cost/TTFT reach the metrics — joined back to the trace through the
+usage record's `trace_id`.
 
 **Instrumentation lives in a middleware layer plus one seam in the route.** The
 layer owns span creation, inbound context extraction, and the coarse HTTP
