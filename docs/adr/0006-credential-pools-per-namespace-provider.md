@@ -1,4 +1,4 @@
-# 5. Credential pools per namespace and provider
+# 6. Credential pools per namespace and provider
 
 Date: 2026-08-04
 

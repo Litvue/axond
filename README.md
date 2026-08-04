@@ -114,7 +114,7 @@ alone; the target stays available to every other key. The credential that served
 a request is attributed on its usage record as `credential_id`. Pools never cross
 a namespace boundary: a BYOK namespace uses its own pool, or the whole platform
 pool when it opts into `allow_platform_fallback`. See
-[ADR 0005](./docs/adr/0005-credential-pools-per-namespace-provider.md).
+[ADR 0006](./docs/adr/0006-credential-pools-per-namespace-provider.md).
 
 ## Architecture
 
