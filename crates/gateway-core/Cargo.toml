@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 description = "Runtime-neutral LLM provider adapters, wire translation, and routing primitives for the Axond AI gateway."
-repository = "https://github.com/OWNER/axond"
+repository = "https://github.com/Litvue/axond"
 
 [lib]
 name = "gateway_core"
