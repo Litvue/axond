@@ -456,6 +456,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             UsageFanout::new(sinks),
             Box::new(LedgerBudget(ledger)),
         )
+        .expect("state")
     }
 
     fn stream_request() -> Request<Body> {
