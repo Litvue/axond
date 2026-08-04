@@ -28,8 +28,7 @@ async fn main() -> anyhow::Result<()> {
         .json()
         .init();
 
-    let config_path =
-        std::env::var("AXOND_CONFIG").unwrap_or_else(|_| "axond.toml".to_string());
+    let config_path = std::env::var("AXOND_CONFIG").unwrap_or_else(|_| "axond.toml".to_string());
     let config = Config::load(&config_path)
         .map_err(|e| anyhow::anyhow!("failed to load config from `{config_path}`: {e}"))?;
 

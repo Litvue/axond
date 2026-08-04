@@ -3,8 +3,8 @@
 default:
     @just --list
 
-# Format, lint (warnings = errors), and test — the same gates CI runs.
-check: fmt-check clippy test
+# Format, lint (warnings = errors), test, docs, and supply-chain — the CI gates.
+check: fmt-check clippy test docs deny
 
 fmt:
     cargo fmt --all
@@ -13,10 +13,17 @@ fmt-check:
     cargo fmt --all -- --check
 
 clippy:
-    cargo clippy --all-targets --all-features -- -D warnings
+    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 test:
-    cargo test --all-features
+    cargo test --workspace --all-features --locked
+
+docs:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
+
+# Supply-chain policy: advisories, licenses, sources (see deny.toml).
+deny:
+    cargo deny --locked --all-features check
 
 # Run the gateway against ./axond.toml (copy axond.example.toml first).
 run:
@@ -29,3 +36,7 @@ build-static:
 # Build the distroless container image.
 docker:
     docker build -t axond:dev .
+
+# Build the image and prove it boots and serves /healthz.
+docker-smoke:
+    ops/docker-smoke.sh "$(docker build -q .)"
