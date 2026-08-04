@@ -142,6 +142,7 @@ async fn flush(sink: &dyn UsageSink, batch: &mut Vec<ObservedRecord>, dropped: &
             metrics::record_usage_dropped(sink.name(), DropReason::SinkError.as_str(), count);
             tracing::warn!(
                 sink = sink.name(),
+                reason = DropReason::SinkError.as_str(),
                 records = count,
                 error = %e,
                 "usage batch dropped: sink rejected it"
