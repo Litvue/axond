@@ -3,12 +3,17 @@
 //! Boot sequence: install telemetry (logs always, OTLP only when configured),
 //! load + validate config (fail fast, delta B2), snapshot the environment for
 //! credential resolution, connect the configured usage sinks, build shared
-//! state, then serve.
+//! state, install the reload triggers, then serve.
+//!
+//! The config the process serves is replaceable at runtime: `SIGHUP` (and, when
+//! `[reload] watch` is on, a change to the config file) re-runs this same load +
+//! validate path and swaps the result in atomically (ADR 0011).
 
 mod budget;
 mod config;
 mod credentials;
 mod error;
+mod reload;
 mod routes;
 mod state;
 mod streaming;
@@ -16,6 +21,7 @@ mod telemetry;
 mod usage;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use budget::{BudgetStore, NoBudget};
 use config::Config;
@@ -45,11 +51,18 @@ async fn main() -> anyhow::Result<()> {
     let budget: Box<dyn BudgetStore> = Box::new(NoBudget);
 
     let bind = config.server.bind;
+    let watching = config.reload.watch;
     let state = AppState::new(config, &env, usage, budget)
         .map_err(|e| anyhow::anyhow!("credential validation failed: {e}"))?;
+    reload::spawn(Arc::new(reload::Reloader::new(config_path, state.clone())));
     let app = routes::router(state).layer(telemetry::TelemetryLayer);
 
-    tracing::info!(%bind, otlp = telemetry::is_exporting(), "axond listening");
+    tracing::info!(
+        %bind,
+        otlp = telemetry::is_exporting(),
+        config_watch = watching,
+        "axond listening"
+    );
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app).await?;
     Ok(())

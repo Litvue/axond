@@ -166,6 +166,47 @@ policy, and the delivery guarantees, and
 [ADR 0009](./docs/adr/0009-durable-usage-sinks.md) for why. Tinybird and
 ClickHouse fit the same seam and are deferred to post-beta.
 
+## Config hot-reload
+
+Provider, model, namespace, credential, and gateway-key config is replaceable
+without a restart, so onboarding a BYOK customer is an edit and a signal:
+
+```bash
+export ACME_OPENAI_KEY=sk-...          # must reach the gateway's own process env
+$EDITOR axond.toml                     # add [[namespace]], [[credential]], aliases
+kill -HUP "$(pidof axond)"
+```
+
+The candidate config goes through the **full boot-time validation**, so a reload
+is the boot gate applied again: any error — bad TOML, an alias pointing at an
+undefined provider, a declared credential whose env var is unset — rejects the
+candidate and the **previous config keeps serving**. The process environment is
+re-read on every reload, which is what makes a newly-referenced credential
+resolve; it must be set on the gateway's process, not just in your shell.
+
+A successful reload publishes one atomic snapshot. Each request takes that
+snapshot once and holds it for its whole life (streams included), so a reload
+never half-applies and nothing in flight is dropped.
+
+Watching the config file is opt-in:
+
+```toml
+[reload]
+watch = true              # reload when the file's contents change
+poll_interval_ms = 2_000  # floor 100
+```
+
+Reloads are observable: an `axond.config.reload` span, a counter
+`axond.config.reloads{trigger,outcome}`, and a gauge `axond.config.generation`
+(0 at boot, +1 per applied reload) — a replica that missed a reload shows up as a
+generation skew. The applied log line carries an added/removed diff of
+namespaces, providers, aliases, credential labels, and gateway-key env-var names.
+
+`[server] bind` and `[[usage_sink]]` changes are reported with a warning and
+otherwise ignored: the socket is already bound and sinks own live connections, so
+both still need a restart. See
+[ADR 0011](./docs/adr/0011-config-hot-reload.md).
+
 ## Telemetry
 
 Off by default: with no OTLP endpoint the process only writes JSON logs to
@@ -211,7 +252,7 @@ runtime-neutral.
 - [ ] Budget backends: in-memory (present) → Redis / Postgres, reserve-then-reconcile
 - [ ] Native Anthropic `/v1/messages` passthrough; `/v1/embeddings`, `/v1/responses`
 - [x] Multiple credentials per provider (pooling, weighted, skip-on-429)
-- [ ] Config hot-reload (SIGHUP / watched files) for zero-restart BYOK onboarding
+- [x] Config hot-reload (SIGHUP / watched files) for zero-restart BYOK onboarding (see [ADR 0011](./docs/adr/0011-config-hot-reload.md))
 - [ ] Provider-SDK compatibility + record/replay + SSE soak tests
 
 See [`docs/adr`](./docs/adr) for the decisions behind these.

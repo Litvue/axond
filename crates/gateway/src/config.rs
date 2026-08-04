@@ -6,6 +6,11 @@
 //! note in the assessment (§5, delta B4): config is a public API, so it is
 //! validated as a whole at boot (delta B2) rather than coping with invalid
 //! entries at request time.
+//!
+//! The same load + validate path serves hot reload (ADR 0011): a reload builds a
+//! candidate through [`Config::load`], so a reloaded config passes exactly the
+//! gate a booting one does. The environment is read at *reload* time, so a
+//! credential env-var added after boot resolves without a restart.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -35,6 +40,9 @@ pub struct Config {
     /// Ordered failover across an alias's targets and per-target circuit health.
     #[serde(default)]
     pub failover: Failover,
+    /// How the running config is replaced without a restart.
+    #[serde(default)]
+    pub reload: Reload,
     /// Inbound gateway keys. Each binds a secret (resolved from `env`) to a
     /// namespace. When empty, the gateway is unauthenticated and every request
     /// uses the default namespace — intended for local dev only.
@@ -208,6 +216,36 @@ impl Default for Failover {
     }
 }
 
+/// Config hot-reload (ADR 0011). `SIGHUP` always reloads; watching the config
+/// file is opt-in, since a watch reloads whatever the file says the moment it
+/// says it, while a signal is an explicit operator action.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Reload {
+    /// Reload when the config file's contents change.
+    #[serde(default)]
+    pub watch: bool,
+    /// How often the watcher compares the file's contents. Also bounds how long
+    /// a change to this section itself takes to be picked up.
+    #[serde(default = "default_reload_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+}
+
+impl Default for Reload {
+    fn default() -> Self {
+        Self {
+            watch: false,
+            poll_interval_ms: default_reload_poll_interval_ms(),
+        }
+    }
+}
+
+fn default_reload_poll_interval_ms() -> u64 {
+    2_000
+}
+
+/// Below this the watcher would spend more time reading the file than serving.
+const MIN_RELOAD_POLL_INTERVAL_MS: u64 = 100;
+
 fn default_weight() -> u32 {
     1
 }
@@ -239,7 +277,7 @@ fn default_target_cooldown_seconds() -> u64 {
 /// One usage destination. `kind` decides which of the remaining fields apply;
 /// they are validated as a set at boot, so a Postgres sink without a DSN (or a
 /// batch size the wire protocol cannot carry) refuses to start.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct UsageSinkConfig {
     pub kind: UsageSinkKind,
     /// `postgres`: name of the env var holding the connection string. The DSN is
@@ -419,6 +457,11 @@ impl Config {
                 "failover.cooldown_seconds must be at least 1".into(),
             ));
         }
+        if self.reload.poll_interval_ms < MIN_RELOAD_POLL_INTERVAL_MS {
+            return Err(ConfigError::Invalid(format!(
+                "reload.poll_interval_ms must be at least {MIN_RELOAD_POLL_INTERVAL_MS}"
+            )));
+        }
         let mut labels: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
         for c in &self.credential {
             if c.env.trim().is_empty() {
@@ -596,6 +639,29 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
                 "expected an Invalid error mentioning `{field}`",
             );
         }
+    }
+
+    #[test]
+    fn hot_reload_is_signal_only_until_watching_is_asked_for() {
+        let cfg = Config::from_toml_str(VALID).expect("valid config");
+        assert!(!cfg.reload.watch);
+        assert_eq!(cfg.reload.poll_interval_ms, 2_000);
+
+        let cfg = Config::from_toml_str(&format!(
+            "{VALID}\n[reload]\nwatch = true\npoll_interval_ms = 500\n"
+        ))
+        .expect("valid config");
+        assert!(cfg.reload.watch);
+        assert_eq!(cfg.reload.poll_interval_ms, 500);
+    }
+
+    #[test]
+    fn rejects_a_watch_interval_that_would_busy_read_the_config() {
+        let toml = format!("{VALID}\n[reload]\nwatch = true\npoll_interval_ms = 5\n");
+        assert!(matches!(
+            Config::from_toml_str(&toml),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 
     #[test]

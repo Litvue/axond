@@ -19,8 +19,9 @@ mod spans;
 
 pub use http::TelemetryLayer;
 pub use spans::{
-    ATTEMPT_ERROR, ATTEMPT_OK, finish_upstream_attempt, record_request, record_routing,
-    record_streamed, trace_id, upstream_attempt_span,
+    ATTEMPT_ERROR, ATTEMPT_OK, RELOAD_APPLIED, RELOAD_REJECTED, config_reload_span,
+    finish_config_reload, finish_upstream_attempt, record_request, record_routing, record_streamed,
+    trace_id, upstream_attempt_span,
 };
 
 use std::sync::OnceLock;
