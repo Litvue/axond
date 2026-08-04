@@ -87,15 +87,18 @@ where
     }
 }
 
-/// The matched axum route, so metric and span dimensions stay
-/// low-cardinality rather than carrying raw paths.
+/// The matched axum route, so metric and span dimensions stay low-cardinality.
+/// Unmatched requests collapse to one label rather than carrying the raw path,
+/// which a caller could otherwise use to mint unbounded metric series.
 fn route_of<B>(request: &Request<B>) -> String {
     request
         .extensions()
         .get::<MatchedPath>()
         .map(|matched| matched.as_str().to_owned())
-        .unwrap_or_else(|| request.uri().path().to_owned())
+        .unwrap_or_else(|| UNMATCHED_ROUTE.to_owned())
 }
+
+const UNMATCHED_ROUTE: &str = "/{unmatched}";
 
 /// The per-request server span. Every gateway-specific field is declared
 /// `Empty` here and filled in later from the canonical usage record, so the

@@ -49,8 +49,10 @@ derived from *one* record per request and cannot disagree.
 extracted and become the parent of the server span, so the gateway joins the
 caller's trace rather than starting a new one. The transport injects the current
 context into the upstream request, so the trace continues past the gateway. The
-request id in the usage record is the trace id when a trace is being recorded, so
-a usage row, a log line, and a span all name the same request.
+usage record keeps its own unique `request_id` and gains a `trace_id`, so a row
+joins the caller's trace without losing per-request identity — one caller trace
+routinely covers a whole agent loop of requests, so the trace id cannot serve as
+the row's identity.
 
 **Two metric families, on purpose.** `axond.http.*` covers every HTTP request —
 including ones that never reach a provider, like `unknown_model` — dimensioned
@@ -72,7 +74,9 @@ exporting nowhere, consistent with "fail at boot, not at request time". The
 exporter is handed the same pooled client the gateway uses, because the
 alternative — the exporter's bundled client — pulls a second `reqwest` major
 version and a second TLS provider into a binary whose selling point is being one
-static file.
+static file. The SDK drives exports from its own non-Tokio threads, so the client
+spawns each request onto the runtime captured at init and awaits the join handle;
+doing the I/O on the exporter thread directly panics for want of a reactor.
 
 **Nothing sensitive is recorded.** Spans and metrics carry identifiers, counts,
 and durations. Prompts, completions, and credentials never appear; a per-tenant

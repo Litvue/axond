@@ -52,7 +52,12 @@ impl Status {
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageRecord {
     pub schema_version: u32,
+    /// Unique per request, so rows can be de-duplicated. Distinct from
+    /// `trace_id`, which one caller trace shares across many requests.
     pub request_id: String,
+    /// Set when the request was traced, joining the row to the caller's trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
     pub namespace: String,
     /// Authenticated caller / gateway-key id.
     pub subject: String,

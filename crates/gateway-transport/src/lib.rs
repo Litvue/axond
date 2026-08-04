@@ -164,6 +164,16 @@ fn trace_context_headers() -> reqwest::header::HeaderMap {
     global::get_text_map_propagator(|propagator| {
         propagator.inject_context(&context, &mut HeaderInjector(&mut headers))
     });
+    // The W3C propagator emits `tracestate` unconditionally; an empty one says
+    // nothing, so it is not worth a header.
+    let empty: Vec<_> = headers
+        .iter()
+        .filter(|(_, value)| value.is_empty())
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in empty {
+        headers.remove(name);
+    }
     headers
 }
 

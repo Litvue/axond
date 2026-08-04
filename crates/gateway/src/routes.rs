@@ -168,6 +168,7 @@ async fn chat_completions(
             target_model: target_model.clone(),
             source: plan.source,
             credential_id: lease.id.clone(),
+            trace_id: telemetry::trace_id(),
             price,
             budget_key,
         };
@@ -403,14 +404,13 @@ fn estimate_cost_microdollars(body: &Value, price: &ModelPrice) -> u64 {
     })
 }
 
-/// The active trace id when a trace is being recorded, so a usage row joins the
-/// caller's trace; otherwise a monotonic per-process id. `pub` so the streaming
-/// relay can stamp the same id on its settled usage record.
+/// Monotonic per-process request id. The trace it belongs to travels in the
+/// record's `trace_id`, which a caller's whole agent loop shares. `pub` so the
+/// streaming relay can stamp the same id on its settled usage record.
 pub fn next_request_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(1);
-    telemetry::trace_id()
-        .unwrap_or_else(|| format!("req_{:016x}", COUNTER.fetch_add(1, Ordering::Relaxed)))
+    format!("req_{:016x}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 struct RecordArgs<'a> {
@@ -437,6 +437,7 @@ async fn record_usage(state: &AppState, args: RecordArgs<'_>) {
     let record = UsageRecord {
         schema_version: UsageRecord::SCHEMA_VERSION,
         request_id: next_request_id(),
+        trace_id: telemetry::trace_id(),
         namespace: args.caller.namespace.clone(),
         subject: args.caller.subject.clone(),
         model: args.alias.to_string(),

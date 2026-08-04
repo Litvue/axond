@@ -43,6 +43,9 @@ pub struct StreamContext {
     pub target_model: String,
     pub source: CredentialSource,
     pub credential_id: String,
+    /// Captured in the handler while the server span is live; settlement may run
+    /// in a detached task where the span context is no longer current.
+    pub trace_id: Option<String>,
     pub price: ModelPrice,
     pub budget_key: BudgetKey,
 }
@@ -313,6 +316,7 @@ impl Accounting {
             target_model: self.ctx.target_model.clone(),
             credential_source: UsageRecord::credential_source_str(self.ctx.source),
             credential_id: self.ctx.credential_id.clone(),
+            trace_id: self.ctx.trace_id.clone(),
             status,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
@@ -481,6 +485,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             target_model: "gpt-4o".to_owned(),
             source: CredentialSource::Platform,
             credential_id: "openai-primary".to_owned(),
+            trace_id: None,
             price: ModelPrice {
                 input_microdollars_per_million: 1_000_000,
                 output_microdollars_per_million: 2_000_000,

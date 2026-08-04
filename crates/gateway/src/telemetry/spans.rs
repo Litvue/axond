@@ -14,9 +14,9 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::telemetry::metrics;
 use crate::usage::UsageRecord;
 
-/// The active trace id, when a trace is being recorded. Requests reuse it as
-/// their request id so a usage row, a log line, and a span all point at the
-/// same identifier.
+/// The trace the current request belongs to, when one is being recorded. Usage
+/// records carry it so a row joins the caller's trace; it is deliberately not
+/// the row's identity, since a caller's whole agent loop shares one trace.
 pub fn trace_id() -> Option<String> {
     if !super::is_exporting() {
         return None;
@@ -76,6 +76,8 @@ pub fn finish_upstream_attempt(
 /// the usage record is emitted, so spans, metrics, and sinks cannot disagree.
 pub fn record_request(record: &UsageRecord, ttft_ms: Option<u64>, attempts: u32) {
     let span = Span::current();
+    // The record's own id, not the trace id: a trace covers every request an
+    // agent loop makes, so reusing it would collapse distinct usage rows.
     span.record("axond.request_id", record.request_id.as_str());
     span.record("axond.namespace", record.namespace.as_str());
     span.record("axond.subject", record.subject.as_str());

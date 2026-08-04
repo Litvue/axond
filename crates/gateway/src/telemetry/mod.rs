@@ -43,6 +43,9 @@ pub const SERVICE_NAME: &str = "axond";
 
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The OTLP/HTTP signals axond exports.
+const SIGNALS: [&str; 2] = ["traces", "metrics"];
+
 static EXPORTING: AtomicBool = AtomicBool::new(false);
 
 /// Whether OTLP export was installed at boot. Instrumentation consults this to
@@ -159,7 +162,7 @@ fn init_with(config: TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         });
     };
 
-    let client = exporter::ExportClient::new();
+    let client = exporter::ExportClient::new()?;
     let span_exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .with_protocol(Protocol::HttpBinary)
@@ -203,14 +206,16 @@ fn init_with(config: TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
 }
 
 /// OTLP/HTTP wants a per-signal path. Accept either a base endpoint
-/// (`http://collector:4318`) or one already pointing at the signal.
+/// (`http://collector:4318`) or one already pointing at a signal — an endpoint
+/// naming *one* signal still has to yield the right URL for the other, so any
+/// signal path is stripped before the requested one is appended.
 fn signal_endpoint(endpoint: &str, signal: &str) -> String {
-    let suffix = format!("/v1/{signal}");
-    if endpoint.ends_with(&suffix) {
-        endpoint.to_owned()
-    } else {
-        format!("{}{suffix}", endpoint.trim_end_matches('/'))
-    }
+    let base = SIGNALS
+        .iter()
+        .fold(endpoint.trim_end_matches('/'), |base, s| {
+            base.trim_end_matches(&format!("/v1/{s}"))
+        });
+    format!("{}/v1/{signal}", base.trim_end_matches('/'))
 }
 
 #[cfg(test)]
@@ -240,6 +245,15 @@ mod tests {
         assert_eq!(
             signal_endpoint("http://collector:4318/v1/metrics", "metrics"),
             "http://collector:4318/v1/metrics"
+        );
+        // An endpoint naming one signal must still resolve the other.
+        assert_eq!(
+            signal_endpoint("http://collector:4318/v1/traces", "metrics"),
+            "http://collector:4318/v1/metrics"
+        );
+        assert_eq!(
+            signal_endpoint("http://collector:4318/otlp/", "traces"),
+            "http://collector:4318/otlp/v1/traces"
         );
     }
 
