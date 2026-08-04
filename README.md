@@ -57,6 +57,7 @@ cp axond.example.toml axond.toml      # edit providers/models/namespaces
 export GW_PLATFORM_OPENAI_API_KEY=sk-...
 export GW_PLATFORM_OPENAI_API_KEY_OVERFLOW=sk-...   # second key in the openai pool
 export GW_PLATFORM_ANTHROPIC_API_KEY=sk-ant-...
+export GW_PLATFORM_AZURE_OPENAI_API_KEY=...         # gpt-4o's failover target
 export GW_ACME_OPENAI_API_KEY=sk-...                # the example's BYOK namespace
 
 cargo run -p axond                    # or: just run
