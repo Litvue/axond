@@ -42,6 +42,16 @@ pub fn normalize_foundry_endpoint(endpoint: &str) -> String {
     }
 }
 
+/// Usage from an OpenAI-compatible embeddings response. Embeddings generate no
+/// completion, so only the prompt is billed: whatever the provider reports as
+/// output is ignored rather than priced.
+pub fn embeddings_usage(response: &Value) -> ModelUsage {
+    ModelUsage {
+        output_tokens: 0,
+        ..chat_usage(response)
+    }
+}
+
 impl ProviderAdapter for OpenAiCompatibleAdapter {
     fn name(&self) -> &'static str {
         match self.flavor {
@@ -185,6 +195,21 @@ mod tests {
             .unwrap();
         assert_eq!(body["model"], "deployment");
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn embeddings_usage_is_prompt_only() {
+        assert_eq!(
+            embeddings_usage(&json!({
+                "object": "list",
+                "data": [{ "embedding": [0.1, 0.2] }],
+                "usage": { "prompt_tokens": 8, "total_tokens": 8, "completion_tokens": 3 }
+            })),
+            ModelUsage {
+                input_tokens: 8,
+                ..ModelUsage::default()
+            }
+        );
     }
 
     #[test]

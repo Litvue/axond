@@ -6,10 +6,12 @@
 //! retries and connection pooling — and drives a [`gateway_core::ProviderAdapter`]
 //! against a real upstream.
 //!
-//! Scope of this scaffold: OpenAI-compatible dispatch, buffered and streamed.
-//! Per-attempt failover and the native Anthropic transport are tracked as
-//! follow-ups — the decoding logic already lives in `gateway-core`
-//! (`SseDecoder`, `AnthropicAdapter`), so this crate only has to feed bytes in.
+//! Two dispatch shapes are served. Adapter dispatch ([`HttpDispatcher::dispatch`])
+//! encodes through a `gateway-core` adapter, which may translate wire formats.
+//! Native dispatch ([`HttpDispatcher::send`]) forwards an already-shaped body to
+//! the provider's own path and returns its response untouched, for a caller that
+//! already speaks the target's wire. Both have a streamed twin that hands back
+//! undecoded bytes, since decoding is `gateway-core`'s job.
 
 use std::pin::Pin;
 
@@ -42,6 +44,21 @@ pub struct Upstream {
 pub enum AuthScheme {
     Bearer,
     Header(&'static str),
+}
+
+/// A request forwarded to a provider in the provider's own wire shape.
+///
+/// Nothing here is translated: the body is the caller's, the path is the
+/// provider's, and `headers` carries whatever the wire shape itself requires
+/// (Anthropic's `anthropic-version`, for instance). Deciding those is wire
+/// knowledge and belongs to the caller; the transport only sends them.
+pub struct NativeCall {
+    /// Provider name, used to attribute a failure to the upstream.
+    pub provider: &'static str,
+    /// Path appended to the provider's `base_url`, e.g. `/messages`.
+    pub path: &'static str,
+    pub body: serde_json::Value,
+    pub headers: Vec<(&'static str, String)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +123,80 @@ impl HttpDispatcher {
         let json: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| TransportError::Http(format!("decode upstream body: {e}")))?;
         Ok(adapter.decode_response(surface, json)?)
+    }
+
+    /// Native dispatch: POST an already-shaped body to the provider's own path
+    /// and hand back its response body unchanged. Nothing is encoded or decoded,
+    /// so a caller speaking the target's wire gets exactly what the provider
+    /// said — the fidelity a translated round trip cannot promise.
+    pub async fn send(
+        &self,
+        upstream: &Upstream,
+        call: &NativeCall,
+    ) -> Result<serde_json::Value, TransportError> {
+        let resp = self
+            .native_request(upstream, call, false)
+            .send()
+            .await
+            .map_err(|e| TransportError::Http(e.to_string()))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| TransportError::Http(e.to_string()))?;
+        if !status.is_success() {
+            return Err(ProviderError::from_upstream(call.provider, status.as_u16(), &text).into());
+        }
+        serde_json::from_str(&text)
+            .map_err(|e| TransportError::Http(format!("decode upstream body: {e}")))
+    }
+
+    /// Streaming native dispatch, the streamed twin of [`Self::send`]: the
+    /// undecoded upstream byte stream, so the relay can forward the provider's
+    /// own events. A non-success status is reported before any bytes flow.
+    pub async fn send_stream(
+        &self,
+        upstream: &Upstream,
+        call: &NativeCall,
+    ) -> Result<ByteStream, TransportError> {
+        let resp = self
+            .native_request(upstream, call, true)
+            .send()
+            .await
+            .map_err(|e| TransportError::Http(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::from_upstream(call.provider, status.as_u16(), &text).into());
+        }
+        Ok(Box::pin(resp.bytes_stream().map(|chunk| {
+            chunk.map_err(|e| TransportError::Http(e.to_string()))
+        })))
+    }
+
+    fn native_request(
+        &self,
+        upstream: &Upstream,
+        call: &NativeCall,
+        stream: bool,
+    ) -> reqwest::RequestBuilder {
+        let mut body = call.body.clone();
+        // Only the streamed twin asserts `stream`: a buffered native body is
+        // forwarded exactly as the caller wrote it, and a route without a
+        // `stream` parameter at all (embeddings) would reject one.
+        if stream && let Some(object) = body.as_object_mut() {
+            object.insert("stream".to_owned(), serde_json::Value::Bool(true));
+        }
+        let url = format!("{}{}", upstream.base_url.trim_end_matches('/'), call.path);
+        let mut req = self.client.post(url).json(&body);
+        req = match &upstream.auth {
+            AuthScheme::Bearer => req.bearer_auth(upstream.api_key.expose_secret()),
+            AuthScheme::Header(name) => req.header(*name, upstream.api_key.expose_secret()),
+        };
+        for (name, value) in &call.headers {
+            req = req.header(*name, value);
+        }
+        req.headers(trace_context_headers())
     }
 
     /// Streaming dispatch: encode via the adapter, POST with `stream: true`,

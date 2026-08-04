@@ -5,8 +5,15 @@
 //! `model` field to the resolved target. Cross-provider translation (e.g.
 //! routing an OpenAI request to Anthropic) reuses `gateway-core`'s adapters and
 //! is wired in as failover lands. A `stream: true` request takes the SSE relay
-//! in [`crate::streaming`]; native routes (`/v1/messages`) exist as typed
-//! `501`s rather than missing routes (delta B3).
+//! in [`crate::streaming`].
+//!
+//! The provider-native routes — Anthropic's `/v1/messages` and OpenAI-shaped
+//! `/v1/embeddings` — take the same path (ADR 0012). A caller already speaking
+//! the target's wire has its body forwarded to the provider's own endpoint with
+//! only `model` rewritten, so signed thinking and tool-use blocks survive
+//! byte-for-byte; only how usage is read back differs per route. `/v1/responses`
+//! is deferred past beta and answers with a typed `501` rather than being a
+//! missing route (delta B3).
 //!
 //! An alias's `targets` are tried in configured order (ADR 0008). The failover
 //! walk is the *outer* loop around credential-pool dispatch: each target has an
@@ -23,10 +30,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use gateway_core::{
-    CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, ModelPrice, ProviderError,
-    ProviderRequest, ProviderResponse, Surface, Usage,
+    CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, ModelPrice, ModelUsage,
+    NativeMessagesDecoder, ProviderError, ProviderRequest, ProviderResponse, ProviderStreamDecoder,
+    Surface, Usage,
 };
-use gateway_transport::{AuthScheme, TransportError, Upstream};
+use gateway_transport::{AuthScheme, NativeCall, TransportError, Upstream};
 use serde_json::{Value, json};
 use tracing::Instrument;
 
@@ -35,7 +43,7 @@ use crate::config::{Model, Provider, ProviderKind, Target};
 use crate::credentials::{CredentialPlan, CredentialSource};
 use crate::error::GatewayError;
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
-use crate::streaming::{self, StreamContext};
+use crate::streaming::{self, Framing, StreamContext};
 use crate::telemetry;
 use crate::usage::{Status, UsageRecord};
 
@@ -72,9 +80,13 @@ async fn list_models(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "object": "list", "data": data }))
 }
 
-/// Resolve the caller's namespace + subject from the bearer token. When no
+/// Resolve the caller's namespace + subject from the inbound key. When no
 /// gateway keys are configured the gateway is open (dev mode) and uses the
 /// default namespace.
+///
+/// The key travels as `Authorization: Bearer` or, because that is what an
+/// Anthropic SDK pointed at the gateway sends, as `x-api-key`. Both name the
+/// same gateway key; the scheme is the client's, not a second credential space.
 fn authenticate(
     snapshot: &ConfigSnapshot,
     headers: &HeaderMap,
@@ -89,6 +101,7 @@ fn authenticate(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
         .ok_or(GatewayError::Unauthorized)?;
     snapshot
         .inbound_keys
@@ -97,10 +110,202 @@ fn authenticate(
         .ok_or(GatewayError::Unauthorized)
 }
 
+/// The wire shape a route speaks, which is the only thing that differs between
+/// the routes: the upstream path, which provider kinds can serve it, and how
+/// usage is read out of the provider's answer. Everything else — aliasing,
+/// failover, credential pools, budgets, usage — is shared.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// OpenAI-shaped chat, dispatched *through* the provider adapter so a target
+    /// on another wire can still serve it by translation.
+    ChatCompletions,
+    /// Anthropic-shaped Messages, forwarded verbatim to an Anthropic target.
+    NativeMessages,
+    /// OpenAI-shaped embeddings, forwarded verbatim to an OpenAI-family target.
+    Embeddings,
+}
+
+impl Route {
+    /// The caller-facing path, for error messages.
+    fn label(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "/v1/chat/completions",
+            Self::NativeMessages => "/v1/messages",
+            Self::Embeddings => "/v1/embeddings",
+        }
+    }
+
+    /// Path appended to the provider's `base_url`.
+    fn upstream_path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "/chat/completions",
+            Self::NativeMessages => "/messages",
+            Self::Embeddings => "/embeddings",
+        }
+    }
+
+    /// Whether a provider of this kind speaks the route's wire shape. A native
+    /// route has no translation to fall back on, so an alias whose target cannot
+    /// serve the shape is a configuration mistake worth naming.
+    fn serves(self, kind: ProviderKind) -> bool {
+        match self {
+            Self::ChatCompletions => true,
+            Self::NativeMessages => kind == ProviderKind::Anthropic,
+            Self::Embeddings => {
+                matches!(kind, ProviderKind::Openai | ProviderKind::OpenaiCompatible)
+            }
+        }
+    }
+
+    fn streamable(self) -> bool {
+        self != Self::Embeddings
+    }
+
+    fn framing(self) -> Framing {
+        match self {
+            Self::ChatCompletions => Framing::OpenAiSse,
+            Self::NativeMessages | Self::Embeddings => Framing::Native,
+        }
+    }
+
+    /// Usage from a *native* response, mapped onto the canonical record every
+    /// route produces. Wire knowledge lives in `gateway-core`.
+    fn native_usage(self, response: &Value) -> ModelUsage {
+        match self {
+            Self::NativeMessages => gateway_core::native_message_usage(response),
+            // Chat never takes this path (its adapter reports usage), so the
+            // OpenAI-shaped prompt-only reader is the honest default.
+            Self::ChatCompletions | Self::Embeddings => gateway_core::embeddings_usage(response),
+        }
+    }
+
+    /// Pre-dispatch estimate the budget hold is priced from. Embeddings produce
+    /// no completion, so nothing is held for output.
+    fn estimate(self, body: &Value) -> Usage {
+        let estimate = estimate_usage(body);
+        match self {
+            Self::Embeddings => Usage {
+                output_tokens: 0,
+                ..estimate
+            },
+            _ => estimate,
+        }
+    }
+
+    /// Headers the wire shape itself requires upstream. Anthropic needs a
+    /// version; the caller's own value wins so an SDK pinned to a newer wire
+    /// keeps its behaviour, and its `anthropic-beta` opt-ins travel as sent.
+    fn wire_headers(self, headers: &HeaderMap) -> Vec<(&'static str, String)> {
+        if self != Self::NativeMessages {
+            return Vec::new();
+        }
+        let mut wire = vec![(
+            "anthropic-version",
+            headers
+                .get("anthropic-version")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or(gateway_core::AnthropicAdapter::VERSION)
+                .to_owned(),
+        )];
+        if let Some(beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+            wire.push(("anthropic-beta", beta.to_owned()));
+        }
+        wire
+    }
+}
+
+/// A route plus the wire headers this request carries upstream, threaded through
+/// the shared failover walk so both dispatch shapes reuse one request path.
+struct Wire {
+    route: Route,
+    headers: Vec<(&'static str, String)>,
+}
+
+impl Wire {
+    /// Reject an alias whose targets cannot speak the route's wire *before*
+    /// anything is reserved or dispatched: a native route has no translation to
+    /// fall back on, and failing over into a target that cannot serve the shape
+    /// would turn a config mistake into a confusing upstream `404`.
+    fn check_targets(
+        &self,
+        cfg: &crate::config::Config,
+        model: &Model,
+        alias: &str,
+    ) -> Result<(), GatewayError> {
+        for target in &model.targets {
+            let Some(provider) = cfg.provider(&target.provider) else {
+                continue;
+            };
+            if !self.route.serves(provider.kind) {
+                return Err(GatewayError::UnsupportedWire {
+                    route: self.route.label(),
+                    alias: alias.to_owned(),
+                    provider: provider.id.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn call(&self, body: Value, provider: &'static str) -> NativeCall {
+        NativeCall {
+            provider,
+            path: self.route.upstream_path(),
+            body,
+            headers: self.headers.clone(),
+        }
+    }
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
+) -> Result<Response, GatewayError> {
+    serve(state, headers, body, Route::ChatCompletions).await
+}
+
+/// Anthropic-native Messages. The caller's body already speaks the target's
+/// wire, so it is forwarded to the provider's `/messages` untouched but for the
+/// `model` alias — which is what keeps signed thinking and tool-use blocks
+/// intact through the gateway (ADR 0012).
+async fn native_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, GatewayError> {
+    serve(state, headers, body, Route::NativeMessages).await
+}
+
+async fn embeddings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, GatewayError> {
+    serve(state, headers, body, Route::Embeddings).await
+}
+
+/// Deferred past beta (ADR 0012): the OpenAI Responses API is a stateful
+/// surface, and serving it honestly needs more than passthrough. The route
+/// exists and says so, because a missing route is indistinguishable from a
+/// misconfigured `base_url`.
+async fn responses() -> Result<Json<Value>, GatewayError> {
+    Err(GatewayError::NotImplemented(
+        "the OpenAI Responses API (`/v1/responses`), deferred past beta by ADR 0012 \
+         in favour of `/v1/chat/completions`,",
+    ))
+}
+
+/// The one request path every route shares: authenticate against a single
+/// config snapshot, resolve the alias, hold a budget estimate, dispatch through
+/// the failover walk, then settle the hold and record exactly one usage record.
+/// Routes differ only in the wire they speak — where the body goes upstream and
+/// how usage is read back out (see [`Route`]).
+async fn serve(
+    state: AppState,
+    headers: HeaderMap,
+    body: Value,
+    route: Route,
 ) -> Result<Response, GatewayError> {
     // One snapshot for the whole request: a reload that lands mid-request
     // cannot change the alias, credential, or circuit this request resolved.
@@ -108,7 +313,7 @@ async fn chat_completions(
     let caller = authenticate(&snapshot, &headers)?;
     let cfg = &snapshot.config;
 
-    let streamed = body.get("stream").and_then(Value::as_bool) == Some(true);
+    let streamed = route.streamable() && body.get("stream").and_then(Value::as_bool) == Some(true);
 
     let alias = body
         .get("model")
@@ -119,6 +324,11 @@ async fn chat_completions(
     let model = cfg
         .model(&alias)
         .ok_or_else(|| GatewayError::UnknownModel(alias.clone()))?;
+    let wire = Wire {
+        route,
+        headers: route.wire_headers(&headers),
+    };
+    wire.check_targets(cfg, model, &alias)?;
 
     // Budget is denominated in micro-dollars. Hold a conservative cost estimate
     // from the first target's price before dispatch; settle the hold against the
@@ -127,7 +337,7 @@ async fn chat_completions(
         namespace: caller.namespace.clone(),
         subject: caller.subject.clone(),
     };
-    let estimate = estimate_usage(&body);
+    let estimate = route.estimate(&body);
     let estimated_cost = model.targets[0].price.cost_microdollars(estimate);
     let reservation = match state.0.budget.reserve(&budget_key, estimated_cost).await {
         Admission::Allowed(reservation) => reservation,
@@ -141,26 +351,30 @@ async fn chat_completions(
             &snapshot,
             &caller,
             model,
-            alias,
-            body,
-            BudgetHold {
-                key: budget_key,
-                reservation,
-                estimated_input_tokens: estimate.input_tokens,
+            StreamRequest {
+                alias,
+                body,
+                wire: &wire,
+                hold: BudgetHold {
+                    key: budget_key,
+                    reservation,
+                    estimated_input_tokens: estimate.input_tokens,
+                },
             },
         )
         .await;
     }
 
-    let outcome = match dispatch_with_failover(&state, &snapshot, &caller, model, &body).await {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            // Nothing reached a provider, so nothing was consumed: the whole
-            // estimate goes back rather than lingering until it expires.
-            state.0.budget.release(&budget_key, &reservation).await;
-            return Err(err);
-        }
-    };
+    let outcome =
+        match dispatch_with_failover(&state, &snapshot, &caller, model, &body, &wire).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                // Nothing reached a provider, so nothing was consumed: the whole
+                // estimate goes back rather than lingering until it expires.
+                state.0.budget.release(&budget_key, &reservation).await;
+                return Err(err);
+            }
+        };
     let served = &outcome.served;
     match outcome.result {
         Ok(response) => {
@@ -257,6 +471,7 @@ async fn dispatch_with_failover(
     caller: &InboundKey,
     model: &Model,
     body: &Value,
+    wire: &Wire,
 ) -> Result<FailoverOutcome, GatewayError> {
     let cfg = &snapshot.config;
     let policy = FailoverPolicy;
@@ -293,9 +508,17 @@ async fn dispatch_with_failover(
             UsageRecord::credential_source_str(plan.source),
         );
         let started = Instant::now();
-        let attempt = dispatch_over_pool(state, snapshot, provider, &plan, &target.model, req_body)
-            .instrument(attempt_span.clone())
-            .await;
+        let attempt = dispatch_over_pool(
+            state,
+            snapshot,
+            provider,
+            &plan,
+            &target.model,
+            req_body,
+            wire,
+        )
+        .instrument(attempt_span.clone())
+        .await;
         let latency_ms = started.elapsed().as_millis() as u64;
         // A non-streamed response arrives whole, so the first token lands with
         // the last one; the streaming relay reports the real first chunk.
@@ -372,10 +595,14 @@ async fn stream_with_failover(
     snapshot: &ConfigSnapshot,
     caller: &InboundKey,
     model: &Model,
-    alias: String,
-    body: Value,
-    hold: BudgetHold,
+    request: StreamRequest<'_>,
 ) -> Result<Response, GatewayError> {
+    let StreamRequest {
+        alias,
+        body,
+        wire,
+        hold,
+    } = request;
     let cfg = &snapshot.config;
     let policy = FailoverPolicy;
     let deadline = Instant::now() + Duration::from_millis(cfg.failover.overall_timeout_ms);
@@ -416,10 +643,6 @@ async fn stream_with_failover(
         };
         let mut req_body = body.clone();
         req_body["model"] = Value::String(target.model.clone());
-        let request = ProviderRequest {
-            model: target.model.clone(),
-            body: req_body,
-        };
         let mut ctx = StreamContext {
             namespace: caller.namespace.clone(),
             subject: caller.subject.clone(),
@@ -439,25 +662,48 @@ async fn stream_with_failover(
         let adapter = adapter_for(provider.kind);
         // Decoder creation is a property of the provider kind, not the upstream,
         // so its failure is the same for every remaining target — surface it
-        // rather than failing over.
-        let decoder = match adapter.stream_decoder(Surface::ChatCompletions) {
-            Ok(decoder) => decoder,
-            Err(err) => {
-                state.0.budget.release(&hold.key, &hold.reservation).await;
-                return Err(err.into());
-            }
+        // rather than failing over. A native stream is relayed verbatim, so its
+        // decoder only observes usage.
+        let decoder = match wire.route {
+            Route::ChatCompletions => match adapter.stream_decoder(Surface::ChatCompletions) {
+                Ok(decoder) => decoder,
+                Err(err) => {
+                    state.0.budget.release(&hold.key, &hold.reservation).await;
+                    return Err(err.into());
+                }
+            },
+            _ => Box::new(NativeMessagesDecoder::new()) as Box<dyn ProviderStreamDecoder>,
         };
         let started = Instant::now();
-        let opened = streaming::open_stream(
-            state,
-            &ctx,
-            adapter.as_ref(),
-            &upstream,
-            Surface::ChatCompletions,
-            request,
-            walk.attempts,
-        )
-        .await;
+        let dispatcher = &state.0.dispatcher;
+        let opened = match wire.route {
+            Route::ChatCompletions => {
+                let request = ProviderRequest {
+                    model: target.model.clone(),
+                    body: req_body,
+                };
+                streaming::open_stream(
+                    &ctx,
+                    walk.attempts,
+                    dispatcher.dispatch_stream(
+                        adapter.as_ref(),
+                        &upstream,
+                        Surface::ChatCompletions,
+                        request,
+                    ),
+                )
+                .await
+            }
+            _ => {
+                let call = wire.call(req_body, adapter.name());
+                streaming::open_stream(
+                    &ctx,
+                    walk.attempts,
+                    dispatcher.send_stream(&upstream, &call),
+                )
+                .await
+            }
+        };
         walk.attempts += 1;
         ctx.attempts = walk.attempts;
 
@@ -478,6 +724,7 @@ async fn stream_with_failover(
                     decoder,
                     bytes,
                     started,
+                    wire.route.framing(),
                 ));
             }
             Err(err) => {
@@ -506,6 +753,16 @@ async fn stream_with_failover(
     }
     state.0.budget.release(&hold.key, &hold.reservation).await;
     Err(walk.into_error())
+}
+
+/// One streamed request as the failover walk sees it: the alias it resolved,
+/// the body to forward, the wire it speaks, and the budget hold it was admitted
+/// under.
+struct StreamRequest<'a> {
+    alias: String,
+    body: Value,
+    wire: &'a Wire,
+    hold: BudgetHold,
 }
 
 /// The budget reservation a request is dispatched under, plus the input-token
@@ -637,6 +894,7 @@ async fn dispatch_over_pool(
     plan: &CredentialPlan,
     target_model: &str,
     body: Value,
+    wire: &Wire,
 ) -> PooledAttempt {
     let adapter = adapter_for(provider.kind);
     let mut exhausted: Option<PooledAttempt> = None;
@@ -650,20 +908,35 @@ async fn dispatch_over_pool(
                 ProviderKind::Openai | ProviderKind::OpenaiCompatible => AuthScheme::Bearer,
             },
         };
-        let request = ProviderRequest {
-            model: target_model.to_string(),
-            body: body.clone(),
+        let result = match wire.route {
+            Route::ChatCompletions => {
+                let request = ProviderRequest {
+                    model: target_model.to_string(),
+                    body: body.clone(),
+                };
+                state
+                    .0
+                    .dispatcher
+                    .dispatch(
+                        adapter.as_ref(),
+                        &upstream,
+                        Surface::ChatCompletions,
+                        request,
+                    )
+                    .await
+            }
+            // Native: the provider's answer is handed back untouched, and only
+            // its usage block is read into the canonical record.
+            route => state
+                .0
+                .dispatcher
+                .send(&upstream, &wire.call(body.clone(), adapter.name()))
+                .await
+                .map(|body| ProviderResponse {
+                    usage: route.native_usage(&body),
+                    body,
+                }),
         };
-        let result = state
-            .0
-            .dispatcher
-            .dispatch(
-                adapter.as_ref(),
-                &upstream,
-                Surface::ChatCompletions,
-                request,
-            )
-            .await;
         match result {
             Ok(response) => {
                 snapshot.credentials.record_success(lease);
@@ -717,20 +990,6 @@ fn to_usage(u: &gateway_core::ModelUsage) -> Usage {
         cache_read_tokens: u.cache_read_tokens,
         cache_write_tokens: u.cache_write_tokens,
     }
-}
-
-async fn native_messages() -> Result<Json<Value>, GatewayError> {
-    Err(GatewayError::NotImplemented(
-        "native Anthropic /v1/messages",
-    ))
-}
-
-async fn embeddings() -> Result<Json<Value>, GatewayError> {
-    Err(GatewayError::NotImplemented("/v1/embeddings"))
-}
-
-async fn responses() -> Result<Json<Value>, GatewayError> {
-    Err(GatewayError::NotImplemented("/v1/responses"))
 }
 
 /// Conservative pre-dispatch usage estimate: input tokens from the request body
@@ -889,13 +1148,41 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
         assert_eq!(json["error"]["type"], "unknown_model");
     }
 
+    /// Deferred past beta, but the route still answers for itself: a caller
+    /// cannot tell a missing route from a misconfigured `base_url`.
     #[tokio::test]
-    async fn native_messages_route_exists_and_returns_typed_501() {
+    async fn the_responses_route_is_a_typed_501_that_names_its_deferral() {
         let resp = router(test_state())
-            .oneshot(Request::post("/v1/messages").body(Body::empty()).unwrap())
+            .oneshot(Request::post("/v1/responses").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "not_implemented");
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(message.contains("/v1/chat/completions"), "{message}");
+    }
+
+    /// An alias whose targets cannot speak the route's wire is the caller's
+    /// mistake, answered as a typed 4xx before anything is dispatched — there is
+    /// no translation to fall back on for a native route.
+    #[tokio::test]
+    async fn an_openai_only_alias_on_the_native_route_is_a_typed_4xx() {
+        let body = serde_json::to_vec(&json!({ "model": "gpt-4o", "messages": [] })).unwrap();
+        let resp = router(test_state())
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "unsupported_wire");
     }
 
     /// Collects records so attribution can be asserted.
@@ -1337,6 +1624,180 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(records[0].status.as_str(), "upstream_error");
         assert_eq!(records[0].target_provider, "pa");
         assert_eq!(records[0].attempts, 1);
+    }
+
+    /// What the upstream was actually sent, so passthrough can be asserted from
+    /// the provider's side as well as the caller's.
+    type Received = Arc<Mutex<Vec<(Value, HeaderMap)>>>;
+
+    /// A stand-in provider serving one native path, answering with a fixed body
+    /// (or SSE text) and recording every request it received.
+    async fn native_upstream(path: &'static str, answer: Response) -> (String, Received) {
+        let received: Received = Arc::new(Mutex::new(Vec::new()));
+        let seen = received.clone();
+        let answer = Arc::new(Mutex::new(Some(answer)));
+        let app = Router::new().route(
+            path,
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let seen = seen.clone();
+                let answer = answer.clone();
+                async move {
+                    seen.lock().unwrap().push((body, headers));
+                    answer.lock().unwrap().take().expect("one request")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), received)
+    }
+
+    /// One alias over one target of the given provider kind, at 1 µ$/token both
+    /// ways so a settled cost reads as a token count.
+    fn native_state(kind: &str, base_url: &str, captured: CapturingSink) -> AppState {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "p"
+kind = "{kind}"
+base_url = "{base_url}"
+
+[[credential]]
+namespace = "platform"
+provider = "p"
+env = "K1"
+id = "cred-a"
+
+[[model]]
+name = "alias"
+targets = [{{ provider = "p", model = "upstream-model", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 1000000 }} }}]
+"#
+        ))
+        .unwrap();
+        let env = HashMap::from([("K1".to_owned(), "sk-test".to_owned())]);
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(captured)];
+        AppState::new(cfg, &env, UsageFanout::new(sinks), Box::new(NoBudget)).unwrap()
+    }
+
+    /// The point of serving the native wire: a body a translation would mangle
+    /// (a signed thinking block, a tool-use block) crosses the gateway
+    /// unchanged, and only `model` differs from what the caller sent.
+    #[tokio::test]
+    async fn a_native_message_is_forwarded_verbatim_with_only_the_model_rewritten() {
+        let upstream_answer = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                { "type": "thinking", "thinking": "deliberating", "signature": "sig-abc" },
+                { "type": "tool_use", "id": "toolu_1", "name": "search", "input": { "q": "x" } }
+            ],
+            "stop_reason": "tool_use",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 2,
+                "cache_read_input_tokens": 1
+            }
+        });
+        let (base_url, received) =
+            native_upstream("/messages", Json(upstream_answer.clone()).into_response()).await;
+        let captured = CapturingSink::default();
+        let state = native_state("anthropic", &base_url, captured.clone());
+
+        let sent = json!({
+            "model": "alias",
+            "max_tokens": 64,
+            "thinking": { "type": "enabled", "budget_tokens": 32 },
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    { "type": "thinking", "thinking": "earlier", "signature": "sig-prior" }
+                ]
+            }],
+            "tools": [{ "name": "search", "input_schema": { "type": "object" } }]
+        });
+        let resp = router(state)
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", "2099-01-01")
+                    .body(Body::from(serde_json::to_vec(&sent).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let returned: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(returned, upstream_answer);
+
+        let requests = received.lock().unwrap();
+        let (forwarded, headers) = &requests[0];
+        let mut expected = sent.clone();
+        expected["model"] = json!("upstream-model");
+        assert_eq!(forwarded, &expected);
+        // The caller's pinned wire version is honoured, and the provider key is
+        // injected in Anthropic's own scheme.
+        assert_eq!(headers["anthropic-version"], "2099-01-01");
+        assert_eq!(headers["x-api-key"], "sk-test");
+
+        let records = captured.0.lock().unwrap();
+        assert_eq!(records[0].input_tokens, 10);
+        assert_eq!(records[0].output_tokens, 5);
+        // Anthropic's cache counters are billed too, at the input rate here.
+        assert_eq!(records[0].cost_microdollars, 18);
+        assert_eq!(records[0].status.as_str(), "ok");
+    }
+
+    /// Embeddings have no completion to bill, so the record carries input only
+    /// even when the provider reports something else.
+    #[tokio::test]
+    async fn embeddings_pass_through_and_bill_input_only() {
+        let answer = json!({
+            "object": "list",
+            "data": [{ "object": "embedding", "index": 0, "embedding": [0.25, -0.5] }],
+            "usage": { "prompt_tokens": 8, "total_tokens": 8, "completion_tokens": 4 }
+        });
+        let (base_url, received) =
+            native_upstream("/embeddings", Json(answer.clone()).into_response()).await;
+        let captured = CapturingSink::default();
+        let state = native_state("openai", &base_url, captured.clone());
+
+        let sent = json!({ "model": "alias", "input": ["one", "two"], "dimensions": 2 });
+        let resp = router(state)
+            .oneshot(
+                Request::post("/v1/embeddings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&sent).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), answer);
+
+        // Forwarded as sent but for the model — notably without a `stream` field,
+        // which the embeddings endpoint does not accept.
+        let requests = received.lock().unwrap();
+        let (forwarded, _) = &requests[0];
+        assert_eq!(
+            forwarded,
+            &json!({ "model": "upstream-model", "input": ["one", "two"], "dimensions": 2 })
+        );
+
+        let records = captured.0.lock().unwrap();
+        assert_eq!(records[0].input_tokens, 8);
+        assert_eq!(records[0].output_tokens, 0);
+        assert_eq!(records[0].cost_microdollars, 8);
     }
 
     #[tokio::test]
