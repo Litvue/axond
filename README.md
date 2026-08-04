@@ -50,8 +50,15 @@ centralizes that:
 
 ```bash
 cp axond.example.toml axond.toml      # edit providers/models/namespaces
-export GW_PLATFORM_OPENAI_API_KEY=sk-...     # secrets by env, referenced from config
-cargo run -p axond                        # or: just run
+
+# Secrets by env, referenced from config. Every credential the config declares
+# must resolve, so either set all of these or delete the entries you don't want.
+export GW_PLATFORM_OPENAI_API_KEY=sk-...
+export GW_PLATFORM_OPENAI_API_KEY_OVERFLOW=sk-...   # second key in the openai pool
+export GW_PLATFORM_ANTHROPIC_API_KEY=sk-ant-...
+export GW_ACME_OPENAI_API_KEY=sk-...                # the example's BYOK namespace
+
+cargo run -p axond                    # or: just run
 ```
 
 ```bash

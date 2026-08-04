@@ -54,9 +54,12 @@ and is left to target failover and the per-target breaker.
 
 **Credential health is a circuit scoped below the target.** After
 `failure_threshold` consecutive credential-scoped failures a credential is parked
-for `cooldown_seconds`, then re-offered as a half-open probe; a success clears
-its history. Inspection never advances the cooldown, so a credential that is
-merely passed over keeps its deadline. The breaker lives in the gateway crate
+for `cooldown_seconds`, then re-offered as a half-open probe; a success clears its
+history. The probe is single-shot and taking it re-arms the cooldown, so a burst
+of concurrent requests cannot all pay a round-trip to a key that is still
+known-bad. The probe *leads* the plan rather than trailing it, so the request
+holding it actually exercises the key, and a probe failure simply continues the
+walk into the healthy credentials. The breaker lives in the gateway crate
 next to the pool, deliberately separate from `gateway-core`'s per-target breaker:
 a bad key parks that key, and the target stays available to every other key. When
 *every* credential in a pool is parked and none is due a probe, the request still

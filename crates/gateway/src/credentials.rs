@@ -66,6 +66,15 @@ pub enum CredentialState {
     Parked,
 }
 
+/// What one request may do with a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Eligibility {
+    Healthy,
+    /// Parked, and this request holds the single half-open probe.
+    Probe,
+    Parked,
+}
+
 struct PoolEntry {
     id: String,
     secret: SecretString,
@@ -123,7 +132,7 @@ impl Pool {
 
 /// Per-credential circuit breaker. Distinct from `gateway-core`'s per-target
 /// breaker: a credential that is rate-limited or out of quota is parked on its
-/// own, and recovers through a half-open probe once the cooldown elapses.
+/// own, and recovers through a single half-open probe once the cooldown elapses.
 struct CredentialHealth {
     threshold: u32,
     cooldown: Duration,
@@ -145,15 +154,23 @@ impl CredentialHealth {
         }
     }
 
-    /// Non-mutating: a parked credential becomes eligible again only as a probe
-    /// once its cooldown has elapsed. Inspection never advances the cooldown, so
-    /// a credential that is merely *passed over* keeps its parked deadline.
-    fn eligible_at(&self, key: &str, now: Instant) -> bool {
-        self.lock().get(key).is_none_or(|circuit| {
-            circuit
-                .parked_at
-                .is_none_or(|parked_at| now.saturating_duration_since(parked_at) >= self.cooldown)
-        })
+    /// Classify a credential for one request, **taking** the half-open probe when
+    /// this is the request that gets it. Handing out a probe re-arms the cooldown
+    /// under the same lock, so exactly one request per cooldown window pays a
+    /// round-trip to a credential that is still known-bad.
+    fn classify_at(&self, key: &str, now: Instant) -> Eligibility {
+        let mut circuits = self.lock();
+        let Some(circuit) = circuits.get_mut(key) else {
+            return Eligibility::Healthy;
+        };
+        match circuit.parked_at {
+            None => Eligibility::Healthy,
+            Some(parked_at) if now.saturating_duration_since(parked_at) >= self.cooldown => {
+                circuit.parked_at = Some(now);
+                Eligibility::Probe
+            }
+            Some(_) => Eligibility::Parked,
+        }
     }
 
     fn record_success(&self, key: &str) {
@@ -287,20 +304,30 @@ impl Credentials {
         };
 
         let order = pool.order(self.strategy);
-        let mut attempts: Vec<CredentialLease> = order
-            .iter()
-            .map(|&i| &pool.entries[i])
-            .filter(|entry| self.health.eligible_at(&entry.health_key, now))
-            .map(lease)
-            .collect();
+        let entries = order.iter().map(|&i| &pool.entries[i]);
+        // A parked credential whose cooldown elapsed leads the plan as a
+        // half-open probe, and only one request per cooldown window gets it. The
+        // probe is first so it is actually attempted; if it fails, the walk
+        // continues into the healthy credentials and the request still succeeds.
+        let mut attempts: Vec<CredentialLease> = Vec::new();
+        let mut parked: Vec<&PoolEntry> = Vec::new();
+        for entry in entries {
+            match self.health.classify_at(&entry.health_key, now) {
+                Eligibility::Healthy => attempts.push(lease(entry)),
+                Eligibility::Probe => attempts.insert(0, lease(entry)),
+                Eligibility::Parked => parked.push(entry),
+            }
+        }
         // Every credential is parked and none is due a probe. Health is
         // advisory, so the request still gets the rotation's first choice rather
         // than being failed on stale bookkeeping.
         if attempts.is_empty() {
-            attempts = order
+            attempts = parked
                 .first()
-                .map(|&i| vec![lease(&pool.entries[i])])
-                .unwrap_or_default();
+                .map(|entry| vec![lease(entry)])
+                .into_iter()
+                .flatten()
+                .collect();
         }
         if attempts.is_empty() {
             return None;
@@ -485,7 +512,17 @@ weight = 1
             .plan_at(&cfg, "platform", "openai", after_cooldown)
             .expect("plan");
         let ids: Vec<&str> = plan.attempts.iter().map(|a| a.id.as_str()).collect();
-        assert!(ids.contains(&"openai-a"), "probe must re-offer the key");
+        assert_eq!(ids[0], "openai-a", "the probe leads the plan");
+
+        let next = creds
+            .plan_at(&cfg, "platform", "openai", after_cooldown)
+            .expect("plan");
+        let ids: Vec<&str> = next.attempts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["openai-b"],
+            "the probe is single-shot: a concurrent request must not retry the parked key"
+        );
         let probed = plan
             .attempts
             .iter()
