@@ -29,6 +29,9 @@ pub struct Config {
     /// one credential: how a credential is picked and when a bad one is parked.
     #[serde(default)]
     pub credential_pool: CredentialPool,
+    /// Ordered failover across an alias's targets and per-target circuit health.
+    #[serde(default)]
+    pub failover: Failover,
     /// Inbound gateway keys. Each binds a secret (resolved from `env`) to a
     /// namespace. When empty, the gateway is unauthenticated and every request
     /// uses the default namespace — intended for local dev only.
@@ -162,6 +165,42 @@ pub enum SelectionStrategy {
     Weighted,
 }
 
+/// Ordered failover across an alias's `targets`, plus the per-target circuit
+/// breaker. This is the *outer* loop around credential-pool dispatch: a target
+/// is skipped while its circuit is open, and a retryable upstream failure
+/// advances to the next target. The bounds cap how much failover can amplify a
+/// request's latency (ADR 0008).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Failover {
+    /// Upper bound on upstream target attempts for one request. The retry count
+    /// a request can add is `max_attempts - 1`, so this caps latency
+    /// amplification even for an alias with many targets.
+    #[serde(default = "default_failover_max_attempts")]
+    pub max_attempts: u32,
+    /// Overall wall-clock budget for the whole failover walk, in milliseconds.
+    /// No further target is attempted once it is spent.
+    #[serde(default = "default_failover_overall_timeout_ms")]
+    pub overall_timeout_ms: u64,
+    /// Consecutive target-scoped failures that trip a target's circuit. Distinct
+    /// from `credential_pool.failure_threshold`, which parks a single credential.
+    #[serde(default = "default_target_failure_threshold")]
+    pub failure_threshold: u32,
+    /// How long a tripped target circuit waits before a half-open probe.
+    #[serde(default = "default_target_cooldown_seconds")]
+    pub cooldown_seconds: u64,
+}
+
+impl Default for Failover {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_failover_max_attempts(),
+            overall_timeout_ms: default_failover_overall_timeout_ms(),
+            failure_threshold: default_target_failure_threshold(),
+            cooldown_seconds: default_target_cooldown_seconds(),
+        }
+    }
+}
+
 fn default_weight() -> u32 {
     1
 }
@@ -171,6 +210,22 @@ fn default_credential_failure_threshold() -> u32 {
 }
 
 fn default_credential_cooldown_seconds() -> u64 {
+    30
+}
+
+fn default_failover_max_attempts() -> u32 {
+    3
+}
+
+fn default_failover_overall_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_target_failure_threshold() -> u32 {
+    3
+}
+
+fn default_target_cooldown_seconds() -> u64 {
     30
 }
 
@@ -244,6 +299,26 @@ impl Config {
         if self.credential_pool.cooldown_seconds == 0 {
             return Err(ConfigError::Invalid(
                 "credential_pool.cooldown_seconds must be at least 1".into(),
+            ));
+        }
+        if self.failover.max_attempts == 0 {
+            return Err(ConfigError::Invalid(
+                "failover.max_attempts must be at least 1".into(),
+            ));
+        }
+        if self.failover.overall_timeout_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "failover.overall_timeout_ms must be at least 1".into(),
+            ));
+        }
+        if self.failover.failure_threshold == 0 {
+            return Err(ConfigError::Invalid(
+                "failover.failure_threshold must be at least 1".into(),
+            ));
+        }
+        if self.failover.cooldown_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "failover.cooldown_seconds must be at least 1".into(),
             ));
         }
         let mut labels: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
@@ -357,6 +432,32 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
         let cfg = Config::from_toml_str(VALID).expect("valid config");
         assert_eq!(cfg.default_namespace(), "platform");
         assert!(cfg.model("gpt-4o").is_some());
+    }
+
+    #[test]
+    fn failover_has_sane_defaults_when_omitted() {
+        let cfg = Config::from_toml_str(VALID).expect("valid config");
+        assert_eq!(cfg.failover.max_attempts, 3);
+        assert_eq!(cfg.failover.overall_timeout_ms, 30_000);
+        assert_eq!(cfg.failover.failure_threshold, 3);
+        assert_eq!(cfg.failover.cooldown_seconds, 30);
+    }
+
+    #[test]
+    fn rejects_zero_valued_failover_bounds() {
+        for field in [
+            "max_attempts",
+            "overall_timeout_ms",
+            "failure_threshold",
+            "cooldown_seconds",
+        ] {
+            let toml = format!("{VALID}\n[failover]\n{field} = 0\n");
+            let err = Config::from_toml_str(&toml).expect_err("zero must be rejected");
+            assert!(
+                matches!(err, ConfigError::Invalid(msg) if msg.contains(field)),
+                "expected an Invalid error mentioning `{field}`",
+            );
+        }
     }
 
     #[test]

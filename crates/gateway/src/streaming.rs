@@ -24,13 +24,12 @@ use gateway_core::{
     ModelPrice, ModelUsage, ProviderAdapter, ProviderRequest, ProviderStreamDecoder,
     ProviderStreamEvent, SseDecoder, Surface,
 };
-use gateway_transport::{ByteStream, Upstream};
+use gateway_transport::{ByteStream, TransportError, Upstream};
 use serde_json::{Value, json};
 use tracing::Instrument;
 
 use crate::budget::BudgetKey;
 use crate::credentials::CredentialSource;
-use crate::error::GatewayError;
 use crate::routes::next_request_id;
 use crate::state::AppState;
 use crate::telemetry;
@@ -50,28 +49,33 @@ pub struct StreamContext {
     pub trace_id: Option<String>,
     pub price: ModelPrice,
     pub budget_key: BudgetKey,
+    /// Upstream target attempts made before this stream opened (or the walk
+    /// gave up), so the settled record matches the buffered path's attribution.
+    pub attempts: u32,
 }
 
-/// Open the upstream stream and return the client-facing SSE response.
+/// Attempt to open one target's upstream stream, wrapped in its per-attempt
+/// child span. Returns the undecoded byte stream on success, or the transport
+/// error so the failover loop can decide whether to advance to the next target
+/// — failover is only possible here, *before* the first byte is relayed.
 ///
-/// An upstream that fails before any byte is relayed becomes a typed error
-/// response (the caller never saw a `200`); an upstream that fails mid-stream
-/// is surfaced as a terminal `error` event followed by `[DONE]`.
-pub async fn relay(
-    state: AppState,
-    ctx: StreamContext,
-    adapter: Box<dyn ProviderAdapter>,
-    upstream: Upstream,
+/// A non-success upstream status is reported by `dispatch_stream` before any
+/// bytes flow, so a failed open never yields a partially-consumed stream.
+pub async fn open_stream(
+    state: &AppState,
+    ctx: &StreamContext,
+    adapter: &dyn ProviderAdapter,
+    upstream: &Upstream,
     surface: Surface,
     request: ProviderRequest,
-) -> Result<Response, GatewayError> {
-    let started = Instant::now();
-    let decoder = adapter.stream_decoder(surface)?;
+    attempt: u32,
+) -> Result<ByteStream, TransportError> {
     // The attempt span covers opening the stream, which is where a failed
     // stream fails; the relayed body outlives it, so its TTFT is reported
     // through the metrics at settlement instead.
+    let started = Instant::now();
     let attempt_span = telemetry::upstream_attempt_span(
-        0,
+        attempt,
         &ctx.target_provider,
         &ctx.target_model,
         UsageRecord::credential_source_str(ctx.source),
@@ -79,7 +83,7 @@ pub async fn relay(
     let opened = state
         .0
         .dispatcher
-        .dispatch_stream(adapter.as_ref(), &upstream, surface, request)
+        .dispatch_stream(adapter, upstream, surface, request)
         .instrument(attempt_span.clone())
         .await;
     telemetry::finish_upstream_attempt(
@@ -92,15 +96,21 @@ pub async fn relay(
         started.elapsed().as_millis() as u64,
         None,
     );
-    let bytes = match opened {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            let mut accounting = Accounting::new(state, ctx, started);
-            accounting.settle(Status::UpstreamError);
-            return Err(err.into());
-        }
-    };
+    opened
+}
 
+/// Build the client-facing SSE response from an already-opened upstream stream.
+///
+/// The caller has committed to this target (the first byte is about to flow),
+/// so there is no more failover: an upstream that fails mid-stream is surfaced
+/// as a terminal `error` event followed by `[DONE]`.
+pub fn relay_opened(
+    state: AppState,
+    ctx: StreamContext,
+    decoder: Box<dyn ProviderStreamDecoder>,
+    bytes: ByteStream,
+    started: Instant,
+) -> Response {
     let relay = Relay {
         bytes,
         carry: Vec::new(),
@@ -124,7 +134,15 @@ pub async fn relay(
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    Ok(response)
+    response
+}
+
+/// Settle a streamed request that never opened a stream (every target failed or
+/// was skipped) as a single upstream-error usage record, so a failed stream
+/// still reconciles exactly one record like the buffered path.
+pub fn settle_upstream_error(state: AppState, ctx: StreamContext, started: Instant) {
+    let mut accounting = Accounting::new(state, ctx, started);
+    accounting.settle(Status::UpstreamError);
 }
 
 enum Phase {
@@ -355,6 +373,7 @@ impl Accounting {
             cost_microdollars: cost,
             catalog_version: 0,
             latency_ms,
+            attempts: self.ctx.attempts,
         };
         telemetry::record_streamed(&record, self.ttft_ms);
         let budget_key = self.ctx.budget_key.clone();
@@ -530,6 +549,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
                 namespace: "platform".to_owned(),
                 subject: "anonymous".to_owned(),
             },
+            attempts: 1,
         }
     }
 
@@ -682,5 +702,100 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         let record = settled(&ledger).await;
         assert_eq!(record["status"], "client_cancelled");
         assert_eq!(ledger.commits.lock().expect("ledger").len(), 1);
+    }
+
+    /// An upstream that never opens a stream: it answers a non-200 status, so
+    /// the dispatch fails before a single byte is relayed.
+    async fn failing_to_open_upstream(status: StatusCode) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            post(move || async move { (status, "upstream is unavailable") }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn two_target_stream_state(url_a: &str, url_b: &str, ledger: Arc<Ledger>) -> AppState {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "pa"
+kind = "openai"
+base_url = "{url_a}"
+
+[[provider]]
+id = "pb"
+kind = "openai"
+base_url = "{url_b}"
+
+[[credential]]
+namespace = "platform"
+provider = "pa"
+env = "KA"
+
+[[credential]]
+namespace = "platform"
+provider = "pb"
+env = "KB"
+
+[[model]]
+name = "gpt-4o"
+targets = [
+  {{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000 }} }},
+  {{ provider = "pb", model = "m-b", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000 }} }},
+]
+"#
+        ))
+        .expect("config");
+        let env = HashMap::from([
+            ("KA".to_owned(), "a".to_owned()),
+            ("KB".to_owned(), "b".to_owned()),
+        ]);
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(LedgerSink(ledger.clone()))];
+        AppState::new(
+            cfg,
+            &env,
+            UsageFanout::new(sinks),
+            Box::new(LedgerBudget(ledger)),
+        )
+        .expect("state")
+    }
+
+    #[tokio::test]
+    async fn streaming_fails_over_to_the_next_target_before_the_first_byte() {
+        let ledger = Arc::new(Ledger::default());
+        let url_a = failing_to_open_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let url_b = upstream_serving(OPENAI_STREAM).await;
+        let resp = router(two_target_stream_state(&url_a, &url_b, ledger.clone()))
+            .oneshot(stream_request())
+            .await
+            .expect("response");
+
+        // The first target failed to open, so failover picked the second and the
+        // client only ever saw a successful `200` stream.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body().into_data_stream();
+        let mut relayed = String::new();
+        while let Some(chunk) = body.next().await {
+            relayed.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+        }
+        assert!(relayed.contains("\"content\":\"hel\""));
+        assert!(relayed.ends_with("data: [DONE]\n\n"));
+
+        let record = settled(&ledger).await;
+        assert_eq!(record["status"], "ok");
+        assert_eq!(record["target_provider"], "pb");
+        assert_eq!(record["target_model"], "m-b");
+        assert_eq!(record["attempts"], 2);
     }
 }
