@@ -52,6 +52,10 @@ pub struct Config {
     /// JSON line per record on stdout (ADR 0002).
     #[serde(default)]
     pub usage_sink: Vec<UsageSinkConfig>,
+    /// Spend cap enforcement. Defaults to no budget at all, so nothing drags a
+    /// datastore onto the default path (ADR 0002).
+    #[serde(default)]
+    pub budget: BudgetConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -365,6 +369,119 @@ fn default_flush_interval_ms() -> u64 {
     1_000
 }
 
+/// The spend cap and the store that enforces it. `backend` decides which of the
+/// remaining fields apply; they are validated as a set at boot, so a shared
+/// backend without a DSN reference — or a cap of zero, which would deny every
+/// request — refuses to start (ADR 0010).
+#[derive(Debug, Clone, Deserialize)]
+pub struct BudgetConfig {
+    #[serde(default)]
+    pub backend: BudgetBackend,
+    /// The cap, in micro-dollars, per `(namespace, subject)`. Required by every
+    /// backend but `none`.
+    #[serde(default)]
+    pub limit_microdollars: u64,
+    /// What to do when the store cannot be reached. Fail-closed by default: an
+    /// unenforceable cap denies rather than silently admitting.
+    #[serde(default)]
+    pub on_unavailable: StoreUnavailable,
+    /// `redis` / `postgres`: name of the env var holding the connection string.
+    /// The DSN is a secret, so it is referenced rather than inlined.
+    #[serde(default)]
+    pub dsn_env: Option<String>,
+    /// `postgres`: base table name. The reservation table is
+    /// `<table>_reservation`. Defaults to `axond_budget`, matching the shipped
+    /// DDL.
+    #[serde(default)]
+    pub table: Option<String>,
+    /// `postgres`: apply the shipped DDL at boot. Off by default — most
+    /// deployments give the gateway's role no DDL rights.
+    #[serde(default)]
+    pub create_table: bool,
+    /// `redis`: key namespace for budget state.
+    #[serde(default)]
+    pub key_prefix: Option<String>,
+    /// How long a reservation is held before the store reclaims it. It bounds
+    /// how long a replica that died mid-request holds budget it will never
+    /// settle, so it should exceed the longest expected request.
+    #[serde(default = "default_reservation_ttl_seconds")]
+    pub reservation_ttl_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BudgetBackend {
+    /// Always admit. The default: no cap, no datastore.
+    #[default]
+    None,
+    /// Per-replica holds and counters; a fleet enforces per-replica ceilings.
+    InMemory,
+    /// Shared across replicas, atomic per key.
+    Redis,
+    Postgres,
+}
+
+impl BudgetBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::InMemory => "in-memory",
+            Self::Redis => "redis",
+            Self::Postgres => "postgres",
+        }
+    }
+
+    /// Whether the backend keeps its state outside the process, and so needs a
+    /// connection string and an unavailability stance.
+    fn is_shared(self) -> bool {
+        matches!(self, Self::Redis | Self::Postgres)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StoreUnavailable {
+    #[default]
+    Deny,
+    Allow,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            backend: BudgetBackend::None,
+            limit_microdollars: 0,
+            on_unavailable: StoreUnavailable::Deny,
+            dsn_env: None,
+            table: None,
+            create_table: false,
+            key_prefix: None,
+            reservation_ttl_seconds: default_reservation_ttl_seconds(),
+        }
+    }
+}
+
+impl BudgetConfig {
+    pub fn table(&self) -> String {
+        self.table
+            .clone()
+            .unwrap_or_else(|| DEFAULT_BUDGET_TABLE.to_owned())
+    }
+
+    pub fn key_prefix(&self) -> String {
+        self.key_prefix
+            .clone()
+            .unwrap_or_else(|| DEFAULT_BUDGET_KEY_PREFIX.to_owned())
+    }
+}
+
+const DEFAULT_BUDGET_TABLE: &str = "axond_budget";
+const DEFAULT_BUDGET_KEY_PREFIX: &str = "axond:budget";
+
+fn default_reservation_ttl_seconds() -> u64 {
+    300
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayKey {
     /// Env var holding the inbound key secret.
@@ -510,6 +627,43 @@ impl Config {
             }
         }
         self.validate_usage_sinks()?;
+        self.validate_budget()?;
+        Ok(())
+    }
+
+    /// A budget's fields only make sense together: a cap of zero would deny
+    /// every request, and a shared backend without a DSN reference cannot
+    /// enforce anything.
+    fn validate_budget(&self) -> Result<(), ConfigError> {
+        let budget = &self.budget;
+        let backend = budget.backend.as_str();
+        if budget.backend == BudgetBackend::None {
+            return Ok(());
+        }
+        if budget.limit_microdollars == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "budget `{backend}`: limit_microdollars must be at least 1"
+            )));
+        }
+        if budget.reservation_ttl_seconds == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "budget `{backend}`: reservation_ttl_seconds must be at least 1"
+            )));
+        }
+        if budget.backend.is_shared()
+            && !budget
+                .dsn_env
+                .as_deref()
+                .is_some_and(|dsn_env| !dsn_env.trim().is_empty())
+        {
+            return Err(ConfigError::Invalid(format!(
+                "budget `{backend}`: `dsn_env` must name the env var holding the connection string"
+            )));
+        }
+        if budget.backend == BudgetBackend::Postgres {
+            validate_table_name(&budget.table())
+                .map_err(|message| ConfigError::Invalid(format!("budget `postgres`: {message}")))?;
+        }
         Ok(())
     }
 
@@ -613,6 +767,52 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
         let cfg = Config::from_toml_str(VALID).expect("valid config");
         assert_eq!(cfg.default_namespace(), "platform");
         assert!(cfg.model("gpt-4o").is_some());
+    }
+
+    #[test]
+    fn no_budget_section_means_no_cap_and_no_datastore() {
+        let cfg = Config::from_toml_str(VALID).expect("valid config");
+        assert_eq!(cfg.budget.backend, BudgetBackend::None);
+        assert_eq!(cfg.budget.on_unavailable, StoreUnavailable::Deny);
+        assert_eq!(cfg.budget.reservation_ttl_seconds, 300);
+    }
+
+    #[test]
+    fn a_budget_reads_its_backend_and_stance() {
+        let cfg = Config::from_toml_str(&format!(
+            r#"{VALID}
+[budget]
+backend = "redis"
+limit_microdollars = 10000
+dsn_env = "AXOND_BUDGET_REDIS_URL"
+on_unavailable = "allow"
+"#
+        ))
+        .expect("valid config");
+        assert_eq!(cfg.budget.backend, BudgetBackend::Redis);
+        assert_eq!(cfg.budget.on_unavailable, StoreUnavailable::Allow);
+        assert_eq!(cfg.budget.key_prefix(), "axond:budget");
+    }
+
+    /// A budget whose fields do not add up is a boot failure, not a surprise at
+    /// request time.
+    #[test]
+    fn rejects_budgets_that_could_not_enforce_anything() {
+        for budget in [
+            // A shared backend with nowhere to connect.
+            "[budget]\nbackend = \"redis\"\nlimit_microdollars = 10000",
+            // A cap of zero would deny every request.
+            "[budget]\nbackend = \"in-memory\"",
+            "[budget]\nbackend = \"postgres\"\nlimit_microdollars = 1\ndsn_env = \"D\"\nreservation_ttl_seconds = 0",
+            // A table name that could carry SQL.
+            "[budget]\nbackend = \"postgres\"\nlimit_microdollars = 1\ndsn_env = \"D\"\ntable = \"caps; drop table users\"",
+        ] {
+            let result = Config::from_toml_str(&format!("{VALID}\n{budget}\n"));
+            assert!(
+                matches!(result, Err(ConfigError::Invalid(_))),
+                "expected `{budget}` to be rejected"
+            );
+        }
     }
 
     #[test]

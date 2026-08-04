@@ -28,7 +28,7 @@ use gateway_transport::{ByteStream, TransportError, Upstream};
 use serde_json::{Value, json};
 use tracing::Instrument;
 
-use crate::budget::BudgetKey;
+use crate::budget::{BudgetKey, Reservation};
 use crate::credentials::CredentialSource;
 use crate::routes::next_request_id;
 use crate::state::AppState;
@@ -49,6 +49,13 @@ pub struct StreamContext {
     pub trace_id: Option<String>,
     pub price: ModelPrice,
     pub budget_key: BudgetKey,
+    /// The hold this request was admitted under, settled once when the stream
+    /// ends however it ends.
+    pub reservation: Reservation,
+    /// Input tokens estimated from the request body when the hold was taken.
+    /// A stream that ends before the provider reports usage still consumed its
+    /// prompt, so this is what the partial charge is priced from.
+    pub estimated_input_tokens: u64,
     /// Upstream target attempts made before this stream opened (or the walk
     /// gave up), so the settled record matches the buffered path's attribution.
     pub attempts: u32,
@@ -275,6 +282,7 @@ impl Relay {
             match event {
                 ProviderStreamEvent::Data { event, data } => {
                     self.accounting.mark_first_token();
+                    self.accounting.count_relayed(&data);
                     self.pending.push_back(data_event(event.as_deref(), &data));
                 }
                 ProviderStreamEvent::Done(usage) => {
@@ -284,6 +292,37 @@ impl Relay {
             }
         }
     }
+}
+
+/// Generated text in one relayed chunk, across the shapes the adapters emit:
+/// OpenAI chat deltas, and Anthropic's content-block deltas. Anything else
+/// contributes nothing rather than guessing, so an unmeasurable stream is
+/// charged its prompt only.
+fn relayed_text_len(data: &Value) -> usize {
+    let mut chars = 0;
+    if let Some(choices) = data.get("choices").and_then(Value::as_array) {
+        for choice in choices {
+            for pointer in ["/delta/content", "/delta/reasoning_content"] {
+                chars += choice
+                    .pointer(pointer)
+                    .and_then(Value::as_str)
+                    .map_or(0, text_chars);
+            }
+        }
+    }
+    for pointer in ["/delta/text", "/content_block/text", "/delta/partial_json"] {
+        chars += data
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map_or(0, text_chars);
+    }
+    chars
+}
+
+/// Characters, not bytes: the tokens-per-character heuristic would otherwise
+/// over-charge multi-byte scripts by the width of their encoding.
+fn text_chars(text: &str) -> usize {
+    text.chars().count()
 }
 
 fn data_event(name: Option<&str>, data: &Value) -> Bytes {
@@ -307,17 +346,22 @@ fn error_event(message: &str) -> Bytes {
 }
 
 /// Terminal accounting for one streamed request: exactly one usage record and
-/// exactly one budget commit, whichever way the stream ends.
+/// exactly one budget settlement, whichever way the stream ends.
 ///
 /// The `Drop` arm is the cancellation path — a dropped body means the client
-/// went away, so the spend accrued up to that point is still charged. Partial
-/// spend is committed through the existing `BudgetStore::commit`; a dedicated
-/// reserve/release lifecycle belongs with the durable backends (#6).
+/// went away, so the spend accrued up to that point is still charged. A stream
+/// that ends before the provider reports usage is charged its *measured partial*
+/// spend (ADR 0010): the prompt it consumed plus the output it actually relayed,
+/// counted here as it goes. A stream that relayed nothing is charged nothing and
+/// its whole hold is released.
 struct Accounting {
     state: AppState,
     ctx: StreamContext,
     started: Instant,
     usage: ModelUsage,
+    /// Characters of generated text relayed to the client, which is the only
+    /// measure of output a stream has before the provider's usage arrives.
+    relayed_chars: usize,
     /// Time to the first relayed token, which for a stream is the number a
     /// caller actually feels.
     ttft_ms: Option<u64>,
@@ -331,6 +375,7 @@ impl Accounting {
             ctx,
             started,
             usage: ModelUsage::default(),
+            relayed_chars: 0,
             ttft_ms: None,
             settled: false,
         }
@@ -341,13 +386,36 @@ impl Accounting {
             .get_or_insert_with(|| self.started.elapsed().as_millis() as u64);
     }
 
+    fn count_relayed(&mut self, data: &Value) {
+        self.relayed_chars = self.relayed_chars.saturating_add(relayed_text_len(data));
+    }
+
+    /// The usage the request is charged for. The provider's own numbers win
+    /// whenever they arrived; otherwise — a cancelled or broken stream — the
+    /// charge is derived from what was measurably relayed, and a stream that
+    /// produced nothing is charged nothing.
+    fn chargeable_usage(&self) -> ModelUsage {
+        const CHARS_PER_TOKEN: usize = 4;
+        if self.usage.input_tokens > 0 || self.usage.output_tokens > 0 {
+            return self.usage;
+        }
+        if self.relayed_chars == 0 {
+            return ModelUsage::default();
+        }
+        ModelUsage {
+            input_tokens: self.ctx.estimated_input_tokens,
+            output_tokens: self.relayed_chars.div_ceil(CHARS_PER_TOKEN) as u64,
+            ..ModelUsage::default()
+        }
+    }
+
     fn settle(&mut self, status: Status) {
         if self.settled {
             return;
         }
         self.settled = true;
         let state = self.state.clone();
-        let usage = self.usage;
+        let usage = self.chargeable_usage();
         let latency_ms = self.started.elapsed().as_millis() as u64;
         let cost = self.ctx.price.cost_microdollars(gateway_core::Usage {
             input_tokens: usage.input_tokens,
@@ -377,8 +445,9 @@ impl Accounting {
         };
         telemetry::record_streamed(&record, self.ttft_ms);
         let budget_key = self.ctx.budget_key.clone();
+        let reservation = self.ctx.reservation.clone();
         spawn_settlement(async move {
-            state.0.budget.commit(&budget_key, cost).await;
+            state.0.budget.settle(&budget_key, &reservation, cost).await;
             state.0.usage.record(&record).await;
         });
     }
@@ -415,7 +484,7 @@ mod tests {
     use serde_json::json;
     use tower::util::ServiceExt;
 
-    use crate::budget::{Admission, BudgetStore};
+    use crate::budget::{Admission, BudgetStore, Denial};
     use crate::config::Config;
     use crate::routes::router;
     use crate::usage::{UsageFanout, UsageSink};
@@ -426,6 +495,12 @@ mod tests {
     struct Ledger {
         records: Mutex<Vec<Value>>,
         commits: Mutex<Vec<u64>>,
+    }
+
+    impl Ledger {
+        fn settlements(&self) -> Vec<u64> {
+            self.commits.lock().expect("ledger").clone()
+        }
     }
 
     struct LedgerSink(Arc<Ledger>);
@@ -441,6 +516,8 @@ mod tests {
         }
     }
 
+    /// Admits everything and records what each request settled for, so the
+    /// charging policy can be asserted end to end.
     struct LedgerBudget(Arc<Ledger>);
 
     #[async_trait]
@@ -448,15 +525,44 @@ mod tests {
         fn name(&self) -> &'static str {
             "ledger"
         }
-        async fn reserve(&self, _key: &BudgetKey, _estimated_microdollars: u64) -> Admission {
-            Admission::Allowed
+        async fn reserve(&self, _key: &BudgetKey, estimated_microdollars: u64) -> Admission {
+            Admission::Allowed(Reservation {
+                id: "ledger".to_owned(),
+                estimate_microdollars: estimated_microdollars,
+            })
         }
-        async fn commit(&self, _key: &BudgetKey, actual_microdollars: u64) {
+        async fn settle(
+            &self,
+            _key: &BudgetKey,
+            _reservation: &Reservation,
+            actual_microdollars: u64,
+        ) {
             self.0
                 .commits
                 .lock()
                 .expect("ledger")
                 .push(actual_microdollars);
+        }
+    }
+
+    /// Denies everything, standing in for a budget that is exhausted or a store
+    /// that is unreachable.
+    struct DenyingBudget(Denial);
+
+    #[async_trait]
+    impl BudgetStore for DenyingBudget {
+        fn name(&self) -> &'static str {
+            "denying"
+        }
+        async fn reserve(&self, _key: &BudgetKey, _estimated_microdollars: u64) -> Admission {
+            Admission::Denied(self.0)
+        }
+        async fn settle(
+            &self,
+            _key: &BudgetKey,
+            _reservation: &Reservation,
+            _actual_microdollars: u64,
+        ) {
         }
     }
 
@@ -482,7 +588,33 @@ mod tests {
     }
 
     fn state_for(base_url: &str, ledger: Arc<Ledger>) -> AppState {
-        let cfg = Config::from_toml_str(&format!(
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(LedgerSink(ledger.clone()))];
+        AppState::new(
+            single_target_config(base_url),
+            &test_env(),
+            UsageFanout::new(sinks),
+            Box::new(LedgerBudget(ledger)),
+        )
+        .expect("state")
+    }
+
+    /// The same single-target gateway, with the budget store under test.
+    fn state_with_budget(base_url: &str, budget: Box<dyn BudgetStore>) -> AppState {
+        AppState::new(
+            single_target_config(base_url),
+            &test_env(),
+            UsageFanout::new(Vec::new()),
+            budget,
+        )
+        .expect("state")
+    }
+
+    fn test_env() -> HashMap<String, String> {
+        HashMap::from([("GW_TEST_OPENAI_KEY".to_owned(), "sk-test".to_owned())])
+    }
+
+    fn single_target_config(base_url: &str) -> Config {
+        Config::from_toml_str(&format!(
             r#"
 [[namespace]]
 id = "platform"
@@ -503,16 +635,7 @@ name = "gpt-4o"
 targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000 }} }}]
 "#
         ))
-        .expect("config");
-        let env = HashMap::from([("GW_TEST_OPENAI_KEY".to_owned(), "sk-test".to_owned())]);
-        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(LedgerSink(ledger.clone()))];
-        AppState::new(
-            cfg,
-            &env,
-            UsageFanout::new(sinks),
-            Box::new(LedgerBudget(ledger)),
-        )
-        .expect("state")
+        .expect("config")
     }
 
     fn stream_request() -> Request<Body> {
@@ -549,6 +672,11 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
                 namespace: "platform".to_owned(),
                 subject: "anonymous".to_owned(),
             },
+            reservation: Reservation {
+                id: "test".to_owned(),
+                estimate_microdollars: 1_000,
+            },
+            estimated_input_tokens: 8,
             attempts: 1,
         }
     }
@@ -605,7 +733,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(record["output_tokens"], 3);
         // 11 input @ 1 µ$/token + 3 output @ 2 µ$/token.
         assert_eq!(record["cost_microdollars"], 17);
-        assert_eq!(*ledger.commits.lock().expect("ledger"), vec![17]);
+        assert_eq!(ledger.settlements(), vec![17]);
     }
 
     #[tokio::test]
@@ -701,7 +829,78 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
 
         let record = settled(&ledger).await;
         assert_eq!(record["status"], "client_cancelled");
-        assert_eq!(ledger.commits.lock().expect("ledger").len(), 1);
+        // The provider never reported usage, so the charge is the measured
+        // partial spend: the prompt it consumed plus the text actually relayed —
+        // not zero, and not the reserved estimate (ADR 0010).
+        let charged = record["cost_microdollars"].as_u64().expect("cost");
+        assert!(charged > 0, "a cancelled stream must not be free");
+        assert!(record["input_tokens"].as_u64().expect("input") > 0);
+        assert!(record["output_tokens"].as_u64().expect("output") > 0);
+        assert_eq!(ledger.settlements(), vec![charged]);
+    }
+
+    /// A stream that fails before the provider reports usage is charged the
+    /// same way: what it relayed, priced from the catalog.
+    #[tokio::test]
+    async fn a_broken_stream_charges_what_it_relayed() {
+        let ledger = Arc::new(Ledger::default());
+        let base_url = upstream_serving(concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial answer\"}}]}\n\n",
+            "data: {not json}\n\n",
+        ))
+        .await;
+        let resp = router(state_for(&base_url, ledger.clone()))
+            .oneshot(stream_request())
+            .await
+            .expect("response");
+
+        let mut body = resp.into_body().into_data_stream();
+        while let Some(chunk) = body.next().await {
+            let _ = chunk.expect("chunk");
+        }
+
+        let record = settled(&ledger).await;
+        assert_eq!(record["status"], "upstream_error");
+        // 14 relayed characters ≈ 4 output tokens @ 2 µ$ + 8 estimated input
+        // tokens @ 1 µ$.
+        assert_eq!(record["output_tokens"], 4);
+        let charged = record["cost_microdollars"].as_u64().expect("cost");
+        assert!(charged > 0);
+        assert_eq!(ledger.settlements(), vec![charged]);
+    }
+
+    /// A stream that never opened relayed nothing, so there is nothing to
+    /// measure and nothing to charge — the whole hold goes back.
+    #[tokio::test]
+    async fn a_stream_that_never_opened_is_charged_nothing() {
+        let ledger = Arc::new(Ledger::default());
+        let base_url = failing_to_open_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let resp = router(state_for(&base_url, ledger.clone()))
+            .oneshot(stream_request())
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let record = settled(&ledger).await;
+        assert_eq!(record["status"], "upstream_error");
+        assert_eq!(record["cost_microdollars"], 0);
+        assert_eq!(ledger.settlements(), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_budget_store_rejects_the_request() {
+        let base_url = upstream_serving(OPENAI_STREAM).await;
+        for (denial, status) in [
+            (Denial::Exceeded, StatusCode::TOO_MANY_REQUESTS),
+            (Denial::StoreUnavailable, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let state = state_with_budget(&base_url, Box::new(DenyingBudget(denial)));
+            let resp = router(state)
+                .oneshot(stream_request())
+                .await
+                .expect("response");
+            assert_eq!(resp.status(), status);
+        }
     }
 
     /// An upstream that never opens a stream: it answers a non-200 status, so

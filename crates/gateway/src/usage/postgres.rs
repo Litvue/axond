@@ -208,8 +208,9 @@ impl UsageSink for PostgresSink {
 
 /// Rustls with the Mozilla root bundle, built once. The process-default crypto
 /// provider is installed here because `reqwest` configures its own explicitly
-/// and so leaves the default unset.
-fn tls_connector() -> MakeRustlsConnect {
+/// and so leaves the default unset. Shared with the Postgres budget backend, so
+/// both Postgres connections speak TLS the same way.
+pub fn tls_connector() -> MakeRustlsConnect {
     static CONNECTOR: OnceLock<MakeRustlsConnect> = OnceLock::new();
     CONNECTOR
         .get_or_init(|| {

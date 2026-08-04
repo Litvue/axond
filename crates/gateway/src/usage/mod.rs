@@ -29,7 +29,7 @@ use crate::credentials::CredentialSource;
 pub use batch::{BatchSettings, BatchedSink};
 pub use otlp::OtlpUsageSink;
 pub use postgres::{
-    MAX_ROWS_PER_STATEMENT, PostgresSink, PostgresSinkSettings, validate_table_name,
+    MAX_ROWS_PER_STATEMENT, PostgresSink, PostgresSinkSettings, tls_connector, validate_table_name,
 };
 
 /// The terminal outcome of a request. Every terminated request produces

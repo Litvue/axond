@@ -25,6 +25,7 @@ opentelemetry.workspace = true
 opentelemetry-http.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
+redis.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 secrecy.workspace = true
