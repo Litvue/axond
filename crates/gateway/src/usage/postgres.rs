@@ -31,6 +31,10 @@ const SCHEMA_DDL: &str = include_str!("../../../../ops/postgres/usage_v1.sql");
 /// with another one.
 const DEFAULT_TABLE: &str = "axond_usage";
 
+/// Stands in for an index-name prefix while the table name is substituted, so
+/// the two do not rewrite each other. Not valid SQL, and never left in the DDL.
+const INDEX_PREFIX_PLACEHOLDER: &str = "\u{1}index_prefix\u{1}";
+
 /// Columns written per row, in parameter order. `reasoning_tokens`,
 /// `cache_read_tokens`, and `cache_write_tokens` exist in the table but are not
 /// written: the canonical record does not carry them yet.
@@ -114,8 +118,17 @@ impl PostgresSink {
     }
 
     /// The shipped DDL, retargeted at the configured table.
+    ///
+    /// Table references and index names are substituted separately: an index
+    /// lives in its table's schema and its name may not carry a qualifier, so
+    /// `billing.axond_usage` yields `ON billing.axond_usage` but
+    /// `axond_usage_recorded_at_idx`.
     fn schema_ddl(&self) -> String {
-        SCHEMA_DDL.replace(DEFAULT_TABLE, &self.table)
+        let index_prefix = self.table.rsplit('.').next().unwrap_or(&self.table);
+        SCHEMA_DDL
+            .replace(&format!("{DEFAULT_TABLE}_"), INDEX_PREFIX_PLACEHOLDER)
+            .replace(DEFAULT_TABLE, &self.table)
+            .replace(INDEX_PREFIX_PLACEHOLDER, &format!("{index_prefix}_"))
     }
 
     async fn connect_client(&self) -> Result<Client, tokio_postgres::Error> {
@@ -351,11 +364,46 @@ mod tests {
         assert!(started < observed.observed_at);
     }
 
+    fn ddl_for(table: &str) -> String {
+        let sink = PostgresSink {
+            table: table.to_owned(),
+            config: "host=localhost".parse().expect("static dsn"),
+            client: tokio::sync::Mutex::new(None),
+        };
+        sink.schema_ddl()
+    }
+
     #[test]
     fn the_ddl_is_retargeted_at_the_configured_table() {
-        let ddl = SCHEMA_DDL.replace(DEFAULT_TABLE, "billing.usage");
-        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS billing.usage"));
-        assert!(!ddl.contains("CREATE TABLE IF NOT EXISTS axond_usage"));
+        let ddl = ddl_for("usage_rows");
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS usage_rows"));
+        assert!(ddl.contains("CREATE INDEX IF NOT EXISTS usage_rows_recorded_at_idx"));
+        assert!(!ddl.contains(DEFAULT_TABLE));
+    }
+
+    /// An index lives in its table's schema and its *name* may not be
+    /// qualified, so the qualifier belongs to the table reference only.
+    #[test]
+    fn a_schema_qualified_table_keeps_its_index_names_unqualified() {
+        let ddl = ddl_for("billing.axond_usage");
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS billing.axond_usage"));
+        for index in [
+            "axond_usage_recorded_at_idx",
+            "axond_usage_namespace_recorded_at_idx",
+            "axond_usage_request_id_idx",
+        ] {
+            assert!(
+                ddl.contains(&format!(
+                    "CREATE INDEX IF NOT EXISTS {index}\n    ON billing.axond_usage"
+                )),
+                "index `{index}` is not created on the qualified table with an unqualified name"
+            );
+        }
+        assert!(
+            !ddl.contains("billing.axond_usage_"),
+            "qualified index name"
+        );
+        assert!(!ddl.contains(INDEX_PREFIX_PLACEHOLDER));
     }
 
     #[test]
