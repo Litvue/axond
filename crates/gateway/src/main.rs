@@ -2,20 +2,20 @@
 //!
 //! Boot sequence: load + validate config (fail fast, delta B2), snapshot the
 //! environment for credential resolution, build shared state with the default
-//! no-datastore usage sink and quota store, then serve.
+//! no-datastore usage sink and budget store, then serve.
 
+mod budget;
 mod config;
 mod credentials;
 mod error;
-mod quota;
 mod routes;
 mod state;
 mod usage;
 
 use std::collections::HashMap;
 
+use budget::{BudgetStore, NoBudget};
 use config::Config;
-use quota::{NoQuota, QuotaStore};
 use state::AppState;
 use usage::{StdoutSink, UsageFanout, UsageSink};
 
@@ -35,14 +35,14 @@ async fn main() -> anyhow::Result<()> {
 
     let env: HashMap<String, String> = std::env::vars().collect();
 
-    // No-datastore defaults: usage to stdout, quota always-allow. Postgres /
-    // Tinybird sinks and Redis / in-memory quota are opt-in via config.
+    // No-datastore defaults: usage to stdout, budget always-allow. Postgres /
+    // Tinybird sinks and Redis / in-memory budget are opt-in via config.
     let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
     let usage = UsageFanout::new(sinks);
-    let quota: Box<dyn QuotaStore> = Box::new(NoQuota);
+    let budget: Box<dyn BudgetStore> = Box::new(NoBudget);
 
     let bind = config.server.bind;
-    let state = AppState::new(config, &env, usage, quota);
+    let state = AppState::new(config, &env, usage, budget);
     let app = routes::router(state);
 
     tracing::info!(%bind, "tollgate listening");

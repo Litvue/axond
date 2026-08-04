@@ -24,6 +24,37 @@ pub struct ModelPrice {
     pub cache_write_microdollars_per_million: Option<u64>,
 }
 
+impl ModelPrice {
+    /// Cost of a usage record in integer micro-dollars. Reasoning tokens are a
+    /// subset of output tokens and are priced separately (falling back to the
+    /// output rate); cache reads/writes fall back to the input rate. Saturates
+    /// rather than overflowing.
+    pub fn cost_microdollars(&self, usage: Usage) -> u64 {
+        let billed_output_tokens = usage.output_tokens.saturating_sub(usage.reasoning_tokens);
+        let cost = component(usage.input_tokens, self.input_microdollars_per_million)
+            .saturating_add(component(
+                billed_output_tokens,
+                self.output_microdollars_per_million,
+            ))
+            .saturating_add(component(
+                usage.reasoning_tokens,
+                self.reasoning_microdollars_per_million
+                    .unwrap_or(self.output_microdollars_per_million),
+            ))
+            .saturating_add(component(
+                usage.cache_read_tokens,
+                self.cache_read_microdollars_per_million
+                    .unwrap_or(self.input_microdollars_per_million),
+            ))
+            .saturating_add(component(
+                usage.cache_write_tokens,
+                self.cache_write_microdollars_per_million
+                    .unwrap_or(self.input_microdollars_per_million),
+            ));
+        u64::try_from(cost).unwrap_or(u64::MAX)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogModel {
     pub id: String,
@@ -79,31 +110,7 @@ impl ModelCatalog {
             .find(|entry| entry.id == model)
             .map(|entry| entry.price)
             .ok_or_else(|| CatalogError::UnknownModel(model.to_owned()))?;
-        let billed_output_tokens = usage.output_tokens.saturating_sub(usage.reasoning_tokens);
-        let cost = component(usage.input_tokens, price.input_microdollars_per_million)
-            .saturating_add(component(
-                billed_output_tokens,
-                price.output_microdollars_per_million,
-            ))
-            .saturating_add(component(
-                usage.reasoning_tokens,
-                price
-                    .reasoning_microdollars_per_million
-                    .unwrap_or(price.output_microdollars_per_million),
-            ))
-            .saturating_add(component(
-                usage.cache_read_tokens,
-                price
-                    .cache_read_microdollars_per_million
-                    .unwrap_or(price.input_microdollars_per_million),
-            ))
-            .saturating_add(component(
-                usage.cache_write_tokens,
-                price
-                    .cache_write_microdollars_per_million
-                    .unwrap_or(price.input_microdollars_per_million),
-            ));
-        let cost_microdollars = u64::try_from(cost).map_err(|_| CatalogError::CostOverflow)?;
+        let cost_microdollars = price.cost_microdollars(usage);
         Ok(UsageReceipt {
             catalog_version: self.version,
             model: model.to_owned(),

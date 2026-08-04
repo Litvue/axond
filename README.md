@@ -23,17 +23,18 @@ centralizes that:
   fallback.
 - **Model aliases, not topology.** Callers send `gpt-4o`; the gateway resolves it
   to a concrete provider + deployment. Change providers without touching callers.
-- **Usage + quotas behind traits.** Raw usage records fan out to pluggable sinks
-  (stdout today; Postgres/Tinybird/ClickHouse/OTLP planned); quota checks run on a
+- **Usage + budgets behind traits.** Raw usage records fan out to pluggable sinks
+  (stdout today; Postgres/Tinybird/ClickHouse/OTLP planned); spend budgets —
+  denominated in currency, computed from per-model pricing — are checked on a
   separate, request-path store.
 - **Telemetry first.** One canonical usage record per request drives sinks,
-  quotas, spans, and metrics from the same source of truth.
+  budgets, spans, and metrics from the same source of truth.
 
 ## Design principles
 
 - **Runs stateless; scales stateful only when you ask it to.** The binary boots
   with zero external dependencies. Every stateful feature (durable usage,
-  cross-replica quotas) is opt-in behind a trait — nothing silently drags a
+  cross-replica budgets) is opt-in behind a trait — nothing silently drags a
   datastore onto the default path.
 - **Passthrough-first.** When the caller's wire shape already matches the target,
   the body is forwarded and only the `model` field is rewritten. Cross-provider
@@ -80,7 +81,7 @@ crates/
   gateway-transport   The HTTP half: pooled reqwest client, credential
                       injection, timeouts (retries/failover next).
   gateway             The binary: config, namespaced credential resolution,
-                      routes, UsageSink + QuotaStore wiring.
+                      routes, UsageSink + BudgetStore wiring.
 ```
 
 The split keeps the hard-won provider-wire logic testable in isolation and
@@ -92,7 +93,7 @@ runtime-neutral.
 - [ ] Ordered failover across targets + per-target circuit health
 - [ ] OpenTelemetry traces (per-upstream-attempt spans, TTFT), metrics, logs
 - [ ] Usage sinks: Postgres, Tinybird, ClickHouse, OTLP
-- [ ] Quota backends: in-memory (present) → Redis / Postgres, reserve-then-reconcile
+- [ ] Budget backends: in-memory (present) → Redis / Postgres, reserve-then-reconcile
 - [ ] Native Anthropic `/v1/messages` passthrough; `/v1/embeddings`, `/v1/responses`
 - [ ] Multiple credentials per provider (pooling, weighted, skip-on-429)
 - [ ] Config hot-reload (SIGHUP / watched files) for zero-restart BYOK onboarding

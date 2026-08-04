@@ -13,14 +13,14 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use gateway_core::{ProviderRequest, Surface};
+use gateway_core::{ModelPrice, ProviderRequest, Surface, Usage};
 use gateway_transport::{AuthScheme, Upstream};
 use serde_json::{Value, json};
 
+use crate::budget::{Admission, BudgetKey};
 use crate::config::ProviderKind;
 use crate::credentials::CredentialSource;
 use crate::error::GatewayError;
-use crate::quota::{Admission, QuotaKey};
 use crate::state::{AppState, InboundKey, adapter_for};
 use crate::usage::{Status, UsageRecord};
 
@@ -105,8 +105,11 @@ async fn chat_completions(
     // Scaffold: first target only. Ordered failover across targets is the
     // next increment (per-attempt spans + circuit breaker from gateway-core).
     let target = &model.targets[0];
+    let price = target.price;
+    let target_provider = target.provider.clone();
+    let target_model = target.model.clone();
     let provider = cfg
-        .provider(&target.provider)
+        .provider(&target_provider)
         .ok_or_else(|| GatewayError::UnknownModel(alias.clone()))?;
 
     let resolved = state
@@ -118,17 +121,19 @@ async fn chat_completions(
             provider: provider.id.clone(),
         })?;
 
-    let quota_key = QuotaKey {
+    // Budget is denominated in micro-dollars. Reserve a conservative cost
+    // estimate before dispatch; reconcile against the real cost after.
+    let budget_key = BudgetKey {
         namespace: caller.namespace.clone(),
-        model: alias.clone(),
+        subject: caller.subject.clone(),
     };
-    let estimate = estimate_tokens(&body);
-    if state.0.quota.reserve(&quota_key, estimate).await == Admission::Denied {
-        return Err(GatewayError::QuotaExceeded(alias));
+    let estimated_cost = estimate_cost_microdollars(&body, &price);
+    if state.0.budget.reserve(&budget_key, estimated_cost).await == Admission::Denied {
+        return Err(GatewayError::BudgetExceeded(alias));
     }
 
     // Rewrite only the model field; everything else is byte-passthrough.
-    body["model"] = Value::String(target.model.clone());
+    body["model"] = Value::String(target_model.clone());
 
     let auth = match provider.kind {
         ProviderKind::Anthropic => AuthScheme::Header("x-api-key"),
@@ -142,7 +147,7 @@ async fn chat_completions(
 
     let adapter = adapter_for(provider.kind);
     let request = ProviderRequest {
-        model: target.model.clone(),
+        model: target_model.clone(),
         body,
     };
 
@@ -161,42 +166,60 @@ async fn chat_completions(
 
     match result {
         Ok(response) => {
-            state
-                .0
-                .quota
-                .commit(&quota_key, response.usage.total_tokens())
-                .await;
+            let usage = to_usage(&response.usage);
+            let cost = price.cost_microdollars(usage);
+            state.0.budget.commit(&budget_key, cost).await;
             record_usage(
                 &state,
-                &caller,
-                &alias,
-                &target.provider,
-                &target.model,
-                resolved.source,
-                Status::Ok,
-                response.usage.input_tokens,
-                response.usage.output_tokens,
-                latency_ms,
+                RecordArgs {
+                    caller: &caller,
+                    alias: &alias,
+                    target_provider: &target_provider,
+                    target_model: &target_model,
+                    source: resolved.source,
+                    status: Status::Ok,
+                    input_tokens: response.usage.input_tokens,
+                    output_tokens: response.usage.output_tokens,
+                    cost_microdollars: cost,
+                    latency_ms,
+                },
             )
             .await;
             Ok(Json(response.body))
         }
         Err(err) => {
+            // Failure still cost provider tokens in principle, but we have no
+            // authoritative usage from a failed call, so cost is recorded as 0
+            // and nothing is committed against the budget (reconciliation of
+            // partial/failed spend is a follow-up).
             record_usage(
                 &state,
-                &caller,
-                &alias,
-                &target.provider,
-                &target.model,
-                resolved.source,
-                Status::UpstreamError,
-                0,
-                0,
-                latency_ms,
+                RecordArgs {
+                    caller: &caller,
+                    alias: &alias,
+                    target_provider: &target_provider,
+                    target_model: &target_model,
+                    source: resolved.source,
+                    status: Status::UpstreamError,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_microdollars: 0,
+                    latency_ms,
+                },
             )
             .await;
             Err(err.into())
         }
+    }
+}
+
+fn to_usage(u: &gateway_core::ModelUsage) -> Usage {
+    Usage {
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        reasoning_tokens: u.reasoning_tokens,
+        cache_read_tokens: u.cache_read_tokens,
+        cache_write_tokens: u.cache_write_tokens,
     }
 }
 
@@ -214,10 +237,26 @@ async fn responses() -> Result<Json<Value>, GatewayError> {
     Err(GatewayError::NotImplemented("/v1/responses"))
 }
 
-/// Conservative pre-dispatch token estimate (~4 chars/token over the request
-/// body). Reserve-then-reconcile replaces this with the real count on commit.
-fn estimate_tokens(body: &Value) -> u64 {
-    (serde_json::to_string(body).map(|s| s.len()).unwrap_or(0) / 4) as u64
+/// Conservative pre-dispatch cost estimate in micro-dollars: input tokens from
+/// the request body (~4 chars/token) plus a reserved output allowance
+/// (`max_tokens` when present, else a default), priced with the target's
+/// `ModelPrice`. Reserve-then-reconcile replaces this with the real cost on
+/// commit.
+fn estimate_cost_microdollars(body: &Value, price: &ModelPrice) -> u64 {
+    const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1_024;
+    let input_tokens = (serde_json::to_string(body).map(|s| s.len()).unwrap_or(0) / 4) as u64;
+    let output_tokens = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+    price.cost_microdollars(Usage {
+        input_tokens,
+        output_tokens,
+        reasoning_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+    })
 }
 
 /// Monotonic per-process request id. A real deploy layers this behind the
@@ -228,34 +267,35 @@ fn next_request_id() -> String {
     format!("req_{:016x}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn record_usage(
-    state: &AppState,
-    caller: &InboundKey,
-    alias: &str,
-    target_provider: &str,
-    target_model: &str,
+struct RecordArgs<'a> {
+    caller: &'a InboundKey,
+    alias: &'a str,
+    target_provider: &'a str,
+    target_model: &'a str,
     source: CredentialSource,
     status: Status,
     input_tokens: u64,
     output_tokens: u64,
+    cost_microdollars: u64,
     latency_ms: u64,
-) {
+}
+
+async fn record_usage(state: &AppState, args: RecordArgs<'_>) {
     let record = UsageRecord {
         schema_version: UsageRecord::SCHEMA_VERSION,
         request_id: next_request_id(),
-        namespace: caller.namespace.clone(),
-        subject: caller.subject.clone(),
-        model: alias.to_string(),
-        target_provider: target_provider.to_string(),
-        target_model: target_model.to_string(),
-        credential_source: UsageRecord::credential_source_str(source),
-        status,
-        input_tokens,
-        output_tokens,
-        cost_microdollars: 0,
+        namespace: args.caller.namespace.clone(),
+        subject: args.caller.subject.clone(),
+        model: args.alias.to_string(),
+        target_provider: args.target_provider.to_string(),
+        target_model: args.target_model.to_string(),
+        credential_source: UsageRecord::credential_source_str(args.source),
+        status: args.status,
+        input_tokens: args.input_tokens,
+        output_tokens: args.output_tokens,
+        cost_microdollars: args.cost_microdollars,
         catalog_version: 0,
-        latency_ms,
+        latency_ms: args.latency_ms,
     };
     state.0.usage.record(&record).await;
 }
@@ -263,8 +303,8 @@ async fn record_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budget::NoBudget;
     use crate::config::Config;
-    use crate::quota::NoQuota;
     use crate::usage::{StdoutSink, UsageFanout, UsageSink};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -286,7 +326,7 @@ base_url = "https://api.openai.com/v1"
 
 [[model]]
 name = "gpt-4o"
-targets = [{ provider = "openai", model = "gpt-4o" }]
+targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 } }]
 "#,
         )
         .unwrap();
@@ -295,7 +335,7 @@ targets = [{ provider = "openai", model = "gpt-4o" }]
             cfg,
             &HashMap::new(),
             UsageFanout::new(sinks),
-            Box::new(NoQuota),
+            Box::new(NoBudget),
         )
     }
 

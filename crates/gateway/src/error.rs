@@ -17,8 +17,8 @@ pub enum GatewayError {
     UnknownModel(String),
     #[error("no credential for provider `{provider}` in namespace `{namespace}`")]
     NoCredential { namespace: String, provider: String },
-    #[error("quota exceeded for model `{0}`")]
-    QuotaExceeded(String),
+    #[error("budget exceeded for model `{0}`")]
+    BudgetExceeded(String),
     #[error("unauthorized")]
     Unauthorized,
     #[error("{0} is not implemented yet")]
@@ -36,7 +36,7 @@ impl GatewayError {
         match self {
             Self::UnknownModel(_) => StatusCode::NOT_FOUND,
             Self::NoCredential { .. } => StatusCode::BAD_GATEWAY,
-            Self::QuotaExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
@@ -58,7 +58,7 @@ impl GatewayError {
         match self {
             Self::UnknownModel(_) => "unknown_model",
             Self::NoCredential { .. } => "no_credential",
-            Self::QuotaExceeded(_) => "quota_exceeded",
+            Self::BudgetExceeded(_) => "budget_exceeded",
             Self::Unauthorized => "unauthorized",
             Self::NotImplemented(_) => "not_implemented",
             Self::BadRequest(_) => "bad_request",

@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+use gateway_core::ModelPrice;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,6 +93,10 @@ pub struct Target {
     pub provider: String,
     /// Concrete upstream model / deployment id.
     pub model: String,
+    /// Per-token pricing for this concrete target, in micro-dollars per million
+    /// tokens. Required — a target that can't be priced can't be budget-checked,
+    /// so an unpriced target fails config parsing at boot (delta B2).
+    pub price: ModelPrice,
 }
 
 /// Explicit (namespace, provider) → env-var binding. Declared, never inferred
@@ -243,7 +248,7 @@ base_url = "https://api.openai.com/v1"
 
 [[model]]
 name = "gpt-4o"
-targets = [{ provider = "openai", model = "gpt-4o" }]
+targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 } }]
 "#;
 
     #[test]
@@ -262,7 +267,7 @@ default = true
 
 [[model]]
 name = "gpt-4o"
-targets = [{ provider = "ghost", model = "gpt-4o" }]
+targets = [{ provider = "ghost", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
 "#;
         let err = Config::from_toml_str(toml).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid(_)), "{err:?}");
@@ -296,6 +301,29 @@ targets = []
         assert!(matches!(
             Config::from_toml_str(toml),
             Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_unpriced_target_at_parse() {
+        let toml = r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[model]]
+name = "gpt-4o"
+targets = [{ provider = "openai", model = "gpt-4o" }]
+"#;
+        // Missing `price` → deserialization fails before validation runs.
+        assert!(matches!(
+            Config::from_toml_str(toml),
+            Err(ConfigError::Load(_))
         ));
     }
 }

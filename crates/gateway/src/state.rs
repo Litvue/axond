@@ -6,9 +6,9 @@ use std::sync::Arc;
 use gateway_core::{AnthropicAdapter, OpenAiCompatibleAdapter, OpenAiFlavor, ProviderAdapter};
 use gateway_transport::HttpDispatcher;
 
+use crate::budget::BudgetStore;
 use crate::config::{Config, ProviderKind};
 use crate::credentials::Credentials;
-use crate::quota::QuotaStore;
 use crate::usage::UsageFanout;
 
 #[derive(Clone)]
@@ -19,7 +19,7 @@ pub struct Inner {
     pub credentials: Credentials,
     pub dispatcher: HttpDispatcher,
     pub usage: UsageFanout,
-    pub quota: Box<dyn QuotaStore>,
+    pub budget: Box<dyn BudgetStore>,
     /// Inbound gateway-key secret → (namespace, subject). Empty ⇒ unauthenticated.
     pub inbound_keys: HashMap<String, InboundKey>,
 }
@@ -35,7 +35,7 @@ impl AppState {
         config: Config,
         env: &HashMap<String, String>,
         usage: UsageFanout,
-        quota: Box<dyn QuotaStore>,
+        budget: Box<dyn BudgetStore>,
     ) -> Self {
         let credentials = Credentials::from_env(&config, env);
         let dispatcher = HttpDispatcher::new(reqwest::Client::new());
@@ -56,7 +56,7 @@ impl AppState {
             credentials,
             dispatcher,
             usage,
-            quota,
+            budget,
             inbound_keys,
         }))
     }
