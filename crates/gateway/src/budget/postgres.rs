@@ -100,19 +100,24 @@ impl PostgresBudget {
         Ok(client)
     }
 
-    /// Hand out the pooled client, reconnecting when it is missing or stale. The
-    /// caller returns it with [`Self::restore`] on success and drops it on
-    /// failure, which is what replaces a broken connection.
-    async fn take_client(&self) -> Result<Client, tokio_postgres::Error> {
+    /// Runs one operation on the store's single connection, holding the lock for
+    /// its whole duration so concurrent requests queue on the connection rather
+    /// than each opening one of their own. A failed operation drops the
+    /// connection, so the next caller reconnects.
+    async fn run<T>(
+        &self,
+        operation: impl AsyncFnOnce(&mut Client) -> Result<T, tokio_postgres::Error>,
+    ) -> Result<T, tokio_postgres::Error> {
         let mut guard = self.client.lock().await;
-        match guard.take() {
-            Some(client) if !client.is_closed() => Ok(client),
-            _ => self.connect_client().await,
+        if guard.as_ref().is_none_or(Client::is_closed) {
+            *guard = Some(self.connect_client().await?);
         }
-    }
-
-    async fn restore(&self, client: Client) {
-        *self.client.lock().await = Some(client);
+        let client = guard.as_mut().expect("connected above");
+        let result = operation(client).await;
+        if result.is_err() {
+            *guard = None;
+        }
+        result
     }
 
     /// The admission decision, in one transaction. Returns whether the estimate
@@ -208,26 +213,27 @@ impl PostgresBudget {
         let table = &self.table;
         let reservations = self.reservation_table();
         let transaction = client.transaction().await?;
+        // The spend row is taken before the reservation row, the same order
+        // `try_hold` takes them, so a settlement and a reserve on one key cannot
+        // deadlock against each other.
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {table} (namespace, subject, spent_microdollars)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (namespace, subject) DO UPDATE
+                     SET spent_microdollars = {table}.spent_microdollars + $3,
+                         updated_at = now()"
+                ),
+                &[&key.namespace, &key.subject, &bigint(actual_microdollars)],
+            )
+            .await?;
         transaction
             .execute(
                 &format!("DELETE FROM {reservations} WHERE id = $1"),
                 &[&reservation.id],
             )
             .await?;
-        if actual_microdollars > 0 {
-            transaction
-                .execute(
-                    &format!(
-                        "INSERT INTO {table} (namespace, subject, spent_microdollars)
-                         VALUES ($1, $2, $3)
-                         ON CONFLICT (namespace, subject) DO UPDATE
-                         SET spent_microdollars = {table}.spent_microdollars + $3,
-                             updated_at = now()"
-                    ),
-                    &[&key.namespace, &key.subject, &bigint(actual_microdollars)],
-                )
-                .await?;
-        }
         transaction.commit().await
     }
 }
@@ -243,19 +249,12 @@ impl BudgetStore for PostgresBudget {
             id: Reservation::next_id(),
             estimate_microdollars: estimated_microdollars,
         };
-        let mut client = match self.take_client().await {
-            Ok(client) => client,
-            Err(e) => return self.settings.unavailable.admission(BACKEND, &e),
-        };
-        match self.try_hold(&mut client, key, &reservation).await {
-            Ok(admitted) => {
-                self.restore(client).await;
-                if admitted {
-                    Admission::Allowed(reservation)
-                } else {
-                    Admission::Denied(Denial::Exceeded)
-                }
-            }
+        match self
+            .run(async |client| self.try_hold(client, key, &reservation).await)
+            .await
+        {
+            Ok(true) => Admission::Allowed(reservation),
+            Ok(false) => Admission::Denied(Denial::Exceeded),
             Err(e) => self.settings.unavailable.admission(BACKEND, &e),
         }
     }
@@ -266,18 +265,14 @@ impl BudgetStore for PostgresBudget {
         if reservation.id.is_empty() {
             return;
         }
-        let mut client = match self.take_client().await {
-            Ok(client) => client,
-            Err(e) => {
-                tracing::error!(error = %e, "budget settlement could not connect");
-                return;
-            }
-        };
         match self
-            .commit_spend(&mut client, key, reservation, actual_microdollars)
+            .run(async |client| {
+                self.commit_spend(client, key, reservation, actual_microdollars)
+                    .await
+            })
             .await
         {
-            Ok(()) => self.restore(client).await,
+            Ok(()) => {}
             Err(e) => tracing::error!(
                 error = %e,
                 namespace = %key.namespace,

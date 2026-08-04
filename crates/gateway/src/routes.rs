@@ -440,7 +440,13 @@ async fn stream_with_failover(
         // Decoder creation is a property of the provider kind, not the upstream,
         // so its failure is the same for every remaining target — surface it
         // rather than failing over.
-        let decoder = adapter.stream_decoder(Surface::ChatCompletions)?;
+        let decoder = match adapter.stream_decoder(Surface::ChatCompletions) {
+            Ok(decoder) => decoder,
+            Err(err) => {
+                state.0.budget.release(&hold.key, &hold.reservation).await;
+                return Err(err.into());
+            }
+        };
         let started = Instant::now();
         let opened = streaming::open_stream(
             state,

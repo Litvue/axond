@@ -306,7 +306,7 @@ fn relayed_text_len(data: &Value) -> usize {
                 chars += choice
                     .pointer(pointer)
                     .and_then(Value::as_str)
-                    .map_or(0, str::len);
+                    .map_or(0, text_chars);
             }
         }
     }
@@ -314,9 +314,15 @@ fn relayed_text_len(data: &Value) -> usize {
         chars += data
             .pointer(pointer)
             .and_then(Value::as_str)
-            .map_or(0, str::len);
+            .map_or(0, text_chars);
     }
     chars
+}
+
+/// Characters, not bytes: the tokens-per-character heuristic would otherwise
+/// over-charge multi-byte scripts by the width of their encoding.
+fn text_chars(text: &str) -> usize {
+    text.chars().count()
 }
 
 fn data_event(name: Option<&str>, data: &Value) -> Bytes {
