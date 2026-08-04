@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local config / secrets — never commit real keys
+/tollgate.toml
+/.env
+*.env

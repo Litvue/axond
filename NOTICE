@@ -1,0 +1,8 @@
+Tollgate
+Copyright 2026 Tollgate contributors
+
+This product includes software developed by the Tollgate contributors.
+
+Portions of the provider-adapter core (crates/gateway-core) originated as the
+`llm-provider-rs` library and were relicensed by the copyright holder for
+inclusion in this project.

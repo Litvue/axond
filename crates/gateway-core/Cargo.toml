@@ -1,0 +1,18 @@
+[package]
+name = "gateway-core"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+description = "Runtime-neutral LLM provider adapters, wire translation, and routing primitives for the Tollgate AI gateway."
+repository = "https://github.com/OWNER/tollgate"
+
+[lib]
+name = "gateway_core"
+path = "src/lib.rs"
+
+[dependencies]
+base64 = "0.22"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

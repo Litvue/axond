@@ -1,0 +1,74 @@
+# Tollgate example configuration.
+#
+# Structure lives here; SECRETS DO NOT. Keys are referenced by the *name* of an
+# environment variable (`env = "..."`) and read at startup — never inlined.
+# Copy to `tollgate.toml` (gitignored) and set the referenced env vars.
+
+[server]
+bind = "0.0.0.0:8080"
+
+# ── Namespaces ────────────────────────────────────────────────────────────────
+# Exactly one namespace is the default (used when a request has no gateway key,
+# or in open dev mode). BYOK namespaces default to `allow_platform_fallback =
+# false`, so a customer missing a key hard-fails rather than silently spending
+# your platform credits.
+
+[[namespace]]
+id = "platform"
+default = true
+
+[[namespace]]
+id = "acme"
+allow_platform_fallback = false
+
+# ── Providers ───────────────────────────────────────────────────────────────
+# kind = "openai" | "anthropic" | "openai-compatible"
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[provider]]
+id = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+
+# ── Credentials ───────────────────────────────────────────────────────────────
+# Explicit (namespace, provider) → env-var binding. Never inferred from the
+# namespace name.
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "GW_PLATFORM_OPENAI_API_KEY"
+
+[[credential]]
+namespace = "platform"
+provider = "anthropic"
+env = "GW_PLATFORM_ANTHROPIC_API_KEY"
+
+[[credential]]
+namespace = "acme"
+provider = "openai"
+env = "GW_ACME_OPENAI_API_KEY"
+
+# ── Inbound gateway keys (optional) ───────────────────────────────────────────
+# Bind an inbound bearer token (read from `env`) to a namespace. Omit entirely
+# to run open in local dev (default namespace, subject = "anonymous").
+
+# [[gateway_key]]
+# env = "GW_INBOUND_ACME_KEY"
+# namespace = "acme"
+
+# ── Models (aliases) ──────────────────────────────────────────────────────────
+# Callers send the alias (`gpt-4o`), never `provider/model`. Targets are tried
+# in order (failover across targets is on the roadmap).
+
+[[model]]
+name = "gpt-4o"
+targets = [{ provider = "openai", model = "gpt-4o" }]
+
+[[model]]
+name = "claude-sonnet"
+targets = [{ provider = "anthropic", model = "claude-3-7-sonnet-latest" }]
