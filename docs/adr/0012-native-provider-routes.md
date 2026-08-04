@@ -43,6 +43,17 @@ have an opinion about the shape of a body it is not translating, so signed
 thinking and tool-use blocks are preserved by construction rather than by a
 translator that has to be kept in sync.
 
+The promise is exact *values*, and on a stream exact bytes. A buffered body is
+parsed and re-serialized on its way through, so object key order may differ from
+what the provider emitted; every value, including a thinking `signature` and a
+`tool_use` `input`, is carried through untouched, which is what the wire
+semantics actually depend on. Passthrough also stops at the success body:
+non-2xx upstreams are still mapped to the gateway's own typed error shape,
+because that mapping is what classifies a failure as retryable and drives
+failover (ADR 0008), and provider response headers are not forwarded. Forwarding
+native error shapes and rate-limit headers is a follow-up that has to answer how
+a passed-through error still participates in failover.
+
 **One request path, parameterized by wire — not a second dispatch path.** All
 routes share the `serve` body in `routes.rs`: one config snapshot per request
 (ADR 0011), alias resolution, one budget hold (ADR 0010), the ordered target walk
@@ -70,8 +81,10 @@ settle and sinks receive the same `UsageRecord` every other route produces.
 **Embeddings bill input only.** An embeddings response has no completion, so
 whatever a provider reports as output tokens is ignored rather than priced, and
 the pre-dispatch estimate reserves nothing for output. The forwarded body is also
-left exactly as sent — notably without a `stream` field, which the endpoint does
-not accept.
+left exactly as sent — notably the gateway never adds a `stream` field, which the
+endpoint does not accept. A caller that sends one anyway keeps it: passthrough
+means the provider gets to reject the caller's own mistake, not that the gateway
+starts editing bodies it does not translate.
 
 **A wire the alias cannot speak is a typed 4xx, checked before dispatch.** A
 native route has no translation to fall back on, so an alias whose target is an

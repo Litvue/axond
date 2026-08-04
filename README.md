@@ -83,7 +83,8 @@ curl localhost:8080/v1/messages \
 ```
 
 The body is forwarded to the provider untouched but for `model`, streaming
-included, so signed thinking blocks and tool-use blocks survive byte-for-byte —
+included, so signed thinking blocks and tool-use blocks survive intact (verbatim
+bytes on a stream; re-serialized values, same signatures, when buffered) —
 and aliasing, failover, credential pools, budgets, and usage records apply exactly
 as they do on `/v1/chat/completions`. `/v1/embeddings` is served the same way for
 OpenAI-family targets, billed on input tokens only. A native alias must resolve to

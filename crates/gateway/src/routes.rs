@@ -10,8 +10,9 @@
 //! The provider-native routes — Anthropic's `/v1/messages` and OpenAI-shaped
 //! `/v1/embeddings` — take the same path (ADR 0012). A caller already speaking
 //! the target's wire has its body forwarded to the provider's own endpoint with
-//! only `model` rewritten, so signed thinking and tool-use blocks survive
-//! byte-for-byte; only how usage is read back differs per route. `/v1/responses`
+//! only `model` rewritten, so signed thinking and tool-use blocks survive intact
+//! (verbatim bytes when streamed, re-serialized values when buffered); only how
+//! usage is read back differs per route. `/v1/responses`
 //! is deferred past beta and answers with a typed `501` rather than being a
 //! missing route (delta B3).
 //!
