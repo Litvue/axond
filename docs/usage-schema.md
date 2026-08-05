@@ -53,6 +53,11 @@ when absent), and the OTLP sink emits it as an OTel log record with
 - One table may hold rows written by several gateway versions. Read
   `schema_version` rather than assuming a deploy timeline.
 
+This schema versions independently of the gateway's own version; where it sits
+among axond's other published interfaces is the
+[compatibility contract](./compatibility.md), and the policy of record is
+[ADR 0015](./adr/0015-zero-dot-x-compatibility-policy.md).
+
 ## Reading the rows
 
 Writes are **at least once**: a batch whose commit outcome is unknown is retried,
