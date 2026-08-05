@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.1](https://github.com/Litvue/axond/compare/v0.1.0...v0.1.1) (2026-08-05)
+
+
+### Features
+
+* **auth:** gate /v1/models and scope its catalogue to the caller's namespace ([7d89041](https://github.com/Litvue/axond/commit/7d89041fd937675b1f8d146692e96892cfe5a63e))
+* **auth:** gate /v1/models and scope its catalogue to the caller's namespace ([51e08fe](https://github.com/Litvue/axond/commit/51e08fef615c04f2b23b92ef942cda8af3830374)), closes [#34](https://github.com/Litvue/axond/issues/34)
+
+
+### Bug Fixes
+
+* **credentials:** make is_present a pure query, no rotation/health side effects ([01ec109](https://github.com/Litvue/axond/commit/01ec109567f64a3ad79225561e7866c6c7b9e3d7))
+* **security:** hold inbound gateway keys as SecretString ([eb3c562](https://github.com/Litvue/axond/commit/eb3c562657eb1f68bbcac20d0b521a4099f6d437))
+* **security:** hold inbound gateway keys as SecretString ([9473677](https://github.com/Litvue/axond/commit/9473677f6f5c679efa36758f5b86b9e7bcd624af)), closes [#35](https://github.com/Litvue/axond/issues/35)
+
+
+### Continuous Integration
+
+* drop the invalid bootstrap-sha from release-please config ([febe5ba](https://github.com/Litvue/axond/commit/febe5ba6147f6422a1502d0f51f4e015f1a13ce8))
+* drop the invalid bootstrap-sha from release-please config ([1d000ed](https://github.com/Litvue/axond/commit/1d000ed77e231968135f159e76c21c3386711079)), closes [#36](https://github.com/Litvue/axond/issues/36)
+
 ## 0.1.0 (2026-08-05)
 
 
