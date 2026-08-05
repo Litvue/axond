@@ -76,7 +76,9 @@ userinfo while keeping the host and path that make the error diagnosable.
 Covered by `a_described_failure_keeps_the_endpoint_and_drops_its_secrets`.
 
 The [configuration reference](./configuration.md) now also states plainly that
-`base_url` must not carry a secret.
+`base_url` must be path-only and must not carry a secret — a query string there
+is doubly wrong, since the route's path is appended to it and would land inside
+the query.
 
 ## 5. Accepted risk, with follow-ups
 

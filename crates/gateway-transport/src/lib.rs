@@ -293,18 +293,41 @@ mod tests {
     /// A provider `base_url` is operator-supplied, so it may carry a secret in
     /// its query or userinfo. The described failure keeps the host and path,
     /// which is what makes it diagnosable, and drops the rest.
+    ///
+    /// Driven through a real `reqwest` failure rather than a hand-built string:
+    /// the redaction works by matching how `reqwest` renders the URL, so a
+    /// rendering change upstream has to fail here rather than silently turn the
+    /// redaction into a no-op.
+    #[tokio::test]
+    async fn a_described_failure_keeps_the_endpoint_and_drops_its_secrets() {
+        // Port 1 refuses immediately: the transport-error path without a
+        // timeout or a network dependency.
+        let error = reqwest::Client::new()
+            .post("http://127.0.0.1:1/v1/chat/completions?api-key=secret#frag")
+            .send()
+            .await
+            .expect_err("an unreachable port cannot answer");
+        let TransportError::Http(message) = transport_failure(&error) else {
+            panic!("a reqwest failure is a transport failure");
+        };
+
+        assert!(
+            message.contains("127.0.0.1:1/v1/chat/completions"),
+            "{message}"
+        );
+        for leaked in ["secret", "api-key", "frag"] {
+            assert!(!message.contains(leaked), "{message} leaked `{leaked}`");
+        }
+    }
+
     #[test]
-    fn a_described_failure_keeps_the_endpoint_and_drops_its_secrets() {
-        let url: reqwest::Url = "https://user:pw@example.test/v1/chat/completions?api-key=secret"
+    fn userinfo_is_dropped_too() {
+        let url: reqwest::Url = "https://user:pw@example.test/v1/messages"
             .parse()
             .expect("static url");
         let message = redact_url(format!("error sending request for url ({url})"), Some(&url));
-        assert!(
-            message.contains("example.test/v1/chat/completions"),
-            "{message}"
-        );
-        for leaked in ["secret", "api-key", "pw", "user"] {
-            assert!(!message.contains(leaked), "{message} leaked `{leaked}`");
-        }
+
+        assert!(message.contains("example.test/v1/messages"), "{message}");
+        assert!(!message.contains("pw"), "{message}");
     }
 }

@@ -42,7 +42,7 @@ The tenancy boundary: which credential pool a caller's requests draw from.
 | --- | --- | --- | --- |
 | `id` | string | — | Provider name, referenced by targets and credentials. |
 | `kind` | `openai` \| `anthropic` \| `openai-compatible` | — | Which wire the endpoint speaks. Decides which routes can serve it — see the [compatibility contract](./compatibility.md). |
-| `base_url` | string | — | Endpoint root, e.g. `https://api.openai.com/v1`. Route paths are appended. Never put a secret in it. |
+| `base_url` | string | — | Endpoint root, e.g. `https://api.openai.com/v1`. **Path only**: the route's path is appended by string concatenation, so a query string or fragment here would swallow it. Never put a secret in it either — see the [security review](./security-review-2026-08-05.md#4-finding-transport-errors-echoed-the-upstream-url--fixed-here). |
 
 ## `[[model]]` — aliases and pricing
 

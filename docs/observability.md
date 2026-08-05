@@ -114,7 +114,10 @@ settles as `partial` or `upstream_error`.
 ### Boot failures
 
 The process exits before binding the socket, with a message naming the
-offending *reference*:
+offending *reference*. What an operator sees is one of these shapes behind a
+prefix — `Error: config resolution failed: …` for a resolution failure, or
+`Error: failed to load config from <path>: invalid config: …` for one caught
+while parsing and validating the file:
 
 | Message shape | Cause |
 | --- | --- |
