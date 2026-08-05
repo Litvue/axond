@@ -347,11 +347,32 @@ impl Credentials {
             .record_failure_at(&lease.health_key, Instant::now());
     }
 
-    /// Presence only — never the value (write-only invariant). Backs the
-    /// per-namespace `/v1/models` scoping and the "which providers are live
-    /// here" read surface.
+    /// Whether `(namespace, provider)` resolves to any credential — its own
+    /// pool, or the platform's under `allow_platform_fallback`, mirroring the
+    /// same branching [`plan`](Self::plan) walks. Presence only, never the value
+    /// (write-only invariant). Backs the per-namespace `/v1/models` scoping and
+    /// the "which providers are live here" read surface.
+    ///
+    /// This is a pure query: unlike `plan`, it must not advance the pool's
+    /// rotation cursor or consume a parked credential's half-open probe, so a
+    /// read path (a catalogue listing) cannot perturb which credential real
+    /// dispatch picks or starve a rate-limited key of its recovery attempt. A
+    /// pool always holds at least one entry, so pool presence is exactly what
+    /// `plan(...).is_some()` would report.
     pub fn is_present(&self, config: &Config, namespace: &str, provider: &str) -> bool {
-        self.plan(config, namespace, provider).is_some()
+        if self
+            .pools
+            .contains_key(&(namespace.to_string(), provider.to_string()))
+        {
+            return true;
+        }
+        namespace != self.platform_ns
+            && config
+                .namespace(namespace)
+                .is_some_and(|n| n.allow_platform_fallback)
+            && self
+                .pools
+                .contains_key(&(self.platform_ns.clone(), provider.to_string()))
     }
 
     /// Labels + circuit state per credential, for the status endpoint and logs.
@@ -441,6 +462,54 @@ id = "openai-b"
             })
             .collect();
         assert_eq!(first, ["openai-a", "openai-b", "openai-a", "openai-b"]);
+    }
+
+    #[test]
+    fn is_present_is_a_pure_query_that_does_not_perturb_rotation_or_health() {
+        let cfg = config(TWO_PLATFORM_KEYS);
+        let creds = two_key_credentials(&cfg);
+
+        // A presence check must not advance the round-robin cursor, so a read
+        // path (a `/v1/models` listing) cannot bias which credential the next
+        // real dispatch picks: after any number of listings the first attempt
+        // still starts at the pool head.
+        for _ in 0..5 {
+            assert!(creds.is_present(&cfg, "platform", "openai"));
+        }
+        assert_eq!(
+            creds
+                .plan(&cfg, "platform", "openai")
+                .expect("plan")
+                .attempts[0]
+                .id,
+            "openai-a",
+        );
+
+        // Park the head credential and let its cooldown elapse, then poll
+        // presence repeatedly: the single half-open probe must survive so a
+        // real request still re-tests the key. If `is_present` consumed it, the
+        // probe would be re-armed and the plan below would skip the parked key.
+        let now = Instant::now();
+        let (head_id, head_key) = {
+            let plan = creds
+                .plan_at(&cfg, "platform", "openai", now)
+                .expect("plan");
+            let head = &plan.attempts[0];
+            (head.id.clone(), head.health_key.clone())
+        };
+        creds.health.record_failure_at(&head_key, now);
+        creds.health.record_failure_at(&head_key, now);
+        let after_cooldown = now + Duration::from_secs(31);
+        for _ in 0..5 {
+            assert!(creds.is_present(&cfg, "platform", "openai"));
+        }
+        let plan = creds
+            .plan_at(&cfg, "platform", "openai", after_cooldown)
+            .expect("plan");
+        assert_eq!(
+            plan.attempts[0].id, head_id,
+            "the recovery probe must not be consumed by presence checks",
+        );
     }
 
     #[test]
