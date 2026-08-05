@@ -399,6 +399,11 @@ id = "openai"
 kind = "openai"
 base_url = "https://api.openai.com/v1"
 
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "PLATFORM_OPENAI_KEY"
+
 [[gateway_key]]
 env = "AXOND_INBOUND_KEY"
 namespace = "platform"
@@ -422,6 +427,11 @@ id = "acme"
 id = "openai"
 kind = "openai"
 base_url = "https://api.openai.com/v1"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "PLATFORM_OPENAI_KEY"
 
 [[gateway_key]]
 env = "AXOND_INBOUND_KEY"
@@ -453,11 +463,15 @@ targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdo
         .expect("boot state")
     }
 
-    /// Just the inbound gateway key, which every servable config needs.
+    /// The inbound gateway key every servable config needs, plus the platform
+    /// provider credential both fixtures declare.
     fn inbound_env() -> HashMap<String, String> {
-        [(INBOUND_KEY_ENV.to_string(), "inbound-secret".to_string())]
-            .into_iter()
-            .collect()
+        [
+            (INBOUND_KEY_ENV.to_string(), "inbound-secret".to_string()),
+            ("PLATFORM_OPENAI_KEY".to_string(), "sk-platform".to_string()),
+        ]
+        .into_iter()
+        .collect()
     }
 
     fn tenant_env() -> HashMap<String, String> {
@@ -468,7 +482,12 @@ targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdo
 
     async fn listed_aliases(state: &AppState) -> Vec<String> {
         let resp = routes::router(state.clone())
-            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer inbound-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

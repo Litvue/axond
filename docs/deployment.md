@@ -165,7 +165,7 @@ process environment. Nothing in the config file is ever a secret value.
 | --- | --- | --- |
 | `GET /healthz` | none | `ok` once the process is serving. |
 | `GET /readyz` | none | `ready` once the process is serving. |
-| `GET /v1/models` | none | The configured alias catalogue (names only). |
+| `GET /v1/models` | gateway key | The alias catalogue (names only), scoped to the caller's namespace — only aliases whose targets the caller holds a credential for. |
 
 Both probes report process liveness. `/readyz` does **not** currently probe the
 usage sink, the budget store, or any provider — it answers `ready` whenever the

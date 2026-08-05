@@ -71,15 +71,31 @@ async fn readyz() -> &'static str {
     "ready"
 }
 
-async fn list_models(State(state): State<AppState>) -> Json<Value> {
-    let data: Vec<Value> = state
-        .config()
-        .config
+/// The model catalog, gated behind a gateway key and scoped to the caller's
+/// namespace: a caller sees only the aliases it could actually invoke — those
+/// with at least one target whose provider resolves a credential for the
+/// caller's namespace (its own, or the platform's when fallback is allowed).
+/// So a BYOK tenant cannot enumerate aliases it is not entitled to.
+async fn list_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, GatewayError> {
+    let snapshot = state.config();
+    let caller = authenticate(&snapshot, &headers)?;
+    let cfg = &snapshot.config;
+    let data: Vec<Value> = cfg
         .model
         .iter()
+        .filter(|m| {
+            m.targets.iter().any(|t| {
+                snapshot
+                    .credentials
+                    .is_present(cfg, &caller.namespace, &t.provider)
+            })
+        })
         .map(|m| json!({ "id": m.name, "object": "model", "owned_by": "axond" }))
         .collect();
-    Json(json!({ "object": "list", "data": data }))
+    Ok(Json(json!({ "object": "list", "data": data })))
 }
 
 /// Resolve the caller's namespace + subject from the inbound key. Every request
@@ -1115,6 +1131,11 @@ id = "openai"
 kind = "openai"
 base_url = "https://api.openai.com/v1"
 
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "AXOND_PLATFORM_OPENAI"
+
 {GATEWAY_KEY}
 
 [[model]]
@@ -1126,11 +1147,11 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
         AppState::new(
             cfg,
-            &env_with([]),
+            &env_with([("AXOND_PLATFORM_OPENAI", "sk-platform-test")]),
             UsageFanout::new(sinks),
             Box::new(NoBudget),
         )
-        .expect("no credentials to resolve")
+        .expect("credentials resolve")
     }
 
     /// Inbound auth is enforced for every configured key set: the wrong
@@ -1191,16 +1212,117 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// `/v1/models` fails closed like every other request path: no gateway key
+    /// means `401`, not an open catalog (ADR 0013).
     #[tokio::test]
-    async fn models_lists_configured_aliases() {
+    async fn models_requires_a_gateway_key() {
         let resp = router(test_state())
             .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn models_lists_the_callers_aliases() {
+        let resp = router(test_state())
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {CALLER_SECRET}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["data"][0]["id"], "gpt-4o");
+    }
+
+    /// A caller sees only the aliases it could invoke: a BYOK namespace with no
+    /// credential for the target's provider (and no platform fallback) gets an
+    /// empty list, so it cannot enumerate aliases it is not entitled to, while
+    /// the platform namespace — which does hold the credential — sees the alias.
+    #[tokio::test]
+    async fn models_are_scoped_to_the_callers_namespace() {
+        let cfg = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[namespace]]
+id = "acme"
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K_PLATFORM"
+
+[[gateway_key]]
+env = "GK_PLATFORM"
+namespace = "platform"
+
+[[gateway_key]]
+env = "GK_ACME"
+namespace = "acme"
+
+[[model]]
+name = "gpt-4o"
+targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
+"#,
+        )
+        .unwrap();
+        let env: HashMap<String, String> = [
+            ("K_PLATFORM", "sk"),
+            ("GK_PLATFORM", "plat-key"),
+            ("GK_ACME", "acme-key"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let state = AppState::new(
+            cfg,
+            &env,
+            UsageFanout::new(vec![Box::new(StdoutSink)]),
+            Box::new(NoBudget),
+        )
+        .unwrap();
+
+        assert_eq!(
+            models_for(&state, "plat-key").await["data"][0]["id"],
+            "gpt-4o"
+        );
+        let acme = models_for(&state, "acme-key").await;
+        assert_eq!(acme["data"].as_array().unwrap().len(), 0);
+    }
+
+    /// The `/v1/models` body a caller presenting `secret` receives.
+    async fn models_for(state: &AppState, secret: &str) -> Value {
+        let resp = router(state.clone())
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {secret}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     #[tokio::test]

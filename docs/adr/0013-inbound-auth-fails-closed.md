@@ -51,9 +51,12 @@ flag that reintroduces one.** Concretely:
   another namespace's authority.
 - `authenticate` has no empty-table branch: every request to a route that
   dispatches to a provider presents a configured key, as `Authorization: Bearer`
-  or `x-api-key` (ADR 0012), or gets `401`. The operational endpoints —
-  `/healthz`, `/readyz`, and the `/v1/models` alias catalogue — stay
-  unauthenticated, as they were: they name no credential and reach no provider.
+  or `x-api-key` (ADR 0012), or gets `401`. `/v1/models` authenticates the same
+  way and additionally scopes its catalogue to the caller's namespace (#34): it
+  lists only aliases whose targets that namespace can resolve a credential for,
+  so a key cannot enumerate aliases it is not entitled to. Only the liveness
+  probes `/healthz` and `/readyz` stay unauthenticated — they name no credential
+  and reach no provider.
 - Boot logs the enforced posture as a count (`inbound auth enforced`,
   `gateway_keys = N`). There is no "anonymous access enabled" line, because that
   state no longer exists.

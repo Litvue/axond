@@ -7,9 +7,10 @@
 #
 # Boot refuses a credential or gateway key whose env var is unset, so every env
 # var the example config references is supplied with a placeholder. Nothing here
-# is dispatched upstream and the probed routes are unauthenticated, so the values
-# are never used as keys. Two gateway keys may not share a secret, so the inbound
-# placeholders differ.
+# is dispatched upstream: /healthz is unauthenticated, and /v1/models is probed
+# with the platform gateway key (it now fails closed like every request path),
+# so the placeholders are never used as provider keys. Two gateway keys may not
+# share a secret, so the inbound placeholders differ.
 #
 # Usage: ops/docker-smoke.sh <image-ref>
 set -euo pipefail
@@ -42,7 +43,9 @@ for attempt in $(seq 1 30); do
     body="$(cat /tmp/axond-healthz)"
     if [[ "$body" == "ok" ]]; then
       echo "healthz: $body"
-      curl --fail --silent "http://127.0.0.1:${host_port}/v1/models" | tee /tmp/axond-models
+      curl --fail --silent \
+        -H "Authorization: Bearer smoke-placeholder-platform" \
+        "http://127.0.0.1:${host_port}/v1/models" | tee /tmp/axond-models
       echo
       echo "axond image smoke passed"
       exit 0

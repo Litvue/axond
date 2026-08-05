@@ -96,7 +96,7 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | Status | `type` | What happened | What to do |
 | --- | --- | --- | --- |
 | `401` | `unauthorized` | No `Authorization: Bearer` / `x-api-key`, or the token is not in the key table. | Check the caller's key and that its `[[gateway_key]]` is declared and its env var set. There is no keyless mode. |
-| `404` | `unknown_model` | The alias is not configured. | Add a `[[model]]`, or fix the caller. `/v1/models` lists what exists. |
+| `404` | `unknown_model` | The alias is not configured. | Add a `[[model]]`, or fix the caller. `/v1/models` lists the aliases the caller can invoke. |
 | `400` | `unsupported_wire` | The alias's target (or one of its failover targets) does not speak this route's wire — e.g. an OpenAI-only alias on `/v1/messages`. Raised **before** anything is reserved or dispatched. | Fix the alias's targets; no route translates between wires. See the [compatibility contract](./compatibility.md). |
 | `400` | `invalid_request`, `context_window_exceeded`, `bad_request` | The provider (or the gateway) rejected the request shape. | Caller-side fix; retrying will not help. |
 | `429` | `budget_exceeded` | The `(namespace, subject)` cap is spent — settled spend plus live holds leaves no room. | Raise `limit_microdollars` or wait. This is the tenant's own cap, not a provider rate limit. |

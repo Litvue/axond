@@ -88,13 +88,14 @@ the query.
    private `ConfigSnapshot` field that is resolved through
    `resolve_inbound(...)` rather than a public map. The lookup is a
    constant-time byte comparison, closing the timing-oracle gap as well.
-2. **`GET /v1/models` is unauthenticated.** It discloses configured alias names
-   — not secrets, not per-tenant data, and the same list for every caller — and
-   the smoke test relies on it. Gating it behind the key table is a small
-   behaviour change and therefore a follow-up rather than a change smuggled into
-   a review PR.
+2. ~~**`GET /v1/models` is unauthenticated.**~~ **Resolved (#34).** `/v1/models`
+   now fails closed like every request path — it requires a configured gateway
+   key and returns `401` without one — and scopes its catalogue to the caller's
+   namespace, listing only aliases whose targets that namespace can resolve a
+   credential for. A BYOK tenant can no longer enumerate aliases it is not
+   entitled to. The docker smoke now probes it with the platform key.
 
-Neither is a known secret exposure; both are recorded here so the posture is
+Item 1 is not a known secret exposure; it is recorded here so the posture is
 stated rather than implied.
 
 ## 6. BYOK isolation

@@ -1,6 +1,6 @@
 ---
 name: testing-axond
-description: How to run and black-box test the axond HTTP gateway locally (boot from a TOML config, hit the unauthenticated probes and typed-error routes, exercise transport failures) without any provider credentials.
+description: How to run and black-box test the axond HTTP gateway locally (boot from a TOML config, hit the unauthenticated liveness probes and the authenticated catalogue/typed-error routes, exercise transport failures) without any provider credentials.
 ---
 
 # Testing axond end to end
@@ -31,16 +31,21 @@ GW_INBOUND_PLATFORM_KEY=dummy-inbound \
 - Start from `axond.example.toml`; `ops/docker-smoke.sh` lists every env var that file
   needs.
 
-## Useful probes (all unauthenticated)
+## Useful probes
 
 ```bash
-curl -s http://127.0.0.1:8080/healthz     # -> ok
-curl -s http://127.0.0.1:8080/readyz      # -> ready
-curl -s http://127.0.0.1:8080/v1/models   # -> {"object":"list","data":[{"id":"<alias>",...}]}
+curl -s http://127.0.0.1:8080/healthz     # -> ok      (unauthenticated)
+curl -s http://127.0.0.1:8080/readyz      # -> ready   (unauthenticated)
+# /v1/models is authenticated and namespace-scoped: pass a gateway key, and it
+# lists only aliases whose targets that key's namespace holds a credential for.
+curl -s -H "Authorization: Bearer <gateway key value>" \
+  http://127.0.0.1:8080/v1/models         # -> {"object":"list","data":[{"id":"<alias>",...}]}
+curl -s http://127.0.0.1:8080/v1/models   # -> 401 unauthorized (no key)
 ```
 
-Everything else needs `Authorization: Bearer <gateway key value>` or `x-api-key: <value>`
-(the value of the env var named by `[[gateway_key]] env`, not the env var name).
+Every route except the `/healthz` and `/readyz` liveness probes needs
+`Authorization: Bearer <gateway key value>` or `x-api-key: <value>` (the value of
+the env var named by `[[gateway_key]] env`, not the env var name).
 
 Typed errors are `{"error":{"type":...,"message":...}}`; useful ones you can trigger with
 no upstream: `401 unauthorized`, `404 unknown_model`, `501 not_implemented`
