@@ -69,6 +69,26 @@ pub enum TransportError {
     Http(String),
 }
 
+/// A transport failure, described without the upstream URL's credential-bearing
+/// parts. `reqwest` renders the whole URL into its message, and this message
+/// reaches logs, spans, and the caller's error body — so a query string or
+/// userinfo an operator put in a provider's `base_url` would travel with it.
+fn transport_failure(e: &reqwest::Error) -> TransportError {
+    TransportError::Http(redact_url(e.to_string(), e.url()))
+}
+
+fn redact_url(message: String, url: Option<&reqwest::Url>) -> String {
+    let Some(url) = url else {
+        return message;
+    };
+    let mut redacted = url.clone();
+    redacted.set_query(None);
+    redacted.set_fragment(None);
+    let _ = redacted.set_password(None);
+    let _ = redacted.set_username("");
+    message.replace(url.as_str(), redacted.as_str())
+}
+
 /// A pooled HTTP client that drives a `gateway-core` adapter against an
 /// upstream. Construct once and share (`Clone` is cheap — `reqwest::Client`
 /// is an `Arc` internally).
@@ -107,12 +127,9 @@ impl HttpDispatcher {
             .headers(trace_context_headers())
             .send()
             .await
-            .map_err(|e| TransportError::Http(e.to_string()))?;
+            .map_err(|e| transport_failure(&e))?;
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| TransportError::Http(e.to_string()))?;
+        let text = resp.text().await.map_err(|e| transport_failure(&e))?;
 
         if !status.is_success() {
             return Err(
@@ -138,12 +155,9 @@ impl HttpDispatcher {
             .native_request(upstream, call, false)
             .send()
             .await
-            .map_err(|e| TransportError::Http(e.to_string()))?;
+            .map_err(|e| transport_failure(&e))?;
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| TransportError::Http(e.to_string()))?;
+        let text = resp.text().await.map_err(|e| transport_failure(&e))?;
         if !status.is_success() {
             return Err(ProviderError::from_upstream(call.provider, status.as_u16(), &text).into());
         }
@@ -163,15 +177,16 @@ impl HttpDispatcher {
             .native_request(upstream, call, true)
             .send()
             .await
-            .map_err(|e| TransportError::Http(e.to_string()))?;
+            .map_err(|e| transport_failure(&e))?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             return Err(ProviderError::from_upstream(call.provider, status.as_u16(), &text).into());
         }
-        Ok(Box::pin(resp.bytes_stream().map(|chunk| {
-            chunk.map_err(|e| TransportError::Http(e.to_string()))
-        })))
+        Ok(Box::pin(
+            resp.bytes_stream()
+                .map(|chunk| chunk.map_err(|e| transport_failure(&e))),
+        ))
     }
 
     fn native_request(
@@ -228,10 +243,7 @@ impl HttpDispatcher {
             AuthScheme::Header(name) => req.header(*name, upstream.api_key.expose_secret()),
         };
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| TransportError::Http(e.to_string()))?;
+        let resp = req.send().await.map_err(|e| transport_failure(&e))?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -240,9 +252,10 @@ impl HttpDispatcher {
             );
         }
 
-        Ok(Box::pin(resp.bytes_stream().map(|chunk| {
-            chunk.map_err(|e| TransportError::Http(e.to_string()))
-        })))
+        Ok(Box::pin(
+            resp.bytes_stream()
+                .map(|chunk| chunk.map_err(|e| transport_failure(&e))),
+        ))
     }
 }
 
@@ -275,5 +288,46 @@ mod tests {
     #[test]
     fn no_propagator_means_no_outbound_headers() {
         assert!(trace_context_headers().is_empty());
+    }
+
+    /// A provider `base_url` is operator-supplied, so it may carry a secret in
+    /// its query or userinfo. The described failure keeps the host and path,
+    /// which is what makes it diagnosable, and drops the rest.
+    ///
+    /// Driven through a real `reqwest` failure rather than a hand-built string:
+    /// the redaction works by matching how `reqwest` renders the URL, so a
+    /// rendering change upstream has to fail here rather than silently turn the
+    /// redaction into a no-op.
+    #[tokio::test]
+    async fn a_described_failure_keeps_the_endpoint_and_drops_its_secrets() {
+        // Port 1 refuses immediately: the transport-error path without a
+        // timeout or a network dependency.
+        let error = reqwest::Client::new()
+            .post("http://127.0.0.1:1/v1/chat/completions?api-key=secret#frag")
+            .send()
+            .await
+            .expect_err("an unreachable port cannot answer");
+        let TransportError::Http(message) = transport_failure(&error) else {
+            panic!("a reqwest failure is a transport failure");
+        };
+
+        assert!(
+            message.contains("127.0.0.1:1/v1/chat/completions"),
+            "{message}"
+        );
+        for leaked in ["secret", "api-key", "frag"] {
+            assert!(!message.contains(leaked), "{message} leaked `{leaked}`");
+        }
+    }
+
+    #[test]
+    fn userinfo_is_dropped_too() {
+        let url: reqwest::Url = "https://user:pw@example.test/v1/messages"
+            .parse()
+            .expect("static url");
+        let message = redact_url(format!("error sending request for url ({url})"), Some(&url));
+
+        assert!(message.contains("example.test/v1/messages"), "{message}");
+        assert!(!message.contains("pw"), "{message}");
     }
 }

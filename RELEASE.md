@@ -1,0 +1,107 @@
+# Beta release readiness — go/no-go
+
+Dated review of whether axond is ready to publish its first `0.x` beta.
+Reviewed at `main` (`1dd3a14`) plus the changes in the PR that adds this file.
+
+**Date: 2026-08-05**
+**Recommendation: GO**, conditional on two maintainer decisions that this
+document cannot make (below). No blocking gap was found; the release pipeline is
+correctly wired and has been exercised as far as it can be without a tag.
+
+Beta here means the stability milestone the epic defines — the surfaces are
+stable and documented, the failure modes are understood, the supply chain is
+signed — not completion of the roadmap. `/v1/responses` and cross-provider
+translation stay deferred, deliberately and in writing
+([compatibility contract](./docs/compatibility.md)).
+
+## Exit criteria
+
+| # | Criterion | Status | Evidence |
+| --- | --- | --- | --- |
+| 1 | Streaming, failover, native `/v1/messages`, OTel, a durable usage sink, and a shared budget backend are implemented and covered by tests | **Met** | Streaming [ADR 0005](./docs/adr/0005-streaming-relay.md) (`crates/gateway/src/streaming.rs`); failover [ADR 0008](./docs/adr/0008-target-failover-and-circuit-scope.md); native routes [ADR 0012](./docs/adr/0012-native-provider-routes.md); telemetry [ADR 0007](./docs/adr/0007-telemetry-model.md); usage sinks [ADR 0009](./docs/adr/0009-durable-usage-sinks.md) (Postgres + OTLP); budgets [ADR 0010](./docs/adr/0010-shared-budget-backends-and-charging-policy.md) (Redis + Postgres, fail-closed). Whole workspace green under gate 3 below. |
+| 2 | The supported-provider/compatibility contract and the usage schema are documented and versioned | **Met** | [`docs/compatibility.md`](./docs/compatibility.md) (routes, provider kinds, deferrals, `0.x` promise); [`docs/usage-schema.md`](./docs/usage-schema.md) + `UsageRecord::SCHEMA_VERSION = 1` + [`ops/postgres/usage_v1.sql`](./ops/postgres/usage_v1.sql); policy of record in [ADR 0015](./docs/adr/0015-zero-dot-x-compatibility-policy.md). |
+| 3 | Security review complete with no known secret-exposure paths | **Met** | [`docs/security-review-2026-08-05.md`](./docs/security-review-2026-08-05.md). One finding (transport errors echoed the upstream URL's query/userinfo) found **and fixed** in the same PR, with a regression test. Two residual items recorded as accepted risk with follow-ups; neither is a known exposure. |
+| 4 | Deployment guide + config reference + runbook published | **Met** | [`docs/deployment.md`](./docs/deployment.md), [`docs/configuration.md`](./docs/configuration.md), [`docs/observability.md`](./docs/observability.md) — each cross-checked against `config.rs`, `routes.rs`, and the telemetry module rather than the roadmap. |
+| 5 | Compatibility, record/replay, and SSE soak suites pass in CI | **Met** | [ADR 0014](./docs/adr/0014-compatibility-and-soak-harness.md); `crates/gateway/tests/{compat,replay,soak}.rs` and `tests/compat/` (vendor SDKs pinned to `openai==2.50.0`, `anthropic==0.120.0`). Both lanes are required by the `CI-Success` aggregate in `.github/workflows/ci.yml`. |
+| 6 | A signed, attested `0.x` beta release is published and its artifacts verify; go/no-go recorded | **Not met — by design** | The pipeline is verified as far as is possible without cutting a tag (see below). Publishing is the maintainer's act: tagging requires merging a release PR, and this PR deliberately does not seed a version. This document is the recorded go/no-go. |
+
+Criterion 6 is the only open one, and it is open because it *should* be: it can
+only be closed by the maintainer merging the release PR that release-please
+opens once this lands.
+
+## Release pipeline verification
+
+Read end to end in `.github/workflows/release-please.yml`, plus what could be
+executed locally.
+
+| Stage | Verified | How |
+| --- | --- | --- |
+| Version + changelog | Wired | `release-please-config.json`: `release-type: simple`, `bump-minor-pre-major`, `bump-patch-for-minor-pre-major`, Cargo workspace version in `extra-files`, `CHANGELOG.md` sections per Conventional Commit type. A GitHub App token (falling back to `GITHUB_TOKEN`) makes the release PR trigger CI; the lockfile is re-synced onto the release PR so `--locked` stays green. |
+| Release fan-out | Wired | `release-metadata` resolves the automatic path and the `workflow_dispatch` repair path, and rejects a dispatch whose ref is not the requested tag. |
+| Binaries | Wired | Four targets — `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc` — each built at the pinned toolchain from the tagged commit, packaged with a SHA-256 sidecar, an SPDX SBOM, and provenance + SBOM attestations. |
+| Image | Wired **and exercised** | `docker build` + `ops/docker-smoke.sh` run locally against the built image: `healthz: ok`, `/v1/models` returns the example catalogue, `axond image smoke passed`. In the release job the same smoke runs against the *published* image **before** it is signed. |
+| Signing | Wired | Keyless cosign over the digest, verified in-job against `SIGNER_IDENTITY`, which is anchored to this workflow file at `refs/heads/main` or `refs/tags/v<semver>` only. `gh attestation verify` then checks SLSA provenance. A broken chain fails the release rather than shipping quietly. |
+| Supply chain | Wired | `deny.toml` fails on any advisory, yanked crate, unlisted license, or non-crates.io source, with no ignores; `dependency-audit.yml` re-runs it on a schedule. Gate 5 below is green. |
+
+No configuration error was found that warranted a fix. Two observations, both
+maintainer calls rather than defects, are in the decisions section.
+
+## Gates
+
+All five run locally at the reviewed tree:
+
+| Gate | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | pass |
+| `cargo test --workspace --all-features --locked` | pass |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked` | pass |
+| `cargo deny --locked --all-features check` | pass |
+| `just docker-smoke` | pass |
+
+## Decisions the maintainer owns
+
+1. **The first tag's version.** `.release-please-manifest.json` says `0.0.0` and
+   `release-please-config.json` says `initial-version: 0.1.0`. Because the
+   manifest already has an entry, `initial-version` does not apply: with
+   `bump-patch-for-minor-pre-major`, the accumulated `feat` commits will produce
+   **`v0.0.1`**, and only a commit marked breaking would produce `v0.1.0`.
+   `v0.1.0` reads far better as "first beta" and matches the stated intent of
+   `initial-version`, but getting it requires seeding the manifest — which this
+   PR deliberately does not touch. Decide, then either accept `v0.0.1` or seed
+   `0.1.0` in a separate, explicit commit.
+2. **`bootstrap-sha: "HEAD"`.** The literal string is not a commit SHA, so it
+   will not match and release-please will consider the full history for the
+   first changelog. For a repo this young that is probably the desired outcome —
+   the first `CHANGELOG.md` describes everything in the beta — but it is worth a
+   conscious yes rather than an accident. Left unchanged.
+3. **Publishing itself.** Merging this PR opens (or updates) the release PR.
+   Merging *that* tags, builds, signs, and publishes. Neither is done here.
+
+## After the tag
+
+Close criterion 6 by verifying the published artifacts from outside CI, exactly
+as an adopter would — the commands are in the
+[deployment guide](./docs/deployment.md#running-the-container-image):
+
+```bash
+cosign verify --certificate-identity-regexp … --certificate-oidc-issuer … ghcr.io/litvue/axond@<digest>
+gh attestation verify oci://ghcr.io/litvue/axond@<digest> --repo Litvue/axond --predicate-type https://slsa.dev/provenance/v1
+sha256sum -c axond-<version>-x86_64-unknown-linux-musl.tar.gz.sha256
+```
+
+Then append the result and the date to this file.
+
+## Known gaps carried into beta
+
+None of these blocks the release; all are stated so adopters are not surprised.
+
+- `/readyz` reports process liveness only — it does not probe the usage sink,
+  the budget store, or any provider. Documented in the
+  [deployment guide](./docs/deployment.md#health-and-readiness).
+- `/v1/models` is unauthenticated (alias names only). Follow-up in the
+  [security review](./docs/security-review-2026-08-05.md#5-accepted-risk-with-follow-ups).
+- Inbound key material is held as a `String` rather than a `SecretString`; no
+  exposure path exists today, and hardening is a follow-up (same section).
+- Only `linux/amd64` images are published; `arm64` is post-beta.
+- `/v1/responses` and cross-provider translation remain typed deferrals.

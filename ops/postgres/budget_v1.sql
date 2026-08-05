@@ -1,4 +1,5 @@
--- Axond budget schema, version 1 (docs/adr/0010-shared-budget-backends.md).
+-- Axond budget schema, version 1
+-- (docs/adr/0010-shared-budget-backends-and-charging-policy.md).
 --
 -- Apply once per database before enabling `backend = "postgres"` under
 -- `[budget]`:

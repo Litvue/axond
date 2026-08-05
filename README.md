@@ -4,10 +4,13 @@ A stateless, single-binary, self-hosted **AI gateway**. Point your agents at
 Axond instead of at provider APIs directly, and get one place to hold
 provider keys, route model names, meter usage, and emit telemetry.
 
-> **Status: early scaffold.** The architecture, config surface, and the
-> core ↔ transport seam are in place, with a working OpenAI-compatible path,
-> buffered and streamed, ordered failover across targets, and OTLP telemetry.
-> The Postgres/Tinybird/Redis backends are on the roadmap below.
+> **Status: beta.** Everything below is implemented and covered by tests:
+> OpenAI-compatible and native Anthropic paths (buffered and streamed), ordered
+> failover, credential pools, OTLP telemetry, durable usage sinks, shared
+> budgets, and config hot-reload. What is supported, what is deferred, and what
+> may change is written down in the
+> [compatibility contract](./docs/compatibility.md); readiness is assessed in
+> [`RELEASE.md`](./RELEASE.md).
 
 ## Why
 
@@ -35,9 +38,10 @@ centralizes that:
   with zero external dependencies. Every stateful feature (durable usage,
   cross-replica budgets) is opt-in behind a trait — nothing silently drags a
   datastore onto the default path.
-- **Passthrough-first.** When the caller's wire shape already matches the target,
-  the body is forwarded and only the `model` field is rewritten. Cross-provider
-  translation happens only when routing requires it.
+- **Passthrough-first.** The caller's wire shape must already match the target:
+  the body is forwarded and only the `model` field is rewritten. A
+  wire-incompatible target is rejected up front (`400 unsupported_wire`) rather
+  than translated; cross-provider translation is deferred past beta.
 - **Fail at boot, not at request time.** The whole config graph is validated on
   startup: undefined alias targets, empty target lists, and dangling
   namespace/provider references refuse to start.
@@ -321,6 +325,20 @@ runtime-neutral.
 - [x] Provider-SDK compatibility + record/replay + SSE soak tests (see [ADR 0014](./docs/adr/0014-compatibility-and-soak-harness.md))
 
 See [`docs/adr`](./docs/adr) for the decisions behind these.
+
+## Documentation
+
+- [Deployment guide](./docs/deployment.md) — static binary, signed image, env,
+  health/readiness, rotation.
+- [Configuration reference](./docs/configuration.md) — every section, key, and
+  default.
+- [Observability and runbook](./docs/observability.md) — OTel setup, metrics,
+  failure modes.
+- [Compatibility contract](./docs/compatibility.md) — supported routes and
+  providers, deferrals, the `0.x` stability promise.
+- [Usage schema](./docs/usage-schema.md) — the versioned usage row.
+- [Security review](./docs/security-review-2026-08-05.md) and
+  [release readiness](./RELEASE.md).
 
 ## Development
 
