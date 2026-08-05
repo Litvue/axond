@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(config, &env, usage, budget)
         .map_err(|e| anyhow::anyhow!("config resolution failed: {e}"))?;
     tracing::info!(
-        gateway_keys = state.config().inbound_keys.len(),
+        gateway_keys = state.config().inbound_key_count(),
         "inbound auth enforced"
     );
     reload::spawn(Arc::new(reload::Reloader::new(config_path, state.clone())));

@@ -611,7 +611,7 @@ default = true
         // The running config still serves, still with its own key table.
         assert!(Arc::ptr_eq(&before, &state.config()));
         assert_eq!(state.config().generation, 0);
-        assert!(state.config().inbound_keys.contains_key("inbound-secret"));
+        assert!(state.config().resolve_inbound("inbound-secret").is_some());
 
         // Exporting the rotated key is all the candidate was waiting for.
         let mut rotated = inbound_env();
@@ -624,8 +624,8 @@ default = true
             .expect("resolves once the key is exported");
         let after = state.config();
         assert_eq!(after.generation, 1);
-        assert!(after.inbound_keys.contains_key("rotated-secret"));
-        assert!(!after.inbound_keys.contains_key("inbound-secret"));
+        assert!(after.resolve_inbound("rotated-secret").is_some());
+        assert!(after.resolve_inbound("inbound-secret").is_none());
     }
 
     /// A request holds its snapshot for its whole life, so a reload that lands

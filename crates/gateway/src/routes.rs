@@ -116,8 +116,7 @@ fn authenticate(
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
         .ok_or(GatewayError::Unauthorized)?;
     snapshot
-        .inbound_keys
-        .get(token)
+        .resolve_inbound(token)
         .cloned()
         .ok_or(GatewayError::Unauthorized)
 }

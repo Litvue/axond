@@ -82,14 +82,12 @@ the query.
 
 ## 5. Accepted risk, with follow-ups
 
-1. **Inbound key material is a `String`, not a `SecretString`.** It is the key
-   of `ConfigSnapshot::inbound_keys`, so it is never formatted and no type in
-   its path derives `Debug` — there is no exposure today. It is asymmetric with
-   the outbound path and is not zeroized on drop (a core dump or swap could hold
-   it). Lookup is also a hash-map comparison rather than constant-time; the
-   information a timing oracle could extract from a `HashMap` probe over the
-   network is not a practical attack, but it is worth removing. Hardening both
-   is a follow-up, not a beta blocker.
+1. ~~**Inbound key material is a `String`, not a `SecretString`.**~~ **Resolved
+   (#35).** Inbound keys are now held as `secrecy::SecretString` (redacted
+   `Debug`, zeroized on drop), symmetric with the outbound path, behind a
+   private `ConfigSnapshot` field that is resolved through
+   `resolve_inbound(...)` rather than a public map. The lookup is a
+   constant-time byte comparison, closing the timing-oracle gap as well.
 2. ~~**`GET /v1/models` is unauthenticated.**~~ **Resolved (#34).** `/v1/models`
    now fails closed like every request path — it requires a configured gateway
    key and returns `401` without one — and scopes its catalogue to the caller's
