@@ -1,0 +1,14 @@
+data: {"id":"chatcmpl-fixture-0002","object":"chat.completion.chunk","created":1750000000,"model":"gpt-4o-2024-08-06","system_fingerprint":"fp_fixture","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-0002","object":"chat.completion.chunk","created":1750000000,"model":"gpt-4o-2024-08-06","system_fingerprint":"fp_fixture","choices":[{"index":0,"delta":{"content":"The capital"},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-0002","object":"chat.completion.chunk","created":1750000000,"model":"gpt-4o-2024-08-06","system_fingerprint":"fp_fixture","choices":[{"index":0,"delta":{"content":" of France"},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-0002","object":"chat.completion.chunk","created":1750000000,"model":"gpt-4o-2024-08-06","system_fingerprint":"fp_fixture","choices":[{"index":0,"delta":{"content":" is Paris."},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-0002","object":"chat.completion.chunk","created":1750000000,"model":"gpt-4o-2024-08-06","system_fingerprint":"fp_fixture","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-fixture-0002","object":"chat.completion.chunk","created":1750000000,"model":"gpt-4o-2024-08-06","system_fingerprint":"fp_fixture","choices":[],"usage":{"prompt_tokens":19,"completion_tokens":7,"total_tokens":26}}
+
+data: [DONE]
+

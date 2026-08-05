@@ -25,6 +25,19 @@ docs:
 deny:
     cargo deny --locked --all-features check
 
+# Provider-SDK compatibility: the vendors' own Python SDKs against a real
+# axond and the committed fixtures. Offline; needs python3.
+compat:
+    cargo build -p axond --locked
+    python3 -m venv target/compat-venv
+    target/compat-venv/bin/pip install --quiet --require-virtualenv -r tests/compat/requirements.txt
+    AXOND_BIN="$(pwd)/target/debug/axond" target/compat-venv/bin/python -m pytest tests/compat -q
+
+# The heavy SSE soak: hundreds of concurrent streams with cancels and drops.
+# The short subset runs in `just test`; this is the long one.
+soak:
+    AXOND_SOAK=1 cargo test --locked --all-features --test soak -- --nocapture
+
 # Run the gateway against ./axond.toml (copy axond.example.toml first).
 run:
     cargo run -p axond

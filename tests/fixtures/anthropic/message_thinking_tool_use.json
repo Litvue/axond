@@ -1,0 +1,31 @@
+{
+  "id": "msg_fixture0001",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-3-7-sonnet-20250219",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "The user wants the weather in Paris. I should call the weather tool.",
+      "signature": "REDACTED_THINKING_SIGNATURE_0001"
+    },
+    {
+      "type": "text",
+      "text": "Let me look that up."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_fixture0001",
+      "name": "get_weather",
+      "input": { "location": "Paris, France", "unit": "celsius" }
+    }
+  ],
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 41,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "output_tokens": 63
+  }
+}

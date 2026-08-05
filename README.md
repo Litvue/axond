@@ -318,7 +318,7 @@ runtime-neutral.
 - [x] Native Anthropic `/v1/messages` passthrough + `/v1/embeddings` (see [ADR 0012](./docs/adr/0012-native-provider-routes.md)); `/v1/responses` deferred post-beta (typed `501`)
 - [x] Multiple credentials per provider (pooling, weighted, skip-on-429)
 - [x] Config hot-reload (SIGHUP / watched files) for zero-restart BYOK onboarding (see [ADR 0011](./docs/adr/0011-config-hot-reload.md))
-- [ ] Provider-SDK compatibility + record/replay + SSE soak tests
+- [x] Provider-SDK compatibility + record/replay + SSE soak tests (see [ADR 0014](./docs/adr/0014-compatibility-and-soak-harness.md))
 
 See [`docs/adr`](./docs/adr) for the decisions behind these.
 
@@ -335,6 +335,19 @@ cargo doc --workspace --no-deps --all-features --locked   # RUSTDOCFLAGS=-D warn
 cargo deny --locked --all-features check                  # advisories, licenses, sources
 bash ops/docker-smoke.sh "$(docker build -q .)"           # image boots and serves /healthz
 ```
+
+`cargo test` includes the black-box suites in [`crates/gateway/tests`](./crates/gateway/tests):
+a real `axond` process against a fake upstream replaying the committed wire
+fixtures in [`tests/fixtures`](./tests/fixtures), plus a short SSE soak. Two
+heavier lanes run outside it:
+
+```bash
+just compat   # the vendors' own Python SDKs against a real axond (its own CI lane)
+just soak     # the long soak: hundreds of concurrent streams (weekly / on demand)
+```
+
+Everything is offline: no provider account, no key, no network. See
+[ADR 0014](./docs/adr/0014-compatibility-and-soak-harness.md).
 
 ## Releases
 

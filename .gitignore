@@ -6,3 +6,7 @@
 /axond.toml
 /.env
 *.env
+
+# Python bytecode from the SDK compatibility lane
+__pycache__/
+.pytest_cache/
