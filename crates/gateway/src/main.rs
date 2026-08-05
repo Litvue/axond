@@ -56,7 +56,11 @@ async fn main() -> anyhow::Result<()> {
     let bind = config.server.bind;
     let watching = config.reload.watch;
     let state = AppState::new(config, &env, usage, budget)
-        .map_err(|e| anyhow::anyhow!("credential validation failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("config resolution failed: {e}"))?;
+    tracing::info!(
+        gateway_keys = state.config().inbound_keys.len(),
+        "inbound auth enforced"
+    );
     reload::spawn(Arc::new(reload::Reloader::new(config_path, state.clone())));
     let app = routes::router(state).layer(telemetry::TelemetryLayer);
 

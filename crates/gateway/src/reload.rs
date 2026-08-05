@@ -22,8 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::config::{Config, ConfigError, Reload, UsageSinkConfig};
-use crate::credentials::CredentialError;
-use crate::state::{AppState, ConfigSnapshot};
+use crate::state::{AppState, ConfigSnapshot, SnapshotError};
 use crate::telemetry;
 
 /// A reload asked for by `SIGHUP`.
@@ -35,8 +34,8 @@ pub const TRIGGER_WATCH: &str = "watch";
 pub enum ReloadError {
     #[error(transparent)]
     Config(#[from] ConfigError),
-    #[error("credential validation failed: {0}")]
-    Credentials(#[from] CredentialError),
+    #[error("config resolution failed: {0}")]
+    Snapshot(#[from] SnapshotError),
 }
 
 /// What the process committed to at startup and cannot redo while serving, so a
@@ -385,6 +384,11 @@ mod tests {
         }
     }
 
+    /// The inbound key every candidate declares, resolved from the test
+    /// environment: inbound auth fails closed, so a config without one would not
+    /// boot at all (ADR 0013).
+    const INBOUND_KEY_ENV: &str = "AXOND_INBOUND_KEY";
+
     const PLATFORM_ONLY: &str = r#"
 [[namespace]]
 id = "platform"
@@ -394,6 +398,10 @@ default = true
 id = "openai"
 kind = "openai"
 base_url = "https://api.openai.com/v1"
+
+[[gateway_key]]
+env = "AXOND_INBOUND_KEY"
+namespace = "platform"
 
 [[model]]
 name = "gpt-4o"
@@ -415,6 +423,10 @@ id = "openai"
 kind = "openai"
 base_url = "https://api.openai.com/v1"
 
+[[gateway_key]]
+env = "AXOND_INBOUND_KEY"
+namespace = "platform"
+
 [[credential]]
 namespace = "acme"
 provider = "openai"
@@ -434,17 +446,24 @@ targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdo
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
         AppState::new(
             config,
-            &HashMap::new(),
+            &inbound_env(),
             UsageFanout::new(sinks),
             Box::new(NoBudget),
         )
         .expect("boot state")
     }
 
-    fn tenant_env() -> HashMap<String, String> {
-        [("ACME_OPENAI_KEY".to_string(), "sk-acme".to_string())]
+    /// Just the inbound gateway key, which every servable config needs.
+    fn inbound_env() -> HashMap<String, String> {
+        [(INBOUND_KEY_ENV.to_string(), "inbound-secret".to_string())]
             .into_iter()
             .collect()
+    }
+
+    fn tenant_env() -> HashMap<String, String> {
+        let mut env = inbound_env();
+        env.insert("ACME_OPENAI_KEY".to_string(), "sk-acme".to_string());
+        env
     }
 
     async fn listed_aliases(state: &AppState) -> Vec<String> {
@@ -505,9 +524,12 @@ targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdo
 
         file.rewrite(WITH_BYOK_TENANT);
         let err = reloader
-            .reload_with_env(TRIGGER_SIGNAL, &HashMap::new())
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
             .expect_err("the tenant's key is not exported yet");
-        assert!(matches!(err, ReloadError::Credentials(_)));
+        assert!(matches!(
+            err,
+            ReloadError::Snapshot(SnapshotError::Credentials(_))
+        ));
         assert_eq!(state.config().generation, 0);
 
         reloader
@@ -536,12 +558,55 @@ default = true
 "#,
         );
         let err = reloader
-            .reload_with_env(TRIGGER_WATCH, &HashMap::new())
+            .reload_with_env(TRIGGER_WATCH, &inbound_env())
             .expect_err("candidate is invalid");
 
         assert!(matches!(err, ReloadError::Config(ConfigError::Invalid(_))));
         assert!(Arc::ptr_eq(&before, &state.config()));
         assert_eq!(listed_aliases(&state).await, vec!["gpt-4o".to_string()]);
+    }
+
+    /// Reload runs the same fail-closed validation boot does, so a candidate
+    /// whose gateway key cannot be resolved never replaces a config that can be
+    /// authenticated against (ADR 0013).
+    #[tokio::test]
+    async fn a_candidate_with_an_unresolvable_gateway_key_is_rejected_and_kept() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state.clone());
+        let before = state.config();
+
+        file.rewrite(&PLATFORM_ONLY.replace(INBOUND_KEY_ENV, "AXOND_ROTATED_KEY"));
+        let err = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect_err("the rotated key is not exported");
+
+        assert!(
+            matches!(
+                err,
+                ReloadError::Snapshot(SnapshotError::MissingGatewayKey { ref env, .. })
+                    if env == "AXOND_ROTATED_KEY"
+            ),
+            "{err}"
+        );
+        // The running config still serves, still with its own key table.
+        assert!(Arc::ptr_eq(&before, &state.config()));
+        assert_eq!(state.config().generation, 0);
+        assert!(state.config().inbound_keys.contains_key("inbound-secret"));
+
+        // Exporting the rotated key is all the candidate was waiting for.
+        let mut rotated = inbound_env();
+        rotated.insert(
+            "AXOND_ROTATED_KEY".to_string(),
+            "rotated-secret".to_string(),
+        );
+        reloader
+            .reload_with_env(TRIGGER_SIGNAL, &rotated)
+            .expect("resolves once the key is exported");
+        let after = state.config();
+        assert_eq!(after.generation, 1);
+        assert!(after.inbound_keys.contains_key("rotated-secret"));
+        assert!(!after.inbound_keys.contains_key("inbound-secret"));
     }
 
     /// A request holds its snapshot for its whole life, so a reload that lands
@@ -563,7 +628,7 @@ default = true
         let in_flight = state.config();
         file.rewrite(PLATFORM_ONLY);
         let summary = reloader
-            .reload_with_env(TRIGGER_SIGNAL, &HashMap::new())
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
             .expect("candidate is valid");
 
         assert_eq!(summary.models.removed, vec!["acme-fast".to_string()]);
@@ -589,13 +654,13 @@ default = true
             "[server]\nbind = \"127.0.0.1:9999\"\n{PLATFORM_ONLY}"
         ));
         let summary = reloader
-            .reload_with_env(TRIGGER_SIGNAL, &HashMap::new())
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
             .expect("candidate is valid");
         assert!(summary.bind_changed);
         assert!(summary.is_empty());
 
         let summary = reloader
-            .reload_with_env(TRIGGER_SIGNAL, &HashMap::new())
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
             .expect("candidate is valid");
         assert!(summary.bind_changed);
         assert_eq!(state.config().generation, 2);
@@ -624,7 +689,7 @@ default = true
 
         file.rewrite(PLATFORM_ONLY);
         reloader
-            .reload_if_changed_with_env(TRIGGER_WATCH, &HashMap::new())
+            .reload_if_changed_with_env(TRIGGER_WATCH, &inbound_env())
             .expect("the file changed")
             .expect("candidate is valid");
         assert_eq!(state.config().generation, 2);
@@ -637,7 +702,7 @@ default = true
         let reloader = Reloader::new("/nonexistent/axond.toml", state.clone());
 
         let err = reloader
-            .reload_with_env(TRIGGER_SIGNAL, &HashMap::new())
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
             .expect_err("no file, no candidate");
         assert!(matches!(err, ReloadError::Config(_)));
         assert_eq!(state.config().generation, 0);

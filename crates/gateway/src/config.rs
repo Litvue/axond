@@ -44,8 +44,8 @@ pub struct Config {
     #[serde(default)]
     pub reload: Reload,
     /// Inbound gateway keys. Each binds a secret (resolved from `env`) to a
-    /// namespace. When empty, the gateway is unauthenticated and every request
-    /// uses the default namespace — intended for local dev only.
+    /// namespace. At least one is required: inbound authentication fails closed,
+    /// so there is no keyless mode (ADR 0013).
     #[serde(default)]
     pub gateway_key: Vec<GatewayKey>,
     /// Where raw usage records go. Empty means the no-datastore default: one
@@ -618,16 +618,39 @@ impl Config {
                 )));
             }
         }
+        self.validate_gateway_keys(&namespaces)?;
+        self.validate_usage_sinks()?;
+        self.validate_budget()?;
+        Ok(())
+    }
+
+    /// Inbound authentication fails closed (ADR 0013): a config that declares no
+    /// usable gateway key describes a gateway nobody could call, which is a boot
+    /// failure rather than an open door.
+    fn validate_gateway_keys(
+        &self,
+        namespaces: &HashMap<&str, &Namespace>,
+    ) -> Result<(), ConfigError> {
+        if self.gateway_key.is_empty() {
+            return Err(ConfigError::Invalid(
+                "at least one `[[gateway_key]]` is required: inbound authentication fails closed and there is no keyless mode"
+                    .into(),
+            ));
+        }
         for k in &self.gateway_key {
-            if !namespaces.contains_key(k.namespace.as_str()) {
+            if k.env.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "gateway_key references undefined namespace `{}`",
+                    "gateway_key for namespace `{}` has an empty `env`",
                     k.namespace
                 )));
             }
+            if !namespaces.contains_key(k.namespace.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "gateway_key `{}` references undefined namespace `{}`",
+                    k.env, k.namespace
+                )));
+            }
         }
-        self.validate_usage_sinks()?;
-        self.validate_budget()?;
         Ok(())
     }
 
@@ -757,10 +780,53 @@ id = "openai"
 kind = "openai"
 base_url = "https://api.openai.com/v1"
 
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "platform"
+
 [[model]]
 name = "gpt-4o"
 targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 } }]
 "#;
+
+    /// Inbound auth fails closed (ADR 0013), so a config that would leave the
+    /// gateway callable without a credential is refused at boot.
+    #[test]
+    fn rejects_a_config_with_no_gateway_keys() {
+        let toml = r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[model]]
+name = "gpt-4o"
+targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
+"#;
+        let err = Config::from_toml_str(toml).expect_err("a keyless gateway must not boot");
+        assert!(
+            matches!(err, ConfigError::Invalid(ref msg) if msg.contains("gateway_key")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_gateway_key_that_names_nothing_resolvable() {
+        for key in [
+            "[[gateway_key]]\nenv = \"\"\nnamespace = \"platform\"",
+            "[[gateway_key]]\nenv = \"K\"\nnamespace = \"ghost\"",
+        ] {
+            let result = Config::from_toml_str(&format!("{VALID}\n{key}\n"));
+            assert!(
+                matches!(result, Err(ConfigError::Invalid(_))),
+                "expected `{key}` to be rejected"
+            );
+        }
+    }
 
     #[test]
     fn accepts_a_well_formed_config() {
