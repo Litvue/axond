@@ -128,13 +128,26 @@ namespace = "acme"
 provider = "openai"
 env = "GW_ACME_OPENAI_API_KEY"
 
-# ── Inbound gateway keys (optional) ───────────────────────────────────────────
-# Bind an inbound bearer token (read from `env`) to a namespace. Omit entirely
-# to run open in local dev (default namespace, subject = "anonymous").
+# ── Inbound gateway keys (required) ───────────────────────────────────────────
+# Bind an inbound token (read from `env`) to a namespace. Callers send it as
+# `Authorization: Bearer <token>` or `x-api-key: <token>`; the subject on every
+# usage record is the env var's NAME, never its value.
+#
+# Inbound auth fails closed: there is no keyless / anonymous mode, and no flag
+# that enables one. At least one `[[gateway_key]]` is required, and a declared
+# key whose `env` var is unset or empty is a FATAL boot error naming the env var
+# and namespace — it is never silently dropped. Two keys may not hold the same
+# secret (whose namespace the caller gets would be ambiguous). A reload candidate
+# with an unresolvable key is rejected and the running config keeps serving. See
+# docs/adr/0013-inbound-auth-fails-closed.md.
 
-# [[gateway_key]]
-# env = "GW_INBOUND_ACME_KEY"
-# namespace = "acme"
+[[gateway_key]]
+env = "GW_INBOUND_PLATFORM_KEY"
+namespace = "platform"
+
+[[gateway_key]]
+env = "GW_INBOUND_ACME_KEY"
+namespace = "acme"
 
 # ── Models (aliases) ──────────────────────────────────────────────────────────
 # Callers send the alias (`gpt-4o`), never `provider/model`. Targets are tried
@@ -155,11 +168,12 @@ targets = [
   { provider = "azure-openai", model = "gpt-4o", price = { input_microdollars_per_million = 2_500_000, output_microdollars_per_million = 10_000_000 } },
 ]
 
-# Usable from BOTH /v1/chat/completions (translated to Anthropic's wire) and
-# Anthropic's native /v1/messages (forwarded verbatim, streaming included, with
-# only `model` rewritten). A native route has no translation to fall back on, so
-# every target of an alias used on /v1/messages must be an `anthropic` provider —
-# an OpenAI-only alias there is a 400. See
+# Served on Anthropic's native /v1/messages (forwarded verbatim, streaming
+# included, with only `model` rewritten). No route translates between wires, so
+# every target of an alias must speak the route's shape: `anthropic` providers on
+# /v1/messages, OpenAI-family providers on /v1/chat/completions and
+# /v1/embeddings. A mismatch — including in a failover target — is a
+# 400 unsupported_wire before anything is dispatched. See
 # docs/adr/0012-native-provider-routes.md.
 
 [[model]]

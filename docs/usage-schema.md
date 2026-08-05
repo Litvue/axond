@@ -18,7 +18,7 @@ meaning, and how they are allowed to change. The design rationale is
 | `request_id` | `text` | Identifies one request. Unique **per gateway process**, not globally. |
 | `trace_id` | `text` | W3C trace id of the caller's trace; NULL when the request was not traced. One trace usually spans many requests. |
 | `namespace` | `text` | Tenant/namespace the request was served under. |
-| `subject` | `text` | Authenticated caller — the gateway-key id, or `anonymous` in open dev mode. |
+| `subject` | `text` | Authenticated caller — the gateway key's label (its env-var name). Always a declared identity: inbound auth fails closed (ADR 0013). |
 | `model` | `text` | Alias the caller asked for (`gpt-4o`). |
 | `target_provider` | `text` | Provider that served it. |
 | `target_model` | `text` | Concrete upstream model / deployment. |

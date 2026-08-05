@@ -667,8 +667,27 @@ mod tests {
         .expect("state")
     }
 
+    /// The inbound key the test configs declare, and the secret a caller
+    /// presents for it: inbound auth is always enforced (ADR 0013).
+    const GATEWAY_KEY: &str = r#"
+[[gateway_key]]
+env = "GW_TEST_INBOUND_KEY"
+namespace = "platform"
+"#;
+    const CALLER_SECRET: &str = "inbound-secret";
+
     fn test_env() -> HashMap<String, String> {
-        HashMap::from([("GW_TEST_OPENAI_KEY".to_owned(), "sk-test".to_owned())])
+        HashMap::from([
+            ("GW_TEST_OPENAI_KEY".to_owned(), "sk-test".to_owned()),
+            ("GW_TEST_INBOUND_KEY".to_owned(), CALLER_SECRET.to_owned()),
+        ])
+    }
+
+    /// A JSON `POST` that already carries the caller's gateway key.
+    fn authorized(uri: &str) -> axum::http::request::Builder {
+        Request::post(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {CALLER_SECRET}"))
     }
 
     fn single_target_config(base_url: &str) -> Config {
@@ -682,6 +701,8 @@ default = true
 id = "openai"
 kind = "openai"
 base_url = "{base_url}"
+
+{GATEWAY_KEY}
 
 [[credential]]
 namespace = "platform"
@@ -703,8 +724,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             "stream_options": { "include_usage": true },
             "messages": [{ "role": "user", "content": "hi" }]
         });
-        Request::post("/v1/chat/completions")
-            .header("content-type", "application/json")
+        authorized("/v1/chat/completions")
             .body(Body::from(serde_json::to_vec(&body).expect("body")))
             .expect("request")
     }
@@ -712,7 +732,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
     fn context() -> StreamContext {
         StreamContext {
             namespace: "platform".to_owned(),
-            subject: "anonymous".to_owned(),
+            subject: "GW_TEST_INBOUND_KEY".to_owned(),
             alias: "gpt-4o".to_owned(),
             target_provider: "openai".to_owned(),
             target_model: "gpt-4o".to_owned(),
@@ -728,7 +748,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             },
             budget_key: BudgetKey {
                 namespace: "platform".to_owned(),
-                subject: "anonymous".to_owned(),
+                subject: "GW_TEST_INBOUND_KEY".to_owned(),
             },
             reservation: Reservation {
                 id: "test".to_owned(),
@@ -843,6 +863,8 @@ id = "anthropic"
 kind = "anthropic"
 base_url = "http://{addr}"
 
+{GATEWAY_KEY}
+
 [[credential]]
 namespace = "platform"
 provider = "anthropic"
@@ -871,8 +893,7 @@ targets = [{{ provider = "anthropic", model = "claude-sonnet-4-5", price = {{ in
         });
         let resp = router(state)
             .oneshot(
-                Request::post("/v1/messages")
-                    .header("content-type", "application/json")
+                authorized("/v1/messages")
                     .body(Body::from(serde_json::to_vec(&body).expect("body")))
                     .expect("request"),
             )
@@ -1101,6 +1122,8 @@ id = "pb"
 kind = "openai"
 base_url = "{url_b}"
 
+{GATEWAY_KEY}
+
 [[credential]]
 namespace = "platform"
 provider = "pa"
@@ -1123,6 +1146,7 @@ targets = [
         let env = HashMap::from([
             ("KA".to_owned(), "a".to_owned()),
             ("KB".to_owned(), "b".to_owned()),
+            ("GW_TEST_INBOUND_KEY".to_owned(), CALLER_SECRET.to_owned()),
         ]);
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(LedgerSink(ledger.clone()))];
         AppState::new(

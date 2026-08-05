@@ -3,9 +3,10 @@
 //! Passthrough-first (delta A1): the OpenAI-shaped `/v1/chat/completions` route
 //! forwards the caller's body to a same-shaped upstream and only rewrites the
 //! `model` field to the resolved target. Cross-provider translation (e.g.
-//! routing an OpenAI request to Anthropic) reuses `gateway-core`'s adapters and
-//! is wired in as failover lands. A `stream: true` request takes the SSE relay
-//! in [`crate::streaming`].
+//! routing an OpenAI request to Anthropic) is deferred, so an alias whose
+//! targets cannot serve a route's wire is rejected up front rather than
+//! dispatched (ADR 0012). A `stream: true` request takes the SSE relay in
+//! [`crate::streaming`].
 //!
 //! The provider-native routes — Anthropic's `/v1/messages` and OpenAI-shaped
 //! `/v1/embeddings` — take the same path (ADR 0012). A caller already speaking
@@ -81,9 +82,9 @@ async fn list_models(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "object": "list", "data": data }))
 }
 
-/// Resolve the caller's namespace + subject from the inbound key. When no
-/// gateway keys are configured the gateway is open (dev mode) and uses the
-/// default namespace.
+/// Resolve the caller's namespace + subject from the inbound key. Every request
+/// must present a configured gateway key: authentication fails closed, and a
+/// snapshot with no key never reaches a request (ADR 0013).
 ///
 /// The key travels as `Authorization: Bearer` or, because that is what an
 /// Anthropic SDK pointed at the gateway sends, as `x-api-key`. Both name the
@@ -92,12 +93,6 @@ fn authenticate(
     snapshot: &ConfigSnapshot,
     headers: &HeaderMap,
 ) -> Result<InboundKey, GatewayError> {
-    if snapshot.inbound_keys.is_empty() {
-        return Ok(InboundKey {
-            namespace: snapshot.config.default_namespace().to_string(),
-            subject: "anonymous".to_string(),
-        });
-    }
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -117,8 +112,8 @@ fn authenticate(
 /// failover, credential pools, budgets, usage — is shared.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Route {
-    /// OpenAI-shaped chat, dispatched *through* the provider adapter so a target
-    /// on another wire can still serve it by translation.
+    /// OpenAI-shaped chat, dispatched through the provider adapter to an
+    /// OpenAI-family target's `/chat/completions`.
     ChatCompletions,
     /// Anthropic-shaped Messages, forwarded verbatim to an Anthropic target.
     NativeMessages,
@@ -145,16 +140,15 @@ impl Route {
         }
     }
 
-    /// Whether a provider of this kind speaks the route's wire shape. A native
-    /// route has no translation to fall back on, so an alias whose target cannot
-    /// serve the shape is a configuration mistake worth naming.
+    /// Whether a provider of this kind speaks the route's wire shape. No route
+    /// translates between wires, so an alias whose target cannot serve the shape
+    /// is a configuration mistake worth naming.
     fn serves(self, kind: ProviderKind) -> bool {
         match self {
-            Self::ChatCompletions => true,
-            Self::NativeMessages => kind == ProviderKind::Anthropic,
-            Self::Embeddings => {
+            Self::ChatCompletions | Self::Embeddings => {
                 matches!(kind, ProviderKind::Openai | ProviderKind::OpenaiCompatible)
             }
+            Self::NativeMessages => kind == ProviderKind::Anthropic,
         }
     }
 
@@ -224,9 +218,9 @@ struct Wire {
 
 impl Wire {
     /// Reject an alias whose targets cannot speak the route's wire *before*
-    /// anything is reserved or dispatched: a native route has no translation to
-    /// fall back on, and failing over into a target that cannot serve the shape
-    /// would turn a config mistake into a confusing upstream `404`.
+    /// anything is reserved or dispatched: no route translates between wires,
+    /// and failing over into a target that cannot serve the shape would turn a
+    /// config mistake into a confusing upstream `404`.
     fn check_targets(
         &self,
         cfg: &crate::config::Config,
@@ -1082,8 +1076,36 @@ mod tests {
     use std::time::Duration;
     use tower::util::ServiceExt;
 
+    /// The inbound key every test config declares, and the secret the caller
+    /// presents for it. Inbound auth is always enforced (ADR 0013).
+    const GATEWAY_KEY: &str = r#"
+[[gateway_key]]
+env = "AXOND_INBOUND_KEY"
+namespace = "platform"
+"#;
+    const CALLER_SECRET: &str = "inbound-secret";
+
+    /// The given provider-credential env vars, plus the inbound key's.
+    fn env_with<const N: usize>(credentials: [(&str, &str); N]) -> HashMap<String, String> {
+        credentials
+            .into_iter()
+            .chain([("AXOND_INBOUND_KEY", CALLER_SECRET)])
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect()
+    }
+
+    /// A JSON `POST` that already carries the caller's gateway key.
+    fn authorized(uri: &str) -> axum::http::request::Builder {
+        Request::post(uri)
+            .header("content-type", "application/json")
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {CALLER_SECRET}"),
+            )
+    }
+
     fn test_state() -> AppState {
-        let cfg = Config::from_toml_str(
+        let cfg = Config::from_toml_str(&format!(
             r#"
 [[namespace]]
 id = "platform"
@@ -1094,20 +1116,71 @@ id = "openai"
 kind = "openai"
 base_url = "https://api.openai.com/v1"
 
+{GATEWAY_KEY}
+
 [[model]]
 name = "gpt-4o"
-targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 } }]
-"#,
-        )
+targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }} }}]
+"#
+        ))
         .unwrap();
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
         AppState::new(
             cfg,
-            &HashMap::new(),
+            &env_with([]),
             UsageFanout::new(sinks),
             Box::new(NoBudget),
         )
         .expect("no credentials to resolve")
+    }
+
+    /// Inbound auth is enforced for every configured key set: the wrong
+    /// credential, and no credential at all, are both `401`.
+    #[tokio::test]
+    async fn a_request_without_a_valid_gateway_key_is_rejected() {
+        let body =
+            || Body::from(serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []})).unwrap());
+        for request in [
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(body())
+                .unwrap(),
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(axum::http::header::AUTHORIZATION, "Bearer not-the-key")
+                .body(body())
+                .unwrap(),
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("x-api-key", "not-the-key")
+                .body(body())
+                .unwrap(),
+        ] {
+            let resp = router(test_state()).oneshot(request).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    /// The configured key passes in either scheme an SDK might send it in, and
+    /// the caller is attributed to the key's namespace and env-var name.
+    #[tokio::test]
+    async fn a_configured_gateway_key_authenticates_in_either_scheme() {
+        let state = test_state();
+        let snapshot = state.config();
+        for headers in [
+            HeaderMap::from_iter([(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {CALLER_SECRET}").parse().unwrap(),
+            )]),
+            HeaderMap::from_iter([(
+                axum::http::HeaderName::from_static("x-api-key"),
+                CALLER_SECRET.parse().unwrap(),
+            )]),
+        ] {
+            let caller = authenticate(&snapshot, &headers).expect("the key is configured");
+            assert_eq!(caller.namespace, "platform");
+            assert_eq!(caller.subject, "AXOND_INBOUND_KEY");
+        }
     }
 
     #[tokio::test]
@@ -1136,8 +1209,7 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
         let body = serde_json::to_vec(&json!({"model": "nope", "messages": []})).unwrap();
         let resp = router(test_state())
             .oneshot(
-                Request::post("/v1/chat/completions")
-                    .header("content-type", "application/json")
+                authorized("/v1/chat/completions")
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -1172,9 +1244,52 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
     async fn an_openai_only_alias_on_the_native_route_is_a_typed_4xx() {
         let body = serde_json::to_vec(&json!({ "model": "gpt-4o", "messages": [] })).unwrap();
         let resp = router(test_state())
+            .oneshot(authorized("/v1/messages").body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "unsupported_wire");
+    }
+
+    /// The mirror of the native-route case: an Anthropic-native target cannot
+    /// serve the OpenAI chat wire, so the alias is rejected up front rather than
+    /// dispatched into a `/chat/completions` the provider does not expose.
+    #[tokio::test]
+    async fn an_anthropic_alias_on_chat_completions_is_a_typed_4xx() {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+
+{GATEWAY_KEY}
+
+[[model]]
+name = "claude"
+targets = [{{ provider = "anthropic", model = "claude-sonnet-4-5", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000 }} }}]
+"#
+        ))
+        .unwrap();
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        let state = AppState::new(
+            cfg,
+            &env_with([]),
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+        )
+        .expect("no credentials to resolve");
+
+        let body = serde_json::to_vec(&json!({ "model": "claude", "messages": [] })).unwrap();
+        let resp = router(state)
             .oneshot(
-                Request::post("/v1/messages")
-                    .header("content-type", "application/json")
+                authorized("/v1/chat/completions")
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -1184,6 +1299,8 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "unsupported_wire");
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(message.contains("anthropic"), "{message}");
     }
 
     /// Collects records so attribution can be asserted.
@@ -1250,6 +1367,8 @@ id = "openai"
 kind = "openai"
 base_url = "{base_url}"
 
+{GATEWAY_KEY}
+
 [[credential]]
 namespace = "platform"
 provider = "openai"
@@ -1268,10 +1387,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
 "#
         ))
         .unwrap();
-        let env: HashMap<String, String> = [("K1", "sk-exhausted"), ("K2", "sk-good")]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        let env = env_with([("K1", "sk-exhausted"), ("K2", "sk-good")]);
         let captured = CapturingSink::default();
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(captured.clone())];
         let state = AppState::new(cfg, &env, UsageFanout::new(sinks), Box::new(NoBudget)).unwrap();
@@ -1279,8 +1395,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         let body = serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []})).unwrap();
         let resp = router(state)
             .oneshot(
-                Request::post("/v1/chat/completions")
-                    .header("content-type", "application/json")
+                authorized("/v1/chat/completions")
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -1362,6 +1477,8 @@ id = "pb"
 kind = "openai"
 base_url = "{url_b}"
 
+{GATEWAY_KEY}
+
 [[credential]]
 namespace = "platform"
 provider = "pa"
@@ -1385,18 +1502,14 @@ targets = [
 "#
         ))
         .unwrap();
-        let env: HashMap<String, String> = [("KA", "ka"), ("KB", "kb")]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        let env = env_with([("KA", "ka"), ("KB", "kb")]);
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(captured)];
         AppState::new(cfg, &env, UsageFanout::new(sinks), Box::new(NoBudget)).unwrap()
     }
 
     fn chat_request() -> Request<Body> {
         let body = serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []})).unwrap();
-        Request::post("/v1/chat/completions")
-            .header("content-type", "application/json")
+        authorized("/v1/chat/completions")
             .body(Body::from(body))
             .unwrap()
     }
@@ -1443,6 +1556,8 @@ id = "openai"
 kind = "openai"
 base_url = "{base_url}"
 
+{GATEWAY_KEY}
+
 [[credential]]
 namespace = "platform"
 provider = "openai"
@@ -1454,7 +1569,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
 "#
         ))
         .unwrap();
-        let env = HashMap::from([("K1".to_owned(), "sk-test".to_owned())]);
+        let env = env_with([("K1", "sk-test")]);
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
         AppState::new(cfg, &env, UsageFanout::new(sinks), budget).unwrap()
     }
@@ -1544,8 +1659,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             let body =
                 serde_json::to_vec(&json!({"model": "gpt-4o", "messages": [], "max_tokens": 16}))
                     .unwrap();
-            Request::post("/v1/chat/completions")
-                .header("content-type", "application/json")
+            authorized("/v1/chat/completions")
                 .body(Body::from(body))
                 .unwrap()
         };
@@ -1668,6 +1782,8 @@ id = "p"
 kind = "{kind}"
 base_url = "{base_url}"
 
+{GATEWAY_KEY}
+
 [[credential]]
 namespace = "platform"
 provider = "p"
@@ -1680,7 +1796,7 @@ targets = [{{ provider = "p", model = "upstream-model", price = {{ input_microdo
 "#
         ))
         .unwrap();
-        let env = HashMap::from([("K1".to_owned(), "sk-test".to_owned())]);
+        let env = env_with([("K1", "sk-test")]);
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(captured)];
         AppState::new(cfg, &env, UsageFanout::new(sinks), Box::new(NoBudget)).unwrap()
     }
@@ -1725,8 +1841,7 @@ targets = [{{ provider = "p", model = "upstream-model", price = {{ input_microdo
         });
         let resp = router(state)
             .oneshot(
-                Request::post("/v1/messages")
-                    .header("content-type", "application/json")
+                authorized("/v1/messages")
                     .header("anthropic-version", "2099-01-01")
                     .body(Body::from(serde_json::to_vec(&sent).unwrap()))
                     .unwrap(),
@@ -1774,8 +1889,7 @@ targets = [{{ provider = "p", model = "upstream-model", price = {{ input_microdo
         let sent = json!({ "model": "alias", "input": ["one", "two"], "dimensions": 2 });
         let resp = router(state)
             .oneshot(
-                Request::post("/v1/embeddings")
-                    .header("content-type", "application/json")
+                authorized("/v1/embeddings")
                     .body(Body::from(serde_json::to_vec(&sent).unwrap()))
                     .unwrap(),
             )

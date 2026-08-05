@@ -391,6 +391,10 @@ id = "acme"
 id = "openai"
 kind = "openai"
 base_url = "https://api.openai.com/v1"
+
+[[gateway_key]]
+env = "AXOND_INBOUND_KEY"
+namespace = "platform"
 {extra}
 "#
         );
@@ -601,6 +605,10 @@ allow_platform_fallback = true
 id = "openai"
 kind = "openai"
 base_url = "https://api.openai.com/v1"
+
+[[gateway_key]]
+env = "AXOND_INBOUND_KEY"
+namespace = "platform"
 {TWO_PLATFORM_KEYS}
 "#
         ))

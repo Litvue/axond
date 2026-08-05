@@ -46,6 +46,8 @@ centralizes that:
   `base_url`.
 - **Credentials are write-only.** No endpoint ever returns a key; only presence
   is observable.
+- **Inbound auth fails closed.** Every request that reaches a provider presents a
+  configured gateway key; there is no keyless / anonymous mode.
 
 ## Quick start
 
@@ -60,16 +62,23 @@ export GW_PLATFORM_ANTHROPIC_API_KEY=sk-ant-...
 export GW_PLATFORM_AZURE_OPENAI_API_KEY=...         # gpt-4o's failover target
 export GW_ACME_OPENAI_API_KEY=sk-...                # the example's BYOK namespace
 
+# Inbound keys authenticate callers. At least one is required — there is no
+# keyless mode, and a declared key whose env var is unset is a boot error.
+export GW_INBOUND_PLATFORM_KEY=local-dev-token
+export GW_INBOUND_ACME_KEY=acme-token
+
 cargo run -p axond                    # or: just run
 ```
 
 ```bash
 curl localhost:8080/v1/chat/completions \
+  -H "authorization: Bearer $GW_INBOUND_PLATFORM_KEY" \
   -H 'content-type: application/json' \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-Point any OpenAI-compatible SDK at `http://localhost:8080/v1` as its base URL.
+Point any OpenAI-compatible SDK at `http://localhost:8080/v1` as its base URL,
+with the gateway key as its API key.
 
 ### Native provider routes
 
@@ -78,6 +87,7 @@ Anthropic's own wire to `/v1/messages`:
 
 ```bash
 curl localhost:8080/v1/messages \
+  -H "x-api-key: $GW_INBOUND_PLATFORM_KEY" \
   -H 'content-type: application/json' \
   -d '{"model":"claude-sonnet","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
 ```
@@ -87,9 +97,11 @@ included, so signed thinking blocks and tool-use blocks survive intact (verbatim
 bytes on a stream; re-serialized values, same signatures, when buffered) —
 and aliasing, failover, credential pools, budgets, and usage records apply exactly
 as they do on `/v1/chat/completions`. `/v1/embeddings` is served the same way for
-OpenAI-family targets, billed on input tokens only. A native alias must resolve to
-targets that speak that wire: an OpenAI-only alias on `/v1/messages` is a
-`400 unsupported_wire`. `/v1/responses` is deferred past beta and returns a typed
+OpenAI-family targets, billed on input tokens only. Every route requires an alias
+whose targets — including its failover targets — speak that route's wire: an
+OpenAI-only alias on `/v1/messages`, or an Anthropic-native one on
+`/v1/chat/completions`, is a `400 unsupported_wire` before anything is reserved or
+dispatched. `/v1/responses` is deferred past beta and returns a typed
 `501`. See [ADR 0012](./docs/adr/0012-native-provider-routes.md).
 
 ## Configuration
@@ -99,8 +111,40 @@ may override scalars. See [`axond.example.toml`](./axond.example.toml) for
 the annotated surface: `server`, `namespace`, `provider`, `credential`,
 `credential_pool`, `gateway_key`, `model`, and `usage_sink`.
 
-Every env var a `[[credential]]` references must be set and non-empty at boot, or
-the gateway refuses to start.
+Every env var a `[[credential]]` or `[[gateway_key]]` references must be set and
+non-empty at boot, or the gateway refuses to start.
+
+### Inbound authentication
+
+```toml
+[[gateway_key]]
+env = "GW_INBOUND_PLATFORM_KEY"   # the secret lives in the env; `env` is its NAME
+namespace = "platform"            # the namespace this caller is served under
+```
+
+Callers present the key as `Authorization: Bearer <token>` or `x-api-key: <token>`
+(what an Anthropic SDK sends) — the same key table either way. Usage records
+attribute the caller as the env var's *name*; a secret's value is never logged.
+
+**Authentication fails closed and there is no keyless / anonymous mode:**
+
+- at least one `[[gateway_key]]` is required, or the gateway refuses to boot;
+- a declared key whose env var is unset or empty is a **fatal** boot error naming
+  that env var and namespace — never a silently dropped key;
+- two keys may not resolve to the same secret: whose namespace the caller gets
+  would be ambiguous, so that too refuses to boot;
+- an empty key table can never mean "allow all": a request without a configured
+  key is `401`;
+- a reload (`SIGHUP` / `[reload] watch`) runs the same validation, so a candidate
+  with an unresolvable key is rejected and the running config keeps serving —
+  rotate by declaring the new key alongside the old, reloading, then dropping the
+  old one.
+
+Every route that dispatches to a provider (`/v1/chat/completions`, `/v1/messages`,
+`/v1/embeddings`) authenticates. The operational endpoints do not: `/healthz`,
+`/readyz`, and the `/v1/models` alias catalogue answer without a credential.
+
+See [ADR 0013](./docs/adr/0013-inbound-auth-fails-closed.md).
 
 ### Credential pools
 
