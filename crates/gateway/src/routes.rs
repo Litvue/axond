@@ -1258,7 +1258,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
     /// dispatched into a `/chat/completions` the provider does not expose.
     #[tokio::test]
     async fn an_anthropic_alias_on_chat_completions_is_a_typed_4xx() {
-        let cfg = Config::from_toml_str(
+        let cfg = Config::from_toml_str(&format!(
             r#"
 [[namespace]]
 id = "platform"
@@ -1269,16 +1269,18 @@ id = "anthropic"
 kind = "anthropic"
 base_url = "https://api.anthropic.com/v1"
 
+{GATEWAY_KEY}
+
 [[model]]
 name = "claude"
-targets = [{ provider = "anthropic", model = "claude-sonnet-4-5", price = { input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000 } }]
-"#,
-        )
+targets = [{{ provider = "anthropic", model = "claude-sonnet-4-5", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000 }} }}]
+"#
+        ))
         .unwrap();
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
         let state = AppState::new(
             cfg,
-            &HashMap::new(),
+            &env_with([]),
             UsageFanout::new(sinks),
             Box::new(NoBudget),
         )
@@ -1287,8 +1289,7 @@ targets = [{ provider = "anthropic", model = "claude-sonnet-4-5", price = { inpu
         let body = serde_json::to_vec(&json!({ "model": "claude", "messages": [] })).unwrap();
         let resp = router(state)
             .oneshot(
-                Request::post("/v1/chat/completions")
-                    .header("content-type", "application/json")
+                authorized("/v1/chat/completions")
                     .body(Body::from(body))
                     .unwrap(),
             )
