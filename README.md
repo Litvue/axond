@@ -97,9 +97,11 @@ included, so signed thinking blocks and tool-use blocks survive intact (verbatim
 bytes on a stream; re-serialized values, same signatures, when buffered) —
 and aliasing, failover, credential pools, budgets, and usage records apply exactly
 as they do on `/v1/chat/completions`. `/v1/embeddings` is served the same way for
-OpenAI-family targets, billed on input tokens only. A native alias must resolve to
-targets that speak that wire: an OpenAI-only alias on `/v1/messages` is a
-`400 unsupported_wire`. `/v1/responses` is deferred past beta and returns a typed
+OpenAI-family targets, billed on input tokens only. Every route requires an alias
+whose targets — including its failover targets — speak that route's wire: an
+OpenAI-only alias on `/v1/messages`, or an Anthropic-native one on
+`/v1/chat/completions`, is a `400 unsupported_wire` before anything is reserved or
+dispatched. `/v1/responses` is deferred past beta and returns a typed
 `501`. See [ADR 0012](./docs/adr/0012-native-provider-routes.md).
 
 ## Configuration

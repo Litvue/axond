@@ -3,9 +3,10 @@
 //! Passthrough-first (delta A1): the OpenAI-shaped `/v1/chat/completions` route
 //! forwards the caller's body to a same-shaped upstream and only rewrites the
 //! `model` field to the resolved target. Cross-provider translation (e.g.
-//! routing an OpenAI request to Anthropic) reuses `gateway-core`'s adapters and
-//! is wired in as failover lands. A `stream: true` request takes the SSE relay
-//! in [`crate::streaming`].
+//! routing an OpenAI request to Anthropic) is deferred, so an alias whose
+//! targets cannot serve a route's wire is rejected up front rather than
+//! dispatched (ADR 0012). A `stream: true` request takes the SSE relay in
+//! [`crate::streaming`].
 //!
 //! The provider-native routes — Anthropic's `/v1/messages` and OpenAI-shaped
 //! `/v1/embeddings` — take the same path (ADR 0012). A caller already speaking
@@ -111,8 +112,8 @@ fn authenticate(
 /// failover, credential pools, budgets, usage — is shared.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Route {
-    /// OpenAI-shaped chat, dispatched *through* the provider adapter so a target
-    /// on another wire can still serve it by translation.
+    /// OpenAI-shaped chat, dispatched through the provider adapter to an
+    /// OpenAI-family target's `/chat/completions`.
     ChatCompletions,
     /// Anthropic-shaped Messages, forwarded verbatim to an Anthropic target.
     NativeMessages,
@@ -139,16 +140,15 @@ impl Route {
         }
     }
 
-    /// Whether a provider of this kind speaks the route's wire shape. A native
-    /// route has no translation to fall back on, so an alias whose target cannot
-    /// serve the shape is a configuration mistake worth naming.
+    /// Whether a provider of this kind speaks the route's wire shape. No route
+    /// translates between wires, so an alias whose target cannot serve the shape
+    /// is a configuration mistake worth naming.
     fn serves(self, kind: ProviderKind) -> bool {
         match self {
-            Self::ChatCompletions => true,
-            Self::NativeMessages => kind == ProviderKind::Anthropic,
-            Self::Embeddings => {
+            Self::ChatCompletions | Self::Embeddings => {
                 matches!(kind, ProviderKind::Openai | ProviderKind::OpenaiCompatible)
             }
+            Self::NativeMessages => kind == ProviderKind::Anthropic,
         }
     }
 
@@ -218,9 +218,9 @@ struct Wire {
 
 impl Wire {
     /// Reject an alias whose targets cannot speak the route's wire *before*
-    /// anything is reserved or dispatched: a native route has no translation to
-    /// fall back on, and failing over into a target that cannot serve the shape
-    /// would turn a config mistake into a confusing upstream `404`.
+    /// anything is reserved or dispatched: no route translates between wires,
+    /// and failing over into a target that cannot serve the shape would turn a
+    /// config mistake into a confusing upstream `404`.
     fn check_targets(
         &self,
         cfg: &crate::config::Config,
@@ -1251,6 +1251,55 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "unsupported_wire");
+    }
+
+    /// The mirror of the native-route case: an Anthropic-native target cannot
+    /// serve the OpenAI chat wire, so the alias is rejected up front rather than
+    /// dispatched into a `/chat/completions` the provider does not expose.
+    #[tokio::test]
+    async fn an_anthropic_alias_on_chat_completions_is_a_typed_4xx() {
+        let cfg = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+
+[[model]]
+name = "claude"
+targets = [{ provider = "anthropic", model = "claude-sonnet-4-5", price = { input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000 } }]
+"#,
+        )
+        .unwrap();
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        let state = AppState::new(
+            cfg,
+            &HashMap::new(),
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+        )
+        .expect("no credentials to resolve");
+
+        let body = serde_json::to_vec(&json!({ "model": "claude", "messages": [] })).unwrap();
+        let resp = router(state)
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "unsupported_wire");
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(message.contains("anthropic"), "{message}");
     }
 
     /// Collects records so attribution can be asserted.

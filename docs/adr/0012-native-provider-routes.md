@@ -95,6 +95,18 @@ is a configuration mistake, and surfacing it as a 400 up front beats an upstream
 `404` mid-failover. This is the fail-early posture the boot gate takes, applied to
 the one thing boot cannot know — which route the caller will use.
 
+The rule is now every route's, not just the native ones'. `/v1/chat/completions`
+initially accepted any provider kind on the theory that the chat adapter could
+translate an OpenAI-shaped body onto another wire, but the request is dispatched
+to the target's `/chat/completions` — a path an Anthropic-native provider does not
+expose — so such an alias could only ever end in an opaque upstream `404`, after a
+budget hold and a dispatch. `ChatCompletions` therefore serves the same
+OpenAI-family provider kinds `/v1/embeddings` does, and the mismatch is the same
+typed `400 unsupported_wire`. Cross-provider translation stays deferred: making it
+real means routing an OpenAI-shaped chat request to a provider's *own* endpoint
+and translating both directions, which is a decision of its own rather than a
+silent fallback.
+
 **`/v1/responses` is deferred past beta.** It is the one route where passthrough
 is not the whole job: the Responses API is *stateful* (server-side conversation
 storage via `store`/`previous_response_id`), and an honest implementation has to
@@ -116,9 +128,10 @@ allowing.
   `Authorization: Bearer`, just the scheme the client happens to send), and its
   `anthropic-version` / `anthropic-beta` headers are forwarded, with the caller's
   pinned version winning over the gateway's default.
-- A native alias is provider-bound by nature: `/v1/messages` can only fail over
-  between Anthropic targets. Cross-wire failover remains available through
-  `/v1/chat/completions`, where translation is the point.
+- Every alias is provider-bound by nature: `/v1/messages` can only fail over
+  between Anthropic targets, and `/v1/chat/completions` and `/v1/embeddings` only
+  between OpenAI-family ones. Cross-wire failover is not available on any route
+  until cross-provider translation is decided on its own terms.
 - The relay now has two framings. The native one relays upstream bytes verbatim,
   which means a mid-stream failure is reported as an Anthropic-shaped `error`
   event; the upstream has usually sent its own already, and an SDK stops at the
