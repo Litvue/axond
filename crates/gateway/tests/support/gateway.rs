@@ -1,0 +1,259 @@
+//! Boots the real `axond` binary against a [`FakeUpstream`].
+//!
+//! Black-box on purpose: these suites qualify the shipped process — its config
+//! parsing, its inbound auth, its usage records on stdout — rather than a
+//! router assembled in-process, so a regression in boot or wiring fails here
+//! too.
+
+use std::io::{BufRead, BufReader};
+use std::net::{SocketAddr, TcpListener};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+
+use super::upstream::target;
+
+/// The inbound gateway key every test authenticates with. A fixture value, not
+/// a secret: the fake upstream is the only thing it can reach.
+pub const GATEWAY_KEY: &str = "test-inbound-key";
+/// Upstream credentials the gateway is expected to inject, asserted on the
+/// fake upstream's recorded requests.
+pub const OPENAI_KEY: &str = "test-upstream-openai-key";
+pub const ANTHROPIC_KEY: &str = "test-upstream-anthropic-key";
+
+/// Caller-facing aliases the test config exposes.
+pub mod alias {
+    pub const CHAT: &str = "chat-golden";
+    pub const CHAT_SLOW: &str = "chat-slow";
+    pub const CHAT_DROP: &str = "chat-drop";
+    pub const CHAT_FAIL: &str = "chat-fail";
+    pub const MESSAGES: &str = "messages-golden";
+    pub const MESSAGES_SLOW: &str = "messages-slow";
+    pub const MESSAGES_DROP: &str = "messages-drop";
+    pub const EMBEDDINGS: &str = "embeddings-golden";
+}
+
+/// Micro-dollars per million tokens every test target is priced at, so an
+/// expected charge can be computed from the tokens a fixture reports.
+pub const INPUT_PRICE: u64 = 2_500_000;
+pub const OUTPUT_PRICE: u64 = 10_000_000;
+
+pub struct Axond {
+    pub base_url: String,
+    child: Child,
+    lines: Arc<Mutex<Vec<String>>>,
+}
+
+impl Axond {
+    /// Boot the binary against `upstream_base_url` and wait until it serves.
+    pub async fn start(upstream_base_url: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("axond-compat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test config directory");
+        let addr = free_addr();
+        let path = dir.join(format!("axond-{}.toml", addr.port()));
+        std::fs::write(&path, config_toml(addr, upstream_base_url))
+            .expect("test config is written");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_axond"))
+            .env("AXOND_CONFIG", &path)
+            .env("GW_INBOUND_KEY", GATEWAY_KEY)
+            .env("GW_FAKE_OPENAI_KEY", OPENAI_KEY)
+            .env("GW_FAKE_ANTHROPIC_KEY", ANTHROPIC_KEY)
+            .env("RUST_LOG", "warn")
+            .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the axond binary starts");
+
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        for stream in [
+            child
+                .stdout
+                .take()
+                .map(Box::new)
+                .map(|s| s as Box<dyn std::io::Read + Send>),
+            child
+                .stderr
+                .take()
+                .map(Box::new)
+                .map(|s| s as Box<dyn std::io::Read + Send>),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let sink = lines.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    sink.lock().expect("output lock").push(line);
+                }
+            });
+        }
+
+        let gateway = Self {
+            base_url: format!("http://{addr}"),
+            child,
+            lines,
+        };
+        gateway.await_ready().await;
+        gateway
+    }
+
+    async fn await_ready(&self) {
+        let client = reqwest::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if let Ok(response) = client
+                .get(format!("{}/healthz", self.base_url))
+                .send()
+                .await
+                && response.status().is_success()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("axond did not become healthy:\n{}", self.output());
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url)
+    }
+
+    /// Everything the process has written to stdout/stderr, for failure output.
+    pub fn output(&self) -> String {
+        self.lines.lock().expect("output lock").join("\n")
+    }
+
+    /// The usage records the process has emitted on its stdout sink — the
+    /// black-box view of what each request was charged.
+    pub fn usage_records(&self) -> Vec<Value> {
+        self.lines
+            .lock()
+            .expect("output lock")
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value.get("schema_version").is_some())
+            .collect()
+    }
+
+    /// Wait until at least `count` usage records have been written. Settlement
+    /// is detached from the request, so a record can land just after the
+    /// client's last byte.
+    pub async fn await_usage_records(&self, count: usize) -> Vec<Value> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let records = self.usage_records();
+            if records.len() >= count {
+                return records;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "expected {count} usage records, saw {}:\n{}",
+                    records.len(),
+                    self.output()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Resident set size of the gateway process, in kibibytes. Used to assert
+    /// a soak does not buffer stream bodies.
+    pub fn resident_kib(&self) -> Option<u64> {
+        resident_kib(self.pid())
+    }
+}
+
+/// Resident set size of a process, in kibibytes; `None` off `/proc` platforms.
+pub fn resident_kib(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status.lines().find_map(|line| {
+        line.strip_prefix("VmRSS:")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    })
+}
+
+impl Drop for Axond {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A loopback address nothing is listening on. The listener is closed before
+/// the gateway binds it, which is the usual small race and is fine for a test
+/// process that owns its own port range for milliseconds.
+fn free_addr() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
+    listener.local_addr().expect("a bound address")
+}
+
+fn config_toml(bind: SocketAddr, upstream: &str) -> String {
+    let price = format!(
+        "{{ input_microdollars_per_million = {INPUT_PRICE}, output_microdollars_per_million = {OUTPUT_PRICE} }}"
+    );
+    let model = |name: &str, provider: &str, target: &str| {
+        format!(
+            "[[model]]\nname = \"{name}\"\ntargets = [ {{ provider = \"{provider}\", model = \"{target}\", price = {price} }} ]\n\n"
+        )
+    };
+    format!(
+        r#"
+[server]
+bind = "{bind}"
+
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "fake-openai"
+kind = "openai"
+base_url = "{upstream}"
+
+[[provider]]
+id = "fake-anthropic"
+kind = "anthropic"
+base_url = "{upstream}"
+
+[[credential]]
+namespace = "platform"
+provider = "fake-openai"
+env = "GW_FAKE_OPENAI_KEY"
+id = "fake-openai-primary"
+
+[[credential]]
+namespace = "platform"
+provider = "fake-anthropic"
+env = "GW_FAKE_ANTHROPIC_KEY"
+id = "fake-anthropic-primary"
+
+[[gateway_key]]
+env = "GW_INBOUND_KEY"
+namespace = "platform"
+
+[failover]
+max_attempts = 1
+overall_timeout_ms = 30000
+
+{chat}{chat_slow}{chat_drop}{chat_fail}{messages}{messages_slow}{messages_drop}{embeddings}"#,
+        chat = model(alias::CHAT, "fake-openai", target::CHAT),
+        chat_slow = model(alias::CHAT_SLOW, "fake-openai", target::SLOW_STREAM),
+        chat_drop = model(alias::CHAT_DROP, "fake-openai", target::DROP_STREAM),
+        chat_fail = model(alias::CHAT_FAIL, "fake-openai", target::FAIL),
+        messages = model(alias::MESSAGES, "fake-anthropic", target::MESSAGES),
+        messages_slow = model(alias::MESSAGES_SLOW, "fake-anthropic", target::SLOW_STREAM),
+        messages_drop = model(alias::MESSAGES_DROP, "fake-anthropic", target::DROP_STREAM),
+        embeddings = model(alias::EMBEDDINGS, "fake-openai", target::EMBEDDINGS),
+    )
+}

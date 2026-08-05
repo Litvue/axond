@@ -71,6 +71,31 @@ jobs:
           cache-targets: false
       - run: cargo test --workspace --all-features --locked
 
+  sdk-compat:
+    name: Provider-SDK compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Build the gateway the SDKs will talk to
+        run: cargo build -p axond --locked
+      # Hermetic: the SDKs are pointed at a local fake upstream serving the
+      # committed fixtures, so this lane makes no provider call and needs no key.
+      - name: Install the pinned provider SDKs
+        run: pip install -r tests/compat/requirements.txt
+      - name: Drive axond with the vendors' own SDKs
+        run: pytest tests/compat -q
+        env:
+          AXOND_BIN: ${{ github.workspace }}/target/debug/axond
+
   docs:
     name: Rustdoc
     runs-on: ubuntu-latest
@@ -147,6 +172,7 @@ jobs:
       - clippy
       - build
       - tests
+      - sdk-compat
       - docs
       - dependency-policy
       - static-binary
@@ -159,6 +185,7 @@ jobs:
           test "${{ needs.clippy.result }}" = success
           test "${{ needs.build.result }}" = success
           test "${{ needs.tests.result }}" = success
+          test "${{ needs.sdk-compat.result }}" = success
           test "${{ needs.docs.result }}" = success
           test "${{ needs.dependency-policy.result }}" = success
           test "${{ needs.static-binary.result }}" = success

@@ -1,0 +1,36 @@
+name: Soak
+
+# The heavy SSE soak: hundreds of concurrent long-lived streams with injected
+# client cancels and upstream drops. Deliberately off the per-PR path — a fast,
+# deterministic subset of the same suite runs under `cargo test` in the `CI`
+# workflow's `tests` lane, and this is the long-running confirmation (ADR 0014).
+on:
+  workflow_dispatch:
+  schedule:
+    # Sundays, 04:17 UTC.
+    - cron: '17 4 * * 0'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  sse-soak:
+    name: SSE soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - name: Soak the SSE relay
+        run: cargo test --locked --all-features --test soak -- --nocapture
+        env:
+          AXOND_SOAK: '1'
