@@ -14,9 +14,12 @@ tests/fixtures/<provider>/<case>.sse    streamed response, verbatim SSE bytes
 ```
 
 A `.sse` file is served byte-for-byte, split at arbitrary chunk boundaries. For
-the native Anthropic route the relay is byte-faithful, so the file doubles as
-the expected client-visible output — reformatting one is a behaviour change,
-not a cosmetic edit.
+the native Anthropic route the relay is asserted to be byte-faithful, so the
+file doubles as the expected client-visible output. Its *content* is pinned by
+`replay.rs`, which asserts the frames accounting reads (`message_start` /
+`message_delta` usage, the OpenAI usage chunk) are present and that the settled
+charge matches the tokens the fixture reports — so editing one moves an
+asserted expectation rather than a cosmetic sample.
 
 ## Adding a fixture
 

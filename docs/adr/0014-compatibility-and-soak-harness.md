@@ -59,8 +59,13 @@ they get their own CI lane.
 Recorded provider responses live in `tests/fixtures/` as plain `.json` bodies
 and byte-exact `.sse` files. Both harnesses serve the same files, and the
 Anthropic streaming test asserts the client-visible bytes are **identical** to
-the fixture — so a fixture is not a convenient sample to reformat at will, it
-is the expected output. Fixtures are redacted (thinking signatures become
+the bytes the upstream sent — the relay may not reframe, reserialize, or
+reorder them. That is a fidelity assertion about the *gateway*, and it is
+symmetric in the fixture by construction, so the fixtures' own content is
+pinned separately: `replay.rs` asserts each committed `.sse` still carries the
+frames accounting depends on, and that the settled charge matches the tokens
+the fixture reports. Editing a fixture therefore moves a stated expectation,
+not just a sample. Fixtures are redacted (thinking signatures become
 `REDACTED_...` placeholders, which the tests then assert survive), and
 `tests/fixtures/README.md` documents how to capture and redact a new one.
 
@@ -95,7 +100,7 @@ nightly cannot rot into something nobody runs.
 
 - A wire-fidelity or accounting regression fails deterministically, offline,
   with no provider account, no secret, and no network in any lane.
-- Editing a fixture is a behaviour change and reads like one in review.
+- Editing a fixture moves an asserted expectation and reads like one in review.
 - The `sdk-compat` lane adds a Python runtime and two pinned SDK versions to
   CI. Pinned exactly, and bumped deliberately: when a new SDK release breaks,
   the bump commit is the report. Nothing enters the Rust dependency graph, so
