@@ -46,8 +46,8 @@ centralizes that:
   `base_url`.
 - **Credentials are write-only.** No endpoint ever returns a key; only presence
   is observable.
-- **Inbound auth fails closed.** Every request presents a configured gateway key;
-  there is no keyless / anonymous mode.
+- **Inbound auth fails closed.** Every request that reaches a provider presents a
+  configured gateway key; there is no keyless / anonymous mode.
 
 ## Quick start
 
@@ -129,12 +129,18 @@ attribute the caller as the env var's *name*; a secret's value is never logged.
 - at least one `[[gateway_key]]` is required, or the gateway refuses to boot;
 - a declared key whose env var is unset or empty is a **fatal** boot error naming
   that env var and namespace — never a silently dropped key;
+- two keys may not resolve to the same secret: whose namespace the caller gets
+  would be ambiguous, so that too refuses to boot;
 - an empty key table can never mean "allow all": a request without a configured
   key is `401`;
 - a reload (`SIGHUP` / `[reload] watch`) runs the same validation, so a candidate
   with an unresolvable key is rejected and the running config keeps serving —
   rotate by declaring the new key alongside the old, reloading, then dropping the
   old one.
+
+Every route that dispatches to a provider (`/v1/chat/completions`, `/v1/messages`,
+`/v1/embeddings`) authenticates. The operational endpoints do not: `/healthz`,
+`/readyz`, and the `/v1/models` alias catalogue answer without a credential.
 
 See [ADR 0013](./docs/adr/0013-inbound-auth-fails-closed.md).
 

@@ -136,8 +136,9 @@ env = "GW_ACME_OPENAI_API_KEY"
 # Inbound auth fails closed: there is no keyless / anonymous mode, and no flag
 # that enables one. At least one `[[gateway_key]]` is required, and a declared
 # key whose `env` var is unset or empty is a FATAL boot error naming the env var
-# and namespace — it is never silently dropped. A reload candidate with an
-# unresolvable key is rejected and the running config keeps serving. See
+# and namespace — it is never silently dropped. Two keys may not hold the same
+# secret (whose namespace the caller gets would be ambiguous). A reload candidate
+# with an unresolvable key is rejected and the running config keeps serving. See
 # docs/adr/0013-inbound-auth-fails-closed.md.
 
 [[gateway_key]]

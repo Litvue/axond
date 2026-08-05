@@ -45,8 +45,15 @@ flag that reintroduces one.** Concretely:
   `ConfigSnapshot::build` additionally refuses to publish a snapshot whose
   resolved key table is empty, so the invariant holds for any future path that
   builds one.
-- `authenticate` has no empty-table branch: every request presents a configured
-  key, as `Authorization: Bearer` or `x-api-key` (ADR 0012), or gets `401`.
+- Two keys may not resolve to the same secret
+  (`SnapshotError::DuplicateGatewayKey`). The key table is keyed by the secret, so
+  a shared value would silently drop one declared key and serve its callers under
+  another namespace's authority.
+- `authenticate` has no empty-table branch: every request to a route that
+  dispatches to a provider presents a configured key, as `Authorization: Bearer`
+  or `x-api-key` (ADR 0012), or gets `401`. The operational endpoints —
+  `/healthz`, `/readyz`, and the `/v1/models` alias catalogue — stay
+  unauthenticated, as they were: they name no credential and reach no provider.
 - Boot logs the enforced posture as a count (`inbound auth enforced`,
   `gateway_keys = N`). There is no "anonymous access enabled" line, because that
   state no longer exists.
@@ -78,5 +85,5 @@ calls a provider with.
 - The gateway is worth exactly one key's worth of trust: keys are still coarse
   (one secret → one namespace) and there is no rotation window in which two
   values for the *same* declared key are accepted. Overlapping rotation is done
-  the way the config already allows — declare the new key alongside the old,
-  reload, then drop the old one.
+  the way the config already allows — declare the new key alongside the old
+  (with a *different* value), reload, then drop the old one.

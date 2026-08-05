@@ -8,7 +8,8 @@
 # Boot refuses a credential or gateway key whose env var is unset, so every env
 # var the example config references is supplied with a placeholder. Nothing here
 # is dispatched upstream and the probed routes are unauthenticated, so the values
-# are never used as keys.
+# are never used as keys. Two gateway keys may not share a secret, so the inbound
+# placeholders differ.
 #
 # Usage: ops/docker-smoke.sh <image-ref>
 set -euo pipefail
@@ -31,8 +32,8 @@ docker run -d --name "$container" \
   -e GW_PLATFORM_ANTHROPIC_API_KEY=smoke-placeholder \
   -e GW_PLATFORM_AZURE_OPENAI_API_KEY=smoke-placeholder \
   -e GW_ACME_OPENAI_API_KEY=smoke-placeholder \
-  -e GW_INBOUND_PLATFORM_KEY=smoke-placeholder \
-  -e GW_INBOUND_ACME_KEY=smoke-placeholder \
+  -e GW_INBOUND_PLATFORM_KEY=smoke-placeholder-platform \
+  -e GW_INBOUND_ACME_KEY=smoke-placeholder-acme \
   -v "${repo_root}/axond.example.toml:/etc/axond/axond.toml:ro" \
   "$image" >/dev/null
 

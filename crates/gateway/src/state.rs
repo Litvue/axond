@@ -74,6 +74,15 @@ pub enum SnapshotError {
     )]
     MissingGatewayKey { namespace: String, env: String },
     #[error(
+        "gateway_key env vars `{env}` (namespace `{namespace}`) and `{other_env}` (namespace `{other_namespace}`) hold the same secret, so the caller's namespace would be ambiguous"
+    )]
+    DuplicateGatewayKey {
+        env: String,
+        namespace: String,
+        other_env: String,
+        other_namespace: String,
+    },
+    #[error(
         "no inbound gateway key resolved: inbound authentication fails closed and there is no keyless mode"
     )]
     NoInboundKeys,
@@ -81,9 +90,10 @@ pub enum SnapshotError {
 
 impl ConfigSnapshot {
     /// Resolve a validated config against an environment snapshot. Fails when a
-    /// declared credential's or gateway key's env var is missing or empty — the
-    /// credential graph and the inbound-key table are both resolved before the
-    /// snapshot is published, never at request time.
+    /// declared credential's or gateway key's env var is missing or empty, or
+    /// when two gateway keys resolve to the same secret — the credential graph
+    /// and the inbound-key table are both resolved before the snapshot is
+    /// published, never at request time.
     pub fn build(
         config: Config,
         env: &HashMap<String, String>,
@@ -102,13 +112,22 @@ impl ConfigSnapshot {
                     env: k.env.clone(),
                 }
             })?;
-            inbound_keys.insert(
+            // Keyed by the secret, so two keys sharing a value would resolve to
+            // one namespace: ambiguous authority, and a declared key dropped.
+            if let Some(other) = inbound_keys.insert(
                 secret.clone(),
                 InboundKey {
                     namespace: k.namespace.clone(),
                     subject: k.env.clone(),
                 },
-            );
+            ) {
+                return Err(SnapshotError::DuplicateGatewayKey {
+                    env: k.env.clone(),
+                    namespace: k.namespace.clone(),
+                    other_env: other.subject,
+                    other_namespace: other.namespace,
+                });
+            }
         }
         if inbound_keys.is_empty() {
             return Err(SnapshotError::NoInboundKeys);
@@ -220,6 +239,37 @@ namespace = "platform"
             // The message names the reference, never a value.
             assert!(err.to_string().contains("AXOND_KEY"), "{err}");
         }
+    }
+
+    /// Two keys holding one secret cannot both be honoured: the table is keyed
+    /// by the secret, so one namespace would silently win.
+    #[test]
+    fn two_gateway_keys_sharing_one_secret_refuse_to_resolve() {
+        let config = config_with(
+            r#"
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "platform"
+
+[[gateway_key]]
+env = "AXOND_OTHER_KEY"
+namespace = "platform"
+"#,
+        );
+        let env = HashMap::from([
+            ("AXOND_KEY".to_owned(), "shared".to_owned()),
+            ("AXOND_OTHER_KEY".to_owned(), "shared".to_owned()),
+        ]);
+        let Err(err) = ConfigSnapshot::build(config, &env, 0) else {
+            panic!("an ambiguous key table must not resolve");
+        };
+        assert!(
+            matches!(err, SnapshotError::DuplicateGatewayKey { .. }),
+            "{err}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("AXOND_KEY") && message.contains("AXOND_OTHER_KEY"));
+        assert!(!message.contains("shared"), "{message}");
     }
 
     #[test]
