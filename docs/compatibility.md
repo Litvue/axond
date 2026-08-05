@@ -14,7 +14,7 @@ breaking them is a deliberate, documented act — not that they are frozen.
 | `POST /v1/chat/completions` | **supported** | OpenAI chat completions | yes (`stream: true`) |
 | `POST /v1/messages` | **supported** | Anthropic Messages, native | yes |
 | `POST /v1/embeddings` | **supported** | OpenAI embeddings | n/a |
-| `GET /v1/models` | **supported** | the configured alias catalogue | n/a |
+| `GET /v1/models` | **supported** | the alias catalogue, gated + namespace-scoped | n/a |
 | `GET /healthz`, `GET /readyz` | **supported** | liveness / readiness text | n/a |
 | `POST /v1/responses` | **deferred** — typed `501 not_implemented` | OpenAI Responses | — |
 

@@ -145,8 +145,10 @@ attribute the caller as the env var's *name*; a secret's value is never logged.
   old one.
 
 Every route that dispatches to a provider (`/v1/chat/completions`, `/v1/messages`,
-`/v1/embeddings`) authenticates. The operational endpoints do not: `/healthz`,
-`/readyz`, and the `/v1/models` alias catalogue answer without a credential.
+`/v1/embeddings`) authenticates, and so does `/v1/models` — it answers only for a
+configured gateway key and lists the aliases scoped to the caller's namespace (an
+alias whose targets the caller holds no credential for is not disclosed). Only the
+liveness probes `/healthz` and `/readyz` answer without a credential.
 
 See [ADR 0013](./docs/adr/0013-inbound-auth-fails-closed.md).
 

@@ -48,7 +48,7 @@ The tenancy boundary: which credential pool a caller's requests draw from.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `name` | string | — | The name callers send (`gpt-4o`). Also what `/v1/models` lists. |
+| `name` | string | — | The name callers send (`gpt-4o`). Also what `/v1/models` lists, for callers whose namespace holds a credential for one of its targets. |
 | `targets` | array of target | — | Concrete destinations, tried **in order** on a retryable failure. An empty list is rejected. |
 
 Each target:

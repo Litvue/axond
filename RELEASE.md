@@ -39,7 +39,7 @@ executed locally.
 | Version + changelog | Wired | `release-please-config.json`: `release-type: simple`, `bump-minor-pre-major`, `bump-patch-for-minor-pre-major`, Cargo workspace version in `extra-files`, `CHANGELOG.md` sections per Conventional Commit type. A GitHub App token (falling back to `GITHUB_TOKEN`) makes the release PR trigger CI; the lockfile is re-synced onto the release PR so `--locked` stays green. |
 | Release fan-out | Wired | `release-metadata` resolves the automatic path and the `workflow_dispatch` repair path, and rejects a dispatch whose ref is not the requested tag. |
 | Binaries | Wired | Four targets — `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc` — each built at the pinned toolchain from the tagged commit, packaged with a SHA-256 sidecar, an SPDX SBOM, and provenance + SBOM attestations. |
-| Image | Wired **and exercised** | `docker build` + `ops/docker-smoke.sh` run locally against the built image: `healthz: ok`, `/v1/models` returns the example catalogue, `axond image smoke passed`. In the release job the same smoke runs against the *published* image **before** it is signed. |
+| Image | Wired **and exercised** | `docker build` + `ops/docker-smoke.sh` run locally against the built image: `healthz: ok`, `/v1/models` (probed with the platform gateway key) returns the example catalogue, `axond image smoke passed`. In the release job the same smoke runs against the *published* image **before** it is signed. |
 | Signing | Wired | Keyless cosign over the digest, verified in-job against `SIGNER_IDENTITY`, which is anchored to this workflow file at `refs/heads/main` or `refs/tags/v<semver>` only. `gh attestation verify` then checks SLSA provenance. A broken chain fails the release rather than shipping quietly. |
 | Supply chain | Wired | `deny.toml` fails on any advisory, yanked crate, unlisted license, or non-crates.io source, with no ignores; `dependency-audit.yml` re-runs it on a schedule. Gate 5 below is green. |
 
@@ -99,8 +99,6 @@ None of these blocks the release; all are stated so adopters are not surprised.
 - `/readyz` reports process liveness only — it does not probe the usage sink,
   the budget store, or any provider. Documented in the
   [deployment guide](./docs/deployment.md#health-and-readiness).
-- `/v1/models` is unauthenticated (alias names only). Follow-up in the
-  [security review](./docs/security-review-2026-08-05.md#5-accepted-risk-with-follow-ups).
 - Inbound key material is held as a `String` rather than a `SecretString`; no
   exposure path exists today, and hardening is a follow-up (same section).
 - Only `linux/amd64` images are published; `arm64` is post-beta.

@@ -348,8 +348,8 @@ impl Credentials {
     }
 
     /// Presence only — never the value (write-only invariant). Backs the
-    /// per-namespace "which providers are live here" read surface.
-    #[allow(dead_code)] // backs the readiness / provider-status endpoint (follow-up)
+    /// per-namespace `/v1/models` scoping and the "which providers are live
+    /// here" read surface.
     pub fn is_present(&self, config: &Config, namespace: &str, provider: &str) -> bool {
         self.plan(config, namespace, provider).is_some()
     }
