@@ -20,6 +20,7 @@ use gateway_core::{
     AnthropicAdapter, CircuitBreaker, OpenAiCompatibleAdapter, OpenAiFlavor, ProviderAdapter,
 };
 use gateway_transport::HttpDispatcher;
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::budget::BudgetStore;
 use crate::config::{Config, ProviderKind};
@@ -47,20 +48,44 @@ pub struct ConfigSnapshot {
     /// stateless by default (ADR 0002); distinct from the per-credential health
     /// that lives on `Credentials` (ADR 0008).
     pub target_circuits: CircuitBreaker,
-    /// Inbound gateway-key secret → (namespace, subject). Never empty: inbound
-    /// authentication fails closed, so a snapshot that resolved no key is not
-    /// published (ADR 0013).
-    pub inbound_keys: HashMap<String, InboundKey>,
+    /// Resolved inbound gateway keys. Never empty: inbound authentication fails
+    /// closed, so a snapshot that resolved no key is not published (ADR 0013).
+    /// Private so the secret material cannot be read back or logged — callers
+    /// resolve through [`ConfigSnapshot::resolve_inbound`].
+    inbound_keys: Vec<GatewayKeyEntry>,
     /// How many times the config has been replaced: `0` is the boot config, and
     /// each applied reload increments it. Published as a metric so an operator
     /// can tell which generation a replica is serving.
     pub generation: u64,
 }
 
+/// One resolved inbound gateway key: the secret bound to the caller identity it
+/// authenticates. The secret is held as [`SecretString`] (redacted `Debug`,
+/// zeroized on drop), symmetric with the outbound credential path (ADR 0006),
+/// and matched in constant time so it never leaves this type.
+struct GatewayKeyEntry {
+    secret: SecretString,
+    caller: InboundKey,
+}
+
 #[derive(Clone)]
 pub struct InboundKey {
     pub namespace: String,
     pub subject: String,
+}
+
+/// Constant-time byte equality. The length may differ observably — it is not
+/// the secret — but no per-byte comparison short-circuits, so a shared-prefix
+/// timing signal cannot be used to narrow a guessed key.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Why a config could not become a servable snapshot. Names the offending
@@ -104,7 +129,7 @@ impl ConfigSnapshot {
             config.failover.failure_threshold,
             Duration::from_secs(config.failover.cooldown_seconds),
         );
-        let mut inbound_keys = HashMap::new();
+        let mut inbound_keys: Vec<GatewayKeyEntry> = Vec::new();
         for k in &config.gateway_key {
             let secret = env.get(&k.env).filter(|v| !v.is_empty()).ok_or_else(|| {
                 SnapshotError::MissingGatewayKey {
@@ -112,22 +137,27 @@ impl ConfigSnapshot {
                     env: k.env.clone(),
                 }
             })?;
-            // Keyed by the secret, so two keys sharing a value would resolve to
-            // one namespace: ambiguous authority, and a declared key dropped.
-            if let Some(other) = inbound_keys.insert(
-                secret.clone(),
-                InboundKey {
-                    namespace: k.namespace.clone(),
-                    subject: k.env.clone(),
-                },
-            ) {
+            // Two keys resolving to one secret is ambiguous authority — one
+            // namespace would silently win — so reject it. Compared here on the
+            // operator-supplied values at boot, never at request time.
+            if let Some(other) = inbound_keys
+                .iter()
+                .find(|e| constant_time_eq(e.secret.expose_secret().as_bytes(), secret.as_bytes()))
+            {
                 return Err(SnapshotError::DuplicateGatewayKey {
                     env: k.env.clone(),
                     namespace: k.namespace.clone(),
-                    other_env: other.subject,
-                    other_namespace: other.namespace,
+                    other_env: other.caller.subject.clone(),
+                    other_namespace: other.caller.namespace.clone(),
                 });
             }
+            inbound_keys.push(GatewayKeyEntry {
+                secret: SecretString::from(secret.clone()),
+                caller: InboundKey {
+                    namespace: k.namespace.clone(),
+                    subject: k.env.clone(),
+                },
+            });
         }
         if inbound_keys.is_empty() {
             return Err(SnapshotError::NoInboundKeys);
@@ -139,6 +169,22 @@ impl ConfigSnapshot {
             inbound_keys,
             generation,
         })
+    }
+
+    /// Resolve the caller for a presented inbound token, matching in constant
+    /// time so the comparison cannot leak the secret through timing. Returns
+    /// only the caller identity; the secret never leaves this type.
+    pub fn resolve_inbound(&self, token: &str) -> Option<&InboundKey> {
+        self.inbound_keys
+            .iter()
+            .find(|e| constant_time_eq(e.secret.expose_secret().as_bytes(), token.as_bytes()))
+            .map(|e| &e.caller)
+    }
+
+    /// How many inbound gateway keys are enforced. For the boot log and reload
+    /// metrics — the count is safe to surface, the secrets are not.
+    pub fn inbound_key_count(&self) -> usize {
+        self.inbound_keys.len()
     }
 }
 
@@ -277,11 +323,21 @@ namespace = "platform"
         let env = HashMap::from([("AXOND_KEY".to_owned(), "inbound-secret".to_owned())]);
         let snapshot = ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 0).expect("resolves");
         let key = snapshot
-            .inbound_keys
-            .get("inbound-secret")
-            .expect("the resolved secret is the lookup key");
+            .resolve_inbound("inbound-secret")
+            .expect("the presented secret resolves its caller");
         assert_eq!(key.namespace, "platform");
         assert_eq!(key.subject, "AXOND_KEY");
-        assert_eq!(snapshot.inbound_keys.len(), 1);
+        assert_eq!(snapshot.inbound_key_count(), 1);
+        assert!(snapshot.resolve_inbound("wrong-secret").is_none());
+    }
+
+    /// The secret is held as `SecretString`, so debugging or logging an entry
+    /// renders the redaction placeholder, never the key material.
+    #[test]
+    fn a_resolved_key_entry_never_renders_its_secret() {
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "inbound-secret".to_owned())]);
+        let snapshot = ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 0).expect("resolves");
+        let rendered = format!("{:?}", snapshot.inbound_keys[0].secret);
+        assert!(!rendered.contains("inbound-secret"), "{rendered}");
     }
 }
