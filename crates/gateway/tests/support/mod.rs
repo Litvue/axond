@@ -22,10 +22,12 @@ pub async fn boot() -> (FakeUpstream, Axond) {
     (upstream, gateway)
 }
 
-/// A client with no timeout, because the soak holds streams open deliberately.
+/// A client with no whole-request deadline: the soak holds streams open
+/// deliberately, and a deadline would cut one off and look like a client
+/// hang-up. Connecting is still bounded, since that cannot legitimately hang.
 pub fn client() -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(10))
         .build()
         .expect("test client builds")
 }

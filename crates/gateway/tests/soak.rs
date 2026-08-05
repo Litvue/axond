@@ -81,6 +81,9 @@ async fn soak(total: usize) {
 
     let baseline_kib = gateway.resident_kib();
     let client = client();
+    // Seeded from the baseline so a run that finishes before the first sample
+    // still asserts something, rather than skipping the invariant in silence.
+    let peak = Arc::new(AtomicU64::new(baseline_kib.unwrap_or_default()));
     let mut running = Vec::new();
     for (ending, native) in plan.iter().copied() {
         let client = client.clone();
@@ -95,7 +98,6 @@ async fn soak(total: usize) {
     }
     // Sample while the streams are in flight: buffering whole bodies would show
     // up here, not after everything has settled.
-    let peak = Arc::new(AtomicU64::new(0));
     let sampler = tokio::spawn({
         let (pid, peak) = (gateway.pid(), peak.clone());
         async move {
@@ -161,17 +163,30 @@ async fn drive(client: &reqwest::Client, url: String, ending: Ending, native: bo
         .expect("the gateway answers");
     assert_eq!(response.status(), 200);
 
+    // Hang up once output has demonstrably been relayed, so the partial charge
+    // is a real one rather than an empty stream. Transport chunks do not map
+    // one-to-one onto events, so the trigger is the relayed text itself.
+    let relayed_output = if native {
+        "content_block_delta"
+    } else {
+        "\"content\":"
+    };
     let mut stream = response.bytes_stream();
-    let mut chunks = 0usize;
+    let mut seen = String::new();
     while let Some(chunk) = stream.next().await {
-        if chunk.is_err() {
+        let Ok(chunk) = chunk else {
+            assert_ne!(
+                ending,
+                Ending::Complete,
+                "a stream planned to complete was torn down by the transport"
+            );
             break;
-        }
-        chunks += 1;
-        // Hang up mid-stream, once output has demonstrably been relayed, so the
-        // partial charge is a real one rather than an empty stream.
-        if ending == Ending::ClientCancel && chunks >= 4 {
-            break;
+        };
+        if ending == Ending::ClientCancel {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+            if seen.matches(relayed_output).count() >= 2 {
+                break;
+            }
         }
     }
 }
