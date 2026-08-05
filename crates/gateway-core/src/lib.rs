@@ -11,8 +11,9 @@ pub mod stream;
 pub mod tool_call;
 
 pub use anthropic::{
-    AnthropicAdapter, REASONING_DETAIL_FORMAT, SignedThinking, encrypted_reasoning_detail,
-    signed_thinking_from_details, thinking_blocks_from_details,
+    AnthropicAdapter, NativeMessagesDecoder, REASONING_DETAIL_FORMAT, SignedThinking,
+    encrypted_reasoning_detail, native_message_usage, signed_thinking_from_details,
+    thinking_blocks_from_details,
 };
 pub use catalog::{CatalogError, CatalogModel, ModelCatalog, ModelPrice, Usage, UsageReceipt};
 pub use circuit::{CircuitBreaker, CircuitDecision, CircuitState};
@@ -23,7 +24,9 @@ pub use guardrail::{
     Guardrail, GuardrailAction, GuardrailPolicy, GuardrailRequest, GuardrailRule, GuardrailVerdict,
     RegexGuardrail,
 };
-pub use openai::{OpenAiCompatibleAdapter, OpenAiFlavor, normalize_foundry_endpoint};
+pub use openai::{
+    OpenAiCompatibleAdapter, OpenAiFlavor, embeddings_usage, normalize_foundry_endpoint,
+};
 pub use provider::{
     Capabilities, ModelUsage, ProviderAdapter, ProviderRequest, ProviderResponse,
     ProviderStreamDecoder, ProviderStreamEvent, Surface,

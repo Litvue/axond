@@ -429,6 +429,74 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
     }
 }
 
+/// Usage from a native Messages response, mapped onto the canonical
+/// [`ModelUsage`]. Anthropic reports `input_tokens`/`output_tokens` alongside
+/// separate cache counters, so a native response needs this rather than the
+/// OpenAI-shaped `prompt_tokens`/`completion_tokens` reader.
+pub fn native_message_usage(response: &Value) -> ModelUsage {
+    anthropic_usage(response.get("usage").unwrap_or(&Value::Null))
+}
+
+/// Decoder for a native Messages stream that is relayed to the caller
+/// unchanged: every event is handed back verbatim, and the only work done is
+/// folding Anthropic's split usage reporting — input tokens on `message_start`,
+/// output tokens on `message_delta` — into one [`ModelUsage`].
+#[derive(Default)]
+pub struct NativeMessagesDecoder {
+    usage: ModelUsage,
+    done: bool,
+}
+
+impl NativeMessagesDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ProviderStreamDecoder for NativeMessagesDecoder {
+    fn decode(&mut self, event: SseEvent) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
+        let data: Value = serde_json::from_str(&event.data)
+            .map_err(|error| ProviderError::InvalidStream(error.to_string()))?;
+        let kind = event
+            .event
+            .clone()
+            .or_else(|| data.get("type").and_then(Value::as_str).map(str::to_owned));
+        match kind.as_deref() {
+            Some("message_start") => merge_anthropic_usage(
+                &mut self.usage,
+                data.pointer("/message/usage").unwrap_or(&Value::Null),
+            ),
+            Some("message_delta") => {
+                merge_anthropic_usage(&mut self.usage, data.get("usage").unwrap_or(&Value::Null))
+            }
+            Some("error") => {
+                return Err(ProviderError::InvalidStream(
+                    data.pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Anthropic stream error")
+                        .to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        let terminal = kind.as_deref() == Some("message_stop");
+        let mut events = vec![ProviderStreamEvent::Data { event: kind, data }];
+        if terminal && !self.done {
+            self.done = true;
+            events.push(ProviderStreamEvent::Done(self.usage));
+        }
+        Ok(events)
+    }
+
+    fn finish(&mut self) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
+        if self.done {
+            return Ok(Vec::new());
+        }
+        self.done = true;
+        Ok(vec![ProviderStreamEvent::Done(self.usage)])
+    }
+}
+
 fn build_request(model: &str, body: &Value) -> Value {
     let max_tokens = body
         .get("max_tokens")
@@ -988,5 +1056,104 @@ mod tests {
         assert!(matches!(terminal[0], ProviderStreamEvent::Data { .. }));
         assert!(matches!(terminal[1], ProviderStreamEvent::Done(_)));
         assert!(decoder.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_response_usage_maps_cache_counters() {
+        assert_eq!(
+            native_message_usage(&json!({
+                "id": "msg_1",
+                "content": [{ "type": "text", "text": "answer" }],
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 4,
+                    "cache_creation_input_tokens": 7,
+                    "cache_read_input_tokens": 5
+                }
+            })),
+            ModelUsage {
+                input_tokens: 11,
+                output_tokens: 4,
+                reasoning_tokens: 0,
+                cache_read_tokens: 5,
+                cache_write_tokens: 7,
+            }
+        );
+        assert_eq!(native_message_usage(&json!({})), ModelUsage::default());
+    }
+
+    #[test]
+    fn native_stream_forwards_events_verbatim_and_folds_split_usage() {
+        let mut decoder = NativeMessagesDecoder::new();
+        let thinking = json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": { "type": "thinking", "thinking": "why", "signature": "sig-1" }
+        });
+        let upstream = vec![
+            json!({ "type": "message_start", "message": { "usage": {
+                "input_tokens": 12,
+                "cache_read_input_tokens": 3,
+                "cache_creation_input_tokens": 2
+            }}}),
+            thinking.clone(),
+            json!({ "type": "content_block_stop", "index": 0 }),
+            json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": {
+                "output_tokens": 9
+            }}),
+            json!({ "type": "message_stop" }),
+        ];
+        let mut events = Vec::new();
+        for event in &upstream {
+            events.extend(decoder.decode(sse(event.clone())).unwrap());
+        }
+
+        let forwarded: Vec<&Value> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::Data { data, .. } => Some(data),
+                ProviderStreamEvent::Done(_) => None,
+            })
+            .collect();
+        assert_eq!(forwarded, upstream.iter().collect::<Vec<_>>());
+        // The signed thinking block survives untouched, which is the whole point
+        // of serving the native wire rather than translating it.
+        assert_eq!(forwarded[1]["content_block"], thinking["content_block"]);
+        assert_eq!(
+            events.last(),
+            Some(&ProviderStreamEvent::Done(ModelUsage {
+                input_tokens: 12,
+                output_tokens: 9,
+                reasoning_tokens: 0,
+                cache_read_tokens: 3,
+                cache_write_tokens: 2,
+            }))
+        );
+        assert!(decoder.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_stream_reports_an_error_event_and_closes_a_truncated_stream() {
+        let mut decoder = NativeMessagesDecoder::new();
+        let error = decoder
+            .decode(sse(
+                json!({ "type": "error", "error": { "message": "overloaded" } }),
+            ))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidStream(message) if message == "overloaded"));
+
+        let mut truncated = NativeMessagesDecoder::new();
+        truncated
+            .decode(sse(
+                json!({ "type": "message_start", "message": { "usage": { "input_tokens": 4 } } }),
+            ))
+            .unwrap();
+        assert_eq!(
+            truncated.finish().unwrap(),
+            vec![ProviderStreamEvent::Done(ModelUsage {
+                input_tokens: 4,
+                ..ModelUsage::default()
+            })]
+        );
     }
 }

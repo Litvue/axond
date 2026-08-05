@@ -155,10 +155,27 @@ targets = [
   { provider = "azure-openai", model = "gpt-4o", price = { input_microdollars_per_million = 2_500_000, output_microdollars_per_million = 10_000_000 } },
 ]
 
+# Usable from BOTH /v1/chat/completions (translated to Anthropic's wire) and
+# Anthropic's native /v1/messages (forwarded verbatim, streaming included, with
+# only `model` rewritten). A native route has no translation to fall back on, so
+# every target of an alias used on /v1/messages must be an `anthropic` provider —
+# an OpenAI-only alias there is a 400. See
+# docs/adr/0012-native-provider-routes.md.
+
 [[model]]
 name = "claude-sonnet"
 targets = [
   { provider = "anthropic", model = "claude-3-7-sonnet-latest", price = { input_microdollars_per_million = 3_000_000, output_microdollars_per_million = 15_000_000 } },
+]
+
+# An embeddings alias, served on /v1/embeddings against an OpenAI-family target.
+# Embeddings produce no completion, so only input tokens are ever billed and the
+# output price is unused.
+
+[[model]]
+name = "text-embedding-3-small"
+targets = [
+  { provider = "openai", model = "text-embedding-3-small", price = { input_microdollars_per_million = 20_000, output_microdollars_per_million = 0 } },
 ]
 
 # ── Config hot-reload ─────────────────────────────────────────────────────────

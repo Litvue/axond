@@ -71,6 +71,27 @@ curl localhost:8080/v1/chat/completions \
 
 Point any OpenAI-compatible SDK at `http://localhost:8080/v1` as its base URL.
 
+### Native provider routes
+
+An Anthropic client works the same way — point it at the same base URL and send
+Anthropic's own wire to `/v1/messages`:
+
+```bash
+curl localhost:8080/v1/messages \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-sonnet","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+The body is forwarded to the provider untouched but for `model`, streaming
+included, so signed thinking blocks and tool-use blocks survive intact (verbatim
+bytes on a stream; re-serialized values, same signatures, when buffered) —
+and aliasing, failover, credential pools, budgets, and usage records apply exactly
+as they do on `/v1/chat/completions`. `/v1/embeddings` is served the same way for
+OpenAI-family targets, billed on input tokens only. A native alias must resolve to
+targets that speak that wire: an OpenAI-only alias on `/v1/messages` is a
+`400 unsupported_wire`. `/v1/responses` is deferred past beta and returns a typed
+`501`. See [ADR 0012](./docs/adr/0012-native-provider-routes.md).
+
 ## Configuration
 
 TOML owns all structure; the environment owns secrets (referenced by name) and
@@ -250,7 +271,7 @@ runtime-neutral.
 - [x] OpenTelemetry traces (per-upstream-attempt spans, TTFT), metrics, logs
 - [x] Usage sinks: Postgres (batched, versioned schema) + OTLP; Tinybird / ClickHouse post-beta
 - [x] Budget backends: shared Redis / Postgres, held reservations, partial charging (see [ADR 0010](./docs/adr/0010-shared-budget-backends-and-charging-policy.md))
-- [ ] Native Anthropic `/v1/messages` passthrough; `/v1/embeddings`, `/v1/responses`
+- [x] Native Anthropic `/v1/messages` passthrough + `/v1/embeddings` (see [ADR 0012](./docs/adr/0012-native-provider-routes.md)); `/v1/responses` deferred post-beta (typed `501`)
 - [x] Multiple credentials per provider (pooling, weighted, skip-on-429)
 - [x] Config hot-reload (SIGHUP / watched files) for zero-restart BYOK onboarding (see [ADR 0011](./docs/adr/0011-config-hot-reload.md))
 - [ ] Provider-SDK compatibility + record/replay + SSE soak tests

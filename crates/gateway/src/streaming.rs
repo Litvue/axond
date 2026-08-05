@@ -3,9 +3,11 @@
 //! The relay decodes the upstream stream with `gateway-core` (`SseDecoder` +
 //! the provider's `ProviderStreamDecoder`) and re-emits OpenAI-shaped chunks,
 //! so a target reaches the caller in the OpenAI chunk shape whichever wire it
-//! spoke upstream. Bytes are forwarded event-by-event as they decode:
-//! nothing buffers a whole response, and the outbound body inherits the
-//! client's backpressure because axum only polls it as the socket drains.
+//! spoke upstream. On a native route the same relay forwards the provider's
+//! bytes untouched and decodes only to observe usage ([`Framing`]). Bytes are
+//! forwarded event-by-event as they arrive: nothing buffers a whole response,
+//! and the outbound body inherits the client's backpressure because axum only
+//! polls it as the socket drains.
 //!
 //! Accounting is attached to the body, not to the handler: a client that hangs
 //! up mid-stream drops the body, which drops the upstream response (cancelling
@@ -21,10 +23,9 @@ use axum::response::Response;
 use bytes::Bytes;
 use futures::StreamExt;
 use gateway_core::{
-    ModelPrice, ModelUsage, ProviderAdapter, ProviderRequest, ProviderStreamDecoder,
-    ProviderStreamEvent, SseDecoder, Surface,
+    ModelPrice, ModelUsage, ProviderStreamDecoder, ProviderStreamEvent, SseDecoder,
 };
-use gateway_transport::{ByteStream, TransportError, Upstream};
+use gateway_transport::{ByteStream, TransportError};
 use serde_json::{Value, json};
 use tracing::Instrument;
 
@@ -66,17 +67,18 @@ pub struct StreamContext {
 /// error so the failover loop can decide whether to advance to the next target
 /// — failover is only possible here, *before* the first byte is relayed.
 ///
-/// A non-success upstream status is reported by `dispatch_stream` before any
-/// bytes flow, so a failed open never yields a partially-consumed stream.
-pub async fn open_stream(
-    state: &AppState,
+/// The open itself is supplied by the caller so an adapter-encoded and a native
+/// passthrough stream share one attempt-span and one failover walk. A
+/// non-success upstream status is reported before any bytes flow, so a failed
+/// open never yields a partially-consumed stream.
+pub async fn open_stream<F>(
     ctx: &StreamContext,
-    adapter: &dyn ProviderAdapter,
-    upstream: &Upstream,
-    surface: Surface,
-    request: ProviderRequest,
     attempt: u32,
-) -> Result<ByteStream, TransportError> {
+    open: F,
+) -> Result<ByteStream, TransportError>
+where
+    F: Future<Output = Result<ByteStream, TransportError>>,
+{
     // The attempt span covers opening the stream, which is where a failed
     // stream fails; the relayed body outlives it, so its TTFT is reported
     // through the metrics at settlement instead.
@@ -87,12 +89,7 @@ pub async fn open_stream(
         &ctx.target_model,
         UsageRecord::credential_source_str(ctx.source),
     );
-    let opened = state
-        .0
-        .dispatcher
-        .dispatch_stream(adapter, upstream, surface, request)
-        .instrument(attempt_span.clone())
-        .await;
+    let opened = open.instrument(attempt_span.clone()).await;
     telemetry::finish_upstream_attempt(
         &attempt_span,
         if opened.is_ok() {
@@ -110,13 +107,14 @@ pub async fn open_stream(
 ///
 /// The caller has committed to this target (the first byte is about to flow),
 /// so there is no more failover: an upstream that fails mid-stream is surfaced
-/// as a terminal `error` event followed by `[DONE]`.
+/// as a terminal `error` event in the caller's framing.
 pub fn relay_opened(
     state: AppState,
     ctx: StreamContext,
     decoder: Box<dyn ProviderStreamDecoder>,
     bytes: ByteStream,
     started: Instant,
+    framing: Framing,
 ) -> Response {
     let relay = Relay {
         bytes,
@@ -125,6 +123,7 @@ pub fn relay_opened(
         decoder,
         pending: VecDeque::new(),
         phase: Phase::Streaming,
+        framing,
         accounting: Accounting::new(state, ctx, started),
     };
 
@@ -152,6 +151,42 @@ pub fn settle_upstream_error(state: AppState, ctx: StreamContext, started: Insta
     accounting.settle(Status::UpstreamError);
 }
 
+/// How the relay frames what it sends the caller.
+///
+/// The OpenAI-compatible routes re-emit each decoded event and close with the
+/// `[DONE]` sentinel an OpenAI SDK waits for. A native route relays the
+/// provider's own bytes verbatim — the decoder runs only to observe usage — and
+/// closes on the provider's own terminal event, because an SDK reading its
+/// native wire would choke on a foreign sentinel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Framing {
+    OpenAiSse,
+    Native,
+}
+
+impl Framing {
+    fn reemits(self) -> bool {
+        self == Self::OpenAiSse
+    }
+
+    fn done(self) -> Option<Bytes> {
+        match self {
+            Self::OpenAiSse => Some(done_event()),
+            Self::Native => None,
+        }
+    }
+
+    /// A stream that broke after the first byte cannot be retried, so the
+    /// failure is delivered as a terminal event in the shape the caller's SDK
+    /// parses.
+    fn error(self, message: &str) -> Bytes {
+        match self {
+            Self::OpenAiSse => error_event(message),
+            Self::Native => native_error_event(message),
+        }
+    }
+}
+
 enum Phase {
     Streaming,
     Failed(String),
@@ -168,6 +203,7 @@ struct Relay {
     decoder: Box<dyn ProviderStreamDecoder>,
     pending: VecDeque<Bytes>,
     phase: Phase,
+    framing: Framing,
     accounting: Accounting,
 }
 
@@ -181,13 +217,13 @@ impl Relay {
                 Phase::Streaming => self.poll_upstream().await,
                 Phase::Failed(message) => {
                     let message = message.clone();
-                    self.pending.push_back(error_event(&message));
-                    self.pending.push_back(done_event());
+                    self.pending.push_back(self.framing.error(&message));
+                    self.pending.extend(self.framing.done());
                     self.accounting.settle(Status::UpstreamError);
                     self.phase = Phase::Ended;
                 }
                 Phase::Finished => {
-                    self.pending.push_back(done_event());
+                    self.pending.extend(self.framing.done());
                     self.accounting.settle(Status::Ok);
                     self.phase = Phase::Ended;
                 }
@@ -199,6 +235,11 @@ impl Relay {
     async fn poll_upstream(&mut self) {
         match self.bytes.next().await {
             Some(Ok(chunk)) => {
+                // A native stream is byte-faithful: the provider's own bytes go
+                // out as they arrive, and the decode below only observes usage.
+                if !self.framing.reemits() {
+                    self.pending.push_back(chunk.clone());
+                }
                 let text = self.decode_utf8(&chunk);
                 let pushed = match self.sse.as_mut() {
                     Some(sse) => sse.push(&text),
@@ -283,7 +324,9 @@ impl Relay {
                 ProviderStreamEvent::Data { event, data } => {
                     self.accounting.mark_first_token();
                     self.accounting.count_relayed(&data);
-                    self.pending.push_back(data_event(event.as_deref(), &data));
+                    if self.framing.reemits() {
+                        self.pending.push_back(data_event(event.as_deref(), &data));
+                    }
                 }
                 ProviderStreamEvent::Done(usage) => {
                     self.accounting.usage = usage;
@@ -339,6 +382,21 @@ fn done_event() -> Bytes {
 
 fn error_event(message: &str) -> Bytes {
     let payload = json!({ "error": { "type": "upstream_stream_error", "message": message } });
+    Bytes::from(format!(
+        "event: error\ndata: {}\n\n",
+        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned())
+    ))
+}
+
+/// The provider-native terminal error: an Anthropic-shaped `error` event, which
+/// its SDKs raise on. When the upstream is what failed it has usually sent its
+/// own `error` event already — the SDK stops at the first one, so the duplicate
+/// is never read, and a transport failure that sent nothing still terminates.
+fn native_error_event(message: &str) -> Bytes {
+    let payload = json!({
+        "type": "error",
+        "error": { "type": "upstream_stream_error", "message": message }
+    });
     Bytes::from(format!(
         "event: error\ndata: {}\n\n",
         serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned())
@@ -736,6 +794,109 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(ledger.settlements(), vec![17]);
     }
 
+    /// Anthropic's own event stream, including a signed thinking block and the
+    /// usage split across `message_start` and `message_delta`.
+    const NATIVE_STREAM: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":11,\"cache_read_input_tokens\":2}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"sig-1\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    /// A native stream reaches the caller exactly as the provider sent it — same
+    /// event names, same payloads, no OpenAI `[DONE]` an Anthropic SDK would not
+    /// expect — while the gateway still books one usage record from the two
+    /// events that carry usage.
+    #[tokio::test]
+    async fn a_native_stream_is_relayed_byte_for_byte_and_still_settles_usage() {
+        let ledger = Arc::new(Ledger::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = axum::Router::new().route(
+            "/messages",
+            post(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from(NATIVE_STREAM),
+                )
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "anthropic"
+kind = "anthropic"
+base_url = "http://{addr}"
+
+[[credential]]
+namespace = "platform"
+provider = "anthropic"
+env = "GW_TEST_OPENAI_KEY"
+
+[[model]]
+name = "claude"
+targets = [{{ provider = "anthropic", model = "claude-sonnet-4-5", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000 }} }}]
+"#
+        ))
+        .expect("config");
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(LedgerSink(ledger.clone()))];
+        let state = AppState::new(
+            cfg,
+            &test_env(),
+            UsageFanout::new(sinks),
+            Box::new(LedgerBudget(ledger.clone())),
+        )
+        .expect("state");
+
+        let body = json!({
+            "model": "claude",
+            "stream": true,
+            "max_tokens": 64,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let resp = router(state)
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).expect("body")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut stream = resp.into_body().into_data_stream();
+        let mut relayed = String::new();
+        while let Some(chunk) = stream.next().await {
+            relayed.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+        }
+        assert_eq!(relayed, NATIVE_STREAM);
+        assert!(!relayed.contains("[DONE]"));
+
+        let record = settled(&ledger).await;
+        assert_eq!(record["status"], "ok");
+        assert_eq!(record["input_tokens"], 11);
+        assert_eq!(record["output_tokens"], 3);
+        // 11 input + 2 cached reads @ 1 µ$/token, 3 output @ 2 µ$/token.
+        assert_eq!(record["cost_microdollars"], 19);
+        assert_eq!(ledger.settlements(), vec![19]);
+    }
+
     #[tokio::test]
     async fn mid_stream_upstream_failure_becomes_a_terminal_error_event() {
         let ledger = Arc::new(Ledger::default());
@@ -768,11 +929,14 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             bytes: Box::pin(futures::stream::empty()),
             carry: Vec::new(),
             sse: Some(SseDecoder::default()),
-            decoder: gateway_core::OpenAiCompatibleAdapter::openai()
-                .stream_decoder(Surface::ChatCompletions)
-                .expect("decoder"),
+            decoder: gateway_core::ProviderAdapter::stream_decoder(
+                &gateway_core::OpenAiCompatibleAdapter::openai(),
+                gateway_core::Surface::ChatCompletions,
+            )
+            .expect("decoder"),
             pending: VecDeque::new(),
             phase: Phase::Streaming,
+            framing: Framing::OpenAiSse,
             accounting: Accounting::new(
                 state_for("http://127.0.0.1:1", Arc::new(Ledger::default())),
                 context(),

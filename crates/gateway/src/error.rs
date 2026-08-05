@@ -31,6 +31,16 @@ pub enum GatewayError {
     Transport(#[from] TransportError),
     #[error("bad request: {0}")]
     BadRequest(String),
+    /// A native route reached with an alias whose target cannot speak that wire
+    /// shape (an OpenAI-only alias on `/v1/messages`, say). The caller asked for
+    /// something the configuration cannot serve, so it is a request error rather
+    /// than an upstream failure.
+    #[error("model `{alias}` cannot serve {route}: provider `{provider}` does not speak that wire")]
+    UnsupportedWire {
+        route: &'static str,
+        alias: String,
+        provider: String,
+    },
 }
 
 impl GatewayError {
@@ -45,6 +55,7 @@ impl GatewayError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::UnsupportedWire { .. } => StatusCode::BAD_REQUEST,
             Self::Provider(e) => match e {
                 ProviderError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
                 ProviderError::ContextWindowExceeded(_) => StatusCode::BAD_REQUEST,
@@ -68,6 +79,7 @@ impl GatewayError {
             Self::Unauthorized => "unauthorized",
             Self::NotImplemented(_) => "not_implemented",
             Self::BadRequest(_) => "bad_request",
+            Self::UnsupportedWire { .. } => "unsupported_wire",
             Self::Provider(e) => e.code(),
             Self::Transport(TransportError::Provider(e)) => e.code(),
             Self::Transport(TransportError::Http(_)) => "upstream_transport",
