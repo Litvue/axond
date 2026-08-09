@@ -11,9 +11,11 @@
 //! rather than at request time — the fail-at-boot posture, applied again.
 //!
 //! Not everything a config file describes can be replaced in a live process.
-//! The listening socket is already bound and the usage sinks already own
-//! connections and flush tasks, so changes to `[server] bind` and
-//! `[[usage_sink]]` are reported and ignored until the next restart.
+//! The listening socket is already bound, the usage sinks already own
+//! connections and flush tasks, and the budget store already owns its
+//! reservations, so changes to `[server] bind`, `[[usage_sink]]`, and
+//! `[budget]` (including `limit_microdollars`) are reported and ignored until
+//! the next restart.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;

@@ -234,9 +234,11 @@ targets = [
 # edit or a Kubernetes ConfigMap symlink swap; a touched-but-identical file
 # reloads nothing). Off by default: a signal is an explicit operator action.
 #
-# `[server] bind` and `[[usage_sink]]` changes are reported with a warning and
-# otherwise ignored — the socket is already bound and sinks own live connections,
-# so both need a restart. See docs/adr/0011-config-hot-reload.md.
+# `[server] bind`, `[[usage_sink]]`, and `[budget]` changes are reported with a
+# warning and otherwise ignored — the socket is already bound, sinks own live
+# connections, and the budget store owns its reservations, so all need a
+# restart. This includes changes to the budget's `limit_microdollars`. See
+# docs/adr/0011-config-hot-reload.md.
 
 [reload]
 watch = false

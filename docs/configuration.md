@@ -129,8 +129,9 @@ table. The usage record's `subject` is the env var's *name*
 
 A reload re-runs the full boot validation against the current file **and the
 current process environment**; a bad candidate is rejected and the running
-config keeps serving. `[server] bind` and `[[usage_sink]]` changes warn and are
-ignored ([ADR 0011](./adr/0011-config-hot-reload.md)).
+config keeps serving. `[server] bind`, `[[usage_sink]]`, and `[budget]`
+changes warn and are ignored until restart; this includes
+`limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
 
 ## `[[usage_sink]]` — opt-in, datastore for `postgres`
 
