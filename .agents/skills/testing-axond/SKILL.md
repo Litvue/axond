@@ -61,6 +61,48 @@ circuit breakers. Note the upstream URL is built by **string concatenation** of 
 + route path, so a `base_url` with a query string or trailing junk will produce a mangled
 URL — keep test `base_url`s path-only unless that is what you are testing.
 
+## Minted tokens and file-backed key material
+
+`[[gateway_verifier]]` and `[[gateway_key]]` take **exactly one** of `env = "NAME"` or
+`file = "/path"`. File material is re-read whenever a reload candidate is built, so
+`SIGHUP` rotates it without a restart.
+
+```bash
+# Ed25519 signer: writes the private PKCS#8 base64 (0600, trailing newline) to the
+# path and prints the public key as an `export NAME='...'` line plus a TOML snippet.
+axond keygen --private-key /tmp/kt/sign.key --kid my-kid \
+  --env GW_VERIFY --namespace platform --max-ttl 15m
+# Verifier from a file: write just the public base64 into the configured path.
+printf %s "$PUB" > /tmp/kt/verifier.pub
+
+# Mint reads the *signing* material from an env var name; --config lets it infer
+# alg/audience/max_ttl from a matching verifier entry.
+export SIGN_KEY="$(cat /tmp/kt/sign.key)"
+axond mint --kid my-kid --key-env SIGN_KEY --namespace platform \
+  --subject tester --ttl 15m --config /tmp/kt/axond.toml   # prints axt1.<jws>
+```
+
+A verifier requires `[gateway_token] audience`, and at least one static
+`[[gateway_key]]` is always mandatory (breakglass). Send the minted token as
+`Authorization: Bearer axt1....`.
+
+Rotation / negative testing:
+
+- Replace material under the same `kid` (`printf %s … > f.next && mv f.next f`) then
+  `kill -HUP $PID`. The applied `"config reloaded"` JSON line carries
+  `gateway_verifiers: "+[] -[] ~[<kid>]"` plus `gateway_verifier_fingerprints` /
+  `gateway_key_fingerprints` (16 hex chars, SHA-256 prefix, never the material) — diff
+  the fingerprint across reloads to prove the re-read happened. Tokens signed by the
+  retired key then return `401 token_invalid_signature`.
+- A bad candidate (empty, deleted, non-UTF-8, corrupt base64, HS256 < 32 bytes) logs
+  `"config reload rejected; the running config keeps serving"` at ERROR with the path,
+  does not emit an applied line, and leaves the previous snapshot serving 200.
+- Whitespace: Ed25519 base64 is `trim()`ed (trailing newline fine); HS256 secrets and
+  static gateway-key files are **exact bytes**. Note a static key whose file ends in a
+  newline is effectively unusable over HTTP, because header values cannot carry a
+  trailing newline (curl strips it) — expect 401 and use `printf %s`.
+- Booting several configs on different ports: `AXOND_SERVER__BIND=127.0.0.1:180xx`.
+
 ## Before/after comparisons
 
 For behaviour-change PRs, build the base branch in a throwaway worktree and run the same

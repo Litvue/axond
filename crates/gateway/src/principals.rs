@@ -11,6 +11,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 use crate::config::{Config, GatewayVerifierAlgorithm};
+use crate::key_material::{self, KeyMaterialError};
 
 #[derive(Clone)]
 pub struct InboundKey {
@@ -110,12 +111,35 @@ pub enum TokenVerifierBuildError {
     MissingAudience,
     #[error("gateway_verifier `{kid}` references env var `{env}`, which is unset or empty")]
     MissingKey { kid: String, env: String },
+    #[error("gateway_verifier `{kid}` key material file `{path}` failed ({kind}): {error}")]
+    FileKey {
+        kid: String,
+        path: String,
+        kind: std::io::ErrorKind,
+        error: String,
+    },
+    #[error("gateway_verifier `{kid}` key material file `{path}` is empty")]
+    EmptyFile { kid: String, path: String },
+    #[error("gateway_verifier `{kid}` key material file `{path}` is not valid UTF-8")]
+    InvalidFileUtf8 { kid: String, path: String },
+    #[error("gateway_verifier `{kid}` must declare exactly one non-empty source")]
+    InvalidSource { kid: String },
     #[error("gateway_verifier `{kid}` has an HS256 secret that is too short")]
     WeakHs256Secret { kid: String },
+    #[error(
+        "gateway_verifier `{kid}` key material file `{path}` has an HS256 secret that is too short"
+    )]
+    FileWeakHs256Secret { kid: String, path: String },
     #[error("gateway_verifier `{kid}` has invalid base64 key material")]
     InvalidBase64 { kid: String },
+    #[error("gateway_verifier `{kid}` key material file `{path}` has invalid base64 key material")]
+    FileInvalidBase64 { kid: String, path: String },
     #[error("gateway_verifier `{kid}` must contain a 32-byte Ed25519 public key")]
     InvalidEd25519Key { kid: String },
+    #[error(
+        "gateway_verifier `{kid}` key material file `{path}` must contain a 32-byte Ed25519 public key"
+    )]
+    FileInvalidEd25519Key { kid: String, path: String },
 }
 
 const TOKEN_CLOCK_SKEW_SECONDS: u64 = 5;
@@ -126,6 +150,7 @@ struct ResolvedVerifier {
     namespaces: HashSet<String>,
     max_ttl: Duration,
     key: DecodingKey,
+    fingerprint: String,
 }
 
 pub struct TokenVerifier {
@@ -164,33 +189,84 @@ impl TokenVerifier {
             .collect();
         let mut verifiers = Vec::with_capacity(config.gateway_verifier.len());
         for verifier in &config.gateway_verifier {
-            let value = env
-                .get(&verifier.env)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| TokenVerifierBuildError::MissingKey {
+            let source =
+                verifier
+                    .source()
+                    .ok_or_else(|| TokenVerifierBuildError::InvalidSource {
+                        kid: verifier.kid.clone(),
+                    })?;
+            let value = key_material::resolve(source, env).map_err(|error| match error {
+                KeyMaterialError::MissingEnv { name } => TokenVerifierBuildError::MissingKey {
                     kid: verifier.kid.clone(),
-                    env: verifier.env.clone(),
-                })?;
+                    env: name,
+                },
+                KeyMaterialError::FileRead { path, kind, error } => {
+                    TokenVerifierBuildError::FileKey {
+                        kid: verifier.kid.clone(),
+                        path,
+                        kind,
+                        error,
+                    }
+                }
+                KeyMaterialError::EmptyFile { path } => TokenVerifierBuildError::EmptyFile {
+                    kid: verifier.kid.clone(),
+                    path,
+                },
+                KeyMaterialError::InvalidUtf8 { path } => {
+                    TokenVerifierBuildError::InvalidFileUtf8 {
+                        kid: verifier.kid.clone(),
+                        path,
+                    }
+                }
+            })?;
             let key = match verifier.alg {
                 // HS256 material lives inside DecodingKey beyond our
                 // zeroization control; Ed25519 is the preferred default.
                 GatewayVerifierAlgorithm::Hs256 => {
                     if value.len() < 32 {
-                        return Err(TokenVerifierBuildError::WeakHs256Secret {
-                            kid: verifier.kid.clone(),
+                        return Err(match source {
+                            crate::config::KeyMaterialSource::File(path) => {
+                                TokenVerifierBuildError::FileWeakHs256Secret {
+                                    kid: verifier.kid.clone(),
+                                    path: path.to_owned(),
+                                }
+                            }
+                            crate::config::KeyMaterialSource::Env(_) => {
+                                TokenVerifierBuildError::WeakHs256Secret {
+                                    kid: verifier.kid.clone(),
+                                }
+                            }
                         });
                     }
                     DecodingKey::from_secret(value.as_bytes())
                 }
                 GatewayVerifierAlgorithm::EdDsa => {
-                    let decoded = BASE64.decode(value.trim()).map_err(|_| {
-                        TokenVerifierBuildError::InvalidBase64 {
-                            kid: verifier.kid.clone(),
+                    let decoded = BASE64.decode(value.trim()).map_err(|_| match source {
+                        crate::config::KeyMaterialSource::File(path) => {
+                            TokenVerifierBuildError::FileInvalidBase64 {
+                                kid: verifier.kid.clone(),
+                                path: path.to_owned(),
+                            }
+                        }
+                        crate::config::KeyMaterialSource::Env(_) => {
+                            TokenVerifierBuildError::InvalidBase64 {
+                                kid: verifier.kid.clone(),
+                            }
                         }
                     })?;
                     if decoded.len() != 32 {
-                        return Err(TokenVerifierBuildError::InvalidEd25519Key {
-                            kid: verifier.kid.clone(),
+                        return Err(match source {
+                            crate::config::KeyMaterialSource::File(path) => {
+                                TokenVerifierBuildError::FileInvalidEd25519Key {
+                                    kid: verifier.kid.clone(),
+                                    path: path.to_owned(),
+                                }
+                            }
+                            crate::config::KeyMaterialSource::Env(_) => {
+                                TokenVerifierBuildError::InvalidEd25519Key {
+                                    kid: verifier.kid.clone(),
+                                }
+                            }
                         });
                     }
                     // jsonwebtoken's EdDSA verifier takes the raw 32-byte
@@ -208,6 +284,7 @@ impl TokenVerifier {
                 namespaces: verifier.namespaces.iter().cloned().collect(),
                 max_ttl: verifier.max_ttl,
                 key,
+                fingerprint: key_material::fingerprint(&verifier.kid, &value),
             });
         }
         Ok(Some(Self {
@@ -215,6 +292,13 @@ impl TokenVerifier {
             namespaces,
             verifiers,
         }))
+    }
+
+    pub(crate) fn fingerprints(&self) -> std::collections::HashMap<String, String> {
+        self.verifiers
+            .iter()
+            .map(|verifier| (verifier.kid.clone(), verifier.fingerprint.clone()))
+            .collect()
     }
 }
 
@@ -507,6 +591,7 @@ mod tests {
     use jsonwebtoken::{EncodingKey, Header, encode};
     use serde::Serialize;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct ShapedStore {
@@ -694,7 +779,7 @@ mod tests {
         assert_eq!(principal.subject, "AXOND_KEY");
     }
 
-    #[derive(Serialize)]
+    #[derive(Clone, Serialize)]
     struct TestClaims {
         #[serde(skip_serializing_if = "Option::is_none")]
         exp: Option<u64>,
@@ -722,6 +807,42 @@ mod tests {
         0xd1, 0xc2, 0x52, 0x3e, 0x22, 0x48, 0xe9, 0x1b, 0x3a, 0x0f, 0x45, 0x13, 0x78, 0x4a, 0x50,
         0x56, 0x3f,
     ];
+
+    fn temp_material(contents: &[u8]) -> String {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "axond-verifier-material-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, contents).expect("write verifier material");
+        path.to_str().expect("utf-8 temp path").to_owned()
+    }
+
+    fn file_verifier_config(path: &str, algorithm: &str) -> Config {
+        Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_key]]
+env = "STATIC_KEY"
+namespace = "platform"
+
+[gateway_token]
+audience = "test-audience"
+
+[[gateway_verifier]]
+kid = "file-test"
+alg = "{algorithm}"
+file = "{path}"
+namespaces = ["platform"]
+max_ttl = "15m"
+"#
+        ))
+        .expect("file verifier config")
+    }
 
     fn token_verifier() -> TokenVerifier {
         let config = Config::from_toml_str(
@@ -758,17 +879,34 @@ max_ttl = "15m"
             .expect("verifier is configured")
     }
 
-    fn signed_token(claims: TestClaims) -> String {
-        let mut header = Header::new(Algorithm::EdDSA);
-        header.kid = Some("ed-test".to_owned());
+    fn signed_token_with(
+        kid: &str,
+        algorithm: Algorithm,
+        key: &EncodingKey,
+        claims: TestClaims,
+    ) -> String {
+        let mut header = Header::new(algorithm);
+        header.kid = Some(kid.to_owned());
         format!(
             "axt1.{}",
-            encode(&header, &claims, &EncodingKey::from_ed_der(ED_PRIVATE_PK8))
-                .expect("test token signs")
+            encode(&header, &claims, key).expect("test token signs")
+        )
+    }
+
+    fn signed_token(claims: TestClaims) -> String {
+        signed_token_with(
+            "ed-test",
+            Algorithm::EdDSA,
+            &EncodingKey::from_ed_der(ED_PRIVATE_PK8),
+            claims,
         )
     }
 
     fn valid_claims() -> TestClaims {
+        valid_claims_for("acme")
+    }
+
+    fn valid_claims_for(namespace: &str) -> TestClaims {
         let now = unix_now();
         TestClaims {
             exp: Some(now + 900),
@@ -776,7 +914,7 @@ max_ttl = "15m"
             nbf: None,
             aud: "test-audience".to_owned(),
             jti: Some("jti-1".to_owned()),
-            ns: Some("acme".to_owned()),
+            ns: Some(namespace.to_owned()),
             sub: Some("caller-1".to_owned()),
         }
     }
@@ -801,6 +939,133 @@ max_ttl = "15m"
         assert_eq!(principal.namespace, "acme");
         assert_eq!(principal.subject, "caller-1");
         assert_eq!(principal.signer_kid.as_deref(), Some("ed-test"));
+    }
+
+    #[tokio::test]
+    async fn token_verifier_reads_ed25519_file_material_with_a_trailing_newline() {
+        let path = temp_material(format!("{}\n", BASE64.encode(ED_PUBLIC_RAW)).as_bytes());
+        let config = file_verifier_config(&path, "EdDSA");
+        let env = HashMap::from([("STATIC_KEY".to_owned(), "static-secret".to_owned())]);
+        let verifier = TokenVerifier::build(&config, &env)
+            .expect("file verifier builds")
+            .expect("verifier is configured");
+        let token = signed_token_with(
+            "file-test",
+            Algorithm::EdDSA,
+            &EncodingKey::from_ed_der(ED_PRIVATE_PK8),
+            valid_claims_for("platform"),
+        );
+        assert!(
+            verifier
+                .resolve(&Presented { credential: &token })
+                .await
+                .expect("token resolves")
+                .is_some()
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn token_verifier_reads_hs256_file_material_as_exact_bytes() {
+        let exact = "01234567890123456789012345678901\n";
+        let path = temp_material(exact.as_bytes());
+        let config = file_verifier_config(&path, "HS256");
+        let env = HashMap::from([("STATIC_KEY".to_owned(), "static-secret".to_owned())]);
+        let verifier = TokenVerifier::build(&config, &env)
+            .expect("file verifier builds")
+            .expect("verifier is configured");
+        let claims = valid_claims_for("platform");
+        let exact_token = signed_token_with(
+            "file-test",
+            Algorithm::HS256,
+            &EncodingKey::from_secret(exact.as_bytes()),
+            claims.clone(),
+        );
+        assert!(
+            verifier
+                .resolve(&Presented {
+                    credential: &exact_token,
+                })
+                .await
+                .expect("exact token resolves")
+                .is_some()
+        );
+        let trimmed_token = signed_token_with(
+            "file-test",
+            Algorithm::HS256,
+            &EncodingKey::from_secret(exact.trim_end().as_bytes()),
+            claims,
+        );
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &trimmed_token,
+                })
+                .await,
+            Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::InvalidSignature
+            ))
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn token_verifier_file_rejections_name_kid_and_path_without_material() {
+        let cases = [
+            ("absent", None, "failed"),
+            ("empty", Some(Vec::new()), "is empty"),
+            ("utf8", Some(vec![0xff, 0xfe]), "not valid UTF-8"),
+            ("base64", Some(b"not base64!".to_vec()), "invalid base64"),
+            (
+                "length",
+                Some(BASE64.encode([0u8; 31]).into_bytes()),
+                "32-byte",
+            ),
+        ];
+        for (name, contents, expected) in cases {
+            let path = std::env::temp_dir().join(format!(
+                "axond-verifier-rejection-{}-{}",
+                std::process::id(),
+                name
+            ));
+            let path = path.to_str().unwrap().to_owned();
+            if let Some(contents) = contents {
+                std::fs::write(&path, contents).unwrap();
+            }
+            let config = file_verifier_config(&path, "EdDSA");
+            let result = TokenVerifier::build(
+                &config,
+                &HashMap::from([("STATIC_KEY".to_owned(), "static-secret".to_owned())]),
+            );
+            let Err(error) = result else {
+                panic!("file material must be rejected");
+            };
+            let error = error.to_string();
+            assert!(error.contains("file-test"), "{error}");
+            assert!(error.contains(&path), "{error}");
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("not base64!"), "{error}");
+            let _ = std::fs::remove_file(path);
+        }
+
+        let secret = b"short-secret";
+        let path = temp_material(secret);
+        let config = file_verifier_config(&path, "HS256");
+        let result = TokenVerifier::build(
+            &config,
+            &HashMap::from([("STATIC_KEY".to_owned(), "static-secret".to_owned())]),
+        );
+        let Err(error) = result else {
+            panic!("short HS256 material must be rejected");
+        };
+        let error = error.to_string();
+        assert!(
+            error.contains("file-test") && error.contains(&path),
+            "{error}"
+        );
+        assert!(error.contains("too short"), "{error}");
+        assert!(!error.contains("short-secret"), "{error}");
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

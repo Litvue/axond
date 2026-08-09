@@ -24,6 +24,19 @@ The value is supplied through the gateway process environment:
 export GW_INBOUND_PLATFORM_KEY='operator-breakglass-value'
 ```
 
+Alternatively, mount the exact secret bytes and reference the path (do not add
+a trailing newline):
+
+```toml
+[[gateway_key]]
+file = "/run/secrets/axond-inbound-platform"
+namespace = "platform"
+```
+
+Use `printf %s 'operator-breakglass-value' > /run/secrets/axond-inbound-platform`.
+A trailing newline makes a file-backed static key unusable because HTTP headers
+cannot carry it. Exactly one of `env` and `file` is permitted.
+
 There is no keyless mode. A config without a static gateway key fails closed at
 boot, and a missing referenced environment variable is a fatal error.
 
@@ -194,39 +207,59 @@ are tracked by #60, #61, and #62 respectively.
 
 ## 5. Rotation runbook
 
-Minted verifier rotation is a restart operation today, not a zero-downtime
-reload. The running process cannot gain a new environment variable: exporting
-`GW_VERIFY_ACME_2026_11` in an operator shell does not add it to an already
-running gateway. This limitation is tracked in [#86](https://github.com/Litvue/axond/issues/86).
-The static breakglass key remains present throughout:
+File-backed verifier material is re-read when a candidate snapshot is built, so
+rotation can happen without a process restart. The static breakglass key remains
+present throughout. Use `printf %s` for HS256 and static gateway-key files:
+their bytes are exact and a trailing newline changes the secret. Ed25519
+base64 is trimmed before decoding, so its generated trailing newline is fine.
 
-1. Generate or provision the new signer with a new `kid`, for example
-   `acme-2026-11`, and provision its public key in the gateway's environment
-   manager under a new variable such as `GW_VERIFY_ACME_2026_11`.
-2. Add the new `[[gateway_verifier]]` entry alongside the old entry. Keep the
-   same audience and namespace permissions unless the change is intentional.
-3. Start or restart the gateway with the new environment variable and both
-   verifier entries present. Confirm the new verifier is active.
-4. Switch all minting over to the new `kid`.
-5. Wait for tokens signed by the old `kid` to expire, or remove the old
-   verifier entry immediately to revoke them, then reload:
+### In-place replacement under the same `kid`
+
+1. Provision the replacement public key or secret to a temporary file, then
+   atomically replace the configured path:
+
+   ```bash
+   printf %s "$NEW_PUBLIC_KEY" > /run/secrets/acme-verifier.next
+   mv /run/secrets/acme-verifier.next /run/secrets/acme-verifier
+   ```
+
+2. Keep the same `kid` and send the reload signal:
 
    ```bash
    kill -HUP "$AXOND_PID"
    ```
 
-The candidate passes the full boot validation before an atomic snapshot swap.
-A failed reload leaves the previous config serving. The applied reload log
-reports added, removed, and definition-changed verifier `kid` values, plus the
-audience delta. It does not report public-key or secret values.
+3. Confirm the applied reload log reports the `kid` in `gateway_verifiers`
+   `changed` and includes a different short fingerprint. The log contains
+   fingerprints, never key material. Fingerprints are comparable only within
+   one process lifetime: they show that material changed at this reload, but
+   are not stable identifiers for a key.
 
-Important rotation trap: the verifier definition diff compares the configured
-`kid`, algorithm, env-var **name**, permitted namespaces, and `max_ttl`; it does
-not inspect key material. Changing the public-key value under the same `kid`
-therefore takes effect only when the gateway starts or restarts, and a later
-reload can still report `changed=false`. Same-name key-material rotation is
-not visible in that summary; use a new `kid` for an observable, overlap-safe
-rotation.
+A failed candidate (for example, a deleted, empty, unreadable, or corrupted
+file) is rejected atomically and the previous snapshot keeps serving. Restore
+the file and send SIGHUP again. A corrupted Ed25519 base64 value is rejected
+during snapshot construction; an HS256 value shorter than 32 bytes is rejected
+the same way.
+
+### Overlap rotation with a new `kid`
+
+For a graceful overlap, provision a new signer and file, then add a second
+verifier alongside the old one:
+
+```toml
+[[gateway_verifier]]
+kid = "acme-2026-11"
+alg = "EdDSA"
+file = "/run/secrets/acme-2026-11-public"
+namespaces = ["acme"]
+max_ttl = "15m"
+```
+
+Send SIGHUP, confirm the new `kid` is active, and switch minting to it. Wait
+for old tokens to expire, or remove the old verifier entry to revoke them, then
+send SIGHUP again. Both the verifier and static `[[gateway_key]]` sections
+support exactly one of `env` and `file`; file sources are re-read at every
+reload.
 
 ## 6. Revocation ladder
 

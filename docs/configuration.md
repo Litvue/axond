@@ -7,9 +7,9 @@ this is the lookup table.
 
 Two rules hold everywhere:
 
-- **TOML owns structure, the environment owns secrets.** A key, DSN, or token is
-  always referenced by the *name* of an environment variable (`env`, `dsn_env`)
-  and read from the process environment. No config key takes a secret value.
+- **TOML owns structure, and secrets are referenced rather than inlined.** A
+  key, DSN, or token is referenced by an environment-variable name or, for
+  gateway key material, a file path. No config key takes material inline.
 - **Fail at boot, not at request time.** The whole graph is validated before the
   socket is bound, and again on every reload. Anything listed as "rejected"
   below refuses to start (or, on reload, is rejected while the previous config
@@ -110,8 +110,25 @@ Circuits are in-memory and per replica, consistent with running stateless
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `env` | string | — | *Name* of the environment variable holding the inbound token. Empty is rejected; unset or empty at boot is fatal. |
+| `env` | string | — | *Name* of the environment variable holding the inbound token. Exactly one of `env` and `file` must be non-empty. |
+| `file` | string | — | Path to a UTF-8 file holding the inbound token. Exactly one of `file` and `env` must be non-empty; the file is re-read on every reload. |
 | `namespace` | string | — | Namespace the bearer is served under. Undefined is rejected. |
+
+Exactly one source (`env` or `file`) is permitted per entry; both declared or
+neither declared is a config error. File contents are read without trimming:
+static gateway-key secrets are exact bytes, so do not leave a trailing newline
+(`printf %s 'secret' > /run/secrets/axond-gateway-key`). On Unix, a
+group/other-readable file produces a warning. A trailing newline makes a
+file-backed static key unusable because HTTP headers cannot carry it. The resolved material is never
+logged; usage subjects use the env name or file path. Switching an existing
+key from `env` to `file` changes that subject, so in-flight or accumulated
+budget ledgers keyed by the old subject do not carry over. An absolute secret
+mount path is emitted as written and may therefore expose tenant names in
+usage sinks.
+
+Reload fingerprints are salted per process: they are comparable only within
+one process lifetime and show that material changed at this reload; they are
+not a stable identifier for a key.
 
 At least one entry is required: a config with none describes a gateway nobody
 could call, so it refuses to boot. Two keys may not resolve to the **same**
@@ -145,16 +162,20 @@ see the [minted identity guide](./minted-token-guide.md).
 | --- | --- | --- | --- |
 | `kid` | string | — | JWS key identifier. Required, non-empty, and unique across verifier entries. |
 | `alg` | `EdDSA` \| `HS256` | — | Signature algorithm. Required and authoritative for this verifier. |
-| `env` | string | — | *Name* of the environment variable holding the public Ed25519 key or opaque HS256 secret. Required and non-empty; the referenced variable must be set and non-empty at boot and reload. |
+| `env` | string | — | *Name* of the environment variable holding the public Ed25519 key or opaque HS256 secret. Exactly one of `env` and `file` must be non-empty; the referenced variable must be set and non-empty at boot and reload. |
+| `file` | string | — | Path to a UTF-8 file holding the public Ed25519 key or opaque HS256 secret. Exactly one of `file` and `env` must be non-empty; the file is re-read at boot and reload. |
 | `namespaces` | array of string | — | Namespaces this signer may place in the token's `ns` claim. Required and non-empty; every namespace must be declared by `[[namespace]]`. |
 | `max_ttl` | duration | — | Maximum `exp - iat` lifetime accepted for this verifier. Required, at least `1s`, and no more than `24h`. |
 
 The verifier's `kid` must be present in the JWS header and its `alg` must match
-the configured algorithm. Ed25519 `env` values are standard-base64 raw
-32-byte public keys; surrounding whitespace is trimmed. HS256 values are
-opaque bytes, are not trimmed, and must be at least 32 bytes. A declared
-verifier without a resolvable environment variable is rejected at boot or
-reload, leaving the previous running snapshot in place on reload.
+the configured algorithm. Ed25519 values from either source are standard-base64
+raw 32-byte public keys; surrounding whitespace is trimmed, so a trailing
+newline is accepted. HS256 values are opaque exact bytes, are not trimmed, and
+must be at least 32 bytes: a trailing newline changes the secret and must not be
+written accidentally (`printf %s 'secret' > /run/secrets/verifier`). Empty,
+absent, unreadable, or non-UTF-8 files are rejected at boot or reload, leaving
+the previous running snapshot in place on reload. File permissions are checked
+on Unix and group/other-readable files produce a warning.
 
 The gateway validates the verifier's namespace set, lifetime, audience, and
 signature on every token. At least one static `[[gateway_key]]` remains
@@ -168,11 +189,11 @@ for the new-`kid` rotation procedure and the Tier 0/Tier 1 revocation boundary.
 | `watch` | bool | `false` | Also reload when the config file's contents change. `SIGHUP` always reloads regardless. |
 | `poll_interval_ms` | integer | `2000` | How often the watcher compares contents. Below `100` is rejected. |
 
-A reload re-runs the full boot validation against the current file **and the
-current process environment**; a bad candidate is rejected and the running
-config keeps serving. The process environment cannot gain a new variable, so a
-newly named minted-verifier `env` reference requires a restart; removing an
-existing verifier can be applied by reload. `[server] bind`, `[[usage_sink]]`, and `[budget]`
+A reload re-runs the full boot validation against the current file, current
+process environment, and referenced key-material files; a bad candidate is
+rejected and the running config keeps serving. Replacing file contents in place
+or via an atomic rename is therefore reload-reachable without a process
+restart. `[server] bind`, `[[usage_sink]]`, and `[budget]`
 changes warn and are ignored until restart; this includes
 `limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
 

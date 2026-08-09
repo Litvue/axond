@@ -43,9 +43,9 @@ pub struct Config {
     /// How the running config is replaced without a restart.
     #[serde(default)]
     pub reload: Reload,
-    /// Inbound gateway keys. Each binds a secret (resolved from `env`) to a
-    /// namespace. At least one is required: inbound authentication fails closed,
-    /// so there is no keyless mode (ADR 0013).
+    /// Inbound gateway keys. Each binds a secret (resolved from `env` or
+    /// `file`) to a namespace. At least one is required: inbound authentication
+    /// fails closed, so there is no keyless mode (ADR 0013).
     #[serde(default)]
     pub gateway_key: Vec<GatewayKey>,
     /// Token verification authority. Verifiers are additive to static gateway
@@ -509,8 +509,39 @@ fn default_max_subjects() -> usize {
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayKey {
     /// Env var holding the inbound key secret.
-    pub env: String,
+    #[serde(default)]
+    pub env: Option<String>,
+    /// File path holding the inbound key secret.
+    #[serde(default)]
+    pub file: Option<String>,
     pub namespace: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyMaterialSource<'a> {
+    Env(&'a str),
+    File(&'a str),
+}
+
+impl GatewayKey {
+    pub fn source(&self) -> Option<KeyMaterialSource<'_>> {
+        let env = self.env.as_deref().filter(|value| !value.trim().is_empty());
+        let file = self
+            .file
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+        match (env, file) {
+            (Some(env), None) => Some(KeyMaterialSource::Env(env)),
+            (None, Some(file)) => Some(KeyMaterialSource::File(file)),
+            _ => None,
+        }
+    }
+
+    pub fn source_label(&self) -> Option<&str> {
+        self.source().map(|source| match source {
+            KeyMaterialSource::Env(value) | KeyMaterialSource::File(value) => value,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -530,10 +561,34 @@ pub enum GatewayVerifierAlgorithm {
 pub struct GatewayVerifier {
     pub kid: String,
     pub alg: GatewayVerifierAlgorithm,
-    pub env: String,
+    #[serde(default)]
+    pub env: Option<String>,
+    #[serde(default)]
+    pub file: Option<String>,
     pub namespaces: Vec<String>,
     #[serde(deserialize_with = "deserialize_gateway_ttl")]
     pub max_ttl: Duration,
+}
+
+impl GatewayVerifier {
+    pub fn source(&self) -> Option<KeyMaterialSource<'_>> {
+        let env = self.env.as_deref().filter(|value| !value.trim().is_empty());
+        let file = self
+            .file
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+        match (env, file) {
+            (Some(env), None) => Some(KeyMaterialSource::Env(env)),
+            (None, Some(file)) => Some(KeyMaterialSource::File(file)),
+            _ => None,
+        }
+    }
+
+    pub fn source_label(&self) -> Option<&str> {
+        self.source().map(|source| match source {
+            KeyMaterialSource::Env(value) | KeyMaterialSource::File(value) => value,
+        })
+    }
 }
 
 // Deliberate policy ceiling for configured token lifetimes, not a protocol limit.
@@ -736,16 +791,25 @@ impl Config {
             ));
         }
         for k in &self.gateway_key {
-            if k.env.trim().is_empty() {
+            let env = k.env.as_deref().unwrap_or("");
+            let file = k.file.as_deref().unwrap_or("");
+            if !env.trim().is_empty() && !file.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "gateway_key for namespace `{}` has an empty `env`",
+                    "gateway_key for namespace `{}` declares both `env` and `file`; exactly one source is permitted",
+                    k.namespace
+                )));
+            }
+            if env.trim().is_empty() && file.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "gateway_key for namespace `{}` must declare exactly one non-empty source (`env` or `file`)",
                     k.namespace
                 )));
             }
             if !namespaces.contains_key(k.namespace.as_str()) {
                 return Err(ConfigError::Invalid(format!(
                     "gateway_key `{}` references undefined namespace `{}`",
-                    k.env, k.namespace
+                    k.source_label().unwrap_or(""),
+                    k.namespace
                 )));
             }
         }
@@ -778,9 +842,17 @@ impl Config {
                     "gateway_verifier `kid` must not be empty".into(),
                 ));
             }
-            if verifier.env.trim().is_empty() {
+            let env = verifier.env.as_deref().unwrap_or("");
+            let file = verifier.file.as_deref().unwrap_or("");
+            if !env.trim().is_empty() && !file.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "gateway_verifier `{}` has an empty `env`",
+                    "gateway_verifier `{}` declares both `env` and `file`; exactly one source is permitted",
+                    verifier.kid
+                )));
+            }
+            if env.trim().is_empty() && file.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "gateway_verifier `{}` must declare exactly one non-empty source (`env` or `file`)",
                     verifier.kid
                 )));
             }
@@ -990,6 +1062,73 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
                 "expected `{key}` to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn gateway_key_requires_exactly_one_source() {
+        for source in [
+            "env = \"K\"\nfile = \"/run/key\"",
+            "env = \"\"\nfile = \"\"",
+        ] {
+            let result = Config::from_toml_str(&format!(
+                "{VALID}\n[[gateway_key]]\n{source}\nnamespace = \"platform\"\n"
+            ));
+            let err = result.expect_err("source shape must be rejected");
+            assert!(err.to_string().contains("exactly one"), "{err}");
+        }
+    }
+
+    #[test]
+    fn gateway_verifier_requires_exactly_one_source() {
+        for source in [
+            "env = \"K\"\nfile = \"/run/key\"",
+            "env = \"\"\nfile = \"\"",
+        ] {
+            let result = Config::from_toml_str(&format!(
+                "{VALID}\n[gateway_token]\naudience = \"test\"\n[[gateway_verifier]]\nkid = \"test\"\nalg = \"HS256\"\n{source}\nnamespaces = [\"platform\"]\nmax_ttl = \"15m\"\n"
+            ));
+            let err = result.expect_err("source shape must be rejected");
+            assert!(err.to_string().contains("exactly one"), "{err}");
+        }
+    }
+
+    #[test]
+    fn blank_file_is_absent_when_gateway_key_uses_env() {
+        let config = Config::from_toml_str(&format!(
+            "{VALID}\n[[gateway_key]]\nenv = \"K\"\nfile = \"\"\nnamespace = \"platform\"\n"
+        ))
+        .expect("blank file must not count as a declared source");
+        let snapshot = crate::state::ConfigSnapshot::build(
+            config,
+            &std::collections::HashMap::from([
+                ("AXOND_KEY".to_owned(), "primary-secret".to_owned()),
+                ("K".to_owned(), "secondary-secret".to_owned()),
+            ]),
+            0,
+        )
+        .expect("the non-empty env source resolves");
+        assert_eq!(snapshot.inbound_key_count(), 2);
+    }
+
+    #[test]
+    fn blank_file_is_absent_when_gateway_verifier_uses_env() {
+        let config = Config::from_toml_str(&format!(
+            "{VALID}\n[gateway_token]\naudience = \"test\"\n[[gateway_verifier]]\nkid = \"test\"\nalg = \"HS256\"\nenv = \"K\"\nfile = \"\"\nnamespaces = [\"platform\"]\nmax_ttl = \"15m\"\n"
+        ))
+        .expect("blank file must not count as a declared source");
+        let snapshot = crate::state::ConfigSnapshot::build(
+            config,
+            &std::collections::HashMap::from([
+                ("AXOND_KEY".to_owned(), "primary-secret".to_owned()),
+                (
+                    "K".to_owned(),
+                    "secondary-secret-012345678901234567890".to_owned(),
+                ),
+            ]),
+            0,
+        )
+        .expect("the non-empty env source resolves");
+        assert_eq!(snapshot.gateway_verifier_fingerprints.len(), 1);
     }
 
     #[test]

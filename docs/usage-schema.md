@@ -18,7 +18,7 @@ meaning, and how they are allowed to change. The design rationale is
 | `request_id` | `text` | Identifies one request. Unique **per gateway process**, not globally. |
 | `trace_id` | `text` | W3C trace id of the caller's trace; NULL when the request was not traced. One trace usually spans many requests. |
 | `namespace` | `text` | Tenant/namespace the request was served under. |
-| `subject` | `text` | Authenticated caller — the gateway key's env-var label for static authentication, or the token's `sub` claim for token authentication. |
+| `subject` | `text` | Authenticated caller — the gateway key's env-var label or file path for static authentication, or the token's `sub` claim for token authentication. Switching a static key from `env` to `file` changes this value and therefore the corresponding budget subject; file paths are emitted as written. |
 | `signer_kid` | `text` | Configured JWS signer that vouched for a token caller; NULL for static gateway-key authentication. |
 | `model` | `text` | Alias the caller asked for (`gpt-4o`). |
 | `target_provider` | `text` | Provider that served it. |

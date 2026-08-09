@@ -13,6 +13,7 @@ mod budget;
 mod config;
 mod credentials;
 mod error;
+mod key_material;
 mod mint;
 mod principals;
 mod reload;

@@ -145,6 +145,12 @@ env = "GW_ACME_OPENAI_API_KEY"
 env = "GW_INBOUND_PLATFORM_KEY"
 namespace = "platform"
 
+# File-based static key (use exactly one of `env` and `file`; no trailing
+# newline in the file, e.g. `printf %s 'secret' > /run/secrets/platform-key`).
+# [[gateway_key]]
+# file = "/run/secrets/axond-inbound-platform"
+# namespace = "platform"
+
 [[gateway_key]]
 env = "GW_INBOUND_ACME_KEY"
 namespace = "acme"
@@ -178,6 +184,15 @@ namespace = "acme"
 # max_ttl may be at most 24h (a policy ceiling, not a protocol limit).
 # max_ttl = "15m"
 #
+# Or read the same verifier material from a mounted file. Ed25519 base64 may
+# have a trailing newline; HS256 and static gateway-key files are exact bytes.
+# [[gateway_verifier]]
+# kid = "acme-2026-08"
+# alg = "EdDSA"
+# file = "/run/secrets/acme-verifier-public"
+# namespaces = ["acme"]
+# max_ttl = "15m"
+#
 # HS256 is also supported as a deliberate shared-secret escape hatch:
 #
 # [[gateway_verifier]]
@@ -188,14 +203,10 @@ namespace = "acme"
 # max_ttl may be at most 24h (a policy ceiling, not a protocol limit).
 # max_ttl = "15m"
 #
-# For rotation, provision the new verifier env var BEFORE starting/restarting
-# the gateway, declare the new verifier alongside the old one, start/restart,
-# switch minting, then remove the old verifier and reload. A running process
-# cannot gain a new env var, so adding one and sending SIGHUP is rejected
-# (#86). The reload summary reports verifier kid/definition changes but does not
-# inspect key material. Replacing the env-var value under the same `kid` takes
-# effect only at restart and a later reload can still show `changed=false`; use
-# a new `kid` for visible overlap.
+# File-backed material is re-read on SIGHUP, so replacing it under the same
+# `kid` takes effect without a restart. Reload summaries include a short
+# material fingerprint and report the `kid` as changed; fingerprints never
+# reveal material. A new `kid` can still be overlapped for a graceful rotation.
 # Short TTLs and removing a kid are the current coarse revocation controls.
 # Precise single-token revocation requires the future Tier 1 `jti` denylist
 # (#68); `min_iat` is tracked separately by #63. See
@@ -259,10 +270,9 @@ targets = [
 # edit or a Kubernetes ConfigMap symlink swap; a touched-but-identical file
 # reloads nothing). Off by default: a signal is an explicit operator action.
 #
-# For minted identity rotation, provision new verifier env vars before a
-# restart, then prefer adding a new `[[gateway_verifier]]` with a new `kid`;
-# same-kid environment-value replacement is not visible in the verifier
-# definition summary (`changed=false`).
+# File-backed verifier and static gateway-key material is re-read on SIGHUP.
+# Replacing material under the same verifier `kid` is reported as changed with
+# a short fingerprint; a new `kid` remains available for overlap rotation.
 #
 # `[server] bind`, `[[usage_sink]]`, and `[budget]` changes are reported with a
 # warning and otherwise ignored — the socket is already bound, sinks own live
