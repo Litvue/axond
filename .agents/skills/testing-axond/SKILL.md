@@ -90,9 +90,10 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/v1/models
 ```
 
 - Mint-time enforcement only happens when a config is loaded. Dropping `--config` (and
-  `AXOND_CONFIG`) makes `mint` enforce just the 24h ceiling, which is how you produce a
-  token the gateway must reject (`token_invalid_lifetime`, `token_signer_not_permitted`) —
-  the cheapest way to test verify-side checks without hand-forging a JWS.
+  `AXOND_CONFIG`) and passing `--alg` plus `--audience` explicitly makes `mint` enforce
+  just the 24h ceiling, which is how you produce a token the gateway must reject
+  (`token_invalid_lifetime`, `token_signer_not_permitted`) — the cheapest way to test
+  verify-side checks without hand-forging a JWS.
 - Verify-side rejections are typed: `token_unknown_key` (kid removed/absent),
   `token_invalid_signature` (key material swapped), `token_invalid_lifetime`
   (`exp - iat > max_ttl`), `token_signer_not_permitted` (403, `ns` not in the verifier's
