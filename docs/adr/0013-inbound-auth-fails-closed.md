@@ -69,6 +69,14 @@ disarming a live gateway.
 Errors and logs name **references only**: env-var names, namespaces, and counts.
 A secret's value never appears, so a fatal boot error is safe to page on.
 
+### Amendment (2026-08-06)
+
+The route table now declares each route's authentication posture alongside its
+path and method router. A single sweep test walks that same table, requiring
+every authenticated route to reject a credential-less request and asserting
+that the only unauthenticated paths remain `/healthz` and `/readyz`. This keeps
+the closed set deliberate when a route is added.
+
 Outbound provider-credential resolution is untouched: `[[credential]]` pools keep
 their own resolution and `allow_platform_fallback` semantics (ADR 0003, ADR
 0006). This decision is about who may call the gateway, not which key the gateway

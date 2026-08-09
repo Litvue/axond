@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
 use gateway_core::{
     CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, ModelPrice, ModelUsage,
@@ -51,15 +51,80 @@ use crate::telemetry;
 use crate::usage::{Status, UsageRecord};
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
-        .route("/v1/models", get(list_models))
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/messages", post(native_messages))
-        .route("/v1/embeddings", post(embeddings))
-        .route("/v1/responses", post(responses))
+    route_specs()
+        .into_iter()
+        .fold(Router::new(), |router, spec| {
+            router.route(spec.path, (spec.router)())
+        })
         .with_state(state)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthPosture {
+    LivenessProbe,
+    Authenticated,
+}
+
+#[derive(Clone, Copy)]
+enum RouteMethod {
+    Get,
+    Post,
+}
+
+struct RouteSpec {
+    path: &'static str,
+    #[cfg_attr(not(test), allow(dead_code))]
+    method: RouteMethod,
+    #[cfg_attr(not(test), allow(dead_code))]
+    auth: AuthPosture,
+    router: fn() -> MethodRouter<AppState>,
+}
+
+fn route_specs() -> [RouteSpec; 7] {
+    [
+        RouteSpec {
+            path: "/healthz",
+            method: RouteMethod::Get,
+            auth: AuthPosture::LivenessProbe,
+            router: || get(healthz),
+        },
+        RouteSpec {
+            path: "/readyz",
+            method: RouteMethod::Get,
+            auth: AuthPosture::LivenessProbe,
+            router: || get(readyz),
+        },
+        RouteSpec {
+            path: "/v1/models",
+            method: RouteMethod::Get,
+            auth: AuthPosture::Authenticated,
+            router: || get(list_models),
+        },
+        RouteSpec {
+            path: "/v1/chat/completions",
+            method: RouteMethod::Post,
+            auth: AuthPosture::Authenticated,
+            router: || post(chat_completions),
+        },
+        RouteSpec {
+            path: "/v1/messages",
+            method: RouteMethod::Post,
+            auth: AuthPosture::Authenticated,
+            router: || post(native_messages),
+        },
+        RouteSpec {
+            path: "/v1/embeddings",
+            method: RouteMethod::Post,
+            auth: AuthPosture::Authenticated,
+            router: || post(embeddings),
+        },
+        RouteSpec {
+            path: "/v1/responses",
+            method: RouteMethod::Post,
+            auth: AuthPosture::Authenticated,
+            router: || post(responses),
+        },
+    ]
 }
 
 async fn healthz() -> &'static str {
@@ -328,7 +393,12 @@ async fn embeddings(
 /// surface, and serving it honestly needs more than passthrough. The route
 /// exists and says so, because a missing route is indistinguishable from a
 /// misconfigured `base_url`.
-async fn responses() -> Result<Json<Value>, GatewayError> {
+async fn responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, GatewayError> {
+    let snapshot = state.config();
+    authenticate(&snapshot, &headers).await?;
     Err(GatewayError::NotImplemented(
         "the OpenAI Responses API (`/v1/responses`), deferred past beta by ADR 0012 \
          in favour of `/v1/chat/completions`,",
@@ -1214,6 +1284,53 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         }
     }
 
+    #[tokio::test]
+    async fn every_authenticated_route_rejects_a_request_without_a_gateway_key() {
+        let public_paths: Vec<_> = route_specs()
+            .iter()
+            .filter(|spec| spec.auth == AuthPosture::LivenessProbe)
+            .map(|spec| spec.path)
+            .collect();
+        assert_eq!(public_paths, ["/healthz", "/readyz"]);
+
+        for spec in route_specs()
+            .into_iter()
+            .filter(|spec| spec.auth == AuthPosture::Authenticated)
+        {
+            let method = match spec.method {
+                RouteMethod::Get => axum::http::Method::GET,
+                RouteMethod::Post => axum::http::Method::POST,
+            };
+            let request = Request::builder()
+                .method(method)
+                .uri(spec.path)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = router(test_state()).oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{} must authenticate before handling the request",
+                spec.path
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_responses_route_rejects_anonymous_callers_before_deferring() {
+        let resp = router(test_state())
+            .oneshot(
+                Request::post("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
     /// The configured key passes in either scheme an SDK might send it in, and
     /// the caller is attributed to the key's namespace and env-var name.
     #[tokio::test]
@@ -1485,7 +1602,7 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
     #[tokio::test]
     async fn the_responses_route_is_a_typed_501_that_names_its_deferral() {
         let resp = router(test_state())
-            .oneshot(Request::post("/v1/responses").body(Body::empty()).unwrap())
+            .oneshot(authorized("/v1/responses").body(Body::from("{}")).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
