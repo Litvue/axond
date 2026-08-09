@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::config::{Config, ConfigError, Reload, UsageSinkConfig};
+use crate::config::{BudgetConfig, Config, ConfigError, Reload, UsageSinkConfig};
 use crate::state::{AppState, ConfigSnapshot, SnapshotError};
 use crate::telemetry;
 
@@ -44,6 +44,7 @@ pub enum ReloadError {
 struct Boot {
     bind: SocketAddr,
     usage_sink: Vec<UsageSinkConfig>,
+    budget: BudgetConfig,
 }
 
 /// Owns the config path and the state whose snapshot it replaces.
@@ -66,6 +67,7 @@ impl Reloader {
             boot: Boot {
                 bind: booted.config.server.bind,
                 usage_sink: booted.config.usage_sink.clone(),
+                budget: booted.config.budget.clone(),
             },
             path,
             state,
@@ -197,6 +199,8 @@ pub struct ReloadSummary {
     pub bind_changed: bool,
     /// `[[usage_sink]]` differs from the connected sinks.
     pub usage_sinks_changed: bool,
+    /// `[budget]` differs from the booted store configuration.
+    pub budget_changed: bool,
 }
 
 /// The added and removed identifiers of one config collection.
@@ -281,6 +285,7 @@ impl ReloadSummary {
             ),
             bind_changed: boot.bind != after.server.bind,
             usage_sinks_changed: boot.usage_sink != after.usage_sink,
+            budget_changed: boot.budget != after.budget,
         }
     }
 
@@ -293,6 +298,7 @@ impl ReloadSummary {
             && self.gateway_keys.is_empty()
             && self.gateway_verifiers.is_empty()
             && self.gateway_token_audience.is_empty()
+            && !self.budget_changed
     }
 
     fn log_applied(&self, trigger: &'static str, path: &str) {
@@ -306,6 +312,7 @@ impl ReloadSummary {
             gateway_keys = %self.gateway_keys,
             gateway_verifiers = %self.gateway_verifiers,
             gateway_token_audience = %self.gateway_token_audience,
+            budget_changed = self.budget_changed,
             changed = !self.is_empty(),
             "config reloaded"
         );
@@ -317,6 +324,11 @@ impl ReloadSummary {
         if self.usage_sinks_changed {
             tracing::warn!(
                 "`[[usage_sink]]` changed, but sinks own live connections; restart to apply it"
+            );
+        }
+        if self.budget_changed {
+            tracing::warn!(
+                "`[budget]` changed, but the budget store is already serving; restart to apply it"
             );
         }
     }
@@ -850,6 +862,28 @@ default = true
             .expect("candidate is valid");
         assert!(summary.bind_changed);
         assert_eq!(state.config().generation, 2);
+    }
+
+    #[tokio::test]
+    async fn budget_changes_are_reported_as_restart_required() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+
+        file.rewrite(&format!(
+            "{PLATFORM_ONLY}\n[budget]\nbackend = \"in-memory\"\nlimit_microdollars = 1_000\nreservation_ttl_seconds = 60\nidle_ttl_seconds = 120\nmax_subjects = 32\n"
+        ));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("budget candidate is valid");
+        assert!(summary.budget_changed);
+        assert!(!summary.is_empty());
+
+        file.rewrite(PLATFORM_ONLY);
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("budget removal is valid");
+        assert!(!summary.budget_changed);
     }
 
     /// Both triggers share one view of what has been acted on, so the watcher

@@ -148,14 +148,20 @@ impl BudgetStore for NoBudget {
 pub struct InMemoryBudget {
     limit_microdollars: u64,
     idle_ttl: Duration,
+    reservation_ttl: Duration,
     max_subjects: usize,
     ledgers: Mutex<HashMap<BudgetKey, Ledger>>,
 }
 
 struct Ledger {
     spent: u64,
-    held: HashMap<String, u64>,
+    held: HashMap<String, HeldReservation>,
     last_touched: Instant,
+}
+
+struct HeldReservation {
+    amount_microdollars: u64,
+    expires_at: Instant,
 }
 
 impl Default for Ledger {
@@ -172,20 +178,45 @@ impl Ledger {
     fn outstanding(&self) -> u64 {
         self.held
             .values()
-            .fold(0, |sum, held| sum.saturating_add(*held))
+            .fold(0, |sum, held| sum.saturating_add(held.amount_microdollars))
+    }
+
+    fn reclaim_expired(&mut self, now: Instant) {
+        self.held.retain(|_, held| held.expires_at > now);
     }
 }
 
 impl InMemoryBudget {
     #[cfg(test)]
     pub fn new(limit_microdollars: u64) -> Self {
-        Self::with_limits(limit_microdollars, Duration::from_secs(60 * 60), 10_000)
+        Self::with_settings(
+            limit_microdollars,
+            Duration::from_secs(60 * 60),
+            Duration::from_secs(300),
+            10_000,
+        )
     }
 
+    #[cfg(test)]
     fn with_limits(limit_microdollars: u64, idle_ttl: Duration, max_subjects: usize) -> Self {
+        Self::with_settings(
+            limit_microdollars,
+            idle_ttl,
+            Duration::from_secs(300),
+            max_subjects,
+        )
+    }
+
+    fn with_settings(
+        limit_microdollars: u64,
+        idle_ttl: Duration,
+        reservation_ttl: Duration,
+        max_subjects: usize,
+    ) -> Self {
         Self {
             limit_microdollars,
             idle_ttl,
+            reservation_ttl,
             max_subjects,
             ledgers: Mutex::new(HashMap::new()),
         }
@@ -194,6 +225,7 @@ impl InMemoryBudget {
     fn prune_idle(&self, ledgers: &mut HashMap<BudgetKey, Ledger>) {
         let now = Instant::now();
         ledgers.retain(|_, ledger| {
+            ledger.reclaim_expired(now);
             !ledger.held.is_empty()
                 || now.saturating_duration_since(ledger.last_touched) <= self.idle_ttl
         });
@@ -221,7 +253,9 @@ impl BudgetStore for InMemoryBudget {
             }
         }
         let ledger = ledgers.entry(key.clone()).or_default();
-        ledger.last_touched = Instant::now();
+        let now = Instant::now();
+        ledger.reclaim_expired(now);
+        ledger.last_touched = now;
         let committed = ledger.spent.saturating_add(ledger.outstanding());
         if committed.saturating_add(estimated_microdollars) > self.limit_microdollars {
             return Admission::Denied(Denial::Exceeded);
@@ -230,18 +264,30 @@ impl BudgetStore for InMemoryBudget {
             id: Reservation::next_id(),
             estimate_microdollars: estimated_microdollars,
         };
-        ledger
-            .held
-            .insert(reservation.id.clone(), estimated_microdollars);
+        ledger.held.insert(
+            reservation.id.clone(),
+            HeldReservation {
+                amount_microdollars: estimated_microdollars,
+                expires_at: now.checked_add(self.reservation_ttl).unwrap_or(now),
+            },
+        );
         Admission::Allowed(reservation)
     }
 
     async fn settle(&self, key: &BudgetKey, reservation: &Reservation, actual_microdollars: u64) {
+        if reservation.id.is_empty() {
+            return;
+        }
         let mut ledgers = self.ledgers.lock().unwrap_or_else(|e| e.into_inner());
-        let ledger = ledgers.entry(key.clone()).or_default();
-        ledger.last_touched = Instant::now();
-        ledger.held.remove(&reservation.id);
-        ledger.spent = ledger.spent.saturating_add(actual_microdollars);
+        let Some(ledger) = ledgers.get_mut(key) else {
+            return;
+        };
+        let now = Instant::now();
+        ledger.reclaim_expired(now);
+        if ledger.held.remove(&reservation.id).is_some() {
+            ledger.last_touched = now;
+            ledger.spent = ledger.spent.saturating_add(actual_microdollars);
+        }
     }
 }
 
@@ -332,9 +378,10 @@ pub async fn build(
     };
     match config.backend {
         BudgetBackend::None => Ok(Box::new(NoBudget)),
-        BudgetBackend::InMemory => Ok(Box::new(InMemoryBudget::with_limits(
+        BudgetBackend::InMemory => Ok(Box::new(InMemoryBudget::with_settings(
             config.limit_microdollars,
             Duration::from_secs(config.idle_ttl_seconds),
+            Duration::from_secs(config.reservation_ttl_seconds),
             config.max_subjects,
         ))),
         BudgetBackend::Redis => {
@@ -542,6 +589,49 @@ mod tests {
             budget.reserve(&first, 401).await,
             Admission::Denied(Denial::Exceeded)
         );
+    }
+
+    #[tokio::test]
+    async fn an_expired_hold_is_reclaimed_and_its_ledger_can_be_evicted() {
+        let budget = InMemoryBudget::with_settings(
+            1_000,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            1,
+        );
+        let first = key();
+        let second = BudgetKey {
+            namespace: "acme".into(),
+            subject: "second".into(),
+        };
+
+        let held = budget.reserve(&first, 500).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert!(matches!(
+            budget.reserve(&second, 100).await,
+            Admission::Allowed(_)
+        ));
+        budget.settle(&first, held.reservation(), 500).await;
+        assert!(!budget.ledgers.lock().unwrap().contains_key(&first));
+    }
+
+    #[tokio::test]
+    async fn settling_an_expired_hold_does_not_charge_or_resurrect_it() {
+        let budget = InMemoryBudget::with_settings(
+            1_000,
+            Duration::from_secs(60),
+            Duration::from_millis(1),
+            1,
+        );
+        let first = key();
+
+        let held = budget.reserve(&first, 100).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        budget.settle(&first, held.reservation(), 900).await;
+        assert!(matches!(
+            budget.reserve(&first, 1_000).await,
+            Admission::Allowed(_)
+        ));
     }
 
     #[tokio::test]

@@ -379,7 +379,7 @@ fn default_flush_interval_ms() -> u64 {
 /// remaining fields apply; they are validated as a set at boot, so a shared
 /// backend without a DSN reference — or a cap of zero, which would deny every
 /// request — refuses to start (ADR 0010).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BudgetConfig {
     #[serde(default)]
     pub backend: BudgetBackend,
