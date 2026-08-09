@@ -186,26 +186,29 @@ grep -q '"id":"fixture-chat"' <<<"$models" || failure "authenticated /v1/models 
 rm -f "$models_probe_body"
 models_probe_body=""
 
-unauth_status="$(curl --silent --output /dev/null --write-out '%{http_code}' "$base_url/v1/models")"
+unauth_status="$(curl --silent --max-time 5 --output /dev/null \
+  --write-out '%{http_code}' "$base_url/v1/models" || true)"
 [[ "$unauth_status" == 401 ]] || failure "unauthenticated /v1/models returned $unauth_status instead of 401"
 
 unknown_body="$(mktemp "$tmpdir/axond-tier0-unknown.XXXXXX")"
-unknown_status="$(curl --silent --output "$unknown_body" --write-out '%{http_code}' \
+unknown_status="$(curl --silent --max-time 5 --output "$unknown_body" \
+  --write-out '%{http_code}' \
   -H 'Authorization: Bearer tier0-gateway-key' -H 'content-type: application/json' \
   -d '{"model":"does-not-exist","messages":[{"role":"user","content":"hello"}]}' \
-  "$base_url/v1/chat/completions")"
-grep -q '"type":"unknown_model"' "$unknown_body" || failure "unknown model response lacked typed unknown_model error"
+  "$base_url/v1/chat/completions" || true)"
 [[ "$unknown_status" == 404 ]] || failure "unknown model returned $unknown_status instead of 404"
+grep -q '"type":"unknown_model"' "$unknown_body" || failure "unknown model response lacked typed unknown_model error"
 rm -f "$unknown_body"
 
 fixture_body="$(mktemp "$tmpdir/axond-tier0-fixture.XXXXXX")"
-fixture_status="$(curl --silent --output "$fixture_body" --write-out '%{http_code}' \
+fixture_status="$(curl --silent --max-time 5 --output "$fixture_body" \
+  --write-out '%{http_code}' \
   -H 'Authorization: Bearer tier0-gateway-key' -H 'content-type: application/json' \
   -d '{"model":"fixture-chat","messages":[{"role":"user","content":"What is the capital of France?"}]}' \
-  "$base_url/v1/chat/completions")"
+  "$base_url/v1/chat/completions" || true)"
+[[ "$fixture_status" == 200 ]] || failure "local fake-upstream request returned $fixture_status instead of 200"
 grep -Eq '"object"[[:space:]]*:[[:space:]]*"chat.completion"' "$fixture_body" ||
   failure "fake-upstream response was not fixture-shaped"
-[[ "$fixture_status" == 200 ]] || failure "local fake-upstream request returned $fixture_status instead of 200"
 rm -f "$fixture_body"
 
 echo "healthz: $health"
