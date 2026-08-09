@@ -129,8 +129,9 @@ table. The usage record's `subject` is the env var's *name*
 
 A reload re-runs the full boot validation against the current file **and the
 current process environment**; a bad candidate is rejected and the running
-config keeps serving. `[server] bind` and `[[usage_sink]]` changes warn and are
-ignored ([ADR 0011](./adr/0011-config-hot-reload.md)).
+config keeps serving. `[server] bind`, `[[usage_sink]]`, and `[budget]`
+changes warn and are ignored until restart; this includes
+`limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
 
 ## `[[usage_sink]]` — opt-in, datastore for `postgres`
 
@@ -156,7 +157,7 @@ A configured sink connects **at boot**, so a bad DSN refuses to start rather
 than dropping records later. Afterwards the sink is off the request path and a
 stalled destination drops with a count rather than delaying a request.
 
-## `[budget]` — opt-in, datastore for `redis` / `postgres`
+## `[budget]` — opt-in budget enforcement
 
 Omit the section for the default: no cap, no datastore
 ([ADR 0010](./adr/0010-shared-budget-backends-and-charging-policy.md)). The cap
@@ -166,12 +167,14 @@ is per `(namespace, subject)` — that is, per gateway key — in micro-dollars.
 | --- | --- | --- | --- | --- |
 | `backend` | `none` \| `in-memory` \| `redis` \| `postgres` | `none` | all | `in-memory` holds state per replica, so a fleet of N enforces N caps; `redis` and `postgres` share one cap atomically. |
 | `limit_microdollars` | integer | `0` | every backend but `none` | The cap. `10_000_000` µ$ = $10. Zero would deny everything, so it is rejected. |
-| `on_unavailable` | `deny` \| `allow` | `deny` | shared backends | What to do when the store cannot be reached. `deny` answers `503 budget_unavailable`; `allow` serves unenforced and warns. |
+| `on_unavailable` | `deny` \| `allow` | `deny` | `in-memory`, `redis`, `postgres` | What to do when the budget cannot enforce the cap. `deny` answers `503 budget_unavailable`; `allow` serves unenforced and warns. |
 | `dsn_env` | string | — | `redis`, `postgres` | *Name* of the env var holding the connection string (`redis://`/`rediss://`, or a libpq DSN). Required and non-empty. |
 | `table` | string | `axond_budget` | `postgres` | Base table; reservations live in `<table>_reservation`. Validated as an identifier. |
 | `create_table` | bool | `false` | `postgres` | Apply the shipped DDL at boot. |
 | `key_prefix` | string | `axond:budget` | `redis` | Key namespace for budget state. |
 | `reservation_ttl_seconds` | integer | `300` | every backend but `none` | How long a hold survives a replica that died mid-request. Should exceed the longest expected request. Zero is rejected. |
+| `idle_ttl_seconds` | integer | `3600` | `in-memory` | Idle time before an unheld ledger may be pruned when `max_subjects` is reached. In-memory state is per-replica and approximate; zero is rejected. |
+| `max_subjects` | integer | `10000` | `in-memory` | Maximum retained `(namespace, subject)` ledgers. When full, unheld idle ledgers are pruned lazily; zero is rejected. Use Redis for exact caps. |
 
 Enforcement holds a priced estimate before dispatch and settles it against
 measured spend afterwards, so concurrent requests cannot collectively overshoot.

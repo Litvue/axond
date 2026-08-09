@@ -74,6 +74,35 @@ export GW_INBOUND_ACME_KEY=acme-token
 cargo run -p axond                    # or: just run
 ```
 
+The same binary also provides offline token minting and Ed25519 key generation.
+`keygen` never loads the gateway config. `mint` uses an explicitly supplied
+`--config` when requested; an `AXOND_CONFIG` value is only an ambient aid.
+
+```bash
+# Generate a public verifier key and write the base64 PKCS#8 private key to a
+# new 0600 file on Unix. On non-Unix platforms, restrict inherited permissions
+# manually. The command prints only the public key and TOML snippet.
+axond keygen --private-key ./acme-signing.key \
+  --kid acme-2026-08 --env GW_VERIFY_ACME_2026_08 \
+  --namespace acme --max-ttl 15m
+
+# Signing material is read by name from the environment, never from argv.
+export GW_SIGN_ACME="$(cat ./acme-signing.key)"
+axond mint --kid acme-2026-08 --alg EdDSA --key-env GW_SIGN_ACME \
+  --namespace acme --subject agent-1 --ttl 10m \
+  --audience acme-production
+```
+
+`mint` prints only the `axt1.` token to stdout. It always enforces the 24-hour
+policy ceiling; when a matching verifier is available in `--config` (or
+`AXOND_CONFIG`), it also enforces that verifier's `max_ttl` and namespace
+permission and defaults the audience from `[gateway_token]`. An unloadable
+explicit config fails; an unloadable ambient `AXOND_CONFIG` produces a warning
+on stderr and minting continues with only the policy ceiling. Without a usable
+config, a token above the verifier's configured `max_ttl` can be minted but is
+rejected by the gateway.
+The minter emits only claims enforced by the current verifier.
+
 ```bash
 curl localhost:8080/v1/chat/completions \
   -H "authorization: Bearer $GW_INBOUND_PLATFORM_KEY" \
@@ -218,7 +247,7 @@ touches no datastore. Durable destinations are opt-in:
 [[usage_sink]]
 kind = "postgres"
 dsn_env = "AXOND_USAGE_POSTGRES_DSN"   # the DSN is a secret: referenced, never inlined
-create_table = true                   # or apply ops/postgres/usage_v1.sql yourself
+create_table = true                   # or apply usage_v1.sql and additive migrations yourself
 
 [[usage_sink]]
 kind = "otlp"                         # usage as OTel log records, on the existing exporter

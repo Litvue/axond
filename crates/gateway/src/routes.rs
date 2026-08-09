@@ -38,12 +38,13 @@ use gateway_core::{
 };
 use gateway_transport::{AuthScheme, NativeCall, TransportError, Upstream};
 use serde_json::{Value, json};
-use tracing::Instrument;
+use tracing::{Instrument, debug, warn};
 
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, Target};
 use crate::credentials::{CredentialPlan, CredentialSource};
 use crate::error::GatewayError;
+use crate::principals::{Presented, PrincipalStoreError};
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::streaming::{self, Framing, StreamContext};
 use crate::telemetry;
@@ -81,7 +82,7 @@ async fn list_models(
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
     let snapshot = state.config();
-    let caller = authenticate(&snapshot, &headers)?;
+    let caller = authenticate(&snapshot, &headers).await?;
     let cfg = &snapshot.config;
     let data: Vec<Value> = cfg
         .model
@@ -105,20 +106,48 @@ async fn list_models(
 /// The key travels as `Authorization: Bearer` or, because that is what an
 /// Anthropic SDK pointed at the gateway sends, as `x-api-key`. Both name the
 /// same gateway key; the scheme is the client's, not a second credential space.
-fn authenticate(
+async fn authenticate(
     snapshot: &ConfigSnapshot,
     headers: &HeaderMap,
 ) -> Result<InboundKey, GatewayError> {
-    let token = headers
+    let credential = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
         .ok_or(GatewayError::Unauthorized)?;
-    snapshot
-        .resolve_inbound(token)
-        .cloned()
-        .ok_or(GatewayError::Unauthorized)
+    let presented = Presented { credential };
+    let store = snapshot.principal_store_name(&presented);
+    let principal = match snapshot.resolve_principal(&presented).await {
+        Ok(principal) => principal,
+        Err(PrincipalStoreError::Unauthorized(error)) => {
+            debug!(
+                store,
+                error = %error,
+                "token rejected during principal resolution"
+            );
+            return Err(GatewayError::TokenUnauthorized(error));
+        }
+        Err(PrincipalStoreError::Forbidden(error)) => {
+            debug!(
+                store,
+                error = %error,
+                "token rejected during principal resolution"
+            );
+            return Err(GatewayError::TokenForbidden(error));
+        }
+        Err(error) => {
+            // A layer error is terminal by design; it must not fall through to
+            // another authority just because the owning layer is unavailable.
+            warn!(
+                store,
+                error = %error,
+                "principal store resolution failed"
+            );
+            return Err(GatewayError::Unauthorized);
+        }
+    };
+    principal.ok_or(GatewayError::Unauthorized)
 }
 
 /// The wire shape a route speaks, which is the only thing that differs between
@@ -320,7 +349,7 @@ async fn serve(
     // One snapshot for the whole request: a reload that lands mid-request
     // cannot change the alias, credential, or circuit this request resolved.
     let snapshot = state.config();
-    let caller = authenticate(&snapshot, &headers)?;
+    let caller = authenticate(&snapshot, &headers).await?;
     let cfg = &snapshot.config;
 
     let streamed = route.streamable() && body.get("stream").and_then(Value::as_bool) == Some(true);
@@ -656,6 +685,7 @@ async fn stream_with_failover(
         let mut ctx = StreamContext {
             namespace: caller.namespace.clone(),
             subject: caller.subject.clone(),
+            signer_kid: caller.signer_kid.clone(),
             alias: alias.clone(),
             target_provider: target.provider.clone(),
             target_model: target.model.clone(),
@@ -1059,6 +1089,7 @@ async fn record_usage(state: &AppState, args: RecordArgs<'_>) {
         trace_id: telemetry::trace_id(),
         namespace: args.caller.namespace.clone(),
         subject: args.caller.subject.clone(),
+        signer_kid: args.caller.signer_kid.clone(),
         model: args.alias.to_string(),
         target_provider: args.target_provider.to_string(),
         target_model: args.target_model.to_string(),
@@ -1085,6 +1116,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use serde::Serialize;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1197,10 +1230,115 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
                 CALLER_SECRET.parse().unwrap(),
             )]),
         ] {
-            let caller = authenticate(&snapshot, &headers).expect("the key is configured");
+            let caller = authenticate(&snapshot, &headers)
+                .await
+                .expect("the key is configured");
             assert_eq!(caller.namespace, "platform");
             assert_eq!(caller.subject, "AXOND_INBOUND_KEY");
+            assert_eq!(caller.signer_kid, None);
         }
+    }
+
+    #[derive(Serialize)]
+    struct TestTokenClaims {
+        exp: u64,
+        iat: u64,
+        jti: &'static str,
+        aud: &'static str,
+        ns: &'static str,
+        sub: &'static str,
+    }
+
+    #[tokio::test]
+    async fn a_verified_token_usage_record_carries_its_signer_kid() {
+        let (base_url, _) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "{base_url}"
+
+[[gateway_key]]
+env = "STATIC_KEY"
+namespace = "platform"
+
+[gateway_token]
+audience = "test-audience"
+
+[[gateway_verifier]]
+kid = "route-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "UPSTREAM_KEY"
+
+[[model]]
+name = "gpt-4o"
+targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 1000000 }} }}]
+"#
+        ))
+        .expect("token test config");
+        let env = HashMap::from([
+            ("STATIC_KEY".to_owned(), "static-secret".to_owned()),
+            ("JWT_SECRET".to_owned(), "a".repeat(32)),
+            ("UPSTREAM_KEY".to_owned(), "sk-test".to_owned()),
+        ]);
+        let captured = CapturingSink::default();
+        let records = captured.0.clone();
+        let state = AppState::new(
+            cfg,
+            &env,
+            UsageFanout::new(vec![Box::new(captured)]),
+            Box::new(NoBudget),
+        )
+        .expect("state");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let claims = TestTokenClaims {
+            exp: now + 900,
+            iat: now,
+            jti: "route-jti",
+            aud: "test-audience",
+            ns: "platform",
+            sub: "token-caller",
+        };
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("route-kid".to_owned());
+        let token = format!(
+            "axt1.{}",
+            encode(
+                &header,
+                &claims,
+                &EncodingKey::from_secret(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .expect("token")
+        );
+        let request = Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []})).expect("body"),
+            ))
+            .expect("request");
+        let response = router(state).oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let records = records.lock().expect("records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].subject, "token-caller");
+        assert_eq!(records[0].signer_kid.as_deref(), Some("route-kid"));
     }
 
     #[tokio::test]
@@ -1528,6 +1666,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].credential_id, "openai-b");
         assert_eq!(records[0].credential_source, "platform");
+        assert_eq!(records[0].signer_kid, None);
         // The pool made one target attempt (credential rotation is inner).
         assert_eq!(records[0].attempts, 1);
     }

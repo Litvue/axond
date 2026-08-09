@@ -84,6 +84,34 @@ export GW_INBOUND_PLATFORM_KEY=...
 
 `AXOND_CONFIG` defaults to `axond.toml` in the working directory.
 
+The same binary has offline-only `keygen` and `mint` subcommands. They dispatch
+before telemetry or gateway configuration is loaded. `keygen` never needs a
+serving config. `mint` uses an explicitly supplied `--config` when requested;
+an `AXOND_CONFIG` value is only an ambient aid for inferring a matching
+verifier's algorithm, audience, namespace permission, and `max_ttl`. Signing
+material is always read from the environment. On Unix, `keygen` writes the
+base64 PKCS#8 private key to a new `0600` file; on non-Unix platforms it warns
+that permissions are inherited and must be restricted manually. It prints only
+the base64 raw public key plus a verifier snippet; `mint` prints only the
+`axt1.` token to stdout.
+
+```bash
+axond keygen --private-key ./acme-signing.key \
+  --kid acme-2026-08 --env GW_VERIFY_ACME_2026_08 \
+  --namespace acme --max-ttl 15m
+export GW_SIGN_ACME="$(cat ./acme-signing.key)"
+axond mint --kid acme-2026-08 --alg EdDSA --key-env GW_SIGN_ACME \
+  --namespace acme --subject agent-1 --ttl 10m \
+  --audience acme-production
+```
+
+`mint` always enforces the 24-hour policy ceiling. An unloadable explicit config
+is fatal; an unloadable ambient `AXOND_CONFIG` produces a warning on stderr and
+minting continues with only the policy ceiling. Without a usable matching
+verifier config, it cannot know that verifier's configured `max_ttl`; such a
+token may be minted and is rejected at gateway verification if it exceeds the
+configured bound.
+
 Under systemd, put the secrets in an `EnvironmentFile` rather than the unit, and
 keep `Restart=on-failure`: a boot failure means the config or the environment is
 wrong, and restarting will (correctly) keep failing until it is fixed.
@@ -218,6 +246,11 @@ actually want:
 | Durable usage rows | `[[usage_sink]] kind = "postgres"` | A Postgres role and the [`usage_v1.sql`](../ops/postgres/usage_v1.sql) table. |
 | Usage in your trace backend | `[[usage_sink]] kind = "otlp"` | Requires `OTEL_EXPORTER_OTLP_ENDPOINT`. |
 | A spend cap across replicas | `[budget] backend = "redis"` or `"postgres"` | Redis, or the [`budget_v1.sql`](../ops/postgres/budget_v1.sql) tables. |
+
+For upgrades, apply each additive `usage_v1_<sequence>_<name>.sql` migration in
+filename order before deploying a gateway that writes its new column. Otherwise
+the sink fails those batches and drops usage rows, surfaced as `sink_error` on
+the dropped-records metric, until the migrations are applied.
 
 A `[budget]` backend of `in-memory` enforces the cap **per replica**, so a fleet
 of N replicas admits up to N caps. Use a shared backend for a real fleet-wide

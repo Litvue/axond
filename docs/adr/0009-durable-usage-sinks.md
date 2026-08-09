@@ -44,6 +44,11 @@ and is documented in [`docs/usage-schema.md`](../usage-schema.md). The rules:
 - An **additive, nullable** column is not a version bump. `reasoning_tokens`,
   `cache_read_tokens`, and `cache_write_tokens` are declared now and left NULL
   precisely so populating them later changes no reader.
+- An additive nullable column that was not reserved ships as an ordered
+  `usage_v1_<sequence>_<name>.sql` alongside the base DDL. Fresh installations
+  apply the base file and then every additive file; existing installations
+  apply only the new file before the writer. The writer does not probe for the
+  column: migrate first or the sink drops its failed writes.
 - Anything a reader can observe as a change in meaning — a dropped or renamed
   column, a widened `NOT NULL`, a changed unit or vocabulary — is a new
   `usage_v<N>.sql` and a bump of `UsageRecord::SCHEMA_VERSION`. The old file is

@@ -4,7 +4,7 @@ Date: 2026-08-09
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
@@ -79,6 +79,11 @@ not TOML, and is resolved by the same boot/reload validation path as the
 existing gateway keys. Public Ed25519 verification keys may be held as public
 key bytes; HS256 secrets remain protected as secrets.
 
+Each verifier's `max_ttl` is bounded by a 24-hour policy ceiling. This is not a
+protocol limit: an unbounded value would let a signer mint credentials that
+outlive any incident response, defeating the first rung of this ADR's
+revocation ladder.
+
 **Ed25519/EdDSA is the default asymmetric verifier. HS256 is a deliberate
 escape hatch.** Ed25519 means a gateway replica holds only public verification
 material and cannot mint inbound identity. HS256 is available when the gateway
@@ -95,6 +100,25 @@ reload. A signer is permitted only for its configured `namespaces`.
 from a signing key and claims. The gateway only verifies it; no issuance record,
 store, or request-path dependency is added. This is the default that preserves
 ADR 0002.
+
+The minter reads signing material from an environment variable named by the
+command, never from argv. It emits only the `axt1.` token on stdout; diagnostics
+go to stderr. `axond keygen` writes a base64 PKCS#8 Ed25519 private key to a new
+`0600` file and prints only the base64 raw public key plus a ready-to-paste
+verifier configuration snippet. The public key is therefore safe to install on
+verification-only replicas while the private key remains with the minter.
+
+Minting always enforces the 24-hour policy ceiling. When a matching verifier is
+available through `--config` or `AXOND_CONFIG`, minting additionally enforces
+that verifier's configured `max_ttl` and may default its audience. Without
+that config, the minter cannot know the verifier-specific bound: a token may
+mint successfully against the policy ceiling and then be rejected by the
+gateway if it exceeds the configured `max_ttl`.
+
+The current minter emits only claims the verifier enforces. It deliberately
+does not emit `scope`, `aliases`, or `max_request_microdollars` until the
+corresponding authorization controls exist; an unenforced narrowing claim
+would create a misleading credential.
 
 `POST /v1/tokens` is an opt-in alternative for deployments where callers cannot
 run a minter. It is authenticated by a static gateway key authorized to mint

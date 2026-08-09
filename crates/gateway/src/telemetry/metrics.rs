@@ -35,6 +35,8 @@ struct Instruments {
     usage_dropped: Counter<u64>,
     config_reloads: Counter<u64>,
     config_generation: Gauge<u64>,
+    budget_capacity_denials: Counter<u64>,
+    budget_retained_subjects: Gauge<u64>,
 }
 
 static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
@@ -110,6 +112,18 @@ impl Instruments {
                 .u64_gauge("axond.config.generation")
                 .with_description(
                     "Config generation this replica is serving: 0 at boot, +1 per applied reload.",
+                )
+                .build(),
+            budget_capacity_denials: meter
+                .u64_counter("axond.budget.capacity_denials")
+                .with_description(
+                    "In-memory budget admissions denied because the ledger bound was exhausted.",
+                )
+                .build(),
+            budget_retained_subjects: meter
+                .u64_gauge("axond.budget.retained_subjects")
+                .with_description(
+                    "In-memory budget ledgers retained after capacity-pressure pruning.",
                 )
                 .build(),
         }
@@ -205,6 +219,24 @@ pub fn record_config_reload(trigger: &'static str, outcome: &'static str, genera
         ],
     );
     instruments.config_generation.record(generation, &[]);
+}
+
+/// Record an in-memory budget admission denied by the subject bound.
+pub fn record_budget_capacity_denial() {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.budget_capacity_denials.add(1, &[]);
+}
+
+/// Record the retained in-memory ledger count after capacity-pressure pruning.
+pub fn record_budget_retained_subjects(subjects: usize) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .budget_retained_subjects
+        .record(subjects as u64, &[]);
 }
 
 /// Publish a target's circuit state. Ordered failover (which owns the breaker)

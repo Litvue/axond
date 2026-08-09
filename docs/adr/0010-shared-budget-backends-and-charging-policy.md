@@ -69,6 +69,21 @@ the expired holds for its key before it decides, so recovery needs no sweeper
 process. A settlement that cannot reach the store logs and leaves the hold to
 expire rather than blocking the caller on a retry.
 
+**In-memory retention is bounded and lazy.** The per-replica backend retains at
+most `max_subjects` ledgers. When that capacity is reached, a reserve lazily
+prunes ledgers whose holds have expired and are unheld and idle beyond
+`idle_ttl_seconds`; there is no background task, since a timer thread would
+regress the Tier 0 default. Holds expire after `reservation_ttl_seconds`, and
+only live holds make a ledger unevictable. Eviction can discard accumulated
+`spent`, but that is the same class of approximation as a replica restart
+resetting the in-memory counter, not a new guarantee; exact caps remain a Tier
+1/Redis concern. If capacity is full and nothing is evictable, admission
+returns `Denial::StoreUnavailable`: the cap cannot be enforced, so the request
+is denied rather than incorrectly reported as over-budget. This capacity path
+follows `on_unavailable`: `allow` admits an unheld reservation, while `deny`
+preserves the fail-closed default. Expiry reclaims only the hold; a later
+settlement still records measured spend.
+
 **Charging policy: charge for what was consumed.** Not `$0`, not the reserved
 estimate.
 

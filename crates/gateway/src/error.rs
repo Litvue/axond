@@ -11,6 +11,8 @@ use gateway_core::ProviderError;
 use gateway_transport::TransportError;
 use serde_json::json;
 
+use crate::principals::TokenVerificationError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
     #[error("unknown model `{0}`")]
@@ -23,6 +25,10 @@ pub enum GatewayError {
     BudgetUnavailable,
     #[error("unauthorized")]
     Unauthorized,
+    #[error("token authentication failed: {0}")]
+    TokenUnauthorized(#[source] TokenVerificationError),
+    #[error("token authorization failed: {0}")]
+    TokenForbidden(#[source] TokenVerificationError),
     #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
     #[error(transparent)]
@@ -53,6 +59,8 @@ impl GatewayError {
             // dependency failure rather than an over-cap caller (ADR 0010).
             Self::BudgetUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::TokenUnauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::TokenForbidden(_) => StatusCode::FORBIDDEN,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::UnsupportedWire { .. } => StatusCode::BAD_REQUEST,
@@ -77,6 +85,7 @@ impl GatewayError {
             Self::BudgetExceeded(_) => "budget_exceeded",
             Self::BudgetUnavailable => "budget_unavailable",
             Self::Unauthorized => "unauthorized",
+            Self::TokenUnauthorized(error) | Self::TokenForbidden(error) => error.code(),
             Self::NotImplemented(_) => "not_implemented",
             Self::BadRequest(_) => "bad_request",
             Self::UnsupportedWire { .. } => "unsupported_wire",
@@ -89,12 +98,65 @@ impl GatewayError {
 
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
+        let message = match &self {
+            Self::TokenUnauthorized(_) => "token authentication failed".to_owned(),
+            Self::TokenForbidden(_) => "token authorization failed".to_owned(),
+            _ => self.to_string(),
+        };
         let body = json!({
             "error": {
                 "type": self.code(),
-                "message": self.to_string(),
+                "message": message,
             }
         });
         (self.status(), Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    #[test]
+    fn token_error_statuses_and_codes_are_distinct() {
+        let unauthorized = GatewayError::TokenUnauthorized(TokenVerificationError::Expired);
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(unauthorized.code(), "token_expired");
+
+        let forbidden = GatewayError::TokenForbidden(TokenVerificationError::UnknownNamespace {
+            namespace: "ghost".to_owned(),
+        });
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        assert_eq!(forbidden.code(), "token_unknown_namespace");
+    }
+
+    #[tokio::test]
+    async fn token_error_bodies_do_not_echo_caller_details() {
+        let unauthorized = GatewayError::TokenUnauthorized(TokenVerificationError::UnknownKey {
+            kid: "caller-kid".to_owned(),
+        })
+        .into_response();
+        let unauthorized_body = unauthorized
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let unauthorized_body = String::from_utf8(unauthorized_body.to_vec()).unwrap();
+        assert!(!unauthorized_body.contains("caller-kid"));
+
+        let forbidden = GatewayError::TokenForbidden(TokenVerificationError::UnknownNamespace {
+            namespace: "caller-namespace".to_owned(),
+        })
+        .into_response();
+        let forbidden_body = forbidden
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let forbidden_body = String::from_utf8(forbidden_body.to_vec()).unwrap();
+        assert!(!forbidden_body.contains("caller-namespace"));
     }
 }

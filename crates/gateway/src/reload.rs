@@ -11,9 +11,11 @@
 //! rather than at request time — the fail-at-boot posture, applied again.
 //!
 //! Not everything a config file describes can be replaced in a live process.
-//! The listening socket is already bound and the usage sinks already own
-//! connections and flush tasks, so changes to `[server] bind` and
-//! `[[usage_sink]]` are reported and ignored until the next restart.
+//! The listening socket is already bound, the usage sinks already own
+//! connections and flush tasks, and the budget store already owns its
+//! reservations, so changes to `[server] bind`, `[[usage_sink]]`, and
+//! `[budget]` (including `limit_microdollars`) are reported and ignored until
+//! the next restart.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -21,7 +23,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::config::{Config, ConfigError, Reload, UsageSinkConfig};
+use crate::config::{BudgetConfig, Config, ConfigError, Reload, UsageSinkConfig};
 use crate::state::{AppState, ConfigSnapshot, SnapshotError};
 use crate::telemetry;
 
@@ -44,6 +46,7 @@ pub enum ReloadError {
 struct Boot {
     bind: SocketAddr,
     usage_sink: Vec<UsageSinkConfig>,
+    budget: BudgetConfig,
 }
 
 /// Owns the config path and the state whose snapshot it replaces.
@@ -66,6 +69,7 @@ impl Reloader {
             boot: Boot {
                 bind: booted.config.server.bind,
                 usage_sink: booted.config.usage_sink.clone(),
+                budget: booted.config.budget.clone(),
             },
             path,
             state,
@@ -191,10 +195,14 @@ pub struct ReloadSummary {
     pub models: Delta,
     pub credentials: Delta,
     pub gateway_keys: Delta,
+    pub gateway_verifiers: Delta,
+    pub gateway_token_audience: Delta,
     /// `[server] bind` differs from what the process bound at startup.
     pub bind_changed: bool,
     /// `[[usage_sink]]` differs from the connected sinks.
     pub usage_sinks_changed: bool,
+    /// `[budget]` differs from the booted store configuration.
+    pub budget_changed: bool,
 }
 
 /// The added and removed identifiers of one config collection.
@@ -202,6 +210,7 @@ pub struct ReloadSummary {
 pub struct Delta {
     pub added: Vec<String>,
     pub removed: Vec<String>,
+    pub changed: Vec<String>,
 }
 
 impl Delta {
@@ -211,11 +220,12 @@ impl Delta {
         Self {
             added: after.difference(&before).cloned().collect(),
             removed: before.difference(&after).cloned().collect(),
+            changed: Vec::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty()
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
     }
 }
 
@@ -229,7 +239,11 @@ impl std::fmt::Display for Delta {
             "+[{}] -[{}]",
             self.added.join(","),
             self.removed.join(",")
-        )
+        )?;
+        if !self.changed.is_empty() {
+            write!(f, " ~[{}]", self.changed.join(","))?;
+        }
+        Ok(())
     }
 }
 
@@ -256,8 +270,24 @@ impl ReloadSummary {
                 before.gateway_key.iter().map(|k| k.env.clone()),
                 after.gateway_key.iter().map(|k| k.env.clone()),
             ),
+            gateway_verifiers: Delta::between(
+                before.gateway_verifier.iter().map(|v| v.kid.clone()),
+                after.gateway_verifier.iter().map(|v| v.kid.clone()),
+            )
+            .with_changed(verifier_definition_changes(before, after)),
+            gateway_token_audience: Delta::between(
+                before
+                    .gateway_token
+                    .iter()
+                    .map(|token| token.audience.clone()),
+                after
+                    .gateway_token
+                    .iter()
+                    .map(|token| token.audience.clone()),
+            ),
             bind_changed: boot.bind != after.server.bind,
             usage_sinks_changed: boot.usage_sink != after.usage_sink,
+            budget_changed: boot.budget != after.budget,
         }
     }
 
@@ -268,6 +298,8 @@ impl ReloadSummary {
             && self.models.is_empty()
             && self.credentials.is_empty()
             && self.gateway_keys.is_empty()
+            && self.gateway_verifiers.is_empty()
+            && self.gateway_token_audience.is_empty()
     }
 
     fn log_applied(&self, trigger: &'static str, path: &str) {
@@ -279,6 +311,9 @@ impl ReloadSummary {
             models = %self.models,
             credentials = %self.credentials,
             gateway_keys = %self.gateway_keys,
+            gateway_verifiers = %self.gateway_verifiers,
+            gateway_token_audience = %self.gateway_token_audience,
+            budget_changed = self.budget_changed,
             changed = !self.is_empty(),
             "config reloaded"
         );
@@ -292,12 +327,51 @@ impl ReloadSummary {
                 "`[[usage_sink]]` changed, but sinks own live connections; restart to apply it"
             );
         }
+        if self.budget_changed {
+            tracing::warn!(
+                "`[budget]` changed, but the budget store is already serving; restart to apply it"
+            );
+        }
     }
 }
 
 /// `namespace/provider/label` — the pool member a credential entry declares.
 fn credential_key(c: &crate::config::Credential) -> String {
     format!("{}/{}/{}", c.namespace, c.provider, c.label())
+}
+
+impl Delta {
+    fn with_changed(mut self, changed: impl IntoIterator<Item = String>) -> Self {
+        self.changed = changed.into_iter().collect();
+        self
+    }
+}
+
+fn verifier_definition_changes(before: &Config, after: &Config) -> Vec<String> {
+    let before: HashMap<&str, &crate::config::GatewayVerifier> = before
+        .gateway_verifier
+        .iter()
+        .map(|verifier| (verifier.kid.as_str(), verifier))
+        .collect();
+    let after: HashMap<&str, &crate::config::GatewayVerifier> = after
+        .gateway_verifier
+        .iter()
+        .map(|verifier| (verifier.kid.as_str(), verifier))
+        .collect();
+    let mut changed = before
+        .keys()
+        .filter_map(|kid| {
+            let before = before[kid];
+            let after = after.get(kid)?;
+            (before.alg != after.alg
+                || before.env != after.env
+                || before.namespaces != after.namespaces
+                || before.max_ttl != after.max_ttl)
+                .then(|| (*kid).to_owned())
+        })
+        .collect::<Vec<_>>();
+    changed.sort();
+    changed
 }
 
 /// Wire the reload triggers up for the process lifetime: the `SIGHUP` handler,
@@ -344,6 +418,7 @@ async fn watch_loop(reloader: Arc<Reloader>) {
 mod tests {
     use super::*;
     use crate::budget::NoBudget;
+    use crate::principals::Presented;
     use crate::routes;
     use crate::usage::{StdoutSink, UsageFanout, UsageSink};
     use axum::body::Body;
@@ -469,6 +544,10 @@ targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdo
         [
             (INBOUND_KEY_ENV.to_string(), "inbound-secret".to_string()),
             ("PLATFORM_OPENAI_KEY".to_string(), "sk-platform".to_string()),
+            (
+                "JWT_SECRET".to_string(),
+                "jwt-test-secret-0123456789012345".to_string(),
+            ),
         ]
         .into_iter()
         .collect()
@@ -530,6 +609,82 @@ targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdo
         );
         let aliases = listed_aliases(&state).await;
         assert!(aliases.contains(&"acme-fast".to_string()));
+    }
+
+    #[tokio::test]
+    async fn reload_summary_reports_gateway_verifier_kid_changes() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+        file.rewrite(&format!(
+            "{PLATFORM_ONLY}\n[gateway_token]\naudience = \"reload-test\"\n\n[[gateway_verifier]]\nkid = \"reload-kid\"\nalg = \"HS256\"\nenv = \"JWT_SECRET\"\nnamespaces = [\"platform\"]\nmax_ttl = \"15m\"\n"
+        ));
+
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("verifier candidate is valid");
+        assert_eq!(summary.gateway_verifiers.added, vec!["reload-kid"]);
+        assert!(summary.gateway_verifiers.removed.is_empty());
+
+        file.rewrite(PLATFORM_ONLY);
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("verifier removal is valid");
+        assert!(summary.gateway_verifiers.added.is_empty());
+        assert_eq!(summary.gateway_verifiers.removed, vec!["reload-kid"]);
+    }
+
+    #[tokio::test]
+    async fn reload_summary_reports_gateway_verifier_definition_changes() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+        let verifier = |audience: &str, max_ttl: &str| {
+            format!(
+                "{PLATFORM_ONLY}\n[gateway_token]\naudience = \"{audience}\"\n\n[[gateway_verifier]]\nkid = \"reload-kid\"\nalg = \"HS256\"\nenv = \"JWT_SECRET\"\nnamespaces = [\"platform\"]\nmax_ttl = \"{max_ttl}\"\n"
+            )
+        };
+
+        file.rewrite(&verifier("reload-test", "15m"));
+        reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("verifier candidate is valid");
+
+        file.rewrite(&verifier("reload-test", "30m"));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("changed verifier candidate is valid");
+        assert!(summary.gateway_verifiers.added.is_empty());
+        assert!(summary.gateway_verifiers.removed.is_empty());
+        assert_eq!(summary.gateway_verifiers.changed, vec!["reload-kid"]);
+        assert!(summary.gateway_token_audience.is_empty());
+        assert!(!summary.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_summary_reports_gateway_token_audience_changes() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+        let config = |audience: &str| {
+            format!(
+                "{PLATFORM_ONLY}\n[gateway_token]\naudience = \"{audience}\"\n\n[[gateway_verifier]]\nkid = \"reload-kid\"\nalg = \"HS256\"\nenv = \"JWT_SECRET\"\nnamespaces = [\"platform\"]\nmax_ttl = \"15m\"\n"
+            )
+        };
+
+        file.rewrite(&config("reload-test"));
+        reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("verifier candidate is valid");
+
+        file.rewrite(&config("new-audience"));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("audience change is valid");
+        assert_eq!(summary.gateway_token_audience.added, vec!["new-audience"]);
+        assert_eq!(summary.gateway_token_audience.removed, vec!["reload-test"]);
+        assert!(summary.gateway_verifiers.is_empty());
+        assert!(!summary.is_empty());
     }
 
     /// The reload reads the environment, so a key exported after boot resolves —
@@ -611,7 +766,16 @@ default = true
         // The running config still serves, still with its own key table.
         assert!(Arc::ptr_eq(&before, &state.config()));
         assert_eq!(state.config().generation, 0);
-        assert!(state.config().resolve_inbound("inbound-secret").is_some());
+        assert!(
+            state
+                .config()
+                .resolve_principal(&Presented {
+                    credential: "inbound-secret",
+                })
+                .await
+                .expect("principal resolution succeeds")
+                .is_some()
+        );
 
         // Exporting the rotated key is all the candidate was waiting for.
         let mut rotated = inbound_env();
@@ -624,8 +788,24 @@ default = true
             .expect("resolves once the key is exported");
         let after = state.config();
         assert_eq!(after.generation, 1);
-        assert!(after.resolve_inbound("rotated-secret").is_some());
-        assert!(after.resolve_inbound("inbound-secret").is_none());
+        assert!(
+            after
+                .resolve_principal(&Presented {
+                    credential: "rotated-secret",
+                })
+                .await
+                .expect("principal resolution succeeds")
+                .is_some()
+        );
+        assert!(
+            after
+                .resolve_principal(&Presented {
+                    credential: "inbound-secret",
+                })
+                .await
+                .expect("principal resolution succeeds")
+                .is_none()
+        );
     }
 
     /// A request holds its snapshot for its whole life, so a reload that lands
@@ -683,6 +863,28 @@ default = true
             .expect("candidate is valid");
         assert!(summary.bind_changed);
         assert_eq!(state.config().generation, 2);
+    }
+
+    #[tokio::test]
+    async fn budget_changes_are_reported_as_restart_required() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+
+        file.rewrite(&format!(
+            "{PLATFORM_ONLY}\n[budget]\nbackend = \"in-memory\"\nlimit_microdollars = 1_000\nreservation_ttl_seconds = 60\nidle_ttl_seconds = 120\nmax_subjects = 32\n"
+        ));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("budget candidate is valid");
+        assert!(summary.budget_changed);
+        assert!(summary.is_empty());
+
+        file.rewrite(PLATFORM_ONLY);
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("budget removal is valid");
+        assert!(!summary.budget_changed);
     }
 
     /// Both triggers share one view of what has been acted on, so the watcher

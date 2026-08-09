@@ -135,6 +135,12 @@ fn attributes(record: &UsageRecord) -> Vec<(&'static str, AnyValue)> {
     if let Some(trace_id) = &record.trace_id {
         attributes.push(("axond.trace_id", AnyValue::String(trace_id.clone().into())));
     }
+    if let Some(signer_kid) = &record.signer_kid {
+        attributes.push((
+            "axond.signer_kid",
+            AnyValue::String(signer_kid.clone().into()),
+        ));
+    }
     attributes
 }
 
@@ -162,6 +168,7 @@ mod tests {
             "axond.request_id",
             "axond.subject",
             "axond.credential_id",
+            "axond.signer_kid",
             "axond.trace_id",
             "axond.schema_version",
         ] {
@@ -174,6 +181,14 @@ mod tests {
                 .map(|(_, value)| value.clone()),
             Some(AnyValue::Int(640))
         );
+    }
+
+    #[test]
+    fn an_static_key_omits_the_signer_kid() {
+        let mut record = sample_record();
+        record.signer_kid = None;
+        let keys: Vec<&str> = attributes(&record).iter().map(|(key, _)| *key).collect();
+        assert!(!keys.contains(&"axond.signer_kid"));
     }
 
     #[test]

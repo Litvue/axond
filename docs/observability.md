@@ -64,6 +64,8 @@ metric and a usage row can never disagree.
 | `axond.usage.records_dropped` | counter | `axond.usage_sink`, `axond.drop_reason` | Records discarded rather than delaying a request. |
 | `axond.config.reloads` | counter | `axond.reload.trigger`, `axond.reload.outcome` | Reload attempts and whether they applied. |
 | `axond.config.generation` | gauge | — | `0` at boot, `+1` per applied reload. |
+| `axond.budget.capacity_denials` | counter | — | In-memory admissions denied because the ledger bound was exhausted. |
+| `axond.budget.retained_subjects` | gauge | — | In-memory ledgers retained after capacity-pressure pruning; watch against `max_subjects`. |
 
 ### What to alert on
 
@@ -75,6 +77,8 @@ metric and a usage row can never disagree.
 | Budget store down | `axond.http.server.requests{status=503}` rising | Fail-closed denial: fix the store, or the whole tenant is refused. |
 | Config drift across the fleet | `axond.config.generation` differs between replicas | A replica missed a reload and is serving stale routing or keys. |
 | Rejected reloads | `axond.config.reloads{outcome="rejected"}` > 0 | Someone edited the config into an invalid state; the old one is still serving. |
+| Budget capacity exhausted | `axond.budget.capacity_denials` > 0 | The replica is refusing unseen subjects; investigate subject churn and the in-memory bound. |
+| Budget ledger pressure | `axond.budget.retained_subjects` near configured `max_subjects` | Leading indicator that the bound is approaching; watch it before capacity denials occur. |
 | TTFT regression | `axond.request.time_to_first_token` p95 | Provider degradation shows here before total latency moves. |
 
 ## Usage records
