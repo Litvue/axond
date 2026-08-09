@@ -34,7 +34,8 @@ namespace = "platform"
 ```
 
 Use `printf %s 'operator-breakglass-value' > /run/secrets/axond-inbound-platform`.
-Exactly one of `env` and `file` is permitted.
+A trailing newline makes a file-backed static key unusable because HTTP headers
+cannot carry it. Exactly one of `env` and `file` is permitted.
 
 There is no keyless mode. A config without a static gateway key fails closed at
 boot, and a missing referenced environment variable is a fatal error.
