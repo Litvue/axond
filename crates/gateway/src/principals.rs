@@ -315,11 +315,11 @@ impl PrincipalStore for TokenVerifier {
                 },
             ));
         }
-        let namespace = claims.ns.ok_or(PrincipalStoreError::Unauthorized(
-            TokenVerificationError::MissingClaim {
+        let namespace = claims.ns.filter(|namespace| !namespace.is_empty()).ok_or(
+            PrincipalStoreError::Unauthorized(TokenVerificationError::MissingClaim {
                 claim: "ns".to_owned(),
-            },
-        ))?;
+            }),
+        )?;
         if !self.namespaces.contains(&namespace) {
             return Err(PrincipalStoreError::Forbidden(
                 TokenVerificationError::UnknownNamespace { namespace },
@@ -333,11 +333,11 @@ impl PrincipalStore for TokenVerifier {
                 },
             ));
         }
-        let subject = claims.sub.ok_or(PrincipalStoreError::Unauthorized(
-            TokenVerificationError::MissingClaim {
+        let subject = claims.sub.filter(|subject| !subject.is_empty()).ok_or(
+            PrincipalStoreError::Unauthorized(TokenVerificationError::MissingClaim {
                 claim: "sub".to_owned(),
-            },
-        ))?;
+            }),
+        )?;
         Ok(Some(InboundKey { namespace, subject }))
     }
 }
@@ -839,6 +839,19 @@ max_ttl = "15m"
             )) if claim == "ns"
         ));
 
+        let mut empty_namespace = valid_claims();
+        empty_namespace.ns = Some(String::new());
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(empty_namespace),
+                })
+                .await,
+            Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::MissingClaim { ref claim }
+            )) if claim == "ns"
+        ));
+
         let mut unpermitted_namespace = valid_claims();
         unpermitted_namespace.ns = Some("platform".to_owned());
         assert!(matches!(
@@ -850,6 +863,23 @@ max_ttl = "15m"
             Err(PrincipalStoreError::Forbidden(
                 TokenVerificationError::SignerNotPermitted { .. }
             ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn token_verifier_rejects_an_empty_subject() {
+        let verifier = token_verifier();
+        let mut empty_subject = valid_claims();
+        empty_subject.sub = Some(String::new());
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(empty_subject),
+                })
+                .await,
+            Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::MissingClaim { ref claim }
+            )) if claim == "sub"
         ));
     }
 

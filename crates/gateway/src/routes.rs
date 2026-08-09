@@ -38,7 +38,7 @@ use gateway_core::{
 };
 use gateway_transport::{AuthScheme, NativeCall, TransportError, Upstream};
 use serde_json::{Value, json};
-use tracing::{Instrument, warn};
+use tracing::{Instrument, debug, warn};
 
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, Target};
@@ -121,20 +121,18 @@ async fn authenticate(
     let principal = match snapshot.resolve_principal(&presented).await {
         Ok(principal) => principal,
         Err(PrincipalStoreError::Unauthorized(error)) => {
-            // A layer error is terminal by design; it must not fall through to
-            // another authority just because the owning layer is unavailable.
-            warn!(
+            debug!(
                 store,
                 error = %error,
-                "principal store resolution failed"
+                "token rejected during principal resolution"
             );
             return Err(GatewayError::TokenUnauthorized(error));
         }
         Err(PrincipalStoreError::Forbidden(error)) => {
-            warn!(
+            debug!(
                 store,
                 error = %error,
-                "principal store resolution failed"
+                "token rejected during principal resolution"
             );
             return Err(GatewayError::TokenForbidden(error));
         }
