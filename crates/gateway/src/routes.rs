@@ -24,10 +24,12 @@
 //! an overall wall-clock budget. Streaming can fail over only while opening the
 //! upstream; once bytes flow, a mid-stream failure is terminal.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
+use axum::extract::{Extension, Request, State};
 use axum::http::HeaderMap;
+use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
@@ -54,7 +56,14 @@ pub fn router(state: AppState) -> Router {
     route_specs()
         .into_iter()
         .fold(Router::new(), |router, spec| {
-            router.route(spec.path, (spec.router)())
+            let route = (spec.router)();
+            let route = match spec.auth {
+                AuthPosture::LivenessProbe => route,
+                AuthPosture::Authenticated => {
+                    route.layer(from_fn_with_state(state.clone(), authenticate_middleware))
+                }
+            };
+            router.route(spec.path, route)
         })
         .with_state(state)
 }
@@ -65,17 +74,8 @@ enum AuthPosture {
     Authenticated,
 }
 
-#[derive(Clone, Copy)]
-enum RouteMethod {
-    Get,
-    Post,
-}
-
 struct RouteSpec {
     path: &'static str,
-    #[cfg_attr(not(test), allow(dead_code))]
-    method: RouteMethod,
-    #[cfg_attr(not(test), allow(dead_code))]
     auth: AuthPosture,
     router: fn() -> MethodRouter<AppState>,
 }
@@ -84,43 +84,36 @@ fn route_specs() -> [RouteSpec; 7] {
     [
         RouteSpec {
             path: "/healthz",
-            method: RouteMethod::Get,
             auth: AuthPosture::LivenessProbe,
             router: || get(healthz),
         },
         RouteSpec {
             path: "/readyz",
-            method: RouteMethod::Get,
             auth: AuthPosture::LivenessProbe,
             router: || get(readyz),
         },
         RouteSpec {
             path: "/v1/models",
-            method: RouteMethod::Get,
             auth: AuthPosture::Authenticated,
             router: || get(list_models),
         },
         RouteSpec {
             path: "/v1/chat/completions",
-            method: RouteMethod::Post,
             auth: AuthPosture::Authenticated,
             router: || post(chat_completions),
         },
         RouteSpec {
             path: "/v1/messages",
-            method: RouteMethod::Post,
             auth: AuthPosture::Authenticated,
             router: || post(native_messages),
         },
         RouteSpec {
             path: "/v1/embeddings",
-            method: RouteMethod::Post,
             auth: AuthPosture::Authenticated,
             router: || post(embeddings),
         },
         RouteSpec {
             path: "/v1/responses",
-            method: RouteMethod::Post,
             auth: AuthPosture::Authenticated,
             router: || post(responses),
         },
@@ -143,11 +136,9 @@ async fn readyz() -> &'static str {
 /// caller's namespace (its own, or the platform's when fallback is allowed).
 /// So a BYOK tenant cannot enumerate aliases it is not entitled to.
 async fn list_models(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
+    Extension(caller): Extension<InboundKey>,
 ) -> Result<Json<Value>, GatewayError> {
-    let snapshot = state.config();
-    let caller = authenticate(&snapshot, &headers).await?;
     let cfg = &snapshot.config;
     let data: Vec<Value> = cfg
         .model
@@ -213,6 +204,19 @@ async fn authenticate(
         }
     };
     principal.ok_or(GatewayError::Unauthorized)
+}
+
+async fn authenticate_middleware(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, GatewayError> {
+    let snapshot = state.config();
+    let caller = authenticate(&snapshot, &headers).await?;
+    request.extensions_mut().insert(snapshot);
+    request.extensions_mut().insert(caller);
+    Ok(next.run(request).await)
 }
 
 /// The wire shape a route speaks, which is the only thing that differs between
@@ -364,9 +368,19 @@ impl Wire {
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
+    Extension(caller): Extension<InboundKey>,
     Json(body): Json<Value>,
 ) -> Result<Response, GatewayError> {
-    serve(state, headers, body, Route::ChatCompletions).await
+    serve(
+        state,
+        headers,
+        body,
+        Route::ChatCompletions,
+        Extension(snapshot),
+        Extension(caller),
+    )
+    .await
 }
 
 /// Anthropic-native Messages. The caller's body already speaks the target's
@@ -376,38 +390,53 @@ async fn chat_completions(
 async fn native_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
+    Extension(caller): Extension<InboundKey>,
     Json(body): Json<Value>,
 ) -> Result<Response, GatewayError> {
-    serve(state, headers, body, Route::NativeMessages).await
+    serve(
+        state,
+        headers,
+        body,
+        Route::NativeMessages,
+        Extension(snapshot),
+        Extension(caller),
+    )
+    .await
 }
 
 async fn embeddings(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
+    Extension(caller): Extension<InboundKey>,
     Json(body): Json<Value>,
 ) -> Result<Response, GatewayError> {
-    serve(state, headers, body, Route::Embeddings).await
+    serve(
+        state,
+        headers,
+        body,
+        Route::Embeddings,
+        Extension(snapshot),
+        Extension(caller),
+    )
+    .await
 }
 
 /// Deferred past beta (ADR 0012): the OpenAI Responses API is a stateful
 /// surface, and serving it honestly needs more than passthrough. The route
 /// exists and says so, because a missing route is indistinguishable from a
 /// misconfigured `base_url`.
-async fn responses(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, GatewayError> {
-    let snapshot = state.config();
-    authenticate(&snapshot, &headers).await?;
+async fn responses() -> Result<Json<Value>, GatewayError> {
     Err(GatewayError::NotImplemented(
         "the OpenAI Responses API (`/v1/responses`), deferred past beta by ADR 0012 \
          in favour of `/v1/chat/completions`,",
     ))
 }
 
-/// The one request path every route shares: authenticate against a single
-/// config snapshot, resolve the alias, hold a budget estimate, dispatch through
-/// the failover walk, then settle the hold and record exactly one usage record.
+/// The one request path every route shares: use the authenticated request
+/// context, resolve the alias, hold a budget estimate, dispatch through the
+/// failover walk, then settle the hold and record exactly one usage record.
 /// Routes differ only in the wire they speak — where the body goes upstream and
 /// how usage is read back out (see [`Route`]).
 async fn serve(
@@ -415,11 +444,9 @@ async fn serve(
     headers: HeaderMap,
     body: Value,
     route: Route,
+    Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
+    Extension(caller): Extension<InboundKey>,
 ) -> Result<Response, GatewayError> {
-    // One snapshot for the whole request: a reload that lands mid-request
-    // cannot change the alias, credential, or circuit this request resolved.
-    let snapshot = state.config();
-    let caller = authenticate(&snapshot, &headers).await?;
     let cfg = &snapshot.config;
 
     let streamed = route.streamable() && body.get("stream").and_then(Value::as_bool) == Some(true);
@@ -1297,23 +1324,26 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             .into_iter()
             .filter(|spec| spec.auth == AuthPosture::Authenticated)
         {
-            let method = match spec.method {
-                RouteMethod::Get => axum::http::Method::GET,
-                RouteMethod::Post => axum::http::Method::POST,
-            };
-            let request = Request::builder()
-                .method(method)
-                .uri(spec.path)
-                .header("content-type", "application/json")
-                .body(Body::from("{}"))
-                .unwrap();
-            let response = router(test_state()).oneshot(request).await.unwrap();
-            assert_eq!(
-                response.status(),
-                StatusCode::UNAUTHORIZED,
-                "{} must authenticate before handling the request",
-                spec.path
-            );
+            let mut rejected = false;
+            for method in [axum::http::Method::GET, axum::http::Method::POST] {
+                let request = Request::builder()
+                    .method(method)
+                    .uri(spec.path)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap();
+                let response = router(test_state()).oneshot(request).await.unwrap();
+                if response.status() != StatusCode::METHOD_NOT_ALLOWED {
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::UNAUTHORIZED,
+                        "{} must authenticate before handling the request",
+                        spec.path
+                    );
+                    rejected = true;
+                }
+            }
+            assert!(rejected, "{0} must handle GET or POST", spec.path);
         }
     }
 
