@@ -1,5 +1,88 @@
 # Changelog
 
+## [0.1.2](https://github.com/Litvue/axond/compare/v0.1.1...v0.1.2) (2026-08-09)
+
+
+### Features
+
+* add hermetic tier 0 gate ([ecb965a](https://github.com/Litvue/axond/commit/ecb965ab7e098524faa982d4ce03196194f5ceea))
+* **auth:** configure and verify minted tokens ([bfed409](https://github.com/Litvue/axond/commit/bfed40905e19245d6d937e2a2dfb3a3d72c0cac1))
+* **auth:** read gateway key material from files ([9b8aad2](https://github.com/Litvue/axond/commit/9b8aad2493d6faab48cdc37492adb25e99dabfe7))
+* **auth:** read gateway key material from files ([16e06a9](https://github.com/Litvue/axond/commit/16e06a9295c16477df293895fc8c100dbce819ec))
+* **budget:** bound in-memory ledger retention ([8f54c71](https://github.com/Litvue/axond/commit/8f54c71ce658f75950f1290d5fc9977a9f3b6d0e))
+* **cli:** add offline mint and keygen commands ([a6be07f](https://github.com/Litvue/axond/commit/a6be07fbf96bab69dce7daf51292e74f64bf2174))
+* **cli:** add offline mint and keygen commands ([adb88d4](https://github.com/Litvue/axond/commit/adb88d4b47e80e97148ee520af827a652a7b1865))
+* **usage:** attribute inbound signer kid ([9385478](https://github.com/Litvue/axond/commit/938547838009557dec24c9c5e6a322d21e5c34a4))
+
+
+### Bug Fixes
+
+* **auth:** enforce token lifetime and reload diffs ([da9cc62](https://github.com/Litvue/axond/commit/da9cc6266026021335dd3247784f344be447a556))
+* authenticate responses route ([fc2026b](https://github.com/Litvue/axond/commit/fc2026be37b3b7038611462e7010a325090a9be3))
+* **auth:** fingerprint verifier material after one read ([106296a](https://github.com/Litvue/axond/commit/106296a1c1cc15d809ea5c5cc720d28982731c81))
+* **auth:** harden token rejection handling ([216fb35](https://github.com/Litvue/axond/commit/216fb3508a7ed06d1cb57d14e08fd9003177df2f))
+* **auth:** harden token verifier configuration ([ec0aaed](https://github.com/Litvue/axond/commit/ec0aaed4fba75db18836d357a908a94e0f179b0f))
+* **auth:** harden verifier lifetime and secret policy ([d92b891](https://github.com/Litvue/axond/commit/d92b891a239ea4fa96454f91e4c573ff4d9c5172))
+* **auth:** reject overlapping principal shapes ([49d97d6](https://github.com/Litvue/axond/commit/49d97d68d1cd241a29e02761c25a1c3e751be257))
+* **auth:** report verifier definition reload changes ([a52e2a0](https://github.com/Litvue/axond/commit/a52e2a0a0c80ce5f85cc6592a78c8a9e7677bc62))
+* **auth:** salt reload fingerprints ([a744849](https://github.com/Litvue/axond/commit/a744849bb83bc3713dbdf416152dc8b50b1bdfce))
+* **auth:** tolerate whitespace around ed25519 keys ([dd4048b](https://github.com/Litvue/axond/commit/dd4048bf0a15f3f634d8cc6a41e5f074844673c5))
+* bound tier 0 probe failures ([15ffdea](https://github.com/Litvue/axond/commit/15ffdea40ff7701769772da825f51a4eaa7addfb))
+* bound tier 0 readiness probes ([d5c7c37](https://github.com/Litvue/axond/commit/d5c7c371ed46b734db573ad95b8a41597842fbd3))
+* **budget:** clarify unenforceable cap logs ([e8d429c](https://github.com/Litvue/axond/commit/e8d429c759897ade428dc77f9e5545011c57c221))
+* **budget:** honor unavailable policy at capacity ([047ce98](https://github.com/Litvue/axond/commit/047ce985512b4f920b240c27483b972eab411167))
+* **budget:** reclaim expired in-memory holds ([eb62995](https://github.com/Litvue/axond/commit/eb629953460ff9679c2c0cb7c1691382fe32bda5))
+* **budget:** record late settlement spend ([ce14be7](https://github.com/Litvue/axond/commit/ce14be774f7361604f9531cabaa7d6c5596f7308))
+* **cli:** clarify key permissions and config hints ([f3df44c](https://github.com/Litvue/axond/commit/f3df44cd6b05d74f0948597aa2a8ace7d124e7b4))
+* **cli:** protect generated private key buffers ([1d5ea46](https://github.com/Litvue/axond/commit/1d5ea46040e5622b787c9eab5fca7dc0b4990df8))
+* **cli:** reject zero token lifetimes ([d8bb0a8](https://github.com/Litvue/axond/commit/d8bb0a8624a95d0022e4fc58c7ccaf1c65fbf3b5))
+* **cli:** tighten config-backed minting ([9ffbaa6](https://github.com/Litvue/axond/commit/9ffbaa6a536db565d1041764f961d802a350c67a))
+* **cli:** validate configured mint audiences ([e5864b6](https://github.com/Litvue/axond/commit/e5864b630a7f7e0abc7de54245adbbb305cae9f6))
+* **cli:** validate keygen identifiers ([86449ef](https://github.com/Litvue/axond/commit/86449ef029303e1c9eb0c4ddbef1ba61346fe322))
+* **config:** ignore blank alternate key sources ([e59cc0d](https://github.com/Litvue/axond/commit/e59cc0dcc8808f636d3ace559a9e318076b64b26))
+* **config:** name budget idle ttl units ([c3d963e](https://github.com/Litvue/axond/commit/c3d963ed493800c0a2039bcf6648a68129a6c520))
+* enforce route authentication posture ([af7e7a0](https://github.com/Litvue/axond/commit/af7e7a041acc993823b8766a0793cc3dfd4ca59b))
+* **gateway:** authenticate /v1/responses and enforce route auth posture ([e0e89c6](https://github.com/Litvue/axond/commit/e0e89c687e625712ef8cbb2119f27b0cc0e2824b))
+* harden tier 0 listener checks ([89e889c](https://github.com/Litvue/axond/commit/89e889ca35da30e9b7c489ae96e34d66231b376c))
+* **metrics:** count only denied budget capacity ([b0fc3a5](https://github.com/Litvue/axond/commit/b0fc3a5c8bb43643882ca64a4ef0c130321fad4d))
+* preserve tier 0 gate diagnostics ([a6ba2b9](https://github.com/Litvue/axond/commit/a6ba2b9166c05af36b56511fb55cbc33012af6dc))
+* **reload:** exclude budget changes from applied delta ([9766906](https://github.com/Litvue/axond/commit/97669064a10263d58bc8b61070919170e8d183a3))
+
+
+### Refactors
+
+* **auth:** drop the orphaned static-key accessors ([7880e8a](https://github.com/Litvue/axond/commit/7880e8ae4a4aad6fcb245d6cc3ee62ef4b590dc0))
+* **auth:** resolve inbound identity through a PrincipalStore seam ([23e8b34](https://github.com/Litvue/axond/commit/23e8b34721b71ca96c0338ea4001a8fd1b8539de))
+* clarify route authentication seams ([a6e8d1a](https://github.com/Litvue/axond/commit/a6e8d1a77e23bdb939d9aecfa897f8e8d7bdef20))
+
+
+### Documentation
+
+* add minted identity operator guide ([5fe1605](https://github.com/Litvue/axond/commit/5fe1605a1e3a96b20dcb3c42ce5e3424ca0e7db7))
+* **adr:** accept 0016 and 0017 ([9240b27](https://github.com/Litvue/axond/commit/9240b2703ec4e379140357d55fdb390f85dd0659))
+* **adr:** clarify principal store failure semantics ([9621618](https://github.com/Litvue/axond/commit/962161861e44c8464502ff69095d2e80d0d5bc7b))
+* **adr:** define minted identity and state tiers ([0e09acb](https://github.com/Litvue/axond/commit/0e09acbef72eab44ddf69ee0d748421c8fd79c28))
+* **adr:** define principal shape ownership ([4de618f](https://github.com/Litvue/axond/commit/4de618f3300963c12ae3ac3c33613eebc38ad96e))
+* **adr:** minted inbound identity and explicit state tiers ([7409ad2](https://github.com/Litvue/axond/commit/7409ad20f3d2c2ed5a89bdc5156a0cf1a19c0390))
+* **auth:** clarify static file key newline behavior ([29f7e2c](https://github.com/Litvue/axond/commit/29f7e2c60f94efcef2cd1e1be7bd1fa335ee25cb))
+* **auth:** minted-token operator guide and rotation runbook ([6b94a3d](https://github.com/Litvue/axond/commit/6b94a3d9d00ba057e4fccef0e0b91bed2b0785fb))
+* **auth:** note verifier env vars must precede boot ([6136e32](https://github.com/Litvue/axond/commit/6136e32b11b0dde2113ac6551ad67c961b5e14b7))
+* **budget:** document in-memory ledger retention ([09e46d1](https://github.com/Litvue/axond/commit/09e46d180768b02569edbbd8b6413eb1263291e6))
+* correct minted identity rotation runbook ([4fbdfc8](https://github.com/Litvue/axond/commit/4fbdfc86d394a1cd3c7d17d82cdd3a9ead8d09af))
+* document budget reload and metrics ([6b6fccc](https://github.com/Litvue/axond/commit/6b6fccc11f2e66bf94ea77ef3669e7e5f5e7f8c5))
+* document minted identity configuration ([f52445c](https://github.com/Litvue/axond/commit/f52445c558d60c7cd992d5d236e4915556d03a26))
+* fix hs256 guide setup ([3f8b8cc](https://github.com/Litvue/axond/commit/3f8b8cc90b42f12c7b23f840f80a6ca6fabeb7c2))
+* record budget reload semantics ([aac34c6](https://github.com/Litvue/axond/commit/aac34c656736b08b4c9007a69f32bf4604513257))
+* **skill:** record tier 0 gate and musl prerequisites ([e3a26b3](https://github.com/Litvue/axond/commit/e3a26b30897c251b20b30cacd2b2d14d45e8c40b))
+* **skills:** add minted-identity testing recipe to testing-axond ([618b68c](https://github.com/Litvue/axond/commit/618b68c39b19a881aae5abc87933cc58a51be9b8))
+* **skills:** fix no-config minted token recipe ([d171066](https://github.com/Litvue/axond/commit/d1710662625cc4295e0c8910776321bcfff7d21d))
+* **usage:** explain additive postgres migrations ([d961e3c](https://github.com/Litvue/axond/commit/d961e3ca6e19b6d06a7d63d5875f03564aeb21d1))
+
+
+### Continuous Integration
+
+* enforce tier 0 with a hermetic boot-and-serve gate ([30da901](https://github.com/Litvue/axond/commit/30da901e26033867d51c4b903e935d42ad031567))
+
 ## [0.1.1](https://github.com/Litvue/axond/compare/v0.1.0...v0.1.1) (2026-08-05)
 
 
