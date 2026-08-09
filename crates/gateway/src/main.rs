@@ -13,6 +13,7 @@ mod budget;
 mod config;
 mod credentials;
 mod error;
+mod mint;
 mod principals;
 mod reload;
 mod routes;
@@ -25,12 +26,118 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use budget::BudgetStore;
+use clap::{Arg, ArgAction, Command};
 use config::Config;
 use state::AppState;
 use usage::UsageFanout;
 
+fn main() -> anyhow::Result<()> {
+    let matches = cli().get_matches();
+    match matches.subcommand() {
+        Some(("mint", args)) => mint::run(args),
+        Some(("keygen", args)) => mint::keygen(args),
+        None => serve(),
+        _ => unreachable!("clap validates subcommands"),
+    }
+}
+
+fn cli() -> Command {
+    Command::new("axond")
+        .about("A stateless, self-hosted AI gateway")
+        .subcommand_required(false)
+        .arg_required_else_help(false)
+        .subcommand(
+            Command::new("mint")
+                .about("Mint an offline inbound identity token")
+                .arg(
+                    Arg::new("kid")
+                        .long("kid")
+                        .required(true)
+                        .help("JWS key identifier"),
+                )
+                .arg(
+                    Arg::new("alg")
+                        .long("alg")
+                        .value_parser(["EdDSA", "HS256"])
+                        .help("Signing algorithm; inferred from matching config verifier"),
+                )
+                .arg(
+                    Arg::new("key-env")
+                        .long("key-env")
+                        .required(true)
+                        .help("Environment variable containing signing key material"),
+                )
+                .arg(
+                    Arg::new("namespace")
+                        .long("namespace")
+                        .required(true)
+                        .help("Namespace claim"),
+                )
+                .arg(
+                    Arg::new("subject")
+                        .long("subject")
+                        .required(true)
+                        .help("Subject claim"),
+                )
+                .arg(
+                    Arg::new("ttl")
+                        .long("ttl")
+                        .required(true)
+                        .help("Token lifetime, such as 15m or 1h"),
+                )
+                .arg(
+                    Arg::new("audience")
+                        .long("audience")
+                        .visible_alias("aud")
+                        .help("Audience claim; defaults from a matching verifier config"),
+                )
+                .arg(
+                    Arg::new("config")
+                        .long("config")
+                        .value_name("PATH")
+                        .help("Optional config used to infer verifier settings and max_ttl"),
+                ),
+        )
+        .subcommand(
+            Command::new("keygen")
+                .about("Generate an Ed25519 verifier keypair")
+                .arg(
+                    Arg::new("private-key")
+                        .long("private-key")
+                        .required(true)
+                        .value_name("PATH")
+                        .help("New file for base64 PKCS#8 private key material"),
+                )
+                .arg(
+                    Arg::new("kid")
+                        .long("kid")
+                        .required(true)
+                        .help("JWS key identifier"),
+                )
+                .arg(
+                    Arg::new("env")
+                        .long("env")
+                        .required(true)
+                        .help("Environment variable for the public key"),
+                )
+                .arg(
+                    Arg::new("namespace")
+                        .long("namespace")
+                        .required(true)
+                        .action(ArgAction::Append)
+                        .help("Namespace permitted for this verifier; repeatable"),
+                )
+                .arg(
+                    Arg::new("max-ttl")
+                        .long("max-ttl")
+                        .default_value("15m")
+                        .help("max_ttl shown in the verifier snippet"),
+                ),
+        )
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn serve() -> anyhow::Result<()> {
     // Held until shutdown so the exporters flush; a no-op when telemetry is off.
     let _telemetry = telemetry::init().map_err(|e| anyhow::anyhow!("telemetry: {e}"))?;
 

@@ -101,6 +101,25 @@ from a signing key and claims. The gateway only verifies it; no issuance record,
 store, or request-path dependency is added. This is the default that preserves
 ADR 0002.
 
+The minter reads signing material from an environment variable named by the
+command, never from argv. It emits only the `axt1.` token on stdout; diagnostics
+go to stderr. `axond keygen` writes a base64 PKCS#8 Ed25519 private key to a new
+`0600` file and prints only the base64 raw public key plus a ready-to-paste
+verifier configuration snippet. The public key is therefore safe to install on
+verification-only replicas while the private key remains with the minter.
+
+Minting always enforces the 24-hour policy ceiling. When a matching verifier is
+available through `--config` or `AXOND_CONFIG`, minting additionally enforces
+that verifier's configured `max_ttl` and may default its audience. Without
+that config, the minter cannot know the verifier-specific bound: a token may
+mint successfully against the policy ceiling and then be rejected by the
+gateway if it exceeds the configured `max_ttl`.
+
+The current minter emits only claims the verifier enforces. It deliberately
+does not emit `scope`, `aliases`, or `max_request_microdollars` until the
+corresponding authorization controls exist; an unenforced narrowing claim
+would create a misleading credential.
+
 `POST /v1/tokens` is an opt-in alternative for deployments where callers cannot
 run a minter. It is authenticated by a static gateway key authorized to mint
 (or by a separately configured minting key), accepts only narrowing claims, and

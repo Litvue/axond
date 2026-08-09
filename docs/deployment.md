@@ -84,6 +84,29 @@ export GW_INBOUND_PLATFORM_KEY=...
 
 `AXOND_CONFIG` defaults to `axond.toml` in the working directory.
 
+The same binary has offline-only `keygen` and `mint` subcommands. They dispatch
+before telemetry or gateway configuration is loaded, so they do not need a
+serving config unless `mint` is given `--config` (or `AXOND_CONFIG` is set) to
+infer a matching verifier's algorithm, audience, and `max_ttl`. Signing
+material is always read from the environment. `keygen` writes the base64
+PKCS#8 private key to a new `0600` file and prints only the base64 raw public
+key plus a verifier snippet; `mint` prints only the `axt1.` token to stdout.
+
+```bash
+axond keygen --private-key ./acme-signing.key \
+  --kid acme-2026-08 --env GW_VERIFY_ACME_2026_08 \
+  --namespace acme --max-ttl 15m
+export GW_SIGN_ACME="$(cat ./acme-signing.key)"
+axond mint --kid acme-2026-08 --alg EdDSA --key-env GW_SIGN_ACME \
+  --namespace acme --subject agent-1 --ttl 10m \
+  --audience acme-production
+```
+
+`mint` always enforces the 24-hour policy ceiling. Without a matching verifier
+in the optional config, it cannot know that verifier's configured `max_ttl`;
+such a token may be minted and is rejected at gateway verification if it
+exceeds the configured bound.
+
 Under systemd, put the secrets in an `EnvironmentFile` rather than the unit, and
 keep `Restart=on-failure`: a boot failure means the config or the environment is
 wrong, and restarting will (correctly) keep failing until it is fixed.
