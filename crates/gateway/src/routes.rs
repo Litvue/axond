@@ -68,18 +68,24 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Whether a route is one of the two unauthenticated liveness probes or must
+/// pass inbound authentication before its handler can run.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AuthPosture {
     LivenessProbe,
     Authenticated,
 }
 
+/// A route's complete registration: adding a route requires declaring its
+/// authentication posture here rather than silently omitting the layer.
 struct RouteSpec {
     path: &'static str,
     auth: AuthPosture,
     router: fn() -> MethodRouter<AppState>,
 }
 
+/// The single route table: its posture is the source of truth for registration
+/// and for the sweep test that keeps the unauthenticated set closed.
 fn route_specs() -> [RouteSpec; 7] {
     [
         RouteSpec {
@@ -206,6 +212,10 @@ async fn authenticate(
     principal.ok_or(GatewayError::Unauthorized)
 }
 
+/// Authenticate once per request, before handler extractors, and carry the
+/// resolved snapshot and caller into the handler. A reload landing mid-request
+/// therefore cannot change what this request resolved; failures return `401`
+/// before any typed handler error, including `/v1/responses`'s `501`.
 async fn authenticate_middleware(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -377,8 +387,8 @@ async fn chat_completions(
         headers,
         body,
         Route::ChatCompletions,
-        Extension(snapshot),
-        Extension(caller),
+        snapshot,
+        caller,
     )
     .await
 }
@@ -399,8 +409,8 @@ async fn native_messages(
         headers,
         body,
         Route::NativeMessages,
-        Extension(snapshot),
-        Extension(caller),
+        snapshot,
+        caller,
     )
     .await
 }
@@ -412,21 +422,13 @@ async fn embeddings(
     Extension(caller): Extension<InboundKey>,
     Json(body): Json<Value>,
 ) -> Result<Response, GatewayError> {
-    serve(
-        state,
-        headers,
-        body,
-        Route::Embeddings,
-        Extension(snapshot),
-        Extension(caller),
-    )
-    .await
+    serve(state, headers, body, Route::Embeddings, snapshot, caller).await
 }
 
 /// Deferred past beta (ADR 0012): the OpenAI Responses API is a stateful
-/// surface, and serving it honestly needs more than passthrough. The route
-/// exists and says so, because a missing route is indistinguishable from a
-/// misconfigured `base_url`.
+/// surface, and serving it honestly needs more than passthrough. Its route
+/// layer authenticates callers before this handler returns the typed `501`,
+/// because a missing route is indistinguishable from a misconfigured `base_url`.
 async fn responses() -> Result<Json<Value>, GatewayError> {
     Err(GatewayError::NotImplemented(
         "the OpenAI Responses API (`/v1/responses`), deferred past beta by ADR 0012 \
@@ -444,8 +446,8 @@ async fn serve(
     headers: HeaderMap,
     body: Value,
     route: Route,
-    Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
-    Extension(caller): Extension<InboundKey>,
+    snapshot: Arc<ConfigSnapshot>,
+    caller: InboundKey,
 ) -> Result<Response, GatewayError> {
     let cfg = &snapshot.config;
 
