@@ -156,7 +156,7 @@ A configured sink connects **at boot**, so a bad DSN refuses to start rather
 than dropping records later. Afterwards the sink is off the request path and a
 stalled destination drops with a count rather than delaying a request.
 
-## `[budget]` — opt-in, datastore for `redis` / `postgres`
+## `[budget]` — opt-in budget enforcement
 
 Omit the section for the default: no cap, no datastore
 ([ADR 0010](./adr/0010-shared-budget-backends-and-charging-policy.md)). The cap
@@ -172,6 +172,8 @@ is per `(namespace, subject)` — that is, per gateway key — in micro-dollars.
 | `create_table` | bool | `false` | `postgres` | Apply the shipped DDL at boot. |
 | `key_prefix` | string | `axond:budget` | `redis` | Key namespace for budget state. |
 | `reservation_ttl_seconds` | integer | `300` | every backend but `none` | How long a hold survives a replica that died mid-request. Should exceed the longest expected request. Zero is rejected. |
+| `idle_ttl_seconds` | integer | `3600` | `in-memory` | Idle time before an unheld ledger may be pruned when `max_subjects` is reached. In-memory state is per-replica and approximate; zero is rejected. |
+| `max_subjects` | integer | `10000` | `in-memory` | Maximum retained `(namespace, subject)` ledgers. When full, unheld idle ledgers are pruned lazily; zero is rejected. Use Redis for exact caps. |
 
 Enforcement holds a priced estimate before dispatch and settles it against
 measured spend afterwards, so concurrent requests cannot collectively overshoot.
