@@ -262,8 +262,10 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # dsn_env = "AXOND_USAGE_POSTGRES_DSN"
 # # Destination table; `schema.table` is allowed. Defaults to `axond_usage`.
 # table = "axond_usage"
-# # Apply ops/postgres/usage_v1.sql at boot. Off by default — most deployments
-# # give the gateway's role no DDL rights and sequence migrations themselves.
+# # Apply ops/postgres/usage_v1.sql and every additive
+# # usage_v1_<sequence>_<name>.sql migration in filename order at boot. Off by
+# # default — most deployments give the gateway's role no DDL rights and
+# # sequence migrations themselves.
 # create_table = false
 # # Records buffered before the sink starts dropping. Trades memory for the
 # # length of a destination stall it can absorb.

@@ -219,6 +219,11 @@ actually want:
 | Usage in your trace backend | `[[usage_sink]] kind = "otlp"` | Requires `OTEL_EXPORTER_OTLP_ENDPOINT`. |
 | A spend cap across replicas | `[budget] backend = "redis"` or `"postgres"` | Redis, or the [`budget_v1.sql`](../ops/postgres/budget_v1.sql) tables. |
 
+For upgrades, apply each additive `usage_v1_<sequence>_<name>.sql` migration in
+filename order before deploying a gateway that writes its new column. Otherwise
+the sink fails those batches and drops usage rows, surfaced as `sink_error` on
+the dropped-records metric, until the migrations are applied.
+
 A `[budget]` backend of `in-memory` enforces the cap **per replica**, so a fleet
 of N replicas admits up to N caps. Use a shared backend for a real fleet-wide
 cap.
