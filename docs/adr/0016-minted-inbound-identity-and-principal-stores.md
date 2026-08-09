@@ -44,7 +44,7 @@ The claim set is:
 | `nbf` | Optional not-before time, with a small fixed skew allowance. |
 | `aud` | Deployment audience, preventing cross-environment replay. |
 | `kid` | Verification-key identifier in the JWS header, supporting overlap during rotation. |
-| `jti` | Required so an opt-in denylist remains possible. |
+| `jti` | Mandatory at every tier, including Tier 0 where no denylist is configured. |
 | `scope` | Optional route capabilities: `chat`, `messages`, `embeddings`, and `models`. |
 | `aliases` | Optional alias allowlist/globs, intersected with the namespace catalogue. |
 | `max_request_microdollars` | Optional per-request ceiling, checked against the existing estimate. |
@@ -122,7 +122,11 @@ ladder is:
    with fail-closed behavior when configured storage is unavailable.
 
 The first three are coarse but stateless. The fourth is the deliberate
-stateful exception for requirements that demand precise revocation.
+stateful exception for requirements that demand precise revocation. `jti` is
+mandatory even at Tier 0, where no denylist exists; this unconditional contract
+is what keeps the fourth rung usable when a deployment later moves to the
+stateful tiers defined by ADR 0017. If `jti` were optional, enabling a denylist
+would silently leave already-issued tokens without revocable identifiers.
 
 ### PrincipalStore seam
 
@@ -150,20 +154,25 @@ gateway-key behavior. `TokenVerifier` handles `axt1.` credentials. Future
 `PostgresPrincipals` or `RedisPrincipals` implementations may add hashed
 credentials, revocation, and self-serve caller lifecycle.
 
-**Principal stores are layered and resolve first-match-wins by credential
-prefix.** A chain dispatches static config keys, minted tokens, and future
-store-backed credentials without probing unrelated schemes. Fall-through
-happens only on no match: if two layers claim the same credential shape, layer
-order decides, and a definite "not found" from an earlier layer may continue to
-the next. A layer error is terminal for that credential; there is no
-fall-through on failure. A credential that an unavailable store would have
-resolved is rejected rather than silently resolved by another layer, because
-store failure must never change which authority authorized a caller.
+**Each principal layer declares the credential shapes it owns, and shapes have
+one owner.** `TokenVerifier` owns `axt1.` credentials; a store-backed layer
+owns credentials such as `axk_<key_id>_`. Two layers may not declare the same
+shape, and a config that attempts to do so is rejected at boot, so ordering
+never decides authority.
 
-The config layer is always present as the operator breakglass path. Other
-callers — those presenting config-owned static keys or minted tokens — remain
-unaffected by a store outage because their resolution never touches that
-store.
+A credential matching an owned shape is resolved exclusively by that owner.
+Both no-match and error are terminal for that credential; there is no
+continuation to another layer in either case. A credential that an unavailable
+store would have resolved is rejected rather than silently resolved by another
+authority, because nothing about a store's state may change which authority
+authorized a caller.
+
+The only routing to `ConfigPrincipals` is a credential matching no declared
+shape. It then gets today's constant-time table scan over the static keys.
+This is shape-based routing, not ordered probing, and it keeps the operator
+breakglass path working. Other callers — those presenting credentials owned by
+unaffected layers — remain unaffected by a store outage because their
+resolution never touches that store.
 
 Any store-backed implementation must satisfy three request-path requirements:
 
@@ -172,8 +181,8 @@ Any store-backed implementation must satisfy three request-path requirements:
    negative TTLs remain short so new credentials and revocations do not remain
    hidden.
 2. Use a bounded timeout and fail closed for that credential when its configured
-   store is unavailable. This is not a fall-through to `ConfigPrincipals` or
-   any other layer; only a no-match result may continue through the chain.
+   store is unavailable. Failure is terminal; there is no continuation to
+   `ConfigPrincipals` or any other layer.
 3. Store `(key_id, hash)`, never plaintext key material. A credential such as
    `axk_<key_id>_<secret>` is indexed by `key_id` and verified against the
    stored hash.
