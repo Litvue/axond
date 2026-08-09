@@ -192,6 +192,7 @@ pub struct ReloadSummary {
     pub credentials: Delta,
     pub gateway_keys: Delta,
     pub gateway_verifiers: Delta,
+    pub gateway_token_audience: Delta,
     /// `[server] bind` differs from what the process bound at startup.
     pub bind_changed: bool,
     /// `[[usage_sink]]` differs from the connected sinks.
@@ -203,6 +204,7 @@ pub struct ReloadSummary {
 pub struct Delta {
     pub added: Vec<String>,
     pub removed: Vec<String>,
+    pub changed: Vec<String>,
 }
 
 impl Delta {
@@ -212,11 +214,12 @@ impl Delta {
         Self {
             added: after.difference(&before).cloned().collect(),
             removed: before.difference(&after).cloned().collect(),
+            changed: Vec::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty()
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
     }
 }
 
@@ -230,7 +233,11 @@ impl std::fmt::Display for Delta {
             "+[{}] -[{}]",
             self.added.join(","),
             self.removed.join(",")
-        )
+        )?;
+        if !self.changed.is_empty() {
+            write!(f, " ~[{}]", self.changed.join(","))?;
+        }
+        Ok(())
     }
 }
 
@@ -260,6 +267,17 @@ impl ReloadSummary {
             gateway_verifiers: Delta::between(
                 before.gateway_verifier.iter().map(|v| v.kid.clone()),
                 after.gateway_verifier.iter().map(|v| v.kid.clone()),
+            )
+            .with_changed(verifier_definition_changes(before, after)),
+            gateway_token_audience: Delta::between(
+                before
+                    .gateway_token
+                    .iter()
+                    .map(|token| token.audience.clone()),
+                after
+                    .gateway_token
+                    .iter()
+                    .map(|token| token.audience.clone()),
             ),
             bind_changed: boot.bind != after.server.bind,
             usage_sinks_changed: boot.usage_sink != after.usage_sink,
@@ -274,6 +292,7 @@ impl ReloadSummary {
             && self.credentials.is_empty()
             && self.gateway_keys.is_empty()
             && self.gateway_verifiers.is_empty()
+            && self.gateway_token_audience.is_empty()
     }
 
     fn log_applied(&self, trigger: &'static str, path: &str) {
@@ -286,6 +305,7 @@ impl ReloadSummary {
             credentials = %self.credentials,
             gateway_keys = %self.gateway_keys,
             gateway_verifiers = %self.gateway_verifiers,
+            gateway_token_audience = %self.gateway_token_audience,
             changed = !self.is_empty(),
             "config reloaded"
         );
@@ -305,6 +325,40 @@ impl ReloadSummary {
 /// `namespace/provider/label` — the pool member a credential entry declares.
 fn credential_key(c: &crate::config::Credential) -> String {
     format!("{}/{}/{}", c.namespace, c.provider, c.label())
+}
+
+impl Delta {
+    fn with_changed(mut self, changed: impl IntoIterator<Item = String>) -> Self {
+        self.changed = changed.into_iter().collect();
+        self
+    }
+}
+
+fn verifier_definition_changes(before: &Config, after: &Config) -> Vec<String> {
+    let before: HashMap<&str, &crate::config::GatewayVerifier> = before
+        .gateway_verifier
+        .iter()
+        .map(|verifier| (verifier.kid.as_str(), verifier))
+        .collect();
+    let after: HashMap<&str, &crate::config::GatewayVerifier> = after
+        .gateway_verifier
+        .iter()
+        .map(|verifier| (verifier.kid.as_str(), verifier))
+        .collect();
+    let mut changed = before
+        .keys()
+        .filter_map(|kid| {
+            let before = before[kid];
+            let after = after.get(kid)?;
+            (before.alg != after.alg
+                || before.env != after.env
+                || before.namespaces != after.namespaces
+                || before.max_ttl != after.max_ttl)
+                .then(|| (*kid).to_owned())
+        })
+        .collect::<Vec<_>>();
+    changed.sort();
+    changed
 }
 
 /// Wire the reload triggers up for the process lifetime: the `SIGHUP` handler,
@@ -565,6 +619,59 @@ targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdo
             .expect("verifier removal is valid");
         assert!(summary.gateway_verifiers.added.is_empty());
         assert_eq!(summary.gateway_verifiers.removed, vec!["reload-kid"]);
+    }
+
+    #[tokio::test]
+    async fn reload_summary_reports_gateway_verifier_definition_changes() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+        let verifier = |audience: &str, max_ttl: &str| {
+            format!(
+                "{PLATFORM_ONLY}\n[gateway_token]\naudience = \"{audience}\"\n\n[[gateway_verifier]]\nkid = \"reload-kid\"\nalg = \"HS256\"\nenv = \"JWT_SECRET\"\nnamespaces = [\"platform\"]\nmax_ttl = \"{max_ttl}\"\n"
+            )
+        };
+
+        file.rewrite(&verifier("reload-test", "15m"));
+        reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("verifier candidate is valid");
+
+        file.rewrite(&verifier("reload-test", "30m"));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("changed verifier candidate is valid");
+        assert!(summary.gateway_verifiers.added.is_empty());
+        assert!(summary.gateway_verifiers.removed.is_empty());
+        assert_eq!(summary.gateway_verifiers.changed, vec!["reload-kid"]);
+        assert!(summary.gateway_token_audience.is_empty());
+        assert!(!summary.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_summary_reports_gateway_token_audience_changes() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+        let config = |audience: &str| {
+            format!(
+                "{PLATFORM_ONLY}\n[gateway_token]\naudience = \"{audience}\"\n\n[[gateway_verifier]]\nkid = \"reload-kid\"\nalg = \"HS256\"\nenv = \"JWT_SECRET\"\nnamespaces = [\"platform\"]\nmax_ttl = \"15m\"\n"
+            )
+        };
+
+        file.rewrite(&config("reload-test"));
+        reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("verifier candidate is valid");
+
+        file.rewrite(&config("new-audience"));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("audience change is valid");
+        assert_eq!(summary.gateway_token_audience.added, vec!["new-audience"]);
+        assert_eq!(summary.gateway_token_audience.removed, vec!["reload-test"]);
+        assert!(summary.gateway_verifiers.is_empty());
+        assert!(!summary.is_empty());
     }
 
     /// The reload reads the environment, so a key exported after boot resolves —
