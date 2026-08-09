@@ -85,6 +85,11 @@ git worktree remove /tmp/axond-main --force
 - `just docker-smoke` builds the distroless image and probes `/healthz`; it needs docker
   and takes a few minutes on a cold cache — run it backgrounded with a long timeout.
 - `just check` runs the full CI gate set (fmt, clippy, test, rustdoc, cargo-deny).
+- `just tier0` builds the static binary and runs `ops/tier0-gate.sh`. The gate
+  re-execs in a network-denied namespace, checks that Redis/Postgres are absent,
+  and boots `tests/tier0/axond.tier0.toml` against the committed local fixture
+  upstream. To use an already-built binary, run
+  `AXOND_BIN=target/debug/axond ops/tier0-gate.sh`.
 
 ## Devin Secrets Needed
 
