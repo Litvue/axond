@@ -279,15 +279,12 @@ impl BudgetStore for InMemoryBudget {
             return;
         }
         let mut ledgers = self.ledgers.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(ledger) = ledgers.get_mut(key) else {
-            return;
-        };
+        let ledger = ledgers.entry(key.clone()).or_default();
         let now = Instant::now();
         ledger.reclaim_expired(now);
-        if ledger.held.remove(&reservation.id).is_some() {
-            ledger.last_touched = now;
-            ledger.spent = ledger.spent.saturating_add(actual_microdollars);
-        }
+        ledger.held.remove(&reservation.id);
+        ledger.last_touched = now;
+        ledger.spent = ledger.spent.saturating_add(actual_microdollars);
     }
 }
 
@@ -605,33 +602,40 @@ mod tests {
             subject: "second".into(),
         };
 
-        let held = budget.reserve(&first, 500).await;
+        budget.reserve(&first, 500).await;
         tokio::time::sleep(Duration::from_millis(2)).await;
         assert!(matches!(
             budget.reserve(&second, 100).await,
             Admission::Allowed(_)
         ));
-        budget.settle(&first, held.reservation(), 500).await;
         assert!(!budget.ledgers.lock().unwrap().contains_key(&first));
     }
 
     #[tokio::test]
-    async fn settling_an_expired_hold_does_not_charge_or_resurrect_it() {
+    async fn a_late_settlement_records_spend_after_ledger_eviction() {
         let budget = InMemoryBudget::with_settings(
             1_000,
-            Duration::from_secs(60),
+            Duration::from_millis(1),
             Duration::from_millis(1),
             1,
         );
         let first = key();
+        let second = BudgetKey {
+            namespace: "acme".into(),
+            subject: "second".into(),
+        };
 
         let held = budget.reserve(&first, 100).await;
         tokio::time::sleep(Duration::from_millis(2)).await;
+        let second_held = budget.reserve(&second, 100).await;
         budget.settle(&first, held.reservation(), 900).await;
-        assert!(matches!(
-            budget.reserve(&first, 1_000).await,
-            Admission::Allowed(_)
-        ));
+        assert_eq!(
+            budget.reserve(&first, 101).await,
+            Admission::Denied(Denial::Exceeded)
+        );
+        let first_followup = budget.reserve(&first, 100).await;
+        budget.release(&first, first_followup.reservation()).await;
+        budget.release(&second, second_held.reservation()).await;
     }
 
     #[tokio::test]
