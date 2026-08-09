@@ -155,6 +155,18 @@ namespace = "acme"
 # the referenced env var is validated at boot and reload. `kid` is carried in
 # the JWS header, and the configured algorithm is authoritative.
 #
+# `axond keygen` writes the private PKCS#8 key to a new file and prints only
+# the public key plus this snippet. `axond mint` reads signing material from
+# an environment-variable name and prints only the `axt1.` token. The generated
+# private file ends with a newline; Ed25519 base64 is trimmed when minting and
+# verifying, while HS256 secrets are opaque bytes and are not trimmed.
+#
+# Keep at least one static `[[gateway_key]]`: minted verifiers do not replace
+# the operator's breakglass credential. Tier 0 verification is stateless and
+# has no Redis/Postgres runtime dependency. `scope`, `aliases`, and
+# `max_request_microdollars` are not currently enforced or emitted; do not
+# imply narrower authority by adding them to a token.
+#
 # [gateway_token]
 # audience = "acme-production"
 #
@@ -175,6 +187,19 @@ namespace = "acme"
 # namespaces = ["platform"]
 # max_ttl may be at most 24h (a policy ceiling, not a protocol limit).
 # max_ttl = "15m"
+#
+# For rotation, provision the new verifier env var BEFORE starting/restarting
+# the gateway, declare the new verifier alongside the old one, start/restart,
+# switch minting, then remove the old verifier and reload. A running process
+# cannot gain a new env var, so adding one and sending SIGHUP is rejected
+# (#86). The reload summary reports verifier kid/definition changes but does not
+# inspect key material. Replacing the env-var value under the same `kid` takes
+# effect only at restart and a later reload can still show `changed=false`; use
+# a new `kid` for visible overlap.
+# Short TTLs and removing a kid are the current coarse revocation controls.
+# Precise single-token revocation requires the future Tier 1 `jti` denylist
+# (#68); `min_iat` is tracked separately by #63. See
+# docs/minted-token-guide.md for the complete runbook.
 
 # ── Models (aliases) ──────────────────────────────────────────────────────────
 # Callers send the alias (`gpt-4o`), never `provider/model`. Targets are tried
@@ -233,6 +258,11 @@ targets = [
 # `watch` additionally reloads whenever this file's CONTENTS change (an in-place
 # edit or a Kubernetes ConfigMap symlink swap; a touched-but-identical file
 # reloads nothing). Off by default: a signal is an explicit operator action.
+#
+# For minted identity rotation, provision new verifier env vars before a
+# restart, then prefer adding a new `[[gateway_verifier]]` with a new `kid`;
+# same-kid environment-value replacement is not visible in the verifier
+# definition summary (`changed=false`).
 #
 # `[server] bind`, `[[usage_sink]]`, and `[budget]` changes are reported with a
 # warning and otherwise ignored — the socket is already bound, sinks own live

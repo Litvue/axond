@@ -120,6 +120,47 @@ secret — the caller's namespace would be ambiguous. Callers present the token 
 table. The usage record's `subject` is the env var's *name*
 ([ADR 0013](./adr/0013-inbound-auth-fails-closed.md)).
 
+## `[gateway_token]` — minted-token deployment policy
+
+This section is optional when the gateway uses only static gateway keys. It is
+required when any `[[gateway_verifier]]` is declared: the verifier needs one
+deployment-wide audience to validate the `aud` claim.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `audience` | string | — | Audience accepted by every configured minted token verifier. It must be present and non-empty when verifiers are declared. |
+
+The audience is config-owned and is applied to every verifier. A token with a
+different audience is rejected. The value is not a secret and is written
+directly in TOML.
+
+## `[[gateway_verifier]]` — minted-token verification (optional)
+
+Verifiers are additive to the required static gateway keys. They resolve
+`axt1.` compact JWS credentials without a per-caller registry or a runtime
+datastore. For the operator setup, rotation, claims, and revocation runbook,
+see the [minted identity guide](./minted-token-guide.md).
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `kid` | string | — | JWS key identifier. Required, non-empty, and unique across verifier entries. |
+| `alg` | `EdDSA` \| `HS256` | — | Signature algorithm. Required and authoritative for this verifier. |
+| `env` | string | — | *Name* of the environment variable holding the public Ed25519 key or opaque HS256 secret. Required and non-empty; the referenced variable must be set and non-empty at boot and reload. |
+| `namespaces` | array of string | — | Namespaces this signer may place in the token's `ns` claim. Required and non-empty; every namespace must be declared by `[[namespace]]`. |
+| `max_ttl` | duration | — | Maximum `exp - iat` lifetime accepted for this verifier. Required, at least `1s`, and no more than `24h`. |
+
+The verifier's `kid` must be present in the JWS header and its `alg` must match
+the configured algorithm. Ed25519 `env` values are standard-base64 raw
+32-byte public keys; surrounding whitespace is trimmed. HS256 values are
+opaque bytes, are not trimmed, and must be at least 32 bytes. A declared
+verifier without a resolvable environment variable is rejected at boot or
+reload, leaving the previous running snapshot in place on reload.
+
+The gateway validates the verifier's namespace set, lifetime, audience, and
+signature on every token. At least one static `[[gateway_key]]` remains
+mandatory as breakglass access. See the [minted identity guide](./minted-token-guide.md)
+for the new-`kid` rotation procedure and the Tier 0/Tier 1 revocation boundary.
+
 ## `[reload]`
 
 | Key | Type | Default | Meaning |
@@ -129,7 +170,9 @@ table. The usage record's `subject` is the env var's *name*
 
 A reload re-runs the full boot validation against the current file **and the
 current process environment**; a bad candidate is rejected and the running
-config keeps serving. `[server] bind`, `[[usage_sink]]`, and `[budget]`
+config keeps serving. The process environment cannot gain a new variable, so a
+newly named minted-verifier `env` reference requires a restart; removing an
+existing verifier can be applied by reload. `[server] bind`, `[[usage_sink]]`, and `[budget]`
 changes warn and are ignored until restart; this includes
 `limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
 
