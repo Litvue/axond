@@ -4,14 +4,35 @@
 # This is the mechanical Tier 0 guarantee from ADR 0017 and ADR 0002: the
 # default gateway starts and serves without a datastore or outbound network.
 # Loopback remains available by design, so a local fake provider can exercise
-# the real serving path; this does not prove that a same-namespace datastore
-# could never be reached, which is why the usual Redis and Postgres ports are
-# asserted empty as well.
+# the real serving path. The namespace itself excludes every external
+# datastore; an external Redis or Postgres dependency therefore fails boot or
+# serving. After boot, the gate also requires exactly its gateway and
+# fake-upstream listeners, catching a datastore or sidecar started in-namespace.
 #
 # Usage: ops/tier0-gate.sh [axond-binary]
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+requested_bin="${1:-${AXOND_BIN:-}}"
+if [[ -z "$requested_bin" ]]; then
+  if [[ -x "$repo_root/target/x86_64-unknown-linux-musl/release/axond" ]]; then
+    requested_bin="$repo_root/target/x86_64-unknown-linux-musl/release/axond"
+  else
+    requested_bin="$repo_root/target/debug/axond"
+  fi
+fi
+if [[ ! -x "$requested_bin" ]]; then
+  echo "TIER 0 INVARIANT FAILED: axond binary is not executable: $requested_bin" >&2
+  exit 1
+fi
+bin="$(realpath -e "$requested_bin")"
+requested_tmpdir="${2:-${TMPDIR:-/tmp}}"
+tmpdir="$(realpath -e "$requested_tmpdir")"
+if [[ ! -d "$tmpdir" ]]; then
+  echo "TIER 0 INVARIANT FAILED: temporary directory is not a directory: $tmpdir" >&2
+  exit 1
+fi
 
 if [[ -z "${AXOND_TIER0_NETNS:-}" ]]; then
   if ! command -v unshare >/dev/null 2>&1; then
@@ -21,35 +42,29 @@ if [[ -z "${AXOND_TIER0_NETNS:-}" ]]; then
   namespace_body='ip link set lo up || { echo "TIER 0 INVARIANT FAILED: could not enable namespace loopback." >&2; exit 1; }; export AXOND_TIER0_NETNS=1; exec "$@"'
   if unshare --user --map-root-user --net --fork true >/dev/null 2>&1; then
     exec unshare --user --map-root-user --net --fork bash -c \
-      "$namespace_body" bash "$0" "$@"
+      "$namespace_body" bash "$0" "$bin" "$tmpdir"
   fi
   echo "unprivileged user/network namespace unavailable; trying passwordless sudo fallback" >&2
-  if ! sudo -n unshare --net --fork bash -c "$namespace_body" bash "$0" "$@"; then
+  if ! sudo -n unshare --net --fork true >/dev/null 2>&1; then
     echo "TIER 0 INVARIANT FAILED: neither unprivileged unshare nor sudo network namespace creation worked; refusing to run with networking enabled." >&2
     exit 1
   fi
-  exit 0
-fi
-
-bin="${1:-${AXOND_BIN:-}}"
-if [[ -z "$bin" ]]; then
-  if [[ -x "$repo_root/target/x86_64-unknown-linux-musl/release/axond" ]]; then
-    bin="$repo_root/target/x86_64-unknown-linux-musl/release/axond"
+  if sudo -n unshare --net --fork bash -c "$namespace_body" bash "$0" "$bin" "$tmpdir"; then
+    exit 0
   else
-    bin="$repo_root/target/debug/axond"
+    status=$?
+    exit "$status"
   fi
-fi
-if [[ ! -x "$bin" ]]; then
-  echo "TIER 0 INVARIANT FAILED: axond binary is not executable: $bin" >&2
-  exit 1
 fi
 
 config="$repo_root/tests/tier0/axond.tier0.toml"
 upstream="$repo_root/tests/tier0/fake_upstream_serve.py"
-gateway_log="$(mktemp "${TMPDIR:-/tmp}/axond-tier0-gateway.XXXXXX.log")"
-upstream_log="$(mktemp "${TMPDIR:-/tmp}/axond-tier0-upstream.XXXXXX.log")"
+gateway_log="$(mktemp "$tmpdir/axond-tier0-gateway.XXXXXX.log")"
+upstream_log="$(mktemp "$tmpdir/axond-tier0-upstream.XXXXXX.log")"
 gateway_pid=""
 upstream_pid=""
+unknown_body=""
+fixture_body=""
 
 failure() {
   echo >&2
@@ -74,7 +89,7 @@ cleanup() {
     kill -KILL "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
-  rm -f "$gateway_log" "$upstream_log"
+  rm -f "$gateway_log" "$upstream_log" "$unknown_body" "$fixture_body"
 }
 trap cleanup EXIT
 
@@ -87,12 +102,10 @@ if getent hosts example.com >/dev/null 2>&1; then
 fi
 echo "sandbox: outbound TCP denied; public DNS denied"
 
-for port in 6379 5432; do
-  if timeout 1 bash -c "</dev/tcp/127.0.0.1/$port" >/dev/null 2>&1; then
-    failure "datastore invariant violated: 127.0.0.1:$port is reachable (Tier 0 forbids Redis/Postgres)"
-  fi
-done
-echo "datastore ports: Redis 6379 and Postgres 5432 unreachable"
+listener_ports() {
+  ss -H -ltn | awk '{print $4}' | awk -F: '{print $NF}' | sort -n | uniq
+}
+baseline_listeners="$(listener_ports)"
 
 python3 "$upstream" --port 18082 >"$upstream_log" 2>&1 &
 upstream_pid=$!
@@ -130,6 +143,13 @@ for _ in $(seq 1 60); do
 done
 [[ "$ready" == 1 ]] || failure "gateway did not serve /healthz; Tier 0 boot is not available"
 
+listeners="$(listener_ports)"
+expected_listeners="$(printf '%s\n18081\n18082\n' "$baseline_listeners" | sed '/^$/d' | sort -n | uniq)"
+if [[ "$listeners" != "$expected_listeners" ]]; then
+  failure "listener invariant violated: namespace must contain its baseline listeners plus only gateway 18081 and fake upstream 18082; unexpected listener set (${listeners//$'\n'/, }), expected (${expected_listeners//$'\n'/, }). This includes any Redis 6379 or Postgres 5432 listener. External datastore dependencies are excluded by the network namespace and would instead appear as boot or serving failure."
+fi
+echo "namespace listeners: baseline (${baseline_listeners//$'\n'/, }) plus gateway 18081 and fake upstream 18082 only; external Redis 6379/Postgres 5432 are excluded by namespace egress denial"
+
 health="$(curl --fail --silent "$base_url/healthz")"
 ready_body="$(curl --fail --silent "$base_url/readyz")"
 [[ "$health" == ok ]] || failure "/healthz was not ok: $health"
@@ -141,7 +161,7 @@ grep -q '"id":"fixture-chat"' <<<"$models" || failure "authenticated /v1/models 
 unauth_status="$(curl --silent --output /dev/null --write-out '%{http_code}' "$base_url/v1/models")"
 [[ "$unauth_status" == 401 ]] || failure "unauthenticated /v1/models returned $unauth_status instead of 401"
 
-unknown_body="$(mktemp "${TMPDIR:-/tmp}/axond-tier0-unknown.XXXXXX")"
+unknown_body="$(mktemp "$tmpdir/axond-tier0-unknown.XXXXXX")"
 unknown_status="$(curl --silent --output "$unknown_body" --write-out '%{http_code}' \
   -H 'Authorization: Bearer tier0-gateway-key' -H 'content-type: application/json' \
   -d '{"model":"does-not-exist","messages":[{"role":"user","content":"hello"}]}' \
@@ -150,7 +170,7 @@ grep -q '"type":"unknown_model"' "$unknown_body" || failure "unknown model respo
 [[ "$unknown_status" == 404 ]] || failure "unknown model returned $unknown_status instead of 404"
 rm -f "$unknown_body"
 
-fixture_body="$(mktemp "${TMPDIR:-/tmp}/axond-tier0-fixture.XXXXXX")"
+fixture_body="$(mktemp "$tmpdir/axond-tier0-fixture.XXXXXX")"
 fixture_status="$(curl --silent --output "$fixture_body" --write-out '%{http_code}' \
   -H 'Authorization: Bearer tier0-gateway-key' -H 'content-type: application/json' \
   -d '{"model":"fixture-chat","messages":[{"role":"user","content":"What is the capital of France?"}]}' \
