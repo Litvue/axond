@@ -398,6 +398,8 @@ See [`docs/adr`](./docs/adr) for the decisions behind these.
   health/readiness, rotation.
 - [Configuration reference](./docs/configuration.md) — every section, key, and
   default.
+- [Minted identity guide](./docs/minted-token-guide.md) — signer setup, claims,
+  rotation, delegation, and revocation boundaries.
 - [Observability and runbook](./docs/observability.md) — OTel setup, metrics,
   failure modes.
 - [Compatibility contract](./docs/compatibility.md) — supported routes and
