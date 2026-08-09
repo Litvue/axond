@@ -1,0 +1,39 @@
+# Tier 0 is config-only: adding a datastore here, or to the default path, is
+# the violation that ops/tier0-gate.sh exists to catch (ADR 0017).
+
+[server]
+bind = "127.0.0.1:18081"
+
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "fake-openai"
+kind = "openai"
+base_url = "http://127.0.0.1:18082"
+
+[[credential]]
+namespace = "platform"
+provider = "fake-openai"
+env = "GW_TIER0_UPSTREAM_KEY"
+
+[[gateway_key]]
+env = "GW_TIER0_INBOUND_KEY"
+namespace = "platform"
+
+[gateway_token]
+audience = "tier0-gate"
+
+[[gateway_verifier]]
+kid = "tier0-gate"
+alg = "HS256"
+env = "GW_TIER0_VERIFIER"
+namespaces = ["platform"]
+max_ttl = "15m"
+
+[[model]]
+name = "fixture-chat"
+targets = [
+  { provider = "fake-openai", model = "fixture-chat", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 } },
+]

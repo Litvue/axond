@@ -126,6 +126,50 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/v1/models
 - `just docker-smoke` builds the distroless image and probes `/healthz`; it needs docker
   and takes a few minutes on a cold cache — run it backgrounded with a long timeout.
 - `just check` runs the full CI gate set (fmt, clippy, test, rustdoc, cargo-deny).
+- `just tier0` builds the static binary and runs `ops/tier0-gate.sh`. The gate
+  re-execs in a network-denied namespace, asserts the post-boot listener set is the
+  captured baseline plus only 18081/18082 (so no in-namespace Redis/Postgres), and
+  boots `tests/tier0/axond.tier0.toml` against the committed local fixture
+  upstream. To use an already-built binary, run
+  `AXOND_BIN=target/debug/axond ops/tier0-gate.sh`. Budget ~4-5s for the gate script
+  itself; the cold musl release build dominates (~40s on 8 cores).
+
+## Static musl builds (`just build-static`, `just tier0`)
+
+Both recipes need the musl toolchain, which is *not* installed by the blueprint:
+
+```bash
+sudo apt-get install -y musl-tools
+# Add the target to the PINNED toolchain from rust-toolchain.toml, not the default one:
+rustup target add --toolchain "$(grep -oP 'channel = "\K[^"]+' rust-toolchain.toml)-x86_64-unknown-linux-gnu" \
+  x86_64-unknown-linux-musl
+```
+
+A bare `rustup target add x86_64-unknown-linux-musl` installs it on the *default*
+toolchain, so the build still dies with `error[E0463]: can't find crate for 'core' ...
+the x86_64-unknown-linux-musl target may not be installed` even though
+`rustup target list --installed` looks right — check
+`rustup target list --installed --toolchain <pinned>`. CI is unaffected (it installs the
+target through `dtolnay/rust-toolchain` with the pinned toolchain); this is local-dev only.
+
+### Testing the namespace plumbing of the Tier-0 gate
+
+The gate prefers `unshare --user --map-root-user --net --fork` and falls back to
+`sudo -n unshare --net --fork`. To exercise the branches without editing the script, put
+shims first on `PATH` in a script file (not inline in the exec tool):
+
+- sudo fallback: shim `unshare` to `exit 1` when any argument is `--user`, else
+  `exec /usr/bin/unshare "$@"`.
+- "no namespace at all" loud failure: shim `unshare` to always fail **and** shim `sudo` to
+  fail — `sudo` resolves `unshare` via `secure_path`, so a PATH shim alone does not reach it.
+- missing-`unshare` branch: run with `PATH` set to a directory holding only symlinks to
+  `bash` and `realpath`, so `command -v unshare` fails before anything else is needed.
+
+To force a *gate* (not sandbox) failure for red-path testing, pass a binary that exits
+immediately, e.g. `ops/tier0-gate.sh /bin/true` — you should get
+`TIER 0 INVARIANT FAILED: gateway exited before /healthz`. For a late-stage failure that
+exercises the temp-file cleanup trap, temporarily make `tests/compat/fake_upstream.py`
+`_buffered` respond `500` (revert afterwards and confirm `git status` is clean).
 
 ## Devin Secrets Needed
 

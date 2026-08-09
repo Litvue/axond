@@ -33,6 +33,16 @@ def fixture(name: str) -> bytes:
     return (FIXTURES / name).read_bytes()
 
 
+def serve_forever(port: int) -> None:
+    """Serve fixtures on loopback until interrupted."""
+    server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+    server.requests = []
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+
+
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 

@@ -46,6 +46,11 @@ run:
 build-static:
     cargo build --release --target x86_64-unknown-linux-musl -p axond
 
+# Build the static binary if needed and prove the Tier 0 default is hermetic.
+tier0:
+    cargo build --release --target x86_64-unknown-linux-musl -p axond
+    ops/tier0-gate.sh target/x86_64-unknown-linux-musl/release/axond
+
 # Build the distroless container image.
 docker:
     docker build -t axond:dev .

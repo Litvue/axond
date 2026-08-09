@@ -153,6 +153,8 @@ jobs:
           # Either is fully static — a dynamic build would say "dynamically linked".
           file "$bin" | grep -Eq 'static-pie linked|statically linked'
           ! file "$bin" | grep -q 'dynamically linked'
+      - name: Tier-0 hermetic boot and serve
+        run: ops/tier0-gate.sh target/x86_64-unknown-linux-musl/release/axond
 
   docker-smoke:
     name: Docker smoke
