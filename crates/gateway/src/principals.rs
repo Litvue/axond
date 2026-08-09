@@ -76,7 +76,7 @@ pub enum TokenVerificationError {
     #[error("token audience is invalid")]
     WrongAudience,
     #[error("token is missing required claim `{claim}`")]
-    MissingClaim { claim: &'static str },
+    MissingClaim { claim: String },
     #[error("token lifetime is invalid for verifier `{kid}`")]
     InvalidLifetime { kid: String },
     #[error("token names unknown namespace `{namespace}`")]
@@ -105,6 +105,8 @@ impl TokenVerificationError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TokenVerifierBuildError {
+    #[error("gateway verifiers require `[gateway_token] audience`")]
+    MissingAudience,
     #[error("gateway_verifier `{kid}` references env var `{env}`, which is unset or empty")]
     MissingKey { kid: String, env: String },
     #[error("gateway_verifier `{kid}` has invalid base64 key material")]
@@ -119,7 +121,6 @@ struct ResolvedVerifier {
     namespaces: HashSet<String>,
     max_ttl: Duration,
     key: DecodingKey,
-    _secret: Option<SecretString>,
 }
 
 pub struct TokenVerifier {
@@ -132,9 +133,6 @@ pub struct TokenVerifier {
 struct TokenClaims {
     exp: Option<u64>,
     iat: Option<u64>,
-    nbf: Option<u64>,
-    #[serde(rename = "aud")]
-    _aud: serde_json::Value,
     jti: Option<String>,
     ns: Option<String>,
     sub: Option<String>,
@@ -151,7 +149,7 @@ impl TokenVerifier {
         let audience = config
             .gateway_token
             .as_ref()
-            .expect("validated verifier config has an audience")
+            .ok_or(TokenVerifierBuildError::MissingAudience)?
             .audience
             .clone();
         let namespaces = config
@@ -168,11 +166,10 @@ impl TokenVerifier {
                     kid: verifier.kid.clone(),
                     env: verifier.env.clone(),
                 })?;
-            let (key, secret) = match verifier.alg {
-                GatewayVerifierAlgorithm::Hs256 => (
-                    DecodingKey::from_secret(value.as_bytes()),
-                    Some(SecretString::from(value.clone())),
-                ),
+            let key = match verifier.alg {
+                // HS256 material lives inside DecodingKey beyond our
+                // zeroization control; Ed25519 is the preferred default.
+                GatewayVerifierAlgorithm::Hs256 => DecodingKey::from_secret(value.as_bytes()),
                 GatewayVerifierAlgorithm::EdDsa => {
                     let decoded = BASE64.decode(value).map_err(|_| {
                         TokenVerifierBuildError::InvalidBase64 {
@@ -187,7 +184,7 @@ impl TokenVerifier {
                     // jsonwebtoken's EdDSA verifier takes the raw 32-byte
                     // Ed25519 public key through `from_ed_der`; this is
                     // validated by the round-trip test below.
-                    (DecodingKey::from_ed_der(&decoded), None)
+                    DecodingKey::from_ed_der(&decoded)
                 }
             };
             verifiers.push(ResolvedVerifier {
@@ -199,7 +196,6 @@ impl TokenVerifier {
                 namespaces: verifier.namespaces.iter().cloned().collect(),
                 max_ttl: verifier.max_ttl,
                 key,
-                _secret: secret,
             });
         }
         Ok(Some(Self {
@@ -234,7 +230,9 @@ impl PrincipalStore for TokenVerifier {
         let header = decode_header(token)
             .map_err(|_| PrincipalStoreError::Unauthorized(TokenVerificationError::Malformed))?;
         let kid = header.kid.ok_or(PrincipalStoreError::Unauthorized(
-            TokenVerificationError::MissingClaim { claim: "kid" },
+            TokenVerificationError::MissingClaim {
+                claim: "kid".to_owned(),
+            },
         ))?;
         let verifier = self
             .verifiers
@@ -252,6 +250,7 @@ impl PrincipalStore for TokenVerifier {
         }
 
         let mut validation = Validation::new(verifier.algorithm);
+        // Five seconds is the fixed clock-skew allowance promised by ADR 0016.
         validation.leeway = 5;
         validation.validate_nbf = true;
         validation.set_audience(std::slice::from_ref(&self.audience));
@@ -262,24 +261,29 @@ impl PrincipalStore for TokenVerifier {
                 JwtErrorKind::ImmatureSignature => TokenVerificationError::NotYetValid,
                 JwtErrorKind::InvalidAudience => TokenVerificationError::WrongAudience,
                 JwtErrorKind::MissingRequiredClaim(claim) => TokenVerificationError::MissingClaim {
-                    claim: required_claim_name(claim),
+                    claim: claim.to_owned(),
                 },
                 JwtErrorKind::InvalidSignature => TokenVerificationError::InvalidSignature,
                 _ => TokenVerificationError::Malformed,
             })
         })?;
         let claims = data.claims;
-        let jti = claims.jti.as_deref().filter(|jti| !jti.is_empty()).ok_or(
-            PrincipalStoreError::Unauthorized(TokenVerificationError::MissingClaim {
-                claim: "jti",
-            }),
-        )?;
-        let _ = jti;
+        if claims.jti.as_deref().is_none_or(str::is_empty) {
+            return Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::MissingClaim {
+                    claim: "jti".to_owned(),
+                },
+            ));
+        }
         let iat = claims.iat.ok_or(PrincipalStoreError::Unauthorized(
-            TokenVerificationError::MissingClaim { claim: "iat" },
+            TokenVerificationError::MissingClaim {
+                claim: "iat".to_owned(),
+            },
         ))?;
         let exp = claims.exp.ok_or(PrincipalStoreError::Unauthorized(
-            TokenVerificationError::MissingClaim { claim: "exp" },
+            TokenVerificationError::MissingClaim {
+                claim: "exp".to_owned(),
+            },
         ))?;
         if exp < iat || exp - iat > verifier.max_ttl.as_secs() {
             return Err(PrincipalStoreError::Unauthorized(
@@ -288,9 +292,10 @@ impl PrincipalStore for TokenVerifier {
                 },
             ));
         }
-        let _ = claims.nbf;
-        let namespace = claims.ns.ok_or(PrincipalStoreError::Forbidden(
-            TokenVerificationError::MissingClaim { claim: "ns" },
+        let namespace = claims.ns.ok_or(PrincipalStoreError::Unauthorized(
+            TokenVerificationError::MissingClaim {
+                claim: "ns".to_owned(),
+            },
         ))?;
         if !self.namespaces.contains(&namespace) {
             return Err(PrincipalStoreError::Forbidden(
@@ -306,17 +311,11 @@ impl PrincipalStore for TokenVerifier {
             ));
         }
         let subject = claims.sub.ok_or(PrincipalStoreError::Unauthorized(
-            TokenVerificationError::MissingClaim { claim: "sub" },
+            TokenVerificationError::MissingClaim {
+                claim: "sub".to_owned(),
+            },
         ))?;
         Ok(Some(InboundKey { namespace, subject }))
-    }
-}
-
-fn required_claim_name(claim: &str) -> &'static str {
-    match claim {
-        "exp" => "exp",
-        "aud" => "aud",
-        _ => "claim",
     }
 }
 
@@ -794,6 +793,19 @@ max_ttl = "15m"
             ))
         ));
 
+        let mut missing_namespace = valid_claims();
+        missing_namespace.ns = None;
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(missing_namespace),
+                })
+                .await,
+            Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::MissingClaim { ref claim }
+            )) if claim == "ns"
+        ));
+
         let mut unpermitted_namespace = valid_claims();
         unpermitted_namespace.ns = Some("platform".to_owned());
         assert!(matches!(
@@ -820,8 +832,8 @@ max_ttl = "15m"
                 })
                 .await,
             Err(PrincipalStoreError::Unauthorized(
-                TokenVerificationError::MissingClaim { claim: "jti" }
-            ))
+                TokenVerificationError::MissingClaim { ref claim }
+            )) if claim == "jti"
         ));
 
         let mut too_long = valid_claims();

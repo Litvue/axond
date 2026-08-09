@@ -518,7 +518,8 @@ pub struct GatewayVerifier {
     pub max_ttl: Duration,
 }
 
-const MAX_GATEWAY_VERIFIER_TTL_SECONDS: u64 = 24 * 60 * 60;
+// Deliberate policy ceiling for configured token lifetimes, not a protocol limit.
+pub(crate) const MAX_GATEWAY_VERIFIER_TTL_SECONDS: u64 = 24 * 60 * 60;
 
 fn deserialize_gateway_ttl<'de, D>(deserializer: D) -> Result<Duration, D::Error>
 where

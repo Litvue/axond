@@ -24,7 +24,7 @@ base64 = "0.22"
 bytes = "1"
 figment = { version = "0.10", features = ["env", "toml"] }
 futures = "0.3"
-jsonwebtoken = "=9.3.1"
+jsonwebtoken = { version = "=9.3.1", default-features = false }
 opentelemetry = "=0.32.0"
 opentelemetry-http = "=0.32.0"
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["http-proto", "trace", "metrics", "logs"] }
