@@ -20,7 +20,6 @@ use gateway_core::{
     AnthropicAdapter, CircuitBreaker, OpenAiCompatibleAdapter, OpenAiFlavor, ProviderAdapter,
 };
 use gateway_transport::HttpDispatcher;
-use ring::digest::{Context, SHA256};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::budget::BudgetStore;
@@ -182,60 +181,24 @@ impl ConfigSnapshot {
                     signer_kid: None,
                 },
             });
-            gateway_key_fingerprints.insert(label.to_owned(), fingerprint(label, &secret));
+            gateway_key_fingerprints
+                .insert(label.to_owned(), key_material::fingerprint(label, &secret));
         }
         if inbound_keys.is_empty() {
             return Err(SnapshotError::NoInboundKeys);
         }
         let inbound_keys: Arc<[GatewayKeyEntry]> = inbound_keys.into();
         let config_principals = ConfigPrincipals::new(Arc::clone(&inbound_keys));
-        let stores = TokenVerifier::build(&config, env)?
+        let verifier = TokenVerifier::build(&config, env)?;
+        let gateway_verifier_fingerprints = verifier
+            .as_ref()
+            .map(TokenVerifier::fingerprints)
+            .unwrap_or_default();
+        let stores = verifier
             .into_iter()
             .map(|verifier| Box::new(verifier) as Box<dyn crate::principals::PrincipalStore>)
             .collect();
         let principals = PrincipalStoreChain::new(stores, config_principals)?;
-        let gateway_verifier_fingerprints = config
-            .gateway_verifier
-            .iter()
-            .map(|verifier| {
-                let source = verifier.source().ok_or_else(|| {
-                    SnapshotError::TokenVerifier(TokenVerifierBuildError::InvalidSource {
-                        kid: verifier.kid.clone(),
-                    })
-                })?;
-                let material = key_material::resolve(source, env).map_err(|error| {
-                    SnapshotError::TokenVerifier(match error {
-                        KeyMaterialError::MissingEnv { name } => {
-                            TokenVerifierBuildError::MissingKey {
-                                kid: verifier.kid.clone(),
-                                env: name,
-                            }
-                        }
-                        KeyMaterialError::FileRead { path, kind, error } => {
-                            TokenVerifierBuildError::FileKey {
-                                kid: verifier.kid.clone(),
-                                path,
-                                kind,
-                                error,
-                            }
-                        }
-                        KeyMaterialError::EmptyFile { path } => {
-                            TokenVerifierBuildError::EmptyFile {
-                                kid: verifier.kid.clone(),
-                                path,
-                            }
-                        }
-                        KeyMaterialError::InvalidUtf8 { path } => {
-                            TokenVerifierBuildError::InvalidFileUtf8 {
-                                kid: verifier.kid.clone(),
-                                path,
-                            }
-                        }
-                    })
-                })?;
-                Ok((verifier.kid.clone(), fingerprint(&verifier.kid, &material)))
-            })
-            .collect::<Result<HashMap<_, _>, SnapshotError>>()?;
         Ok(Self {
             config,
             credentials,
@@ -267,21 +230,6 @@ impl ConfigSnapshot {
     pub fn token_verifier_count(&self) -> usize {
         self.config.gateway_verifier.len()
     }
-}
-
-fn fingerprint(label: &str, material: &str) -> String {
-    let mut context = Context::new(&SHA256);
-    context.update(b"axond-key-material-v1\0");
-    context.update(label.as_bytes());
-    context.update(b"\0");
-    context.update(material.as_bytes());
-    context
-        .finish()
-        .as_ref()
-        .iter()
-        .take(8)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 impl AppState {
@@ -479,6 +427,38 @@ namespace = "platform"
         let message = err.to_string();
         assert!(message.contains("AXOND_KEY") && message.contains("AXOND_OTHER_KEY"));
         assert!(!message.contains("shared"), "{message}");
+    }
+
+    #[test]
+    fn file_backed_gateway_key_errors_redact_material() {
+        let first = temp_file(b"file-shared-secret");
+        let second = temp_file(b"file-shared-secret");
+        let config = config_with(&format!(
+            "[[gateway_key]]\nfile = \"{first}\"\nnamespace = \"platform\"\n\n[[gateway_key]]\nfile = \"{second}\"\nnamespace = \"platform\"\n"
+        ));
+        let Err(error) = ConfigSnapshot::build(config, &HashMap::new(), 0) else {
+            panic!("duplicate file-backed keys must be rejected");
+        };
+        let message = format!("{error:?} {error}");
+        assert!(
+            message.contains(&first) && message.contains(&second),
+            "{message}"
+        );
+        assert!(!message.contains("file-shared-secret"), "{message}");
+        std::fs::remove_file(first).unwrap();
+        std::fs::remove_file(second).unwrap();
+
+        let failed = temp_file(b"");
+        let config = config_with(&format!(
+            "[[gateway_key]]\nfile = \"{failed}\"\nnamespace = \"platform\"\n"
+        ));
+        let Err(error) = ConfigSnapshot::build(config, &HashMap::new(), 0) else {
+            panic!("empty file-backed key must be rejected");
+        };
+        let message = format!("{error:?} {error}");
+        assert!(message.contains(&failed), "{message}");
+        assert!(!message.contains("file-shared-secret"), "{message}");
+        std::fs::remove_file(failed).unwrap();
     }
 
     #[tokio::test]

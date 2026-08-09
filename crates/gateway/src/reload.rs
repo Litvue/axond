@@ -493,9 +493,12 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use serde::Serialize;
     use serde_json::Value;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tower::util::ServiceExt;
 
     /// A config file this test owns, removed when the test ends.
@@ -752,6 +755,73 @@ targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdo
         assert_eq!(
             summary.gateway_verifier_fingerprints["reload-kid"].len(),
             16
+        );
+    }
+
+    #[derive(Serialize)]
+    struct ReloadTokenClaims {
+        exp: u64,
+        iat: u64,
+        jti: String,
+        ns: String,
+        sub: String,
+        aud: String,
+    }
+
+    #[tokio::test]
+    async fn invalid_verifier_file_reload_keeps_previous_snapshot_serving() {
+        let material = ConfigFile::new("reload-secret-012345678901234567890");
+        let file = ConfigFile::new(&format!(
+            "{PLATFORM_ONLY}\n[gateway_token]\naudience = \"reload-test\"\n\n[[gateway_verifier]]\nkid = \"reload-kid\"\nalg = \"HS256\"\nfile = \"{}\"\nnamespaces = [\"platform\"]\nmax_ttl = \"15m\"\n",
+            material.path()
+        ));
+        let state = state_from(&file);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs();
+        let claims = ReloadTokenClaims {
+            exp: now + 900,
+            iat: now,
+            jti: "reload-jti".to_owned(),
+            ns: "platform".to_owned(),
+            sub: "reload-subject".to_owned(),
+            aud: "reload-test".to_owned(),
+        };
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("reload-kid".to_owned());
+        let token = format!(
+            "axt1.{}",
+            encode(
+                &header,
+                &claims,
+                &EncodingKey::from_secret(b"reload-secret-012345678901234567890"),
+            )
+            .expect("token signs")
+        );
+        assert!(
+            state
+                .config()
+                .resolve_principal(&Presented { credential: &token })
+                .await
+                .expect("token resolves")
+                .is_some()
+        );
+        let generation = state.config().generation;
+        let reloader = Reloader::new(file.path(), state.clone());
+        material.rewrite("");
+        let error = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect_err("empty verifier material must reject candidate");
+        assert!(error.to_string().contains(material.path()));
+        assert_eq!(state.config().generation, generation);
+        assert!(
+            state
+                .config()
+                .resolve_principal(&Presented { credential: &token })
+                .await
+                .expect("previous token still resolves")
+                .is_some()
         );
     }
 
