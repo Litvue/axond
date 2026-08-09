@@ -135,15 +135,10 @@ curl --fail-with-body http://127.0.0.1:8080/v1/models \
 unauthenticated routes. A valid token is namespace-scoped, so the catalogue
 only contains aliases the `acme` namespace can resolve.
 
-HS256 is supported for deliberate shared-secret deployments:
-
-Add this verifier alongside the EdDSA verifier in `axond.toml` before running
-the command:
+HS256 is supported for deliberate shared-secret deployments. Add this verifier
+alongside the EdDSA verifier in `axond.toml` before running the command:
 
 ```toml
-[gateway_token]
-audience = "acme-production"
-
 [[gateway_verifier]]
 kid = "local-minter"
 alg = "HS256"
@@ -154,6 +149,7 @@ max_ttl = "15m"
 
 ```bash
 export GW_SIGN_LOCAL='01234567890123456789012345678901'
+export GW_VERIFY_LOCAL_MINTER="$GW_SIGN_LOCAL"
 TOKEN="$(
   axond mint --config ./axond.toml \
     --kid local-minter --alg HS256 --key-env GW_SIGN_LOCAL \
@@ -161,8 +157,10 @@ TOKEN="$(
 )"
 ```
 
-Every verifier holding the HS256 secret can forge tokens. Ed25519 is preferred
-when verification-only replicas must not be able to mint.
+HS256 is symmetric: `GW_SIGN_LOCAL` and `GW_VERIFY_LOCAL_MINTER` must contain
+the same secret bytes. Every verifier holding those bytes can forge tokens,
+which is why Ed25519 is preferred when verification-only replicas must not be
+able to mint.
 
 ## 4. Token contract and claims
 
@@ -208,9 +206,8 @@ The static breakglass key remains present throughout:
 3. Start or restart the gateway with the new environment variable and both
    verifier entries present. Confirm the new verifier is active.
 4. Switch all minting over to the new `kid`.
-5. Wait for tokens signed by the old `kid` to expire, or remove its verifier
-   entry to revoke them immediately.
-6. Remove the old verifier entry and reload:
+5. Wait for tokens signed by the old `kid` to expire, or remove the old
+   verifier entry immediately to revoke them, then reload:
 
    ```bash
    kill -HUP "$AXOND_PID"
