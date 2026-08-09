@@ -152,10 +152,18 @@ credentials, revocation, and self-serve caller lifecycle.
 
 **Principal stores are layered and resolve first-match-wins by credential
 prefix.** A chain dispatches static config keys, minted tokens, and future
-store-backed credentials without probing unrelated schemes. The config layer
-is always present as the operator breakglass path. A store outage therefore
-fails its layer, not the whole chain, and static config credentials continue to
-work.
+store-backed credentials without probing unrelated schemes. Fall-through
+happens only on no match: if two layers claim the same credential shape, layer
+order decides, and a definite "not found" from an earlier layer may continue to
+the next. A layer error is terminal for that credential; there is no
+fall-through on failure. A credential that an unavailable store would have
+resolved is rejected rather than silently resolved by another layer, because
+store failure must never change which authority authorized a caller.
+
+The config layer is always present as the operator breakglass path. Other
+callers — those presenting config-owned static keys or minted tokens — remain
+unaffected by a store outage because their resolution never touches that
+store.
 
 Any store-backed implementation must satisfy three request-path requirements:
 
@@ -163,9 +171,9 @@ Any store-backed implementation must satisfy three request-path requirements:
    including short-lived negative caching. Both cache directions are bounded;
    negative TTLs remain short so new credentials and revocations do not remain
    hidden.
-2. Use a bounded timeout and fail closed for that layer when its configured
-   store is unavailable. The chain must continue to later layers, especially
-   `ConfigPrincipals`.
+2. Use a bounded timeout and fail closed for that credential when its configured
+   store is unavailable. This is not a fall-through to `ConfigPrincipals` or
+   any other layer; only a no-match result may continue through the chain.
 3. Store `(key_id, hash)`, never plaintext key material. A credential such as
    `axk_<key_id>_<secret>` is indexed by `key_id` and verified against the
    stored hash.
@@ -176,11 +184,19 @@ Any store-backed implementation must satisfy three request-path requirements:
 and the authorization for minting. The existing config key table continues to
 work through `ConfigPrincipals`.
 
-The fail-closed rule from ADR 0013 is preserved verbatim in substance: there
-is no keyless mode; a declared gateway key or verifier whose environment value
-is missing or empty is fatal; duplicate static secrets remain invalid; and a
-configuration with neither `[[gateway_key]]` nor `[[gateway_verifier]]` fails
-validation. A failed reload keeps the last valid snapshot serving.
+**At least one `[[gateway_key]]` remains mandatory.** ADR 0013's fail-closed
+rule is preserved: there is no keyless mode, a config with no
+`[[gateway_key]]` fails `Config::validate`, and `ConfigSnapshot::build` refuses
+to publish an empty resolved static-key table. Verifiers are strictly
+additive; a declared gateway verifier whose environment value is missing or
+empty is also fatal, and duplicate static secrets remain invalid. A failed
+reload keeps the last valid snapshot serving.
+
+The static key is the operator breakglass credential and the layer that cannot
+fail for infrastructure or signing-key reasons. A verifier-only deployment is
+therefore not legal: if its sole signing authority is lost or compromised,
+the deployment would have no recovery path. Requiring a static key is an
+additional constraint this ADR accepts deliberately to preserve availability.
 
 Malformed, expired, not-yet-valid, wrongly-audienced, or badly signed tokens
 are authentication failures and return `401`. A validly authenticated token
@@ -215,7 +231,9 @@ assume that subjects belong to the static config key list.
 - `sub` becomes high-cardinality, so memory accounting, usage schemas, and
   operational dashboards must handle arbitrary subjects.
 - The layered resolver makes a stateful identity backend additive rather than a
-  cutover, and the config breakglass key limits availability coupling.
+  cutover: callers on other layers remain unaffected by its outage, while a
+  credential owned by the failed layer is rejected rather than falling through
+  to a different authority.
 - A token is not a second namespace authority. A verifier misconfiguration
   remains capable of granting authority to every token it signs for its
   configured namespaces, so signer ownership and rotation remain operational
