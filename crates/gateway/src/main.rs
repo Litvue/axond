@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("config resolution failed: {e}"))?;
     tracing::info!(
         gateway_keys = state.config().inbound_key_count(),
+        gateway_verifiers = state.config().token_verifier_count(),
         "inbound auth enforced"
     );
     reload::spawn(Arc::new(reload::Reloader::new(config_path, state.clone())));

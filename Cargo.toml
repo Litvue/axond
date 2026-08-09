@@ -20,9 +20,11 @@ anyhow = "1"
 arc-swap = "1.7"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
 bytes = "1"
 figment = { version = "0.10", features = ["env", "toml"] }
 futures = "0.3"
+jsonwebtoken = "=9.3.1"
 opentelemetry = "=0.32.0"
 opentelemetry-http = "=0.32.0"
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["http-proto", "trace", "metrics", "logs"] }

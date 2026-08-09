@@ -44,7 +44,7 @@ use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, Target};
 use crate::credentials::{CredentialPlan, CredentialSource};
 use crate::error::GatewayError;
-use crate::principals::Presented;
+use crate::principals::{Presented, PrincipalStoreError};
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::streaming::{self, Framing, StreamContext};
 use crate::telemetry;
@@ -120,6 +120,24 @@ async fn authenticate(
     let store = snapshot.principal_store_name(&presented);
     let principal = match snapshot.resolve_principal(&presented).await {
         Ok(principal) => principal,
+        Err(PrincipalStoreError::Unauthorized(error)) => {
+            // A layer error is terminal by design; it must not fall through to
+            // another authority just because the owning layer is unavailable.
+            warn!(
+                store,
+                error = %error,
+                "principal store resolution failed"
+            );
+            return Err(GatewayError::TokenUnauthorized(error));
+        }
+        Err(PrincipalStoreError::Forbidden(error)) => {
+            warn!(
+                store,
+                error = %error,
+                "principal store resolution failed"
+            );
+            return Err(GatewayError::TokenForbidden(error));
+        }
         Err(error) => {
             // A layer error is terminal by design; it must not fall through to
             // another authority just because the owning layer is unavailable.

@@ -1,7 +1,16 @@
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, Validation, decode, decode_header, errors::ErrorKind as JwtErrorKind,
+};
 use secrecy::{ExposeSecret, SecretString};
+use serde::Deserialize;
+
+use crate::config::{Config, GatewayVerifierAlgorithm};
 
 #[derive(Clone)]
 pub struct InboundKey {
@@ -44,6 +53,271 @@ pub enum PrincipalStoreError {
     #[allow(dead_code)]
     #[error("principal store unavailable")]
     Unavailable,
+    #[error("token authentication failed: {0}")]
+    Unauthorized(TokenVerificationError),
+    #[error("token authorization failed: {0}")]
+    Forbidden(TokenVerificationError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TokenVerificationError {
+    #[error("malformed token")]
+    Malformed,
+    #[error("unknown verification key `{kid}`")]
+    UnknownKey { kid: String },
+    #[error("token algorithm does not match verifier `{kid}`")]
+    AlgorithmMismatch { kid: String },
+    #[error("invalid token signature")]
+    InvalidSignature,
+    #[error("token has expired")]
+    Expired,
+    #[error("token is not yet valid")]
+    NotYetValid,
+    #[error("token audience is invalid")]
+    WrongAudience,
+    #[error("token is missing required claim `{claim}`")]
+    MissingClaim { claim: &'static str },
+    #[error("token lifetime is invalid for verifier `{kid}`")]
+    InvalidLifetime { kid: String },
+    #[error("token names unknown namespace `{namespace}`")]
+    UnknownNamespace { namespace: String },
+    #[error("verifier `{kid}` is not permitted for namespace `{namespace}`")]
+    SignerNotPermitted { kid: String, namespace: String },
+}
+
+impl TokenVerificationError {
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::Malformed => "token_malformed",
+            Self::UnknownKey { .. } => "token_unknown_key",
+            Self::AlgorithmMismatch { .. } => "token_algorithm_mismatch",
+            Self::InvalidSignature => "token_invalid_signature",
+            Self::Expired => "token_expired",
+            Self::NotYetValid => "token_not_yet_valid",
+            Self::WrongAudience => "token_wrong_audience",
+            Self::MissingClaim { .. } => "token_missing_claim",
+            Self::InvalidLifetime { .. } => "token_invalid_lifetime",
+            Self::UnknownNamespace { .. } => "token_unknown_namespace",
+            Self::SignerNotPermitted { .. } => "token_signer_not_permitted",
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TokenVerifierBuildError {
+    #[error("gateway_verifier `{kid}` references env var `{env}`, which is unset or empty")]
+    MissingKey { kid: String, env: String },
+    #[error("gateway_verifier `{kid}` has invalid base64 key material")]
+    InvalidBase64 { kid: String },
+    #[error("gateway_verifier `{kid}` must contain a 32-byte Ed25519 public key")]
+    InvalidEd25519Key { kid: String },
+}
+
+struct ResolvedVerifier {
+    kid: String,
+    algorithm: Algorithm,
+    namespaces: HashSet<String>,
+    max_ttl: Duration,
+    key: DecodingKey,
+    _secret: Option<SecretString>,
+}
+
+pub struct TokenVerifier {
+    audience: String,
+    namespaces: HashSet<String>,
+    verifiers: Vec<ResolvedVerifier>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenClaims {
+    exp: Option<u64>,
+    iat: Option<u64>,
+    nbf: Option<u64>,
+    #[serde(rename = "aud")]
+    _aud: serde_json::Value,
+    jti: Option<String>,
+    ns: Option<String>,
+    sub: Option<String>,
+}
+
+impl TokenVerifier {
+    pub(crate) fn build(
+        config: &Config,
+        env: &std::collections::HashMap<String, String>,
+    ) -> Result<Option<Self>, TokenVerifierBuildError> {
+        if config.gateway_verifier.is_empty() {
+            return Ok(None);
+        }
+        let audience = config
+            .gateway_token
+            .as_ref()
+            .expect("validated verifier config has an audience")
+            .audience
+            .clone();
+        let namespaces = config
+            .namespace
+            .iter()
+            .map(|namespace| namespace.id.clone())
+            .collect();
+        let mut verifiers = Vec::with_capacity(config.gateway_verifier.len());
+        for verifier in &config.gateway_verifier {
+            let value = env
+                .get(&verifier.env)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| TokenVerifierBuildError::MissingKey {
+                    kid: verifier.kid.clone(),
+                    env: verifier.env.clone(),
+                })?;
+            let (key, secret) = match verifier.alg {
+                GatewayVerifierAlgorithm::Hs256 => (
+                    DecodingKey::from_secret(value.as_bytes()),
+                    Some(SecretString::from(value.clone())),
+                ),
+                GatewayVerifierAlgorithm::EdDsa => {
+                    let decoded = BASE64.decode(value).map_err(|_| {
+                        TokenVerifierBuildError::InvalidBase64 {
+                            kid: verifier.kid.clone(),
+                        }
+                    })?;
+                    if decoded.len() != 32 {
+                        return Err(TokenVerifierBuildError::InvalidEd25519Key {
+                            kid: verifier.kid.clone(),
+                        });
+                    }
+                    // jsonwebtoken's EdDSA verifier takes the raw 32-byte
+                    // Ed25519 public key through `from_ed_der`; this is
+                    // validated by the round-trip test below.
+                    (DecodingKey::from_ed_der(&decoded), None)
+                }
+            };
+            verifiers.push(ResolvedVerifier {
+                kid: verifier.kid.clone(),
+                algorithm: match verifier.alg {
+                    GatewayVerifierAlgorithm::EdDsa => Algorithm::EdDSA,
+                    GatewayVerifierAlgorithm::Hs256 => Algorithm::HS256,
+                },
+                namespaces: verifier.namespaces.iter().cloned().collect(),
+                max_ttl: verifier.max_ttl,
+                key,
+                _secret: secret,
+            });
+        }
+        Ok(Some(Self {
+            audience,
+            namespaces,
+            verifiers,
+        }))
+    }
+}
+
+#[async_trait]
+impl PrincipalStore for TokenVerifier {
+    fn name(&self) -> &'static str {
+        "token-verifier"
+    }
+
+    fn shapes(&self) -> &'static [&'static str] {
+        &["axt1."]
+    }
+
+    async fn resolve(
+        &self,
+        presented: &Presented<'_>,
+    ) -> Result<Option<InboundKey>, PrincipalStoreError> {
+        let token =
+            presented
+                .credential
+                .strip_prefix("axt1.")
+                .ok_or(PrincipalStoreError::Unauthorized(
+                    TokenVerificationError::Malformed,
+                ))?;
+        let header = decode_header(token)
+            .map_err(|_| PrincipalStoreError::Unauthorized(TokenVerificationError::Malformed))?;
+        let kid = header.kid.ok_or(PrincipalStoreError::Unauthorized(
+            TokenVerificationError::MissingClaim { claim: "kid" },
+        ))?;
+        let verifier = self
+            .verifiers
+            .iter()
+            .find(|verifier| verifier.kid == kid)
+            .ok_or_else(|| {
+                PrincipalStoreError::Unauthorized(TokenVerificationError::UnknownKey {
+                    kid: kid.clone(),
+                })
+            })?;
+        if header.alg != verifier.algorithm {
+            return Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::AlgorithmMismatch { kid },
+            ));
+        }
+
+        let mut validation = Validation::new(verifier.algorithm);
+        validation.leeway = 5;
+        validation.validate_nbf = true;
+        validation.set_audience(std::slice::from_ref(&self.audience));
+        validation.set_required_spec_claims(&["exp", "aud"]);
+        let data = decode::<TokenClaims>(token, &verifier.key, &validation).map_err(|error| {
+            PrincipalStoreError::Unauthorized(match error.kind() {
+                JwtErrorKind::ExpiredSignature => TokenVerificationError::Expired,
+                JwtErrorKind::ImmatureSignature => TokenVerificationError::NotYetValid,
+                JwtErrorKind::InvalidAudience => TokenVerificationError::WrongAudience,
+                JwtErrorKind::MissingRequiredClaim(claim) => TokenVerificationError::MissingClaim {
+                    claim: required_claim_name(claim),
+                },
+                JwtErrorKind::InvalidSignature => TokenVerificationError::InvalidSignature,
+                _ => TokenVerificationError::Malformed,
+            })
+        })?;
+        let claims = data.claims;
+        let jti = claims.jti.as_deref().filter(|jti| !jti.is_empty()).ok_or(
+            PrincipalStoreError::Unauthorized(TokenVerificationError::MissingClaim {
+                claim: "jti",
+            }),
+        )?;
+        let _ = jti;
+        let iat = claims.iat.ok_or(PrincipalStoreError::Unauthorized(
+            TokenVerificationError::MissingClaim { claim: "iat" },
+        ))?;
+        let exp = claims.exp.ok_or(PrincipalStoreError::Unauthorized(
+            TokenVerificationError::MissingClaim { claim: "exp" },
+        ))?;
+        if exp < iat || exp - iat > verifier.max_ttl.as_secs() {
+            return Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::InvalidLifetime {
+                    kid: verifier.kid.clone(),
+                },
+            ));
+        }
+        let _ = claims.nbf;
+        let namespace = claims.ns.ok_or(PrincipalStoreError::Forbidden(
+            TokenVerificationError::MissingClaim { claim: "ns" },
+        ))?;
+        if !self.namespaces.contains(&namespace) {
+            return Err(PrincipalStoreError::Forbidden(
+                TokenVerificationError::UnknownNamespace { namespace },
+            ));
+        }
+        if !verifier.namespaces.contains(&namespace) {
+            return Err(PrincipalStoreError::Forbidden(
+                TokenVerificationError::SignerNotPermitted {
+                    kid: verifier.kid.clone(),
+                    namespace,
+                },
+            ));
+        }
+        let subject = claims.sub.ok_or(PrincipalStoreError::Unauthorized(
+            TokenVerificationError::MissingClaim { claim: "sub" },
+        ))?;
+        Ok(Some(InboundKey { namespace, subject }))
+    }
+}
+
+fn required_claim_name(claim: &str) -> &'static str {
+    match claim {
+        "exp" => "exp",
+        "aud" => "aud",
+        _ => "claim",
+    }
 }
 
 #[async_trait]
@@ -203,6 +477,10 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+    use serde::Serialize;
+    use std::collections::HashMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct ShapedStore {
         name: &'static str,
@@ -386,5 +664,177 @@ mod tests {
             .expect("static key resolves");
         assert_eq!(principal.namespace, "platform");
         assert_eq!(principal.subject, "AXOND_KEY");
+    }
+
+    #[derive(Serialize)]
+    struct TestClaims {
+        exp: Option<u64>,
+        iat: Option<u64>,
+        nbf: Option<u64>,
+        aud: String,
+        jti: Option<String>,
+        ns: Option<String>,
+        sub: Option<String>,
+    }
+
+    const ED_PRIVATE_PK8: &[u8] = &[
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20, 0x6a, 0xc3, 0xfd, 0xee, 0xee, 0x29, 0x8a, 0x92, 0x63, 0x8b, 0x70, 0x0c, 0x4b, 0x11,
+        0x7c, 0xc3, 0x2e, 0x2d, 0x2a, 0xce, 0x0d, 0xfd, 0x78, 0x76, 0x94, 0xe2, 0x4c, 0xae, 0x8a,
+        0xd5, 0x82, 0x34,
+    ];
+    const ED_PUBLIC_RAW: &[u8] = &[
+        0xdb, 0xe2, 0x63, 0xd9, 0x4b, 0xcd, 0x0a, 0xf4, 0x22, 0x50, 0xf3, 0x58, 0x46, 0x04, 0xa2,
+        0xd1, 0xc2, 0x52, 0x3e, 0x22, 0x48, 0xe9, 0x1b, 0x3a, 0x0f, 0x45, 0x13, 0x78, 0x4a, 0x50,
+        0x56, 0x3f,
+    ];
+
+    fn token_verifier() -> TokenVerifier {
+        let config = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[namespace]]
+id = "acme"
+
+[[gateway_key]]
+env = "STATIC_KEY"
+namespace = "platform"
+
+[gateway_token]
+audience = "test-audience"
+
+[[gateway_verifier]]
+kid = "ed-test"
+alg = "EdDSA"
+env = "ED_PUBLIC"
+namespaces = ["acme"]
+max_ttl = "15m"
+"#,
+        )
+        .expect("test verifier config");
+        let env = HashMap::from([
+            ("STATIC_KEY".to_owned(), "static-secret".to_owned()),
+            ("ED_PUBLIC".to_owned(), BASE64.encode(ED_PUBLIC_RAW)),
+        ]);
+        TokenVerifier::build(&config, &env)
+            .expect("test verifier builds")
+            .expect("verifier is configured")
+    }
+
+    fn signed_token(claims: TestClaims) -> String {
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some("ed-test".to_owned());
+        format!(
+            "axt1.{}",
+            encode(&header, &claims, &EncodingKey::from_ed_der(ED_PRIVATE_PK8))
+                .expect("test token signs")
+        )
+    }
+
+    fn valid_claims() -> TestClaims {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs();
+        TestClaims {
+            exp: Some(now + 600),
+            iat: Some(now),
+            nbf: None,
+            aud: "test-audience".to_owned(),
+            jti: Some("jti-1".to_owned()),
+            ns: Some("acme".to_owned()),
+            sub: Some("caller-1".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn token_verifier_accepts_a_raw_base64_ed25519_public_key() {
+        let verifier = token_verifier();
+        let principal = verifier
+            .resolve(&Presented {
+                credential: &signed_token(valid_claims()),
+            })
+            .await
+            .expect("valid token resolves")
+            .expect("valid token returns a principal");
+        assert_eq!(principal.namespace, "acme");
+        assert_eq!(principal.subject, "caller-1");
+    }
+
+    #[tokio::test]
+    async fn token_verifier_distinguishes_authentication_and_authorization_failures() {
+        let verifier = token_verifier();
+
+        let mut wrong_audience = valid_claims();
+        wrong_audience.aud = "other".to_owned();
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(wrong_audience),
+                })
+                .await,
+            Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::WrongAudience
+            ))
+        ));
+
+        let mut unknown_namespace = valid_claims();
+        unknown_namespace.ns = Some("ghost".to_owned());
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(unknown_namespace),
+                })
+                .await,
+            Err(PrincipalStoreError::Forbidden(
+                TokenVerificationError::UnknownNamespace { .. }
+            ))
+        ));
+
+        let mut unpermitted_namespace = valid_claims();
+        unpermitted_namespace.ns = Some("platform".to_owned());
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(unpermitted_namespace),
+                })
+                .await,
+            Err(PrincipalStoreError::Forbidden(
+                TokenVerificationError::SignerNotPermitted { .. }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn token_verifier_requires_jti_and_enforces_max_ttl() {
+        let verifier = token_verifier();
+        let mut missing_jti = valid_claims();
+        missing_jti.jti = None;
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(missing_jti),
+                })
+                .await,
+            Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::MissingClaim { claim: "jti" }
+            ))
+        ));
+
+        let mut too_long = valid_claims();
+        too_long.exp = too_long.iat.map(|iat| iat + 901);
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(too_long),
+                })
+                .await,
+            Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::InvalidLifetime { .. }
+            ))
+        ));
     }
 }

@@ -27,6 +27,7 @@ use crate::config::{Config, ProviderKind};
 use crate::credentials::{CredentialError, Credentials};
 use crate::principals::{
     ConfigPrincipals, GatewayKeyEntry, Presented, PrincipalShapeError, PrincipalStoreChain,
+    TokenVerifier, TokenVerifierBuildError,
 };
 use crate::usage::UsageFanout;
 
@@ -81,6 +82,8 @@ pub enum SnapshotError {
     },
     #[error(transparent)]
     PrincipalShapes(#[from] PrincipalShapeError),
+    #[error(transparent)]
+    TokenVerifier(#[from] TokenVerifierBuildError),
     #[error(
         "no inbound gateway key resolved: inbound authentication fails closed and there is no keyless mode"
     )]
@@ -140,7 +143,11 @@ impl ConfigSnapshot {
         }
         let inbound_keys: Arc<[GatewayKeyEntry]> = inbound_keys.into();
         let config_principals = ConfigPrincipals::new(Arc::clone(&inbound_keys));
-        let principals = PrincipalStoreChain::new(Vec::new(), config_principals)?;
+        let stores = TokenVerifier::build(&config, env)?
+            .into_iter()
+            .map(|verifier| Box::new(verifier) as Box<dyn crate::principals::PrincipalStore>)
+            .collect();
+        let principals = PrincipalStoreChain::new(stores, config_principals)?;
         Ok(Self {
             config,
             credentials,
@@ -165,6 +172,10 @@ impl ConfigSnapshot {
     /// metrics — the count is safe to surface, the secrets are not.
     pub fn inbound_key_count(&self) -> usize {
         self.principals.config_count()
+    }
+
+    pub fn token_verifier_count(&self) -> usize {
+        self.config.gateway_verifier.len()
     }
 }
 
@@ -265,6 +276,43 @@ namespace = "platform"
             // The message names the reference, never a value.
             assert!(err.to_string().contains("AXOND_KEY"), "{err}");
         }
+    }
+
+    #[test]
+    fn a_declared_gateway_verifier_without_its_env_var_refuses_to_resolve() {
+        let config = config_with(
+            r#"
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "platform"
+
+[gateway_token]
+audience = "test"
+
+[[gateway_verifier]]
+kid = "test"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+"#,
+        );
+        let Err(err) = ConfigSnapshot::build(
+            config,
+            &HashMap::from([("AXOND_KEY".to_owned(), "static-secret".to_owned())]),
+            0,
+        ) else {
+            panic!("the verifier cannot be resolved");
+        };
+        assert!(
+            matches!(
+                err,
+                SnapshotError::TokenVerifier(
+                    crate::principals::TokenVerifierBuildError::MissingKey { ref kid, ref env }
+                ) if kid == "test" && env == "JWT_SECRET"
+            ),
+            "{err}"
+        );
     }
 
     /// Two keys holding one secret cannot both be honoured: the table is keyed

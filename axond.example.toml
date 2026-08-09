@@ -149,6 +149,31 @@ namespace = "platform"
 env = "GW_INBOUND_ACME_KEY"
 namespace = "acme"
 
+# ── Minted token verification (optional) ─────────────────────────────────────
+# Verifiers are additive to the required static gateway keys. The Ed25519
+# public key is a single-line base64 encoding of the raw 32-byte public key;
+# the referenced env var is validated at boot and reload. `kid` is carried in
+# the JWS header, and the configured algorithm is authoritative.
+#
+# [gateway_token]
+# audience = "acme-production"
+#
+# [[gateway_verifier]]
+# kid = "acme-2026-08"
+# alg = "EdDSA"
+# env = "GW_VERIFY_ACME_2026_08"
+# namespaces = ["acme"]
+# max_ttl = "15m"
+#
+# HS256 is also supported as a deliberate shared-secret escape hatch:
+#
+# [[gateway_verifier]]
+# kid = "local-minter"
+# alg = "HS256"
+# env = "GW_VERIFY_LOCAL_MINTER"
+# namespaces = ["platform"]
+# max_ttl = "15m"
+
 # ── Models (aliases) ──────────────────────────────────────────────────────────
 # Callers send the alias (`gpt-4o`), never `provider/model`. Targets are tried
 # in configured order, failing over to the next on a retryable upstream failure

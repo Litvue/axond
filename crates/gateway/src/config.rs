@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use gateway_core::ModelPrice;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::usage::{BatchSettings, MAX_ROWS_PER_STATEMENT, validate_table_name};
 
@@ -48,6 +48,12 @@ pub struct Config {
     /// so there is no keyless mode (ADR 0013).
     #[serde(default)]
     pub gateway_key: Vec<GatewayKey>,
+    /// Token verification authority. Verifiers are additive to static gateway
+    /// keys and require a deployment audience when any are configured.
+    #[serde(default)]
+    pub gateway_verifier: Vec<GatewayVerifier>,
+    #[serde(default)]
+    pub gateway_token: Option<GatewayToken>,
     /// Where raw usage records go. Empty means the no-datastore default: one
     /// JSON line per record on stdout (ADR 0002).
     #[serde(default)]
@@ -489,6 +495,78 @@ pub struct GatewayKey {
     pub namespace: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct GatewayToken {
+    pub audience: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum GatewayVerifierAlgorithm {
+    #[serde(rename = "EdDSA")]
+    EdDsa,
+    #[serde(rename = "HS256")]
+    Hs256,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GatewayVerifier {
+    pub kid: String,
+    pub alg: GatewayVerifierAlgorithm,
+    pub env: String,
+    pub namespaces: Vec<String>,
+    #[serde(deserialize_with = "deserialize_gateway_ttl")]
+    pub max_ttl: Duration,
+}
+
+const MAX_GATEWAY_VERIFIER_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+fn deserialize_gateway_ttl<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let seconds = match value {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .ok_or_else(|| serde::de::Error::custom("max_ttl must be a positive number"))?,
+        serde_json::Value::String(text) => {
+            parse_gateway_ttl(&text).map_err(serde::de::Error::custom)?
+        }
+        _ => {
+            return Err(serde::de::Error::custom(
+                "max_ttl must be a duration such as `15m`",
+            ));
+        }
+    };
+    if seconds == 0 || seconds > MAX_GATEWAY_VERIFIER_TTL_SECONDS {
+        return Err(serde::de::Error::custom(format!(
+            "max_ttl must be between 1s and {MAX_GATEWAY_VERIFIER_TTL_SECONDS}s"
+        )));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn parse_gateway_ttl(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    let (number, multiplier) = if let Some(number) = value.strip_suffix('s') {
+        (number, 1)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 60 * 60)
+    } else if let Some(number) = value.strip_suffix('d') {
+        (number, 24 * 60 * 60)
+    } else {
+        (value, 1)
+    };
+    let number = number
+        .parse::<u64>()
+        .map_err(|_| "max_ttl must be a duration such as `15m`".to_owned())?;
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| "max_ttl is too large".to_owned())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("config load: {0}")]
@@ -619,6 +697,7 @@ impl Config {
             }
         }
         self.validate_gateway_keys(&namespaces)?;
+        self.validate_gateway_verifiers(&namespaces)?;
         self.validate_usage_sinks()?;
         self.validate_budget()?;
         Ok(())
@@ -649,6 +728,62 @@ impl Config {
                     "gateway_key `{}` references undefined namespace `{}`",
                     k.env, k.namespace
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_gateway_verifiers(
+        &self,
+        namespaces: &HashMap<&str, &Namespace>,
+    ) -> Result<(), ConfigError> {
+        if self.gateway_verifier.is_empty() {
+            return Ok(());
+        }
+        let audience = self
+            .gateway_token
+            .as_ref()
+            .map(|token| token.audience.trim())
+            .filter(|audience| !audience.is_empty())
+            .ok_or_else(|| {
+                ConfigError::Invalid(
+                    "`[gateway_token] audience` is required when gateway verifiers are declared"
+                        .into(),
+                )
+            })?;
+        let _ = audience;
+        let mut kids = HashMap::new();
+        for verifier in &self.gateway_verifier {
+            if verifier.kid.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "gateway_verifier `kid` must not be empty".into(),
+                ));
+            }
+            if verifier.env.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "gateway_verifier `{}` has an empty `env`",
+                    verifier.kid
+                )));
+            }
+            if kids.insert(verifier.kid.as_str(), ()).is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate gateway_verifier kid `{}`",
+                    verifier.kid
+                )));
+            }
+            if verifier.namespaces.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "gateway_verifier `{}` must permit at least one namespace",
+                    verifier.kid
+                )));
+            }
+            for namespace in &verifier.namespaces {
+                if !namespaces.contains_key(namespace.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "gateway_verifier `{}` references undefined namespace `{namespace}`",
+                        verifier.kid
+                    )));
+                }
             }
         }
         Ok(())
@@ -826,6 +961,49 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
                 "expected `{key}` to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn rejects_verifiers_without_a_gateway_token_audience() {
+        let toml = format!(
+            "{VALID}\n[[gateway_verifier]]\nkid = \"test\"\nalg = \"HS256\"\nenv = \"JWT_SECRET\"\nnamespaces = [\"platform\"]\nmax_ttl = \"15m\"\n"
+        );
+        let err = Config::from_toml_str(&toml).expect_err("verifiers need an audience");
+        assert!(err.to_string().contains("gateway_token"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_verifier_only_config() {
+        let toml = r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_verifier]]
+kid = "test"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+
+[gateway_token]
+audience = "test"
+"#;
+        let err = Config::from_toml_str(toml).expect_err("static breakglass key is mandatory");
+        assert!(err.to_string().contains("gateway_key"), "{err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_or_unknown_verifier_configuration() {
+        let duplicate = format!(
+            "{VALID}\n[gateway_token]\naudience = \"test\"\n[[gateway_verifier]]\nkid = \"test\"\nalg = \"HS256\"\nenv = \"A\"\nnamespaces = [\"platform\"]\nmax_ttl = \"15m\"\n[[gateway_verifier]]\nkid = \"test\"\nalg = \"HS256\"\nenv = \"B\"\nnamespaces = [\"platform\"]\nmax_ttl = \"15m\"\n"
+        );
+        assert!(Config::from_toml_str(&duplicate).is_err());
+
+        let unknown_namespace = format!(
+            "{VALID}\n[gateway_token]\naudience = \"test\"\n[[gateway_verifier]]\nkid = \"test\"\nalg = \"HS256\"\nenv = \"A\"\nnamespaces = [\"ghost\"]\nmax_ttl = \"15m\"\n"
+        );
+        assert!(Config::from_toml_str(&unknown_namespace).is_err());
     }
 
     #[test]
