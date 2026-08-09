@@ -118,6 +118,14 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
             verifier.max_ttl.as_secs()
         );
     }
+    if let Some(verifier) = configured
+        && !verifier
+            .namespaces
+            .iter()
+            .any(|allowed| allowed == namespace)
+    {
+        bail!("verifier `{kid}` is not permitted for namespace `{namespace}`");
+    }
 
     let audience = args
         .get_one::<String>("audience")
@@ -185,7 +193,15 @@ pub fn keygen(args: &ArgMatches) -> Result<()> {
         bail!("--namespace must not be empty");
     }
     let max_ttl = required(args, "max-ttl")?;
-    parse_duration(max_ttl).context("--max-ttl is invalid")?;
+    let max_ttl_duration = parse_duration(max_ttl).context("--max-ttl is invalid")?;
+    if max_ttl_duration.is_zero()
+        || max_ttl_duration > Duration::from_secs(MAX_GATEWAY_VERIFIER_TTL_SECONDS)
+    {
+        bail!(
+            "--max-ttl must be between 1 second and {} hours",
+            MAX_GATEWAY_VERIFIER_TTL_SECONDS / (60 * 60)
+        );
+    }
 
     let (document, keypair) = generate_ed25519_keypair()?;
     write_private_key(private_path, document.as_ref())?;
@@ -237,15 +253,31 @@ fn encoding_key(algorithm: MintAlgorithm, value: &str, kid: &str) -> Result<Enco
 }
 
 fn load_optional_config(args: &ArgMatches) -> Result<Option<Config>> {
-    let path = args
-        .get_one::<String>("config")
-        .cloned()
-        .or_else(|| std::env::var("AXOND_CONFIG").ok());
-    path.map(|path| {
-        Config::load(&path)
-            .map_err(|error| anyhow::anyhow!("failed to load config from `{path}`: {error}"))
-    })
-    .transpose()
+    if let Some(path) = args.get_one::<String>("config") {
+        return load_config_path(path, true);
+    }
+    let Some(path) = std::env::var("AXOND_CONFIG").ok() else {
+        return Ok(None);
+    };
+    load_config_path(&path, false)
+}
+
+fn load_config_path(path: &str, explicit: bool) -> Result<Option<Config>> {
+    match Config::load(path) {
+        Ok(config) => Ok(Some(config)),
+        Err(error) => {
+            if explicit {
+                return Err(anyhow::anyhow!(
+                    "failed to load config from `{path}`: {error}"
+                ));
+            }
+            eprintln!(
+                "warning: could not load ambient AXOND_CONFIG `{path}` ({error}); \
+                 minting will enforce only the 24-hour policy ceiling"
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn parse_algorithm(value: &str) -> Result<MintAlgorithm> {
@@ -518,6 +550,66 @@ max_ttl = "15m"
     }
 
     #[test]
+    fn mint_rejects_namespace_not_permitted_by_matching_verifier() {
+        let args = mint_args(&[
+            "--kid",
+            "hs-kid",
+            "--key-env",
+            "HS_SECRET",
+            "--namespace",
+            "other",
+            "--subject",
+            "caller",
+            "--ttl",
+            "10m",
+        ]);
+        let config = verifier_config("hs-kid", "HS256", "HS_SECRET", "15m");
+        let error = mint_from_args(&args, Some(config), "01234567890123456789012345678901")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("hs-kid"));
+        assert!(error.contains("other"));
+    }
+
+    #[test]
+    fn keygen_rejects_zero_and_over_ceiling_max_ttl() {
+        for max_ttl in ["0", "25h"] {
+            let args = keygen_args(max_ttl);
+            let error = keygen(&args).unwrap_err().to_string();
+            assert!(error.contains("--max-ttl"));
+        }
+    }
+
+    #[test]
+    fn explicit_config_failure_is_fatal_but_ambient_failure_is_optional() {
+        let explicit = mint_args(&[
+            "--kid",
+            "hs-kid",
+            "--alg",
+            "HS256",
+            "--key-env",
+            "HS_SECRET",
+            "--namespace",
+            "acme",
+            "--subject",
+            "caller",
+            "--ttl",
+            "10m",
+            "--audience",
+            "configured-audience",
+            "--config",
+            "/definitely/missing/axond.toml",
+        ]);
+        assert!(load_optional_config(&explicit).is_err());
+
+        assert!(
+            load_config_path("/definitely/missing/axond.toml", false)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn parse_duration_supports_common_units() {
         assert_eq!(parse_duration("15m").unwrap(), Duration::from_secs(900));
         assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
@@ -581,6 +673,28 @@ max_ttl = "{max_ttl}"
             .unwrap()
             .remove_subcommand()
             .expect("mint subcommand")
+            .1
+    }
+
+    fn keygen_args(max_ttl: &str) -> clap::ArgMatches {
+        crate::cli()
+            .try_get_matches_from([
+                "axond",
+                "keygen",
+                "--private-key",
+                "/definitely/missing/axond.key",
+                "--kid",
+                "test-kid",
+                "--env",
+                "PUBLIC",
+                "--namespace",
+                "acme",
+                "--max-ttl",
+                max_ttl,
+            ])
+            .unwrap()
+            .remove_subcommand()
+            .expect("keygen subcommand")
             .1
     }
 }

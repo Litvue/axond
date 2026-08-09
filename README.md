@@ -75,8 +75,8 @@ cargo run -p axond                    # or: just run
 ```
 
 The same binary also provides offline token minting and Ed25519 key generation.
-Neither command loads the gateway config unless `mint` is given `--config` (or
-`AXOND_CONFIG` is set):
+`keygen` never loads the gateway config. `mint` uses an explicitly supplied
+`--config` when requested; an `AXOND_CONFIG` value is only an ambient aid.
 
 ```bash
 # Generate a public verifier key and write the base64 PKCS#8 private key to a
@@ -94,9 +94,12 @@ axond mint --kid acme-2026-08 --alg EdDSA --key-env GW_SIGN_ACME \
 
 `mint` prints only the `axt1.` token to stdout. It always enforces the 24-hour
 policy ceiling; when a matching verifier is available in `--config` (or
-`AXOND_CONFIG`), it also enforces that verifier's `max_ttl` and defaults the
-audience from `[gateway_token]`. Without that config, a token above the
-verifier's configured `max_ttl` can be minted but is rejected by the gateway.
+`AXOND_CONFIG`), it also enforces that verifier's `max_ttl` and namespace
+permission and defaults the audience from `[gateway_token]`. An unloadable
+explicit config fails; an unloadable ambient `AXOND_CONFIG` produces a warning
+on stderr and minting continues with only the policy ceiling. Without a usable
+config, a token above the verifier's configured `max_ttl` can be minted but is
+rejected by the gateway.
 The minter emits only claims enforced by the current verifier.
 
 ```bash
