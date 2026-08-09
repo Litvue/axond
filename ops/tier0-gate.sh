@@ -156,7 +156,7 @@ fi
 echo "namespace listeners: baseline (${baseline_listeners//$'\n'/, }) plus gateway 18081 and fake upstream 18082 only; external Redis 6379/Postgres 5432 are excluded by namespace egress denial"
 
 health_probe_body="$(mktemp "$tmpdir/axond-tier0-healthz.XXXXXX")"
-health_status="$(curl --silent --show-error --output "$health_probe_body" \
+health_status="$(curl --silent --show-error --max-time 5 --output "$health_probe_body" \
   --write-out '%{http_code}' "$base_url/healthz" || true)"
 [[ "$health_status" == 200 ]] ||
   failure "/healthz returned HTTP $health_status instead of 200"
@@ -166,7 +166,7 @@ rm -f "$health_probe_body"
 health_probe_body=""
 
 ready_probe_body="$(mktemp "$tmpdir/axond-tier0-readyz.XXXXXX")"
-ready_status="$(curl --silent --show-error --output "$ready_probe_body" \
+ready_status="$(curl --silent --show-error --max-time 5 --output "$ready_probe_body" \
   --write-out '%{http_code}' "$base_url/readyz" || true)"
 [[ "$ready_status" == 200 ]] ||
   failure "/readyz returned HTTP $ready_status instead of 200"
@@ -176,7 +176,7 @@ rm -f "$ready_probe_body"
 ready_probe_body=""
 
 models_probe_body="$(mktemp "$tmpdir/axond-tier0-models.XXXXXX")"
-models_status="$(curl --silent --show-error --output "$models_probe_body" \
+models_status="$(curl --silent --show-error --max-time 5 --output "$models_probe_body" \
   --write-out '%{http_code}' -H 'Authorization: Bearer tier0-gateway-key' \
   "$base_url/v1/models" || true)"
 [[ "$models_status" == 200 ]] ||
