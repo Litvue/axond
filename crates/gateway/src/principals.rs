@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -114,6 +114,8 @@ pub enum TokenVerifierBuildError {
     #[error("gateway_verifier `{kid}` must contain a 32-byte Ed25519 public key")]
     InvalidEd25519Key { kid: String },
 }
+
+const TOKEN_CLOCK_SKEW_SECONDS: u64 = 5;
 
 struct ResolvedVerifier {
     kid: String,
@@ -251,7 +253,7 @@ impl PrincipalStore for TokenVerifier {
 
         let mut validation = Validation::new(verifier.algorithm);
         // Five seconds is the fixed clock-skew allowance promised by ADR 0016.
-        validation.leeway = 5;
+        validation.leeway = TOKEN_CLOCK_SKEW_SECONDS;
         validation.validate_nbf = true;
         validation.set_audience(std::slice::from_ref(&self.audience));
         validation.set_required_spec_claims(&["exp", "aud"]);
@@ -285,7 +287,16 @@ impl PrincipalStore for TokenVerifier {
                 claim: "exp".to_owned(),
             },
         ))?;
-        if exp < iat || exp - iat > verifier.max_ttl.as_secs() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        let max_ttl = verifier.max_ttl.as_secs();
+        if exp < iat
+            || exp - iat > max_ttl
+            || iat > now.saturating_add(TOKEN_CLOCK_SKEW_SECONDS)
+            || exp > now.saturating_add(max_ttl)
+        {
             return Err(PrincipalStoreError::Unauthorized(
                 TokenVerificationError::InvalidLifetime {
                     kid: verifier.kid.clone(),
@@ -734,12 +745,9 @@ max_ttl = "15m"
     }
 
     fn valid_claims() -> TestClaims {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_secs();
+        let now = unix_now();
         TestClaims {
-            exp: Some(now + 600),
+            exp: Some(now + 900),
             iat: Some(now),
             nbf: None,
             aud: "test-audience".to_owned(),
@@ -747,6 +755,13 @@ max_ttl = "15m"
             ns: Some("acme".to_owned()),
             sub: Some("caller-1".to_owned()),
         }
+    }
+
+    fn unix_now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs()
     }
 
     #[tokio::test]
@@ -842,6 +857,36 @@ max_ttl = "15m"
             verifier
                 .resolve(&Presented {
                     credential: &signed_token(too_long),
+                })
+                .await,
+            Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::InvalidLifetime { .. }
+            ))
+        ));
+
+        let future_iat = unix_now() + 10;
+        let mut future_issued = valid_claims();
+        future_issued.iat = Some(future_iat);
+        future_issued.exp = Some(future_iat + 900);
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(future_issued),
+                })
+                .await,
+            Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::InvalidLifetime { .. }
+            ))
+        ));
+
+        let far_future_iat = unix_now() + 10 * 365 * 24 * 60 * 60;
+        let mut far_future_exp = valid_claims();
+        far_future_exp.iat = Some(far_future_iat);
+        far_future_exp.exp = Some(far_future_iat + 900);
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(far_future_exp),
                 })
                 .await,
             Err(PrincipalStoreError::Unauthorized(

@@ -191,6 +191,7 @@ pub struct ReloadSummary {
     pub models: Delta,
     pub credentials: Delta,
     pub gateway_keys: Delta,
+    pub gateway_verifiers: Delta,
     /// `[server] bind` differs from what the process bound at startup.
     pub bind_changed: bool,
     /// `[[usage_sink]]` differs from the connected sinks.
@@ -256,6 +257,10 @@ impl ReloadSummary {
                 before.gateway_key.iter().map(|k| k.env.clone()),
                 after.gateway_key.iter().map(|k| k.env.clone()),
             ),
+            gateway_verifiers: Delta::between(
+                before.gateway_verifier.iter().map(|v| v.kid.clone()),
+                after.gateway_verifier.iter().map(|v| v.kid.clone()),
+            ),
             bind_changed: boot.bind != after.server.bind,
             usage_sinks_changed: boot.usage_sink != after.usage_sink,
         }
@@ -268,6 +273,7 @@ impl ReloadSummary {
             && self.models.is_empty()
             && self.credentials.is_empty()
             && self.gateway_keys.is_empty()
+            && self.gateway_verifiers.is_empty()
     }
 
     fn log_applied(&self, trigger: &'static str, path: &str) {
@@ -279,6 +285,7 @@ impl ReloadSummary {
             models = %self.models,
             credentials = %self.credentials,
             gateway_keys = %self.gateway_keys,
+            gateway_verifiers = %self.gateway_verifiers,
             changed = !self.is_empty(),
             "config reloaded"
         );
@@ -470,6 +477,7 @@ targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdo
         [
             (INBOUND_KEY_ENV.to_string(), "inbound-secret".to_string()),
             ("PLATFORM_OPENAI_KEY".to_string(), "sk-platform".to_string()),
+            ("JWT_SECRET".to_string(), "jwt-test-secret".to_string()),
         ]
         .into_iter()
         .collect()
@@ -531,6 +539,29 @@ targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdo
         );
         let aliases = listed_aliases(&state).await;
         assert!(aliases.contains(&"acme-fast".to_string()));
+    }
+
+    #[tokio::test]
+    async fn reload_summary_reports_gateway_verifier_kid_changes() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+        file.rewrite(&format!(
+            "{PLATFORM_ONLY}\n[gateway_token]\naudience = \"reload-test\"\n\n[[gateway_verifier]]\nkid = \"reload-kid\"\nalg = \"HS256\"\nenv = \"JWT_SECRET\"\nnamespaces = [\"platform\"]\nmax_ttl = \"15m\"\n"
+        ));
+
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("verifier candidate is valid");
+        assert_eq!(summary.gateway_verifiers.added, vec!["reload-kid"]);
+        assert!(summary.gateway_verifiers.removed.is_empty());
+
+        file.rewrite(PLATFORM_ONLY);
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("verifier removal is valid");
+        assert!(summary.gateway_verifiers.added.is_empty());
+        assert_eq!(summary.gateway_verifiers.removed, vec!["reload-kid"]);
     }
 
     /// The reload reads the environment, so a key exported after boot resolves —
