@@ -331,7 +331,7 @@ impl UnavailablePolicy {
                 tracing::error!(
                     backend,
                     error = %error,
-                    "budget store is unreachable; denying (fail-closed)"
+                    "budget cap is unenforceable; denying (fail-closed)"
                 );
                 Admission::Denied(Denial::StoreUnavailable)
             }
@@ -339,7 +339,7 @@ impl UnavailablePolicy {
                 tracing::warn!(
                     backend,
                     error = %error,
-                    "budget store is unreachable; admitting unenforced (fail-open)"
+                    "budget cap is unenforceable; admitting unenforced (fail-open)"
                 );
                 Admission::Allowed(Reservation::unheld())
             }
