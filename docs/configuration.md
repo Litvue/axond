@@ -170,7 +170,9 @@ for the new-`kid` rotation procedure and the Tier 0/Tier 1 revocation boundary.
 
 A reload re-runs the full boot validation against the current file **and the
 current process environment**; a bad candidate is rejected and the running
-config keeps serving. `[server] bind`, `[[usage_sink]]`, and `[budget]`
+config keeps serving. The process environment cannot gain a new variable, so a
+newly named minted-verifier `env` reference requires a restart; removing an
+existing verifier can be applied by reload. `[server] bind`, `[[usage_sink]]`, and `[budget]`
 changes warn and are ignored until restart; this includes
 `limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
 

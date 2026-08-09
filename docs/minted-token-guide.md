@@ -29,27 +29,7 @@ boot, and a missing referenced environment variable is a fatal error.
 
 ## 2. Generate and install an Ed25519 signer
 
-Run `keygen` on the machine that will mint tokens:
-
-```bash
-axond keygen \
-  --private-key ./acme-signing.key \
-  --kid acme-2026-08 \
-  --env GW_VERIFY_ACME_2026_08 \
-  --namespace acme \
-  --max-ttl 15m
-```
-
-`keygen` creates the private-key file with `create_new`; it never overwrites an
-existing path. On Unix the file mode is `0600`. On non-Unix platforms the
-command warns on stderr because permissions are inherited and must be
-restricted by the operator. The file contains one line of standard-base64
-PKCS#8 Ed25519 private-key material, followed by a newline.
-
-Stdout contains only the standard-base64 raw Ed25519 public key and a
-paste-ready `[[gateway_verifier]]` snippet. The private key is never printed.
-Capture the output once, then install the public half in the gateway
-environment under the name printed by `--env`:
+Run `keygen` once on the machine that will mint tokens, capturing its output:
 
 ```bash
 KEYGEN_OUTPUT="$(axond keygen \
@@ -62,6 +42,17 @@ printf '%s\n' "$KEYGEN_OUTPUT"
 # Copy the `export GW_VERIFY_ACME_2026_08='...'` line from the output into
 # the gateway's environment manager.
 ```
+
+`keygen` creates the private-key file with `create_new`; it never overwrites an
+existing path. On Unix the file mode is `0600`. On non-Unix platforms the
+command warns on stderr because permissions are inherited and must be
+restricted by the operator. The file contains one line of standard-base64
+PKCS#8 Ed25519 private-key material, followed by a newline.
+
+Stdout contains only the standard-base64 raw Ed25519 public key and a
+paste-ready `[[gateway_verifier]]` snippet. The private key is never printed.
+Install the public half in the gateway environment under the name printed by
+`--env`; the `printf` above displays the line to copy.
 
 Do not put the private file on verification-only replicas.
 
@@ -146,6 +137,21 @@ only contains aliases the `acme` namespace can resolve.
 
 HS256 is supported for deliberate shared-secret deployments:
 
+Add this verifier alongside the EdDSA verifier in `axond.toml` before running
+the command:
+
+```toml
+[gateway_token]
+audience = "acme-production"
+
+[[gateway_verifier]]
+kid = "local-minter"
+alg = "HS256"
+env = "GW_VERIFY_LOCAL_MINTER"
+namespaces = ["platform"]
+max_ttl = "15m"
+```
+
 ```bash
 export GW_SIGN_LOCAL='01234567890123456789012345678901'
 TOKEN="$(
@@ -188,23 +194,27 @@ are tracked by #60, #61, and #62 respectively.
 
 ## 5. Rotation runbook
 
-Rotation follows the config reload dance from ADR 0011 and ADR 0013. The
-static breakglass key remains present throughout:
+Minted verifier rotation is a restart operation today, not a zero-downtime
+reload. The running process cannot gain a new environment variable: exporting
+`GW_VERIFY_ACME_2026_11` in an operator shell does not add it to an already
+running gateway. This limitation is tracked in [#86](https://github.com/Litvue/axond/issues/86).
+The static breakglass key remains present throughout:
 
 1. Generate or provision the new signer with a new `kid`, for example
-   `acme-2026-11`, and place its public key in the new environment variable.
+   `acme-2026-11`, and provision its public key in the gateway's environment
+   manager under a new variable such as `GW_VERIFY_ACME_2026_11`.
 2. Add the new `[[gateway_verifier]]` entry alongside the old entry. Keep the
    same audience and namespace permissions unless the change is intentional.
-3. Reload the gateway:
+3. Start or restart the gateway with the new environment variable and both
+   verifier entries present. Confirm the new verifier is active.
+4. Switch all minting over to the new `kid`.
+5. Wait for tokens signed by the old `kid` to expire, or remove its verifier
+   entry to revoke them immediately.
+6. Remove the old verifier entry and reload:
 
    ```bash
    kill -HUP "$AXOND_PID"
    ```
-
-4. Confirm the reload was applied and switch all minting to the new `kid`.
-5. Wait for tokens signed by the old `kid` to expire, or accept that removing
-   it revokes them immediately.
-6. Remove the old verifier entry and reload again.
 
 The candidate passes the full boot validation before an atomic snapshot swap.
 A failed reload leaves the previous config serving. The applied reload log
@@ -212,11 +222,12 @@ reports added, removed, and definition-changed verifier `kid` values, plus the
 audience delta. It does not report public-key or secret values.
 
 Important rotation trap: the verifier definition diff compares the configured
-`kid`, algorithm, env-var **name**, permitted namespaces, and `max_ttl`. The
-process environment is reread during reload, so changing the public-key value
-under the same `kid` can change the active key while the reload summary says
-`changed=false`. Same-name key-material rotation is therefore not visible in
-that summary; use a new `kid` for an observable, overlap-safe rotation.
+`kid`, algorithm, env-var **name**, permitted namespaces, and `max_ttl`; it does
+not inspect key material. Changing the public-key value under the same `kid`
+therefore takes effect only when the gateway starts or restarts, and a later
+reload can still report `changed=false`. Same-name key-material rotation is
+not visible in that summary; use a new `kid` for an observable, overlap-safe
+rotation.
 
 ## 6. Revocation ladder
 

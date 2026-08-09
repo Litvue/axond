@@ -188,11 +188,14 @@ namespace = "acme"
 # max_ttl may be at most 24h (a policy ceiling, not a protocol limit).
 # max_ttl = "15m"
 #
-# For rotation, add a new verifier with a NEW `kid`, export its env var, reload
-# with SIGHUP, switch minting, then remove the old verifier and reload again.
-# The reload summary reports verifier kid/definition changes but does not
-# inspect key material. Replacing the env-var value under the same `kid` can
-# therefore apply with `changed=false`; use a new `kid` for visible overlap.
+# For rotation, provision the new verifier env var BEFORE starting/restarting
+# the gateway, declare the new verifier alongside the old one, start/restart,
+# switch minting, then remove the old verifier and reload. A running process
+# cannot gain a new env var, so adding one and sending SIGHUP is rejected
+# (#86). The reload summary reports verifier kid/definition changes but does not
+# inspect key material. Replacing the env-var value under the same `kid` takes
+# effect only at restart and a later reload can still show `changed=false`; use
+# a new `kid` for visible overlap.
 # Short TTLs and removing a kid are the current coarse revocation controls.
 # Precise single-token revocation requires the future Tier 1 `jti` denylist
 # (#68); `min_iat` is tracked separately by #63. See
@@ -256,9 +259,10 @@ targets = [
 # edit or a Kubernetes ConfigMap symlink swap; a touched-but-identical file
 # reloads nothing). Off by default: a signal is an explicit operator action.
 #
-# For minted identity rotation, prefer adding a new `[[gateway_verifier]]` with
-# a new `kid`; same-kid environment-value replacement is not visible in the
-# verifier definition summary (`changed=false`).
+# For minted identity rotation, provision new verifier env vars before a
+# restart, then prefer adding a new `[[gateway_verifier]]` with a new `kid`;
+# same-kid environment-value replacement is not visible in the verifier
+# definition summary (`changed=false`).
 #
 # `[server] bind`, `[[usage_sink]]`, and `[budget]` changes are reported with a
 # warning and otherwise ignored — the socket is already bound, sinks own live

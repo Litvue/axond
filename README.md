@@ -316,8 +316,11 @@ The candidate config goes through the **full boot-time validation**, so a reload
 is the boot gate applied again: any error — bad TOML, an alias pointing at an
 undefined provider, a declared credential whose env var is unset — rejects the
 candidate and the **previous config keeps serving**. The process environment is
-re-read on every reload, which is what makes a newly-referenced credential
-resolve; it must be set on the gateway's process, not just in your shell.
+re-read on every reload, which makes a newly-referenced credential resolve when
+that variable is already present in the gateway process. A running process
+cannot gain a new environment variable: minted verifier rotation must provision
+the new variable before a restart, then start with both verifier entries before
+removing the old one. See [#86](https://github.com/Litvue/axond/issues/86).
 
 A successful reload publishes one atomic snapshot. Each request takes that
 snapshot once and holds it for its whole life (streams included), so a reload
