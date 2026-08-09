@@ -11,6 +11,7 @@ use base64::{
 use clap::ArgMatches;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use ring::{
+    pkcs8::Document,
     rand::{SecureRandom, SystemRandom},
     signature::{Ed25519KeyPair, KeyPair},
 };
@@ -256,13 +257,12 @@ fn validate_keygen_identifier(flag: &str, value: &str, allow_punctuation: bool) 
     Ok(())
 }
 
-fn generate_ed25519_keypair() -> Result<(Vec<u8>, Ed25519KeyPair)> {
+fn generate_ed25519_keypair() -> Result<(Document, Ed25519KeyPair)> {
     let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
         .map_err(|_| anyhow::anyhow!("failed to generate Ed25519 keypair"))?;
-    let bytes = document.as_ref().to_vec();
-    let keypair = Ed25519KeyPair::from_pkcs8(&bytes)
+    let keypair = Ed25519KeyPair::from_pkcs8(document.as_ref())
         .map_err(|_| anyhow::anyhow!("generated Ed25519 keypair is invalid"))?;
-    Ok((bytes, keypair))
+    Ok((document, keypair))
 }
 
 fn encoding_key(algorithm: MintAlgorithm, value: &str, kid: &str) -> Result<EncodingKey> {
@@ -386,13 +386,16 @@ fn write_private_key(path: &str, bytes: &[u8]) -> Result<()> {
         "warning: private key file `{path}` uses inherited permissions on this platform; \
          restrict access manually"
     );
-    let encoded = STANDARD.encode(bytes);
+    let encoded = SecretString::from(STANDARD.encode(bytes));
     if let Err(error) = file
-        .write_all(encoded.as_bytes())
+        .write_all(encoded.expose_secret().as_bytes())
         .and_then(|_| file.write_all(b"\n"))
     {
+        drop(file);
         let _ = std::fs::remove_file(path);
-        return Err(error).with_context(|| format!("cannot write private key file `{path}`"));
+        return Err(error).with_context(|| {
+            format!("cannot write private key file `{path}`; delete it manually if it still exists")
+        });
     }
     Ok(())
 }
@@ -450,7 +453,7 @@ max_ttl = "15m"
         let token = mint_token(
             "test-kid",
             MintAlgorithm::EdDsa,
-            &format!(" \n{}\t ", STANDARD.encode(private)),
+            &format!(" \n{}\t ", STANDARD.encode(private.as_ref())),
             "acme",
             "caller",
             "configured-audience",
@@ -565,10 +568,10 @@ max_ttl = "15m"
             std::process::id(),
             random_jti().unwrap()
         ));
-        write_private_key(path.to_str().unwrap(), &private).unwrap();
+        write_private_key(path.to_str().unwrap(), private.as_ref()).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(STANDARD.decode(written.trim()).unwrap(), private);
-        assert!(write_private_key(path.to_str().unwrap(), &private).is_err());
+        assert_eq!(STANDARD.decode(written.trim()).unwrap(), private.as_ref());
+        assert!(write_private_key(path.to_str().unwrap(), private.as_ref()).is_err());
         let _ = std::fs::remove_file(&path);
 
         let config = verifier_config("generated-kid", "EdDSA", "PUBLIC", "15m");
@@ -583,7 +586,7 @@ max_ttl = "15m"
         let token = mint_token(
             "generated-kid",
             MintAlgorithm::EdDsa,
-            &STANDARD.encode(private),
+            &STANDARD.encode(private.as_ref()),
             "acme",
             "generated-caller",
             "configured-audience",
