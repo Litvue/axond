@@ -29,7 +29,7 @@ mod redis;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
@@ -147,13 +147,25 @@ impl BudgetStore for NoBudget {
 /// are held, so concurrent requests on *this* replica cannot overshoot.
 pub struct InMemoryBudget {
     limit_microdollars: u64,
+    idle_ttl: Duration,
+    max_subjects: usize,
     ledgers: Mutex<HashMap<BudgetKey, Ledger>>,
 }
 
-#[derive(Default)]
 struct Ledger {
     spent: u64,
     held: HashMap<String, u64>,
+    last_touched: Instant,
+}
+
+impl Default for Ledger {
+    fn default() -> Self {
+        Self {
+            spent: 0,
+            held: HashMap::new(),
+            last_touched: Instant::now(),
+        }
+    }
 }
 
 impl Ledger {
@@ -165,11 +177,26 @@ impl Ledger {
 }
 
 impl InMemoryBudget {
+    #[cfg(test)]
     pub fn new(limit_microdollars: u64) -> Self {
+        Self::with_limits(limit_microdollars, Duration::from_secs(60 * 60), 10_000)
+    }
+
+    fn with_limits(limit_microdollars: u64, idle_ttl: Duration, max_subjects: usize) -> Self {
         Self {
             limit_microdollars,
+            idle_ttl,
+            max_subjects,
             ledgers: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn prune_idle(&self, ledgers: &mut HashMap<BudgetKey, Ledger>) {
+        let now = Instant::now();
+        ledgers.retain(|_, ledger| {
+            !ledger.held.is_empty()
+                || now.saturating_duration_since(ledger.last_touched) <= self.idle_ttl
+        });
     }
 }
 
@@ -181,7 +208,20 @@ impl BudgetStore for InMemoryBudget {
 
     async fn reserve(&self, key: &BudgetKey, estimated_microdollars: u64) -> Admission {
         let mut ledgers = self.ledgers.lock().unwrap_or_else(|e| e.into_inner());
+        if !ledgers.contains_key(key) && ledgers.len() >= self.max_subjects {
+            self.prune_idle(&mut ledgers);
+            if ledgers.len() >= self.max_subjects {
+                tracing::error!(
+                    backend = "in_memory",
+                    subjects = ledgers.len(),
+                    max_subjects = self.max_subjects,
+                    "in-memory budget ledger capacity reached; denying (fail-closed)"
+                );
+                return Admission::Denied(Denial::StoreUnavailable);
+            }
+        }
         let ledger = ledgers.entry(key.clone()).or_default();
+        ledger.last_touched = Instant::now();
         let committed = ledger.spent.saturating_add(ledger.outstanding());
         if committed.saturating_add(estimated_microdollars) > self.limit_microdollars {
             return Admission::Denied(Denial::Exceeded);
@@ -199,6 +239,7 @@ impl BudgetStore for InMemoryBudget {
     async fn settle(&self, key: &BudgetKey, reservation: &Reservation, actual_microdollars: u64) {
         let mut ledgers = self.ledgers.lock().unwrap_or_else(|e| e.into_inner());
         let ledger = ledgers.entry(key.clone()).or_default();
+        ledger.last_touched = Instant::now();
         ledger.held.remove(&reservation.id);
         ledger.spent = ledger.spent.saturating_add(actual_microdollars);
     }
@@ -291,7 +332,11 @@ pub async fn build(
     };
     match config.backend {
         BudgetBackend::None => Ok(Box::new(NoBudget)),
-        BudgetBackend::InMemory => Ok(Box::new(InMemoryBudget::new(config.limit_microdollars))),
+        BudgetBackend::InMemory => Ok(Box::new(InMemoryBudget::with_limits(
+            config.limit_microdollars,
+            Duration::from_secs(config.idle_ttl),
+            config.max_subjects,
+        ))),
         BudgetBackend::Redis => {
             let url = dsn(config, "redis", env)?;
             Ok(Box::new(
@@ -453,5 +498,114 @@ mod tests {
             .await
             .expect("the default backend needs no datastore");
         assert_eq!(store.name(), "none");
+    }
+
+    #[tokio::test]
+    async fn an_idle_unheld_ledger_is_evicted_at_capacity() {
+        let budget = InMemoryBudget::with_limits(1_000, Duration::from_millis(1), 1);
+        let first = key();
+        let second = BudgetKey {
+            namespace: "acme".into(),
+            subject: "second".into(),
+        };
+
+        let reservation = budget.reserve(&first, 100).await;
+        budget.settle(&first, reservation.reservation(), 100).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        assert!(matches!(
+            budget.reserve(&second, 100).await,
+            Admission::Allowed(_)
+        ));
+        assert_eq!(budget.ledgers.lock().unwrap().len(), 1);
+        assert!(!budget.ledgers.lock().unwrap().contains_key(&first));
+    }
+
+    #[tokio::test]
+    async fn an_outstanding_reservation_survives_pruning_and_settlement() {
+        let budget = InMemoryBudget::with_limits(1_000, Duration::from_millis(1), 1);
+        let first = key();
+        let second = BudgetKey {
+            namespace: "acme".into(),
+            subject: "second".into(),
+        };
+
+        let held = budget.reserve(&first, 500).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert_eq!(
+            budget.reserve(&second, 100).await,
+            Admission::Denied(Denial::StoreUnavailable)
+        );
+
+        budget.settle(&first, held.reservation(), 600).await;
+        assert_eq!(
+            budget.reserve(&first, 401).await,
+            Admission::Denied(Denial::Exceeded)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_active_ledger_keeps_its_spend_under_the_idle_ttl() {
+        let budget = InMemoryBudget::with_limits(1_000, Duration::from_secs(60), 1);
+        let first = key();
+        let second = BudgetKey {
+            namespace: "acme".into(),
+            subject: "second".into(),
+        };
+
+        let reservation = budget.reserve(&first, 600).await;
+        budget.settle(&first, reservation.reservation(), 600).await;
+        assert_eq!(
+            budget.reserve(&second, 100).await,
+            Admission::Denied(Denial::StoreUnavailable)
+        );
+        assert_eq!(
+            budget.reserve(&first, 401).await,
+            Admission::Denied(Denial::Exceeded)
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_with_only_held_ledgers_denies_fail_closed() {
+        let budget = InMemoryBudget::with_limits(1_000, Duration::from_millis(1), 2);
+        let first = key();
+        let second = BudgetKey {
+            namespace: "acme".into(),
+            subject: "second".into(),
+        };
+        let third = BudgetKey {
+            namespace: "acme".into(),
+            subject: "third".into(),
+        };
+
+        let first_hold = budget.reserve(&first, 100).await;
+        let second_hold = budget.reserve(&second, 100).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert_eq!(
+            budget.reserve(&third, 100).await,
+            Admission::Denied(Denial::StoreUnavailable)
+        );
+        budget.release(&first, first_hold.reservation()).await;
+        budget.release(&second, second_hold.reservation()).await;
+    }
+
+    #[tokio::test]
+    async fn many_subjects_keep_the_in_memory_ledger_bounded() {
+        let max_subjects = 64;
+        let budget = InMemoryBudget::with_limits(1_000_000, Duration::from_nanos(1), max_subjects);
+
+        for index in 0..5_000 {
+            if index >= max_subjects {
+                std::thread::sleep(Duration::from_micros(1));
+            }
+            let key = BudgetKey {
+                namespace: "acme".into(),
+                subject: format!("subject-{index}"),
+            };
+            let reservation = budget.reserve(&key, 1).await.reservation().clone();
+            budget.settle(&key, &reservation, 1).await;
+        }
+
+        assert!(budget.ledgers.lock().unwrap().len() <= max_subjects);
     }
 }

@@ -316,6 +316,9 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # # How long a hold survives a replica that died mid-request. Should exceed the
 # # longest expected request.
 # reservation_ttl_seconds = 300
+# # In-memory caps are per-replica and approximate. Exact caps require Redis.
+# idle_ttl = 3600
+# max_subjects = 10000
 # # Redis only: key namespace for budget state. Defaults to `axond:budget`.
 # key_prefix = "axond:budget"
 

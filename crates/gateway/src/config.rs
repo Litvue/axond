@@ -412,6 +412,14 @@ pub struct BudgetConfig {
     /// settle, so it should exceed the longest expected request.
     #[serde(default = "default_reservation_ttl_seconds")]
     pub reservation_ttl_seconds: u64,
+    /// `in-memory`: remove unheld ledgers after this many idle seconds when
+    /// the subject bound is reached. The in-memory cap is per-replica and
+    /// approximate; exact shared enforcement uses Redis.
+    #[serde(default = "default_idle_ttl")]
+    pub idle_ttl: u64,
+    /// `in-memory`: maximum number of `(namespace, subject)` ledgers retained.
+    #[serde(default = "default_max_subjects")]
+    pub max_subjects: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -463,6 +471,8 @@ impl Default for BudgetConfig {
             create_table: false,
             key_prefix: None,
             reservation_ttl_seconds: default_reservation_ttl_seconds(),
+            idle_ttl: default_idle_ttl(),
+            max_subjects: default_max_subjects(),
         }
     }
 }
@@ -486,6 +496,14 @@ const DEFAULT_BUDGET_KEY_PREFIX: &str = "axond:budget";
 
 fn default_reservation_ttl_seconds() -> u64 {
     300
+}
+
+fn default_idle_ttl() -> u64 {
+    60 * 60
+}
+
+fn default_max_subjects() -> usize {
+    10_000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -809,6 +827,16 @@ impl Config {
                 "budget `{backend}`: reservation_ttl_seconds must be at least 1"
             )));
         }
+        if budget.idle_ttl == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "budget `{backend}`: idle_ttl must be at least 1"
+            )));
+        }
+        if budget.max_subjects == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "budget `{backend}`: max_subjects must be at least 1"
+            )));
+        }
         if budget.backend.is_shared()
             && !budget
                 .dsn_env
@@ -1020,6 +1048,8 @@ audience = "test"
         assert_eq!(cfg.budget.backend, BudgetBackend::None);
         assert_eq!(cfg.budget.on_unavailable, StoreUnavailable::Deny);
         assert_eq!(cfg.budget.reservation_ttl_seconds, 300);
+        assert_eq!(cfg.budget.idle_ttl, 3_600);
+        assert_eq!(cfg.budget.max_subjects, 10_000);
     }
 
     #[test]
@@ -1048,6 +1078,8 @@ on_unavailable = "allow"
             "[budget]\nbackend = \"redis\"\nlimit_microdollars = 10000",
             // A cap of zero would deny every request.
             "[budget]\nbackend = \"in-memory\"",
+            "[budget]\nbackend = \"in-memory\"\nlimit_microdollars = 1\nidle_ttl = 0",
+            "[budget]\nbackend = \"in-memory\"\nlimit_microdollars = 1\nmax_subjects = 0",
             "[budget]\nbackend = \"postgres\"\nlimit_microdollars = 1\ndsn_env = \"D\"\nreservation_ttl_seconds = 0",
             // A table name that could carry SQL.
             "[budget]\nbackend = \"postgres\"\nlimit_microdollars = 1\ndsn_env = \"D\"\ntable = \"caps; drop table users\"",
