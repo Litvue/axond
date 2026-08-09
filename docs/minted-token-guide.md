@@ -160,7 +160,9 @@ TOKEN="$(
 HS256 is symmetric: `GW_SIGN_LOCAL` and `GW_VERIFY_LOCAL_MINTER` must contain
 the same secret bytes. Every verifier holding those bytes can forge tokens,
 which is why Ed25519 is preferred when verification-only replicas must not be
-able to mint.
+able to mint. As with any verifier, `GW_VERIFY_LOCAL_MINTER` must be present in
+the gateway's environment before it starts; the export above only equips the
+minting shell.
 
 ## 4. Token contract and claims
 
