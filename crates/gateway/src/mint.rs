@@ -29,7 +29,7 @@ struct MintClaims {
     sub: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum MintAlgorithm {
     EdDsa,
     Hs256,
@@ -83,6 +83,12 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
             .iter()
             .find(|verifier| verifier.kid == kid)
     });
+    let configured_audience = configured.and_then(|_| {
+        config
+            .as_ref()
+            .and_then(|config| config.gateway_token.as_ref())
+            .map(|token| token.audience.as_str())
+    });
 
     let algorithm = match (args.get_one::<String>("alg"), configured) {
         (Some(value), _) => parse_algorithm(value)?,
@@ -92,14 +98,16 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
         },
         (None, None) => bail!("--alg is required when no matching verifier config is available"),
     };
-    if let Some(verifier) = configured
-        && verifier.alg
-            != match algorithm {
-                MintAlgorithm::EdDsa => GatewayVerifierAlgorithm::EdDsa,
-                MintAlgorithm::Hs256 => GatewayVerifierAlgorithm::Hs256,
-            }
-    {
-        bail!("--alg {} does not match verifier `{kid}`", algorithm.name());
+
+    let explicit_audience = args.get_one::<String>("audience");
+    let audience = explicit_audience
+        .cloned()
+        .or_else(|| configured_audience.map(str::to_owned))
+        .ok_or_else(|| {
+            anyhow::anyhow!("--audience is required without a matching verifier config")
+        })?;
+    if audience.is_empty() {
+        bail!("audience must not be empty");
     }
 
     let ttl = parse_duration(required(args, "ttl")?)?;
@@ -113,39 +121,40 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
             MAX_GATEWAY_VERIFIER_TTL_SECONDS
         );
     }
-    if let Some(verifier) = configured
-        && ttl > verifier.max_ttl
-    {
-        bail!(
-            "requested TTL exceeds verifier `{kid}` max_ttl of {} seconds",
-            verifier.max_ttl.as_secs()
-        );
-    }
-    if let Some(verifier) = configured
-        && !verifier
+
+    if let Some(verifier) = configured {
+        let expected_algorithm = match verifier.alg {
+            GatewayVerifierAlgorithm::EdDsa => MintAlgorithm::EdDsa,
+            GatewayVerifierAlgorithm::Hs256 => MintAlgorithm::Hs256,
+        };
+        if algorithm != expected_algorithm {
+            bail!(
+                "algorithm `{}` does not match verifier `{kid}` algorithm `{}`",
+                algorithm.name(),
+                expected_algorithm.name()
+            );
+        }
+        if ttl > verifier.max_ttl {
+            bail!(
+                "requested TTL exceeds verifier `{kid}` max_ttl of {} seconds",
+                verifier.max_ttl.as_secs()
+            );
+        }
+        if !verifier
             .namespaces
             .iter()
             .any(|allowed| allowed == namespace)
-    {
-        bail!("verifier `{kid}` is not permitted for namespace `{namespace}`");
-    }
-
-    let audience = args
-        .get_one::<String>("audience")
-        .cloned()
-        .or_else(|| {
-            configured.and_then(|_| {
-                config
-                    .as_ref()
-                    .and_then(|config| config.gateway_token.as_ref())
-                    .map(|token| token.audience.clone())
-            })
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!("--audience is required without a matching verifier config")
-        })?;
-    if audience.is_empty() {
-        bail!("audience must not be empty");
+        {
+            bail!("verifier `{kid}` is not permitted for namespace `{namespace}`");
+        }
+        if let Some(expected_audience) = configured_audience
+            && audience != expected_audience
+        {
+            bail!(
+                "audience `{audience}` does not match verifier `{kid}` configured audience \
+                 `{expected_audience}`"
+            );
+        }
     }
 
     mint_token(
@@ -454,9 +463,43 @@ max_ttl = "15m"
             "acme",
             "caller",
             "configured-audience",
-            Duration::from_secs(1),
+            Duration::from_secs(600),
         )
         .unwrap();
+        let principal = verifier
+            .resolve(&Presented { credential: &token })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(principal.namespace, "acme");
+        assert_eq!(principal.subject, "caller");
+        assert_eq!(principal.signer_kid.as_deref(), Some("hs-kid"));
+    }
+
+    #[tokio::test]
+    async fn explicit_audience_and_one_second_ttl_round_trip_through_verifier() {
+        let config = verifier_config("hs-kid", "HS256", "HS_SECRET", "15m");
+        let secret = "01234567890123456789012345678901";
+        let env = HashMap::from([
+            ("STATIC".to_owned(), "static".to_owned()),
+            ("HS_SECRET".to_owned(), secret.to_owned()),
+        ]);
+        let verifier = TokenVerifier::build(&config, &env).unwrap().unwrap();
+        let args = mint_args(&[
+            "--kid",
+            "hs-kid",
+            "--key-env",
+            "HS_SECRET",
+            "--namespace",
+            "acme",
+            "--subject",
+            "caller",
+            "--ttl",
+            "1s",
+            "--audience",
+            "configured-audience",
+        ]);
+        let token = mint_from_args(&args, Some(config), secret).unwrap();
         let principal = verifier
             .resolve(&Presented { credential: &token })
             .await
@@ -619,6 +662,31 @@ max_ttl = "15m"
             .to_string();
         assert!(error.contains("hs-kid"));
         assert!(error.contains("other"));
+    }
+
+    #[test]
+    fn mint_rejects_conflicting_configured_audience() {
+        let args = mint_args(&[
+            "--kid",
+            "hs-kid",
+            "--key-env",
+            "HS_SECRET",
+            "--namespace",
+            "acme",
+            "--subject",
+            "caller",
+            "--ttl",
+            "10m",
+            "--audience",
+            "wrong-audience",
+        ]);
+        let config = verifier_config("hs-kid", "HS256", "HS_SECRET", "15m");
+        let error = mint_from_args(&args, Some(config), "01234567890123456789012345678901")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("hs-kid"));
+        assert!(error.contains("wrong-audience"));
+        assert!(error.contains("configured-audience"));
     }
 
     #[test]
