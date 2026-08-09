@@ -44,6 +44,7 @@ use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, Target};
 use crate::credentials::{CredentialPlan, CredentialSource};
 use crate::error::GatewayError;
+use crate::principals::Presented;
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::streaming::{self, Framing, StreamContext};
 use crate::telemetry;
@@ -81,7 +82,7 @@ async fn list_models(
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
     let snapshot = state.config();
-    let caller = authenticate(&snapshot, &headers)?;
+    let caller = authenticate(&snapshot, &headers).await?;
     let cfg = &snapshot.config;
     let data: Vec<Value> = cfg
         .model
@@ -105,19 +106,20 @@ async fn list_models(
 /// The key travels as `Authorization: Bearer` or, because that is what an
 /// Anthropic SDK pointed at the gateway sends, as `x-api-key`. Both name the
 /// same gateway key; the scheme is the client's, not a second credential space.
-fn authenticate(
+async fn authenticate(
     snapshot: &ConfigSnapshot,
     headers: &HeaderMap,
 ) -> Result<InboundKey, GatewayError> {
-    let token = headers
+    let credential = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
         .ok_or(GatewayError::Unauthorized)?;
     snapshot
-        .resolve_inbound(token)
-        .cloned()
+        .resolve_principal(&Presented { credential })
+        .await
+        .map_err(|_| GatewayError::Unauthorized)?
         .ok_or(GatewayError::Unauthorized)
 }
 
@@ -320,7 +322,7 @@ async fn serve(
     // One snapshot for the whole request: a reload that lands mid-request
     // cannot change the alias, credential, or circuit this request resolved.
     let snapshot = state.config();
-    let caller = authenticate(&snapshot, &headers)?;
+    let caller = authenticate(&snapshot, &headers).await?;
     let cfg = &snapshot.config;
 
     let streamed = route.streamable() && body.get("stream").and_then(Value::as_bool) == Some(true);
@@ -1197,7 +1199,9 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
                 CALLER_SECRET.parse().unwrap(),
             )]),
         ] {
-            let caller = authenticate(&snapshot, &headers).expect("the key is configured");
+            let caller = authenticate(&snapshot, &headers)
+                .await
+                .expect("the key is configured");
             assert_eq!(caller.namespace, "platform");
             assert_eq!(caller.subject, "AXOND_INBOUND_KEY");
         }

@@ -13,6 +13,7 @@ mod budget;
 mod config;
 mod credentials;
 mod error;
+mod principals;
 mod reload;
 mod routes;
 mod state;
