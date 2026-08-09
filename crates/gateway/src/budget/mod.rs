@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use crate::config::{BudgetBackend, BudgetConfig, StoreUnavailable};
+use crate::telemetry::metrics;
 
 pub use postgres::PostgresBudget;
 pub use redis::RedisBudget;
@@ -150,6 +151,7 @@ pub struct InMemoryBudget {
     idle_ttl: Duration,
     reservation_ttl: Duration,
     max_subjects: usize,
+    unavailable: UnavailablePolicy,
     ledgers: Mutex<HashMap<BudgetKey, Ledger>>,
 }
 
@@ -207,17 +209,35 @@ impl InMemoryBudget {
         )
     }
 
+    #[cfg(test)]
     fn with_settings(
         limit_microdollars: u64,
         idle_ttl: Duration,
         reservation_ttl: Duration,
         max_subjects: usize,
     ) -> Self {
+        Self::with_settings_and_policy(
+            limit_microdollars,
+            idle_ttl,
+            reservation_ttl,
+            max_subjects,
+            UnavailablePolicy::Deny,
+        )
+    }
+
+    fn with_settings_and_policy(
+        limit_microdollars: u64,
+        idle_ttl: Duration,
+        reservation_ttl: Duration,
+        max_subjects: usize,
+        unavailable: UnavailablePolicy,
+    ) -> Self {
         Self {
             limit_microdollars,
             idle_ttl,
             reservation_ttl,
             max_subjects,
+            unavailable,
             ledgers: Mutex::new(HashMap::new()),
         }
     }
@@ -242,14 +262,12 @@ impl BudgetStore for InMemoryBudget {
         let mut ledgers = self.ledgers.lock().unwrap_or_else(|e| e.into_inner());
         if !ledgers.contains_key(key) && ledgers.len() >= self.max_subjects {
             self.prune_idle(&mut ledgers);
+            metrics::record_budget_retained_subjects(ledgers.len());
             if ledgers.len() >= self.max_subjects {
-                tracing::error!(
-                    backend = "in_memory",
-                    subjects = ledgers.len(),
-                    max_subjects = self.max_subjects,
-                    "in-memory budget ledger capacity reached; denying (fail-closed)"
-                );
-                return Admission::Denied(Denial::StoreUnavailable);
+                metrics::record_budget_capacity_denial();
+                return self
+                    .unavailable
+                    .admission("in_memory", &"ledger capacity reached");
             }
         }
         let ledger = ledgers.entry(key.clone()).or_default();
@@ -375,11 +393,12 @@ pub async fn build(
     };
     match config.backend {
         BudgetBackend::None => Ok(Box::new(NoBudget)),
-        BudgetBackend::InMemory => Ok(Box::new(InMemoryBudget::with_settings(
+        BudgetBackend::InMemory => Ok(Box::new(InMemoryBudget::with_settings_and_policy(
             config.limit_microdollars,
             Duration::from_secs(config.idle_ttl_seconds),
             Duration::from_secs(config.reservation_ttl_seconds),
             config.max_subjects,
+            config.on_unavailable.into(),
         ))),
         BudgetBackend::Redis => {
             let url = dsn(config, "redis", env)?;
@@ -661,7 +680,13 @@ mod tests {
 
     #[tokio::test]
     async fn capacity_with_only_held_ledgers_denies_fail_closed() {
-        let budget = InMemoryBudget::with_limits(1_000, Duration::from_millis(1), 2);
+        let budget = InMemoryBudget::with_settings_and_policy(
+            1_000,
+            Duration::from_millis(1),
+            Duration::from_secs(300),
+            2,
+            UnavailablePolicy::Deny,
+        );
         let first = key();
         let second = BudgetKey {
             namespace: "acme".into(),
@@ -681,6 +706,33 @@ mod tests {
         );
         budget.release(&first, first_hold.reservation()).await;
         budget.release(&second, second_hold.reservation()).await;
+    }
+
+    #[tokio::test]
+    async fn capacity_with_only_held_ledgers_can_fail_open_without_charging() {
+        let budget = InMemoryBudget::with_settings_and_policy(
+            1_000,
+            Duration::from_millis(1),
+            Duration::from_secs(300),
+            1,
+            UnavailablePolicy::Allow,
+        );
+        let first = key();
+        let second = BudgetKey {
+            namespace: "acme".into(),
+            subject: "second".into(),
+        };
+
+        let first_hold = budget.reserve(&first, 100).await;
+        let second_admission = budget.reserve(&second, 100).await;
+        let second_hold = second_admission.reservation();
+        assert!(second_hold.id.is_empty());
+        budget.settle(&second, second_hold, 900).await;
+        budget.release(&first, first_hold.reservation()).await;
+        assert!(matches!(
+            budget.reserve(&second, 1_000).await,
+            Admission::Allowed(_)
+        ));
     }
 
     #[tokio::test]

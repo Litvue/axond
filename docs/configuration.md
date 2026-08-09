@@ -166,7 +166,7 @@ is per `(namespace, subject)` — that is, per gateway key — in micro-dollars.
 | --- | --- | --- | --- | --- |
 | `backend` | `none` \| `in-memory` \| `redis` \| `postgres` | `none` | all | `in-memory` holds state per replica, so a fleet of N enforces N caps; `redis` and `postgres` share one cap atomically. |
 | `limit_microdollars` | integer | `0` | every backend but `none` | The cap. `10_000_000` µ$ = $10. Zero would deny everything, so it is rejected. |
-| `on_unavailable` | `deny` \| `allow` | `deny` | shared backends | What to do when the store cannot be reached. `deny` answers `503 budget_unavailable`; `allow` serves unenforced and warns. |
+| `on_unavailable` | `deny` \| `allow` | `deny` | `in-memory`, `redis`, `postgres` | What to do when the budget cannot enforce the cap. `deny` answers `503 budget_unavailable`; `allow` serves unenforced and warns. |
 | `dsn_env` | string | — | `redis`, `postgres` | *Name* of the env var holding the connection string (`redis://`/`rediss://`, or a libpq DSN). Required and non-empty. |
 | `table` | string | `axond_budget` | `postgres` | Base table; reservations live in `<table>_reservation`. Validated as an identifier. |
 | `create_table` | bool | `false` | `postgres` | Apply the shipped DDL at boot. |
