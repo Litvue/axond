@@ -196,13 +196,17 @@ pub fn keygen(args: &ArgMatches) -> Result<()> {
     let private_path = required(args, "private-key")?;
     let kid = required(args, "kid")?;
     let env = required(args, "env")?;
+    // Keygen uses a narrower paste-safe vocabulary than the config loader so
+    // its shell and TOML output remains valid without escaping.
+    validate_keygen_identifier("--kid", kid, true)?;
+    validate_keygen_identifier("--env", env, false)?;
     let namespaces = args
         .get_many::<String>("namespace")
         .ok_or_else(|| anyhow::anyhow!("--namespace is required"))?
         .map(String::as_str)
         .collect::<Vec<_>>();
-    if namespaces.iter().any(|namespace| namespace.is_empty()) {
-        bail!("--namespace must not be empty");
+    for namespace in &namespaces {
+        validate_keygen_identifier("--namespace", namespace, true)?;
     }
     let max_ttl = required(args, "max-ttl")?;
     let max_ttl_duration = parse_duration(max_ttl).context("--max-ttl is invalid")?;
@@ -233,6 +237,22 @@ pub fn keygen(args: &ArgMatches) -> Result<()> {
         .join(", ");
     println!("namespaces = [{rendered_namespaces}]");
     println!("max_ttl = \"{max_ttl}\"");
+    Ok(())
+}
+
+fn validate_keygen_identifier(flag: &str, value: &str, allow_punctuation: bool) -> Result<()> {
+    let valid = !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || character == '_'
+                || (allow_punctuation && matches!(character, '.' | '-'))
+        });
+    if !valid {
+        bail!(
+            "{flag} value `{value}` contains unsupported characters; use only letters, \
+             digits, and the permitted separators"
+        );
+    }
     Ok(())
 }
 
@@ -849,6 +869,10 @@ max_ttl = "{max_ttl}"
     }
 
     fn keygen_args(max_ttl: &str) -> clap::ArgMatches {
+        keygen_args_with("test-kid", "PUBLIC", "acme", max_ttl)
+    }
+
+    fn keygen_args_with(kid: &str, env: &str, namespace: &str, max_ttl: &str) -> clap::ArgMatches {
         crate::cli()
             .try_get_matches_from([
                 "axond",
@@ -856,11 +880,11 @@ max_ttl = "{max_ttl}"
                 "--private-key",
                 "/definitely/missing/axond.key",
                 "--kid",
-                "test-kid",
+                kid,
                 "--env",
-                "PUBLIC",
+                env,
                 "--namespace",
-                "acme",
+                namespace,
                 "--max-ttl",
                 max_ttl,
             ])
@@ -868,5 +892,28 @@ max_ttl = "{max_ttl}"
             .remove_subcommand()
             .expect("keygen subcommand")
             .1
+    }
+
+    #[test]
+    fn keygen_rejects_unpasteable_identifiers() {
+        for (flag, kid, env, namespace) in [
+            ("--kid", "bad\"kid", "PUBLIC", "acme"),
+            ("--kid", r"bad\kid", "PUBLIC", "acme"),
+            ("--env", "test-kid", "BAD\"ENV", "acme"),
+            ("--env", "test-kid", r"BAD\ENV", "acme"),
+            ("--namespace", "test-kid", "PUBLIC", "bad\"namespace"),
+            ("--namespace", "test-kid", "PUBLIC", r"bad\namespace"),
+        ] {
+            let args = keygen_args_with(kid, env, namespace, "15m");
+            let error = keygen(&args).unwrap_err().to_string();
+            assert!(error.contains(flag));
+        }
+    }
+
+    #[test]
+    fn keygen_accepts_paste_safe_identifiers() {
+        assert!(validate_keygen_identifier("--kid", "acme-2026_08.v1", true).is_ok());
+        assert!(validate_keygen_identifier("--env", "GW_VERIFY_ACME_2026_08", false).is_ok());
+        assert!(validate_keygen_identifier("--namespace", "acme-prod_1.v1", true).is_ok());
     }
 }
