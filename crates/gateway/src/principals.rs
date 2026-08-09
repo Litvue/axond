@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -26,6 +25,15 @@ pub enum PrincipalShapeError {
     )]
     Duplicate {
         shape: &'static str,
+        first: &'static str,
+        second: &'static str,
+    },
+    #[error(
+        "principal shapes `{first_shape}` and `{second_shape}` overlap between `{first}` and `{second}`, so authority cannot be determined"
+    )]
+    Overlap {
+        first_shape: &'static str,
+        second_shape: &'static str,
         first: &'static str,
         second: &'static str,
     },
@@ -99,16 +107,30 @@ impl PrincipalStoreChain {
         stores: Vec<Box<dyn PrincipalStore>>,
         config: ConfigPrincipals,
     ) -> Result<Self, PrincipalShapeError> {
-        let mut owners: HashMap<&'static str, &'static str> = HashMap::new();
+        let mut declared: Vec<(&'static str, &'static str)> = Vec::new();
         for store in &stores {
             for &shape in store.shapes() {
-                if let Some(first) = owners.insert(shape, store.name()) {
-                    return Err(PrincipalShapeError::Duplicate {
-                        shape,
-                        first,
-                        second: store.name(),
-                    });
+                for &(first_shape, first) in &declared {
+                    if first_shape == shape {
+                        return Err(PrincipalShapeError::Duplicate {
+                            shape,
+                            first,
+                            second: store.name(),
+                        });
+                    }
+                    // A longer prefix also matches credentials owned by the
+                    // shorter prefix, so equality alone cannot establish
+                    // unambiguous authority.
+                    if first_shape.starts_with(shape) || shape.starts_with(first_shape) {
+                        return Err(PrincipalShapeError::Overlap {
+                            first_shape,
+                            second_shape: shape,
+                            first,
+                            second: store.name(),
+                        });
+                    }
                 }
+                declared.push((shape, store.name()));
             }
         }
         Ok(Self { stores, config })
@@ -259,6 +281,64 @@ mod tests {
                 shape: "axk_",
                 first: "first",
                 second: "second",
+            }
+        ));
+    }
+
+    #[test]
+    fn overlapping_shapes_are_rejected_when_shorter_shape_comes_first() {
+        let Err(err) = PrincipalStoreChain::new(
+            vec![
+                Box::new(ShapedStore {
+                    name: "short",
+                    shapes: &["axk_"],
+                }),
+                Box::new(ShapedStore {
+                    name: "long",
+                    shapes: &["axk_v2_"],
+                }),
+            ],
+            config_principals(),
+        ) else {
+            panic!("overlapping shape ownership must be rejected");
+        };
+
+        assert!(matches!(
+            err,
+            PrincipalShapeError::Overlap {
+                first_shape: "axk_",
+                second_shape: "axk_v2_",
+                first: "short",
+                second: "long",
+            }
+        ));
+    }
+
+    #[test]
+    fn overlapping_shapes_are_rejected_when_longer_shape_comes_first() {
+        let Err(err) = PrincipalStoreChain::new(
+            vec![
+                Box::new(ShapedStore {
+                    name: "long",
+                    shapes: &["axk_v2_"],
+                }),
+                Box::new(ShapedStore {
+                    name: "short",
+                    shapes: &["axk_"],
+                }),
+            ],
+            config_principals(),
+        ) else {
+            panic!("overlapping shape ownership must be rejected");
+        };
+
+        assert!(matches!(
+            err,
+            PrincipalShapeError::Overlap {
+                first_shape: "axk_v2_",
+                second_shape: "axk_",
+                first: "long",
+                second: "short",
             }
         ));
     }
