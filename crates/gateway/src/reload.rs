@@ -298,7 +298,6 @@ impl ReloadSummary {
             && self.gateway_keys.is_empty()
             && self.gateway_verifiers.is_empty()
             && self.gateway_token_audience.is_empty()
-            && !self.budget_changed
     }
 
     fn log_applied(&self, trigger: &'static str, path: &str) {
@@ -877,7 +876,7 @@ default = true
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
             .expect("budget candidate is valid");
         assert!(summary.budget_changed);
-        assert!(!summary.is_empty());
+        assert!(summary.is_empty());
 
         file.rewrite(PLATFORM_ONLY);
         let summary = reloader
