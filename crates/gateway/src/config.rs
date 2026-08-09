@@ -525,9 +525,14 @@ pub enum KeyMaterialSource<'a> {
 
 impl GatewayKey {
     pub fn source(&self) -> Option<KeyMaterialSource<'_>> {
-        match (self.env.as_deref(), self.file.as_deref()) {
-            (Some(env), None) if !env.trim().is_empty() => Some(KeyMaterialSource::Env(env)),
-            (None, Some(file)) if !file.trim().is_empty() => Some(KeyMaterialSource::File(file)),
+        let env = self.env.as_deref().filter(|value| !value.trim().is_empty());
+        let file = self
+            .file
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+        match (env, file) {
+            (Some(env), None) => Some(KeyMaterialSource::Env(env)),
+            (None, Some(file)) => Some(KeyMaterialSource::File(file)),
             _ => None,
         }
     }
@@ -567,9 +572,14 @@ pub struct GatewayVerifier {
 
 impl GatewayVerifier {
     pub fn source(&self) -> Option<KeyMaterialSource<'_>> {
-        match (self.env.as_deref(), self.file.as_deref()) {
-            (Some(env), None) if !env.trim().is_empty() => Some(KeyMaterialSource::Env(env)),
-            (None, Some(file)) if !file.trim().is_empty() => Some(KeyMaterialSource::File(file)),
+        let env = self.env.as_deref().filter(|value| !value.trim().is_empty());
+        let file = self
+            .file
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+        match (env, file) {
+            (Some(env), None) => Some(KeyMaterialSource::Env(env)),
+            (None, Some(file)) => Some(KeyMaterialSource::File(file)),
             _ => None,
         }
     }
@@ -1080,6 +1090,45 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
             let err = result.expect_err("source shape must be rejected");
             assert!(err.to_string().contains("exactly one"), "{err}");
         }
+    }
+
+    #[test]
+    fn blank_file_is_absent_when_gateway_key_uses_env() {
+        let config = Config::from_toml_str(&format!(
+            "{VALID}\n[[gateway_key]]\nenv = \"K\"\nfile = \"\"\nnamespace = \"platform\"\n"
+        ))
+        .expect("blank file must not count as a declared source");
+        let snapshot = crate::state::ConfigSnapshot::build(
+            config,
+            &std::collections::HashMap::from([
+                ("AXOND_KEY".to_owned(), "primary-secret".to_owned()),
+                ("K".to_owned(), "secondary-secret".to_owned()),
+            ]),
+            0,
+        )
+        .expect("the non-empty env source resolves");
+        assert_eq!(snapshot.inbound_key_count(), 2);
+    }
+
+    #[test]
+    fn blank_file_is_absent_when_gateway_verifier_uses_env() {
+        let config = Config::from_toml_str(&format!(
+            "{VALID}\n[gateway_token]\naudience = \"test\"\n[[gateway_verifier]]\nkid = \"test\"\nalg = \"HS256\"\nenv = \"K\"\nfile = \"\"\nnamespaces = [\"platform\"]\nmax_ttl = \"15m\"\n"
+        ))
+        .expect("blank file must not count as a declared source");
+        let snapshot = crate::state::ConfigSnapshot::build(
+            config,
+            &std::collections::HashMap::from([
+                ("AXOND_KEY".to_owned(), "primary-secret".to_owned()),
+                (
+                    "K".to_owned(),
+                    "secondary-secret-012345678901234567890".to_owned(),
+                ),
+            ]),
+            0,
+        )
+        .expect("the non-empty env source resolves");
+        assert_eq!(snapshot.gateway_verifier_fingerprints.len(), 1);
     }
 
     #[test]

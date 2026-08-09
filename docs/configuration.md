@@ -119,7 +119,11 @@ neither declared is a config error. File contents are read without trimming:
 static gateway-key secrets are exact bytes, so do not leave a trailing newline
 (`printf %s 'secret' > /run/secrets/axond-gateway-key`). On Unix, a
 group/other-readable file produces a warning. The resolved material is never
-logged; usage subjects use the env name or file path.
+logged; usage subjects use the env name or file path. Switching an existing
+key from `env` to `file` changes that subject, so in-flight or accumulated
+budget ledgers keyed by the old subject do not carry over. An absolute secret
+mount path is emitted as written and may therefore expose tenant names in
+usage sinks.
 
 At least one entry is required: a config with none describes a gateway nobody
 could call, so it refuses to boot. Two keys may not resolve to the **same**
