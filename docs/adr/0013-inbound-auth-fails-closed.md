@@ -90,3 +90,14 @@ calls a provider with.
   values for the *same* declared key are accepted. Overlapping rotation is done
   the way the config already allows — declare the new key alongside the old
   (with a *different* value), reload, then drop the old one.
+
+## Amendment (2026-08-09)
+
+The route table declares each route's authentication posture and the router
+enforces it with an authentication layer. A sweep test walks that same table as
+a backstop, requiring authenticated routes to reject credential-less requests
+and asserting that only `/healthz` and `/readyz` remain unauthenticated.
+Authentication precedes every other check, so a deferred-but-registered route
+such as `/v1/responses` answers an anonymous caller with `401` rather than its
+typed `501`; the `501` would confirm to an unauthenticated caller that the
+route exists and is reachable.
