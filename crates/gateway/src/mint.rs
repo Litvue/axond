@@ -257,6 +257,13 @@ fn load_optional_config(args: &ArgMatches) -> Result<Option<Config>> {
         return load_config_path(path, true);
     }
     let Some(path) = std::env::var("AXOND_CONFIG").ok() else {
+        if let Some(hint) = cwd_config_hint(
+            args.get_one::<String>("config").is_some(),
+            std::env::var_os("AXOND_CONFIG").is_some(),
+            Path::new("axond.toml").is_file(),
+        ) {
+            eprintln!("{hint}");
+        }
         return Ok(None);
     };
     load_config_path(&path, false)
@@ -342,6 +349,11 @@ fn write_private_key(path: &str, bytes: &[u8]) -> Result<()> {
     let mut file = options
         .open(Path::new(path))
         .with_context(|| format!("cannot create private key file `{path}`"))?;
+    #[cfg(not(unix))]
+    eprintln!(
+        "warning: private key file `{path}` uses inherited permissions on this platform; \
+         restrict access manually"
+    );
     let encoded = STANDARD.encode(bytes);
     if let Err(error) = file
         .write_all(encoded.as_bytes())
@@ -351,6 +363,17 @@ fn write_private_key(path: &str, bytes: &[u8]) -> Result<()> {
         return Err(error).with_context(|| format!("cannot write private key file `{path}`"));
     }
     Ok(())
+}
+
+fn cwd_config_hint(explicit: bool, ambient: bool, exists: bool) -> Option<&'static str> {
+    if exists && !explicit && !ambient {
+        Some(
+            "hint: axond.toml exists in the current directory; pass `--config axond.toml` \
+             to additionally enforce the verifier's max_ttl, namespace list, and audience",
+        )
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -607,6 +630,33 @@ max_ttl = "15m"
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn cwd_config_hint_only_applies_without_another_config_source() {
+        assert!(cwd_config_hint(false, false, true).is_some());
+        assert!(cwd_config_hint(false, false, false).is_none());
+        assert!(cwd_config_hint(true, false, true).is_none());
+        assert!(cwd_config_hint(false, true, true).is_none());
+
+        let args = mint_args(&[
+            "--kid",
+            "hs-kid",
+            "--alg",
+            "HS256",
+            "--key-env",
+            "HS_SECRET",
+            "--namespace",
+            "acme",
+            "--subject",
+            "caller",
+            "--ttl",
+            "10m",
+            "--audience",
+            "configured-audience",
+        ]);
+        let token = mint_from_args(&args, None, "01234567890123456789012345678901").unwrap();
+        assert!(token.starts_with("axt1."));
     }
 
     #[test]

@@ -80,7 +80,8 @@ The same binary also provides offline token minting and Ed25519 key generation.
 
 ```bash
 # Generate a public verifier key and write the base64 PKCS#8 private key to a
-# new 0600 file. The command prints only the public key and TOML snippet.
+# new 0600 file on Unix. On non-Unix platforms, restrict inherited permissions
+# manually. The command prints only the public key and TOML snippet.
 axond keygen --private-key ./acme-signing.key \
   --kid acme-2026-08 --env GW_VERIFY_ACME_2026_08 \
   --namespace acme --max-ttl 15m

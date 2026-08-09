@@ -89,9 +89,11 @@ before telemetry or gateway configuration is loaded. `keygen` never needs a
 serving config. `mint` uses an explicitly supplied `--config` when requested;
 an `AXOND_CONFIG` value is only an ambient aid for inferring a matching
 verifier's algorithm, audience, namespace permission, and `max_ttl`. Signing
-material is always read from the environment. `keygen` writes the base64
-PKCS#8 private key to a new `0600` file and prints only the base64 raw public
-key plus a verifier snippet; `mint` prints only the `axt1.` token to stdout.
+material is always read from the environment. On Unix, `keygen` writes the
+base64 PKCS#8 private key to a new `0600` file; on non-Unix platforms it warns
+that permissions are inherited and must be restricted manually. It prints only
+the base64 raw public key plus a verifier snippet; `mint` prints only the
+`axt1.` token to stdout.
 
 ```bash
 axond keygen --private-key ./acme-signing.key \
