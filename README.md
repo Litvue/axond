@@ -103,6 +103,10 @@ config, a token above the verifier's configured `max_ttl` can be minted but is
 rejected by the gateway.
 The minter emits only claims enforced by the current verifier.
 
+For the complete signer setup, claim contract, rotation runbook, revocation
+ladder, and delegation guidance, see
+[`docs/minted-token-guide.md`](./docs/minted-token-guide.md).
+
 ```bash
 curl localhost:8080/v1/chat/completions \
   -H "authorization: Bearer $GW_INBOUND_PLATFORM_KEY" \
@@ -172,6 +176,37 @@ attribute the caller as the env var's *name*; a secret's value is never logged.
   with an unresolvable key is rejected and the running config keeps serving —
   rotate by declaring the new key alongside the old, reloading, then dropping the
   old one.
+
+Minted tokens are additive to this static-key path. Configure a deployment
+audience and a verifier whose public key is referenced by environment-variable
+name:
+
+```toml
+[gateway_token]
+audience = "acme-production"
+
+[[gateway_verifier]]
+kid = "acme-2026-08"
+alg = "EdDSA"
+env = "GW_VERIFY_ACME_2026_08"
+namespaces = ["acme"]
+max_ttl = "15m"
+```
+
+The verifier accepts `axt1.` compact JWS credentials alongside static keys.
+`axond keygen` keeps the private PKCS#8 key in a new file and prints only the
+public key plus this snippet; `axond mint` reads signing material by env-var
+name and prints only the token. Ed25519 base64 whitespace is trimmed on both
+sides because mounted secrets may preserve the generated file's trailing
+newline; HS256 secrets are opaque bytes and are not trimmed. `scope`, `aliases`,
+and `max_request_microdollars` are described by ADR 0016 but are not currently
+enforced or emitted (see #60, #61, and #62). An explicit `--audience` must still
+match the configured `[gateway_token]` audience.
+
+Keep at least one static `[[gateway_key]]` for breakglass. Minted identity
+verification is Tier 0 and adds no runtime datastore dependency. See the
+[minted-token guide](./docs/minted-token-guide.md) for rotation (including the
+same-`kid` key-material reload trap) and the honest Tier 1 revocation boundary.
 
 Every route that dispatches to a provider (`/v1/chat/completions`, `/v1/messages`,
 `/v1/embeddings`) authenticates, and so does `/v1/models` — it answers only for a
