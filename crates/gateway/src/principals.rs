@@ -109,6 +109,8 @@ pub enum TokenVerifierBuildError {
     MissingAudience,
     #[error("gateway_verifier `{kid}` references env var `{env}`, which is unset or empty")]
     MissingKey { kid: String, env: String },
+    #[error("gateway_verifier `{kid}` has an HS256 secret that is too short")]
+    WeakHs256Secret { kid: String },
     #[error("gateway_verifier `{kid}` has invalid base64 key material")]
     InvalidBase64 { kid: String },
     #[error("gateway_verifier `{kid}` must contain a 32-byte Ed25519 public key")]
@@ -171,7 +173,14 @@ impl TokenVerifier {
             let key = match verifier.alg {
                 // HS256 material lives inside DecodingKey beyond our
                 // zeroization control; Ed25519 is the preferred default.
-                GatewayVerifierAlgorithm::Hs256 => DecodingKey::from_secret(value.as_bytes()),
+                GatewayVerifierAlgorithm::Hs256 => {
+                    if value.len() < 32 {
+                        return Err(TokenVerifierBuildError::WeakHs256Secret {
+                            kid: verifier.kid.clone(),
+                        });
+                    }
+                    DecodingKey::from_secret(value.as_bytes())
+                }
                 GatewayVerifierAlgorithm::EdDsa => {
                     let decoded = BASE64.decode(value).map_err(|_| {
                         TokenVerifierBuildError::InvalidBase64 {
@@ -295,7 +304,10 @@ impl PrincipalStore for TokenVerifier {
         if exp < iat
             || exp - iat > max_ttl
             || iat > now.saturating_add(TOKEN_CLOCK_SKEW_SECONDS)
-            || exp > now.saturating_add(max_ttl)
+            || exp
+                > now
+                    .saturating_add(max_ttl)
+                    .saturating_add(TOKEN_CLOCK_SKEW_SECONDS)
         {
             return Err(PrincipalStoreError::Unauthorized(
                 TokenVerificationError::InvalidLifetime {
@@ -678,12 +690,18 @@ mod tests {
 
     #[derive(Serialize)]
     struct TestClaims {
+        #[serde(skip_serializing_if = "Option::is_none")]
         exp: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         iat: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         nbf: Option<u64>,
         aud: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
         jti: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         ns: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         sub: Option<String>,
     }
 
@@ -879,6 +897,20 @@ max_ttl = "15m"
             ))
         ));
 
+        let skewed_iat = unix_now() + 2;
+        let mut skewed_window = valid_claims();
+        skewed_window.iat = Some(skewed_iat);
+        skewed_window.exp = Some(skewed_iat + 900);
+        assert!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(skewed_window),
+                })
+                .await
+                .expect("clock-skewed token resolves")
+                .is_some()
+        );
+
         let far_future_iat = unix_now() + 10 * 365 * 24 * 60 * 60;
         let mut far_future_exp = valid_claims();
         far_future_exp.iat = Some(far_future_iat);
@@ -892,6 +924,57 @@ max_ttl = "15m"
             Err(PrincipalStoreError::Unauthorized(
                 TokenVerificationError::InvalidLifetime { .. }
             ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn token_verifier_rejects_a_future_not_before_claim() {
+        let verifier = token_verifier();
+        let mut future_nbf = valid_claims();
+        future_nbf.nbf = Some(unix_now() + 60);
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(future_nbf),
+                })
+                .await,
+            Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::NotYetValid
+            ))
+        ));
+    }
+
+    #[test]
+    fn token_verifier_rejects_a_short_hs256_secret_at_build() {
+        let config = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_key]]
+env = "STATIC_KEY"
+namespace = "platform"
+
+[gateway_token]
+audience = "test-audience"
+
+[[gateway_verifier]]
+kid = "hs-test"
+alg = "HS256"
+env = "HS_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+"#,
+        )
+        .expect("test verifier config");
+        let env = HashMap::from([
+            ("STATIC_KEY".to_owned(), "static-secret".to_owned()),
+            ("HS_SECRET".to_owned(), "short".to_owned()),
+        ]);
+        assert!(matches!(
+            TokenVerifier::build(&config, &env),
+            Err(TokenVerifierBuildError::WeakHs256Secret { ref kid }) if kid == "hs-test"
         ));
     }
 }

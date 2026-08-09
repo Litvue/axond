@@ -79,6 +79,11 @@ not TOML, and is resolved by the same boot/reload validation path as the
 existing gateway keys. Public Ed25519 verification keys may be held as public
 key bytes; HS256 secrets remain protected as secrets.
 
+Each verifier's `max_ttl` is bounded by a 24-hour policy ceiling. This is not a
+protocol limit: an unbounded value would let a signer mint credentials that
+outlive any incident response, defeating the first rung of this ADR's
+revocation ladder.
+
 **Ed25519/EdDSA is the default asymmetric verifier. HS256 is a deliberate
 escape hatch.** Ed25519 means a gateway replica holds only public verification
 material and cannot mint inbound identity. HS256 is available when the gateway

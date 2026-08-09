@@ -477,7 +477,10 @@ targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdo
         [
             (INBOUND_KEY_ENV.to_string(), "inbound-secret".to_string()),
             ("PLATFORM_OPENAI_KEY".to_string(), "sk-platform".to_string()),
-            ("JWT_SECRET".to_string(), "jwt-test-secret".to_string()),
+            (
+                "JWT_SECRET".to_string(),
+                "jwt-test-secret-0123456789012345".to_string(),
+            ),
         ]
         .into_iter()
         .collect()

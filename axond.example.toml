@@ -163,6 +163,7 @@ namespace = "acme"
 # alg = "EdDSA"
 # env = "GW_VERIFY_ACME_2026_08"
 # namespaces = ["acme"]
+# max_ttl may be at most 24h (a policy ceiling, not a protocol limit).
 # max_ttl = "15m"
 #
 # HS256 is also supported as a deliberate shared-secret escape hatch:
@@ -172,6 +173,7 @@ namespace = "acme"
 # alg = "HS256"
 # env = "GW_VERIFY_LOCAL_MINTER"
 # namespaces = ["platform"]
+# max_ttl may be at most 24h (a policy ceiling, not a protocol limit).
 # max_ttl = "15m"
 
 # ── Models (aliases) ──────────────────────────────────────────────────────────
