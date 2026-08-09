@@ -63,6 +63,9 @@ gateway_log="$(mktemp "$tmpdir/axond-tier0-gateway.XXXXXX.log")"
 upstream_log="$(mktemp "$tmpdir/axond-tier0-upstream.XXXXXX.log")"
 gateway_pid=""
 upstream_pid=""
+health_probe_body=""
+ready_probe_body=""
+models_probe_body=""
 unknown_body=""
 fixture_body=""
 
@@ -89,7 +92,8 @@ cleanup() {
     kill -KILL "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
-  rm -f "$gateway_log" "$upstream_log" "$unknown_body" "$fixture_body"
+  rm -f "$gateway_log" "$upstream_log" "$health_probe_body" "$ready_probe_body" \
+    "$models_probe_body" "$unknown_body" "$fixture_body"
 }
 trap cleanup EXIT
 
@@ -121,6 +125,7 @@ done
 [[ "${upstream_status:-000}" != 000 ]] ||
   failure "local fake-upstream did not bind; Tier 0 serving-path check cannot proceed"
 
+env -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
 AXOND_CONFIG="$config" \
 GW_TIER0_UPSTREAM_KEY=tier0-upstream-placeholder \
 GW_TIER0_INBOUND_KEY=tier0-gateway-key \
@@ -150,13 +155,36 @@ if [[ "$listeners" != "$expected_listeners" ]]; then
 fi
 echo "namespace listeners: baseline (${baseline_listeners//$'\n'/, }) plus gateway 18081 and fake upstream 18082 only; external Redis 6379/Postgres 5432 are excluded by namespace egress denial"
 
-health="$(curl --fail --silent "$base_url/healthz")"
-ready_body="$(curl --fail --silent "$base_url/readyz")"
-[[ "$health" == ok ]] || failure "/healthz was not ok: $health"
-[[ "$ready_body" == ready ]] || failure "/readyz was not ready: $ready_body"
+health_probe_body="$(mktemp "$tmpdir/axond-tier0-healthz.XXXXXX")"
+health_status="$(curl --silent --show-error --output "$health_probe_body" \
+  --write-out '%{http_code}' "$base_url/healthz" || true)"
+[[ "$health_status" == 200 ]] ||
+  failure "/healthz returned HTTP $health_status instead of 200"
+health="$(cat "$health_probe_body")"
+[[ "$health" == ok ]] || failure "/healthz body was not ok: $health"
+rm -f "$health_probe_body"
+health_probe_body=""
 
-models="$(curl --fail --silent -H 'Authorization: Bearer tier0-gateway-key' "$base_url/v1/models")"
+ready_probe_body="$(mktemp "$tmpdir/axond-tier0-readyz.XXXXXX")"
+ready_status="$(curl --silent --show-error --output "$ready_probe_body" \
+  --write-out '%{http_code}' "$base_url/readyz" || true)"
+[[ "$ready_status" == 200 ]] ||
+  failure "/readyz returned HTTP $ready_status instead of 200"
+ready_body="$(cat "$ready_probe_body")"
+[[ "$ready_body" == ready ]] || failure "/readyz body was not ready: $ready_body"
+rm -f "$ready_probe_body"
+ready_probe_body=""
+
+models_probe_body="$(mktemp "$tmpdir/axond-tier0-models.XXXXXX")"
+models_status="$(curl --silent --show-error --output "$models_probe_body" \
+  --write-out '%{http_code}' -H 'Authorization: Bearer tier0-gateway-key' \
+  "$base_url/v1/models" || true)"
+[[ "$models_status" == 200 ]] ||
+  failure "authenticated /v1/models returned HTTP $models_status instead of 200"
+models="$(cat "$models_probe_body")"
 grep -q '"id":"fixture-chat"' <<<"$models" || failure "authenticated /v1/models omitted configured alias fixture-chat"
+rm -f "$models_probe_body"
+models_probe_body=""
 
 unauth_status="$(curl --silent --output /dev/null --write-out '%{http_code}' "$base_url/v1/models")"
 [[ "$unauth_status" == 401 ]] || failure "unauthenticated /v1/models returned $unauth_status instead of 401"
