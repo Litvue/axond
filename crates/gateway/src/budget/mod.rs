@@ -264,10 +264,13 @@ impl BudgetStore for InMemoryBudget {
             self.prune_idle(&mut ledgers);
             metrics::record_budget_retained_subjects(ledgers.len());
             if ledgers.len() >= self.max_subjects {
-                metrics::record_budget_capacity_denial();
-                return self
+                let admission = self
                     .unavailable
                     .admission("in_memory", &"ledger capacity reached");
+                if matches!(&admission, Admission::Denied(Denial::StoreUnavailable)) {
+                    metrics::record_budget_capacity_denial();
+                }
+                return admission;
             }
         }
         let ledger = ledgers.entry(key.clone()).or_default();
