@@ -73,11 +73,14 @@ namespaces = ["acme"]
 max_ttl    = "15m"
 ```
 
-`kid`, algorithm, environment-variable name, permitted namespaces, and maximum
-token lifetime are configuration-owned. The value comes from the environment,
-not TOML, and is resolved by the same boot/reload validation path as the
-existing gateway keys. Public Ed25519 verification keys may be held as public
-key bytes; HS256 secrets remain protected as secrets.
+`kid`, algorithm, source reference, permitted namespaces, and maximum token
+lifetime are configuration-owned. The source is exactly one of an environment
+variable name (`env`) or a file path (`file`), and material is resolved by the
+same boot/reload validation path as existing gateway keys. File material is
+re-read during reload, so rotation is a reload rather than a restart. This
+source choice applies to static `[[gateway_key]]` breakglass credentials too.
+Public Ed25519 verification keys may be held as public key bytes; HS256 secrets
+remain protected as secrets.
 
 Each verifier's `max_ttl` is bounded by a 24-hour policy ceiling. This is not a
 protocol limit: an unbounded value would let a signer mint credentials that
@@ -90,9 +93,12 @@ material and cannot mint inbound identity. HS256 is available when the gateway
 is intentionally also a minter, but every verifier holding the shared secret
 can forge tokens and must therefore opt into that tradeoff.
 
-Verifier rotation follows the existing reload dance from ADRs 0011 and 0013:
-add the new `kid`, reload, move minting to it, then remove the old `kid` and
-reload. A signer is permitted only for its configured `namespaces`.
+Verifier rotation may replace file material under the same `kid` and reload, or
+follow the overlap dance from ADRs 0011 and 0013: add the new `kid`, reload,
+move minting to it, then remove the old `kid` and reload. Applied reload
+summaries include a short fingerprint of each resolved verifier and static-key
+material, so same-`kid` changes are observable without logging secrets. A
+signer is permitted only for its configured `namespaces`.
 
 ### Minting and federation
 
@@ -221,7 +227,7 @@ work through `ConfigPrincipals`.
 rule is preserved: there is no keyless mode, a config with no
 `[[gateway_key]]` fails `Config::validate`, and `ConfigSnapshot::build` refuses
 to publish an empty resolved static-key table. Verifiers are strictly
-additive; a declared gateway verifier whose environment value is missing or
+additive; a declared gateway verifier whose source is missing, unreadable, or
 empty is also fatal, and duplicate static secrets remain invalid. A failed
 reload keeps the last valid snapshot serving.
 
@@ -258,6 +264,9 @@ assume that subjects belong to the static config key list.
 
 - A caller can receive an expiring, scoped credential without an axond config
   edit, environment-variable rollout, or per-caller gateway registry.
+- Gateway verifier and static breakglass material may come from files and is
+  re-read on reload, making rotation a no-restart operation. Reload summaries
+  expose only short SHA-256 fingerprints, never material.
 - Ed25519 keeps verification-only replicas from becoming token minters.
 - Offline minting preserves the zero-external-state default; token issuance
   through HTTP and precise revocation are explicit opt-ins.

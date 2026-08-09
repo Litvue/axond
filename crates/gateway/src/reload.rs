@@ -138,8 +138,7 @@ impl Reloader {
 
         match self.candidate(env, current.generation + 1) {
             Ok(candidate) => {
-                let summary =
-                    ReloadSummary::between(&self.boot, &current.config, &candidate.config);
+                let summary = ReloadSummary::between(&self.boot, &current, &candidate);
                 let generation = candidate.generation;
                 self.state.publish(candidate);
                 telemetry::finish_config_reload(
@@ -187,7 +186,8 @@ impl Reloader {
 }
 
 /// What one reload changed, for the log line an operator reads afterwards.
-/// Identifiers only — env-var *names* are references, never secrets.
+/// Identifiers and short fingerprints only — sources are references, never
+/// secrets.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReloadSummary {
     pub namespaces: Delta,
@@ -197,6 +197,8 @@ pub struct ReloadSummary {
     pub gateway_keys: Delta,
     pub gateway_verifiers: Delta,
     pub gateway_token_audience: Delta,
+    pub gateway_key_fingerprints: HashMap<String, String>,
+    pub gateway_verifier_fingerprints: HashMap<String, String>,
     /// `[server] bind` differs from what the process bound at startup.
     pub bind_changed: bool,
     /// `[[usage_sink]]` differs from the connected sinks.
@@ -248,46 +250,71 @@ impl std::fmt::Display for Delta {
 }
 
 impl ReloadSummary {
-    fn between(boot: &Boot, before: &Config, after: &Config) -> Self {
+    fn between(boot: &Boot, before: &ConfigSnapshot, after: &ConfigSnapshot) -> Self {
+        let before_config = &before.config;
+        let after_config = &after.config;
         Self {
             namespaces: Delta::between(
-                before.namespace.iter().map(|n| n.id.clone()),
-                after.namespace.iter().map(|n| n.id.clone()),
+                before_config.namespace.iter().map(|n| n.id.clone()),
+                after_config.namespace.iter().map(|n| n.id.clone()),
             ),
             providers: Delta::between(
-                before.provider.iter().map(|p| p.id.clone()),
-                after.provider.iter().map(|p| p.id.clone()),
+                before_config.provider.iter().map(|p| p.id.clone()),
+                after_config.provider.iter().map(|p| p.id.clone()),
             ),
             models: Delta::between(
-                before.model.iter().map(|m| m.name.clone()),
-                after.model.iter().map(|m| m.name.clone()),
+                before_config.model.iter().map(|m| m.name.clone()),
+                after_config.model.iter().map(|m| m.name.clone()),
             ),
             credentials: Delta::between(
-                before.credential.iter().map(credential_key),
-                after.credential.iter().map(credential_key),
+                before_config.credential.iter().map(credential_key),
+                after_config.credential.iter().map(credential_key),
             ),
             gateway_keys: Delta::between(
-                before.gateway_key.iter().map(|k| k.env.clone()),
-                after.gateway_key.iter().map(|k| k.env.clone()),
+                before_config
+                    .gateway_key
+                    .iter()
+                    .map(|k| k.source_label().unwrap_or_default().to_owned()),
+                after_config
+                    .gateway_key
+                    .iter()
+                    .map(|k| k.source_label().unwrap_or_default().to_owned()),
+            )
+            .with_changed(
+                gateway_key_definition_changes(before_config, after_config)
+                    .into_iter()
+                    .chain(material_changes(
+                        &before.gateway_key_fingerprints,
+                        &after.gateway_key_fingerprints,
+                    )),
             ),
             gateway_verifiers: Delta::between(
-                before.gateway_verifier.iter().map(|v| v.kid.clone()),
-                after.gateway_verifier.iter().map(|v| v.kid.clone()),
+                before_config.gateway_verifier.iter().map(|v| v.kid.clone()),
+                after_config.gateway_verifier.iter().map(|v| v.kid.clone()),
             )
-            .with_changed(verifier_definition_changes(before, after)),
+            .with_changed(
+                verifier_definition_changes(before_config, after_config)
+                    .into_iter()
+                    .chain(material_changes(
+                        &before.gateway_verifier_fingerprints,
+                        &after.gateway_verifier_fingerprints,
+                    )),
+            ),
             gateway_token_audience: Delta::between(
-                before
+                before_config
                     .gateway_token
                     .iter()
                     .map(|token| token.audience.clone()),
-                after
+                after_config
                     .gateway_token
                     .iter()
                     .map(|token| token.audience.clone()),
             ),
-            bind_changed: boot.bind != after.server.bind,
-            usage_sinks_changed: boot.usage_sink != after.usage_sink,
-            budget_changed: boot.budget != after.budget,
+            gateway_key_fingerprints: after.gateway_key_fingerprints.clone(),
+            gateway_verifier_fingerprints: after.gateway_verifier_fingerprints.clone(),
+            bind_changed: boot.bind != after_config.server.bind,
+            usage_sinks_changed: boot.usage_sink != after_config.usage_sink,
+            budget_changed: boot.budget != after_config.budget,
         }
     }
 
@@ -313,6 +340,8 @@ impl ReloadSummary {
             gateway_keys = %self.gateway_keys,
             gateway_verifiers = %self.gateway_verifiers,
             gateway_token_audience = %self.gateway_token_audience,
+            gateway_key_fingerprints = ?self.gateway_key_fingerprints,
+            gateway_verifier_fingerprints = ?self.gateway_verifier_fingerprints,
             budget_changed = self.budget_changed,
             changed = !self.is_empty(),
             "config reloaded"
@@ -364,11 +393,51 @@ fn verifier_definition_changes(before: &Config, after: &Config) -> Vec<String> {
             let before = before[kid];
             let after = after.get(kid)?;
             (before.alg != after.alg
-                || before.env != after.env
+                || before.source_label() != after.source_label()
                 || before.namespaces != after.namespaces
                 || before.max_ttl != after.max_ttl)
                 .then(|| (*kid).to_owned())
         })
+        .collect::<Vec<_>>();
+    changed.sort();
+    changed
+}
+
+fn gateway_key_definition_changes(before: &Config, after: &Config) -> Vec<String> {
+    let before: HashMap<&str, &crate::config::GatewayKey> = before
+        .gateway_key
+        .iter()
+        .filter_map(|key| key.source_label().map(|label| (label, key)))
+        .collect();
+    let after: HashMap<&str, &crate::config::GatewayKey> = after
+        .gateway_key
+        .iter()
+        .filter_map(|key| key.source_label().map(|label| (label, key)))
+        .collect();
+    let mut changed = before
+        .keys()
+        .filter_map(|label| {
+            let before = before[label];
+            let after = after.get(label)?;
+            (before.namespace != after.namespace).then(|| (*label).to_owned())
+        })
+        .collect::<Vec<_>>();
+    changed.sort();
+    changed
+}
+
+fn material_changes(
+    before: &HashMap<String, String>,
+    after: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut changed = before
+        .iter()
+        .filter(|(label, fingerprint)| {
+            after
+                .get(*label)
+                .is_some_and(|current| current != *fingerprint)
+        })
+        .map(|(label, _)| label.clone())
         .collect::<Vec<_>>();
     changed.sort();
     changed
@@ -659,6 +728,31 @@ targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdo
         assert_eq!(summary.gateway_verifiers.changed, vec!["reload-kid"]);
         assert!(summary.gateway_token_audience.is_empty());
         assert!(!summary.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_summary_reports_file_material_changes_and_new_fingerprint() {
+        let material = ConfigFile::new("jwt-test-secret-012345678901234567890");
+        let file = ConfigFile::new(&format!(
+            "{PLATFORM_ONLY}\n[gateway_token]\naudience = \"reload-test\"\n\n[[gateway_verifier]]\nkid = \"reload-kid\"\nalg = \"HS256\"\nfile = \"{}\"\nnamespaces = [\"platform\"]\nmax_ttl = \"15m\"\n",
+            material.path()
+        ));
+        let state = state_from(&file);
+        let old_fingerprint = state.config().gateway_verifier_fingerprints["reload-kid"].clone();
+        let reloader = Reloader::new(file.path(), state);
+        material.rewrite("jwt-test-secret-012345678901234567891");
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("changed file material is valid");
+        assert_eq!(summary.gateway_verifiers.changed, vec!["reload-kid"]);
+        assert_ne!(
+            summary.gateway_verifier_fingerprints["reload-kid"],
+            old_fingerprint
+        );
+        assert_eq!(
+            summary.gateway_verifier_fingerprints["reload-kid"].len(),
+            16
+        );
     }
 
     #[tokio::test]

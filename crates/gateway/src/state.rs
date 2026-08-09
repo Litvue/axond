@@ -20,11 +20,13 @@ use gateway_core::{
     AnthropicAdapter, CircuitBreaker, OpenAiCompatibleAdapter, OpenAiFlavor, ProviderAdapter,
 };
 use gateway_transport::HttpDispatcher;
+use ring::digest::{Context, SHA256};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::budget::BudgetStore;
 use crate::config::{Config, ProviderKind};
 use crate::credentials::{CredentialError, Credentials};
+use crate::key_material::{self, KeyMaterialError};
 use crate::principals::{
     ConfigPrincipals, GatewayKeyEntry, Presented, PrincipalShapeError, PrincipalStoreChain,
     TokenVerifier, TokenVerifierBuildError,
@@ -59,10 +61,12 @@ pub struct ConfigSnapshot {
     /// each applied reload increments it. Published as a metric so an operator
     /// can tell which generation a replica is serving.
     pub generation: u64,
+    pub gateway_key_fingerprints: HashMap<String, String>,
+    pub gateway_verifier_fingerprints: HashMap<String, String>,
 }
 
 /// Why a config could not become a servable snapshot. Names the offending
-/// reference — an env-var name and a namespace — never a secret's value.
+/// reference — an env-var name or path and a namespace — never a secret's value.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
     #[error(transparent)]
@@ -71,8 +75,21 @@ pub enum SnapshotError {
         "gateway_key for namespace `{namespace}` references env var `{env}`, which is unset or empty"
     )]
     MissingGatewayKey { namespace: String, env: String },
+    #[error("gateway_key for namespace `{namespace}` file `{path}` failed ({kind}): {error}")]
+    GatewayKeyFile {
+        namespace: String,
+        path: String,
+        kind: std::io::ErrorKind,
+        error: String,
+    },
+    #[error("gateway_key for namespace `{namespace}` file `{path}` is empty")]
+    EmptyGatewayKeyFile { namespace: String, path: String },
+    #[error("gateway_key for namespace `{namespace}` file `{path}` is not valid UTF-8")]
+    InvalidGatewayKeyFileUtf8 { namespace: String, path: String },
+    #[error("gateway_key for namespace `{namespace}` must declare exactly one non-empty source")]
+    InvalidGatewayKeySource { namespace: String },
     #[error(
-        "gateway_key env vars `{env}` (namespace `{namespace}`) and `{other_env}` (namespace `{other_namespace}`) hold the same secret, so the caller's namespace would be ambiguous"
+        "gateway_key sources `{env}` (namespace `{namespace}`) and `{other_env}` (namespace `{other_namespace}`) hold the same secret, so the caller's namespace would be ambiguous"
     )]
     DuplicateGatewayKey {
         env: String,
@@ -107,11 +124,38 @@ impl ConfigSnapshot {
             Duration::from_secs(config.failover.cooldown_seconds),
         );
         let mut inbound_keys: Vec<GatewayKeyEntry> = Vec::new();
+        let mut gateway_key_fingerprints = HashMap::new();
         for k in &config.gateway_key {
-            let secret = env.get(&k.env).filter(|v| !v.is_empty()).ok_or_else(|| {
-                SnapshotError::MissingGatewayKey {
+            let source = k
+                .source()
+                .ok_or_else(|| SnapshotError::InvalidGatewayKeySource {
                     namespace: k.namespace.clone(),
-                    env: k.env.clone(),
+                })?;
+            let label = k
+                .source_label()
+                .ok_or_else(|| SnapshotError::InvalidGatewayKeySource {
+                    namespace: k.namespace.clone(),
+                })?;
+            let secret = key_material::resolve(source, env).map_err(|error| match error {
+                KeyMaterialError::MissingEnv { name } => SnapshotError::MissingGatewayKey {
+                    namespace: k.namespace.clone(),
+                    env: name,
+                },
+                KeyMaterialError::FileRead { path, kind, error } => SnapshotError::GatewayKeyFile {
+                    namespace: k.namespace.clone(),
+                    path,
+                    kind,
+                    error,
+                },
+                KeyMaterialError::EmptyFile { path } => SnapshotError::EmptyGatewayKeyFile {
+                    namespace: k.namespace.clone(),
+                    path,
+                },
+                KeyMaterialError::InvalidUtf8 { path } => {
+                    SnapshotError::InvalidGatewayKeyFileUtf8 {
+                        namespace: k.namespace.clone(),
+                        path,
+                    }
                 }
             })?;
             // Two keys resolving to one secret is ambiguous authority — one
@@ -124,7 +168,7 @@ impl ConfigSnapshot {
                 )
             }) {
                 return Err(SnapshotError::DuplicateGatewayKey {
-                    env: k.env.clone(),
+                    env: label.to_owned(),
                     namespace: k.namespace.clone(),
                     other_env: other.caller.subject.clone(),
                     other_namespace: other.caller.namespace.clone(),
@@ -134,10 +178,11 @@ impl ConfigSnapshot {
                 secret: SecretString::from(secret.clone()),
                 caller: InboundKey {
                     namespace: k.namespace.clone(),
-                    subject: k.env.clone(),
+                    subject: label.to_owned(),
                     signer_kid: None,
                 },
             });
+            gateway_key_fingerprints.insert(label.to_owned(), fingerprint(label, &secret));
         }
         if inbound_keys.is_empty() {
             return Err(SnapshotError::NoInboundKeys);
@@ -149,12 +194,56 @@ impl ConfigSnapshot {
             .map(|verifier| Box::new(verifier) as Box<dyn crate::principals::PrincipalStore>)
             .collect();
         let principals = PrincipalStoreChain::new(stores, config_principals)?;
+        let gateway_verifier_fingerprints = config
+            .gateway_verifier
+            .iter()
+            .map(|verifier| {
+                let source = verifier.source().ok_or_else(|| {
+                    SnapshotError::TokenVerifier(TokenVerifierBuildError::InvalidSource {
+                        kid: verifier.kid.clone(),
+                    })
+                })?;
+                let material = key_material::resolve(source, env).map_err(|error| {
+                    SnapshotError::TokenVerifier(match error {
+                        KeyMaterialError::MissingEnv { name } => {
+                            TokenVerifierBuildError::MissingKey {
+                                kid: verifier.kid.clone(),
+                                env: name,
+                            }
+                        }
+                        KeyMaterialError::FileRead { path, kind, error } => {
+                            TokenVerifierBuildError::FileKey {
+                                kid: verifier.kid.clone(),
+                                path,
+                                kind,
+                                error,
+                            }
+                        }
+                        KeyMaterialError::EmptyFile { path } => {
+                            TokenVerifierBuildError::EmptyFile {
+                                kid: verifier.kid.clone(),
+                                path,
+                            }
+                        }
+                        KeyMaterialError::InvalidUtf8 { path } => {
+                            TokenVerifierBuildError::InvalidFileUtf8 {
+                                kid: verifier.kid.clone(),
+                                path,
+                            }
+                        }
+                    })
+                })?;
+                Ok((verifier.kid.clone(), fingerprint(&verifier.kid, &material)))
+            })
+            .collect::<Result<HashMap<_, _>, SnapshotError>>()?;
         Ok(Self {
             config,
             credentials,
             target_circuits,
             principals,
             generation,
+            gateway_key_fingerprints,
+            gateway_verifier_fingerprints,
         })
     }
 
@@ -178,6 +267,21 @@ impl ConfigSnapshot {
     pub fn token_verifier_count(&self) -> usize {
         self.config.gateway_verifier.len()
     }
+}
+
+fn fingerprint(label: &str, material: &str) -> String {
+    let mut context = Context::new(&SHA256);
+    context.update(b"axond-key-material-v1\0");
+    context.update(label.as_bytes());
+    context.update(b"\0");
+    context.update(material.as_bytes());
+    context
+        .finish()
+        .as_ref()
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 impl AppState {
@@ -226,6 +330,18 @@ pub fn adapter_for(kind: ProviderKind) -> Box<dyn ProviderAdapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_file(contents: &[u8]) -> String {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "axond-state-key-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path.to_str().unwrap().to_owned()
+    }
 
     fn config_with(gateway_keys: &str) -> Config {
         Config::from_toml_str(&format!(
@@ -314,6 +430,24 @@ max_ttl = "15m"
             ),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_static_gateway_key_resolves_from_a_file_and_uses_its_path_as_subject() {
+        let path = temp_file(b"static-file-secret");
+        let config = config_with(&format!(
+            "[[gateway_key]]\nfile = \"{path}\"\nnamespace = \"platform\"\n"
+        ));
+        let snapshot = ConfigSnapshot::build(config, &HashMap::new(), 0).expect("resolves");
+        let principal = snapshot
+            .resolve_principal(&Presented {
+                credential: "static-file-secret",
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(principal.subject, path);
+        std::fs::remove_file(path).unwrap();
     }
 
     /// Two keys holding one secret cannot both be honoured: the table is keyed

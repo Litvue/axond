@@ -11,6 +11,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 use crate::config::{Config, GatewayVerifierAlgorithm};
+use crate::key_material::{self, KeyMaterialError};
 
 #[derive(Clone)]
 pub struct InboundKey {
@@ -110,6 +111,19 @@ pub enum TokenVerifierBuildError {
     MissingAudience,
     #[error("gateway_verifier `{kid}` references env var `{env}`, which is unset or empty")]
     MissingKey { kid: String, env: String },
+    #[error("gateway_verifier `{kid}` key material file `{path}` failed ({kind}): {error}")]
+    FileKey {
+        kid: String,
+        path: String,
+        kind: std::io::ErrorKind,
+        error: String,
+    },
+    #[error("gateway_verifier `{kid}` key material file `{path}` is empty")]
+    EmptyFile { kid: String, path: String },
+    #[error("gateway_verifier `{kid}` key material file `{path}` is not valid UTF-8")]
+    InvalidFileUtf8 { kid: String, path: String },
+    #[error("gateway_verifier `{kid}` must declare exactly one non-empty source")]
+    InvalidSource { kid: String },
     #[error("gateway_verifier `{kid}` has an HS256 secret that is too short")]
     WeakHs256Secret { kid: String },
     #[error("gateway_verifier `{kid}` has invalid base64 key material")]
@@ -164,13 +178,36 @@ impl TokenVerifier {
             .collect();
         let mut verifiers = Vec::with_capacity(config.gateway_verifier.len());
         for verifier in &config.gateway_verifier {
-            let value = env
-                .get(&verifier.env)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| TokenVerifierBuildError::MissingKey {
+            let source =
+                verifier
+                    .source()
+                    .ok_or_else(|| TokenVerifierBuildError::InvalidSource {
+                        kid: verifier.kid.clone(),
+                    })?;
+            let value = key_material::resolve(source, env).map_err(|error| match error {
+                KeyMaterialError::MissingEnv { name } => TokenVerifierBuildError::MissingKey {
                     kid: verifier.kid.clone(),
-                    env: verifier.env.clone(),
-                })?;
+                    env: name,
+                },
+                KeyMaterialError::FileRead { path, kind, error } => {
+                    TokenVerifierBuildError::FileKey {
+                        kid: verifier.kid.clone(),
+                        path,
+                        kind,
+                        error,
+                    }
+                }
+                KeyMaterialError::EmptyFile { path } => TokenVerifierBuildError::EmptyFile {
+                    kid: verifier.kid.clone(),
+                    path,
+                },
+                KeyMaterialError::InvalidUtf8 { path } => {
+                    TokenVerifierBuildError::InvalidFileUtf8 {
+                        kid: verifier.kid.clone(),
+                        path,
+                    }
+                }
+            })?;
             let key = match verifier.alg {
                 // HS256 material lives inside DecodingKey beyond our
                 // zeroization control; Ed25519 is the preferred default.
