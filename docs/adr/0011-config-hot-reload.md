@@ -97,13 +97,17 @@ bytes the last reload acted on, which the watcher compares against — so an
 operator who edits the file *and* signals gets one reload, not one per trigger,
 and watching being turned on does not re-apply the edit that turned it on.
 
-**Process-level changes are reported, not applied.** `[server] bind` and
-`[[usage_sink]]` differences are logged as warnings naming the restart
-requirement, so an operator is told rather than left wondering why their edit did
-nothing. They are compared against what the process bound and connected **at
-boot**, not against the previous candidate: the config in the snapshot is the
-file's opinion, and the warning has to keep being true for as long as the file
-and the running socket disagree.
+**Process-level changes are reported, not applied.** `[server] bind`,
+`[[usage_sink]]`, and `[budget]` differences, including
+`limit_microdollars`, are logged as warnings naming the restart requirement, so
+an operator is told rather than left wondering why their edit did nothing. The
+budget store is built once at boot and owns outstanding reservations; replacing
+it on reload would strand live holds. These settings are compared against what
+the process bound, connected, and built **at boot**, not against the previous
+candidate: the config in the snapshot is the file's opinion, and the warning
+has to keep being true for as long as the file and the running process disagree.
+`budget_changed` therefore remains outside `ReloadSummary::is_empty()`, which
+answers only whether something a reload can apply changed.
 
 **Reload outcomes are observable** on the ADR 0007 stack: an
 `axond.config.reload` span with `axond.reload.trigger` / `axond.reload.outcome`,
@@ -125,8 +129,9 @@ credential labels, and gateway-key env-var *names*: references, never secrets.
   misconfigured watcher against a churning file) would keep re-probing unhealthy
   targets. The poll floor and the opt-in default bound this; a rate limit on
   reloads is a follow-up if it is ever observed.
-- Bind address and usage-sink changes still need a restart. Rebinding a listener
-  and re-connecting sinks under load are each their own design (draining the old
-  socket, flushing the old sink) and are deliberately not attempted here.
+- Bind address, usage-sink, and budget changes still need a restart. Rebinding a
+  listener, re-connecting sinks, and replacing a budget store with outstanding
+  reservations are each their own design (draining the old socket, flushing the
+  old sink, or stranding live holds) and are deliberately not attempted here.
 - The `[reload]` section is itself hot-reloadable, which means a reload can
   disable watching. That is intended: `SIGHUP` always remains.
