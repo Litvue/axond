@@ -415,8 +415,8 @@ pub struct BudgetConfig {
     /// `in-memory`: remove unheld ledgers after this many idle seconds when
     /// the subject bound is reached. The in-memory cap is per-replica and
     /// approximate; exact shared enforcement uses Redis.
-    #[serde(default = "default_idle_ttl")]
-    pub idle_ttl: u64,
+    #[serde(default = "default_idle_ttl_seconds")]
+    pub idle_ttl_seconds: u64,
     /// `in-memory`: maximum number of `(namespace, subject)` ledgers retained.
     #[serde(default = "default_max_subjects")]
     pub max_subjects: usize,
@@ -471,7 +471,7 @@ impl Default for BudgetConfig {
             create_table: false,
             key_prefix: None,
             reservation_ttl_seconds: default_reservation_ttl_seconds(),
-            idle_ttl: default_idle_ttl(),
+            idle_ttl_seconds: default_idle_ttl_seconds(),
             max_subjects: default_max_subjects(),
         }
     }
@@ -498,7 +498,7 @@ fn default_reservation_ttl_seconds() -> u64 {
     300
 }
 
-fn default_idle_ttl() -> u64 {
+fn default_idle_ttl_seconds() -> u64 {
     60 * 60
 }
 
@@ -827,9 +827,9 @@ impl Config {
                 "budget `{backend}`: reservation_ttl_seconds must be at least 1"
             )));
         }
-        if budget.idle_ttl == 0 {
+        if budget.idle_ttl_seconds == 0 {
             return Err(ConfigError::Invalid(format!(
-                "budget `{backend}`: idle_ttl must be at least 1"
+                "budget `{backend}`: idle_ttl_seconds must be at least 1"
             )));
         }
         if budget.max_subjects == 0 {
@@ -1048,7 +1048,7 @@ audience = "test"
         assert_eq!(cfg.budget.backend, BudgetBackend::None);
         assert_eq!(cfg.budget.on_unavailable, StoreUnavailable::Deny);
         assert_eq!(cfg.budget.reservation_ttl_seconds, 300);
-        assert_eq!(cfg.budget.idle_ttl, 3_600);
+        assert_eq!(cfg.budget.idle_ttl_seconds, 3_600);
         assert_eq!(cfg.budget.max_subjects, 10_000);
     }
 
@@ -1078,7 +1078,7 @@ on_unavailable = "allow"
             "[budget]\nbackend = \"redis\"\nlimit_microdollars = 10000",
             // A cap of zero would deny every request.
             "[budget]\nbackend = \"in-memory\"",
-            "[budget]\nbackend = \"in-memory\"\nlimit_microdollars = 1\nidle_ttl = 0",
+            "[budget]\nbackend = \"in-memory\"\nlimit_microdollars = 1\nidle_ttl_seconds = 0",
             "[budget]\nbackend = \"in-memory\"\nlimit_microdollars = 1\nmax_subjects = 0",
             "[budget]\nbackend = \"postgres\"\nlimit_microdollars = 1\ndsn_env = \"D\"\nreservation_ttl_seconds = 0",
             // A table name that could carry SQL.

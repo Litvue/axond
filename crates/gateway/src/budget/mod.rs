@@ -334,7 +334,7 @@ pub async fn build(
         BudgetBackend::None => Ok(Box::new(NoBudget)),
         BudgetBackend::InMemory => Ok(Box::new(InMemoryBudget::with_limits(
             config.limit_microdollars,
-            Duration::from_secs(config.idle_ttl),
+            Duration::from_secs(config.idle_ttl_seconds),
             config.max_subjects,
         ))),
         BudgetBackend::Redis => {
