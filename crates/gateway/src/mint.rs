@@ -255,7 +255,7 @@ fn encoding_key(algorithm: MintAlgorithm, value: &str, kid: &str) -> Result<Enco
         }
         MintAlgorithm::EdDsa => {
             let decoded = STANDARD
-                .decode(value)
+                .decode(value.trim())
                 .map_err(|_| anyhow::anyhow!("signing key for `{kid}` is not valid base64"))?;
             Ed25519KeyPair::from_pkcs8(&decoded)
                 .map_err(|_| anyhow::anyhow!("signing key for `{kid}` is not valid Ed25519 PKCS#8"))
@@ -423,14 +423,14 @@ max_ttl = "15m"
             ("STATIC".to_owned(), "static".to_owned()),
             (
                 "PUBLIC".to_owned(),
-                STANDARD.encode(keypair.public_key().as_ref()),
+                format!(" {}\n", STANDARD.encode(keypair.public_key().as_ref())),
             ),
         ]);
         let verifier = TokenVerifier::build(&config, &env).unwrap().unwrap();
         let token = mint_token(
             "test-kid",
             MintAlgorithm::EdDsa,
-            &STANDARD.encode(private),
+            &format!(" \n{}\t ", STANDARD.encode(private)),
             "acme",
             "caller",
             "configured-audience",
@@ -508,6 +508,33 @@ max_ttl = "15m"
         assert_eq!(principal.namespace, "acme");
         assert_eq!(principal.subject, "caller");
         assert_eq!(principal.signer_kid.as_deref(), Some("hs-kid"));
+    }
+
+    #[tokio::test]
+    async fn hs256_preserves_secret_whitespace() {
+        let config = verifier_config("hs-kid", "HS256", "HS_SECRET", "15m");
+        let secret = "0123456789012345678901234567890\n";
+        let env = HashMap::from([
+            ("STATIC".to_owned(), "static".to_owned()),
+            ("HS_SECRET".to_owned(), secret.to_owned()),
+        ]);
+        let verifier = TokenVerifier::build(&config, &env).unwrap().unwrap();
+        let token = mint_token(
+            "hs-kid",
+            MintAlgorithm::Hs256,
+            secret,
+            "acme",
+            "caller",
+            "configured-audience",
+            Duration::from_secs(600),
+        )
+        .unwrap();
+        let principal = verifier
+            .resolve(&Presented { credential: &token })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(principal.subject, "caller");
     }
 
     #[tokio::test]

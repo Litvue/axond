@@ -183,7 +183,7 @@ impl TokenVerifier {
                     DecodingKey::from_secret(value.as_bytes())
                 }
                 GatewayVerifierAlgorithm::EdDsa => {
-                    let decoded = BASE64.decode(value).map_err(|_| {
+                    let decoded = BASE64.decode(value.trim()).map_err(|_| {
                         TokenVerifierBuildError::InvalidBase64 {
                             kid: verifier.kid.clone(),
                         }
