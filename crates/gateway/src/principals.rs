@@ -66,12 +66,8 @@ impl ConfigPrincipals {
         format!("{:?}", self.inbound_keys[0].secret)
     }
 
-    pub(crate) fn resolve_sync(&self, credential: &str) -> Option<InboundKey> {
-        self.resolve_sync_ref(credential).cloned()
-    }
-
-    pub(crate) fn resolve_sync_ref(&self, credential: &str) -> Option<&InboundKey> {
-        resolve_static_key(&self.inbound_keys, credential)
+    pub(crate) fn resolve_static(&self, credential: &str) -> Option<InboundKey> {
+        resolve_static_key(&self.inbound_keys, credential).cloned()
     }
 }
 
@@ -89,7 +85,7 @@ impl PrincipalStore for ConfigPrincipals {
         &self,
         presented: &Presented<'_>,
     ) -> Result<Option<InboundKey>, PrincipalStoreError> {
-        Ok(self.resolve_sync(presented.credential))
+        Ok(self.resolve_static(presented.credential))
     }
 }
 
@@ -134,12 +130,20 @@ impl PrincipalStoreChain {
         self.config.resolve(presented).await
     }
 
-    pub(crate) fn resolve_config_sync(&self, credential: &str) -> Option<&InboundKey> {
-        self.config.resolve_sync_ref(credential)
-    }
-
     pub(crate) fn config_count(&self) -> usize {
         self.config.count()
+    }
+
+    pub(crate) fn owner_name(&self, presented: &Presented<'_>) -> &'static str {
+        self.stores
+            .iter()
+            .find(|store| {
+                store
+                    .shapes()
+                    .iter()
+                    .any(|shape| presented.credential.starts_with(shape))
+            })
+            .map_or(self.config.name(), |store| store.name())
     }
 
     #[cfg(test)]

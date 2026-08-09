@@ -38,7 +38,7 @@ use gateway_core::{
 };
 use gateway_transport::{AuthScheme, NativeCall, TransportError, Upstream};
 use serde_json::{Value, json};
-use tracing::Instrument;
+use tracing::{Instrument, warn};
 
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, Target};
@@ -116,11 +116,22 @@ async fn authenticate(
         .and_then(|v| v.strip_prefix("Bearer "))
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
         .ok_or(GatewayError::Unauthorized)?;
-    snapshot
-        .resolve_principal(&Presented { credential })
-        .await
-        .map_err(|_| GatewayError::Unauthorized)?
-        .ok_or(GatewayError::Unauthorized)
+    let presented = Presented { credential };
+    let store = snapshot.principal_store_name(&presented);
+    let principal = match snapshot.resolve_principal(&presented).await {
+        Ok(principal) => principal,
+        Err(error) => {
+            // A layer error is terminal by design; it must not fall through to
+            // another authority just because the owning layer is unavailable.
+            warn!(
+                store,
+                error = %error,
+                "principal store resolution failed"
+            );
+            return Err(GatewayError::Unauthorized);
+        }
+    };
+    principal.ok_or(GatewayError::Unauthorized)
 }
 
 /// The wire shape a route speaks, which is the only thing that differs between

@@ -26,7 +26,7 @@ use crate::budget::BudgetStore;
 use crate::config::{Config, ProviderKind};
 use crate::credentials::{CredentialError, Credentials};
 use crate::principals::{
-    ConfigPrincipals, GatewayKeyEntry, PrincipalShapeError, PrincipalStoreChain,
+    ConfigPrincipals, GatewayKeyEntry, Presented, PrincipalShapeError, PrincipalStoreChain,
 };
 use crate::usage::UsageFanout;
 
@@ -150,19 +150,15 @@ impl ConfigSnapshot {
         })
     }
 
-    /// Resolve the caller for a presented inbound token, matching in constant
-    /// time so the comparison cannot leak the secret through timing. Returns
-    /// only the caller identity; the secret never leaves this type.
-    #[allow(dead_code)]
-    pub fn resolve_inbound(&self, token: &str) -> Option<&InboundKey> {
-        self.principals.resolve_config_sync(token)
-    }
-
     pub async fn resolve_principal(
         &self,
-        presented: &crate::principals::Presented<'_>,
+        presented: &Presented<'_>,
     ) -> Result<Option<InboundKey>, crate::principals::PrincipalStoreError> {
         self.principals.resolve(presented).await
+    }
+
+    pub fn principal_store_name(&self, presented: &Presented<'_>) -> &'static str {
+        self.principals.owner_name(presented)
     }
 
     /// How many inbound gateway keys are enforced. For the boot log and reload
@@ -302,17 +298,29 @@ namespace = "platform"
         assert!(!message.contains("shared"), "{message}");
     }
 
-    #[test]
-    fn a_resolved_key_is_bound_to_its_namespace_and_env_var() {
+    #[tokio::test]
+    async fn a_resolved_key_is_bound_to_its_namespace_and_env_var() {
         let env = HashMap::from([("AXOND_KEY".to_owned(), "inbound-secret".to_owned())]);
         let snapshot = ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 0).expect("resolves");
         let key = snapshot
-            .resolve_inbound("inbound-secret")
+            .resolve_principal(&Presented {
+                credential: "inbound-secret",
+            })
+            .await
+            .expect("principal resolution succeeds")
             .expect("the presented secret resolves its caller");
         assert_eq!(key.namespace, "platform");
         assert_eq!(key.subject, "AXOND_KEY");
         assert_eq!(snapshot.inbound_key_count(), 1);
-        assert!(snapshot.resolve_inbound("wrong-secret").is_none());
+        assert!(
+            snapshot
+                .resolve_principal(&Presented {
+                    credential: "wrong-secret",
+                })
+                .await
+                .expect("principal resolution succeeds")
+                .is_none()
+        );
     }
 
     /// The secret is held as `SecretString`, so debugging or logging an entry

@@ -344,6 +344,7 @@ async fn watch_loop(reloader: Arc<Reloader>) {
 mod tests {
     use super::*;
     use crate::budget::NoBudget;
+    use crate::principals::Presented;
     use crate::routes;
     use crate::usage::{StdoutSink, UsageFanout, UsageSink};
     use axum::body::Body;
@@ -611,7 +612,16 @@ default = true
         // The running config still serves, still with its own key table.
         assert!(Arc::ptr_eq(&before, &state.config()));
         assert_eq!(state.config().generation, 0);
-        assert!(state.config().resolve_inbound("inbound-secret").is_some());
+        assert!(
+            state
+                .config()
+                .resolve_principal(&Presented {
+                    credential: "inbound-secret",
+                })
+                .await
+                .expect("principal resolution succeeds")
+                .is_some()
+        );
 
         // Exporting the rotated key is all the candidate was waiting for.
         let mut rotated = inbound_env();
@@ -624,8 +634,24 @@ default = true
             .expect("resolves once the key is exported");
         let after = state.config();
         assert_eq!(after.generation, 1);
-        assert!(after.resolve_inbound("rotated-secret").is_some());
-        assert!(after.resolve_inbound("inbound-secret").is_none());
+        assert!(
+            after
+                .resolve_principal(&Presented {
+                    credential: "rotated-secret",
+                })
+                .await
+                .expect("principal resolution succeeds")
+                .is_some()
+        );
+        assert!(
+            after
+                .resolve_principal(&Presented {
+                    credential: "inbound-secret",
+                })
+                .await
+                .expect("principal resolution succeeds")
+                .is_none()
+        );
     }
 
     /// A request holds its snapshot for its whole life, so a reload that lands
