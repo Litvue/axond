@@ -97,8 +97,11 @@ Verifier rotation may replace file material under the same `kid` and reload, or
 follow the overlap dance from ADRs 0011 and 0013: add the new `kid`, reload,
 move minting to it, then remove the old `kid` and reload. Applied reload
 summaries include a short fingerprint of each resolved verifier and static-key
-material, so same-`kid` changes are observable without logging secrets. A
-signer is permitted only for its configured `namespaces`.
+material, so same-`kid` changes are observable without logging secrets. The
+fingerprints are salted per process and comparable only within one process
+lifetime; they show that material changed at this reload, but are not stable
+identifiers for a key. A signer is permitted only for its configured
+`namespaces`.
 
 ### Minting and federation
 
@@ -266,7 +269,9 @@ assume that subjects belong to the static config key list.
   edit, environment-variable rollout, or per-caller gateway registry.
 - Gateway verifier and static breakglass material may come from files and is
   re-read on reload, making rotation a no-restart operation. Reload summaries
-  expose only short SHA-256 fingerprints, never material.
+  expose only short salted SHA-256 fingerprints, never material; fingerprints
+  are comparable only within one process lifetime and are not stable key
+  identifiers.
 - Ed25519 keeps verification-only replicas from becoming token minters.
 - Offline minting preserves the zero-external-state default; token issuance
   through HTTP and precise revocation are explicit opt-ins.

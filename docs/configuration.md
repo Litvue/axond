@@ -126,6 +126,10 @@ budget ledgers keyed by the old subject do not carry over. An absolute secret
 mount path is emitted as written and may therefore expose tenant names in
 usage sinks.
 
+Reload fingerprints are salted per process: they are comparable only within
+one process lifetime and show that material changed at this reload; they are
+not a stable identifier for a key.
+
 At least one entry is required: a config with none describes a gateway nobody
 could call, so it refuses to boot. Two keys may not resolve to the **same**
 secret — the caller's namespace would be ambiguous. Callers present the token as

@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::io;
+use std::sync::OnceLock;
 
 use crate::config::KeyMaterialSource;
 use ring::digest::{Context, SHA256};
+use ring::rand::{SecureRandom, SystemRandom};
 
 #[derive(Debug, thiserror::Error)]
 pub enum KeyMaterialError {
@@ -53,8 +55,17 @@ pub fn resolve(
 }
 
 pub fn fingerprint(label: &str, material: &str) -> String {
+    static SALT: OnceLock<[u8; 32]> = OnceLock::new();
+    let salt = SALT.get_or_init(|| {
+        let mut salt = [0u8; 32];
+        SystemRandom::new()
+            .fill(&mut salt)
+            .expect("system random generator must be available");
+        salt
+    });
     let mut context = Context::new(&SHA256);
     context.update(b"axond-key-material-v1\0");
+    context.update(salt);
     context.update(label.as_bytes());
     context.update(b"\0");
     context.update(material.as_bytes());

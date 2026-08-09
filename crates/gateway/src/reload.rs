@@ -371,7 +371,11 @@ fn credential_key(c: &crate::config::Credential) -> String {
 
 impl Delta {
     fn with_changed(mut self, changed: impl IntoIterator<Item = String>) -> Self {
-        self.changed = changed.into_iter().collect();
+        self.changed = changed
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         self
     }
 }
@@ -744,9 +748,13 @@ targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdo
         let old_fingerprint = state.config().gateway_verifier_fingerprints["reload-kid"].clone();
         let reloader = Reloader::new(file.path(), state);
         material.rewrite("jwt-test-secret-012345678901234567891");
+        file.rewrite(&format!(
+            "{PLATFORM_ONLY}\n[gateway_token]\naudience = \"reload-test\"\n\n[[gateway_verifier]]\nkid = \"reload-kid\"\nalg = \"HS256\"\nfile = \"{}\"\nnamespaces = [\"platform\"]\nmax_ttl = \"30m\"\n",
+            material.path()
+        ));
         let summary = reloader
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
-            .expect("changed file material is valid");
+            .expect("changed definition and file material are valid");
         assert_eq!(summary.gateway_verifiers.changed, vec!["reload-kid"]);
         assert_ne!(
             summary.gateway_verifier_fingerprints["reload-kid"],

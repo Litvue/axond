@@ -231,7 +231,9 @@ base64 is trimmed before decoding, so its generated trailing newline is fine.
 
 3. Confirm the applied reload log reports the `kid` in `gateway_verifiers`
    `changed` and includes a different short fingerprint. The log contains
-   fingerprints, never key material.
+   fingerprints, never key material. Fingerprints are comparable only within
+   one process lifetime: they show that material changed at this reload, but
+   are not stable identifiers for a key.
 
 A failed candidate (for example, a deleted, empty, unreadable, or corrupted
 file) is rejected atomically and the previous snapshot keeps serving. Restore
