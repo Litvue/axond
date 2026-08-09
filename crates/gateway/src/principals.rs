@@ -16,6 +16,7 @@ use crate::config::{Config, GatewayVerifierAlgorithm};
 pub struct InboundKey {
     pub namespace: String,
     pub subject: String,
+    pub signer_kid: Option<String>,
 }
 
 pub(crate) struct GatewayKeyEntry {
@@ -338,7 +339,11 @@ impl PrincipalStore for TokenVerifier {
                 claim: "sub".to_owned(),
             }),
         )?;
-        Ok(Some(InboundKey { namespace, subject }))
+        Ok(Some(InboundKey {
+            namespace,
+            subject,
+            signer_kid: Some(verifier.kid.clone()),
+        }))
     }
 }
 
@@ -553,6 +558,7 @@ mod tests {
             caller: InboundKey {
                 namespace: "platform".to_owned(),
                 subject: "AXOND_KEY".to_owned(),
+                signer_kid: None,
             },
         }]))
     }
@@ -794,6 +800,7 @@ max_ttl = "15m"
             .expect("valid token returns a principal");
         assert_eq!(principal.namespace, "acme");
         assert_eq!(principal.subject, "caller-1");
+        assert_eq!(principal.signer_kid.as_deref(), Some("ed-test"));
     }
 
     #[tokio::test]

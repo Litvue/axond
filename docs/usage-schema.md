@@ -18,7 +18,8 @@ meaning, and how they are allowed to change. The design rationale is
 | `request_id` | `text` | Identifies one request. Unique **per gateway process**, not globally. |
 | `trace_id` | `text` | W3C trace id of the caller's trace; NULL when the request was not traced. One trace usually spans many requests. |
 | `namespace` | `text` | Tenant/namespace the request was served under. |
-| `subject` | `text` | Authenticated caller — the gateway key's label (its env-var name). Always a declared identity: inbound auth fails closed (ADR 0013). |
+| `subject` | `text` | Authenticated caller — the gateway key's env-var label for static authentication, or the token's `sub` claim for token authentication. |
+| `signer_kid` | `text` | Configured JWS signer that vouched for a token caller; NULL for static gateway-key authentication. |
 | `model` | `text` | Alias the caller asked for (`gpt-4o`). |
 | `target_provider` | `text` | Provider that served it. |
 | `target_model` | `text` | Concrete upstream model / deployment. |
@@ -46,6 +47,13 @@ when absent), and the OTLP sink emits it as an OTel log record with
 
 - Adding a **nullable** column, or populating a reserved one, is not a version
   bump: no existing reader changes behaviour.
+- Additive nullable columns that were not reserved in the base DDL ship as
+  ordered `usage_v1_<sequence>_<name>.sql` files alongside `usage_v1.sql`.
+  Fresh installations apply `usage_v1.sql` followed by every additive file in
+  filename order; existing installations apply only the new additive file
+  before deploying a writer that emits its column. The writer does not probe
+  for missing columns: deploying it first causes the existing sink error and
+  dropped-record path.
 - Removing or renaming a column, making one `NOT NULL`, or changing a unit or a
   vocabulary (e.g. a new `status` value is fine; redefining an existing one is
   not) **is** a bump: a new `ops/postgres/usage_v<N>.sql` plus a bump of

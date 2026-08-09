@@ -135,6 +135,7 @@ impl ConfigSnapshot {
                 caller: InboundKey {
                     namespace: k.namespace.clone(),
                     subject: k.env.clone(),
+                    signer_kid: None,
                 },
             });
         }

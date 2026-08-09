@@ -27,6 +27,11 @@ use super::{ObservedRecord, SinkFailure, UsageRecord, UsageSink, UsageSinkError}
 /// version — [`UsageRecord::SCHEMA_VERSION`] — not two that can drift.
 const SCHEMA_DDL: &str = include_str!("../../../../ops/postgres/usage_v1.sql");
 
+/// Additive migrations for the current schema version. These are applied after
+/// the base DDL for fresh tables; existing installations apply them before
+/// deploying a writer that emits the new column.
+const ADDITIVE_DDL: &str = include_str!("../../../../ops/postgres/usage_v1_001_add_signer_kid.sql");
+
 /// The table name the shipped DDL uses; substituted when the sink is configured
 /// with another one.
 const DEFAULT_TABLE: &str = "axond_usage";
@@ -38,12 +43,13 @@ const INDEX_PREFIX_PLACEHOLDER: &str = "\u{1}index_prefix\u{1}";
 /// Columns written per row, in parameter order. `reasoning_tokens`,
 /// `cache_read_tokens`, and `cache_write_tokens` exist in the table but are not
 /// written: the canonical record does not carry them yet.
-const COLUMNS: [&str; 19] = [
+const COLUMNS: [&str; 20] = [
     "schema_version",
     "request_id",
     "trace_id",
     "namespace",
     "subject",
+    "signer_kid",
     "model",
     "target_provider",
     "target_model",
@@ -125,10 +131,12 @@ impl PostgresSink {
     /// `axond_usage_recorded_at_idx`.
     fn schema_ddl(&self) -> String {
         let index_prefix = self.table.rsplit('.').next().unwrap_or(&self.table);
-        SCHEMA_DDL
-            .replace(&format!("{DEFAULT_TABLE}_"), INDEX_PREFIX_PLACEHOLDER)
-            .replace(DEFAULT_TABLE, &self.table)
-            .replace(INDEX_PREFIX_PLACEHOLDER, &format!("{index_prefix}_"))
+        let retarget = |ddl: &str| {
+            ddl.replace(&format!("{DEFAULT_TABLE}_"), INDEX_PREFIX_PLACEHOLDER)
+                .replace(DEFAULT_TABLE, &self.table)
+                .replace(INDEX_PREFIX_PLACEHOLDER, &format!("{index_prefix}_"))
+        };
+        format!("{}\n{}", retarget(SCHEMA_DDL), retarget(ADDITIVE_DDL))
     }
 
     async fn connect_client(&self) -> Result<Client, tokio_postgres::Error> {
@@ -260,6 +268,7 @@ fn row(observed: &ObservedRecord) -> Vec<Box<dyn ToSql + Sync + Send>> {
         Box::new(record.trace_id.clone()),
         Box::new(record.namespace.clone()),
         Box::new(record.subject.clone()),
+        Box::new(record.signer_kid.clone()),
         Box::new(record.model.clone()),
         Box::new(record.target_provider.clone()),
         Box::new(record.target_model.clone()),
@@ -319,8 +328,8 @@ mod tests {
     fn the_row_shape_matches_the_shipped_ddl() {
         for column in COLUMNS {
             assert!(
-                SCHEMA_DDL.contains(column),
-                "column `{column}` is written but not declared in usage_v1.sql"
+                SCHEMA_DDL.contains(column) || ADDITIVE_DDL.contains(column),
+                "column `{column}` is written but not declared in the base or additive DDL"
             );
         }
         assert_eq!(UsageRecord::SCHEMA_VERSION, 1);

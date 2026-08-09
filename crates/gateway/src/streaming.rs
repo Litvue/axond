@@ -40,6 +40,7 @@ use crate::usage::{Status, UsageRecord};
 pub struct StreamContext {
     pub namespace: String,
     pub subject: String,
+    pub signer_kid: Option<String>,
     pub alias: String,
     pub target_provider: String,
     pub target_model: String,
@@ -487,6 +488,7 @@ impl Accounting {
             request_id: next_request_id(),
             namespace: self.ctx.namespace.clone(),
             subject: self.ctx.subject.clone(),
+            signer_kid: self.ctx.signer_kid.clone(),
             model: self.ctx.alias.clone(),
             target_provider: self.ctx.target_provider.clone(),
             target_model: self.ctx.target_model.clone(),
@@ -733,6 +735,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         StreamContext {
             namespace: "platform".to_owned(),
             subject: "GW_TEST_INBOUND_KEY".to_owned(),
+            signer_kid: Some("test-kid".to_owned()),
             alias: "gpt-4o".to_owned(),
             target_provider: "openai".to_owned(),
             target_model: "gpt-4o".to_owned(),
@@ -769,6 +772,19 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("no usage record was settled");
+    }
+
+    #[tokio::test]
+    async fn streaming_usage_preserves_the_signer_kid() {
+        let ledger = Arc::new(Ledger::default());
+        let mut accounting = Accounting::new(
+            state_for("http://127.0.0.1:1", ledger.clone()),
+            context(),
+            Instant::now(),
+        );
+        accounting.settle(Status::Ok);
+        let record = settled(&ledger).await;
+        assert_eq!(record["signer_kid"], "test-kid");
     }
 
     const OPENAI_STREAM: &str = concat!(

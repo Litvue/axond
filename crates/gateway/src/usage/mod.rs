@@ -79,6 +79,10 @@ pub struct UsageRecord {
     pub namespace: String,
     /// Authenticated caller / gateway-key id.
     pub subject: String,
+    /// Configured JWS signer that vouched for the caller; absent for static
+    /// gateway-key authentication.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signer_kid: Option<String>,
     /// Model name the caller requested (the alias).
     pub model: String,
     /// Provider + concrete model that actually served it.
@@ -294,6 +298,7 @@ mod tests {
             trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string()),
             namespace: "acme".to_string(),
             subject: "GW_INBOUND_ACME_KEY".to_string(),
+            signer_kid: Some("verifier-1".to_string()),
             model: "gpt-4o".to_string(),
             target_provider: "openai".to_string(),
             target_model: "gpt-4o-2024-08-06".to_string(),
