@@ -74,6 +74,46 @@ git worktree add /tmp/axond-main origin/main
 git worktree remove /tmp/axond-main --force
 ```
 
+## Minted inbound identity (`keygen` / `mint` / `[[gateway_verifier]]`)
+
+Minted tokens can be exercised fully offline. Working recipe:
+
+```bash
+axond keygen --private-key ./sign.key --kid k1 --env GW_VERIFY_K1 \
+  --namespace acme --max-ttl 15m          # stdout = public key export + verifier snippet
+# config needs: [gateway_token] audience, [[gateway_verifier]], AND >=1 [[gateway_key]]
+export GW_VERIFY_K1='<from keygen stdout>'   # must be in the env BEFORE the gateway starts
+export GW_SIGN_K1="$(cat ./sign.key)"
+TOKEN=$(axond mint --config ./axond.toml --kid k1 --alg EdDSA --key-env GW_SIGN_K1 \
+  --namespace acme --subject agent-1 --ttl 10m)
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/v1/models
+```
+
+- Mint-time enforcement only happens when a config is loaded. Dropping `--config` (and
+  `AXOND_CONFIG`) makes `mint` enforce just the 24h ceiling, which is how you produce a
+  token the gateway must reject (`token_invalid_lifetime`, `token_signer_not_permitted`) —
+  the cheapest way to test verify-side checks without hand-forging a JWS.
+- Verify-side rejections are typed: `token_unknown_key` (kid removed/absent),
+  `token_invalid_signature` (key material swapped), `token_invalid_lifetime`
+  (`exp - iat > max_ttl`), `token_signer_not_permitted` (403, `ns` not in the verifier's
+  `namespaces`), `token_wrong_audience`.
+- `signer_kid` appears in the JSON usage record on stdout only for minted callers; static
+  `[[gateway_key]]` records use the env var *name* as `subject` and omit `signer_kid`. To
+  emit a record with no provider, point the provider `base_url` at `http://127.0.0.1:1/v1`
+  and POST `/v1/chat/completions` (502) — the usage record is still written.
+- **A running process's environment cannot gain a new variable.** SIGHUP re-reads
+  `std::env::vars()` of the *same* process, so adding a `[[gateway_verifier]]` whose `env`
+  was exported after the gateway started makes the reload fail with
+  "references env var `X`, which is unset or empty" and the old config keeps serving.
+  Any new-`kid` rotation test must pre-export every verifier env var before boot, or
+  restart the process. Same-`kid` key-material swaps likewise need a restart.
+- The reload summary line renders the verifier delta as
+  `gateway_verifiers="+[new] -[old] ~[changed-definition]"`; key material is never part of
+  the diff, so a material-only change reports `gateway_verifiers="unchanged", changed=false`.
+- EdDSA base64 is trimmed on both mint and verify sides (a trailing `\n` in either env var
+  still works). HS256 secrets are *not* trimmed — a trailing newline on the signing side
+  yields `token_invalid_signature`, which is the expected, documented behaviour.
+
 ## Gotchas
 
 - Do **not** run `pkill -f '...axond...'` from the exec tool: the pattern matches the
