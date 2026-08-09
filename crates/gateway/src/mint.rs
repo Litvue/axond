@@ -104,6 +104,9 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
 
     let ttl = parse_duration(required(args, "ttl")?)?;
     let policy_ceiling = Duration::from_secs(MAX_GATEWAY_VERIFIER_TTL_SECONDS);
+    if ttl.is_zero() {
+        bail!("requested TTL must be at least 1 second");
+    }
     if ttl > policy_ceiling {
         bail!(
             "requested TTL exceeds the {}-second policy ceiling",
@@ -451,7 +454,7 @@ max_ttl = "15m"
             "acme",
             "caller",
             "configured-audience",
-            Duration::from_secs(600),
+            Duration::from_secs(1),
         )
         .unwrap();
         let principal = verifier
@@ -529,6 +532,30 @@ max_ttl = "15m"
             .unwrap_err()
             .to_string();
         assert!(error.contains("policy ceiling"));
+    }
+
+    #[test]
+    fn mint_rejects_zero_ttl() {
+        let args = mint_args(&[
+            "--kid",
+            "hs-kid",
+            "--alg",
+            "HS256",
+            "--key-env",
+            "HS_SECRET",
+            "--namespace",
+            "acme",
+            "--subject",
+            "caller",
+            "--ttl",
+            "0",
+            "--audience",
+            "configured-audience",
+        ]);
+        let error = mint_from_args(&args, None, "01234567890123456789012345678901")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at least 1 second"));
     }
 
     #[test]
