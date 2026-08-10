@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.1.4](https://github.com/Litvue/axond/compare/v0.1.3...v0.1.4) (2026-08-10)
+
+
+### Features
+
+* **gateway:** add Redis-backed inbound rate limiting ([ca5139d](https://github.com/Litvue/axond/commit/ca5139df0493c714682d1a9a1f7ca5e4cc6d2ffe))
+* **gateway:** separate Redis connect timeout ([c7a4d67](https://github.com/Litvue/axond/commit/c7a4d67e8306d459ccfbb33633bb4b09dac03af4))
+* **limits:** exact cross-replica Redis rate limiting ([9f13050](https://github.com/Litvue/axond/commit/9f130504e768f99d5a46984d6d73d9c2c60e2346))
+
+
+### Bug Fixes
+
+* **gateway:** harden Redis rate-limit lease recovery ([dd41854](https://github.com/Litvue/axond/commit/dd418546cddf20d15fa889a6cad5808ee3adb734))
+* **gateway:** harden Redis rate-limit leases ([2342006](https://github.com/Litvue/axond/commit/2342006bc8a69e593e1d0265461e1b202a10126c))
+
+
+### Tests
+
+* **gateway:** cover rate limit store errors ([03c74e5](https://github.com/Litvue/axond/commit/03c74e54ad4cb09290ec1708f8dd093d67ce4b00))
+* **gateway:** cover Redis limiter failure paths ([8e86a44](https://github.com/Litvue/axond/commit/8e86a441a58e7ea7edc6c4a1f1d005a1e58062e8))
+* **gateway:** verify Redis limiter reconnects after outage ([c206b35](https://github.com/Litvue/axond/commit/c206b357cc879570a9c55dc889fc76c3d4c444c1))
+
 ## [0.1.3](https://github.com/Litvue/axond/compare/v0.1.2...v0.1.3) (2026-08-10)
 
 
