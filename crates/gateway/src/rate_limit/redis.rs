@@ -1182,7 +1182,7 @@ mod tests {
         );
         assert!(allow.acquire(&key()).await.is_ok());
 
-        relay.set_mode(RelayMode::Forward);
+        relay.set_mode(RelayMode::Cut);
         assert!(matches!(
             deny.acquire(&key()).await,
             Err(RateLimitError::StoreUnavailable)
