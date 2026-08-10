@@ -175,6 +175,7 @@ struct TokenClaims {
     jti: Option<String>,
     ns: Option<String>,
     sub: Option<String>,
+    // Keep this loose so a wrong JSON type becomes a typed 403, not a 401 decode failure.
     aliases: Option<Value>,
 }
 

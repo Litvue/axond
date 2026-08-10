@@ -1,3 +1,7 @@
+//! Tiny, case-sensitive alias globs: exact names, one leading or trailing `*`,
+//! or bare `*`. Invalid patterns and the empty set fail closed; a scope can
+//! only narrow configured authority, never widen it.
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AliasPattern {
     Exact(String),

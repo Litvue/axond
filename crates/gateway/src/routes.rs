@@ -46,7 +46,7 @@ use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, Target};
 use crate::credentials::{CredentialPlan, CredentialSource};
 use crate::error::GatewayError;
-use crate::principals::{Presented, PrincipalStoreError};
+use crate::principals::{Presented, PrincipalStoreError, TokenVerificationError};
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::streaming::{self, Framing, StreamContext};
 use crate::telemetry;
@@ -467,7 +467,7 @@ async fn serve(
         && !scope.permits(&alias)
     {
         return Err(GatewayError::TokenForbidden(
-            crate::principals::TokenVerificationError::AliasNotPermitted { alias },
+            TokenVerificationError::AliasNotPermitted { alias },
         ));
     }
 
@@ -1221,6 +1221,7 @@ async fn record_usage(state: &AppState, args: RecordArgs<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aliases::AliasScope;
     use crate::budget::NoBudget;
     use crate::config::Config;
     use crate::usage::{StdoutSink, UsageFanout, UsageSink};
@@ -1285,6 +1286,10 @@ env = "AXOND_PLATFORM_OPENAI"
 [[model]]
 name = "gpt-4o"
 targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }} }}]
+
+[[model]]
+name = "claude-3"
+targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }} }}]
 "#
         ))
         .unwrap();
@@ -1550,7 +1555,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             namespace: "platform".to_owned(),
             subject: "restricted".to_owned(),
             signer_kid: Some("test-kid".to_owned()),
-            alias_scope: Some(crate::aliases::AliasScope::parse(["other"]).unwrap()),
+            alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
         };
         let response = list_models(Extension(snapshot), Extension(caller))
             .await
@@ -1558,7 +1563,8 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             .into_response();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["data"].as_array().unwrap().len(), 0);
+        assert_eq!(json["data"].as_array().unwrap().len(), 1);
+        assert_eq!(json["data"][0]["id"], "gpt-4o");
     }
 
     /// A caller sees only the aliases it could invoke: a BYOK namespace with no
@@ -1663,28 +1669,28 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
     #[tokio::test]
     async fn a_disallowed_alias_is_forbidden_before_model_lookup() {
         let state = test_state();
-        let snapshot = state.config();
-        let caller = InboundKey {
-            namespace: "platform".to_owned(),
-            subject: "restricted".to_owned(),
-            signer_kid: Some("test-kid".to_owned()),
-            alias_scope: Some(crate::aliases::AliasScope::parse(["other"]).unwrap()),
-        };
-        let response = serve(
-            state,
-            HeaderMap::new(),
-            json!({"model": "does-not-exist", "messages": []}),
-            Route::ChatCompletions,
-            snapshot,
-            caller,
-        )
-        .await
-        .unwrap_err()
-        .into_response();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["type"], "token_alias_not_permitted");
+        for alias in ["claude-3", "does-not-exist"] {
+            let response = serve(
+                state.clone(),
+                HeaderMap::new(),
+                json!({"model": alias, "messages": []}),
+                Route::ChatCompletions,
+                state.config(),
+                InboundKey {
+                    namespace: "platform".to_owned(),
+                    subject: "restricted".to_owned(),
+                    signer_kid: Some("test-kid".to_owned()),
+                    alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
+                },
+            )
+            .await
+            .unwrap_err()
+            .into_response();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"]["type"], "token_alias_not_permitted");
+        }
     }
 
     /// Deferred past beta, but the route still answers for itself: a caller

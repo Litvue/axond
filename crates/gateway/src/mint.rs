@@ -165,10 +165,11 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
         .get_many::<String>("alias")
         .map(|values| values.cloned().collect::<Vec<_>>());
     if let Some(patterns) = &aliases {
-        AliasScope::parse(patterns.clone()).map_err(|error| anyhow::anyhow!("{error}"))?;
+        AliasScope::parse(patterns.iter().map(String::as_str))
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
 
-    mint_token_with_aliases(MintRequest {
+    mint_token(MintRequest {
         kid,
         algorithm,
         key_material,
@@ -177,28 +178,6 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
         audience: &audience,
         ttl,
         aliases,
-    })
-}
-
-#[cfg(test)]
-fn mint_token(
-    kid: &str,
-    algorithm: MintAlgorithm,
-    key_material: &str,
-    namespace: &str,
-    subject: &str,
-    audience: &str,
-    ttl: Duration,
-) -> Result<String> {
-    mint_token_with_aliases(MintRequest {
-        kid,
-        algorithm,
-        key_material,
-        namespace,
-        subject,
-        audience,
-        ttl,
-        aliases: None,
     })
 }
 
@@ -213,7 +192,7 @@ struct MintRequest<'a> {
     aliases: Option<Vec<String>>,
 }
 
-fn mint_token_with_aliases(request: MintRequest<'_>) -> Result<String> {
+fn mint_token(request: MintRequest<'_>) -> Result<String> {
     let MintRequest {
         kid,
         algorithm,
@@ -497,15 +476,16 @@ max_ttl = "15m"
             ),
         ]);
         let verifier = TokenVerifier::build(&config, &env).unwrap().unwrap();
-        let token = mint_token(
-            "test-kid",
-            MintAlgorithm::EdDsa,
-            &format!(" \n{}\t ", STANDARD.encode(private.as_ref())),
-            "acme",
-            "caller",
-            "configured-audience",
-            Duration::from_secs(600),
-        )
+        let token = mint_token(MintRequest {
+            kid: "test-kid",
+            algorithm: MintAlgorithm::EdDsa,
+            key_material: &format!(" \n{}\t ", STANDARD.encode(private.as_ref())),
+            namespace: "acme",
+            subject: "caller",
+            audience: "configured-audience",
+            ttl: Duration::from_secs(600),
+            aliases: None,
+        })
         .unwrap();
         let principal = verifier
             .resolve(&Presented { credential: &token })
@@ -526,15 +506,16 @@ max_ttl = "15m"
             ("HS_SECRET".to_owned(), secret.to_owned()),
         ]);
         let verifier = TokenVerifier::build(&config, &env).unwrap().unwrap();
-        let token = mint_token(
-            "hs-kid",
-            MintAlgorithm::Hs256,
-            secret,
-            "acme",
-            "caller",
-            "configured-audience",
-            Duration::from_secs(600),
-        )
+        let token = mint_token(MintRequest {
+            kid: "hs-kid",
+            algorithm: MintAlgorithm::Hs256,
+            key_material: secret,
+            namespace: "acme",
+            subject: "caller",
+            audience: "configured-audience",
+            ttl: Duration::from_secs(600),
+            aliases: None,
+        })
         .unwrap();
         let principal = verifier
             .resolve(&Presented { credential: &token })
@@ -589,15 +570,16 @@ max_ttl = "15m"
             ("HS_SECRET".to_owned(), secret.to_owned()),
         ]);
         let verifier = TokenVerifier::build(&config, &env).unwrap().unwrap();
-        let token = mint_token(
-            "hs-kid",
-            MintAlgorithm::Hs256,
-            secret,
-            "acme",
-            "caller",
-            "configured-audience",
-            Duration::from_secs(600),
-        )
+        let token = mint_token(MintRequest {
+            kid: "hs-kid",
+            algorithm: MintAlgorithm::Hs256,
+            key_material: secret,
+            namespace: "acme",
+            subject: "caller",
+            audience: "configured-audience",
+            ttl: Duration::from_secs(600),
+            aliases: None,
+        })
         .unwrap();
         let principal = verifier
             .resolve(&Presented { credential: &token })
@@ -630,15 +612,16 @@ max_ttl = "15m"
             ),
         ]);
         let verifier = TokenVerifier::build(&config, &env).unwrap().unwrap();
-        let token = mint_token(
-            "generated-kid",
-            MintAlgorithm::EdDsa,
-            &STANDARD.encode(private.as_ref()),
-            "acme",
-            "generated-caller",
-            "configured-audience",
-            Duration::from_secs(600),
-        )
+        let token = mint_token(MintRequest {
+            kid: "generated-kid",
+            algorithm: MintAlgorithm::EdDsa,
+            key_material: &STANDARD.encode(private.as_ref()),
+            namespace: "acme",
+            subject: "generated-caller",
+            audience: "configured-audience",
+            ttl: Duration::from_secs(600),
+            aliases: None,
+        })
         .unwrap();
         let principal = verifier
             .resolve(&Presented { credential: &token })
@@ -867,15 +850,16 @@ max_ttl = "15m"
             ("HS_SECRET".to_owned(), secret.to_owned()),
         ]);
         let verifier = TokenVerifier::build(&config, &env).unwrap().unwrap();
-        let token = mint_token(
-            "different-kid",
-            MintAlgorithm::Hs256,
-            secret,
-            "acme",
-            "caller",
-            "configured-audience",
-            Duration::from_secs(600),
-        )
+        let token = mint_token(MintRequest {
+            kid: "different-kid",
+            algorithm: MintAlgorithm::Hs256,
+            key_material: secret,
+            namespace: "acme",
+            subject: "caller",
+            audience: "configured-audience",
+            ttl: Duration::from_secs(600),
+            aliases: None,
+        })
         .unwrap();
         assert!(matches!(
             verifier.resolve(&Presented { credential: &token }).await,
