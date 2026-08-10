@@ -48,11 +48,16 @@ const REDIS_OPERATION_TIMEOUT_MULTIPLIER: u32 = 4;
 const RELEASE_TIMEOUT_FLOOR: Duration = Duration::from_secs(1);
 const INVOKE_TIMEOUT_FLOOR: Duration = Duration::from_millis(500);
 const SHARED_CONNECTION_REPLACEMENT_COOLDOWN: Duration = Duration::from_millis(250);
-// A normal gateway replica can have hundreds of concurrent requests, but
-// refusing above 256 outstanding shared Redis invokes prevents a stalled
-// multiplexed socket from accumulating an unbounded task population. Saturation
-// refuses only the current request; it is not evidence that the socket failed.
-const SHARED_INVOKE_CONCURRENCY: usize = 256;
+// The old 256-invoke cap with the 250 ms admission timeout allowed
+// 256 / 0.25 = 1,024 admissions per second before shedding. Owned invokes now
+// live for up to 1 second at that default, so 1,024 preserves the same
+// headroom: 1,024 / 1 = 1,024 outstanding invokes per second of normal load.
+// The 500 ms floor provides 2,048 per second of headroom for lower timeouts.
+// This fixed safety bound is preferable to another per-limiter tuning knob in
+// this PR; configurability can be considered once production concurrency data
+// justifies it. Saturation refuses only the current request and is not evidence
+// that the socket failed.
+const SHARED_INVOKE_CONCURRENCY: usize = 1024;
 
 // Keep fresh-connection retries below a small fixed concurrency cap; the
 // shared manager's first attempt remains available to every release.
@@ -392,17 +397,28 @@ struct TimedOutAcquire {
 
 fn reclaim_timed_out_acquire(
     receiver: &mut oneshot::Receiver<OwnedAcquireResult>,
+    before_close: impl FnOnce(),
 ) -> TimedOutAcquire {
-    receiver.close();
     match receiver.try_recv() {
         Ok(result) => TimedOutAcquire {
             compensate: matches!(result, Ok(Ok(1))),
             result: Some(result),
         },
-        Err(oneshot::error::TryRecvError::Empty) => TimedOutAcquire {
-            result: None,
-            compensate: false,
-        },
+        Err(oneshot::error::TryRecvError::Empty) => {
+            before_close();
+            receiver.close();
+            match receiver.try_recv() {
+                Ok(result) => TimedOutAcquire {
+                    compensate: matches!(result, Ok(Ok(1))),
+                    result: Some(result),
+                },
+                Err(oneshot::error::TryRecvError::Empty)
+                | Err(oneshot::error::TryRecvError::Closed) => TimedOutAcquire {
+                    result: None,
+                    compensate: false,
+                },
+            }
+        }
         Err(oneshot::error::TryRecvError::Closed) => TimedOutAcquire {
             result: None,
             compensate: true,
@@ -639,7 +655,7 @@ impl RateLimiter for RedisRateLimiter {
             if ambiguous {
                 abandoned_release.clone().spawn();
             }
-            if sender.send(result).is_err() && definitely_created {
+            if sender.send(result).is_err() && (definite_denial || definitely_created) {
                 abandoned_release.spawn();
             }
             drop(invoke_permit);
@@ -647,14 +663,16 @@ impl RateLimiter for RedisRateLimiter {
         let result: Result<_, ()> = match tokio::time::timeout(self.timeout, &mut receiver).await {
             Ok(result) => Ok(result),
             Err(_) => {
-                let reclaimed = reclaim_timed_out_acquire(&mut receiver);
-                if reclaimed.compensate {
-                    release.spawn();
-                }
+                let reclaimed = reclaim_timed_out_acquire(&mut receiver, || {});
                 if let Some(result) = reclaimed.result {
                     let current_generation = self.connection.load_full().generation;
                     let result_untrusted = connection_generation != current_generation
                         || self.suspect_generation.load(Ordering::Acquire) >= connection_generation;
+                    let compensate =
+                        reclaimed.compensate || (result_untrusted && matches!(result, Ok(Ok(_))));
+                    if compensate {
+                        release.spawn();
+                    }
                     if result_untrusted {
                         return self
                             .unavailable("shared Redis connection was replaced during acquire");
@@ -670,6 +688,9 @@ impl RateLimiter for RedisRateLimiter {
                         Ok(Err(error)) => self.unavailable(error),
                         Err(_) => self.unavailable("operation timed out"),
                     };
+                }
+                if reclaimed.compensate {
+                    release.spawn();
                 }
                 return self.unavailable("operation timed out");
             }
@@ -2145,21 +2166,33 @@ mod tests {
     }
 
     #[test]
-    fn timeout_handoff_reclaims_and_closes_before_late_grant() {
+    fn timeout_handoff_distinguishes_inflight_dead_and_window_grants() {
         let (sender, mut receiver) = oneshot::channel::<OwnedAcquireResult>();
-        sender
-            .send(Ok(Ok(1)))
-            .expect("receiver is still alive before close");
-        let reclaimed = reclaim_timed_out_acquire(&mut receiver);
-        assert!(reclaimed.compensate);
-        assert!(matches!(reclaimed.result, Some(Ok(Ok(1)))));
-
-        let (sender, mut receiver) = oneshot::channel::<OwnedAcquireResult>();
-        let reclaimed = reclaim_timed_out_acquire(&mut receiver);
-        assert!(reclaimed.compensate);
+        let reclaimed = reclaim_timed_out_acquire(&mut receiver, || {});
+        assert!(!reclaimed.compensate);
+        assert!(reclaimed.result.is_none());
         assert!(
             sender.send(Ok(Ok(1))).is_err(),
-            "a late send must fail after the timeout handoff closes the receiver"
+            "the in-flight sender must be stopped after the handoff closes the receiver"
+        );
+
+        let (sender, mut receiver) = oneshot::channel::<OwnedAcquireResult>();
+        drop(sender);
+        let reclaimed = reclaim_timed_out_acquire(&mut receiver, || {});
+        assert!(reclaimed.compensate);
+        assert!(reclaimed.result.is_none());
+
+        let (sender, mut receiver) = oneshot::channel::<OwnedAcquireResult>();
+        let reclaimed = reclaim_timed_out_acquire(&mut receiver, || {
+            sender
+                .send(Ok(Ok(1)))
+                .expect("sender is alive between the two probes");
+        });
+        assert!(reclaimed.compensate);
+        assert!(matches!(&reclaimed.result, Some(Ok(Ok(1)))));
+        assert!(
+            reclaimed.result.is_some(),
+            "a grant sent in the probe/close window must be reclaimed"
         );
     }
 
