@@ -173,9 +173,13 @@ pressure on the failing server: contended attempts are skipped rather than
 queued, while the attempt count and deadline bound the effort. Lease expiry
 remains the final backstop.
 
-A cancelled response wait can poison a multiplexed connection's reply
-alignment, so the limiter retires that generation after any acquire or
-permit-release timeout; ordinary permit releases share this cancellation
-hazard. It refuses new admissions while a bounded replacement is in flight.
+A dropped in-flight response wait can poison a multiplexed connection's reply
+alignment, so every shared invoke is guarded structurally: dropping the
+invoke retires the generation it used. Permit releases use a separate,
+generous bounded timeout because they have no caller waiting on them; ordinary
+slowness should not retire a healthy manager, while a real stall still does.
+When a response is lost, later replies can be delivered to the wrong waiter;
+an unattributable admission result is therefore unknown, not a denial.
+The limiter refuses new admissions while a bounded replacement is in flight.
 Results from a retired generation are unknown, so the existing unavailable
 policy applies rather than trusting an admission or denial.
