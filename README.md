@@ -53,6 +53,36 @@ centralizes that:
 - **Inbound auth fails closed.** Every request that reaches a provider presents a
   configured gateway key; there is no keyless / anonymous mode.
 
+## State tiers
+
+State tiers describe the state backends axond itself depends on, not provider
+egress: the gateway obviously calls upstream providers over the network at
+Tier 0.
+
+| Tier | What it buys | What it costs |
+| --- | --- | --- |
+| **0 — config-only** | Namespaces, providers, aliases, prices, credentials, pools, failover, reload, gateway keys and minted-token verification, stdout usage, local budgets, and health probes. | No datastore. In-memory health and budgets are per replica; the default is no budget. This is the hermetic [`ops/tier0-gate.sh`](./ops/tier0-gate.sh) CI posture proved on every PR by [ADR 0018](./docs/adr/0018-tier-0-hermetic-boot-gate.md). |
+| **1 — Redis** | Shared budget enforcement today. | Redis availability is part of admission for every budgeted request; `on_unavailable = "deny"` (the default) returns `503 budget_unavailable`. |
+| **2 — Postgres** | Durable usage rows and shared Postgres-backed budgets; a future store-owned caller/key lifecycle. | A Postgres role, ordered migrations, backup/restore ownership, and boot-time DSN resolution. |
+
+The shipped Tier 1 feature today is `[budget] backend = "redis"`. Exact
+inbound rate limiting (`RateLimiter`/`NoLimit`) and precise per-token
+revocation are future, not-yet-shipped declarations: axond has no inbound
+limiting or revocation store today. Minted claims require `jti`, but today's
+revocation ladder is short TTLs, killing a `kid`, and rotation. An OTLP usage
+sink is Tier 0 state (no datastore, nothing to migrate), but not hermetic: it
+adds a collector dependency at boot, so it is excluded from the hermetic Tier
+0 CI lane.
+
+**One dimension, one owner.** Namespaces, providers, aliases, prices, and
+provider credentials are permanently config-owned and reload through ADR 0011.
+Only callers and keys may ever become store-owned at Tier 2; nothing is ever
+defined in both. No database may override namespace provider access, an
+alias's target, a price, or the credential pool. Even at Tier 2, a token
+verifier intersects token claims with config-owned namespace authority (ADR
+0016). See [ADR 0017](./docs/adr/0017-state-tiers-and-optional-backends.md)
+and [ADR 0018](./docs/adr/0018-tier-0-hermetic-boot-gate.md).
+
 ## Quick start
 
 ```bash
@@ -216,7 +246,7 @@ liveness probes `/healthz` and `/readyz` answer without a credential.
 
 See [ADR 0013](./docs/adr/0013-inbound-auth-fails-closed.md).
 
-### Credential pools
+### Credential pools (Tier 0)
 
 Several `[[credential]]` entries may name the same `(namespace, provider)` pair;
 together they are that pair's pool. Each entry takes an optional `id` (the
@@ -271,7 +301,7 @@ upstream; once the relay emits its first byte a mid-stream failure is a terminal
 record and on the per-attempt spans. See
 [ADR 0008](./docs/adr/0008-target-failover-and-circuit-scope.md).
 
-## Usage sinks
+## Usage sinks (Tier 0 by default; Tier 2 for Postgres)
 
 Every terminated request — including failures, cancellations, and partial
 streams — produces one canonical usage record. With no `[[usage_sink]]`
@@ -288,6 +318,10 @@ create_table = true                   # or apply usage_v1.sql and additive migra
 kind = "otlp"                         # usage as OTel log records, on the existing exporter
 ```
 
+A `kind = "otlp"` sink is Tier 0 state but not hermetic: it requires the OTLP
+collector at boot and is excluded from the hermetic Tier 0 CI lane. A
+`kind = "postgres"` sink is Tier 2.
+
 A configured sink connects at boot, so a bad DSN or an unreachable database
 refuses to start rather than dropping records later. From then on the sink is off
 the request path: records are buffered per sink and written in batches, and a
@@ -301,7 +335,7 @@ policy, and the delivery guarantees, and
 [ADR 0009](./docs/adr/0009-durable-usage-sinks.md) for why. Tinybird and
 ClickHouse fit the same seam and are deferred to post-beta.
 
-## Config hot-reload
+## Config hot-reload (Tier 0)
 
 Provider, model, namespace, credential, and gateway-key config is replaceable
 without a restart, so onboarding a BYOK customer is an edit and a signal:
@@ -387,7 +421,7 @@ runtime-neutral.
 - [x] Ordered failover across targets + per-target circuit health (see [ADR 0008](./docs/adr/0008-target-failover-and-circuit-scope.md))
 - [x] OpenTelemetry traces (per-upstream-attempt spans, TTFT), metrics, logs
 - [x] Usage sinks: Postgres (batched, versioned schema) + OTLP; Tinybird / ClickHouse post-beta
-- [x] Budget backends: shared Redis / Postgres, held reservations, partial charging (see [ADR 0010](./docs/adr/0010-shared-budget-backends-and-charging-policy.md))
+- [x] Budget backends (Tier 1 / Tier 2): shared Redis / Postgres, held reservations, partial charging (see [ADR 0010](./docs/adr/0010-shared-budget-backends-and-charging-policy.md))
 - [x] Native Anthropic `/v1/messages` passthrough + `/v1/embeddings` (see [ADR 0012](./docs/adr/0012-native-provider-routes.md)); `/v1/responses` deferred post-beta (typed `501`)
 - [x] Multiple credentials per provider (pooling, weighted, skip-on-429)
 - [x] Config hot-reload (SIGHUP / watched files) for zero-restart BYOK onboarding (see [ADR 0011](./docs/adr/0011-config-hot-reload.md))
