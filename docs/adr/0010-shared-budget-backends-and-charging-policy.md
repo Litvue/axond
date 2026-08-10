@@ -84,6 +84,23 @@ follows `on_unavailable`: `allow` admits an unheld reservation, while `deny`
 preserves the fail-closed default. Expiry reclaims only the hold; a later
 settlement still records measured spend.
 
+The in-memory bound reserves a derived equal floor for each configured
+namespace: `max_subjects / configured_namespace_count`, with a minimum of one.
+There is no operator override. A namespace may use headroom only when it is not
+reserved for another configured namespace's unmet floor.
+When a reserve would consume another namespace's floor it reclaims and evicts
+only unheld, idle ledgers in the requesting namespace. Because every configured
+namespace holds a floor, including namespaces never seen on this replica, many
+configured but inactive namespaces can leave the table mostly empty while an
+active namespace receives `503` capacity denials; operators should size
+`max_subjects` for the busiest namespace rather than the fleet average.
+Namespace identity is configuration-owned, rather than learned from observed
+subjects, so the guarantee is stable across traffic patterns. If no namespaces
+are configured, or `max_subjects` is below the configured namespace count, floors
+are disabled and the original global lazy behavior is retained (with a boot
+warning in the latter case). This remains per-replica and fail-closed by
+default; exact cross-replica retention and enforcement still requires Redis.
+
 **Charging policy: charge for what was consumed.** Not `$0`, not the reserved
 estimate.
 

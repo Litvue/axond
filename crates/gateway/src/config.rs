@@ -12,7 +12,7 @@
 //! gate a booting one does. The environment is read at *reload* time, so a
 //! credential env-var added after boot resolves without a restart.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -1193,6 +1193,14 @@ impl Config {
         self.namespace.iter().find(|n| n.id == id)
     }
 
+    pub fn distinct_namespace_count(&self) -> usize {
+        self.namespace
+            .iter()
+            .map(|namespace| namespace.id.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
     pub fn model(&self, name: &str) -> Option<&Model> {
         self.model.iter().find(|m| m.name == name)
     }
@@ -1442,6 +1450,17 @@ audience = "test"
             assert!(error.to_string().contains("subject"), "{error}");
             assert!(error.to_string().contains("empty"), "{error}");
         }
+    }
+
+    #[test]
+    fn distinct_namespace_count_ignores_duplicate_ids() {
+        let cfg = Config::from_toml_str(&format!(
+            "{VALID}\n[[namespace]]\nid = \"platform\"\n\n[[namespace]]\nid = \"tenant\"\n"
+        ))
+        .expect("duplicate namespace ids remain valid");
+
+        assert_eq!(cfg.namespace.len(), 3);
+        assert_eq!(cfg.distinct_namespace_count(), 2);
     }
 
     #[test]

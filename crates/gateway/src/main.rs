@@ -179,9 +179,10 @@ async fn serve() -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("usage sink configuration failed: {e}"))?,
     );
-    let budget: Box<dyn BudgetStore> = budget::build(&config.budget, &env)
-        .await
-        .map_err(|e| anyhow::anyhow!("budget configuration failed: {e}"))?;
+    let budget: Box<dyn BudgetStore> =
+        budget::build(&config.budget, &env, config.distinct_namespace_count())
+            .await
+            .map_err(|e| anyhow::anyhow!("budget configuration failed: {e}"))?;
     tracing::info!(backend = budget.name(), "budget enforcement");
     let rate_limiter: Box<dyn RateLimiter> = rate_limit::build(&config.rate_limit);
     tracing::info!(backend = rate_limiter.name(), "inbound rate limiting");

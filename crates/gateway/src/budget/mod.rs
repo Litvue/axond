@@ -151,8 +151,16 @@ pub struct InMemoryBudget {
     idle_ttl: Duration,
     reservation_ttl: Duration,
     max_subjects: usize,
+    namespace_count: usize,
+    floor: usize,
     unavailable: UnavailablePolicy,
-    ledgers: Mutex<HashMap<BudgetKey, Ledger>>,
+    ledger_state: Mutex<LedgerState>,
+}
+
+#[derive(Default)]
+struct LedgerState {
+    ledgers: HashMap<BudgetKey, Ledger>,
+    namespace_counts: HashMap<String, usize>,
 }
 
 struct Ledger {
@@ -222,6 +230,7 @@ impl InMemoryBudget {
             reservation_ttl,
             max_subjects,
             UnavailablePolicy::Deny,
+            1,
         )
     }
 
@@ -231,31 +240,145 @@ impl InMemoryBudget {
         reservation_ttl: Duration,
         max_subjects: usize,
         unavailable: UnavailablePolicy,
+        namespace_count: usize,
     ) -> Self {
+        let floor = if namespace_count == 0 || max_subjects < namespace_count {
+            if max_subjects < namespace_count && namespace_count != 0 {
+                tracing::warn!(
+                    max_subjects,
+                    configured_namespace_count = namespace_count,
+                    "per-namespace ledger floors are disabled because max_subjects is below the configured namespace count"
+                );
+            }
+            0
+        } else {
+            (max_subjects / namespace_count).max(1)
+        };
         Self {
             limit_microdollars,
             idle_ttl,
             reservation_ttl,
             max_subjects,
+            namespace_count,
+            floor,
             unavailable,
-            ledgers: Mutex::new(HashMap::new()),
+            ledger_state: Mutex::new(LedgerState::default()),
         }
     }
 
-    fn prune_idle(&self, ledgers: &mut HashMap<BudgetKey, Ledger>) {
-        let now = Instant::now();
-        ledgers.retain(|_, ledger| {
-            ledger.reclaim_expired(now);
-            !ledger.held.is_empty()
-                || now.saturating_duration_since(ledger.last_touched) <= self.idle_ttl
-        });
+    #[cfg(test)]
+    fn with_namespace_count(
+        limit_microdollars: u64,
+        idle_ttl: Duration,
+        reservation_ttl: Duration,
+        max_subjects: usize,
+        namespace_count: usize,
+    ) -> Self {
+        Self::with_settings_and_policy(
+            limit_microdollars,
+            idle_ttl,
+            reservation_ttl,
+            max_subjects,
+            UnavailablePolicy::Deny,
+            namespace_count,
+        )
     }
 
+    fn prune_idle(&self, state: &mut LedgerState) {
+        let now = Instant::now();
+        let removed = state
+            .ledgers
+            .iter_mut()
+            .filter_map(|(key, ledger)| {
+                ledger.reclaim_expired(now);
+                (ledger.held.is_empty()
+                    && now.saturating_duration_since(ledger.last_touched) > self.idle_ttl)
+                    .then_some(key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in removed {
+            state.remove(&key);
+        }
+    }
+
+    fn prune_namespace(&self, namespace: &str, state: &mut LedgerState) {
+        let now = Instant::now();
+        let removed = state
+            .ledgers
+            .iter_mut()
+            .filter_map(|(key, ledger)| {
+                if key.namespace != namespace {
+                    return None;
+                }
+                ledger.reclaim_expired(now);
+                (ledger.held.is_empty()
+                    && now.saturating_duration_since(ledger.last_touched) > self.idle_ttl)
+                    .then_some(key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in removed {
+            state.remove(&key);
+        }
+    }
+
+    fn reserved_for_others(&self, namespace: &str, state: &LedgerState) -> usize {
+        let present_other_shortfall = state
+            .namespace_counts
+            .iter()
+            .filter(|(present_namespace, _)| present_namespace.as_str() != namespace)
+            .map(|(_, retained)| self.floor.saturating_sub(*retained))
+            .sum::<usize>();
+        let requesting_present = state.namespace_counts.contains_key(namespace);
+        let absent_other_count = self
+            .namespace_count
+            .saturating_sub(state.namespace_counts.len())
+            .saturating_sub(usize::from(!requesting_present));
+        let reservation =
+            present_other_shortfall.saturating_add(absent_other_count.saturating_mul(self.floor));
+        let free = self.max_subjects.saturating_sub(state.ledgers.len());
+        let requesting_shortfall = self
+            .floor
+            .saturating_sub(state.namespace_counts.get(namespace).copied().unwrap_or(0));
+        reservation.min(free.saturating_sub(requesting_shortfall))
+    }
+}
+
+impl LedgerState {
+    fn entry_or_default(&mut self, key: &BudgetKey) -> &mut Ledger {
+        if !self.ledgers.contains_key(key) {
+            *self
+                .namespace_counts
+                .entry(key.namespace.clone())
+                .or_default() += 1;
+        }
+        self.ledgers.entry(key.clone()).or_default()
+    }
+
+    fn remove(&mut self, key: &BudgetKey) -> Option<Ledger> {
+        let removed = self.ledgers.remove(key);
+        if removed.is_some() {
+            self.decrement_namespace_count(&key.namespace);
+        }
+        removed
+    }
+
+    fn decrement_namespace_count(&mut self, namespace: &str) {
+        if let Some(count) = self.namespace_counts.get_mut(namespace) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.namespace_counts.remove(namespace);
+            }
+        }
+    }
+}
+
+impl InMemoryBudget {
     #[cfg(test)]
     pub fn outstanding(&self, key: &BudgetKey) -> u64 {
-        self.ledgers
+        self.ledger_state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .ledgers
             .get(key)
             .map_or(0, Ledger::outstanding)
     }
@@ -268,21 +391,43 @@ impl BudgetStore for InMemoryBudget {
     }
 
     async fn reserve(&self, key: &BudgetKey, estimated_microdollars: u64) -> Admission {
-        let mut ledgers = self.ledgers.lock().unwrap_or_else(|e| e.into_inner());
-        if !ledgers.contains_key(key) && ledgers.len() >= self.max_subjects {
-            self.prune_idle(&mut ledgers);
-            metrics::record_budget_retained_subjects(ledgers.len());
-            if ledgers.len() >= self.max_subjects {
-                let admission = self
-                    .unavailable
-                    .admission("in_memory", &"ledger capacity reached");
-                if matches!(&admission, Admission::Denied(Denial::StoreUnavailable)) {
-                    metrics::record_budget_capacity_denial();
+        let mut state = self.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.ledgers.contains_key(key) {
+            let free = self.max_subjects.saturating_sub(state.ledgers.len());
+            let reserved_for_others = self.reserved_for_others(&key.namespace, &state);
+            if free <= reserved_for_others {
+                if self.floor == 0 {
+                    self.prune_idle(&mut state);
+                } else {
+                    self.prune_namespace(&key.namespace, &mut state);
                 }
-                return admission;
+                metrics::record_budget_retained_subjects(state.ledgers.len());
+                let free_after_prune = self.max_subjects.saturating_sub(state.ledgers.len());
+                let reserved_after_prune = self.reserved_for_others(&key.namespace, &state);
+                if free_after_prune <= reserved_after_prune {
+                    let reason = if self.floor == 0 || free_after_prune == 0 {
+                        "ledger capacity reached"
+                    } else {
+                        "ledger capacity is reserved for other namespaces"
+                    };
+                    tracing::warn!(
+                        namespace = %key.namespace,
+                        namespace_retained = state.namespace_counts.get(&key.namespace).copied().unwrap_or(0),
+                        floor = self.floor,
+                        global_retained = state.ledgers.len(),
+                        max_subjects = self.max_subjects,
+                        reason,
+                        "budget ledger capacity denied"
+                    );
+                    let admission = self.unavailable.admission("in_memory", &reason);
+                    if matches!(&admission, Admission::Denied(Denial::StoreUnavailable)) {
+                        metrics::record_budget_capacity_denial();
+                    }
+                    return admission;
+                }
             }
         }
-        let ledger = ledgers.entry(key.clone()).or_default();
+        let ledger = state.entry_or_default(key);
         let now = Instant::now();
         ledger.reclaim_expired(now);
         ledger.last_touched = now;
@@ -308,8 +453,8 @@ impl BudgetStore for InMemoryBudget {
         if reservation.id.is_empty() {
             return;
         }
-        let mut ledgers = self.ledgers.lock().unwrap_or_else(|e| e.into_inner());
-        let ledger = ledgers.entry(key.clone()).or_default();
+        let mut state = self.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+        let ledger = state.entry_or_default(key);
         let now = Instant::now();
         ledger.reclaim_expired(now);
         ledger.held.remove(&reservation.id);
@@ -397,6 +542,7 @@ pub struct SharedSettings {
 pub async fn build(
     config: &BudgetConfig,
     env: &HashMap<String, String>,
+    namespace_count: usize,
 ) -> Result<Box<dyn BudgetStore>, BudgetError> {
     let settings = SharedSettings {
         limit_microdollars: config.limit_microdollars,
@@ -411,6 +557,7 @@ pub async fn build(
             Duration::from_secs(config.reservation_ttl_seconds),
             config.max_subjects,
             config.on_unavailable.into(),
+            namespace_count,
         ))),
         BudgetBackend::Redis => {
             let url = dsn(config, "redis", env)?;
@@ -560,7 +707,7 @@ mod tests {
             dsn_env: Some("AXOND_TEST_MISSING_BUDGET_URL".to_owned()),
             ..BudgetConfig::default()
         };
-        let err = build(&config, &HashMap::new())
+        let err = build(&config, &HashMap::new(), 0)
             .await
             .err()
             .expect("a missing dsn must fail at boot");
@@ -569,7 +716,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_default_backend_holds_nothing() {
-        let store = build(&BudgetConfig::default(), &HashMap::new())
+        let store = build(&BudgetConfig::default(), &HashMap::new(), 0)
             .await
             .expect("the default backend needs no datastore");
         assert_eq!(store.name(), "none");
@@ -592,8 +739,15 @@ mod tests {
             budget.reserve(&second, 100).await,
             Admission::Allowed(_)
         ));
-        assert_eq!(budget.ledgers.lock().unwrap().len(), 1);
-        assert!(!budget.ledgers.lock().unwrap().contains_key(&first));
+        assert_eq!(budget.ledger_state.lock().unwrap().ledgers.len(), 1);
+        assert!(
+            !budget
+                .ledger_state
+                .lock()
+                .unwrap()
+                .ledgers
+                .contains_key(&first)
+        );
     }
 
     #[tokio::test]
@@ -639,7 +793,14 @@ mod tests {
             budget.reserve(&second, 100).await,
             Admission::Allowed(_)
         ));
-        assert!(!budget.ledgers.lock().unwrap().contains_key(&first));
+        assert!(
+            !budget
+                .ledger_state
+                .lock()
+                .unwrap()
+                .ledgers
+                .contains_key(&first)
+        );
     }
 
     #[tokio::test]
@@ -698,6 +859,7 @@ mod tests {
             Duration::from_secs(300),
             2,
             UnavailablePolicy::Deny,
+            1,
         );
         let first = key();
         let second = BudgetKey {
@@ -728,6 +890,7 @@ mod tests {
             Duration::from_secs(300),
             1,
             UnavailablePolicy::Allow,
+            1,
         );
         let first = key();
         let second = BudgetKey {
@@ -748,6 +911,326 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_namespace_cannot_consume_another_namespaces_floor() {
+        let budget = InMemoryBudget::with_namespace_count(
+            1_000,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            4,
+            2,
+        );
+        for subject in ["a-1", "a-2"] {
+            let key = BudgetKey {
+                namespace: "a".into(),
+                subject: subject.into(),
+            };
+            let reservation = budget.reserve(&key, 1).await;
+            budget.settle(&key, reservation.reservation(), 1).await;
+        }
+
+        let b = BudgetKey {
+            namespace: "b".into(),
+            subject: "never-seen".into(),
+        };
+        assert!(matches!(budget.reserve(&b, 1).await, Admission::Allowed(_)));
+    }
+
+    #[tokio::test]
+    async fn post_reload_namespace_growth_does_not_lock_out_free_capacity() {
+        let budget = InMemoryBudget::with_namespace_count(
+            1_000,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            10,
+            2,
+        );
+        {
+            let mut state = budget.ledger_state.lock().unwrap();
+            for namespace in ["a", "b", "c", "d"] {
+                for subject in ["1", "2"] {
+                    state.entry_or_default(&BudgetKey {
+                        namespace: namespace.into(),
+                        subject: subject.into(),
+                    });
+                }
+            }
+        }
+
+        let admission = budget
+            .reserve(
+                &BudgetKey {
+                    namespace: "a".into(),
+                    subject: "new".into(),
+                },
+                1,
+            )
+            .await;
+        assert!(matches!(admission, Admission::Allowed(_)));
+        assert!(budget.ledger_state.lock().unwrap().ledgers.len() <= budget.max_subjects);
+    }
+
+    #[tokio::test]
+    async fn nominal_namespace_count_preserves_full_capacity_isolation() {
+        let budget = InMemoryBudget::with_namespace_count(
+            1_000,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            4,
+            2,
+        );
+        {
+            let mut state = budget.ledger_state.lock().unwrap();
+            for namespace in ["a", "b"] {
+                for subject in ["1", "2"] {
+                    state.entry_or_default(&BudgetKey {
+                        namespace: namespace.into(),
+                        subject: subject.into(),
+                    });
+                }
+            }
+        }
+
+        assert_eq!(
+            budget
+                .reserve(
+                    &BudgetKey {
+                        namespace: "a".into(),
+                        subject: "new".into(),
+                    },
+                    1,
+                )
+                .await,
+            Admission::Denied(Denial::StoreUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_namespace_can_burst_into_unused_headroom() {
+        let budget = InMemoryBudget::with_namespace_count(
+            1_000,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            7,
+            2,
+        );
+        for subject in ["a-1", "a-2", "a-3", "a-4"] {
+            let key = BudgetKey {
+                namespace: "a".into(),
+                subject: subject.into(),
+            };
+            let reservation = budget.reserve(&key, 1).await;
+            budget.settle(&key, reservation.reservation(), 1).await;
+        }
+        assert_eq!(budget.ledger_state.lock().unwrap().ledgers.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn full_capacity_evicts_only_the_requesting_namespace() {
+        let budget = InMemoryBudget::with_namespace_count(
+            1_000,
+            Duration::from_millis(1),
+            Duration::from_secs(300),
+            4,
+            2,
+        );
+        let first = BudgetKey {
+            namespace: "a".into(),
+            subject: "a-1".into(),
+        };
+        let reservation = budget.reserve(&first, 1).await;
+        budget.settle(&first, reservation.reservation(), 1).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        for (namespace, subject) in [("a", "a-2"), ("b", "b-1"), ("b", "b-2")] {
+            let key = BudgetKey {
+                namespace: namespace.into(),
+                subject: subject.into(),
+            };
+            let reservation = budget.reserve(&key, 1).await;
+            budget.settle(&key, reservation.reservation(), 1).await;
+        }
+
+        let replacement = BudgetKey {
+            namespace: "a".into(),
+            subject: "a-new".into(),
+        };
+        assert!(matches!(
+            budget.reserve(&replacement, 1).await,
+            Admission::Allowed(_)
+        ));
+        let state = budget.ledger_state.lock().unwrap();
+        assert_eq!(state.ledgers.len(), 4);
+        assert_eq!(
+            state.namespace_counts.get("a").copied().unwrap_or_default(),
+            2
+        );
+        assert_eq!(
+            state.namespace_counts.get("b").copied().unwrap_or_default(),
+            2
+        );
+        assert!(state.ledgers.contains_key(&BudgetKey {
+            namespace: "b".into(),
+            subject: "b-1".into(),
+        }));
+        assert!(state.ledgers.contains_key(&BudgetKey {
+            namespace: "b".into(),
+            subject: "b-2".into(),
+        }));
+        assert!(!state.ledgers.contains_key(&BudgetKey {
+            namespace: "a".into(),
+            subject: "a-1".into(),
+        }));
+        assert!(state.ledgers.contains_key(&BudgetKey {
+            namespace: "a".into(),
+            subject: "a-2".into(),
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_live_hold_is_never_evicted() {
+        let budget = InMemoryBudget::with_namespace_count(
+            1_000,
+            Duration::from_millis(1),
+            Duration::from_secs(300),
+            2,
+            2,
+        );
+        let first = BudgetKey {
+            namespace: "a".into(),
+            subject: "a-1".into(),
+        };
+        let second = BudgetKey {
+            namespace: "b".into(),
+            subject: "b-1".into(),
+        };
+        let first_hold = budget.reserve(&first, 1).await;
+        let second_hold = budget.reserve(&second, 1).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let replacement = BudgetKey {
+            namespace: "a".into(),
+            subject: "a-2".into(),
+        };
+        assert_eq!(
+            budget.reserve(&replacement, 1).await,
+            Admission::Denied(Denial::StoreUnavailable)
+        );
+        budget.release(&first, first_hold.reservation()).await;
+        budget.release(&second, second_hold.reservation()).await;
+    }
+
+    #[tokio::test]
+    async fn expired_holds_are_reclaimed_before_idle_eviction() {
+        let budget = InMemoryBudget::with_namespace_count(
+            1_000,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            2,
+            2,
+        );
+        let first = BudgetKey {
+            namespace: "a".into(),
+            subject: "a-1".into(),
+        };
+        let second = BudgetKey {
+            namespace: "b".into(),
+            subject: "b-1".into(),
+        };
+        budget.reserve(&first, 1).await;
+        let second_hold = budget.reserve(&second, 1).await;
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        let replacement = BudgetKey {
+            namespace: "a".into(),
+            subject: "a-2".into(),
+        };
+        assert!(matches!(
+            budget.reserve(&replacement, 1).await,
+            Admission::Allowed(_)
+        ));
+        assert!(
+            !budget
+                .ledger_state
+                .lock()
+                .unwrap()
+                .ledgers
+                .contains_key(&first)
+        );
+        budget.release(&second, second_hold.reservation()).await;
+    }
+
+    #[tokio::test]
+    async fn global_bound_holds_under_namespace_churn() {
+        let max_subjects = 16;
+        let budget = InMemoryBudget::with_namespace_count(
+            1_000_000,
+            Duration::from_nanos(1),
+            Duration::from_secs(300),
+            max_subjects,
+            2,
+        );
+        for index in 0..1_000 {
+            let key = BudgetKey {
+                namespace: if index % 2 == 0 { "a" } else { "b" }.into(),
+                subject: format!("subject-{index}"),
+            };
+            let admission = budget.reserve(&key, 1).await;
+            if let Admission::Allowed(reservation) = admission {
+                budget.settle(&key, &reservation, 1).await;
+            }
+            assert!(budget.ledger_state.lock().unwrap().ledgers.len() <= max_subjects);
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_namespaces_keep_global_capacity_behavior() {
+        let budget = InMemoryBudget::with_namespace_count(
+            1_000,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            1,
+            0,
+        );
+        let first = BudgetKey {
+            namespace: "a".into(),
+            subject: "a-1".into(),
+        };
+        let second = BudgetKey {
+            namespace: "b".into(),
+            subject: "b-1".into(),
+        };
+        let hold = budget.reserve(&first, 1).await;
+        assert_eq!(
+            budget.reserve(&second, 1).await,
+            Admission::Denied(Denial::StoreUnavailable)
+        );
+        budget.release(&first, hold.reservation()).await;
+    }
+
+    #[tokio::test]
+    async fn too_few_subjects_for_namespaces_keep_global_capacity_behavior() {
+        let budget = InMemoryBudget::with_namespace_count(
+            1_000,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            1,
+            2,
+        );
+        let first = BudgetKey {
+            namespace: "a".into(),
+            subject: "a-1".into(),
+        };
+        let second = BudgetKey {
+            namespace: "b".into(),
+            subject: "b-1".into(),
+        };
+        let hold = budget.reserve(&first, 1).await;
+        assert_eq!(
+            budget.reserve(&second, 1).await,
+            Admission::Denied(Denial::StoreUnavailable)
+        );
+        budget.release(&first, hold.reservation()).await;
+    }
+
+    #[tokio::test]
     async fn many_subjects_keep_the_in_memory_ledger_bounded() {
         let max_subjects = 64;
         let budget = InMemoryBudget::with_limits(1_000_000, Duration::from_nanos(1), max_subjects);
@@ -764,6 +1247,6 @@ mod tests {
             budget.settle(&key, &reservation, 1).await;
         }
 
-        assert!(budget.ledgers.lock().unwrap().len() <= max_subjects);
+        assert!(budget.ledger_state.lock().unwrap().ledgers.len() <= max_subjects);
     }
 }
