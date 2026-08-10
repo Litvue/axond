@@ -602,6 +602,39 @@ name = "acme-fast"
 targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdollars_per_million = 150000, output_microdollars_per_million = 600000 } }]
 "#;
 
+    const WITH_MINTED_NAMESPACES: &str = r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[namespace]]
+id = "acme"
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "PLATFORM_OPENAI_KEY"
+
+[[gateway_key]]
+env = "AXOND_INBOUND_KEY"
+namespace = "platform"
+
+[gateway_token]
+audience = "reload-test"
+
+[[gateway_verifier]]
+kid = "reload-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform", "acme"]
+max_ttl = "15m"
+"#;
+
     fn state_from(file: &ConfigFile) -> AppState {
         let config = Config::load(file.path()).expect("valid boot config");
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
@@ -685,6 +718,92 @@ targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdo
         );
         let aliases = listed_aliases(&state).await;
         assert!(aliases.contains(&"acme-fast".to_string()));
+    }
+
+    /// An issuance epoch is part of the immutable candidate snapshot: SIGHUP
+    /// applies it to one namespace while a different namespace keeps serving.
+    #[tokio::test]
+    async fn minted_token_epochs_apply_after_reload_without_affecting_other_namespaces() {
+        let file = ConfigFile::new(WITH_MINTED_NAMESPACES);
+        let state = state_from(&file);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs();
+        let make_token = |namespace: &str| {
+            let claims = ReloadTokenClaims {
+                exp: now + 890,
+                iat: now - 10,
+                jti: format!("reload-{namespace}"),
+                ns: namespace.to_owned(),
+                sub: "reload-subject".to_owned(),
+                aud: "reload-test".to_owned(),
+            };
+            let mut header = Header::new(Algorithm::HS256);
+            header.kid = Some("reload-kid".to_owned());
+            format!(
+                "axt1.{}",
+                encode(
+                    &header,
+                    &claims,
+                    &EncodingKey::from_secret(b"jwt-test-secret-0123456789012345"),
+                )
+                .expect("token signs")
+            )
+        };
+        let platform_token = make_token("platform");
+        let acme_token = make_token("acme");
+        for token in [&platform_token, &acme_token] {
+            assert!(
+                state
+                    .config()
+                    .resolve_principal(&Presented { credential: token })
+                    .await
+                    .expect("token resolves")
+                    .is_some()
+            );
+        }
+
+        let reloader = Reloader::new(file.path(), state.clone());
+        file.rewrite(&format!(
+            "{WITH_MINTED_NAMESPACES}\n[[gateway_token_epoch]]\nnamespace = \"platform\"\nmin_iat = {}\n",
+            now
+        ));
+        reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("epoch candidate is valid");
+
+        assert!(matches!(
+            state
+                .config()
+                .resolve_principal(&Presented {
+                    credential: &platform_token
+                })
+                .await,
+            Err(crate::principals::PrincipalStoreError::Unauthorized(
+                crate::principals::TokenVerificationError::IssuedBeforeEpoch { .. }
+            ))
+        ));
+        assert!(
+            state
+                .config()
+                .resolve_principal(&Presented {
+                    credential: &acme_token
+                })
+                .await
+                .expect("other namespace resolves")
+                .is_some()
+        );
+        assert!(
+            state
+                .config()
+                .resolve_principal(&Presented {
+                    credential: "inbound-secret"
+                })
+                .await
+                .expect("static key resolves")
+                .is_some()
+        );
     }
 
     #[tokio::test]
