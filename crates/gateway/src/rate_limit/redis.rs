@@ -213,10 +213,9 @@ mod tests {
     use super::*;
     use crate::config::StoreUnavailable;
     use std::net::SocketAddr;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::watch;
     use tokio::task::JoinHandle;
 
     fn key() -> RateLimitKey {
@@ -239,43 +238,58 @@ mod tests {
         .expect("connect")
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RelayMode {
+        Forward,
+        Blackhole,
+        Cut,
+    }
+
     struct RedisRelay {
         address: SocketAddr,
-        blackhole: Arc<AtomicBool>,
+        mode: watch::Sender<RelayMode>,
         task: JoinHandle<()>,
     }
 
     impl RedisRelay {
         async fn start(redis_url: &str) -> Self {
+            assert!(
+                redis_url.starts_with("redis://"),
+                "AXOND_TEST_REDIS_URL must use a plain redis:// URL; TLS rediss:// is not supported by the test relay"
+            );
             let target = redis_url
                 .strip_prefix("redis://")
-                .unwrap_or(redis_url)
-                .trim_end_matches('/')
+                .expect("checked redis:// prefix")
+                .split('/')
+                .next()
+                .expect("Redis URL must include a host and port")
                 .parse::<SocketAddr>()
-                .expect("AXOND_TEST_REDIS_URL must use a host:port Redis URL");
+                .expect("AXOND_TEST_REDIS_URL must use redis://host:port[/db]");
             let listener = TcpListener::bind(("127.0.0.1", 0))
                 .await
                 .expect("bind relay");
             let address = listener.local_addr().expect("relay address");
-            let blackhole = Arc::new(AtomicBool::new(false));
-            let relay_state = Arc::clone(&blackhole);
+            let (mode, relay_mode) = watch::channel(RelayMode::Forward);
             let task = tokio::spawn(async move {
                 loop {
                     let Ok((client, _)) = listener.accept().await else {
                         break;
                     };
-                    let state = Arc::clone(&relay_state);
+                    let mut state = relay_mode.clone();
                     tokio::spawn(async move {
+                        if *state.borrow() == RelayMode::Cut {
+                            return;
+                        }
                         let Ok(server) = TcpStream::connect(target).await else {
                             return;
                         };
-                        proxy(client, server, state).await;
+                        proxy(client, server, &mut state).await;
                     });
                 }
             });
             Self {
                 address,
-                blackhole,
+                mode,
                 task,
             }
         }
@@ -284,8 +298,8 @@ mod tests {
             format!("redis://{}/", self.address)
         }
 
-        fn set_blackhole(&self, blackhole: bool) {
-            self.blackhole.store(blackhole, Ordering::Release);
+        fn set_mode(&self, mode: RelayMode) {
+            self.mode.send_replace(mode);
         }
     }
 
@@ -295,17 +309,22 @@ mod tests {
         }
     }
 
-    async fn proxy(client: TcpStream, server: TcpStream, blackhole: Arc<AtomicBool>) {
+    async fn proxy(client: TcpStream, server: TcpStream, mode: &mut watch::Receiver<RelayMode>) {
         let (mut client_read, mut client_write) = client.into_split();
         let (mut server_read, mut server_write) = server.into_split();
         let mut client_buffer = [0_u8; 16 * 1024];
         let mut server_buffer = [0_u8; 16 * 1024];
         loop {
             tokio::select! {
+                changed = mode.changed() => {
+                    if changed.is_err() || *mode.borrow() == RelayMode::Cut {
+                        return;
+                    }
+                }
                 result = client_read.read(&mut client_buffer) => {
                     let Ok(size) = result else { return };
                     if size == 0 { return; }
-                    if !blackhole.load(Ordering::Acquire)
+                    if *mode.borrow() == RelayMode::Forward
                         && server_write.write_all(&client_buffer[..size]).await.is_err()
                     {
                         return;
@@ -314,7 +333,7 @@ mod tests {
                 result = server_read.read(&mut server_buffer) => {
                     let Ok(size) = result else { return };
                     if size == 0 { return; }
-                    if !blackhole.load(Ordering::Acquire)
+                    if *mode.borrow() == RelayMode::Forward
                         && client_write.write_all(&server_buffer[..size]).await.is_err()
                     {
                         return;
@@ -429,7 +448,7 @@ mod tests {
         .await
         .expect("connect allow limiter");
 
-        relay.set_blackhole(true);
+        relay.set_mode(RelayMode::Blackhole);
         let started = std::time::Instant::now();
         assert!(matches!(
             deny.acquire(&key()).await,
@@ -446,21 +465,26 @@ mod tests {
         );
         assert!(allow.acquire(&key()).await.is_ok());
 
-        relay.set_blackhole(false);
-        let recovered = RedisRateLimiter::connect(
-            &relay.url(),
-            prefix,
-            1,
-            Duration::from_secs(5),
-            timeout,
-            StoreUnavailable::Deny,
-        )
-        .await
-        .expect("connect after relay restore");
-        recovered
-            .acquire(&key())
-            .await
-            .expect("limiter admitted after relay restore");
+        relay.set_mode(RelayMode::Cut);
+        assert!(matches!(
+            deny.acquire(&key()).await,
+            Err(RateLimitError::StoreUnavailable)
+        ));
+
+        relay.set_mode(RelayMode::Forward);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut recovered = false;
+        while tokio::time::Instant::now() < deadline {
+            if deny.acquire(&key()).await.is_ok() {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            recovered,
+            "same limiter did not recover after relay forwarding was restored"
+        );
     }
 
     #[tokio::test]
