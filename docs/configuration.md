@@ -29,7 +29,7 @@ egress: upstream provider calls still use the network at Tier 0.
 | --- | --- |
 | `[server]`, `[[namespace]]`, `[[provider]]`, `[[model]]`, `[[credential]]` | Tier 0: config-only. |
 | `[credential_pool]`, `[failover]` | Tier 0: in-memory, per replica. |
-| `[[gateway_key]]`, `[gateway_token]`, `[[gateway_verifier]]`, offline `keygen`/`mint` | Tier 0: config, referenced files, and environment only. |
+| `[[gateway_key]]`, `[gateway_token]`, `[[gateway_verifier]]`, `[[gateway_token_epoch]]`, offline `keygen`/`mint` | Tier 0: config, referenced files, and environment only. |
 | `[reload]` | Tier 0: reload reads the config file, referenced key-material files, and process environment. |
 | `[[usage_sink]]` omitted or `kind = "stdout"` | Tier 0: one JSON line on stdout. |
 | `[[usage_sink]] kind = "otlp"` | Tier 0 state, but not hermetic: a collector is a boot-time dependency, so this is outside the hermetic Tier 0 CI lane. |
@@ -223,6 +223,24 @@ already reach. Static gateway keys remain unrestricted.
 The check runs before the alias is looked up, so a disallowed alias returns `403`
 whether or not it is configured and regardless of whether the endpoint supports
 the target's wire protocol.
+
+## `[[gateway_token_epoch]]` — minted-token issuance revocation (optional)
+
+An issuance epoch invalidates minted tokens whose `iat` is earlier than the
+configured instant. It is applied when the config is reloaded, so changing an
+epoch and sending `SIGHUP` revokes matching tokens without a restart.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `namespace` | string | — | Declared namespace whose minted tokens are affected. Required. |
+| `subject` | string | omitted | Optional subject-specific override. If present, this entry is the only epoch used for that subject; otherwise the namespace-wide entry applies. |
+| `min_iat` | integer or RFC 3339 UTC string | — | Earliest accepted token issuance time, as Unix seconds or a timestamp such as `2026-08-10T12:00:00Z`. Required. |
+
+Entries must use declared namespaces and may not duplicate a
+`(namespace, subject)` pair. A namespace-wide epoch cannot spare one subject;
+use a per-subject entry with an earlier epoch when that exception is needed.
+Epochs affect minted `axt1.` tokens only. Static `[[gateway_key]]` credentials
+remain valid.
 
 ## `[reload]` — Tier 0
 

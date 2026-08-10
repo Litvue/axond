@@ -1578,6 +1578,99 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(records[0].signer_kid.as_deref(), Some("route-kid"));
     }
 
+    /// An epoch rejection is a typed authentication failure, so HTTP clients
+    /// can distinguish it from an ordinary expired-token response.
+    #[tokio::test]
+    async fn an_epoch_rejected_token_returns_a_distinct_401_error_code() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_key]]
+env = "STATIC_KEY"
+namespace = "platform"
+
+[gateway_token]
+audience = "test-audience"
+
+[[gateway_verifier]]
+kid = "route-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+
+[[gateway_token_epoch]]
+namespace = "platform"
+min_iat = {}
+"#,
+            now + 1
+        ))
+        .expect("epoch test config");
+        let env = HashMap::from([
+            ("STATIC_KEY".to_owned(), "static-secret".to_owned()),
+            ("JWT_SECRET".to_owned(), "a".repeat(32)),
+        ]);
+        let state = AppState::new(
+            cfg,
+            &env,
+            UsageFanout::new(vec![Box::new(StdoutSink)]),
+            Box::new(NoBudget),
+        )
+        .expect("state");
+        let claims = TestTokenClaims {
+            exp: now + 900,
+            iat: now,
+            jti: "route-epoch-jti",
+            aud: "test-audience",
+            ns: "platform",
+            sub: "epoch-caller",
+            max_request_microdollars: None,
+        };
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("route-kid".to_owned());
+        let token = format!(
+            "axt1.{}",
+            encode(
+                &header,
+                &claims,
+                &EncodingKey::from_secret(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .expect("token")
+        );
+        let response = router(state)
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []}))
+                            .expect("body"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body: Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes(),
+        )
+        .expect("json error body");
+        assert_eq!(body["error"]["type"], "token_issued_before_epoch");
+        assert_ne!(body["error"]["type"], "token_expired");
+    }
+
     #[tokio::test]
     async fn healthz_is_ok() {
         let resp = router(test_state())

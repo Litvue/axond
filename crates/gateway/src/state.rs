@@ -488,6 +488,28 @@ namespace = "platform"
         );
     }
 
+    /// Issuance epochs belong only to minted tokens; the static breakglass key
+    /// remains resolvable when a namespace-wide epoch is configured.
+    #[tokio::test]
+    async fn a_static_gateway_key_ignores_token_epochs() {
+        let config = config_with(&format!(
+            "{PLATFORM_KEY}\n[[gateway_token_epoch]]\nnamespace = \"platform\"\nmin_iat = 9_999_999_999\n"
+        ));
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "inbound-secret".to_owned())]);
+        let snapshot = ConfigSnapshot::build(config, &env, 0).expect("resolves");
+        assert_eq!(
+            snapshot
+                .resolve_principal(&Presented {
+                    credential: "inbound-secret",
+                })
+                .await
+                .expect("principal resolution succeeds")
+                .expect("static key resolves")
+                .namespace,
+            "platform"
+        );
+    }
+
     /// The secret is held as `SecretString`, so debugging or logging an entry
     /// renders the redaction placeholder, never the key material.
     #[test]
