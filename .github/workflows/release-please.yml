@@ -23,14 +23,6 @@ on:
 permissions:
   contents: read
 
-# release-please force-updates the release branch on every run, so two runs for
-# main in parallel leave one of them pushing the lockfile sync onto a ref the
-# other has already replaced. Queue instead of cancelling: a cancelled run is
-# the one that would have synced the lockfile for the merge it was triggered by.
-concurrency:
-  group: release-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
-
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/litvue/axond
@@ -43,6 +35,15 @@ env:
 jobs:
   release-please:
     if: github.event_name == 'push'
+    # release-please force-updates the release branch on every run, so two runs
+    # for main in parallel leave one of them pushing the lockfile sync onto a
+    # ref the other has already replaced. Scope the queue to this job: only its
+    # lockfile-sync push needs serialization, while the per-tag artifact lanes
+    # must not queue behind each other. Queue instead of cancelling: a cancelled
+    # run is the one that would have synced the lockfile for its merge.
+    concurrency:
+      group: release-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -82,11 +83,12 @@ jobs:
       - name: Install the sync toolchain
         if: ${{ steps.release.outputs.pr }}
         run: rustup toolchain install stable --profile minimal
-      # The concurrency group serializes Release runs for main, but a dispatch or
-      # a manual push to the release branch can still move it under this job, so
-      # every attempt re-syncs onto the remote tip rather than pushing a commit
-      # built on a stale checkout. A force push is deliberately avoided: the goal
-      # is to include release-please's regenerated content, not overwrite it.
+      # The job concurrency group serializes lockfile sync for main, but a
+      # dispatch or a manual push to the release branch can still move it under
+      # this job, so every attempt re-syncs onto the remote tip rather than
+      # pushing a commit built on a stale checkout. A force push is deliberately
+      # avoided: the goal is to include release-please's regenerated content,
+      # not overwrite it.
       - name: Sync Cargo.lock onto the release branch
         if: ${{ steps.release.outputs.pr }}
         env:

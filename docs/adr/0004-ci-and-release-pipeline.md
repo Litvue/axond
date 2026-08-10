@@ -27,9 +27,10 @@ updates `CHANGELOG.md`, and bumps the single `workspace.package.version` via a
 `toml` extra-file. Pre-1.0 uses `bump-minor-pre-major` +
 `bump-patch-for-minor-pre-major`, matching the siblings, so the first automated
 release off `0.0.0` is a patch. `Cargo.lock` is re-synced on the release PR so
-`--locked` builds stay green after the version bump. Release runs for a ref are
-serialized by a queueing concurrency group, and lockfile sync re-bases onto the
-remote branch tip with a bounded retry instead of force-pushing.
+`--locked` builds stay green after the version bump. The release-please/
+lockfile-sync job for a ref is serialized by a queueing concurrency group, and
+lockfile sync re-bases onto the remote branch tip with a bounded retry instead
+of force-pushing.
 
 **CI is one job per concern** (`fmt`, `clippy`, `build`, `tests`, `docs`,
 `dependency-policy`, `static-binary`, `docker-smoke`) behind a single required
