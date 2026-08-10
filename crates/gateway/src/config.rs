@@ -532,6 +532,9 @@ pub struct RateLimitConfig {
     /// Bounded timeout for each Redis operation.
     #[serde(default = "default_rate_limit_timeout_ms")]
     pub timeout_ms: u64,
+    /// Bounded timeout for the Redis connection and boot-time PING.
+    #[serde(default = "default_rate_limit_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
 }
 
 impl Default for RateLimitConfig {
@@ -545,6 +548,7 @@ impl Default for RateLimitConfig {
             on_unavailable: StoreUnavailable::Deny,
             lease_ttl_seconds: default_lease_ttl_seconds(),
             timeout_ms: default_rate_limit_timeout_ms(),
+            connect_timeout_ms: default_rate_limit_connect_timeout_ms(),
         }
     }
 }
@@ -559,6 +563,10 @@ fn default_lease_ttl_seconds() -> u64 {
 
 fn default_rate_limit_timeout_ms() -> u64 {
     250
+}
+
+fn default_rate_limit_connect_timeout_ms() -> u64 {
+    5_000
 }
 
 impl BudgetConfig {
@@ -1186,6 +1194,11 @@ impl Config {
                     "rate_limit `redis`: timeout_ms must be at least 1".into(),
                 ));
             }
+            if rate_limit.connect_timeout_ms == 0 {
+                return Err(ConfigError::Invalid(
+                    "rate_limit `redis`: connect_timeout_ms must be at least 1".into(),
+                ));
+            }
             let has_rate_limit_dsn = rate_limit
                 .dsn_env
                 .as_deref()
@@ -1570,6 +1583,7 @@ audience = "test"
         .expect("valid config");
         assert_eq!(cfg.rate_limit.lease_ttl_seconds, 300);
         assert_eq!(cfg.rate_limit.timeout_ms, 250);
+        assert_eq!(cfg.rate_limit.connect_timeout_ms, 5_000);
         assert_eq!(cfg.rate_limit.key_prefix(), "axond:rate_limit");
         assert_eq!(
             crate::rate_limit::resolve_dsn_env(&cfg.rate_limit, &cfg.budget),
@@ -1583,6 +1597,7 @@ audience = "test"
             "[rate_limit]\nbackend = \"redis\"",
             "[rate_limit]\nbackend = \"redis\"\nlease_ttl_seconds = 0\ndsn_env = \"R\"",
             "[rate_limit]\nbackend = \"redis\"\ntimeout_ms = 0\ndsn_env = \"R\"",
+            "[rate_limit]\nbackend = \"redis\"\nconnect_timeout_ms = 0\ndsn_env = \"R\"",
         ] {
             assert!(Config::from_toml_str(&format!("{VALID}\n{section}\n")).is_err());
         }

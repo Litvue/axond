@@ -243,6 +243,7 @@ pub async fn build(
                     config.max_in_flight_per_subject,
                     std::time::Duration::from_secs(config.lease_ttl_seconds),
                     std::time::Duration::from_millis(config.timeout_ms),
+                    std::time::Duration::from_millis(config.connect_timeout_ms),
                     config.on_unavailable,
                 )
                 .await?,

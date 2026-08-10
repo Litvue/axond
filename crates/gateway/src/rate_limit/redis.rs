@@ -99,10 +99,11 @@ impl RedisRateLimiter {
         max_in_flight: usize,
         lease_ttl: Duration,
         timeout: Duration,
+        connect_timeout: Duration,
         on_unavailable: StoreUnavailable,
     ) -> Result<Self, RedisConnectError> {
         let client = redis::Client::open(url)?;
-        let connection = tokio::time::timeout(timeout, async {
+        let connection = tokio::time::timeout(connect_timeout, async {
             let mut connection = ConnectionManager::new(client).await?;
             redis::cmd("PING")
                 .query_async::<String>(&mut connection)
@@ -110,7 +111,9 @@ impl RedisRateLimiter {
             Ok::<_, redis::RedisError>(connection)
         })
         .await
-        .map_err(|_| RedisConnectError::Timeout { timeout })??;
+        .map_err(|_| RedisConnectError::Timeout {
+            timeout: connect_timeout,
+        })??;
         Ok(Self {
             key_prefix,
             max_in_flight,
@@ -285,6 +288,7 @@ mod tests {
             prefix,
             1,
             ttl,
+            Duration::from_millis(250),
             Duration::from_millis(250),
             StoreUnavailable::Deny,
         )
@@ -617,6 +621,7 @@ mod tests {
             1,
             Duration::from_secs(5),
             timeout,
+            timeout,
             StoreUnavailable::Deny,
         )
         .await
@@ -626,6 +631,7 @@ mod tests {
             format!("axond:test:{}", next_id()),
             1,
             Duration::from_secs(5),
+            timeout,
             timeout,
             StoreUnavailable::Allow,
         )
@@ -681,6 +687,7 @@ mod tests {
             1,
             Duration::from_secs(5),
             timeout,
+            timeout,
             StoreUnavailable::Deny,
         )
         .await
@@ -690,6 +697,7 @@ mod tests {
             format!("axond:test:{}", next_id()),
             1,
             Duration::from_secs(5),
+            timeout,
             timeout,
             StoreUnavailable::Allow,
         )
@@ -713,6 +721,7 @@ mod tests {
             "axond:test".into(),
             1,
             Duration::from_secs(1),
+            Duration::from_millis(250),
             timeout,
             StoreUnavailable::Deny,
         )
@@ -737,6 +746,7 @@ mod tests {
             format!("axond:test:{}", next_id()),
             1,
             Duration::from_secs(5),
+            Duration::from_millis(50),
             Duration::from_millis(50),
             StoreUnavailable::Deny,
         )
@@ -767,6 +777,7 @@ mod tests {
             "axond:test".into(),
             1,
             Duration::from_secs(1),
+            Duration::from_millis(10),
             Duration::from_millis(10),
             StoreUnavailable::Deny,
         )

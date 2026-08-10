@@ -339,6 +339,7 @@ leases; it is not an RPM/token-bucket limiter.
 | `on_unavailable` | `deny` \| `allow` | `deny` | Redis outage policy. `deny` fails closed with `503 rate_limit_unavailable`; `allow` admits unenforced and warns. |
 | `lease_ttl_seconds` | integer | `300` | Redis lease lifetime and crash-safety backstop. Must be ≥ 1 for Redis. |
 | `timeout_ms` | integer | `250` | Bounded Redis acquire/release operation timeout. Must be ≥ 1 for Redis. |
+| `connect_timeout_ms` | integer | `5000` | Bounded Redis connection setup and boot-time `PING` timeout. Must be ≥ 1 for Redis. |
 
 When `max_subjects` is reached, a new caller is refused rather than silently
 admitted without a limit; zero-in-flight entries are evicted on permit drop, so
