@@ -50,7 +50,7 @@ enum PermitRelease {
         state: Arc<InMemoryState>,
         key: RateLimitKey,
     },
-    Redis(redis::RedisRelease),
+    Redis(Box<redis::RedisRelease>),
 }
 
 impl RateLimitPermit {

@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use redis::Script;
+use redis::aio::ConnectionLike;
 use redis::aio::ConnectionManager;
+use redis::{Client, Script};
 use ring::rand::{SecureRandom, SystemRandom};
 use thiserror::Error;
 
@@ -38,13 +39,16 @@ return 1
 "#;
 
 const RELEASE: &str = "redis.call('HDEL', KEYS[1], ARGV[1]); return 1";
+const RELEASE_MAX_ATTEMPTS: usize = 8;
 
 pub(crate) struct RedisRelease {
     connection: ConnectionManager,
+    client: Client,
     script: Script,
     key: String,
     lease_id: String,
     timeout: Duration,
+    lease_ttl: Duration,
 }
 
 impl RedisRelease {
@@ -54,22 +58,78 @@ impl RedisRelease {
             return;
         };
         handle.spawn(async move {
+            let retry_window = self
+                .timeout
+                .saturating_mul((RELEASE_MAX_ATTEMPTS * 5) as u32)
+                .min(self.lease_ttl);
+            let deadline = tokio::time::Instant::now() + retry_window;
+            let backoff = self.timeout.min(Duration::from_millis(25));
             let mut connection = self.connection;
-            let result = tokio::time::timeout(self.timeout, async {
-                self.script
-                    .prepare_invoke()
-                    .key(self.key)
-                    .arg(self.lease_id)
-                    .invoke_async::<i64>(&mut connection)
-                    .await
-            })
-            .await;
-            match result {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => tracing::debug!(%error, "rate-limit lease release failed"),
-                Err(_) => tracing::warn!("rate-limit lease release timed out; lease will expire"),
+
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if !remaining.is_zero() {
+                let result = tokio::time::timeout(
+                    self.timeout.min(remaining),
+                    Self::invoke(&self.script, &self.key, &self.lease_id, &mut connection),
+                )
+                .await;
+                if matches!(result, Ok(Ok(_))) {
+                    return;
+                }
+                tracing::debug!("rate-limit lease release failed; retrying on a fresh connection");
             }
+
+            for attempt in 2..=RELEASE_MAX_ATTEMPTS {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                tokio::time::sleep(backoff.min(remaining)).await;
+
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let connection = tokio::time::timeout(
+                    self.timeout.min(remaining),
+                    self.client.get_multiplexed_async_connection(),
+                )
+                .await;
+                let Ok(Ok(mut connection)) = connection else {
+                    tracing::debug!(
+                        attempt,
+                        "fresh Redis connection for lease release failed; retrying"
+                    );
+                    continue;
+                };
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let result = tokio::time::timeout(
+                    self.timeout.min(remaining),
+                    Self::invoke(&self.script, &self.key, &self.lease_id, &mut connection),
+                )
+                .await;
+                if matches!(result, Ok(Ok(_))) {
+                    return;
+                }
+                tracing::debug!(attempt, "rate-limit lease release failed; retrying");
+            }
+
+            tracing::warn!("rate-limit lease release gave up; lease will expire");
         });
+    }
+
+    async fn invoke<C: ConnectionLike>(
+        script: &Script,
+        key: &str,
+        lease_id: &str,
+        connection: &mut C,
+    ) -> redis::RedisResult<i64> {
+        script
+            .prepare_invoke()
+            .key(key)
+            .arg(lease_id)
+            .invoke_async(connection)
+            .await
     }
 }
 
@@ -80,6 +140,7 @@ pub struct RedisRateLimiter {
     timeout: Duration,
     on_unavailable: StoreUnavailable,
     connection: ConnectionManager,
+    client: Client,
     acquire: Script,
     release: Script,
 }
@@ -103,6 +164,7 @@ impl RedisRateLimiter {
         on_unavailable: StoreUnavailable,
     ) -> Result<Self, RedisConnectError> {
         let client = redis::Client::open(url)?;
+        let release_client = client.clone();
         let connection = tokio::time::timeout(connect_timeout, async {
             let mut connection = ConnectionManager::new(client).await?;
             redis::cmd("PING")
@@ -121,6 +183,7 @@ impl RedisRateLimiter {
             timeout,
             on_unavailable,
             connection,
+            client: release_client,
             acquire: Script::new(ACQUIRE),
             release: Script::new(RELEASE),
         })
@@ -133,10 +196,12 @@ impl RedisRateLimiter {
     fn release(&self, key: String, lease_id: String) -> RedisRelease {
         RedisRelease {
             connection: self.connection.clone(),
+            client: self.client.clone(),
             script: self.release.clone(),
             key,
             lease_id,
             timeout: self.timeout,
+            lease_ttl: self.lease_ttl,
         }
     }
 
@@ -211,7 +276,9 @@ impl RateLimiter for RedisRateLimiter {
         .await;
         match result {
             Ok(Ok(1)) => Ok(RateLimitPermit {
-                release: Some(PermitRelease::Redis(self.release(lease_key, lease_id))),
+                release: Some(PermitRelease::Redis(Box::new(
+                    self.release(lease_key, lease_id),
+                ))),
             }),
             Ok(Ok(_)) => {
                 metrics::record_rate_limit_denial();

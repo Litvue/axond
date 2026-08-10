@@ -165,3 +165,7 @@ omitted, so a single-Redis deployment has one connection-string reference.
 Redis connects and PINGs at boot. Each operation has a bounded timeout and the
 default `on_unavailable = "deny"` fails closed with
 `503 rate_limit_unavailable`; `allow` is an explicit fail-open exception.
+When an ambiguous acquire may have created a lease, its compensating release is
+fire-and-forget with bounded retries; retries open fresh Redis connections
+instead of waiting behind the timed-out shared connection, while lease expiry
+remains the final backstop.
