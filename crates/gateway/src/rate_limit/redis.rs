@@ -44,7 +44,7 @@ const RELEASE: &str = "redis.call('HDEL', KEYS[1], ARGV[1]); return 1";
 const RELEASE_MAX_ATTEMPTS: usize = 8;
 const RELEASE_RETRY_CONCURRENCY: usize = 16;
 const RELEASE_RETRY_WINDOW_MULTIPLIER: u32 = 10;
-const RELEASE_TIMEOUT_MULTIPLIER: u32 = 4;
+const REDIS_OPERATION_TIMEOUT_MULTIPLIER: u32 = 4;
 const RELEASE_TIMEOUT_FLOOR: Duration = Duration::from_secs(1);
 const INVOKE_TIMEOUT_FLOOR: Duration = Duration::from_millis(500);
 const SHARED_CONNECTION_REPLACEMENT_COOLDOWN: Duration = Duration::from_millis(250);
@@ -370,7 +370,7 @@ fn release_timeout(admission_timeout: Duration) -> Duration {
     // latency. This budget bounds shared and fresh attempts; retry deadlines
     // and lease TTL still bound total release effort.
     admission_timeout
-        .saturating_mul(RELEASE_TIMEOUT_MULTIPLIER)
+        .saturating_mul(REDIS_OPERATION_TIMEOUT_MULTIPLIER)
         .max(RELEASE_TIMEOUT_FLOOR)
 }
 
@@ -379,8 +379,35 @@ fn invoke_timeout(admission_timeout: Duration) -> Duration {
     // shorter floor keeps low-timeout configurations from delaying recovery
     // longer than necessary while still allowing ordinary Redis latency.
     admission_timeout
-        .saturating_mul(RELEASE_TIMEOUT_MULTIPLIER)
+        .saturating_mul(REDIS_OPERATION_TIMEOUT_MULTIPLIER)
         .max(INVOKE_TIMEOUT_FLOOR)
+}
+
+type OwnedAcquireResult = Result<redis::RedisResult<i64>, tokio::time::error::Elapsed>;
+
+struct TimedOutAcquire {
+    result: Option<OwnedAcquireResult>,
+    compensate: bool,
+}
+
+fn reclaim_timed_out_acquire(
+    receiver: &mut oneshot::Receiver<OwnedAcquireResult>,
+) -> TimedOutAcquire {
+    receiver.close();
+    match receiver.try_recv() {
+        Ok(result) => TimedOutAcquire {
+            compensate: matches!(result, Ok(Ok(1))),
+            result: Some(result),
+        },
+        Err(oneshot::error::TryRecvError::Empty) => TimedOutAcquire {
+            result: None,
+            compensate: false,
+        },
+        Err(oneshot::error::TryRecvError::Closed) => TimedOutAcquire {
+            result: None,
+            compensate: true,
+        },
+    }
 }
 
 fn connection_manager_config() -> ConnectionManagerConfig {
@@ -585,13 +612,13 @@ impl RateLimiter for RedisRateLimiter {
         let invoke_timeout = invoke_timeout(self.timeout);
         let recovery = self.recovery.clone();
         tokio::spawn(async move {
-            let mut invoke_guard = SharedInvokeGuard::new(connection_generation, recovery);
             // Swapping the manager only affects future requests. This task
             // keeps its snapshot and consumes the response even if its caller
-            // stops waiting. The nested task lets the deadline watchdog remain
-            // schedulable even if the Redis future itself does not wake again.
-            let mut invoke_task = tokio::spawn(async move {
-                let mut connection = snapshot.manager.clone();
+            // stops waiting.
+            let mut connection = snapshot.manager.clone();
+            let mut invoke_guard = SharedInvokeGuard::new(connection_generation, recovery);
+            let result: OwnedAcquireResult = tokio::time::timeout(
+                invoke_timeout,
                 acquire
                     .prepare_invoke()
                     .key(&lease_key)
@@ -599,22 +626,9 @@ impl RateLimiter for RedisRateLimiter {
                     .arg(ttl.as_millis() as u64)
                     .arg(max_in_flight)
                     .arg(&lease_id)
-                    .invoke_async::<i64>(&mut connection)
-                    .await
-            });
-            let result = match tokio::time::timeout(invoke_timeout, &mut invoke_task).await {
-                Ok(Ok(result)) => Ok(result),
-                Ok(Err(error)) => Ok(Err(redis::RedisError::from((
-                    redis::ErrorKind::Io,
-                    "owned Redis invoke task failed",
-                    error.to_string(),
-                )))),
-                Err(error) => {
-                    invoke_task.abort();
-                    let _ = invoke_task.await;
-                    Err(error)
-                }
-            };
+                    .invoke_async::<i64>(&mut connection),
+            )
+            .await;
             if result.is_ok() {
                 invoke_guard.complete();
             }
@@ -633,39 +647,31 @@ impl RateLimiter for RedisRateLimiter {
         let result: Result<_, ()> = match tokio::time::timeout(self.timeout, &mut receiver).await {
             Ok(result) => Ok(result),
             Err(_) => {
-                // Keep the receiver alive while the timeout decision is
-                // observed. Closing it first makes a value sent in the race
-                // window recoverable instead of letting it be discarded.
-                receiver.close();
-                match receiver.try_recv() {
-                    Ok(result) => {
-                        // An unambiguous late grant was not retained by the
-                        // caller, so compensate it here. Ambiguous results
-                        // are already compensated by the owning task before
-                        // it sends them.
-                        if matches!(result, Ok(Ok(1))) {
-                            release.spawn();
-                        }
-                        return match result {
-                            Ok(Ok(1)) => {
-                                self.unavailable("acquire completed after its caller wait expired")
-                            }
-                            Ok(Ok(_)) => {
-                                metrics::record_rate_limit_denial();
-                                Err(RateLimitError::Exceeded)
-                            }
-                            Ok(Err(error)) => self.unavailable(error),
-                            Err(_) => self.unavailable("operation timed out"),
-                        };
-                    }
-                    Err(oneshot::error::TryRecvError::Empty) => {
-                        return self.unavailable("operation timed out");
-                    }
-                    Err(oneshot::error::TryRecvError::Closed) => {
-                        release.spawn();
-                        return self.unavailable("operation timed out");
-                    }
+                let reclaimed = reclaim_timed_out_acquire(&mut receiver);
+                if reclaimed.compensate {
+                    release.spawn();
                 }
+                if let Some(result) = reclaimed.result {
+                    let current_generation = self.connection.load_full().generation;
+                    let result_untrusted = connection_generation != current_generation
+                        || self.suspect_generation.load(Ordering::Acquire) >= connection_generation;
+                    if result_untrusted {
+                        return self
+                            .unavailable("shared Redis connection was replaced during acquire");
+                    }
+                    return match result {
+                        Ok(Ok(1)) => {
+                            self.unavailable("acquire completed after its caller wait expired")
+                        }
+                        Ok(Ok(_)) => {
+                            metrics::record_rate_limit_denial();
+                            Err(RateLimitError::Exceeded)
+                        }
+                        Ok(Err(error)) => self.unavailable(error),
+                        Err(_) => self.unavailable("operation timed out"),
+                    };
+                }
+                return self.unavailable("operation timed out");
             }
         };
         let current_generation = self.connection.load_full().generation;
@@ -2139,17 +2145,22 @@ mod tests {
     }
 
     #[test]
-    fn timeout_handoff_reclaims_a_value_sent_before_receiver_close() {
-        let (sender, mut receiver) =
-            oneshot::channel::<Result<redis::RedisResult<i64>, tokio::time::error::Elapsed>>();
+    fn timeout_handoff_reclaims_and_closes_before_late_grant() {
+        let (sender, mut receiver) = oneshot::channel::<OwnedAcquireResult>();
         sender
             .send(Ok(Ok(1)))
             .expect("receiver is still alive before close");
-        receiver.close();
-        let reclaimed = receiver
-            .try_recv()
-            .expect("close must preserve an already-sent value");
-        assert!(matches!(reclaimed, Ok(Ok(1))));
+        let reclaimed = reclaim_timed_out_acquire(&mut receiver);
+        assert!(reclaimed.compensate);
+        assert!(matches!(reclaimed.result, Some(Ok(Ok(1)))));
+
+        let (sender, mut receiver) = oneshot::channel::<OwnedAcquireResult>();
+        let reclaimed = reclaim_timed_out_acquire(&mut receiver);
+        assert!(reclaimed.compensate);
+        assert!(
+            sender.send(Ok(Ok(1))).is_err(),
+            "a late send must fail after the timeout handoff closes the receiver"
+        );
     }
 
     #[tokio::test]
