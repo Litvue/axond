@@ -90,10 +90,6 @@ impl RedisRelease {
                 tracing::debug!("rate-limit lease release failed; retrying on a fresh connection");
             }
 
-            let Some(_retry_permit) = try_release_retry_permit(self.retry_semaphore) else {
-                tracing::debug!("rate-limit lease release retry limit reached; lease will expire");
-                return;
-            };
             for attempt in 2..=RELEASE_MAX_ATTEMPTS {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
@@ -110,6 +106,13 @@ impl RedisRelease {
                 if remaining.is_zero() {
                     break;
                 }
+                let Some(_retry_permit) = try_release_retry_permit(self.retry_semaphore) else {
+                    tracing::debug!(
+                        attempt,
+                        "rate-limit lease release retry limit reached; lease will expire"
+                    );
+                    return;
+                };
                 let connection = tokio::time::timeout(
                     self.timeout.min(remaining),
                     self.client.get_multiplexed_async_connection(),
