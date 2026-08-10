@@ -166,7 +166,8 @@ by the same rule as the usage table — a change to the row shape is a new file.
   input estimate is the pre-dispatch one.
 - Two datastore backends is two operational surfaces to document and test. The
   cross-replica tests exercise real servers when `AXOND_TEST_REDIS_URL` /
-  `AXOND_TEST_POSTGRES_DSN` are set and skip otherwise, so the suite still runs
-  with no datastore.
+  `AXOND_TEST_POSTGRES_DSN` are set and skip otherwise, so the hermetic suite
+  still runs with no datastore; CI's stateful lane sets
+  `AXOND_TEST_REQUIRE_SERVICES=1` to make missing services fail.
 - Per-model and hierarchical caps, and a budget-state admin/reset surface, remain
   open.

@@ -32,13 +32,17 @@ lockfile-sync job for a ref is serialized by a queueing concurrency group, and
 lockfile sync re-bases onto the remote branch tip with a bounded retry instead
 of force-pushing.
 
-**CI is one job per concern** (`fmt`, `clippy`, `build`, `tests`, `docs`,
-`dependency-policy`, `static-binary`, `docker-smoke`) behind a single required
-`CI-Success` gate. All Rust invocations are `--locked`; the toolchain is pinned
-to the `rust-toolchain.toml` channel. The `static-binary` lane asserts the musl
-build is actually static (accepting `static-pie linked`, the modern musl
-default, as well as `statically linked`), and `docker-smoke` boots the image
-against the example config and probes `/healthz` + `/v1/models`.
+**CI is one job per concern** (`fmt`, `clippy`, `build`, `tests`,
+`stateful-tests`, `docs`, `dependency-policy`, `static-binary`, `docker-smoke`)
+behind a single required `CI-Success` gate. The hermetic `tests` lane remains
+service-free; `stateful-tests` runs the gated Redis/Postgres tests in pinned
+service containers with `AXOND_TEST_REQUIRE_SERVICES=1`, so a missing service
+configuration fails loudly instead of silently skipping. All Rust invocations
+are `--locked`; the toolchain is pinned to the `rust-toolchain.toml` channel.
+The `static-binary` lane asserts the musl build is actually static (accepting
+`static-pie linked`, the modern musl default, as well as `statically linked`),
+and `docker-smoke` boots the image against the example config and probes
+`/healthz` + `/v1/models`.
 
 **Release artifacts, per tagged commit:**
 
@@ -70,6 +74,9 @@ dirty worktree — and the signing identity is pinned to this workflow on
 
 - Versioning and changelog are mechanical and tied to commit discipline; a
   sloppy commit type produces a wrong bump, so the PR-title gate is load-bearing.
+- The hermetic and stateful test lanes cover both no-service developer runs and
+  real Redis/Postgres behavior; the required-services guard prevents CI from
+  passing with those tests skipped.
 - Consumers can verify provenance and signatures for both the binaries and the
   image, and reconstruct the dependency set from the attached SBOMs.
 - The release PR only triggers downstream CI when the org-wide release GitHub

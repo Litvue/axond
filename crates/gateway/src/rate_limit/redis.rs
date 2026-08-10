@@ -1345,7 +1345,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_limiters_sharing_one_redis_enforce_one_limit() {
-        let Ok(url) = std::env::var("AXOND_TEST_REDIS_URL") else {
+        let Some(url) = crate::test_services::redis_url() else {
             return;
         };
         let prefix = format!("axond:test:{}", next_id());
@@ -1364,7 +1364,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_abandoned_lease_is_reclaimed_after_ttl() {
-        let Ok(url) = std::env::var("AXOND_TEST_REDIS_URL") else {
+        let Some(url) = crate::test_services::redis_url() else {
             return;
         };
         let limiter = limiter(
@@ -1388,7 +1388,7 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_redis_denies_within_timeout_and_recovers() {
-        let Ok(url) = std::env::var("AXOND_TEST_REDIS_URL") else {
+        let Some(url) = crate::test_services::redis_url() else {
             return;
         };
         let relay = RedisRelay::start(&url).await;
@@ -2059,7 +2059,7 @@ mod tests {
 
     #[tokio::test]
     async fn timed_out_acquire_releases_an_ambiguous_redis_lease() {
-        let Ok(url) = std::env::var("AXOND_TEST_REDIS_URL") else {
+        let Some(url) = crate::test_services::redis_url() else {
             return;
         };
         let relay = RedisRelay::start(&url).await;

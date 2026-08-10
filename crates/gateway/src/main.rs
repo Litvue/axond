@@ -23,6 +23,8 @@ mod routes;
 mod state;
 mod streaming;
 mod telemetry;
+#[cfg(test)]
+mod test_services;
 mod usage;
 
 use std::collections::HashMap;

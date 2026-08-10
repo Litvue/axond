@@ -358,7 +358,7 @@ mod tests {
     /// failed) otherwise, so the suite stays runnable with no datastore.
     #[tokio::test]
     async fn two_stores_sharing_one_database_enforce_a_single_cap() {
-        let Ok(dsn) = std::env::var("AXOND_TEST_POSTGRES_DSN") else {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
         };
         let table = "axond_budget_test";
