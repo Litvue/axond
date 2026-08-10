@@ -477,6 +477,15 @@ async fn serve(
     };
     let estimate = route.estimate(&body);
     let estimated_cost = model.targets[0].price.cost_microdollars(estimate);
+    if let Some(ceiling) = caller.max_request_microdollars
+        && estimated_cost > ceiling
+    {
+        return Err(GatewayError::RequestCostCeilingExceeded {
+            subject: caller.subject.clone(),
+            estimated_microdollars: estimated_cost,
+            ceiling_microdollars: ceiling,
+        });
+    }
     let reservation = match state.0.budget.reserve(&budget_key, estimated_cost).await {
         Admission::Allowed(reservation) => reservation,
         Admission::Denied(Denial::Exceeded) => return Err(GatewayError::BudgetExceeded(alias)),
@@ -1396,6 +1405,8 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         aud: &'static str,
         ns: &'static str,
         sub: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_request_microdollars: Option<u64>,
     }
 
     #[tokio::test]
@@ -1463,6 +1474,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             aud: "test-audience",
             ns: "platform",
             sub: "token-caller",
+            max_request_microdollars: None,
         };
         let mut header = Header::new(Algorithm::HS256);
         header.kid = Some("route-kid".to_owned());
@@ -1981,6 +1993,41 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         let env = env_with([("K1", "sk-test")]);
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
         AppState::new(cfg, &env, UsageFanout::new(sinks), budget).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_request_over_its_ceiling_is_rejected_before_reservation_or_dispatch() {
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let budget = RecordingBudget::default();
+        let state = budgeted_state(&base_url, Box::new(budget.clone()));
+        let snapshot = state.config();
+        let caller = InboundKey {
+            namespace: "platform".to_owned(),
+            subject: "ceiling-caller".to_owned(),
+            signer_kid: Some("test-kid".to_owned()),
+            max_request_microdollars: Some(1),
+        };
+        let body = json!({"model": "gpt-4o", "messages": []});
+
+        let error = serve(
+            state,
+            HeaderMap::new(),
+            body,
+            Route::ChatCompletions,
+            snapshot,
+            caller,
+        )
+        .await
+        .expect_err("the estimate exceeds the caller ceiling");
+
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "request_cost_ceiling_exceeded");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert!(budget.0.lock().unwrap().is_empty());
     }
 
     /// The reserved estimate is a ceiling, not the charge: a completed request

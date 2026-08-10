@@ -198,10 +198,12 @@ The verifier accepts `axt1.` compact JWS credentials alongside static keys.
 public key plus this snippet; `axond mint` reads signing material by env-var
 name and prints only the token. Ed25519 base64 whitespace is trimmed on both
 sides because mounted secrets may preserve the generated file's trailing
-newline; HS256 secrets are opaque bytes and are not trimmed. `scope`, `aliases`,
-and `max_request_microdollars` are described by ADR 0016 but are not currently
-enforced or emitted (see #60, #61, and #62). An explicit `--audience` must still
-match the configured `[gateway_token]` audience.
+newline; HS256 secrets are opaque bytes and are not trimmed. `scope` and
+`aliases` are described by ADR 0016 but are not currently enforced or emitted
+(see #60 and #61). `max_request_microdollars` is enforced at admission time
+against the pre-dispatch estimate and can be emitted by `axond mint`. An
+explicit `--audience` must still match the configured `[gateway_token]`
+audience.
 
 Keep at least one static `[[gateway_key]]` for breakglass. Minted identity
 verification is Tier 0 and adds no runtime datastore dependency. See the

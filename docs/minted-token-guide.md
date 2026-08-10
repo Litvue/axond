@@ -199,11 +199,11 @@ The verifier requires these claims:
 five-second clock-skew allowance. Unknown claims are otherwise ignored by the
 current verifier.
 
-ADR 0016 describes three future narrowing claims:
-`scope`, `aliases`, and `max_request_microdollars`. They are **not enforced by
-the current gateway and are not emitted by `axond mint`**. Do not add them by
-hand and assume a token is narrowed: it is not. Their enforcement and minting
-are tracked by #60, #61, and #62 respectively.
+ADR 0016 describes three narrowing claims: `scope` and `aliases` are not yet
+enforced by the current gateway or emitted by `axond mint` (see #60 and #61).
+`max_request_microdollars` is enforced at admission time against the
+pre-dispatch estimate and is emitted by
+`axond mint --max-request-microdollars`.
 
 ## 5. Rotation runbook
 
