@@ -220,7 +220,7 @@ mod tests {
     /// posture as the gateway itself.
     #[tokio::test]
     async fn two_stores_sharing_one_redis_enforce_a_single_cap() {
-        let Ok(url) = std::env::var("AXOND_TEST_REDIS_URL") else {
+        let Some(url) = crate::test_services::redis_url() else {
             return;
         };
         let prefix = format!("axond:test:{}", Reservation::next_id());
@@ -260,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_expired_reservation_stops_counting_against_the_cap() {
-        let Ok(url) = std::env::var("AXOND_TEST_REDIS_URL") else {
+        let Some(url) = crate::test_services::redis_url() else {
             return;
         };
         let prefix = format!("axond:test:{}", Reservation::next_id());

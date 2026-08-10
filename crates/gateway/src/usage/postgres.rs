@@ -437,7 +437,7 @@ mod tests {
     /// the same posture as the gateway itself.
     #[tokio::test]
     async fn a_batch_lands_in_postgres() {
-        let Ok(dsn) = std::env::var("AXOND_TEST_POSTGRES_DSN") else {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
         };
         let table = "axond_usage_test";

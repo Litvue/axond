@@ -20,6 +20,19 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
+The Redis/Postgres-backed tests skip when their services are not configured.
+To run them locally, start pinned service containers and set the same variables
+as CI:
+
+```bash
+docker run -d --name axond-test-redis -p 6399:6379 redis:7.4.2-alpine
+docker run -d --name axond-test-postgres -e POSTGRES_PASSWORD=axond-ci \
+  -p 55432:5432 postgres:17.6-alpine
+AXOND_TEST_REDIS_URL=redis://127.0.0.1:6399 \
+AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:55432/postgres \
+AXOND_TEST_REQUIRE_SERVICES=1 cargo test -p axond --all-features --locked
+```
+
 ## Conventions
 
 - **Warnings are errors.** CI runs clippy with `-D warnings`; keep it clean.
