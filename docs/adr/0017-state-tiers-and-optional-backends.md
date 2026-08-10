@@ -175,17 +175,25 @@ remains the final backstop.
 
 A dropped in-flight response wait can poison a multiplexed connection's reply
 alignment, so abandoning a caller's wait does not abandon the Redis operation:
-the invoke runs in its own task and its result is consumed in order. Each
-owned invoke has a finite task deadline; when it expires, the invoke is dropped,
-its permit is reclaimed, and the guard retires that generation before any future
-request can use it. This cancellation is safe because a retired generation is
-never read again. Outstanding shared invokes are bounded by a non-queuing
+the invoke runs in its own task and its result is consumed in order. The
+caller-facing admission timeout is a latency budget, not the invoke deadline:
+each owned invoke gets the longer four-times-admission budget with a 500 ms
+floor. When that liveness deadline expires, the invoke is dropped, its permit is
+reclaimed, and the guard retires that generation before any future request can
+use it. This cancellation is safe because a retired generation is never read
+again. Outstanding shared invokes are bounded by a non-queuing
 per-manager cap; when that cap is exhausted, the limiter refuses that request
 without retiring a healthy connection or queueing another waiter. Permit
 releases use a separate, generous bounded retry budget derived from the
 configured admission timeout; the shared release attempt is bounded by the same
 budget before fresh-connection retries begin. Retirement starts replacement
-asynchronously and remains single-flight and generation-safe.
+asynchronously and remains single-flight and generation-safe. The acquire
+handoff keeps its result receiver alive through the caller timeout, closes it,
+and drains any value sent in the timeout race window; a reclaimed successful
+lease is compensated by the caller, while the owning task compensates a late
+successful send after the receiver closes. A disconnected handoff is
+unattributable and is compensated conservatively; only a definite `0` proves
+that no lease exists.
 redis-rs 1.4.1's documented source default is
 `DEFAULT_RESPONSE_TIMEOUT = Some(Duration::from_millis(500))`
 (`src/client.rs`); axond disables it because that internal cancellation could
