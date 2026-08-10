@@ -50,13 +50,14 @@ const INVOKE_TIMEOUT_FLOOR: Duration = Duration::from_millis(500);
 const SHARED_CONNECTION_REPLACEMENT_COOLDOWN: Duration = Duration::from_millis(250);
 // The old 256-invoke cap with the 250 ms admission timeout allowed
 // 256 / 0.25 = 1,024 admissions per second before shedding. Owned invokes now
-// live for up to 1 second at that default, so 1,024 preserves the same
-// headroom: 1,024 / 1 = 1,024 outstanding invokes per second of normal load.
-// The 500 ms floor provides 2,048 per second of headroom for lower timeouts.
-// This fixed safety bound is preferable to another per-limiter tuning knob in
-// this PR; configurability can be considered once production concurrency data
-// justifies it. Saturation refuses only the current request and is not evidence
-// that the socket failed.
+// live for up to 1 second at that default, so 1,024 preserves that headroom:
+// 1,024 / 1 = 1,024 outstanding invokes per second. At a 2-second admission
+// timeout the liveness budget is 8 seconds, so this fixed ceiling intentionally
+// sheds at 1,024 / 8 = 128 admissions per second rather than allowing 8,192
+// stalled tasks. The cap is therefore a safety ceiling, not a configurable
+// throughput promise; configurability can be considered once production
+// concurrency data justifies it. Saturation refuses only the current request
+// and is not evidence that the socket failed.
 const SHARED_INVOKE_CONCURRENCY: usize = 1024;
 
 // Keep fresh-connection retries below a small fixed concurrency cap; the
@@ -212,6 +213,27 @@ impl SharedRecovery {
             recovery.schedule_replacement(generation);
         }
     }
+}
+
+fn result_is_untrusted(recovery: &SharedRecovery, generation: u64, receiver_closed: bool) -> bool {
+    let current_generation = recovery.connection.load_full().generation;
+    receiver_closed
+        || generation != current_generation
+        || recovery.suspect_generation.load(Ordering::Acquire) >= generation
+}
+
+fn compensate_abandoned_result(result: &OwnedAcquireResult, result_untrusted: bool) -> bool {
+    matches!(result, Ok(Ok(1))) || (result_untrusted && matches!(result, Ok(Ok(_))))
+}
+
+fn should_compensate_acquire_result(
+    result: Option<&OwnedAcquireResult>,
+    result_untrusted: bool,
+    sender_disconnected: bool,
+) -> bool {
+    result
+        .map(|result| compensate_abandoned_result(result, result_untrusted))
+        .unwrap_or(sender_disconnected)
 }
 
 #[derive(Clone)]
@@ -397,6 +419,8 @@ struct TimedOutAcquire {
 
 fn reclaim_timed_out_acquire(
     receiver: &mut oneshot::Receiver<OwnedAcquireResult>,
+    // The production caller passes a no-op; the hook deterministically models
+    // a send landing between the first probe and receiver close in tests.
     before_close: impl FnOnce(),
 ) -> TimedOutAcquire {
     match receiver.try_recv() {
@@ -632,7 +656,7 @@ impl RateLimiter for RedisRateLimiter {
             // keeps its snapshot and consumes the response even if its caller
             // stops waiting.
             let mut connection = snapshot.manager.clone();
-            let mut invoke_guard = SharedInvokeGuard::new(connection_generation, recovery);
+            let mut invoke_guard = SharedInvokeGuard::new(connection_generation, recovery.clone());
             let result: OwnedAcquireResult = tokio::time::timeout(
                 invoke_timeout,
                 acquire
@@ -652,10 +676,16 @@ impl RateLimiter for RedisRateLimiter {
             let definite_denial = matches!(result, Ok(Ok(0)));
             let definitely_created = matches!(result, Ok(Ok(1)));
             let ambiguous = !definite_denial && !definitely_created;
+            // Once the caller has closed the receiver, a successful reply is
+            // no longer attributable to that abandoned wait even if the
+            // generation has not yet been retired.
+            let result_untrusted =
+                result_is_untrusted(&recovery, connection_generation, sender.is_closed());
+            let compensate_on_send_failure = compensate_abandoned_result(&result, result_untrusted);
             if ambiguous {
                 abandoned_release.clone().spawn();
             }
-            if sender.send(result).is_err() && (definite_denial || definitely_created) {
+            if sender.send(result).is_err() && compensate_on_send_failure {
                 abandoned_release.spawn();
             }
             drop(invoke_permit);
@@ -665,11 +695,10 @@ impl RateLimiter for RedisRateLimiter {
             Err(_) => {
                 let reclaimed = reclaim_timed_out_acquire(&mut receiver, || {});
                 if let Some(result) = reclaimed.result {
-                    let current_generation = self.connection.load_full().generation;
-                    let result_untrusted = connection_generation != current_generation
-                        || self.suspect_generation.load(Ordering::Acquire) >= connection_generation;
-                    let compensate =
-                        reclaimed.compensate || (result_untrusted && matches!(result, Ok(Ok(_))));
+                    let result_untrusted =
+                        result_is_untrusted(&self.recovery, connection_generation, false);
+                    let compensate = reclaimed.compensate
+                        || should_compensate_acquire_result(Some(&result), result_untrusted, false);
                     if compensate {
                         release.spawn();
                     }
@@ -689,15 +718,13 @@ impl RateLimiter for RedisRateLimiter {
                         Err(_) => self.unavailable("operation timed out"),
                     };
                 }
-                if reclaimed.compensate {
+                if reclaimed.compensate || should_compensate_acquire_result(None, false, false) {
                     release.spawn();
                 }
                 return self.unavailable("operation timed out");
             }
         };
-        let current_generation = self.connection.load_full().generation;
-        let result_untrusted = connection_generation != current_generation
-            || self.suspect_generation.load(Ordering::Acquire) >= connection_generation;
+        let result_untrusted = result_is_untrusted(&self.recovery, connection_generation, false);
         if result_untrusted && matches!(result, Ok(Ok(Ok(Ok(_))))) {
             release.spawn();
             return self.unavailable("shared Redis connection was replaced during acquire");
@@ -711,7 +738,13 @@ impl RateLimiter for RedisRateLimiter {
                 Err(RateLimitError::Exceeded)
             }
             Ok(Ok(Ok(Err(error)))) => self.unavailable(error),
-            Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => self.unavailable("operation timed out"),
+            Ok(Ok(Err(_))) | Err(_) => self.unavailable("operation timed out"),
+            Ok(Err(_)) => {
+                if should_compensate_acquire_result(None, false, true) {
+                    release.spawn();
+                }
+                self.unavailable("operation timed out")
+            }
         }
     }
 }
@@ -2163,6 +2196,23 @@ mod tests {
         assert!(try_release_retry_permit(&semaphore).is_none());
         drop(permits);
         assert!(try_release_retry_permit(&semaphore).is_some());
+    }
+
+    #[test]
+    fn abandoned_zero_and_disconnected_results_follow_compensation_rule() {
+        let denial = Ok(Ok(0));
+        assert!(
+            !compensate_abandoned_result(&denial, false),
+            "a trusted definite denial proves no lease was created"
+        );
+        assert!(
+            compensate_abandoned_result(&denial, true),
+            "a denial from a retired generation is unattributable and must compensate"
+        );
+        assert!(
+            should_compensate_acquire_result(None, false, true),
+            "a disconnected acquire task may have created a lease before disappearing"
+        );
     }
 
     #[test]
