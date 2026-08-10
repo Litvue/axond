@@ -1,5 +1,70 @@
 # Changelog
 
+## [0.1.3](https://github.com/Litvue/axond/compare/v0.1.2...v0.1.3) (2026-08-10)
+
+
+### Features
+
+* **auth:** add minted token issuance epochs ([d6b2c1b](https://github.com/Litvue/axond/commit/d6b2c1b06853404cc86c00d5cbe9db25d0d90838))
+* **auth:** enforce max_request_microdollars per-request ceiling ([a1f8609](https://github.com/Litvue/axond/commit/a1f86096c2b45d092cc7d40658a055c00aae2380))
+* **auth:** enforce max_request_microdollars per-request ceiling ([604f962](https://github.com/Litvue/axond/commit/604f962be7137d78222c650b565eaadf8135df4f))
+* **auth:** enforce scoped route capabilities ([dd8711b](https://github.com/Litvue/axond/commit/dd8711bb95e7fb5da429cda14b0398cd3713160b))
+* **auth:** enforce scoped route capabilities on every provider route ([49d378d](https://github.com/Litvue/axond/commit/49d378db2473b9254219433b4bca2865b46c8cff))
+* **auth:** enforce the minted `aliases` narrowing claim ([a1465ad](https://github.com/Litvue/axond/commit/a1465ad9963643cbd7f2a360347e0076be5ff01c))
+* **auth:** min_iat issuance epochs for stateless mass revocation ([c2033c2](https://github.com/Litvue/axond/commit/c2033c2c7ee85992521d62980a06493007e9a847))
+* **budget:** bound in-memory ledger retention by namespace ([9346c1d](https://github.com/Litvue/axond/commit/9346c1d550918c79b3c2dd0136865c8a92460928))
+* **budget:** bound in-memory ledger retention per namespace ([ba08041](https://github.com/Litvue/axond/commit/ba0804184a778c6129711fc11f1538d82c00bfd0))
+* **gateway:** enforce minted alias claims ([f5d0adb](https://github.com/Litvue/axond/commit/f5d0adbbd5b9a525eb5c195aed4df9e1c2023c2a))
+* **limits:** add inbound rate limiter with in-memory backend ([50d4592](https://github.com/Litvue/axond/commit/50d45921075513b3bb8138fdc45e58c35a54e421))
+* **limits:** inbound RateLimiter trait with NoLimit default and in-memory limiter ([91a7e8e](https://github.com/Litvue/axond/commit/91a7e8ebd69c7b785f4f004636823e00b65b1ee8))
+
+
+### Bug Fixes
+
+* **auth:** avoid allocations for epoch checks ([755b80a](https://github.com/Litvue/axond/commit/755b80aa20dedc37653aff94822744400a0a8202))
+* **auth:** repair merged epoch documentation and test ([4eb5784](https://github.com/Litvue/axond/commit/4eb578469197337f88b236a851a22b8809fea188))
+* **auth:** report and reject invalid token epochs ([c314b10](https://github.com/Litvue/axond/commit/c314b1073f0d5154d70160944e77c5493ce093ac))
+* **auth:** tighten request ceiling response and coverage ([6c90e97](https://github.com/Litvue/axond/commit/6c90e97fc58bf20935931041cade2f53029ffd1c))
+* **budget:** clamp post-reload namespace reservations ([45a883f](https://github.com/Litvue/axond/commit/45a883f3c4641ee6a4b734cc55d317905d17e927))
+* **budget:** size namespace floors by distinct IDs ([cbe4959](https://github.com/Litvue/axond/commit/cbe4959227ba71423927248cebf544b95cf0b437))
+* **config:** report rate limit changes on reload ([b996640](https://github.com/Litvue/axond/commit/b99664027ea37f78e16050fabd87b98a98813cdd))
+* **gateway:** reject null aliases claims ([5dc4dd8](https://github.com/Litvue/axond/commit/5dc4dd80010b7efc9d3e0b1d4b6f8f204f25a4bf))
+* **gateway:** release cancelled buffered reservations ([d18009a](https://github.com/Litvue/axond/commit/d18009a2f9121537e4ee62867add858d03d40e16))
+* **gateway:** release cancelled buffered reservations ([23c07e7](https://github.com/Litvue/axond/commit/23c07e75f579a2dae528f0758aa35f93e6cd0c85))
+* **gateway:** strengthen alias claim coverage ([5314825](https://github.com/Litvue/axond/commit/53148256a5f5cd4f0ba1bac2f3809b2e3ccadfc4))
+* **limits:** tighten permit and rejection handling ([26479d8](https://github.com/Litvue/axond/commit/26479d8c30a8390ae399cc094509b97e78b5be0b))
+
+
+### Refactors
+
+* **budget:** unify in-memory ledger state locking ([339e49d](https://github.com/Litvue/axond/commit/339e49d9e7b21ac36fcf1fd0dbe9aee41004752a))
+
+
+### Documentation
+
+* **adr:** document scoped capability state tier ([09a43a8](https://github.com/Litvue/axond/commit/09a43a8ce785c4d19f07195c2eec4127137efbe6))
+* **adr:** note that a null scope claim is an absent claim ([10a36c7](https://github.com/Litvue/axond/commit/10a36c7f844ed5ac8298c1f9b6c449ae8f6edce6))
+* **auth:** note the zero-ceiling and estimate-granularity edges ([2ee0e26](https://github.com/Litvue/axond/commit/2ee0e2638dc6982cf90ede987ea7e48e65e25632))
+* **budget:** clarify namespace retention headroom ([38ecda7](https://github.com/Litvue/axond/commit/38ecda7db350dbb5cc2af99e10559fdda429ea07))
+* clarify alias claim behavior ([3dd9f1b](https://github.com/Litvue/axond/commit/3dd9f1bbb8e4fec23137b8b1ebe5de49cd8d5978))
+* declare the state tier of every existing feature ([629884c](https://github.com/Litvue/axond/commit/629884c6ad4ccba927985914988078d567f2c7b1))
+* document state tiers ([8c7294f](https://github.com/Litvue/axond/commit/8c7294f5f3c6eee04de0d86b633bd0c26d40a855))
+* **gateway:** narrow reservation guard coverage ([4220e68](https://github.com/Litvue/axond/commit/4220e688998e1a6a2206881123f6333b96eacdd7))
+* keep config loading order ahead of the tier table ([453325f](https://github.com/Litvue/axond/commit/453325f3f0e6b63bfed5774ccf0b5e920b6e956e))
+
+
+### Tests
+
+* **auth:** cover issuance epoch reloads ([0edb5cc](https://github.com/Litvue/axond/commit/0edb5ccbcbf1dd97c52b1c1de5eddb89e8a3134f))
+* **gateway:** wait for cancellation release ([3a3f789](https://github.com/Litvue/axond/commit/3a3f78961fc3e4ae3e3e11423582564ec8f71f73))
+
+
+### Continuous Integration
+
+* **release:** narrow lockfile sync concurrency ([1f5d605](https://github.com/Litvue/axond/commit/1f5d605f29b0d899f3e496f5b1729e4692ec03fd))
+* **release:** serialize lockfile sync retries ([b4615e0](https://github.com/Litvue/axond/commit/b4615e0efcd2efb1d6ef8ff13d25e695013f87ab))
+* **release:** serialize release runs and re-base the lockfile sync ([6e13a32](https://github.com/Litvue/axond/commit/6e13a32234e94868fffee4598b2981520e301523))
+
 ## [0.1.2](https://github.com/Litvue/axond/compare/v0.1.1...v0.1.2) (2026-08-09)
 
 
