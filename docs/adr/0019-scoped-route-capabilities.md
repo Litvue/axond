@@ -35,10 +35,11 @@ This adds no configuration surface and mirrors catalogue scoping.
 Only a principal carrying a `scope` is subject to this gate. Its effective
 capabilities are the intersection of the token scope and the derived namespace
 authority. A missing scope therefore preserves Phase 1 behavior, including for
-static gateway keys, while an empty scope narrows authority to nothing.
-Unknown scope values are ignored and intersect away rather than failing token
-verification. `/v1/responses` has no capability and remains the typed `501
-not_implemented` route for scoped callers.
+static gateway keys, while an empty scope narrows authority to nothing. A
+`null` claim is an absent claim, not an empty scope. Unknown scope values are
+ignored and intersect away rather than failing token verification.
+`/v1/responses` has no capability and remains the typed `501 not_implemented`
+route for scoped callers.
 
 The auth middleware enforces the capability before handler extractors run.
 Scope denial is a typed `403` with code `token_scope_insufficient`; its message
