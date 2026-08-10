@@ -158,11 +158,17 @@ struct ResolvedVerifier {
     fingerprint: String,
 }
 
+#[derive(Default)]
+struct NamespaceEpoch {
+    namespace_min_iat: Option<u64>,
+    subjects: HashMap<String, u64>,
+}
+
 pub struct TokenVerifier {
     audience: String,
     namespaces: HashSet<String>,
     verifiers: Vec<ResolvedVerifier>,
-    epochs: HashMap<(String, Option<String>), u64>,
+    epochs: HashMap<String, NamespaceEpoch>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,16 +199,15 @@ impl TokenVerifier {
             .iter()
             .map(|namespace| namespace.id.clone())
             .collect();
-        let epochs = config
-            .gateway_token_epoch
-            .iter()
-            .map(|epoch| {
-                (
-                    (epoch.namespace.clone(), epoch.subject.clone()),
-                    epoch.min_iat,
-                )
-            })
-            .collect();
+        let mut epochs: HashMap<String, NamespaceEpoch> = HashMap::new();
+        for epoch in &config.gateway_token_epoch {
+            let namespace = epochs.entry(epoch.namespace.clone()).or_default();
+            if let Some(subject) = &epoch.subject {
+                namespace.subjects.insert(subject.clone(), epoch.min_iat);
+            } else {
+                namespace.namespace_min_iat = Some(epoch.min_iat);
+            }
+        }
         let mut verifiers = Vec::with_capacity(config.gateway_verifier.len());
         for verifier in &config.gateway_verifier {
             let source =
@@ -440,11 +445,14 @@ impl PrincipalStore for TokenVerifier {
                 claim: "sub".to_owned(),
             }),
         )?;
-        let epoch = self
-            .epochs
-            .get(&(namespace.clone(), Some(subject.clone())))
-            .or_else(|| self.epochs.get(&(namespace.clone(), None)));
-        if epoch.is_some_and(|min_iat| iat < *min_iat) {
+        let epoch = self.epochs.get(namespace.as_str()).and_then(|namespace| {
+            namespace
+                .subjects
+                .get(subject.as_str())
+                .copied()
+                .or(namespace.namespace_min_iat)
+        });
+        if epoch.is_some_and(|min_iat| iat < min_iat) {
             return Err(PrincipalStoreError::Unauthorized(
                 TokenVerificationError::IssuedBeforeEpoch { namespace, subject },
             ));
