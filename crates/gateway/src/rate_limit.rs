@@ -27,7 +27,11 @@ pub struct RateLimitKey {
 pub enum RateLimitError {
     #[error("in-flight concurrency limit exceeded")]
     Exceeded,
-    #[error("in-memory rate-limit subject capacity exhausted")]
+    /// New callers are refused rather than silently admitted without a limit;
+    /// zero-in-flight entries are evicted on permit drop.
+    #[error(
+        "in-memory rate-limit subject capacity exhausted; new callers are refused until an active key is evicted"
+    )]
     SubjectCapacityExceeded,
 }
 

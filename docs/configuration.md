@@ -259,6 +259,10 @@ fleet-wide concurrency.
 | `max_in_flight_per_subject` | integer | `16` | Maximum concurrent dispatches for one authenticated caller. Must be nonzero when `backend = "in-memory"`. |
 | `max_subjects` | integer | `10000` | Maximum retained caller keys in the in-memory map. Must be nonzero when enabled; zero-count entries are evicted. |
 
+When `max_subjects` is reached, a new caller is refused rather than silently
+admitted without a limit; zero-in-flight entries are evicted on permit drop, so
+the map retains only active callers.
+
 ## Telemetry
 
 There is no telemetry section: telemetry is environment-only, exactly as in any

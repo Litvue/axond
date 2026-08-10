@@ -481,6 +481,7 @@ async fn serve(
         .map_err(|_| GatewayError::RateLimitExceeded {
             retry_after_seconds: None,
         })?;
+    // Held for the request lifetime: buffered paths drop it at scope end; streams move it into accounting.
 
     // Budget is denominated in micro-dollars. Hold a conservative cost estimate
     // from the first target's price before dispatch; settle the hold against the
@@ -889,9 +890,6 @@ async fn stream_with_failover(
                     && walk.attempts < max_attempts
                     && Instant::now() < deadline;
                 let decision = policy.decide(&as_provider_error(&err), has_next);
-                if decision == FailoverDecision::Return {
-                    ctx.rate_limit_permit = hold.permit.take();
-                }
                 last_ctx = Some((ctx, started));
                 walk.last_error = Some(err);
                 if decision == FailoverDecision::Return {
@@ -2047,7 +2045,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
     }
 
     #[tokio::test]
-    async fn limiter_runs_before_budget_and_budget_denial_releases_permit() {
+    async fn limiter_runs_before_budget_reservation() {
         let limiter = Arc::new(InMemoryRateLimiter::new(1, 10));
         let held = limiter
             .acquire(&RateLimitKey {
@@ -2064,6 +2062,11 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         );
         let response = router(state).oneshot(chat_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let no_retry_after = response.headers().get("retry-after").is_none();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limited");
+        assert!(no_retry_after);
         assert!(budget.0.lock().unwrap().is_empty());
         drop(held);
     }
@@ -2079,6 +2082,9 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         for _ in 0..2 {
             let response = router(state.clone()).oneshot(chat_request()).await.unwrap();
             assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["type"], "budget_exceeded");
         }
     }
 

@@ -483,10 +483,10 @@ impl Default for BudgetConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RateLimitBackend {
+    /// Always admit. The default: no cap, no state.
     #[default]
-    #[serde(rename = "none")]
     None,
-    #[serde(rename = "in-memory")]
+    /// Per-replica in-flight holds and counters.
     InMemory,
 }
 
@@ -501,11 +501,13 @@ impl RateLimitBackend {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct RateLimitConfig {
+    /// Selects the inbound concurrency backend.
     #[serde(default)]
     pub backend: RateLimitBackend,
+    /// Maximum concurrent dispatches for one `(namespace, subject)` key.
     #[serde(default = "default_max_in_flight_per_subject")]
-    #[serde(alias = "max_in_flight", alias = "max_in_flight_per_key")]
     pub max_in_flight_per_subject: usize,
+    /// Maximum number of active caller keys retained by the in-memory backend.
     #[serde(default = "default_max_subjects")]
     pub max_subjects: usize,
 }

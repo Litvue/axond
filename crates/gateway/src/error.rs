@@ -5,7 +5,7 @@
 //! a 404 from a proxy is indistinguishable from a wrong `base_url`.
 
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use gateway_core::ProviderError;
 use gateway_transport::TransportError;
@@ -122,11 +122,12 @@ impl IntoResponse for GatewayError {
             }
         });
         let mut response = (status, Json(body)).into_response();
-        if let Some(seconds) = retry_after {
-            response.headers_mut().insert(
-                axum::http::header::RETRY_AFTER,
-                seconds.parse().expect("numeric retry-after"),
-            );
+        if let Some(seconds) = retry_after
+            && let Ok(value) = HeaderValue::from_str(&seconds)
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
         }
         response
     }

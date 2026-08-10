@@ -30,7 +30,9 @@ use crate::principals::{
     ConfigPrincipals, GatewayKeyEntry, Presented, PrincipalShapeError, PrincipalStoreChain,
     TokenVerifier, TokenVerifierBuildError,
 };
-use crate::rate_limit::{NoLimit, RateLimiter};
+#[cfg(test)]
+use crate::rate_limit::NoLimit;
+use crate::rate_limit::RateLimiter;
 use crate::usage::UsageFanout;
 
 pub use crate::principals::InboundKey;
@@ -237,7 +239,7 @@ impl ConfigSnapshot {
 impl AppState {
     /// Fails when a declared credential's or gateway key's env var is missing or
     /// empty — both are resolved at boot, not at request time.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new(
         config: Config,
         env: &HashMap<String, String>,
