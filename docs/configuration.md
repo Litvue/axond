@@ -332,8 +332,8 @@ leases; it is not an RPM/token-bucket limiter.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `backend` | `none` \| `in-memory` \| `redis` | `none` | Selects no-op, per-replica in-memory, or exact shared Redis leases. |
-| `max_in_flight_per_subject` | integer | `16` | Maximum concurrent dispatches for one authenticated caller. |
-| `max_subjects` | integer | `10000` | Maximum retained caller keys in the in-memory map. |
+| `max_in_flight_per_subject` | integer | `16` | Maximum concurrent dispatches for one authenticated caller. Must be nonzero when enabled. |
+| `max_subjects` | integer | `10000` | Maximum retained caller keys in the in-memory map. Must be nonzero when enabled. |
 | `dsn_env` | string | — | Name of the env var holding the Redis URL. If omitted, a Redis budget's `dsn_env` is reused explicitly. |
 | `key_prefix` | string | `axond:rate_limit` | Redis key namespace. |
 | `on_unavailable` | `deny` \| `allow` | `deny` | Redis outage policy. `deny` fails closed with `503 rate_limit_unavailable`; `allow` admits unenforced and warns. |

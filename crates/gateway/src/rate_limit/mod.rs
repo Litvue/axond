@@ -167,7 +167,7 @@ impl RateLimiter for InMemoryRateLimiter {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RateLimitBuildError {
-    #[error("rate-limit configuration failed: {message}")]
+    #[error("{message}")]
     Invalid { message: String },
     #[error("redis rate-limit backend: {0}")]
     Redis(#[from] ::redis::RedisError),
@@ -193,14 +193,14 @@ pub fn resolve_dsn_env<'a>(
         .as_deref()
         .filter(|name| !name.trim().is_empty())
         .or_else(|| {
-            (budget.backend == crate::config::BudgetBackend::Redis)
-                .then_some(
-                    budget
-                        .dsn_env
-                        .as_deref()
-                        .filter(|name| !name.trim().is_empty()),
-                )
-                .flatten()
+            if budget.backend == crate::config::BudgetBackend::Redis {
+                budget
+                    .dsn_env
+                    .as_deref()
+                    .filter(|name| !name.trim().is_empty())
+            } else {
+                None
+            }
         })
 }
 

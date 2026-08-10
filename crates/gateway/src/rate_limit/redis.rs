@@ -1,5 +1,6 @@
 //! Exact cross-replica in-flight concurrency leases in Redis.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -46,7 +47,7 @@ pub(crate) struct RedisRelease {
 
 impl RedisRelease {
     pub(crate) fn spawn(self) {
-        let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
             tracing::warn!("rate-limit permit dropped without a Tokio runtime; lease will expire");
             return;
         };
@@ -182,9 +183,20 @@ impl RateLimiter for RedisRateLimiter {
 
 fn next_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
+    // Lease ids are Redis hash fields, so they must be globally unique:
+    // another replica colliding here would overwrite a live lease and
+    // over-admit past the fleet-wide concurrency limit.
+    static EPOCH_MICROS: OnceLock<u64> = OnceLock::new();
+    let epoch_micros = *EPOCH_MICROS.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_micros() as u64)
+            .unwrap_or_default()
+    });
     format!(
-        "{:x}-{:x}",
-        now_ms(),
+        "{:x}-{:x}-{:x}",
+        epoch_micros,
+        std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     )
 }
@@ -200,6 +212,12 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::config::StoreUnavailable;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinHandle;
 
     fn key() -> RateLimitKey {
         RateLimitKey {
@@ -219,6 +237,91 @@ mod tests {
         )
         .await
         .expect("connect")
+    }
+
+    struct RedisRelay {
+        address: SocketAddr,
+        blackhole: Arc<AtomicBool>,
+        task: JoinHandle<()>,
+    }
+
+    impl RedisRelay {
+        async fn start(redis_url: &str) -> Self {
+            let target = redis_url
+                .strip_prefix("redis://")
+                .unwrap_or(redis_url)
+                .trim_end_matches('/')
+                .parse::<SocketAddr>()
+                .expect("AXOND_TEST_REDIS_URL must use a host:port Redis URL");
+            let listener = TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind relay");
+            let address = listener.local_addr().expect("relay address");
+            let blackhole = Arc::new(AtomicBool::new(false));
+            let relay_state = Arc::clone(&blackhole);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((client, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let state = Arc::clone(&relay_state);
+                    tokio::spawn(async move {
+                        let Ok(server) = TcpStream::connect(target).await else {
+                            return;
+                        };
+                        proxy(client, server, state).await;
+                    });
+                }
+            });
+            Self {
+                address,
+                blackhole,
+                task,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("redis://{}/", self.address)
+        }
+
+        fn set_blackhole(&self, blackhole: bool) {
+            self.blackhole.store(blackhole, Ordering::Release);
+        }
+    }
+
+    impl Drop for RedisRelay {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn proxy(client: TcpStream, server: TcpStream, blackhole: Arc<AtomicBool>) {
+        let (mut client_read, mut client_write) = client.into_split();
+        let (mut server_read, mut server_write) = server.into_split();
+        let mut client_buffer = [0_u8; 16 * 1024];
+        let mut server_buffer = [0_u8; 16 * 1024];
+        loop {
+            tokio::select! {
+                result = client_read.read(&mut client_buffer) => {
+                    let Ok(size) = result else { return };
+                    if size == 0 { return; }
+                    if !blackhole.load(Ordering::Acquire)
+                        && server_write.write_all(&client_buffer[..size]).await.is_err()
+                    {
+                        return;
+                    }
+                }
+                result = server_read.read(&mut server_buffer) => {
+                    let Ok(size) = result else { return };
+                    if size == 0 { return; }
+                    if !blackhole.load(Ordering::Acquire)
+                        && client_write.write_all(&server_buffer[..size]).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -244,6 +347,14 @@ mod tests {
             Err(RateLimitError::StoreUnavailable)
         ));
         assert!(unavailable(StoreUnavailable::Allow, "offline").is_ok());
+    }
+
+    #[test]
+    fn lease_ids_are_unique_within_a_process() {
+        let ids = (0..100)
+            .map(|_| next_id())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 100);
     }
 
     #[tokio::test]
@@ -287,6 +398,69 @@ mod tests {
             .acquire(&key())
             .await
             .expect("expired lease reclaimed");
+    }
+
+    #[tokio::test]
+    async fn unavailable_redis_denies_within_timeout_and_recovers() {
+        let Ok(url) = std::env::var("AXOND_TEST_REDIS_URL") else {
+            return;
+        };
+        let relay = RedisRelay::start(&url).await;
+        let timeout = Duration::from_millis(50);
+        let prefix = format!("axond:test:{}", next_id());
+        let deny = RedisRateLimiter::connect(
+            &relay.url(),
+            prefix.clone(),
+            1,
+            Duration::from_secs(5),
+            timeout,
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect deny limiter");
+        let allow = RedisRateLimiter::connect(
+            &relay.url(),
+            format!("axond:test:{}", next_id()),
+            1,
+            Duration::from_secs(5),
+            timeout,
+            StoreUnavailable::Allow,
+        )
+        .await
+        .expect("connect allow limiter");
+
+        relay.set_blackhole(true);
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            deny.acquire(&key()).await,
+            Err(RateLimitError::StoreUnavailable)
+        ));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= timeout,
+            "returned before operation timeout: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "unavailable acquire was not bounded: {elapsed:?}"
+        );
+        assert!(allow.acquire(&key()).await.is_ok());
+
+        relay.set_blackhole(false);
+        let recovered = RedisRateLimiter::connect(
+            &relay.url(),
+            prefix,
+            1,
+            Duration::from_secs(5),
+            timeout,
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect after relay restore");
+        recovered
+            .acquire(&key())
+            .await
+            .expect("limiter admitted after relay restore");
     }
 
     #[tokio::test]
