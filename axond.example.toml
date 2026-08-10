@@ -169,9 +169,10 @@ namespace = "acme"
 #
 # Keep at least one static `[[gateway_key]]`: minted verifiers do not replace
 # the operator's breakglass credential. Tier 0 verification is stateless and
-# has no Redis/Postgres runtime dependency. `scope`, `aliases`, and
-# `max_request_microdollars` are not currently enforced or emitted; do not
-# imply narrower authority by adding them to a token.
+# has no Redis/Postgres runtime dependency. `scope` and `aliases` are not
+# currently enforced or emitted. `max_request_microdollars` is enforced at
+# admission time against the pre-dispatch estimate and can be emitted by
+# `axond mint`.
 #
 # [gateway_token]
 # audience = "acme-production"

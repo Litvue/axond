@@ -183,6 +183,7 @@ impl ConfigSnapshot {
                     namespace: k.namespace.clone(),
                     subject: label.to_owned(),
                     signer_kid: None,
+                    max_request_microdollars: None,
                 },
             });
             gateway_key_fingerprints

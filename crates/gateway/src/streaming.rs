@@ -523,7 +523,7 @@ impl Drop for Accounting {
 
 /// Settlement outlives the request body, so it runs detached. Outside a
 /// runtime (process teardown) there is nothing left to settle onto.
-fn spawn_settlement<F>(future: F)
+pub(crate) fn spawn_settlement<F>(future: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
