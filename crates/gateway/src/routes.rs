@@ -481,7 +481,7 @@ async fn serve(
         && estimated_cost > ceiling
     {
         return Err(GatewayError::RequestCostCeilingExceeded {
-            subject: caller.subject.clone(),
+            alias: alias.clone(),
             estimated_microdollars: estimated_cost,
             ceiling_microdollars: ceiling,
         });
@@ -2028,6 +2028,37 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(body["error"]["type"], "request_cost_ceiling_exceeded");
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         assert!(budget.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_request_under_its_ceiling_still_reserves_and_dispatches() {
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let budget = RecordingBudget::default();
+        let state = budgeted_state(&base_url, Box::new(budget.clone()));
+        let snapshot = state.config();
+        let caller = InboundKey {
+            namespace: "platform".to_owned(),
+            subject: "ceiling-caller".to_owned(),
+            signer_kid: Some("test-kid".to_owned()),
+            max_request_microdollars: Some(10_000),
+        };
+        let body = json!({"model": "gpt-4o", "messages": []});
+
+        let response = serve(
+            state,
+            HeaderMap::new(),
+            body,
+            Route::ChatCompletions,
+            snapshot,
+            caller,
+        )
+        .await
+        .expect("the estimate is under the caller ceiling");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(hits.load(Ordering::SeqCst) > 0);
+        assert!(!budget.0.lock().unwrap().is_empty());
     }
 
     /// The reserved estimate is a ceiling, not the charge: a completed request

@@ -22,10 +22,10 @@ pub enum GatewayError {
     #[error("budget exceeded for model `{0}`")]
     BudgetExceeded(String),
     #[error(
-        "request cost ceiling exceeded for `{subject}`: estimated {estimated_microdollars} microdollars exceeds the per-request ceiling of {ceiling_microdollars} microdollars"
+        "request cost ceiling exceeded for model `{alias}`: estimated {estimated_microdollars} microdollars exceeds the per-request ceiling of {ceiling_microdollars} microdollars"
     )]
     RequestCostCeilingExceeded {
-        subject: String,
+        alias: String,
         estimated_microdollars: u64,
         ceiling_microdollars: u64,
     },
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn request_cost_ceiling_and_budget_errors_are_distinct() {
         let ceiling = GatewayError::RequestCostCeilingExceeded {
-            subject: "caller".to_owned(),
+            alias: "gpt-4o".to_owned(),
             estimated_microdollars: 11,
             ceiling_microdollars: 10,
         };

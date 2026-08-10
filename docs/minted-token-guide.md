@@ -199,6 +199,11 @@ The verifier requires these claims:
 five-second clock-skew allowance. Unknown claims are otherwise ignored by the
 current verifier.
 
+`max_request_microdollars` is an optional admission-time per-request ceiling
+in microdollars. The gateway compares it with the pre-dispatch estimate before
+reservation; a cumulative per-token cap is not stateless and belongs to the
+Tier 1 work in ADR 0017.
+
 ADR 0016 describes three narrowing claims: `scope` and `aliases` are not yet
 enforced by the current gateway or emitted by `axond mint` (see #60 and #61).
 `max_request_microdollars` is enforced at admission time against the

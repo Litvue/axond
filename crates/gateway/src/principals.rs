@@ -167,7 +167,6 @@ struct TokenClaims {
     jti: Option<String>,
     ns: Option<String>,
     sub: Option<String>,
-    #[serde(rename = "max_request_microdollars")]
     max_request_microdollars: Option<u64>,
 }
 
