@@ -15,6 +15,11 @@ Two rules hold everywhere:
   below refuses to start (or, on reload, is rejected while the previous config
   keeps serving).
 
+Loading order: the TOML file (`AXOND_CONFIG`, default `axond.toml`), then
+`AXOND_`-prefixed environment variables layered on top with `__` as the section
+separator (`AXOND_SERVER__BIND=0.0.0.0:9090`). The override layer is for scalars
+in containerized deploys; structure belongs in the file.
+
 ## State tiers
 
 State tiers describe the state backends axond itself depends on, not provider
@@ -42,11 +47,6 @@ credential pool. Even at Tier 2, a token verifier intersects token claims with
 config-owned namespace authority (ADR 0016). See
 [ADR 0017](./adr/0017-state-tiers-and-optional-backends.md) and the hermetic
 [Tier 0 gate](./adr/0018-tier-0-hermetic-boot-gate.md).
-
-Loading order: the TOML file (`AXOND_CONFIG`, default `axond.toml`), then
-`AXOND_`-prefixed environment variables layered on top with `__` as the section
-separator (`AXOND_SERVER__BIND=0.0.0.0:9090`). The override layer is for scalars
-in containerized deploys; structure belongs in the file.
 
 ## `[server]`
 
