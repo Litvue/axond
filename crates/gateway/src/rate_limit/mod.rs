@@ -170,7 +170,7 @@ pub enum RateLimitBuildError {
     #[error("{message}")]
     Invalid { message: String },
     #[error("redis rate-limit backend: {0}")]
-    Redis(#[from] ::redis::RedisError),
+    Redis(#[from] redis::RedisConnectError),
 }
 
 impl RateLimitBuildError {

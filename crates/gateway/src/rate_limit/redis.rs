@@ -7,6 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use redis::Script;
 use redis::aio::ConnectionManager;
+use ring::rand::{SecureRandom, SystemRandom};
+use thiserror::Error;
 
 use super::{PermitRelease, RateLimitError, RateLimitKey, RateLimitPermit, RateLimiter};
 use crate::config::StoreUnavailable;
@@ -82,6 +84,14 @@ pub struct RedisRateLimiter {
     release: Script,
 }
 
+#[derive(Debug, Error)]
+pub enum RedisConnectError {
+    #[error("Redis connection failed: {0}")]
+    Redis(#[from] redis::RedisError),
+    #[error("Redis connection timed out after {timeout:?}")]
+    Timeout { timeout: Duration },
+}
+
 impl RedisRateLimiter {
     pub async fn connect(
         url: &str,
@@ -90,12 +100,17 @@ impl RedisRateLimiter {
         lease_ttl: Duration,
         timeout: Duration,
         on_unavailable: StoreUnavailable,
-    ) -> Result<Self, redis::RedisError> {
+    ) -> Result<Self, RedisConnectError> {
         let client = redis::Client::open(url)?;
-        let mut connection = ConnectionManager::new(client).await?;
-        redis::cmd("PING")
-            .query_async::<String>(&mut connection)
-            .await?;
+        let connection = tokio::time::timeout(timeout, async {
+            let mut connection = ConnectionManager::new(client).await?;
+            redis::cmd("PING")
+                .query_async::<String>(&mut connection)
+                .await?;
+            Ok::<_, redis::RedisError>(connection)
+        })
+        .await
+        .map_err(|_| RedisConnectError::Timeout { timeout })??;
         Ok(Self {
             key_prefix,
             max_in_flight,
@@ -109,10 +124,17 @@ impl RedisRateLimiter {
     }
 
     fn key(&self, key: &RateLimitKey) -> String {
-        format!(
-            "{}:{{{}|{}}}:leases",
-            self.key_prefix, key.namespace, key.subject
-        )
+        lease_key(&self.key_prefix, key)
+    }
+
+    fn release(&self, key: String, lease_id: String) -> RedisRelease {
+        RedisRelease {
+            connection: self.connection.clone(),
+            script: self.release.clone(),
+            key,
+            lease_id,
+            timeout: self.timeout,
+        }
     }
 
     fn unavailable(
@@ -140,6 +162,28 @@ fn unavailable(
     }
 }
 
+fn lease_key(prefix: &str, key: &RateLimitKey) -> String {
+    format!(
+        "{prefix}:{{{}|{}}}:leases",
+        encode_component(&key.namespace),
+        encode_component(&key.subject)
+    )
+}
+
+fn encode_component(component: &str) -> String {
+    let mut encoded = String::with_capacity(component.len());
+    for character in component.chars() {
+        match character {
+            '%' => encoded.push_str("%25"),
+            '|' => encoded.push_str("%7C"),
+            '{' => encoded.push_str("%7B"),
+            '}' => encoded.push_str("%7D"),
+            _ => encoded.push(character),
+        }
+    }
+    encoded
+}
+
 #[async_trait]
 impl RateLimiter for RedisRateLimiter {
     fn name(&self) -> &'static str {
@@ -148,11 +192,12 @@ impl RateLimiter for RedisRateLimiter {
 
     async fn acquire(&self, key: &RateLimitKey) -> Result<RateLimitPermit, RateLimitError> {
         let lease_id = next_id();
+        let lease_key = self.key(key);
         let result = tokio::time::timeout(self.timeout, async {
             let mut connection = self.connection.clone();
             self.acquire
                 .prepare_invoke()
-                .key(self.key(key))
+                .key(&lease_key)
                 .arg(now_ms())
                 .arg(self.lease_ttl.as_millis() as u64)
                 .arg(self.max_in_flight)
@@ -163,26 +208,27 @@ impl RateLimiter for RedisRateLimiter {
         .await;
         match result {
             Ok(Ok(1)) => Ok(RateLimitPermit {
-                release: Some(PermitRelease::Redis(RedisRelease {
-                    connection: self.connection.clone(),
-                    script: self.release.clone(),
-                    key: self.key(key),
-                    lease_id,
-                    timeout: self.timeout,
-                })),
+                release: Some(PermitRelease::Redis(self.release(lease_key, lease_id))),
             }),
             Ok(Ok(_)) => {
                 metrics::record_rate_limit_denial();
                 Err(RateLimitError::Exceeded)
             }
-            Ok(Err(error)) => self.unavailable(error),
-            Err(_) => self.unavailable("operation timed out"),
+            Ok(Err(error)) => {
+                self.release(lease_key, lease_id).spawn();
+                self.unavailable(error)
+            }
+            Err(_) => {
+                self.release(lease_key, lease_id).spawn();
+                self.unavailable("operation timed out")
+            }
         }
     }
 }
 
 fn next_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
+    static RANDOM: OnceLock<u128> = OnceLock::new();
     // Lease ids are Redis hash fields, so they must be globally unique:
     // another replica colliding here would overwrite a live lease and
     // over-admit past the fleet-wide concurrency limit.
@@ -193,10 +239,18 @@ fn next_id() -> String {
             .map(|duration| duration.as_micros() as u64)
             .unwrap_or_default()
     });
+    let random = *RANDOM.get_or_init(|| {
+        let mut bytes = [0_u8; 16];
+        SystemRandom::new()
+            .fill(&mut bytes)
+            .expect("OS randomness unavailable");
+        u128::from_be_bytes(bytes)
+    });
     format!(
-        "{:x}-{:x}-{:x}",
+        "{:x}-{:x}-{:x}-{:x}",
         epoch_micros,
         std::process::id(),
+        random,
         COUNTER.fetch_add(1, Ordering::Relaxed)
     )
 }
@@ -242,6 +296,7 @@ mod tests {
     enum RelayMode {
         Forward,
         Blackhole,
+        StallResponses,
         Cut,
     }
 
@@ -324,7 +379,10 @@ mod tests {
                 result = client_read.read(&mut client_buffer) => {
                     let Ok(size) = result else { return };
                     if size == 0 { return; }
-                    if *mode.borrow() == RelayMode::Forward
+                    if matches!(
+                        *mode.borrow(),
+                        RelayMode::Forward | RelayMode::StallResponses
+                    )
                         && server_write.write_all(&client_buffer[..size]).await.is_err()
                     {
                         return;
@@ -353,10 +411,41 @@ mod tests {
 
     #[test]
     fn lease_key_uses_one_hash_tag() {
-        let key = format!("axond:rate_limit:{{{}|{}}}:leases", "acme", "subject");
+        let key = lease_key("axond:rate_limit", &key());
         let start = key.find('{').unwrap() + 1;
         let end = key.find('}').unwrap();
         assert_eq!(&key[start..end], "acme|subject");
+        assert_eq!(key, "axond:rate_limit:{acme|subject}:leases");
+    }
+
+    #[test]
+    fn lease_key_encoding_is_injective_and_preserves_one_hash_tag() {
+        let first = lease_key(
+            "axond:rate_limit",
+            &RateLimitKey {
+                namespace: "a|b".into(),
+                subject: "c".into(),
+            },
+        );
+        let second = lease_key(
+            "axond:rate_limit",
+            &RateLimitKey {
+                namespace: "a".into(),
+                subject: "b|c".into(),
+            },
+        );
+        assert_ne!(first, second);
+
+        let braces = lease_key(
+            "axond:rate_limit",
+            &RateLimitKey {
+                namespace: "a{b".into(),
+                subject: "c}d".into(),
+            },
+        );
+        assert_eq!(braces.matches('{').count(), 1);
+        assert_eq!(braces.matches('}').count(), 1);
+        assert!(braces.contains("{a%7Bb|c%7Dd}"));
     }
 
     #[test]
@@ -485,6 +574,40 @@ mod tests {
             recovered,
             "same limiter did not recover after relay forwarding was restored"
         );
+    }
+
+    #[tokio::test]
+    async fn timed_out_acquire_releases_an_ambiguous_redis_lease() {
+        let Ok(url) = std::env::var("AXOND_TEST_REDIS_URL") else {
+            return;
+        };
+        let relay = RedisRelay::start(&url).await;
+        let limiter = RedisRateLimiter::connect(
+            &relay.url(),
+            format!("axond:test:{}", next_id()),
+            1,
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect limiter");
+
+        relay.set_mode(RelayMode::StallResponses);
+        assert!(matches!(
+            limiter.acquire(&key()).await,
+            Err(RateLimitError::StoreUnavailable)
+        ));
+        relay.set_mode(RelayMode::Forward);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if limiter.acquire(&key()).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed-out acquire left a lease consuming the subject slot");
     }
 
     #[tokio::test]
