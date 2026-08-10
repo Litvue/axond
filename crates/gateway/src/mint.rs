@@ -20,6 +20,7 @@ use serde::Serialize;
 
 use crate::aliases::AliasScope;
 use crate::config::{Config, GatewayVerifierAlgorithm, MAX_GATEWAY_VERIFIER_TTL_SECONDS};
+use crate::principals::Capability;
 
 #[derive(Debug, Serialize)]
 struct MintClaims {
@@ -33,6 +34,8 @@ struct MintClaims {
     aliases: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_request_microdollars: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -117,6 +120,17 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
     }
 
     let ttl = parse_duration(required(args, "ttl")?)?;
+    let scope = args
+        .get_many::<String>("scope")
+        .map(|values| {
+            values
+                .map(|value| {
+                    Capability::parse(value)
+                        .ok_or_else(|| anyhow::anyhow!("unknown scope capability `{value}`"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
     let max_request_microdollars = args.get_one::<u64>("max-request-microdollars").copied();
     let policy_ceiling = Duration::from_secs(MAX_GATEWAY_VERIFIER_TTL_SECONDS);
     if ttl.is_zero() {
@@ -182,6 +196,7 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
         ttl,
         aliases,
         max_request_microdollars,
+        scope,
     })
 }
 
@@ -195,6 +210,7 @@ struct MintRequest<'a> {
     ttl: Duration,
     aliases: Option<Vec<String>>,
     max_request_microdollars: Option<u64>,
+    scope: Option<Vec<Capability>>,
 }
 
 fn mint_token(request: MintRequest<'_>) -> Result<String> {
@@ -208,6 +224,7 @@ fn mint_token(request: MintRequest<'_>) -> Result<String> {
         ttl,
         aliases,
         max_request_microdollars,
+        scope,
     } = request;
     let encoding_key = encoding_key(algorithm, key_material, kid)?;
     let now = unix_now()?;
@@ -220,6 +237,7 @@ fn mint_token(request: MintRequest<'_>) -> Result<String> {
         sub: subject.to_owned(),
         aliases,
         max_request_microdollars,
+        scope: scope.map(|values| values.into_iter().map(|value| value.to_string()).collect()),
     };
     let mut header = Header::new(algorithm.jwt());
     header.kid = Some(kid.to_owned());
@@ -493,6 +511,7 @@ max_ttl = "15m"
             ttl: Duration::from_secs(600),
             aliases: None,
             max_request_microdollars: None,
+            scope: None,
         })
         .unwrap();
         let principal = verifier
@@ -524,6 +543,7 @@ max_ttl = "15m"
             ttl: Duration::from_secs(600),
             aliases: None,
             max_request_microdollars: None,
+            scope: None,
         })
         .unwrap();
         let principal = verifier
@@ -558,6 +578,10 @@ max_ttl = "15m"
             "1s",
             "--audience",
             "configured-audience",
+            "--scope",
+            "chat",
+            "--scope",
+            "models",
             "--max-request-microdollars",
             "123",
         ]);
@@ -570,6 +594,9 @@ max_ttl = "15m"
         assert_eq!(principal.namespace, "acme");
         assert_eq!(principal.subject, "caller");
         assert_eq!(principal.signer_kid.as_deref(), Some("hs-kid"));
+        let scope = principal.scope.expect("scope claim");
+        assert!(scope.contains(&Capability::Chat));
+        assert!(scope.contains(&Capability::Models));
         assert_eq!(principal.max_request_microdollars, Some(123));
     }
 
@@ -592,6 +619,7 @@ max_ttl = "15m"
             ttl: Duration::from_secs(600),
             aliases: None,
             max_request_microdollars: None,
+            scope: None,
         })
         .unwrap();
         let principal = verifier
@@ -635,6 +663,7 @@ max_ttl = "15m"
             ttl: Duration::from_secs(600),
             aliases: None,
             max_request_microdollars: None,
+            scope: None,
         })
         .unwrap();
         let principal = verifier
@@ -849,6 +878,32 @@ max_ttl = "15m"
     }
 
     #[test]
+    fn mint_rejects_unknown_scope_capability() {
+        let args = mint_args(&[
+            "--kid",
+            "hs-kid",
+            "--alg",
+            "HS256",
+            "--key-env",
+            "HS_SECRET",
+            "--namespace",
+            "acme",
+            "--subject",
+            "caller",
+            "--ttl",
+            "10m",
+            "--audience",
+            "configured-audience",
+            "--scope",
+            "typo",
+        ]);
+        let error = mint_from_args(&args, None, "01234567890123456789012345678901")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown scope capability"));
+    }
+
+    #[test]
     fn parse_duration_supports_common_units() {
         assert_eq!(parse_duration("15m").unwrap(), Duration::from_secs(900));
         assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
@@ -874,6 +929,7 @@ max_ttl = "15m"
             ttl: Duration::from_secs(600),
             aliases: None,
             max_request_microdollars: None,
+            scope: None,
         })
         .unwrap();
         assert!(matches!(

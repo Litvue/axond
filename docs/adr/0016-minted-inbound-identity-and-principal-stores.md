@@ -125,12 +125,13 @@ mint successfully against the policy ceiling and then be rejected by the
 gateway if it exceeds the configured `max_ttl`.
 
 The current minter emits only claims the verifier enforces. It deliberately
-does not emit `scope` until the corresponding authorization control exists;
-an unenforced narrowing claim would create a misleading credential. The
-`aliases` claim is enforced at dispatch and in the `/v1/models` view, and is
-emitted by `axond mint --alias`. `max_request_microdollars` is enforced at
-admission time: the gateway compares it with the pre-dispatch estimate before
-the budget reservation and rejects an over-ceiling request with typed 403
+emits both narrowing claims because both authorization controls exist: `scope`
+capabilities are enforced as described in ADR 0019 and may be emitted by
+`axond mint`, while `aliases` is enforced at dispatch and in the `/v1/models`
+view and is emitted by `axond mint --alias`. `max_request_microdollars` is
+enforced at admission time only: the gateway compares it with the pre-dispatch
+estimate immediately before the budget reservation, and rejects an over-ceiling
+request with a typed 403
 `request_cost_ceiling_exceeded`, distinct from the 429 `budget_exceeded`
 tenant cumulative cap in ADR 0010. It is emitted by `axond mint`; the
 reservation and settlement policy is unchanged, so actual usage above the

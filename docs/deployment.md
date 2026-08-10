@@ -195,6 +195,11 @@ process environment. Nothing in the config file is ever a secret value.
 | `GET /readyz` | none | `ready` once the process is serving. |
 | `GET /v1/models` | gateway key | The alias catalogue (names only), scoped to the caller's namespace — only aliases whose targets the caller holds a credential for. |
 
+Minted callers may additionally carry repeatable `--scope` capabilities
+(`chat`, `messages`, `embeddings`, or `models`). Scope only narrows the derived
+namespace authority; denial is `403 token_scope_insufficient`. Static keys and
+scope-less tokens are unaffected. `/v1/responses` remains a typed `501`.
+
 Both probes report process liveness. `/readyz` does **not** currently probe the
 usage sink, the budget store, or any provider — it answers `ready` whenever the
 listener is up. That is deliberate rather than aspirational: the dependencies it
