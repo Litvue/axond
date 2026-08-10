@@ -193,7 +193,7 @@ A reload re-runs the full boot validation against the current file, current
 process environment, and referenced key-material files; a bad candidate is
 rejected and the running config keeps serving. Replacing file contents in place
 or via an atomic rename is therefore reload-reachable without a process
-restart. `[server] bind`, `[[usage_sink]]`, and `[budget]`
+restart. `[server] bind`, `[[usage_sink]]`, `[budget]`, and `[rate_limit]`
 changes warn and are ignored until restart; this includes
 `limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
 

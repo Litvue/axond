@@ -12,10 +12,10 @@
 //!
 //! Not everything a config file describes can be replaced in a live process.
 //! The listening socket is already bound, the usage sinks already own
-//! connections and flush tasks, and the budget store already owns its
-//! reservations, so changes to `[server] bind`, `[[usage_sink]]`, and
-//! `[budget]` (including `limit_microdollars`) are reported and ignored until
-//! the next restart.
+//! connections and flush tasks, and the budget store and rate limiter already
+//! own their state, so changes to `[server] bind`, `[[usage_sink]]`, `[budget]`
+//! (including `limit_microdollars`), and `[rate_limit]` are reported and
+//! ignored until the next restart.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::config::{BudgetConfig, Config, ConfigError, Reload, UsageSinkConfig};
+use crate::config::{BudgetConfig, Config, ConfigError, RateLimitConfig, Reload, UsageSinkConfig};
 use crate::state::{AppState, ConfigSnapshot, SnapshotError};
 use crate::telemetry;
 
@@ -47,6 +47,7 @@ struct Boot {
     bind: SocketAddr,
     usage_sink: Vec<UsageSinkConfig>,
     budget: BudgetConfig,
+    rate_limit: RateLimitConfig,
 }
 
 /// Owns the config path and the state whose snapshot it replaces.
@@ -70,6 +71,7 @@ impl Reloader {
                 bind: booted.config.server.bind,
                 usage_sink: booted.config.usage_sink.clone(),
                 budget: booted.config.budget.clone(),
+                rate_limit: booted.config.rate_limit,
             },
             path,
             state,
@@ -205,6 +207,8 @@ pub struct ReloadSummary {
     pub usage_sinks_changed: bool,
     /// `[budget]` differs from the booted store configuration.
     pub budget_changed: bool,
+    /// `[rate_limit]` differs from the booted limiter configuration.
+    pub rate_limit_changed: bool,
 }
 
 /// The added and removed identifiers of one config collection.
@@ -315,6 +319,7 @@ impl ReloadSummary {
             bind_changed: boot.bind != after_config.server.bind,
             usage_sinks_changed: boot.usage_sink != after_config.usage_sink,
             budget_changed: boot.budget != after_config.budget,
+            rate_limit_changed: boot.rate_limit != after_config.rate_limit,
         }
     }
 
@@ -343,6 +348,7 @@ impl ReloadSummary {
             gateway_key_fingerprints = ?self.gateway_key_fingerprints,
             gateway_verifier_fingerprints = ?self.gateway_verifier_fingerprints,
             budget_changed = self.budget_changed,
+            rate_limit_changed = self.rate_limit_changed,
             changed = !self.is_empty(),
             "config reloaded"
         );
@@ -359,6 +365,11 @@ impl ReloadSummary {
         if self.budget_changed {
             tracing::warn!(
                 "`[budget]` changed, but the budget store is already serving; restart to apply it"
+            );
+        }
+        if self.rate_limit_changed {
+            tracing::warn!(
+                "`[rate_limit]` changed, but the limiter is already serving; restart to apply it"
             );
         }
     }
@@ -1057,6 +1068,28 @@ default = true
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
             .expect("budget removal is valid");
         assert!(!summary.budget_changed);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_changes_are_reported_as_restart_required() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+
+        file.rewrite(&format!(
+            "{PLATFORM_ONLY}\n[rate_limit]\nbackend = \"in-memory\"\nmax_in_flight_per_subject = 3\nmax_subjects = 32\n"
+        ));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("rate limit candidate is valid");
+        assert!(summary.rate_limit_changed);
+        assert!(summary.is_empty());
+
+        file.rewrite(PLATFORM_ONLY);
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("rate limit removal is valid");
+        assert!(!summary.rate_limit_changed);
     }
 
     /// Both triggers share one view of what has been acted on, so the watcher
