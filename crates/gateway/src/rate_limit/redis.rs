@@ -106,6 +106,13 @@ impl RedisRelease {
                         Self::invoke(&self.script, &self.key, &self.lease_id, &mut connection),
                     )
                     .await;
+                    if result.is_err() {
+                        // Cancelling a multiplexed response can desynchronize
+                        // reply alignment. Escalate only this snapshot's
+                        // generation; the next acquire owns replacement.
+                        self.suspect_generation
+                            .fetch_max(shared_generation, Ordering::AcqRel);
+                    }
                     if matches!(result, Ok(Ok(_))) {
                         let current = self.current_connection.load_full();
                         if current.generation == shared_generation
@@ -436,10 +443,9 @@ impl RateLimiter for RedisRateLimiter {
         })
         .await;
         let current_generation = self.connection.load_full().generation;
-        if matches!(result, Ok(Ok(1)))
-            && (connection_generation != current_generation
-                || self.suspect_generation.load(Ordering::Acquire) >= connection_generation)
-        {
+        let result_untrusted = connection_generation != current_generation
+            || self.suspect_generation.load(Ordering::Acquire) >= connection_generation;
+        if result_untrusted && matches!(result, Ok(Ok(_))) {
             self.release(lease_key, lease_id).spawn();
             return self.unavailable("shared Redis connection was replaced during acquire");
         }
@@ -750,6 +756,7 @@ mod tests {
         releases: Arc<AtomicUsize>,
         acquire_result: Arc<AtomicI64>,
         acquire_delay_ms: Arc<AtomicU64>,
+        release_delay_ms: Arc<AtomicU64>,
         task: JoinHandle<()>,
     }
 
@@ -764,12 +771,14 @@ mod tests {
             let releases = Arc::new(AtomicUsize::new(0));
             let acquire_result = Arc::new(AtomicI64::new(1));
             let acquire_delay_ms = Arc::new(AtomicU64::new(0));
+            let release_delay_ms = Arc::new(AtomicU64::new(0));
             let task = {
                 let connections = connections.clone();
                 let acquires = acquires.clone();
                 let releases = releases.clone();
                 let acquire_result = acquire_result.clone();
                 let acquire_delay_ms = acquire_delay_ms.clone();
+                let release_delay_ms = release_delay_ms.clone();
                 tokio::spawn(async move {
                     loop {
                         let Ok((stream, _)) = listener.accept().await else {
@@ -782,6 +791,7 @@ mod tests {
                             releases.clone(),
                             acquire_result.clone(),
                             acquire_delay_ms.clone(),
+                            release_delay_ms.clone(),
                         ));
                     }
                 })
@@ -793,6 +803,7 @@ mod tests {
                 releases,
                 acquire_result,
                 acquire_delay_ms,
+                release_delay_ms,
                 task,
             }
         }
@@ -809,6 +820,11 @@ mod tests {
             self.acquire_delay_ms
                 .store(delay.as_millis() as u64, Ordering::Relaxed);
         }
+
+        fn set_release_delay(&self, delay: Duration) {
+            self.release_delay_ms
+                .store(delay.as_millis() as u64, Ordering::Relaxed);
+        }
     }
 
     impl Drop for RedisLiveStub {
@@ -823,6 +839,7 @@ mod tests {
         releases: Arc<AtomicUsize>,
         acquire_result: Arc<AtomicI64>,
         acquire_delay_ms: Arc<AtomicU64>,
+        release_delay_ms: Arc<AtomicU64>,
     ) {
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
@@ -852,6 +869,10 @@ mod tests {
                 format!(":{}\r\n", acquire_result.load(Ordering::Relaxed)).into_bytes()
             } else if name.eq_ignore_ascii_case(b"EVALSHA") {
                 releases.fetch_add(1, Ordering::Relaxed);
+                let delay = release_delay_ms.load(Ordering::Relaxed);
+                if delay != 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
                 b":1\r\n".to_vec()
             } else {
                 b"+OK\r\n".to_vec()
@@ -1242,7 +1263,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn denial_during_replacement_stays_a_denial_when_unavailable_allows() {
+    /// An unattributable acquire result is unknown, so `allow` may fail open
+    /// rather than turning an untrusted denial into a hard 429.
+    async fn unattributable_denial_during_replacement_fails_open_when_allowed() {
         let stub = RedisLiveStub::start().await;
         let limiter = Arc::new(
             RedisRateLimiter::connect(
@@ -1276,10 +1299,10 @@ mod tests {
         let generation = limiter.connection.load_full().generation;
         limiter.mark_connection_suspect(generation);
 
-        assert!(matches!(
-            acquire.await.expect("acquire task"),
-            Err(RateLimitError::Exceeded)
-        ));
+        assert!(
+            acquire.await.expect("acquire task").is_ok(),
+            "an unattributable result did not follow the unavailable allow policy"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1323,6 +1346,39 @@ mod tests {
             stub.connections.load(Ordering::Relaxed),
             connections_after_swap,
             "release fell through to a fresh connection despite a healthy current manager"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_shared_release_marks_its_generation_suspect() {
+        let stub = RedisLiveStub::start().await;
+        let limiter = RedisRateLimiter::connect(
+            &stub.url(),
+            format!("axond:test:{}", next_id()),
+            1,
+            Duration::from_secs(5),
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect limiter");
+        let permit = limiter.acquire(&key()).await.expect("acquire permit");
+        let generation = limiter.connection.load_full().generation;
+        stub.set_release_delay(Duration::from_millis(100));
+        drop(permit);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        while limiter.suspect_generation.load(Ordering::Acquire) < generation {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cancelled shared release did not retire its generation"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            limiter.suspect_generation.load(Ordering::Acquire),
+            generation
         );
     }
 

@@ -174,6 +174,8 @@ queued, while the attempt count and deadline bound the effort. Lease expiry
 remains the final backstop.
 
 A cancelled response wait can poison a multiplexed connection's reply
-alignment, so the limiter retires a shared connection after any operation
-timeout and refuses new admissions while a bounded replacement is in flight;
-requests do not wait for recovery, and the existing unavailable policy applies.
+alignment, so the limiter retires that generation after any acquire or
+compensating-release timeout and refuses new admissions while a bounded
+replacement is in flight. Results from a retired generation are unknown, so
+the existing unavailable policy applies rather than trusting an admission or
+denial.
