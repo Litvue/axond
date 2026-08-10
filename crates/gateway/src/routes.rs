@@ -916,9 +916,8 @@ struct BudgetHold {
 }
 
 /// A buffered request's reservation must be reconciled even when its handler is
-/// dropped while the upstream request is in flight. The streaming path gets the
-/// same guarantee from its streaming accounting guard, but its relay owns additional
-/// usage state that does not belong on this small buffered-path guard.
+/// dropped while the upstream request is in flight. Streaming `Accounting`
+/// covers cancellation once the relay exists; this guard covers the buffered path.
 struct BudgetReservation {
     state: AppState,
     key: BudgetKey,
