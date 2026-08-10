@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -85,6 +85,10 @@ pub enum TokenVerificationError {
     UnknownNamespace { namespace: String },
     #[error("verifier `{kid}` is not permitted for namespace `{namespace}`")]
     SignerNotPermitted { kid: String, namespace: String },
+    #[error(
+        "token for namespace `{namespace}` and subject `{subject}` was issued before its revocation epoch"
+    )]
+    IssuedBeforeEpoch { namespace: String, subject: String },
 }
 
 impl TokenVerificationError {
@@ -101,6 +105,7 @@ impl TokenVerificationError {
             Self::InvalidLifetime { .. } => "token_invalid_lifetime",
             Self::UnknownNamespace { .. } => "token_unknown_namespace",
             Self::SignerNotPermitted { .. } => "token_signer_not_permitted",
+            Self::IssuedBeforeEpoch { .. } => "token_issued_before_epoch",
         }
     }
 }
@@ -157,6 +162,7 @@ pub struct TokenVerifier {
     audience: String,
     namespaces: HashSet<String>,
     verifiers: Vec<ResolvedVerifier>,
+    epochs: HashMap<(String, Option<String>), u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,6 +192,16 @@ impl TokenVerifier {
             .namespace
             .iter()
             .map(|namespace| namespace.id.clone())
+            .collect();
+        let epochs = config
+            .gateway_token_epoch
+            .iter()
+            .map(|epoch| {
+                (
+                    (epoch.namespace.clone(), epoch.subject.clone()),
+                    epoch.min_iat,
+                )
+            })
             .collect();
         let mut verifiers = Vec::with_capacity(config.gateway_verifier.len());
         for verifier in &config.gateway_verifier {
@@ -291,6 +307,7 @@ impl TokenVerifier {
             audience,
             namespaces,
             verifiers,
+            epochs,
         }))
     }
 
@@ -423,6 +440,15 @@ impl PrincipalStore for TokenVerifier {
                 claim: "sub".to_owned(),
             }),
         )?;
+        let epoch = self
+            .epochs
+            .get(&(namespace.clone(), Some(subject.clone())))
+            .or_else(|| self.epochs.get(&(namespace.clone(), None)));
+        if epoch.is_some_and(|min_iat| iat < *min_iat) {
+            return Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::IssuedBeforeEpoch { namespace, subject },
+            ));
+        }
         Ok(Some(InboundKey {
             namespace,
             subject,
@@ -1244,6 +1270,95 @@ max_ttl = "15m"
                 TokenVerificationError::NotYetValid
             ))
         ));
+    }
+
+    /// Namespace epochs reject older issuance times, preserve the exact
+    /// boundary, and let a subject-specific entry override the namespace-wide
+    /// policy.
+    #[tokio::test]
+    async fn token_verifier_enforces_most_specific_issuance_epochs() {
+        let now = unix_now();
+        let namespace_epoch = now - 100;
+        let subject_epoch = now - 200;
+        let config = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_key]]
+env = "STATIC_KEY"
+namespace = "platform"
+
+[gateway_token]
+audience = "test-audience"
+
+[[gateway_verifier]]
+kid = "ed-test"
+alg = "EdDSA"
+env = "ED_PUBLIC"
+namespaces = ["platform"]
+max_ttl = "15m"
+
+[[gateway_token_epoch]]
+namespace = "platform"
+min_iat = {namespace_epoch}
+
+[[gateway_token_epoch]]
+namespace = "platform"
+subject = "spared"
+min_iat = {subject_epoch}
+"#,
+        ))
+        .expect("epoch verifier config");
+        let env = HashMap::from([
+            ("STATIC_KEY".to_owned(), "static-secret".to_owned()),
+            ("ED_PUBLIC".to_owned(), BASE64.encode(ED_PUBLIC_RAW)),
+        ]);
+        let verifier = TokenVerifier::build(&config, &env)
+            .expect("test verifier builds")
+            .expect("verifier is configured");
+
+        let mut rejected = valid_claims_for("platform");
+        rejected.iat = Some(namespace_epoch - 1);
+        rejected.exp = Some(namespace_epoch - 1 + 899);
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(rejected),
+                })
+                .await,
+            Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::IssuedBeforeEpoch { .. }
+            ))
+        ));
+
+        let mut boundary = valid_claims_for("platform");
+        boundary.iat = Some(namespace_epoch);
+        boundary.exp = Some(namespace_epoch + 900);
+        assert!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(boundary),
+                })
+                .await
+                .expect("boundary token resolves")
+                .is_some()
+        );
+
+        let mut spared = valid_claims_for("platform");
+        spared.sub = Some("spared".to_owned());
+        spared.iat = Some(subject_epoch + 1);
+        spared.exp = Some(subject_epoch + 1 + 900);
+        assert!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(spared),
+                })
+                .await
+                .expect("subject override resolves")
+                .is_some()
+        );
     }
 
     #[test]

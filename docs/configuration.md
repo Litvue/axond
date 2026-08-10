@@ -182,6 +182,24 @@ signature on every token. At least one static `[[gateway_key]]` remains
 mandatory as breakglass access. See the [minted identity guide](./minted-token-guide.md)
 for the new-`kid` rotation procedure and the Tier 0/Tier 1 revocation boundary.
 
+## `[[gateway_token_epoch]]` — minted-token issuance revocation (optional)
+
+An issuance epoch invalidates minted tokens whose `iat` is earlier than the
+configured instant. It is applied when the config is reloaded, so changing an
+epoch and sending `SIGHUP` revokes matching tokens without a restart.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `namespace` | string | — | Declared namespace whose minted tokens are affected. Required. |
+| `subject` | string | omitted | Optional subject-specific override. If present, this entry is the only epoch used for that subject; otherwise the namespace-wide entry applies. |
+| `min_iat` | integer or RFC 3339 UTC string | — | Earliest accepted token issuance time, as Unix seconds or a timestamp such as `2026-08-10T12:00:00Z`. Required. |
+
+Entries must use declared namespaces and may not duplicate a
+`(namespace, subject)` pair. A namespace-wide epoch cannot spare one subject;
+use a per-subject entry with an earlier epoch when that exception is needed.
+Epochs affect minted `axt1.` tokens only. Static `[[gateway_key]]` credentials
+remain valid.
+
 ## `[reload]`
 
 | Key | Type | Default | Meaning |
