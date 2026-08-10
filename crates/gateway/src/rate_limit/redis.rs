@@ -56,6 +56,7 @@ pub(crate) struct RedisRelease {
     lease_id: String,
     timeout: Duration,
     lease_ttl: Duration,
+    retry_semaphore: &'static Semaphore,
 }
 
 impl RedisRelease {
@@ -89,7 +90,7 @@ impl RedisRelease {
                 tracing::debug!("rate-limit lease release failed; retrying on a fresh connection");
             }
 
-            let Some(_retry_permit) = try_release_retry_permit(release_retry_semaphore()) else {
+            let Some(_retry_permit) = try_release_retry_permit(self.retry_semaphore) else {
                 tracing::debug!("rate-limit lease release retry limit reached; lease will expire");
                 return;
             };
@@ -173,6 +174,7 @@ pub struct RedisRateLimiter {
     client: Client,
     acquire: Script,
     release: Script,
+    retry_semaphore: &'static Semaphore,
 }
 
 #[derive(Debug, Error)]
@@ -216,6 +218,7 @@ impl RedisRateLimiter {
             client: release_client,
             acquire: Script::new(ACQUIRE),
             release: Script::new(RELEASE),
+            retry_semaphore: release_retry_semaphore(),
         })
     }
 
@@ -232,6 +235,7 @@ impl RedisRateLimiter {
             lease_id,
             timeout: self.timeout,
             lease_ttl: self.lease_ttl,
+            retry_semaphore: self.retry_semaphore,
         }
     }
 
@@ -983,6 +987,35 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("compensating release was not observed on a fresh connection");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_release_gives_up_when_retry_semaphore_is_exhausted() {
+        static NO_RETRY_SEMAPHORE: Semaphore = Semaphore::const_new(0);
+
+        let stub = RedisRetryStub::start().await;
+        let timeout = Duration::from_millis(40);
+        let mut limiter = RedisRateLimiter::connect(
+            &stub.url(),
+            format!("axond:test:{}", next_id()),
+            1,
+            Duration::from_secs(5),
+            timeout,
+            timeout,
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect limiter");
+        limiter.retry_semaphore = &NO_RETRY_SEMAPHORE;
+
+        assert!(matches!(
+            limiter.acquire(&key()).await,
+            Err(RateLimitError::StoreUnavailable)
+        ));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(stub.connections.load(Ordering::Relaxed), 1);
+        assert!(stub.released_lease.lock().unwrap().is_none());
     }
 
     #[test]
