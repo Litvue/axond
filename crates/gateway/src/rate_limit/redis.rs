@@ -33,11 +33,11 @@ for i = 1, #leases, 2 do
   end
 end
 if live >= max then
-  return 0
+  return {0, lease_id}
 end
 redis.call('HSET', KEYS[1], lease_id, now + ttl_ms)
 redis.call('PEXPIRE', KEYS[1], ttl_ms * 2)
-return 1
+return {1, lease_id}
 "#;
 
 const RELEASE: &str = "redis.call('HDEL', KEYS[1], ARGV[1]); return 1";
@@ -215,25 +215,42 @@ impl SharedRecovery {
     }
 }
 
-fn result_is_untrusted(recovery: &SharedRecovery, generation: u64, receiver_closed: bool) -> bool {
+fn result_is_untrusted(recovery: &SharedRecovery, generation: u64) -> bool {
     let current_generation = recovery.connection.load_full().generation;
-    receiver_closed
-        || generation != current_generation
+    generation != current_generation
         || recovery.suspect_generation.load(Ordering::Acquire) >= generation
 }
 
 fn compensate_abandoned_result(result: &OwnedAcquireResult, result_untrusted: bool) -> bool {
-    matches!(result, Ok(Ok(1))) || (result_untrusted && matches!(result, Ok(Ok(_))))
+    matches!(result, Ok(Ok((1, _)))) || (result_untrusted && matches!(result, Ok(Ok(_))))
 }
 
-fn should_compensate_acquire_result(
-    result: Option<&OwnedAcquireResult>,
-    result_untrusted: bool,
-    sender_disconnected: bool,
+fn result_has_mismatched_lease_id(result: &OwnedAcquireResult, lease_id: &str) -> bool {
+    matches!(result, Ok(Ok((_, echoed_lease_id))) if echoed_lease_id != lease_id)
+}
+
+fn mark_mismatched_result(
+    recovery: &SharedRecovery,
+    generation: u64,
+    result: &OwnedAcquireResult,
+    lease_id: &str,
 ) -> bool {
-    result
-        .map(|result| compensate_abandoned_result(result, result_untrusted))
-        .unwrap_or(sender_disconnected)
+    if !result_has_mismatched_lease_id(result, lease_id) {
+        return false;
+    }
+    recovery
+        .suspect_generation
+        .fetch_max(generation, Ordering::AcqRel);
+    recovery.request_replacement();
+    true
+}
+
+fn should_compensate_abandoned_send(
+    result: &OwnedAcquireResult,
+    result_untrusted: bool,
+    send_failed: bool,
+) -> bool {
+    send_failed && compensate_abandoned_result(result, result_untrusted)
 }
 
 #[derive(Clone)]
@@ -410,7 +427,7 @@ fn invoke_timeout(admission_timeout: Duration) -> Duration {
         .max(INVOKE_TIMEOUT_FLOOR)
 }
 
-type OwnedAcquireResult = Result<redis::RedisResult<i64>, tokio::time::error::Elapsed>;
+type OwnedAcquireResult = Result<redis::RedisResult<(i64, String)>, tokio::time::error::Elapsed>;
 
 struct TimedOutAcquire {
     result: Option<OwnedAcquireResult>,
@@ -425,7 +442,7 @@ fn reclaim_timed_out_acquire(
 ) -> TimedOutAcquire {
     match receiver.try_recv() {
         Ok(result) => TimedOutAcquire {
-            compensate: matches!(result, Ok(Ok(1))),
+            compensate: matches!(result, Ok(Ok((1, _)))),
             result: Some(result),
         },
         Err(oneshot::error::TryRecvError::Empty) => {
@@ -433,7 +450,7 @@ fn reclaim_timed_out_acquire(
             receiver.close();
             match receiver.try_recv() {
                 Ok(result) => TimedOutAcquire {
-                    compensate: matches!(result, Ok(Ok(1))),
+                    compensate: matches!(result, Ok(Ok((1, _)))),
                     result: Some(result),
                 },
                 Err(oneshot::error::TryRecvError::Empty)
@@ -646,6 +663,7 @@ impl RateLimiter for RedisRateLimiter {
         let acquire = self.acquire.clone();
         let ttl = self.lease_ttl;
         let max_in_flight = self.max_in_flight;
+        let invoke_lease_id = lease_id.clone();
         // The caller's timeout is a latency budget; the owned invoke gets the
         // longer liveness budget so ordinary slow Redis responses do not
         // retire a healthy shared generation.
@@ -665,26 +683,25 @@ impl RateLimiter for RedisRateLimiter {
                     .arg(now_ms())
                     .arg(ttl.as_millis() as u64)
                     .arg(max_in_flight)
-                    .arg(&lease_id)
-                    .invoke_async::<i64>(&mut connection),
+                    .arg(&invoke_lease_id)
+                    .invoke_async::<(i64, String)>(&mut connection),
             )
             .await;
             if result.is_ok() {
                 invoke_guard.complete();
             }
             drop(invoke_guard);
-            let definite_denial = matches!(result, Ok(Ok(0)));
-            let definitely_created = matches!(result, Ok(Ok(1)));
+            let definite_denial = matches!(result, Ok(Ok((0, _))));
+            let definitely_created = matches!(result, Ok(Ok((1, _))));
             let ambiguous = !definite_denial && !definitely_created;
-            // Once the caller has closed the receiver, a successful reply is
-            // no longer attributable to that abandoned wait even if the
-            // generation has not yet been retired.
-            let result_untrusted =
-                result_is_untrusted(&recovery, connection_generation, sender.is_closed());
-            let compensate_on_send_failure = compensate_abandoned_result(&result, result_untrusted);
+            let result_untrusted = result_is_untrusted(&recovery, connection_generation);
+            let mismatched_lease_id =
+                mark_mismatched_result(&recovery, connection_generation, &result, &invoke_lease_id);
             if ambiguous {
                 abandoned_release.clone().spawn();
             }
+            let compensate_on_send_failure = mismatched_lease_id
+                || should_compensate_abandoned_send(&result, result_untrusted, true);
             if sender.send(result).is_err() && compensate_on_send_failure {
                 abandoned_release.spawn();
             }
@@ -695,10 +712,22 @@ impl RateLimiter for RedisRateLimiter {
             Err(_) => {
                 let reclaimed = reclaim_timed_out_acquire(&mut receiver, || {});
                 if let Some(result) = reclaimed.result {
+                    let mismatched_lease_id = mark_mismatched_result(
+                        &self.recovery,
+                        connection_generation,
+                        &result,
+                        &lease_id,
+                    );
+                    if mismatched_lease_id {
+                        self.mark_connection_suspect(connection_generation);
+                        release.spawn();
+                        return self
+                            .unavailable("shared Redis response echoed a different lease id");
+                    }
                     let result_untrusted =
-                        result_is_untrusted(&self.recovery, connection_generation, false);
+                        result_is_untrusted(&self.recovery, connection_generation);
                     let compensate = reclaimed.compensate
-                        || should_compensate_acquire_result(Some(&result), result_untrusted, false);
+                        || compensate_abandoned_result(&result, result_untrusted);
                     if compensate {
                         release.spawn();
                     }
@@ -707,7 +736,7 @@ impl RateLimiter for RedisRateLimiter {
                             .unavailable("shared Redis connection was replaced during acquire");
                     }
                     return match result {
-                        Ok(Ok(1)) => {
+                        Ok(Ok((1, _))) => {
                             self.unavailable("acquire completed after its caller wait expired")
                         }
                         Ok(Ok(_)) => {
@@ -718,19 +747,26 @@ impl RateLimiter for RedisRateLimiter {
                         Err(_) => self.unavailable("operation timed out"),
                     };
                 }
-                if reclaimed.compensate || should_compensate_acquire_result(None, false, false) {
+                if reclaimed.compensate {
                     release.spawn();
                 }
                 return self.unavailable("operation timed out");
             }
         };
-        let result_untrusted = result_is_untrusted(&self.recovery, connection_generation, false);
+        let result_untrusted = result_is_untrusted(&self.recovery, connection_generation);
+        let mismatched_lease_id =
+            matches!(&result, Ok(Ok(Ok(Ok((_, echoed_lease_id))))) if echoed_lease_id != &lease_id);
+        if mismatched_lease_id {
+            self.mark_connection_suspect(connection_generation);
+            release.spawn();
+            return self.unavailable("shared Redis response echoed a different lease id");
+        }
         if result_untrusted && matches!(result, Ok(Ok(Ok(Ok(_))))) {
             release.spawn();
             return self.unavailable("shared Redis connection was replaced during acquire");
         }
         match result {
-            Ok(Ok(Ok(Ok(1)))) => Ok(RateLimitPermit {
+            Ok(Ok(Ok(Ok((1, _))))) => Ok(RateLimitPermit {
                 release: Some(PermitRelease::Redis(Box::new(release))),
             }),
             Ok(Ok(Ok(Ok(_)))) => {
@@ -740,9 +776,9 @@ impl RateLimiter for RedisRateLimiter {
             Ok(Ok(Ok(Err(error)))) => self.unavailable(error),
             Ok(Ok(Err(_))) | Err(_) => self.unavailable("operation timed out"),
             Ok(Err(_)) => {
-                if should_compensate_acquire_result(None, false, true) {
-                    release.spawn();
-                }
+                // A dropped sender means the task is gone; its invoke may
+                // already have executed HSET, so no other path can clean up.
+                release.spawn();
                 self.unavailable("operation timed out")
             }
         }
@@ -1233,7 +1269,13 @@ mod tests {
                 if delay != 0 {
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
-                format!(":{result}\r\n").into_bytes()
+                let echoed_lease_id = command.get(7).cloned().unwrap_or_default();
+                format!(
+                    "*2\r\n:{result}\r\n${}\r\n{}\r\n",
+                    echoed_lease_id.len(),
+                    String::from_utf8_lossy(&echoed_lease_id)
+                )
+                .into_bytes()
             } else if name.eq_ignore_ascii_case(b"EVALSHA") {
                 releases.fetch_add(1, Ordering::Relaxed);
                 let delay = release_delay_ms.load(Ordering::Relaxed);
@@ -2198,11 +2240,31 @@ mod tests {
         assert!(try_release_retry_permit(&semaphore).is_some());
     }
 
-    #[test]
-    fn abandoned_zero_and_disconnected_results_follow_compensation_rule() {
-        let denial = Ok(Ok(0));
+    #[tokio::test]
+    async fn abandoned_zero_and_disconnected_results_follow_compensation_rule() {
+        let stub = RedisStub::start(true, false).await;
+        let limiter = RedisRateLimiter::connect(
+            &stub.url(),
+            "test".to_owned(),
+            1,
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect limiter");
+        let (sender, mut receiver) = oneshot::channel::<OwnedAcquireResult>();
+        receiver.close();
+        let denial = Ok(Ok((0, "test".to_owned())));
+        assert!(sender.send(Ok(Ok((0, "test".to_owned())))).is_err());
+        let result_untrusted = result_is_untrusted(&limiter.recovery, 1);
         assert!(
-            !compensate_abandoned_result(&denial, false),
+            !result_untrusted,
+            "a healthy current generation must remain trusted"
+        );
+        assert!(
+            !should_compensate_abandoned_send(&denial, result_untrusted, true),
             "a trusted definite denial proves no lease was created"
         );
         assert!(
@@ -2210,8 +2272,23 @@ mod tests {
             "a denial from a retired generation is unattributable and must compensate"
         );
         assert!(
-            should_compensate_acquire_result(None, false, true),
-            "a disconnected acquire task may have created a lease before disappearing"
+            !should_compensate_abandoned_send(&denial, false, true),
+            "a trusted denial sent to an abandoned wait must not compensate"
+        );
+        let mismatch = Ok(Ok((1, "someone-else".to_owned())));
+        assert!(mark_mismatched_result(
+            &limiter.recovery,
+            1,
+            &mismatch,
+            "ours"
+        ));
+        assert!(
+            limiter.suspect_generation.load(Ordering::Acquire) >= 1,
+            "a mismatched echo must retire the reply generation"
+        );
+        assert!(
+            compensate_abandoned_result(&mismatch, true),
+            "a mismatched grant must be compensated"
         );
     }
 
@@ -2222,7 +2299,7 @@ mod tests {
         assert!(!reclaimed.compensate);
         assert!(reclaimed.result.is_none());
         assert!(
-            sender.send(Ok(Ok(1))).is_err(),
+            sender.send(Ok(Ok((1, "test".to_owned())))).is_err(),
             "the in-flight sender must be stopped after the handoff closes the receiver"
         );
 
@@ -2235,11 +2312,11 @@ mod tests {
         let (sender, mut receiver) = oneshot::channel::<OwnedAcquireResult>();
         let reclaimed = reclaim_timed_out_acquire(&mut receiver, || {
             sender
-                .send(Ok(Ok(1)))
+                .send(Ok(Ok((1, "test".to_owned()))))
                 .expect("sender is alive between the two probes");
         });
         assert!(reclaimed.compensate);
-        assert!(matches!(&reclaimed.result, Some(Ok(Ok(1)))));
+        assert!(matches!(&reclaimed.result, Some(Ok(Ok((1, _))))));
         assert!(
             reclaimed.result.is_some(),
             "a grant sent in the probe/close window must be reclaimed"

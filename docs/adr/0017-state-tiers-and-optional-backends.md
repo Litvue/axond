@@ -188,20 +188,29 @@ releases use a separate, generous bounded retry budget derived from the
 configured admission timeout; the shared release attempt is bounded by the same
 budget before fresh-connection retries begin. Retirement starts replacement
 asynchronously and remains single-flight and generation-safe. The acquire
-handoff keeps its result receiver alive through the caller timeout, closes it,
-and drains any value sent in the timeout race window; a reclaimed successful
-lease is compensated by the caller, while the owning task compensates a late
+script returns both the verdict and the requested lease id. The caller compares
+the echoed id with its own: a match makes the verdict authoritative, so a
+matched `0` proves that no lease exists, while a mismatch proves response
+desynchronization. A mismatch marks the generation suspect, requests
+replacement, and compensates because the invoke may have created a lease whose
+response was delivered to another waiter. Existing generation checks remain in
+force for replies from retired or suspect connections. The acquire handoff
+keeps its result receiver alive through the caller timeout, closes it, and
+drains any value sent in the timeout race window; a reclaimed successful lease
+is compensated by the caller, while the owning task compensates a late
 successful send after the receiver closes. A disconnected handoff is
-unattributable and is compensated conservatively; only a definite `0` proves
-that no lease exists.
+compensated conservatively because the task may have executed HSET before
+disappearing.
 redis-rs 1.4.1's documented source default is
 `DEFAULT_RESPONSE_TIMEOUT = Some(Duration::from_millis(500))`
 (`src/client.rs`); axond disables it because that internal cancellation could
-drop a multiplexed waiter and misalign later replies. If an acquire outcome is
-unattributable, compensation assumes that a lease exists and cleans it up; only
-a definite `0` proves that no lease was created. When a response is lost, later
-replies can be delivered to the wrong waiter; an unattributable admission
-result is therefore unknown, not a denial.
+drop a multiplexed waiter and misalign later replies. If an acquire reply's
+echoed lease id mismatches, response desynchronization is proven rather than
+inferred: the generation is retired/replaced and the possibly-created lease is
+compensated. A matching echoed id makes the verdict authoritative, including a
+definite `0`, so denied requests do not perform wasteful compensation. Replies
+from retired or suspect generations remain untrusted even when their echoed id
+happens to match.
 The limiter refuses new admissions while a bounded replacement is in flight.
 Results from a retired generation are unknown, so the existing unavailable
 policy applies rather than trusting an admission or denial.
