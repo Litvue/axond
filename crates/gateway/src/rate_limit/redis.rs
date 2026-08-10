@@ -11,7 +11,7 @@ use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::{Client, Script};
 use ring::rand::{SecureRandom, SystemRandom};
 use thiserror::Error;
-use tokio::sync::{Semaphore, SemaphorePermit, oneshot};
+use tokio::sync::{Notify, Semaphore, SemaphorePermit, oneshot};
 
 use super::{PermitRelease, RateLimitError, RateLimitKey, RateLimitPermit, RateLimiter};
 use crate::config::StoreUnavailable;
@@ -49,7 +49,8 @@ const RELEASE_TIMEOUT_FLOOR: Duration = Duration::from_secs(1);
 const SHARED_CONNECTION_REPLACEMENT_COOLDOWN: Duration = Duration::from_millis(250);
 // A normal gateway replica can have hundreds of concurrent requests, but
 // refusing above 256 outstanding shared Redis invokes prevents a stalled
-// multiplexed socket from accumulating an unbounded task population.
+// multiplexed socket from accumulating an unbounded task population. Saturation
+// refuses only the current request; it is not evidence that the socket failed.
 const SHARED_INVOKE_CONCURRENCY: usize = 256;
 
 // Keep fresh-connection retries below a small fixed concurrency cap; the
@@ -68,6 +69,10 @@ struct SharedInvokeGuard {
     completed: bool,
 }
 
+// The caller owns only the result wait. An invoke deadline deliberately drops
+// the Redis future; this guard retires that generation before it can be reused.
+// Ordinary caller cancellation never reaches this guard because the invoke task
+// remains alive until its own deadline.
 impl SharedInvokeGuard {
     fn new(generation: u64, recovery: Arc<SharedRecovery>) -> Self {
         Self {
@@ -88,7 +93,7 @@ impl Drop for SharedInvokeGuard {
             self.recovery
                 .suspect_generation
                 .fetch_max(self.generation, Ordering::AcqRel);
-            self.recovery.schedule_replacement(self.generation);
+            self.recovery.request_replacement();
         }
     }
 }
@@ -101,9 +106,14 @@ struct SharedRecovery {
     replacement_in_flight: Arc<AtomicBool>,
     last_replacement_ms: Arc<AtomicU64>,
     invoke_semaphore: Arc<Semaphore>,
+    replacement_notify: Arc<Notify>,
 }
 
 impl SharedRecovery {
+    fn request_replacement(&self) {
+        self.replacement_notify.notify_one();
+    }
+
     fn schedule_replacement(&self, generation: u64) {
         let current = self.connection.load_full();
         if current.generation != generation
@@ -168,6 +178,14 @@ impl SharedRecovery {
             replacement_in_flight.store(false, Ordering::Release);
         });
     }
+
+    async fn replacement_worker(self: Arc<Self>) {
+        loop {
+            self.replacement_notify.notified().await;
+            let generation = self.connection.load_full().generation;
+            self.schedule_replacement(generation);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -220,12 +238,16 @@ impl RedisRelease {
                     {
                         let mut invoke_guard =
                             SharedInvokeGuard::new(shared_generation, self.recovery.clone());
-                        let result =
-                            Self::invoke(&self.script, &self.key, &self.lease_id, &mut connection)
-                                .await;
-                        invoke_guard.complete();
-                        drop(invoke_guard);
+                        let result = tokio::time::timeout(
+                            release_budget.min(remaining),
+                            Self::invoke(&self.script, &self.key, &self.lease_id, &mut connection),
+                        )
+                        .await;
                         if result.is_ok() {
+                            invoke_guard.complete();
+                        }
+                        drop(invoke_guard);
+                        if matches!(result, Ok(Ok(_))) {
                             let current = self.recovery.connection.load_full();
                             if current.generation == shared_generation
                                 && self.recovery.suspect_generation.load(Ordering::Acquire)
@@ -238,10 +260,6 @@ impl RedisRelease {
                             "rate-limit lease release failed; retrying on a fresh connection"
                         );
                     } else {
-                        self.recovery
-                            .suspect_generation
-                            .fetch_max(shared_generation, Ordering::AcqRel);
-                        self.recovery.schedule_replacement(shared_generation);
                         tracing::debug!(
                             "rate-limit shared release skipped because invoke cap was exhausted"
                         );
@@ -328,14 +346,18 @@ fn try_release_retry_permit(semaphore: &Semaphore) -> Option<SemaphorePermit<'_>
 fn release_timeout(admission_timeout: Duration) -> Duration {
     // Permit drops have no caller waiting on them, so tolerate four times the
     // configured admission budget, with a one-second floor for ordinary Redis
-    // HDEL latency. The lease TTL and retry deadline still bound total effort;
-    // a real stall beyond this per-attempt budget retires the generation.
+    // HDEL latency. This budget bounds both the shared attempt and each fresh
+    // retry; the retry deadline and lease TTL still bound total effort.
     admission_timeout
         .saturating_mul(RELEASE_TIMEOUT_MULTIPLIER)
         .max(RELEASE_TIMEOUT_FLOOR)
 }
 
 fn connection_manager_config() -> ConnectionManagerConfig {
+    // redis-rs 1.4.1 defaults response_timeout to Some(500 ms)
+    // (src/client.rs::DEFAULT_RESPONSE_TIMEOUT). Its internal cancellation
+    // can drop a multiplexed waiter and misalign later replies, so invoke
+    // tasks own the deadline and retire the generation if it expires.
     ConnectionManagerConfig::new().set_response_timeout(None)
 }
 
@@ -401,7 +423,9 @@ impl RedisRateLimiter {
             replacement_in_flight: replacement_in_flight.clone(),
             last_replacement_ms: last_replacement_ms.clone(),
             invoke_semaphore: Arc::new(Semaphore::new(SHARED_INVOKE_CONCURRENCY)),
+            replacement_notify: Arc::new(Notify::new()),
         });
+        tokio::spawn(recovery.clone().replacement_worker());
         Ok(Self {
             key_prefix,
             max_in_flight,
@@ -512,7 +536,6 @@ impl RateLimiter for RedisRateLimiter {
             .try_acquire_owned()
             .ok()
         else {
-            self.mark_connection_suspect(snapshot.generation);
             return self.unavailable("shared Redis invoke cap is exhausted");
         };
         let lease_id = next_id();
@@ -524,6 +547,7 @@ impl RateLimiter for RedisRateLimiter {
         let acquire = self.acquire.clone();
         let ttl = self.lease_ttl;
         let max_in_flight = self.max_in_flight;
+        let invoke_timeout = self.timeout;
         let recovery = self.recovery.clone();
         tokio::spawn(async move {
             // Swapping the manager only affects future requests. This task
@@ -531,19 +555,29 @@ impl RateLimiter for RedisRateLimiter {
             // stops waiting.
             let mut connection = snapshot.manager.clone();
             let mut invoke_guard = SharedInvokeGuard::new(connection_generation, recovery);
-            let result = acquire
-                .prepare_invoke()
-                .key(&lease_key)
-                .arg(now_ms())
-                .arg(ttl.as_millis() as u64)
-                .arg(max_in_flight)
-                .arg(&lease_id)
-                .invoke_async::<i64>(&mut connection)
-                .await;
-            invoke_guard.complete();
+            let result = tokio::time::timeout(
+                invoke_timeout,
+                acquire
+                    .prepare_invoke()
+                    .key(&lease_key)
+                    .arg(now_ms())
+                    .arg(ttl.as_millis() as u64)
+                    .arg(max_in_flight)
+                    .arg(&lease_id)
+                    .invoke_async::<i64>(&mut connection),
+            )
+            .await;
+            if result.is_ok() {
+                invoke_guard.complete();
+            }
             drop(invoke_guard);
-            let needs_compensation = !matches!(result, Ok(0));
-            if sender.send(result).is_err() && needs_compensation {
+            let definite_denial = matches!(result, Ok(Ok(0)));
+            let definitely_created = matches!(result, Ok(Ok(1)));
+            let ambiguous = !definite_denial && !definitely_created;
+            if ambiguous {
+                abandoned_release.clone().spawn();
+            }
+            if sender.send(result).is_err() && definitely_created {
                 abandoned_release.spawn();
             }
             drop(invoke_permit);
@@ -552,34 +586,20 @@ impl RateLimiter for RedisRateLimiter {
         let current_generation = self.connection.load_full().generation;
         let result_untrusted = connection_generation != current_generation
             || self.suspect_generation.load(Ordering::Acquire) >= connection_generation;
-        if result_untrusted && matches!(result, Ok(Ok(Ok(_)))) {
+        if result_untrusted && matches!(result, Ok(Ok(Ok(Ok(_))))) {
             release.spawn();
             return self.unavailable("shared Redis connection was replaced during acquire");
         }
         match result {
-            Ok(Ok(Ok(1))) => Ok(RateLimitPermit {
+            Ok(Ok(Ok(Ok(1)))) => Ok(RateLimitPermit {
                 release: Some(PermitRelease::Redis(Box::new(release))),
             }),
-            Ok(Ok(Ok(_))) => {
+            Ok(Ok(Ok(Ok(_)))) => {
                 metrics::record_rate_limit_denial();
                 Err(RateLimitError::Exceeded)
             }
-            Ok(Ok(Err(error))) => {
-                // The caller's wait ended without an attributable admission
-                // result. Compensate regardless of whether Redis returned an
-                // error or no response: HDEL is idempotent when no lease was
-                // written, and this closes the ambiguous acquire window.
-                release.spawn();
-                self.unavailable(error)
-            }
-            Ok(Err(_)) | Err(_) => {
-                // The caller's wait ended without an attributable admission
-                // result. HDEL is idempotent when no lease exists, so
-                // compensate rather than guessing that Redis did not create
-                // one.
-                release.spawn();
-                self.unavailable("operation timed out")
-            }
+            Ok(Ok(Ok(Err(error)))) => self.unavailable(error),
+            Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => self.unavailable("operation timed out"),
         }
     }
 }
@@ -800,6 +820,7 @@ mod tests {
         release_connection: Arc<AtomicUsize>,
         shared_release_commands: Arc<AtomicUsize>,
         block_replacement: Arc<AtomicBool>,
+        stall_shared_release: Arc<AtomicBool>,
     }
 
     struct RedisRetryStub {
@@ -808,7 +829,7 @@ mod tests {
         released_lease: Arc<Mutex<Option<Vec<u8>>>>,
         release_connection: Arc<AtomicUsize>,
         shared_release_commands: Arc<AtomicUsize>,
-        block_replacement: Arc<AtomicBool>,
+        stall_shared_release: Arc<AtomicBool>,
         task: JoinHandle<()>,
     }
 
@@ -824,11 +845,13 @@ mod tests {
             let release_connection = Arc::new(AtomicUsize::new(0));
             let shared_release_commands = Arc::new(AtomicUsize::new(0));
             let block_replacement = Arc::new(AtomicBool::new(false));
+            let stall_shared_release = Arc::new(AtomicBool::new(false));
             let release_state = RetryReleaseState {
                 released_lease: released_lease.clone(),
                 release_connection: release_connection.clone(),
                 shared_release_commands: shared_release_commands.clone(),
                 block_replacement: block_replacement.clone(),
+                stall_shared_release: stall_shared_release.clone(),
             };
             let task = {
                 let connections = connections.clone();
@@ -856,7 +879,7 @@ mod tests {
                 released_lease,
                 release_connection,
                 shared_release_commands,
-                block_replacement,
+                stall_shared_release,
                 task,
             }
         }
@@ -865,8 +888,8 @@ mod tests {
             format!("redis://{}/", self.address)
         }
 
-        fn block_replacement(&self) {
-            self.block_replacement.store(true, Ordering::Relaxed);
+        fn stall_shared_release(&self) {
+            self.stall_shared_release.store(true, Ordering::Relaxed);
         }
     }
 
@@ -1111,10 +1134,14 @@ mod tests {
                 }
                 continue;
             } else if name.eq_ignore_ascii_case(b"EVALSHA") {
-                if stall_acquire && command.len() == 5 {
+                if command.len() == 5 {
                     release_state
                         .shared_release_commands
                         .fetch_add(1, Ordering::Relaxed);
+                    if connection == 1 && release_state.stall_shared_release.load(Ordering::Relaxed)
+                    {
+                        continue;
+                    }
                 }
                 if loaded_release
                     && loaded_hash.as_deref().map(str::as_bytes)
@@ -1528,7 +1555,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stalled_shared_release_does_not_retire_before_cap_exhaustion() {
+    async fn stalled_shared_release_retires_after_release_budget() {
         let stub = RedisLiveStub::start().await;
         let limiter = RedisRateLimiter::connect(
             &stub.url(),
@@ -1558,13 +1585,20 @@ mod tests {
             );
             tokio::task::yield_now().await;
         }
-        assert_eq!(
-            limiter.suspect_generation.load(Ordering::Acquire),
-            0,
-            "an owned slow release retired a healthy generation"
+        while limiter.connection.load_full().generation == generation
+            && limiter.suspect_generation.load(Ordering::Acquire) < generation
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "stalled shared release was not bounded by its release budget"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            limiter.connection.load_full().generation > generation
+                || limiter.suspect_generation.load(Ordering::Acquire) >= generation,
+            "stalled shared release did not retire its generation"
         );
-        tokio::time::sleep(deadline.saturating_duration_since(tokio::time::Instant::now())).await;
-        assert!(limiter.suspect_generation.load(Ordering::Acquire) < generation);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1644,7 +1678,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn shared_invoke_cap_refuses_without_queueing() {
+    async fn shared_invoke_cap_refusal_leaves_connection_usable() {
         let stub = RedisLiveStub::start().await;
         let limiter = RedisRateLimiter::connect(
             &stub.url(),
@@ -1673,7 +1707,115 @@ mod tests {
             .expect("cap-exhausted acquire queued behind in-flight work");
         assert!(matches!(result, Err(RateLimitError::StoreUnavailable)));
         drop(permits);
-        drop(stub);
+        assert_eq!(
+            limiter.suspect_generation.load(Ordering::Acquire),
+            0,
+            "healthy connection was retired by invoke-cap saturation"
+        );
+        assert!(
+            limiter.acquire(&key()).await.is_ok(),
+            "connection did not remain usable after cap refusal"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_invoke_reclaims_its_shared_permit() {
+        let stub = RedisLiveStub::start().await;
+        let limiter = RedisRateLimiter::connect(
+            &stub.url(),
+            format!("axond:test:{}", next_id()),
+            1,
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect limiter");
+        let mut held_permits = Vec::with_capacity(SHARED_INVOKE_CONCURRENCY - 1);
+        for _ in 0..SHARED_INVOKE_CONCURRENCY - 1 {
+            held_permits.push(
+                limiter
+                    .recovery
+                    .invoke_semaphore
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("invoke cap permit"),
+            );
+        }
+        stub.set_acquire_delay(Duration::from_secs(5));
+        let generation = limiter.connection.load_full().generation;
+        assert!(matches!(
+            limiter.acquire(&key()).await,
+            Err(RateLimitError::StoreUnavailable)
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let reclaimed = loop {
+            if let Ok(permit) = limiter
+                .recovery
+                .invoke_semaphore
+                .clone()
+                .try_acquire_owned()
+            {
+                break Some(permit);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "retired invoke did not return its semaphore permit"
+            );
+            tokio::task::yield_now().await;
+        };
+        assert!(reclaimed.is_some());
+        assert!(
+            limiter.suspect_generation.load(Ordering::Acquire) >= generation
+                || limiter.connection.load_full().generation > generation,
+            "invoke deadline did not retire or replace the stalled generation"
+        );
+        drop(held_permits);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_shared_release_falls_through_to_fresh_retry() {
+        let stub = RedisRetryStub::start().await;
+        let limiter = RedisRateLimiter::connect(
+            &stub.url(),
+            format!("axond:test:{}", next_id()),
+            1,
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect limiter");
+        stub.stall_shared_release();
+        let release = limiter.release("rate-limit-key".into(), "lease-id".into());
+        let started = tokio::time::Instant::now();
+        release.spawn();
+        let deadline = started + Duration::from_millis(1500);
+        while stub.connections.load(Ordering::Relaxed) < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "bounded shared release did not reach a fresh retry connection"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            stub.shared_release_commands.load(Ordering::Relaxed),
+            1,
+            "shared release was not attempted exactly once before fresh retry"
+        );
+        while stub.release_connection.load(Ordering::Acquire) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fresh retry did not release the lease"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            stub.release_connection.load(Ordering::Relaxed) >= 2,
+            "lease was not released by a fresh connection"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1709,6 +1851,11 @@ mod tests {
         assert!(
             limiter.suspect_generation.load(Ordering::Acquire) < generation,
             "ordinary slow release retired a healthy generation"
+        );
+        assert_eq!(
+            limiter.connection.load_full().generation,
+            generation,
+            "ordinary slow release triggered an unnecessary replacement"
         );
         assert!(limiter.acquire(&key()).await.is_ok());
     }
@@ -1804,7 +1951,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn shared_invoke_cap_skips_contended_release_attempts() {
+    async fn shared_invoke_cap_refusal_does_not_poison_or_retry_release() {
         let stub = RedisRetryStub::start().await;
         let timeout = Duration::from_millis(40);
         let limiter = RedisRateLimiter::connect(
@@ -1829,33 +1976,24 @@ mod tests {
                     .expect("invoke cap permit"),
             );
         }
-        stub.block_replacement();
-
         assert!(matches!(
             limiter.acquire(&key()).await,
             Err(RateLimitError::StoreUnavailable)
         ));
-        let replacement_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-        while stub.connections.load(Ordering::Relaxed) < 2 {
-            assert!(
-                tokio::time::Instant::now() < replacement_deadline,
-                "shared replacement was not attempted"
-            );
-            tokio::task::yield_now().await;
-        }
-
-        // The replacement connection is deliberately held at its PING. Any
-        // third connection during the complete retry window would therefore
-        // be an unexpected fresh-dial release attempt.
-        let retry_deadline = tokio::time::Instant::now() + Duration::from_millis(1_300);
+        let retry_deadline = tokio::time::Instant::now() + Duration::from_millis(300);
         while tokio::time::Instant::now() < retry_deadline {
             assert_eq!(
                 stub.connections.load(Ordering::Relaxed),
-                2,
-                "contended release opened a fresh Redis connection"
+                1,
+                "cap saturation poisoned the healthy manager"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert_eq!(
+            limiter.suspect_generation.load(Ordering::Acquire),
+            0,
+            "cap saturation retired a healthy generation"
+        );
         assert_eq!(stub.shared_release_commands.load(Ordering::Relaxed), 0);
         assert_eq!(stub.release_connection.load(Ordering::Relaxed), 0);
         assert!(stub.released_lease.lock().unwrap().is_none());
