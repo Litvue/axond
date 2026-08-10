@@ -5,7 +5,7 @@
 //! a 404 from a proxy is indistinguishable from a wrong `base_url`.
 
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use gateway_core::ProviderError;
 use gateway_transport::TransportError;
@@ -31,6 +31,8 @@ pub enum GatewayError {
     },
     #[error("budget store is unavailable")]
     BudgetUnavailable,
+    #[error("inbound concurrency limit exceeded")]
+    RateLimitExceeded { retry_after_seconds: Option<u64> },
     #[error("unauthorized")]
     Unauthorized,
     #[error("token authentication failed: {0}")]
@@ -69,6 +71,7 @@ impl GatewayError {
             // Fail-closed: the cap cannot be enforced, so the request is a
             // dependency failure rather than an over-cap caller (ADR 0010).
             Self::BudgetUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::RateLimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::TokenUnauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::TokenForbidden(_) => StatusCode::FORBIDDEN,
@@ -97,6 +100,7 @@ impl GatewayError {
             Self::BudgetExceeded(_) => "budget_exceeded",
             Self::RequestCostCeilingExceeded { .. } => "request_cost_ceiling_exceeded",
             Self::BudgetUnavailable => "budget_unavailable",
+            Self::RateLimitExceeded { .. } => "rate_limited",
             Self::Unauthorized => "unauthorized",
             Self::TokenUnauthorized(error) | Self::TokenForbidden(error) => error.code(),
             Self::ScopeInsufficient(_) => "token_scope_insufficient",
@@ -112,6 +116,14 @@ impl GatewayError {
 
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
+        let status = self.status();
+        let code = self.code().to_owned();
+        let retry_after = match &self {
+            Self::RateLimitExceeded {
+                retry_after_seconds: Some(seconds),
+            } => Some(seconds.to_string()),
+            _ => None,
+        };
         let message = match &self {
             Self::TokenUnauthorized(_) => "token authentication failed".to_owned(),
             Self::TokenForbidden(_) => "token authorization failed".to_owned(),
@@ -119,11 +131,19 @@ impl IntoResponse for GatewayError {
         };
         let body = json!({
             "error": {
-                "type": self.code(),
+                "type": code,
                 "message": message,
             }
         });
-        (self.status(), Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if let Some(seconds) = retry_after
+            && let Ok(value) = HeaderValue::from_str(&seconds)
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
+        }
+        response
     }
 }
 
@@ -187,6 +207,36 @@ mod tests {
             .to_bytes();
         let forbidden_body = String::from_utf8(forbidden_body.to_vec()).unwrap();
         assert!(!forbidden_body.contains("caller-namespace"));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_error_is_typed_429_without_retry_after() {
+        let response = GatewayError::RateLimitExceeded {
+            retry_after_seconds: None,
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
+        );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "error": {
+                    "type": "rate_limited",
+                    "message": "inbound concurrency limit exceeded"
+                }
+            })
+        );
     }
 
     #[tokio::test]

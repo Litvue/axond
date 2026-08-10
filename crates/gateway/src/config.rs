@@ -66,6 +66,9 @@ pub struct Config {
     /// datastore onto the default path (ADR 0002).
     #[serde(default)]
     pub budget: BudgetConfig,
+    /// Inbound per-caller concurrency enforcement. Defaults to no limit.
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -481,6 +484,52 @@ impl Default for BudgetConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RateLimitBackend {
+    /// Always admit. The default: no cap, no state.
+    #[default]
+    None,
+    /// Per-replica in-flight holds and counters.
+    InMemory,
+}
+
+impl RateLimitBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::InMemory => "in-memory",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct RateLimitConfig {
+    /// Selects the inbound concurrency backend.
+    #[serde(default)]
+    pub backend: RateLimitBackend,
+    /// Maximum concurrent dispatches for one `(namespace, subject)` key.
+    #[serde(default = "default_max_in_flight_per_subject")]
+    pub max_in_flight_per_subject: usize,
+    /// Maximum number of active caller keys retained by the in-memory backend.
+    #[serde(default = "default_max_subjects")]
+    pub max_subjects: usize,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            backend: RateLimitBackend::None,
+            max_in_flight_per_subject: default_max_in_flight_per_subject(),
+            max_subjects: default_max_subjects(),
+        }
+    }
+}
+
+fn default_max_in_flight_per_subject() -> usize {
+    16
+}
+
 impl BudgetConfig {
     pub fn table(&self) -> String {
         self.table
@@ -880,6 +929,7 @@ impl Config {
         self.validate_gateway_token_epochs(&namespaces)?;
         self.validate_usage_sinks()?;
         self.validate_budget()?;
+        self.validate_rate_limit()?;
         Ok(())
     }
 
@@ -1064,6 +1114,26 @@ impl Config {
         if budget.backend == BudgetBackend::Postgres {
             validate_table_name(&budget.table())
                 .map_err(|message| ConfigError::Invalid(format!("budget `postgres`: {message}")))?;
+        }
+        Ok(())
+    }
+
+    fn validate_rate_limit(&self) -> Result<(), ConfigError> {
+        let rate_limit = &self.rate_limit;
+        if rate_limit.backend == RateLimitBackend::None {
+            return Ok(());
+        }
+        if rate_limit.max_in_flight_per_subject == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "rate_limit `{}`: max_in_flight_per_subject must be at least 1",
+                rate_limit.backend.as_str()
+            )));
+        }
+        if rate_limit.max_subjects == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "rate_limit `{}`: max_subjects must be at least 1",
+                rate_limit.backend.as_str()
+            )));
         }
         Ok(())
     }
@@ -1382,6 +1452,27 @@ audience = "test"
         assert_eq!(cfg.budget.reservation_ttl_seconds, 300);
         assert_eq!(cfg.budget.idle_ttl_seconds, 3_600);
         assert_eq!(cfg.budget.max_subjects, 10_000);
+        assert_eq!(cfg.rate_limit.backend, RateLimitBackend::None);
+        assert_eq!(cfg.rate_limit.max_in_flight_per_subject, 16);
+        assert_eq!(cfg.rate_limit.max_subjects, 10_000);
+    }
+
+    #[test]
+    fn rate_limit_reads_backend_and_rejects_zero_bounds_when_enabled() {
+        let cfg = Config::from_toml_str(&format!(
+            "{VALID}\n[rate_limit]\nbackend = \"in-memory\"\nmax_in_flight_per_subject = 3\nmax_subjects = 25\n"
+        ))
+        .expect("valid rate limit");
+        assert_eq!(cfg.rate_limit.backend, RateLimitBackend::InMemory);
+        assert_eq!(cfg.rate_limit.max_in_flight_per_subject, 3);
+        assert_eq!(cfg.rate_limit.max_subjects, 25);
+
+        for section in [
+            "[rate_limit]\nbackend = \"in-memory\"\nmax_in_flight_per_subject = 0",
+            "[rate_limit]\nbackend = \"in-memory\"\nmax_subjects = 0",
+        ] {
+            assert!(Config::from_toml_str(&format!("{VALID}\n{section}\n")).is_err());
+        }
     }
 
     #[test]

@@ -17,6 +17,7 @@ mod error;
 mod key_material;
 mod mint;
 mod principals;
+mod rate_limit;
 mod reload;
 mod routes;
 mod state;
@@ -30,6 +31,7 @@ use std::sync::Arc;
 use budget::BudgetStore;
 use clap::{Arg, ArgAction, Command};
 use config::Config;
+use rate_limit::RateLimiter;
 use state::AppState;
 use usage::UsageFanout;
 
@@ -181,10 +183,12 @@ async fn serve() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("budget configuration failed: {e}"))?;
     tracing::info!(backend = budget.name(), "budget enforcement");
+    let rate_limiter: Box<dyn RateLimiter> = rate_limit::build(&config.rate_limit);
+    tracing::info!(backend = rate_limiter.name(), "inbound rate limiting");
 
     let bind = config.server.bind;
     let watching = config.reload.watch;
-    let state = AppState::new(config, &env, usage, budget)
+    let state = AppState::new_with_rate_limiter(config, &env, usage, budget, rate_limiter)
         .map_err(|e| anyhow::anyhow!("config resolution failed: {e}"))?;
     tracing::info!(
         gateway_keys = state.config().inbound_key_count(),

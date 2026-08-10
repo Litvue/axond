@@ -393,3 +393,17 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # # is allowed. Defaults to `axond_budget`.
 # table = "axond_budget"
 # create_table = false
+
+# ---------------------------------------------------------------------------
+# Inbound rate limiting — concurrency per authenticated caller
+# ---------------------------------------------------------------------------
+# Omit this section for the default Tier 0 NoLimit backend: it has zero state
+# and no network dependency. The in-memory backend is per-replica; with N
+# replicas sharing a nominal limit, each enforces approximately limit ÷ N.
+# It cannot enforce fleet-wide concurrency. The key is exactly
+# (namespace, subject), with no route or alias dimension.
+
+# [rate_limit]
+# backend = "in-memory" # none (default) | in-memory
+# max_in_flight_per_subject = 16
+# max_subjects = 10000

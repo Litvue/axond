@@ -31,6 +31,7 @@ use tracing::Instrument;
 
 use crate::budget::{BudgetKey, Reservation};
 use crate::credentials::CredentialSource;
+use crate::rate_limit::RateLimitPermit;
 use crate::routes::next_request_id;
 use crate::state::AppState;
 use crate::telemetry;
@@ -54,6 +55,7 @@ pub struct StreamContext {
     /// The hold this request was admitted under, settled once when the stream
     /// ends however it ends.
     pub reservation: Reservation,
+    pub rate_limit_permit: Option<RateLimitPermit>,
     /// Input tokens estimated from the request body when the hold was taken.
     /// A stream that ends before the provider reports usage still consumed its
     /// prompt, so this is what the partial charge is priced from.
@@ -546,6 +548,7 @@ mod tests {
 
     use crate::budget::{Admission, BudgetStore, Denial};
     use crate::config::Config;
+    use crate::rate_limit::RateLimiter;
     use crate::routes::router;
     use crate::usage::{UsageFanout, UsageSink};
 
@@ -757,6 +760,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
                 id: "test".to_owned(),
                 estimate_microdollars: 1_000,
             },
+            rate_limit_permit: None,
             estimated_input_tokens: 8,
             attempts: 1,
         }
@@ -1038,6 +1042,24 @@ targets = [{{ provider = "anthropic", model = "claude-sonnet-4-5", price = {{ in
         assert!(record["input_tokens"].as_u64().expect("input") > 0);
         assert!(record["output_tokens"].as_u64().expect("output") > 0);
         assert_eq!(ledger.settlements(), vec![charged]);
+    }
+
+    #[tokio::test]
+    async fn accounting_drop_releases_rate_limit_permit_once() {
+        let limiter = crate::rate_limit::InMemoryRateLimiter::new(1, 10);
+        let key = crate::rate_limit::RateLimitKey {
+            namespace: "platform".to_owned(),
+            subject: "GW_TEST_INBOUND_KEY".to_owned(),
+        };
+        let permit = limiter.acquire(&key).await.expect("permit");
+        let mut ctx = context();
+        ctx.rate_limit_permit = Some(permit);
+        let state = state_for("http://127.0.0.1:1", Arc::new(Ledger::default()));
+        drop(Accounting::new(state, ctx, Instant::now()));
+        let replacement = limiter.acquire(&key).await.expect("released permit");
+        drop(replacement);
+        let replacement = limiter.acquire(&key).await.expect("idempotent release");
+        drop(replacement);
     }
 
     /// A stream that fails before the provider reports usage is charged the

@@ -30,6 +30,9 @@ use crate::principals::{
     ConfigPrincipals, GatewayKeyEntry, Presented, PrincipalShapeError, PrincipalStoreChain,
     TokenVerifier, TokenVerifierBuildError,
 };
+#[cfg(test)]
+use crate::rate_limit::NoLimit;
+use crate::rate_limit::RateLimiter;
 use crate::usage::UsageFanout;
 
 pub use crate::principals::InboundKey;
@@ -41,6 +44,7 @@ pub struct Inner {
     pub dispatcher: HttpDispatcher,
     pub usage: UsageFanout,
     pub budget: Box<dyn BudgetStore>,
+    pub rate_limiter: Box<dyn RateLimiter>,
     config: ArcSwap<ConfigSnapshot>,
 }
 
@@ -238,17 +242,29 @@ impl ConfigSnapshot {
 impl AppState {
     /// Fails when a declared credential's or gateway key's env var is missing or
     /// empty — both are resolved at boot, not at request time.
+    #[cfg(test)]
     pub fn new(
         config: Config,
         env: &HashMap<String, String>,
         usage: UsageFanout,
         budget: Box<dyn BudgetStore>,
     ) -> Result<Self, SnapshotError> {
+        Self::new_with_rate_limiter(config, env, usage, budget, Box::new(NoLimit))
+    }
+
+    pub fn new_with_rate_limiter(
+        config: Config,
+        env: &HashMap<String, String>,
+        usage: UsageFanout,
+        budget: Box<dyn BudgetStore>,
+        rate_limiter: Box<dyn RateLimiter>,
+    ) -> Result<Self, SnapshotError> {
         let snapshot = ConfigSnapshot::build(config, env, 0)?;
         Ok(AppState(Arc::new(Inner {
             dispatcher: HttpDispatcher::new(reqwest::Client::new()),
             usage,
             budget,
+            rate_limiter,
             config: ArcSwap::from_pointee(snapshot),
         })))
     }

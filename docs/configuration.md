@@ -253,7 +253,7 @@ A reload re-runs the full boot validation against the current file, current
 process environment, and referenced key-material files; a bad candidate is
 rejected and the running config keeps serving. Replacing file contents in place
 or via an atomic rename is therefore reload-reachable without a process
-restart. `[server] bind`, `[[usage_sink]]`, and `[budget]`
+restart. `[server] bind`, `[[usage_sink]]`, `[budget]`, and `[rate_limit]`
 changes warn and are ignored until restart; this includes
 `limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
 
@@ -316,6 +316,24 @@ Enforcement holds a priced estimate before dispatch and settles it against
 measured spend afterwards, so concurrent requests cannot collectively overshoot.
 A cancelled or failed request is charged what it actually consumed — not the
 estimate, and not always zero.
+
+## `[rate_limit]` — opt-in inbound concurrency enforcement
+
+Omit this section for the Tier 0 default: `NoLimit` has zero state and no
+network dependency. The in-memory backend limits concurrent requests per
+`(namespace, subject)` and is per-replica. With N replicas sharing a nominal
+limit, each replica enforces approximately `limit ÷ N`; it cannot enforce
+fleet-wide concurrency.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `backend` | `none` \| `in-memory` | `none` | Selects the default no-op or bounded in-memory limiter. |
+| `max_in_flight_per_subject` | integer | `16` | Maximum concurrent dispatches for one authenticated caller. Must be nonzero when `backend = "in-memory"`. |
+| `max_subjects` | integer | `10000` | Maximum retained caller keys in the in-memory map. Must be nonzero when enabled; zero-count entries are evicted. |
+
+When `max_subjects` is reached, a new caller is refused rather than silently
+admitted without a limit; zero-in-flight entries are evicted on permit drop, so
+the map retains only active callers.
 
 ## Telemetry
 

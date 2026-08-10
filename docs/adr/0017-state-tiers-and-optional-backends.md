@@ -130,9 +130,12 @@ Per-model and hierarchical budget caps remain the existing opt-in
 
 ## Open questions
 
-- The exact `RateLimiter` key and policy dimensions (namespace, subject,
-  route, alias, tokens, concurrency) remain to be specified with the request
-  contract.
+- Settled by issue #64: the `RateLimiter` key is exactly `(namespace, subject)`,
+  with no route or alias dimension, and the first policy is in-flight
+  concurrency only (no RPM or TPM). Concurrency rejections do not emit
+  `Retry-After`, because an upstream request has no honest deadline. Redis
+  (#65) will slot behind the same trait without changing key semantics,
+  placement, error shape, or the `NoLimit` default.
 - The Redis schema and algorithm parameters for rate limiting and `jti`
   revocation remain open.
 - A future self-serve identity product must define its administrative auth

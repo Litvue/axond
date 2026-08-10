@@ -47,6 +47,7 @@ use crate::config::{Model, Provider, ProviderKind, Target};
 use crate::credentials::{CredentialPlan, CredentialSource};
 use crate::error::GatewayError;
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
+use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::streaming::{self, Framing, StreamContext};
 use crate::telemetry;
@@ -530,6 +531,21 @@ async fn serve(
     };
     wire.check_targets(cfg, model, &alias)?;
 
+    // The permit is held for the request's lifetime: buffered paths drop it at
+    // scope end, and a stream moves it into the accounting owner that settles it.
+    let rate_limit_key = RateLimitKey {
+        namespace: caller.namespace.clone(),
+        subject: caller.subject.clone(),
+    };
+    let rate_limit_permit = state
+        .0
+        .rate_limiter
+        .acquire(&rate_limit_key)
+        .await
+        .map_err(|_| GatewayError::RateLimitExceeded {
+            retry_after_seconds: None,
+        })?;
+
     // Budget is denominated in micro-dollars. Hold a conservative cost estimate
     // from the first target's price before dispatch; settle the hold against the
     // real cost — priced at whichever target actually served — after.
@@ -568,6 +584,7 @@ async fn serve(
                     key: budget_key,
                     reservation,
                     estimated_input_tokens: estimate.input_tokens,
+                    permit: Some(rate_limit_permit),
                 },
             },
         )
@@ -811,7 +828,7 @@ async fn stream_with_failover(
         alias,
         body,
         wire,
-        hold,
+        mut hold,
     } = request;
     let cfg = &snapshot.config;
     let policy = FailoverPolicy;
@@ -866,6 +883,7 @@ async fn stream_with_failover(
             price: target.price,
             budget_key: hold.key.clone(),
             reservation: hold.reservation.clone(),
+            rate_limit_permit: None,
             estimated_input_tokens: hold.estimated_input_tokens,
             attempts: 0,
         };
@@ -920,6 +938,7 @@ async fn stream_with_failover(
 
         match opened {
             Ok(bytes) => {
+                ctx.rate_limit_permit = hold.permit.take();
                 record_target_success(snapshot, target, &circuit_key);
                 telemetry::record_routing(
                     &ctx.namespace,
@@ -956,6 +975,7 @@ async fn stream_with_failover(
     if let Some(err) = walk.last_error.take() {
         if let Some((mut ctx, started)) = last_ctx {
             ctx.attempts = walk.attempts;
+            ctx.rate_limit_permit = hold.permit.take();
             streaming::settle_upstream_error(state.clone(), ctx, started);
         } else {
             state.0.budget.release(&hold.key, &hold.reservation).await;
@@ -984,6 +1004,7 @@ struct BudgetHold {
     key: BudgetKey,
     reservation: Reservation,
     estimated_input_tokens: u64,
+    permit: Option<RateLimitPermit>,
 }
 
 /// A buffered request's reservation must be reconciled even when its handler is
@@ -1340,6 +1361,7 @@ mod tests {
     use crate::aliases::AliasScope;
     use crate::budget::NoBudget;
     use crate::config::Config;
+    use crate::rate_limit::{InMemoryRateLimiter, NoLimit, RateLimitKey, RateLimiter};
     use crate::usage::{StdoutSink, UsageFanout, UsageSink};
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
@@ -2622,6 +2644,37 @@ targets = [
         }
     }
 
+    struct SharedLimiter(Arc<InMemoryRateLimiter>);
+
+    #[async_trait::async_trait]
+    impl RateLimiter for SharedLimiter {
+        fn name(&self) -> &'static str {
+            "shared-test"
+        }
+
+        async fn acquire(
+            &self,
+            key: &RateLimitKey,
+        ) -> Result<crate::rate_limit::RateLimitPermit, crate::rate_limit::RateLimitError> {
+            self.0.acquire(key).await
+        }
+    }
+
+    struct RejectingBudget;
+
+    #[async_trait::async_trait]
+    impl crate::budget::BudgetStore for RejectingBudget {
+        fn name(&self) -> &'static str {
+            "rejecting"
+        }
+
+        async fn reserve(&self, _key: &BudgetKey, _estimate: u64) -> Admission {
+            Admission::Denied(Denial::Exceeded)
+        }
+
+        async fn settle(&self, _key: &BudgetKey, _reservation: &Reservation, _actual: u64) {}
+    }
+
     struct SharedBudget(Arc<crate::budget::InMemoryBudget>);
 
     #[async_trait::async_trait]
@@ -2641,6 +2694,14 @@ targets = [
 
     /// One target, one credential, and the budget store under test.
     fn budgeted_state(base_url: &str, budget: Box<dyn crate::budget::BudgetStore>) -> AppState {
+        budgeted_state_with_limiter(base_url, budget, Box::new(NoLimit))
+    }
+
+    fn budgeted_state_with_limiter(
+        base_url: &str,
+        budget: Box<dyn crate::budget::BudgetStore>,
+        rate_limiter: Box<dyn RateLimiter>,
+    ) -> AppState {
         let cfg = Config::from_toml_str(&format!(
             r#"
 [[namespace]]
@@ -2667,7 +2728,52 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         .unwrap();
         let env = env_with([("K1", "sk-test")]);
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
-        AppState::new(cfg, &env, UsageFanout::new(sinks), budget).unwrap()
+        AppState::new_with_rate_limiter(cfg, &env, UsageFanout::new(sinks), budget, rate_limiter)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn limiter_runs_before_budget_reservation() {
+        let limiter = Arc::new(InMemoryRateLimiter::new(1, 10));
+        let held = limiter
+            .acquire(&RateLimitKey {
+                namespace: "platform".to_owned(),
+                subject: "AXOND_INBOUND_KEY".to_owned(),
+            })
+            .await
+            .expect("held permit");
+        let budget = RecordingBudget::default();
+        let state = budgeted_state_with_limiter(
+            "http://127.0.0.1:1",
+            Box::new(budget.clone()),
+            Box::new(SharedLimiter(Arc::clone(&limiter))),
+        );
+        let response = router(state).oneshot(chat_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let no_retry_after = response.headers().get("retry-after").is_none();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limited");
+        assert!(no_retry_after);
+        assert!(budget.0.lock().unwrap().is_empty());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn budget_denial_does_not_leave_limiter_saturated() {
+        let limiter = Arc::new(InMemoryRateLimiter::new(1, 10));
+        let state = budgeted_state_with_limiter(
+            "http://127.0.0.1:1",
+            Box::new(RejectingBudget),
+            Box::new(SharedLimiter(Arc::clone(&limiter))),
+        );
+        for _ in 0..2 {
+            let response = router(state.clone()).oneshot(chat_request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["type"], "budget_exceeded");
+        }
     }
 
     #[tokio::test]
