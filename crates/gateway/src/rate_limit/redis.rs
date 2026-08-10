@@ -109,9 +109,9 @@ impl RedisRelease {
                 let Some(_retry_permit) = try_release_retry_permit(self.retry_semaphore) else {
                     tracing::debug!(
                         attempt,
-                        "rate-limit lease release retry limit reached; lease will expire"
+                        "rate-limit lease release retry unavailable; skipping attempt"
                     );
-                    return;
+                    continue;
                 };
                 let connection = tokio::time::timeout(
                     self.timeout.min(remaining),
@@ -993,11 +993,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_release_gives_up_when_retry_semaphore_is_exhausted() {
+    async fn ambiguous_release_skips_contended_retry_attempts() {
         static NO_RETRY_SEMAPHORE: Semaphore = Semaphore::const_new(0);
 
         let stub = RedisRetryStub::start().await;
         let timeout = Duration::from_millis(40);
+        let started = tokio::time::Instant::now();
         let mut limiter = RedisRateLimiter::connect(
             &stub.url(),
             format!("axond:test:{}", next_id()),
@@ -1016,7 +1017,11 @@ mod tests {
             Err(RateLimitError::StoreUnavailable)
         ));
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(900),
+            "retry loop did not run through its bounded backoff attempts"
+        );
         assert_eq!(stub.connections.load(Ordering::Relaxed), 1);
         assert!(stub.released_lease.lock().unwrap().is_none());
     }

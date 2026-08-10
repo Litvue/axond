@@ -170,4 +170,5 @@ fire-and-forget with bounded retries; retries open fresh Redis connections
 instead of waiting behind the timed-out shared connection, while lease expiry
 remains the final backstop. A process-wide cap limits how many releases retry
 at once, so an outage cannot amplify connection pressure on the failing server:
-releases beyond the cap are abandoned to expiry rather than queued.
+contended attempts are skipped rather than queued, while the attempt count and
+deadline bound the effort and lease expiry remains the final backstop.
