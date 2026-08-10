@@ -172,3 +172,19 @@ limits how many releases retry at once, so an outage cannot amplify connection
 pressure on the failing server: contended attempts are skipped rather than
 queued, while the attempt count and deadline bound the effort. Lease expiry
 remains the final backstop.
+
+A dropped in-flight response wait can poison a multiplexed connection's reply
+alignment, so abandoning a caller's wait does not abandon the Redis operation:
+the invoke runs in its own task and its result is consumed in order. Outstanding
+shared invokes are bounded by a non-queuing per-manager cap; when that cap is
+exhausted, the limiter refuses rather than adding another waiter. Permit
+releases use a separate, generous bounded retry budget derived from the
+configured admission timeout. Retirement is reserved for a genuinely abandoned
+invoke or an exhausted cap, and starts the bounded replacement asynchronously.
+If an acquire outcome is unattributable, compensation assumes that a lease
+exists and cleans it up; only a definite `0` proves that no lease was created.
+When a response is lost, later replies can be delivered to the wrong waiter;
+an unattributable admission result is therefore unknown, not a denial.
+The limiter refuses new admissions while a bounded replacement is in flight.
+Results from a retired generation are unknown, so the existing unavailable
+policy applies rather than trusting an admission or denial.
