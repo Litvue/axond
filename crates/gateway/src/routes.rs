@@ -150,11 +150,15 @@ async fn list_models(
         .model
         .iter()
         .filter(|m| {
-            m.targets.iter().any(|t| {
-                snapshot
-                    .credentials
-                    .is_present(cfg, &caller.namespace, &t.provider)
-            })
+            caller
+                .alias_scope
+                .as_ref()
+                .is_none_or(|scope| scope.permits(&m.name))
+                && m.targets.iter().any(|t| {
+                    snapshot
+                        .credentials
+                        .is_present(cfg, &caller.namespace, &t.provider)
+                })
         })
         .map(|m| json!({ "id": m.name, "object": "model", "owned_by": "axond" }))
         .collect();
@@ -458,6 +462,14 @@ async fn serve(
         .and_then(Value::as_str)
         .ok_or_else(|| GatewayError::BadRequest("missing `model`".into()))?
         .to_string();
+
+    if let Some(scope) = &caller.alias_scope
+        && !scope.permits(&alias)
+    {
+        return Err(GatewayError::TokenForbidden(
+            crate::principals::TokenVerificationError::AliasNotPermitted { alias },
+        ));
+    }
 
     let model = cfg
         .model(&alias)
@@ -1530,6 +1542,25 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(json["data"][0]["id"], "gpt-4o");
     }
 
+    #[tokio::test]
+    async fn models_intersect_namespace_access_with_alias_scope() {
+        let state = test_state();
+        let snapshot = state.config();
+        let caller = InboundKey {
+            namespace: "platform".to_owned(),
+            subject: "restricted".to_owned(),
+            signer_kid: Some("test-kid".to_owned()),
+            alias_scope: Some(crate::aliases::AliasScope::parse(["other"]).unwrap()),
+        };
+        let response = list_models(Extension(snapshot), Extension(caller))
+            .await
+            .unwrap()
+            .into_response();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"].as_array().unwrap().len(), 0);
+    }
+
     /// A caller sees only the aliases it could invoke: a BYOK namespace with no
     /// credential for the target's provider (and no platform fallback) gets an
     /// empty list, so it cannot enumerate aliases it is not entitled to, while
@@ -1627,6 +1658,33 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "unknown_model");
+    }
+
+    #[tokio::test]
+    async fn a_disallowed_alias_is_forbidden_before_model_lookup() {
+        let state = test_state();
+        let snapshot = state.config();
+        let caller = InboundKey {
+            namespace: "platform".to_owned(),
+            subject: "restricted".to_owned(),
+            signer_kid: Some("test-kid".to_owned()),
+            alias_scope: Some(crate::aliases::AliasScope::parse(["other"]).unwrap()),
+        };
+        let response = serve(
+            state,
+            HeaderMap::new(),
+            json!({"model": "does-not-exist", "messages": []}),
+            Route::ChatCompletions,
+            snapshot,
+            caller,
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "token_alias_not_permitted");
     }
 
     /// Deferred past beta, but the route still answers for itself: a caller

@@ -182,6 +182,15 @@ signature on every token. At least one static `[[gateway_key]]` remains
 mandatory as breakglass access. See the [minted identity guide](./minted-token-guide.md)
 for the new-`kid` rotation procedure and the Tier 0/Tier 1 revocation boundary.
 
+An optional `aliases` claim narrows the aliases the token may use. It is an array
+of strings, matched as a case-sensitive union: a string without `*` is an exact
+alias; one `*` at the end is a prefix match (`foo*`); one at the beginning is a
+suffix match (`*foo`); and bare `*` matches every alias. Empty strings, a `*`
+in the middle, or more than one `*` are invalid and reject the request with
+`403`. An empty array permits no aliases. The claim can only narrow the
+namespace's existing authority: it never adds aliases the namespace cannot
+already reach. Static gateway keys remain unrestricted.
+
 ## `[reload]`
 
 | Key | Type | Default | Meaning |

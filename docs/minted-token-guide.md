@@ -199,11 +199,21 @@ The verifier requires these claims:
 five-second clock-skew allowance. Unknown claims are otherwise ignored by the
 current verifier.
 
-ADR 0016 describes three future narrowing claims:
-`scope`, `aliases`, and `max_request_microdollars`. They are **not enforced by
-the current gateway and are not emitted by `axond mint`**. Do not add them by
-hand and assume a token is narrowed: it is not. Their enforcement and minting
-are tracked by #60, #61, and #62 respectively.
+ADR 0016 describes three narrowing claims. `scope` and
+`max_request_microdollars` are **not enforced by the current gateway and are not
+emitted by `axond mint`**; their enforcement and minting are tracked by #60 and
+#62. The `aliases` claim is enforced both before dispatch and in the caller's
+`/v1/models` view. It is a repeatable, case-sensitive pattern restriction:
+
+```bash
+axond mint --kid acme-2026-08 --key-env SIGN_KEY --namespace acme \
+  --subject alice --ttl 15m --config axond.toml \
+  --alias "gpt-4o" --alias "claude-*"
+```
+
+The claim is omitted when no `--alias` is supplied. Its exact glob syntax,
+including fail-closed empty-array and invalid-pattern behavior, is documented
+under `[[gateway_verifier]]` in [configuration.md](./configuration.md).
 
 ## 5. Rotation runbook
 

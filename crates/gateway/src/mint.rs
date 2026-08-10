@@ -18,6 +18,7 @@ use ring::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 
+use crate::aliases::AliasScope;
 use crate::config::{Config, GatewayVerifierAlgorithm, MAX_GATEWAY_VERIFIER_TTL_SECONDS};
 
 #[derive(Debug, Serialize)]
@@ -28,6 +29,8 @@ struct MintClaims {
     jti: String,
     ns: String,
     sub: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aliases: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -158,17 +161,26 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
         }
     }
 
-    mint_token(
+    let aliases = args
+        .get_many::<String>("alias")
+        .map(|values| values.cloned().collect::<Vec<_>>());
+    if let Some(patterns) = &aliases {
+        AliasScope::parse(patterns.clone()).map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
+
+    mint_token_with_aliases(MintRequest {
         kid,
         algorithm,
         key_material,
         namespace,
         subject,
-        &audience,
+        audience: &audience,
         ttl,
-    )
+        aliases,
+    })
 }
 
+#[cfg(test)]
 fn mint_token(
     kid: &str,
     algorithm: MintAlgorithm,
@@ -178,6 +190,40 @@ fn mint_token(
     audience: &str,
     ttl: Duration,
 ) -> Result<String> {
+    mint_token_with_aliases(MintRequest {
+        kid,
+        algorithm,
+        key_material,
+        namespace,
+        subject,
+        audience,
+        ttl,
+        aliases: None,
+    })
+}
+
+struct MintRequest<'a> {
+    kid: &'a str,
+    algorithm: MintAlgorithm,
+    key_material: &'a str,
+    namespace: &'a str,
+    subject: &'a str,
+    audience: &'a str,
+    ttl: Duration,
+    aliases: Option<Vec<String>>,
+}
+
+fn mint_token_with_aliases(request: MintRequest<'_>) -> Result<String> {
+    let MintRequest {
+        kid,
+        algorithm,
+        key_material,
+        namespace,
+        subject,
+        audience,
+        ttl,
+        aliases,
+    } = request;
     let encoding_key = encoding_key(algorithm, key_material, kid)?;
     let now = unix_now()?;
     let claims = MintClaims {
@@ -187,6 +233,7 @@ fn mint_token(
         jti: random_jti()?,
         ns: namespace.to_owned(),
         sub: subject.to_owned(),
+        aliases,
     };
     let mut header = Header::new(algorithm.jwt());
     header.kid = Some(kid.to_owned());
@@ -836,6 +883,59 @@ max_ttl = "15m"
                 TokenVerificationError::UnknownKey { .. }
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn mint_emits_alias_claim_and_validates_patterns() {
+        let config = verifier_config("configured-kid", "HS256", "HS_SECRET", "15m");
+        let secret = "01234567890123456789012345678901";
+        let env = HashMap::from([
+            ("STATIC".to_owned(), "static".to_owned()),
+            ("HS_SECRET".to_owned(), secret.to_owned()),
+        ]);
+        let verifier = TokenVerifier::build(&config, &env).unwrap().unwrap();
+        let args = mint_args(&[
+            "--kid",
+            "configured-kid",
+            "--key-env",
+            "HS_SECRET",
+            "--namespace",
+            "acme",
+            "--subject",
+            "caller",
+            "--ttl",
+            "10m",
+            "--alias",
+            "gpt-*",
+            "--alias",
+            "claude-3",
+        ]);
+        let token = mint_from_args(&args, Some(config.clone()), secret).unwrap();
+        let principal = verifier
+            .resolve(&Presented { credential: &token })
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = principal.alias_scope.unwrap();
+        assert!(scope.permits("gpt-4o"));
+        assert!(scope.permits("claude-3"));
+        assert!(!scope.permits("other"));
+
+        let invalid = mint_args(&[
+            "--kid",
+            "configured-kid",
+            "--key-env",
+            "HS_SECRET",
+            "--namespace",
+            "acme",
+            "--subject",
+            "caller",
+            "--ttl",
+            "10m",
+            "--alias",
+            "foo*bar",
+        ]);
+        assert!(mint_from_args(&invalid, Some(config), secret).is_err());
     }
 
     fn verifier_config(kid: &str, algorithm: &str, env: &str, max_ttl: &str) -> Config {

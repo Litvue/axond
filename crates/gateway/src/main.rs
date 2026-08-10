@@ -9,6 +9,7 @@
 //! `[reload] watch` is on, a change to the config file) re-runs this same load +
 //! validate path and swaps the result in atomically (ADR 0011).
 
+mod aliases;
 mod budget;
 mod config;
 mod credentials;
@@ -85,6 +86,12 @@ fn cli() -> Command {
                         .long("ttl")
                         .required(true)
                         .help("Token lifetime, such as 15m or 1h"),
+                )
+                .arg(
+                    Arg::new("alias")
+                        .long("alias")
+                        .action(ArgAction::Append)
+                        .help("Alias pattern claim; repeatable"),
                 )
                 .arg(
                     Arg::new("audience")
