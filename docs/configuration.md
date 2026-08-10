@@ -245,6 +245,20 @@ measured spend afterwards, so concurrent requests cannot collectively overshoot.
 A cancelled or failed request is charged what it actually consumed — not the
 estimate, and not always zero.
 
+## `[rate_limit]` — opt-in inbound concurrency enforcement
+
+Omit this section for the Tier 0 default: `NoLimit` has zero state and no
+network dependency. The in-memory backend limits concurrent requests per
+`(namespace, subject)` and is per-replica. With N replicas sharing a nominal
+limit, each replica enforces approximately `limit ÷ N`; it cannot enforce
+fleet-wide concurrency.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `backend` | `none` \| `in-memory` | `none` | Selects the default no-op or bounded in-memory limiter. |
+| `max_in_flight_per_subject` | integer | `16` | Maximum concurrent dispatches for one authenticated caller. Must be nonzero when `backend = "in-memory"`. |
+| `max_subjects` | integer | `10000` | Maximum retained caller keys in the in-memory map. Must be nonzero when enabled; zero-count entries are evicted. |
+
 ## Telemetry
 
 There is no telemetry section: telemetry is environment-only, exactly as in any
