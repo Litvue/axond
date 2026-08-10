@@ -204,13 +204,19 @@ namespace = "acme"
 # max_ttl may be at most 24h (a policy ceiling, not a protocol limit).
 # max_ttl = "15m"
 #
+# Set a namespace-wide issuance epoch to reject older minted tokens on reload.
+# A per-subject entry overrides the namespace-wide value for that subject.
+# [[gateway_token_epoch]]
+# namespace = "acme"
+# min_iat = "2026-08-10T12:00:00Z"
+#
 # File-backed material is re-read on SIGHUP, so replacing it under the same
 # `kid` takes effect without a restart. Reload summaries include a short
 # material fingerprint and report the `kid` as changed; fingerprints never
 # reveal material. A new `kid` can still be overlapped for a graceful rotation.
-# Short TTLs and removing a kid are the current coarse revocation controls.
-# Precise single-token revocation requires the future Tier 1 `jti` denylist
-# (#68); `min_iat` is tracked separately by #63. See
+# Short TTLs, removing a kid, and `min_iat` issuance epochs are the current
+# Tier 0 revocation controls. Precise single-token revocation requires the
+# future Tier 1 `jti` denylist (#68). See
 # docs/minted-token-guide.md for the complete runbook.
 
 # ── Models (aliases) ──────────────────────────────────────────────────────────
