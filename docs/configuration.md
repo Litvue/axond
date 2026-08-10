@@ -35,7 +35,8 @@ egress: upstream provider calls still use the network at Tier 0.
 | `[[usage_sink]] kind = "otlp"` | Tier 0 state, but not hermetic: a collector is a boot-time dependency, so this is outside the hermetic Tier 0 CI lane. |
 | `[[usage_sink]] kind = "postgres"` | Tier 2: durable usage rows. |
 | `[budget] backend = "none"` or `"in-memory"` | Tier 0; in-memory state is per replica and approximate. |
-| `[budget] backend = "redis"` | Tier 1: the only shipped Tier 1 feature today. |
+| `[budget] backend = "redis"` or `[rate_limit] backend = "redis"` | Tier 1: exact shared admission through Redis. |
+| `[rate_limit] backend = "none"` or `"in-memory"` | Tier 0; in-memory state is per replica and approximate. |
 | `[budget] backend = "postgres"` | Tier 2: shared caps. |
 | `/healthz`, `/readyz` | Tier 0. |
 
@@ -297,9 +298,9 @@ Omit the section for the default: no cap, no datastore
 is per `(namespace, subject)` — that is, per gateway key — in micro-dollars.
 
 `backend = "none"` and `"in-memory"` are Tier 0; in-memory enforcement is
-per-replica and approximate. `backend = "redis"` is Tier 1 and is the only
-shipped Tier 1 feature today; with the default `on_unavailable = "deny"`, an
-unavailable Redis answers `503 budget_unavailable`. `backend = "postgres"` is
+per-replica and approximate. `backend = "redis"` is Tier 1; with the default
+`on_unavailable = "deny"`, an unavailable Redis answers `503 budget_unavailable`.
+`backend = "postgres"` is
 Tier 2 and shares the cap through Postgres.
 
 | Key | Type | Default | Applies to | Meaning |
@@ -324,19 +325,28 @@ estimate, and not always zero.
 
 Omit this section for the Tier 0 default: `NoLimit` has zero state and no
 network dependency. The in-memory backend limits concurrent requests per
-`(namespace, subject)` and is per-replica. With N replicas sharing a nominal
-limit, each replica enforces approximately `limit ÷ N`; it cannot enforce
-fleet-wide concurrency.
+`(namespace, subject)` and is per-replica and approximate. `backend = "redis"`
+is Tier 1 and enforces exact fleet-wide in-flight concurrency using expiring
+leases; it is not an RPM/token-bucket limiter.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `backend` | `none` \| `in-memory` | `none` | Selects the default no-op or bounded in-memory limiter. |
-| `max_in_flight_per_subject` | integer | `16` | Maximum concurrent dispatches for one authenticated caller. Must be nonzero when `backend = "in-memory"`. |
-| `max_subjects` | integer | `10000` | Maximum retained caller keys in the in-memory map. Must be nonzero when enabled; zero-count entries are evicted. |
+| `backend` | `none` \| `in-memory` \| `redis` | `none` | Selects no-op, per-replica in-memory, or exact shared Redis leases. |
+| `max_in_flight_per_subject` | integer | `16` | Maximum concurrent dispatches for one authenticated caller. Must be nonzero when enabled. |
+| `max_subjects` | integer | `10000` | Maximum retained caller keys in the in-memory map. Must be nonzero when enabled. |
+| `dsn_env` | string | — | Name of the env var holding the Redis URL. If omitted, a Redis budget's `dsn_env` is reused explicitly. |
+| `key_prefix` | string | `axond:rate_limit` | Redis key namespace. |
+| `on_unavailable` | `deny` \| `allow` | `deny` | Redis outage policy. `deny` fails closed with `503 rate_limit_unavailable`; `allow` admits unenforced and warns. |
+| `lease_ttl_seconds` | integer | `300` | Redis lease lifetime and crash-safety backstop. Must be ≥ 1 for Redis. |
+| `timeout_ms` | integer | `250` | Bounded Redis acquire/release operation timeout. Must be ≥ 1 for Redis. |
+| `connect_timeout_ms` | integer | `5000` | Bounded Redis connection setup and boot-time `PING` timeout. Must be ≥ 1 for Redis. |
 
 When `max_subjects` is reached, a new caller is refused rather than silently
 admitted without a limit; zero-in-flight entries are evicted on permit drop, so
 the map retains only active callers.
+
+Redis connects and PINGs at boot. A Redis limiter's lease is released when its
+permit drops; if the process or Redis is unavailable, the TTL reclaims it.
 
 ## Telemetry
 

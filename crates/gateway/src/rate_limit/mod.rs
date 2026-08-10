@@ -7,12 +7,14 @@
 //! replica admits approximately `limit / N`, rather than enforcing a
 //! fleet-wide ceiling.
 
+mod redis;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::config::RateLimitConfig;
+use crate::config::{BudgetConfig, RateLimitBackend, RateLimitConfig};
 use crate::telemetry::metrics;
 
 /// The authenticated caller dimension used by inbound limits.
@@ -33,6 +35,8 @@ pub enum RateLimitError {
         "in-memory rate-limit subject capacity exhausted; new callers are refused until an active key is evicted"
     )]
     SubjectCapacityExceeded,
+    #[error("rate-limit store is unavailable")]
+    StoreUnavailable,
 }
 
 /// An owned permit released synchronously when dropped.
@@ -46,10 +50,11 @@ enum PermitRelease {
         state: Arc<InMemoryState>,
         key: RateLimitKey,
     },
+    Redis(redis::RedisRelease),
 }
 
 impl RateLimitPermit {
-    fn no_limit() -> Self {
+    pub(crate) fn no_limit() -> Self {
         Self {
             release: Some(PermitRelease::NoLimit),
         }
@@ -64,18 +69,21 @@ impl RateLimitPermit {
 
 impl Drop for RateLimitPermit {
     fn drop(&mut self) {
-        let Some(PermitRelease::InMemory { state, key }) = self.release.take() else {
-            return;
-        };
-        let mut subjects = state
-            .subjects
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(count) = subjects.get_mut(&key) {
-            *count -= 1;
-            if *count == 0 {
-                subjects.remove(&key);
+        match self.release.take() {
+            Some(PermitRelease::InMemory { state, key }) => {
+                let mut subjects = state
+                    .subjects
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(count) = subjects.get_mut(&key) {
+                    *count -= 1;
+                    if *count == 0 {
+                        subjects.remove(&key);
+                    }
+                }
             }
+            Some(PermitRelease::Redis(release)) => release.spawn(),
+            Some(PermitRelease::NoLimit) | None => {}
         }
     }
 }
@@ -157,13 +165,90 @@ impl RateLimiter for InMemoryRateLimiter {
     }
 }
 
-pub fn build(config: &RateLimitConfig) -> Box<dyn RateLimiter> {
+#[derive(Debug, thiserror::Error)]
+pub enum RateLimitBuildError {
+    #[error("{message}")]
+    Invalid { message: String },
+    #[error("redis rate-limit backend: {0}")]
+    Redis(#[from] redis::RedisConnectError),
+}
+
+impl RateLimitBuildError {
+    fn invalid(message: impl Into<String>) -> Self {
+        Self::Invalid {
+            message: message.into(),
+        }
+    }
+}
+
+/// Resolve the limiter DSN reference, explicitly reusing the budget reference
+/// when configured. This keeps one-Redis deployments from naming the same
+/// connection string twice.
+pub fn resolve_dsn_env<'a>(
+    config: &'a RateLimitConfig,
+    budget: &'a BudgetConfig,
+) -> Option<&'a str> {
+    config
+        .dsn_env
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            if budget.backend == crate::config::BudgetBackend::Redis {
+                budget
+                    .dsn_env
+                    .as_deref()
+                    .filter(|name| !name.trim().is_empty())
+            } else {
+                None
+            }
+        })
+}
+
+pub async fn build(
+    config: &RateLimitConfig,
+    budget: &BudgetConfig,
+    env: &HashMap<String, String>,
+) -> Result<Box<dyn RateLimiter>, RateLimitBuildError> {
     match config.backend {
-        crate::config::RateLimitBackend::None => Box::new(NoLimit),
-        crate::config::RateLimitBackend::InMemory => Box::new(InMemoryRateLimiter::new(
+        RateLimitBackend::None => Ok(Box::new(NoLimit)),
+        RateLimitBackend::InMemory => Ok(Box::new(InMemoryRateLimiter::new(
             config.max_in_flight_per_subject,
             config.max_subjects,
-        )),
+        ))),
+        RateLimitBackend::Redis => {
+            let dsn_env = resolve_dsn_env(config, budget).ok_or_else(|| {
+                RateLimitBuildError::invalid(
+                    "rate_limit `redis`: `dsn_env` must name the env var holding the connection string",
+                )
+            })?;
+            if config.dsn_env.is_none() {
+                tracing::info!(
+                    dsn_env,
+                    "rate-limit Redis backend reusing the budget DSN reference"
+                );
+            }
+            let url = env
+                .get(dsn_env)
+                .map(String::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    RateLimitBuildError::invalid(format!(
+                        "`{dsn_env}` is unset or empty in the environment"
+                    ))
+                })?;
+            Ok(Box::new(
+                redis::RedisRateLimiter::connect(
+                    url,
+                    config.key_prefix(),
+                    config.max_in_flight_per_subject,
+                    std::time::Duration::from_secs(config.lease_ttl_seconds),
+                    std::time::Duration::from_millis(config.timeout_ms),
+                    std::time::Duration::from_millis(config.connect_timeout_ms),
+                    config.on_unavailable,
+                )
+                .await?,
+            ))
+        }
     }
 }
 
@@ -228,6 +313,7 @@ mod tests {
                 }
                 Err(RateLimitError::Exceeded) => denied += 1,
                 Err(RateLimitError::SubjectCapacityExceeded) => unreachable!(),
+                Err(RateLimitError::StoreUnavailable) => unreachable!(),
             }
         }
         assert_eq!((admitted, denied), (2, 1));

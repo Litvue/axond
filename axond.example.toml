@@ -410,6 +410,11 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # (namespace, subject), with no route or alias dimension.
 
 # [rate_limit]
-# backend = "in-memory" # none (default) | in-memory
+# backend = "in-memory" # none (default) | in-memory | redis
 # max_in_flight_per_subject = 16
 # max_subjects = 10000
+# dsn_env = "AXOND_REDIS_URL" # optional: otherwise reuse [budget].dsn_env
+# key_prefix = "axond:rate_limit"
+# on_unavailable = "deny" # deny (default) | allow
+# lease_ttl_seconds = 300
+# timeout_ms = 250

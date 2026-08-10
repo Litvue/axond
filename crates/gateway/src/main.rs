@@ -184,7 +184,10 @@ async fn serve() -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("budget configuration failed: {e}"))?;
     tracing::info!(backend = budget.name(), "budget enforcement");
-    let rate_limiter: Box<dyn RateLimiter> = rate_limit::build(&config.rate_limit);
+    let rate_limiter: Box<dyn RateLimiter> =
+        rate_limit::build(&config.rate_limit, &config.budget, &env)
+            .await
+            .map_err(|e| anyhow::anyhow!("rate-limit configuration failed: {e}"))?;
     tracing::info!(backend = rate_limiter.name(), "inbound rate limiting");
 
     let bind = config.server.bind;

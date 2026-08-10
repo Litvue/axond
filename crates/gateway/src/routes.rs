@@ -542,8 +542,16 @@ async fn serve(
         .rate_limiter
         .acquire(&rate_limit_key)
         .await
-        .map_err(|_| GatewayError::RateLimitExceeded {
-            retry_after_seconds: None,
+        .map_err(|error| match error {
+            crate::rate_limit::RateLimitError::StoreUnavailable => {
+                GatewayError::RateLimitUnavailable
+            }
+            crate::rate_limit::RateLimitError::Exceeded
+            | crate::rate_limit::RateLimitError::SubjectCapacityExceeded => {
+                GatewayError::RateLimitExceeded {
+                    retry_after_seconds: None,
+                }
+            }
         })?;
 
     // Budget is denominated in micro-dollars. Hold a conservative cost estimate
@@ -2660,6 +2668,22 @@ targets = [
         }
     }
 
+    struct UnavailableLimiter;
+
+    #[async_trait::async_trait]
+    impl RateLimiter for UnavailableLimiter {
+        fn name(&self) -> &'static str {
+            "unavailable-test"
+        }
+
+        async fn acquire(
+            &self,
+            _key: &RateLimitKey,
+        ) -> Result<crate::rate_limit::RateLimitPermit, crate::rate_limit::RateLimitError> {
+            Err(crate::rate_limit::RateLimitError::StoreUnavailable)
+        }
+    }
+
     struct RejectingBudget;
 
     #[async_trait::async_trait]
@@ -2757,6 +2781,23 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert!(no_retry_after);
         assert!(budget.0.lock().unwrap().is_empty());
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn unavailable_rate_limit_store_is_a_typed_503_before_budget_reservation() {
+        let budget = RecordingBudget::default();
+        let state = budgeted_state_with_limiter(
+            "http://127.0.0.1:1",
+            Box::new(budget.clone()),
+            Box::new(UnavailableLimiter),
+        );
+
+        let response = router(state).oneshot(chat_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limit_unavailable");
+        assert!(budget.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -62,13 +62,12 @@ Tier 0.
 | Tier | What it buys | What it costs |
 | --- | --- | --- |
 | **0 — config-only** | Namespaces, providers, aliases, prices, credentials, pools, failover, reload, gateway keys, minted-token verification and issuance epochs, stdout usage, local budgets, and health probes. | No datastore. In-memory health and budgets are per replica; the default is no budget. This is the hermetic [`ops/tier0-gate.sh`](./ops/tier0-gate.sh) CI posture proved on every PR by [ADR 0018](./docs/adr/0018-tier-0-hermetic-boot-gate.md). |
-| **1 — Redis** | Shared budget enforcement today. | Redis availability is part of admission for every budgeted request; `on_unavailable = "deny"` (the default) returns `503 budget_unavailable`. |
+| **1 — Redis** | Exact shared budgets and inbound in-flight rate limiting. | Redis availability is part of selected admission paths; `on_unavailable = "deny"` (the default) returns `503` (`budget_unavailable` or `rate_limit_unavailable`). |
 | **2 — Postgres** | Durable usage rows and shared Postgres-backed budgets; a future store-owned caller/key lifecycle. | A Postgres role, ordered migrations, backup/restore ownership, and boot-time DSN resolution. |
 
-The shipped Tier 1 feature today is `[budget] backend = "redis"`. Exact
-inbound rate limiting (`RateLimiter`/`NoLimit`) and precise per-token
-revocation are future, not-yet-shipped declarations: axond has no inbound
-limiting or revocation store today. Minted claims require `jti`, but today's
+Tier 1 ships `[budget] backend = "redis"` and `[rate_limit] backend = "redis"`
+for exact shared admission. Precise per-token revocation remains a future
+declaration. Minted claims require `jti`, but today's
 revocation ladder is short TTLs, killing a `kid`, and rotation. An OTLP usage
 sink is Tier 0 state (no datastore, nothing to migrate), but not hermetic: it
 adds a collector dependency at boot, so it is excluded from the hermetic Tier
@@ -434,6 +433,7 @@ runtime-neutral.
 - [x] OpenTelemetry traces (per-upstream-attempt spans, TTFT), metrics, logs
 - [x] Usage sinks: Postgres (batched, versioned schema) + OTLP; Tinybird / ClickHouse post-beta
 - [x] Budget backends (Tier 1 / Tier 2): shared Redis / Postgres, held reservations, partial charging (see [ADR 0010](./docs/adr/0010-shared-budget-backends-and-charging-policy.md))
+- [x] Exact cross-replica inbound in-flight rate limiting via Redis leases (Tier 1)
 - [x] Native Anthropic `/v1/messages` passthrough + `/v1/embeddings` (see [ADR 0012](./docs/adr/0012-native-provider-routes.md)); `/v1/responses` deferred post-beta (typed `501`)
 - [x] Multiple credentials per provider (pooling, weighted, skip-on-429)
 - [x] Config hot-reload (SIGHUP / watched files) for zero-restart BYOK onboarding (see [ADR 0011](./docs/adr/0011-config-hot-reload.md))
