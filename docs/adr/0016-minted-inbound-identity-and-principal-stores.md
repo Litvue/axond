@@ -125,9 +125,10 @@ mint successfully against the policy ceiling and then be rejected by the
 gateway if it exceeds the configured `max_ttl`.
 
 The current minter emits only claims the verifier enforces. It deliberately
-does not emit `scope`, `aliases`, or `max_request_microdollars` until the
-corresponding authorization controls exist; an unenforced narrowing claim
-would create a misleading credential.
+does not emit `scope` or `max_request_microdollars` until the corresponding
+authorization controls exist; an unenforced narrowing claim would create a
+misleading credential. The `aliases` claim is enforced at dispatch and in the
+`/v1/models` view, and is emitted by `axond mint --alias`.
 
 `POST /v1/tokens` is an opt-in alternative for deployments where callers cannot
 run a minter. It is authenticated by a static gateway key authorized to mint

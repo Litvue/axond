@@ -8,7 +8,7 @@ use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header, errors::ErrorKind as JwtErrorKind,
 };
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use crate::aliases::AliasScope;
@@ -176,7 +176,15 @@ struct TokenClaims {
     ns: Option<String>,
     sub: Option<String>,
     // Keep this loose so a wrong JSON type becomes a typed 403, not a 401 decode failure.
-    aliases: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_optional_value")]
+    aliases: Option<Option<Value>>,
+}
+
+fn deserialize_optional_value<'de, D>(deserializer: D) -> Result<Option<Option<Value>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Some(Option::<Value>::deserialize(deserializer)?))
 }
 
 impl TokenVerifier {
@@ -431,7 +439,7 @@ impl PrincipalStore for TokenVerifier {
         }
         let alias_scope = match claims.aliases {
             None => None,
-            Some(value) => Some(
+            Some(Some(value)) => Some(
                 AliasScope::parse(serde_json::from_value::<Vec<String>>(value).map_err(|_| {
                     PrincipalStoreError::Forbidden(TokenVerificationError::InvalidAliasClaim)
                 })?)
@@ -439,6 +447,11 @@ impl PrincipalStore for TokenVerifier {
                     PrincipalStoreError::Forbidden(TokenVerificationError::InvalidAliasClaim)
                 })?,
             ),
+            Some(None) => {
+                return Err(PrincipalStoreError::Forbidden(
+                    TokenVerificationError::InvalidAliasClaim,
+                ));
+            }
         };
         let subject = claims.sub.filter(|subject| !subject.is_empty()).ok_or(
             PrincipalStoreError::Unauthorized(TokenVerificationError::MissingClaim {
@@ -819,7 +832,7 @@ mod tests {
         #[serde(skip_serializing_if = "Option::is_none")]
         sub: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        aliases: Option<Vec<String>>,
+        aliases: Option<Value>,
     }
 
     const ED_PRIVATE_PK8: &[u8] = &[
@@ -972,7 +985,7 @@ max_ttl = "15m"
     async fn token_verifier_resolves_alias_scope_and_rejects_invalid_claims() {
         let verifier = token_verifier();
         let mut restricted = valid_claims();
-        restricted.aliases = Some(vec!["gpt-*".to_owned(), "claude-3".to_owned()]);
+        restricted.aliases = Some(serde_json::json!(["gpt-*", "claude-3"]));
         let principal = verifier
             .resolve(&Presented {
                 credential: &signed_token(restricted),
@@ -986,11 +999,24 @@ max_ttl = "15m"
         assert!(!scope.permits("other"));
 
         let mut invalid = valid_claims();
-        invalid.aliases = Some(vec!["foo*bar".to_owned()]);
+        invalid.aliases = Some(serde_json::json!(["foo*bar"]));
         assert!(matches!(
             verifier
                 .resolve(&Presented {
                     credential: &signed_token(invalid),
+                })
+                .await,
+            Err(PrincipalStoreError::Forbidden(
+                TokenVerificationError::InvalidAliasClaim
+            ))
+        ));
+
+        let mut null = valid_claims();
+        null.aliases = Some(Value::Null);
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(null),
                 })
                 .await,
             Err(PrincipalStoreError::Forbidden(
