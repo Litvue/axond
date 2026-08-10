@@ -59,6 +59,7 @@ pub(crate) struct RedisRelease {
     timeout: Duration,
     lease_ttl: Duration,
     retry_semaphore: &'static Semaphore,
+    connection_suspect: Arc<AtomicBool>,
 }
 
 impl RedisRelease {
@@ -77,19 +78,22 @@ impl RedisRelease {
                 )
                 .min(self.lease_ttl);
             let deadline = tokio::time::Instant::now() + retry_window;
-            let mut connection = self.connection;
-
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if !remaining.is_zero() {
-                let result = tokio::time::timeout(
-                    self.timeout.min(remaining),
-                    Self::invoke(&self.script, &self.key, &self.lease_id, &mut connection),
-                )
-                .await;
-                if matches!(result, Ok(Ok(_))) {
-                    return;
+            if !self.connection_suspect.load(Ordering::Acquire) {
+                let mut connection = self.connection;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if !remaining.is_zero() {
+                    let result = tokio::time::timeout(
+                        self.timeout.min(remaining),
+                        Self::invoke(&self.script, &self.key, &self.lease_id, &mut connection),
+                    )
+                    .await;
+                    if matches!(result, Ok(Ok(_))) {
+                        return;
+                    }
+                    tracing::debug!(
+                        "rate-limit lease release failed; retrying on a fresh connection"
+                    );
                 }
-                tracing::debug!("rate-limit lease release failed; retrying on a fresh connection");
             }
 
             for attempt in 2..=RELEASE_MAX_ATTEMPTS {
@@ -251,6 +255,7 @@ impl RedisRateLimiter {
             timeout: self.timeout,
             lease_ttl: self.lease_ttl,
             retry_semaphore: self.retry_semaphore,
+            connection_suspect: self.connection_suspect.clone(),
         }
     }
 
@@ -620,6 +625,7 @@ mod tests {
         stalled_lease: Arc<Mutex<Option<Vec<u8>>>>,
         released_lease: Arc<Mutex<Option<Vec<u8>>>>,
         release_connection: Arc<AtomicUsize>,
+        shared_release_commands: Arc<AtomicUsize>,
         task: JoinHandle<()>,
     }
 
@@ -633,11 +639,13 @@ mod tests {
             let stalled_lease = Arc::new(Mutex::new(None));
             let released_lease = Arc::new(Mutex::new(None));
             let release_connection = Arc::new(AtomicUsize::new(0));
+            let shared_release_commands = Arc::new(AtomicUsize::new(0));
             let task = {
                 let connections = connections.clone();
                 let stalled_lease = stalled_lease.clone();
                 let released_lease = released_lease.clone();
                 let release_connection = release_connection.clone();
+                let shared_release_commands = shared_release_commands.clone();
                 tokio::spawn(async move {
                     loop {
                         let Ok((stream, _)) = listener.accept().await else {
@@ -651,6 +659,7 @@ mod tests {
                             stalled_lease.clone(),
                             released_lease.clone(),
                             release_connection.clone(),
+                            shared_release_commands.clone(),
                         ));
                     }
                 })
@@ -661,6 +670,7 @@ mod tests {
                 stalled_lease,
                 released_lease,
                 release_connection,
+                shared_release_commands,
                 task,
             }
         }
@@ -759,6 +769,7 @@ mod tests {
         stalled_lease: Arc<Mutex<Option<Vec<u8>>>>,
         released_lease: Arc<Mutex<Option<Vec<u8>>>>,
         release_connection: Arc<AtomicUsize>,
+        shared_release_commands: Arc<AtomicUsize>,
     ) {
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
@@ -774,6 +785,9 @@ mod tests {
                     return;
                 }
             } else if stall_acquire && name.eq_ignore_ascii_case(b"EVALSHA") {
+                if command.len() == 5 {
+                    shared_release_commands.fetch_add(1, Ordering::Relaxed);
+                }
                 if let Some(lease_id) = command.get(7) {
                     *stalled_lease.lock().unwrap() = Some(lease_id.clone());
                 }
@@ -1175,6 +1189,11 @@ mod tests {
             if let (Some(stalled_lease), Some(released_lease)) = (stalled_lease, released_lease) {
                 assert!(stub.connections.load(Ordering::Relaxed) >= 2);
                 assert!(stub.release_connection.load(Ordering::Relaxed) >= 2);
+                assert_eq!(
+                    stub.shared_release_commands.load(Ordering::Relaxed),
+                    0,
+                    "suspect shared connection received a release command"
+                );
                 assert_eq!(released_lease, stalled_lease);
                 return;
             }
