@@ -905,15 +905,15 @@ mod tests {
                 if write_half.write_all(b"+PONG\r\n").await.is_err() {
                     return;
                 }
-            } else if stall_acquire && name.eq_ignore_ascii_case(b"EVALSHA") {
-                if command.len() == 5 {
-                    shared_release_commands.fetch_add(1, Ordering::Relaxed);
-                }
+            } else if stall_acquire && name.eq_ignore_ascii_case(b"EVALSHA") && command.len() >= 8 {
                 if let Some(lease_id) = command.get(7) {
                     *stalled_lease.lock().unwrap() = Some(lease_id.clone());
                 }
-                std::future::pending::<()>().await;
+                continue;
             } else if name.eq_ignore_ascii_case(b"EVALSHA") {
+                if stall_acquire && command.len() == 5 {
+                    shared_release_commands.fetch_add(1, Ordering::Relaxed);
+                }
                 if loaded_release
                     && loaded_hash.as_deref().map(str::as_bytes)
                         == command.get(1).map(Vec::as_slice)
@@ -1182,7 +1182,7 @@ mod tests {
         );
         assert!(allow.acquire(&key()).await.is_ok());
 
-        relay.set_mode(RelayMode::Cut);
+        relay.set_mode(RelayMode::Forward);
         assert!(matches!(
             deny.acquire(&key()).await,
             Err(RateLimitError::StoreUnavailable)
@@ -1225,7 +1225,7 @@ mod tests {
             limiter.acquire(&key()).await,
             Err(RateLimitError::StoreUnavailable)
         ));
-        relay.set_mode(RelayMode::Forward);
+        relay.set_mode(RelayMode::Cut);
         assert_eq!(stub.acquires.load(Ordering::Relaxed), 1);
 
         let started = std::time::Instant::now();
@@ -1243,6 +1243,7 @@ mod tests {
             "acquire used a poisoned shared connection"
         );
 
+        relay.set_mode(RelayMode::Forward);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         let mut recovered = false;
         while tokio::time::Instant::now() < deadline {

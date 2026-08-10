@@ -175,7 +175,7 @@ remains the final backstop.
 
 A cancelled response wait can poison a multiplexed connection's reply
 alignment, so the limiter retires that generation after any acquire or
-compensating-release timeout and refuses new admissions while a bounded
-replacement is in flight. Results from a retired generation are unknown, so
-the existing unavailable policy applies rather than trusting an admission or
-denial.
+permit-release timeout; ordinary permit releases share this cancellation
+hazard. It refuses new admissions while a bounded replacement is in flight.
+Results from a retired generation are unknown, so the existing unavailable
+policy applies rather than trusting an admission or denial.
