@@ -196,6 +196,7 @@ pub struct ReloadSummary {
     pub credentials: Delta,
     pub gateway_keys: Delta,
     pub gateway_verifiers: Delta,
+    pub gateway_token_epochs: Delta,
     pub gateway_token_audience: Delta,
     pub gateway_key_fingerprints: HashMap<String, String>,
     pub gateway_verifier_fingerprints: HashMap<String, String>,
@@ -300,6 +301,20 @@ impl ReloadSummary {
                         &after.gateway_verifier_fingerprints,
                     )),
             ),
+            gateway_token_epochs: Delta::between(
+                before_config
+                    .gateway_token_epoch
+                    .iter()
+                    .map(gateway_token_epoch_key),
+                after_config
+                    .gateway_token_epoch
+                    .iter()
+                    .map(gateway_token_epoch_key),
+            )
+            .with_changed(gateway_token_epoch_definition_changes(
+                before_config,
+                after_config,
+            )),
             gateway_token_audience: Delta::between(
                 before_config
                     .gateway_token
@@ -326,6 +341,7 @@ impl ReloadSummary {
             && self.credentials.is_empty()
             && self.gateway_keys.is_empty()
             && self.gateway_verifiers.is_empty()
+            && self.gateway_token_epochs.is_empty()
             && self.gateway_token_audience.is_empty()
     }
 
@@ -339,6 +355,7 @@ impl ReloadSummary {
             credentials = %self.credentials,
             gateway_keys = %self.gateway_keys,
             gateway_verifiers = %self.gateway_verifiers,
+            gateway_token_epochs = %self.gateway_token_epochs,
             gateway_token_audience = %self.gateway_token_audience,
             gateway_key_fingerprints = ?self.gateway_key_fingerprints,
             gateway_verifier_fingerprints = ?self.gateway_verifier_fingerprints,
@@ -367,6 +384,13 @@ impl ReloadSummary {
 /// `namespace/provider/label` — the pool member a credential entry declares.
 fn credential_key(c: &crate::config::Credential) -> String {
     format!("{}/{}/{}", c.namespace, c.provider, c.label())
+}
+
+fn gateway_token_epoch_key(epoch: &crate::config::GatewayTokenEpoch) -> String {
+    match epoch.subject.as_deref() {
+        Some(subject) => format!("{}/{}", epoch.namespace, subject),
+        None => epoch.namespace.clone(),
+    }
 }
 
 impl Delta {
@@ -402,6 +426,26 @@ fn verifier_definition_changes(before: &Config, after: &Config) -> Vec<String> {
                 || before.max_ttl != after.max_ttl)
                 .then(|| (*kid).to_owned())
         })
+        .collect::<Vec<_>>();
+    changed.sort();
+    changed
+}
+
+fn gateway_token_epoch_definition_changes(before: &Config, after: &Config) -> Vec<String> {
+    let before: HashMap<String, u64> = before
+        .gateway_token_epoch
+        .iter()
+        .map(|epoch| (gateway_token_epoch_key(epoch), epoch.min_iat))
+        .collect();
+    let after: HashMap<String, u64> = after
+        .gateway_token_epoch
+        .iter()
+        .map(|epoch| (gateway_token_epoch_key(epoch), epoch.min_iat))
+        .collect();
+    let mut changed = before
+        .iter()
+        .filter(|(key, min_iat)| after.get(*key).is_some_and(|current| current != *min_iat))
+        .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
     changed.sort();
     changed
@@ -718,6 +762,45 @@ max_ttl = "15m"
         );
         let aliases = listed_aliases(&state).await;
         assert!(aliases.contains(&"acme-fast".to_string()));
+    }
+
+    /// An epoch-only edit is visible in the applied reload summary, while a
+    /// second reload of the same content is a no-op.
+    #[tokio::test]
+    async fn reload_summary_reports_token_epoch_changes_and_noop_reloads() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+        let epoch_config = format!(
+            "{PLATFORM_ONLY}\n[[gateway_token_epoch]]\nnamespace = \"platform\"\nmin_iat = 1\n"
+        );
+
+        file.rewrite(&epoch_config);
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("epoch candidate is valid");
+        assert_eq!(
+            summary.gateway_token_epochs.added,
+            vec!["platform".to_string()]
+        );
+        assert!(summary.gateway_token_epochs.removed.is_empty());
+        assert!(summary.gateway_token_epochs.changed.is_empty());
+        assert!(!summary.is_empty());
+
+        file.rewrite(&epoch_config.replace("min_iat = 1", "min_iat = 2"));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("changed epoch candidate is valid");
+        assert_eq!(
+            summary.gateway_token_epochs.changed,
+            vec!["platform".to_string()]
+        );
+
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("no-op candidate is valid");
+        assert!(summary.gateway_token_epochs.is_empty());
+        assert!(summary.is_empty());
     }
 
     /// An issuance epoch is part of the immutable candidate snapshot: SIGHUP

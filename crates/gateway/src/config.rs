@@ -895,6 +895,16 @@ impl Config {
                     epoch.namespace
                 )));
             }
+            if epoch
+                .subject
+                .as_deref()
+                .is_some_and(|subject| subject.trim().is_empty())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "gateway_token_epoch subject for namespace `{}` must not be empty",
+                    epoch.namespace
+                )));
+            }
             let subject = epoch.subject.as_deref().unwrap_or("");
             if entries
                 .insert((epoch.namespace.as_str(), subject), ())
@@ -1353,6 +1363,15 @@ audience = "test"
                 .to_string()
                 .contains("duplicate")
         );
+
+        for subject in ["", "   "] {
+            let blank_subject = format!(
+                "{VALID}\n[[gateway_token_epoch]]\nnamespace = \"platform\"\nsubject = \"{subject}\"\nmin_iat = 1\n"
+            );
+            let error = Config::from_toml_str(&blank_subject).expect_err("blank subject must fail");
+            assert!(error.to_string().contains("subject"), "{error}");
+            assert!(error.to_string().contains("empty"), "{error}");
+        }
     }
 
     #[test]
