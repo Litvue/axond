@@ -50,6 +50,12 @@ subject, signer key id, and capability, but never token bytes or key material.
 `axond mint --scope` emits repeatable capability claims and validates each
 name against the fixed vocabulary before signing.
 
+### State tier
+
+This is Tier 0 / config-only: enforcement is derived from the config snapshot
+and the token itself, with no Redis, Postgres, or request-path store. It does
+not raise the state tier of an existing deployment.
+
 ## Consequences
 
 - A minted caller can be narrowed per route without a config edit.
