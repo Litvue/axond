@@ -50,8 +50,14 @@ const SHARED_CONNECTION_REPLACEMENT_COOLDOWN: Duration = Duration::from_millis(2
 // shared manager's first attempt remains available to every release.
 static RELEASE_RETRY_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
 
+#[derive(Clone)]
+struct SharedConnection {
+    manager: ConnectionManager,
+    generation: u64,
+}
+
 pub(crate) struct RedisRelease {
-    connection: ConnectionManager,
+    connection: SharedConnection,
     client: Client,
     script: Script,
     key: String,
@@ -59,7 +65,8 @@ pub(crate) struct RedisRelease {
     timeout: Duration,
     lease_ttl: Duration,
     retry_semaphore: &'static Semaphore,
-    connection_suspect: Arc<AtomicBool>,
+    current_connection: Arc<ArcSwap<SharedConnection>>,
+    suspect_generation: Arc<AtomicU64>,
 }
 
 impl RedisRelease {
@@ -78,8 +85,11 @@ impl RedisRelease {
                 )
                 .min(self.lease_ttl);
             let deadline = tokio::time::Instant::now() + retry_window;
-            if !self.connection_suspect.load(Ordering::Acquire) {
-                let mut connection = self.connection;
+            let current = self.current_connection.load_full();
+            let snapshot_is_clean = current.generation == self.connection.generation
+                && self.suspect_generation.load(Ordering::Acquire) < self.connection.generation;
+            if snapshot_is_clean {
+                let mut connection = self.connection.manager.clone();
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if !remaining.is_zero() {
                     let result = tokio::time::timeout(
@@ -179,16 +189,15 @@ pub struct RedisRateLimiter {
     lease_ttl: Duration,
     timeout: Duration,
     on_unavailable: StoreUnavailable,
-    connection: Arc<ArcSwap<ConnectionManager>>,
+    connection: Arc<ArcSwap<SharedConnection>>,
     client: Client,
     connect_timeout: Duration,
     acquire: Script,
     release: Script,
     retry_semaphore: &'static Semaphore,
-    connection_suspect: Arc<AtomicBool>,
+    suspect_generation: Arc<AtomicU64>,
     replacement_in_flight: Arc<AtomicBool>,
     last_replacement_ms: Arc<AtomicU64>,
-    connection_generation: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Error)]
@@ -228,16 +237,18 @@ impl RedisRateLimiter {
             lease_ttl,
             timeout,
             on_unavailable,
-            connection: Arc::new(ArcSwap::from_pointee(connection)),
+            connection: Arc::new(ArcSwap::from_pointee(SharedConnection {
+                manager: connection,
+                generation: 1,
+            })),
             client: release_client,
             connect_timeout,
             acquire: Script::new(ACQUIRE),
             release: Script::new(RELEASE),
             retry_semaphore: release_retry_semaphore(),
-            connection_suspect: Arc::new(AtomicBool::new(false)),
+            suspect_generation: Arc::new(AtomicU64::new(0)),
             replacement_in_flight: Arc::new(AtomicBool::new(false)),
             last_replacement_ms: Arc::new(AtomicU64::new(0)),
-            connection_generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -255,12 +266,20 @@ impl RedisRateLimiter {
             timeout: self.timeout,
             lease_ttl: self.lease_ttl,
             retry_semaphore: self.retry_semaphore,
-            connection_suspect: self.connection_suspect.clone(),
+            current_connection: self.connection.clone(),
+            suspect_generation: self.suspect_generation.clone(),
         }
     }
 
-    fn mark_connection_suspect(&self) {
-        self.connection_suspect.store(true, Ordering::Release);
+    fn mark_connection_suspect(&self, generation: u64) {
+        self.suspect_generation
+            .fetch_max(generation, Ordering::AcqRel);
+        let current = self.connection.load_full();
+        if current.generation != generation
+            || self.suspect_generation.load(Ordering::Acquire) != generation
+        {
+            return;
+        }
         if self
             .replacement_in_flight
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
@@ -268,24 +287,39 @@ impl RedisRateLimiter {
         {
             return;
         }
-        let now = now_ms();
         let previous = self.last_replacement_ms.load(Ordering::Relaxed);
-        if previous != 0
-            && now.saturating_sub(previous)
-                < SHARED_CONNECTION_REPLACEMENT_COOLDOWN.as_millis() as u64
-        {
-            self.replacement_in_flight.store(false, Ordering::Release);
-            return;
-        }
-        self.last_replacement_ms.store(now, Ordering::Relaxed);
 
         let connection = self.connection.clone();
         let client = self.client.clone();
         let connect_timeout = self.connect_timeout;
-        let connection_suspect = self.connection_suspect.clone();
+        let suspect_generation = self.suspect_generation.clone();
         let replacement_in_flight = self.replacement_in_flight.clone();
-        let connection_generation = self.connection_generation.clone();
+        let last_replacement_ms = self.last_replacement_ms.clone();
         tokio::spawn(async move {
+            // Keep the replacement marked in flight while honoring cooldown;
+            // otherwise a suspect manager could be left refusing requests with
+            // no replacement scheduled to repair it.
+            if previous != 0 {
+                let elapsed = now_ms().saturating_sub(previous);
+                if elapsed < SHARED_CONNECTION_REPLACEMENT_COOLDOWN.as_millis() as u64 {
+                    tokio::time::sleep(
+                        SHARED_CONNECTION_REPLACEMENT_COOLDOWN
+                            .saturating_sub(Duration::from_millis(elapsed)),
+                    )
+                    .await;
+                }
+            }
+            let current = connection.load_full();
+            if current.generation != generation
+                || suspect_generation.load(Ordering::Acquire) != generation
+            {
+                replacement_in_flight.store(false, Ordering::Release);
+                return;
+            }
+            // Record the actual dial attempt, not merely the scheduling time.
+            // This makes cooldown cover the whole replacement attempt.
+            // (The task remains in flight during any preceding cooldown wait.)
+            last_replacement_ms.store(now_ms(), Ordering::Relaxed);
             let replacement = tokio::time::timeout(connect_timeout, async {
                 let mut connection = ConnectionManager::new(client).await?;
                 redis::cmd("PING")
@@ -295,9 +329,15 @@ impl RedisRateLimiter {
             })
             .await;
             if let Ok(Ok(manager)) = replacement {
-                connection.store(Arc::new(manager));
-                connection_generation.fetch_add(1, Ordering::Release);
-                connection_suspect.store(false, Ordering::Release);
+                let current = connection.load_full();
+                if current.generation == generation
+                    && suspect_generation.load(Ordering::Acquire) == generation
+                {
+                    connection.store(Arc::new(SharedConnection {
+                        manager,
+                        generation: generation + 1,
+                    }));
+                }
             }
             replacement_in_flight.store(false, Ordering::Release);
         });
@@ -357,18 +397,19 @@ impl RateLimiter for RedisRateLimiter {
     }
 
     async fn acquire(&self, key: &RateLimitKey) -> Result<RateLimitPermit, RateLimitError> {
-        if self.connection_suspect.load(Ordering::Acquire) {
-            self.mark_connection_suspect();
+        let snapshot = self.connection.load_full();
+        if self.suspect_generation.load(Ordering::Acquire) >= snapshot.generation {
+            self.mark_connection_suspect(snapshot.generation);
             return self.unavailable("shared Redis connection is recovering");
         }
         let lease_id = next_id();
         let lease_key = self.key(key);
-        let connection_generation = self.connection_generation.load(Ordering::Acquire);
+        let connection_generation = snapshot.generation;
         let result = tokio::time::timeout(self.timeout, async {
             // Swapping the manager only affects future requests. This request
             // keeps its snapshot; the generation check below discards any
             // successful result if a replacement happened while it was in flight.
-            let mut connection = self.connection.load_full().as_ref().clone();
+            let mut connection = snapshot.manager.clone();
             self.acquire
                 .prepare_invoke()
                 .key(&lease_key)
@@ -380,8 +421,10 @@ impl RateLimiter for RedisRateLimiter {
                 .await
         })
         .await;
-        if connection_generation != self.connection_generation.load(Ordering::Acquire)
-            && matches!(result, Ok(Ok(_)))
+        let current_generation = self.connection.load_full().generation;
+        if matches!(result, Ok(Ok(_)))
+            && (connection_generation != current_generation
+                || self.suspect_generation.load(Ordering::Acquire) >= connection_generation)
         {
             self.release(lease_key, lease_id).spawn();
             return self.unavailable("shared Redis connection was replaced during acquire");
@@ -401,7 +444,7 @@ impl RateLimiter for RedisRateLimiter {
                 self.unavailable(error)
             }
             Err(_) => {
-                self.mark_connection_suspect();
+                self.mark_connection_suspect(connection_generation);
                 self.release(lease_key, lease_id).spawn();
                 self.unavailable("operation timed out")
             }
@@ -1083,7 +1126,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_response_retires_shared_manager_before_next_acquire() {
         let stub = RedisLiveStub::start().await;
         let relay = RedisRelay::start(&stub.url()).await;
@@ -1122,9 +1165,23 @@ mod tests {
             "acquire used a poisoned shared connection"
         );
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(limiter.acquire(&key()).await.is_ok());
-        assert!(stub.acquires.load(Ordering::Relaxed) >= 2);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut recovered = false;
+        while tokio::time::Instant::now() < deadline {
+            if limiter.acquire(&key()).await.is_ok() {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            recovered,
+            "replacement did not restore admission within the bounded recovery window"
+        );
+        assert!(
+            stub.acquires.load(Ordering::Relaxed) >= 2,
+            "replacement admission did not reach the live stub"
+        );
     }
 
     #[tokio::test]
