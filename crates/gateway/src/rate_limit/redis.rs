@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use redis::aio::ConnectionLike;
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::{Client, Script};
 use ring::rand::{SecureRandom, SystemRandom};
 use thiserror::Error;
@@ -44,9 +44,8 @@ const RELEASE: &str = "redis.call('HDEL', KEYS[1], ARGV[1]); return 1";
 const RELEASE_MAX_ATTEMPTS: usize = 8;
 const RELEASE_RETRY_CONCURRENCY: usize = 16;
 const RELEASE_RETRY_WINDOW_MULTIPLIER: u32 = 10;
-// Permit drops have no caller waiting on them, so allow ordinary Redis
-// slowness more time than the admission budget before retiring a generation.
-const RELEASE_TIMEOUT: Duration = Duration::from_millis(250);
+const RELEASE_TIMEOUT_MULTIPLIER: u32 = 4;
+const RELEASE_TIMEOUT_FLOOR: Duration = Duration::from_secs(1);
 const SHARED_CONNECTION_REPLACEMENT_COOLDOWN: Duration = Duration::from_millis(250);
 
 // Keep fresh-connection retries below a small fixed concurrency cap; the
@@ -108,10 +107,10 @@ impl RedisRelease {
             return;
         };
         handle.spawn(async move {
+            let release_budget = release_timeout(self.timeout);
             // This fixed margin covers each attempt's bounded connect and invoke
             // plus capped exponential backoff; the TTL cap makes later retries pointless.
-            let retry_window = self
-                .timeout
+            let retry_window = release_budget
                 .saturating_mul(
                     RELEASE_RETRY_WINDOW_MULTIPLIER.saturating_mul(RELEASE_MAX_ATTEMPTS as u32),
                 )
@@ -136,7 +135,7 @@ impl RedisRelease {
                     let mut invoke_guard =
                         SharedInvokeGuard::new(shared_generation, self.suspect_generation.clone());
                     let result = tokio::time::timeout(
-                        RELEASE_TIMEOUT.min(remaining),
+                        release_budget.min(remaining),
                         Self::invoke(&self.script, &self.key, &self.lease_id, &mut connection),
                     )
                     .await;
@@ -163,8 +162,7 @@ impl RedisRelease {
                 if remaining.is_zero() {
                     break;
                 }
-                let backoff = self
-                    .timeout
+                let backoff = release_budget
                     .min(Duration::from_millis(25))
                     .saturating_mul(2_u32.pow((attempt - 2) as u32))
                     .min(Duration::from_millis(200));
@@ -182,7 +180,7 @@ impl RedisRelease {
                     continue;
                 };
                 let connection = tokio::time::timeout(
-                    self.timeout.min(remaining),
+                    release_budget.min(remaining),
                     self.client.get_multiplexed_async_connection(),
                 )
                 .await;
@@ -198,7 +196,7 @@ impl RedisRelease {
                     break;
                 }
                 let result = tokio::time::timeout(
-                    RELEASE_TIMEOUT.min(remaining),
+                    release_budget.min(remaining),
                     Self::invoke(&self.script, &self.key, &self.lease_id, &mut connection),
                 )
                 .await;
@@ -233,6 +231,20 @@ fn release_retry_semaphore() -> &'static Semaphore {
 
 fn try_release_retry_permit(semaphore: &Semaphore) -> Option<SemaphorePermit<'_>> {
     semaphore.try_acquire().ok()
+}
+
+fn release_timeout(admission_timeout: Duration) -> Duration {
+    // Permit drops have no caller waiting on them, so tolerate four times the
+    // configured admission budget, with a one-second floor for ordinary Redis
+    // HDEL latency. The lease TTL and retry deadline still bound total effort;
+    // a real stall beyond this per-attempt budget retires the generation.
+    admission_timeout
+        .saturating_mul(RELEASE_TIMEOUT_MULTIPLIER)
+        .max(RELEASE_TIMEOUT_FLOOR)
+}
+
+fn connection_manager_config() -> ConnectionManagerConfig {
+    ConnectionManagerConfig::new().set_response_timeout(None)
 }
 
 pub struct RedisRateLimiter {
@@ -273,7 +285,8 @@ impl RedisRateLimiter {
         let client = redis::Client::open(url)?;
         let release_client = client.clone();
         let connection = tokio::time::timeout(connect_timeout, async {
-            let mut connection = ConnectionManager::new(client).await?;
+            let mut connection =
+                ConnectionManager::new_with_config(client, connection_manager_config()).await?;
             redis::cmd("PING")
                 .query_async::<String>(&mut connection)
                 .await?;
@@ -371,7 +384,8 @@ impl RedisRateLimiter {
             // (The task remains in flight during any preceding cooldown wait.)
             last_replacement_ms.store(now_ms(), Ordering::Relaxed);
             let replacement = tokio::time::timeout(connect_timeout, async {
-                let mut connection = ConnectionManager::new(client).await?;
+                let mut connection =
+                    ConnectionManager::new_with_config(client, connection_manager_config()).await?;
                 redis::cmd("PING")
                     .query_async::<String>(&mut connection)
                     .await?;
@@ -1495,7 +1509,7 @@ mod tests {
             format!("axond:test:{}", next_id()),
             1,
             Duration::from_secs(5),
-            Duration::from_millis(25),
+            Duration::from_millis(250),
             Duration::from_millis(25),
             StoreUnavailable::Deny,
         )
@@ -1503,10 +1517,13 @@ mod tests {
         .expect("connect limiter");
         let permit = limiter.acquire(&key()).await.expect("acquire permit");
         let generation = limiter.connection.load_full().generation;
-        stub.set_release_delay(Duration::from_millis(500));
+        let timeout = Duration::from_millis(250);
+        let release_budget = release_timeout(timeout);
+        assert!(release_budget > timeout);
+        stub.set_release_delay(release_budget.saturating_mul(2));
         drop(permit);
 
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        let deadline = tokio::time::Instant::now() + release_budget.saturating_mul(2);
         let release_deadline = tokio::time::Instant::now() + Duration::from_millis(250);
         while stub.releases.load(Ordering::Relaxed) == 0 {
             assert!(
@@ -1576,7 +1593,7 @@ mod tests {
             format!("axond:test:{}", next_id()),
             1,
             Duration::from_secs(5),
-            Duration::from_millis(25),
+            Duration::from_millis(250),
             Duration::from_millis(50),
             StoreUnavailable::Deny,
         )
@@ -1584,7 +1601,9 @@ mod tests {
         .expect("connect limiter");
         let permit = limiter.acquire(&key()).await.expect("acquire permit");
         let generation = limiter.connection.load_full().generation;
-        stub.set_release_delay(Duration::from_millis(100));
+        let timeout = Duration::from_millis(250);
+        assert!(release_timeout(timeout) > timeout);
+        stub.set_release_delay(timeout.saturating_mul(2));
         drop(permit);
 
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
@@ -1595,7 +1614,7 @@ mod tests {
             );
             tokio::task::yield_now().await;
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(timeout.saturating_mul(3)).await;
         assert!(
             limiter.suspect_generation.load(Ordering::Acquire) < generation,
             "ordinary slow release retired a healthy generation"
