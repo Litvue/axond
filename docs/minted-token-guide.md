@@ -208,11 +208,11 @@ whole microdollars, so a cheap request against a cheap alias can estimate `0`
 and pass any ceiling. It is enforced at admission time and emitted by
 `axond mint --max-request-microdollars`.
 
-ADR 0016 describes three narrowing claims. `scope` is **not enforced by the
-current gateway and is not emitted by `axond mint`**; its enforcement and
-minting are tracked by #60. The `aliases` claim is enforced both before
-dispatch and in the caller's `/v1/models` view. It is a repeatable,
-case-sensitive pattern restriction:
+ADR 0016 describes three narrowing claims. `scope` is enforced by route
+capability and can be emitted with repeatable `--scope` flags:
+`chat`, `messages`, `embeddings`, and `models`. The `aliases` claim is enforced
+both before dispatch and in the caller's `/v1/models` view, and is emitted by
+`axond mint --alias`. It is a repeatable, case-sensitive pattern restriction.
 
 ```bash
 axond mint --kid acme-2026-08 --key-env SIGN_KEY --namespace acme \

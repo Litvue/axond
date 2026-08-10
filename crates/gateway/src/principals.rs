@@ -15,11 +15,47 @@ use crate::aliases::AliasScope;
 use crate::config::{Config, GatewayVerifierAlgorithm};
 use crate::key_material::{self, KeyMaterialError};
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum Capability {
+    Chat,
+    Messages,
+    Embeddings,
+    Models,
+}
+
+impl Capability {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "chat" => Some(Self::Chat),
+            "messages" => Some(Self::Messages),
+            "embeddings" => Some(Self::Embeddings),
+            "models" => Some(Self::Models),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Messages => "messages",
+            Self::Embeddings => "embeddings",
+            Self::Models => "models",
+        }
+    }
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 #[derive(Clone)]
 pub struct InboundKey {
     pub namespace: String,
     pub subject: String,
     pub signer_kid: Option<String>,
+    pub scope: Option<HashSet<Capability>>,
     pub alias_scope: Option<AliasScope>,
     pub max_request_microdollars: Option<u64>,
 }
@@ -188,10 +224,31 @@ struct TokenClaims {
     jti: Option<String>,
     ns: Option<String>,
     sub: Option<String>,
+    scope: Option<RawScope>,
     // Keep this loose so a wrong JSON type becomes a typed 403, not a 401 decode failure.
     #[serde(default, deserialize_with = "deserialize_optional_value")]
     aliases: Option<Option<Value>>,
     max_request_microdollars: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawScope {
+    String(String),
+    Array(Vec<String>),
+}
+
+impl RawScope {
+    fn capabilities(self) -> HashSet<Capability> {
+        let values = match self {
+            Self::String(value) => value.split_whitespace().map(str::to_owned).collect(),
+            Self::Array(values) => values,
+        };
+        values
+            .iter()
+            .filter_map(|value| Capability::parse(value))
+            .collect()
+    }
 }
 
 fn deserialize_optional_value<'de, D>(deserializer: D) -> Result<Option<Option<Value>>, D::Error>
@@ -498,6 +555,7 @@ impl PrincipalStore for TokenVerifier {
             namespace,
             subject,
             signer_kid: Some(verifier.kid.clone()),
+            scope: claims.scope.map(RawScope::capabilities),
             alias_scope,
             max_request_microdollars: claims.max_request_microdollars,
         }))
@@ -717,6 +775,7 @@ mod tests {
                 namespace: "platform".to_owned(),
                 subject: "AXOND_KEY".to_owned(),
                 signer_kid: None,
+                scope: None,
                 alias_scope: None,
                 max_request_microdollars: None,
             },
@@ -870,6 +929,8 @@ mod tests {
         #[serde(skip_serializing_if = "Option::is_none")]
         sub: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        scope: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         aliases: Option<Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         max_request_microdollars: Option<u64>,
@@ -995,6 +1056,7 @@ max_ttl = "15m"
             jti: Some("jti-1".to_owned()),
             ns: Some(namespace.to_owned()),
             sub: Some("caller-1".to_owned()),
+            scope: None,
             aliases: None,
             max_request_microdollars: None,
         }
@@ -1063,6 +1125,39 @@ max_ttl = "15m"
                 TokenVerificationError::Malformed
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn token_scope_accepts_oauth_string_and_discards_unknown_capabilities() {
+        let verifier = token_verifier();
+        let mut claims = valid_claims();
+        claims.scope = Some(serde_json::json!("chat unknown models"));
+        let principal = verifier
+            .resolve(&Presented {
+                credential: &signed_token(claims),
+            })
+            .await
+            .expect("valid token resolves")
+            .expect("valid token returns a principal");
+        let scope = principal.scope.expect("scope is present");
+        assert!(scope.contains(&Capability::Chat));
+        assert!(scope.contains(&Capability::Models));
+        assert_eq!(scope.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn token_scope_accepts_an_empty_array_as_an_empty_scope() {
+        let verifier = token_verifier();
+        let mut claims = valid_claims();
+        claims.scope = Some(serde_json::json!([]));
+        let principal = verifier
+            .resolve(&Presented {
+                credential: &signed_token(claims),
+            })
+            .await
+            .expect("valid token resolves")
+            .expect("valid token returns a principal");
+        assert!(principal.scope.expect("scope is present").is_empty());
     }
 
     #[tokio::test]

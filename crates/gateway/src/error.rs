@@ -11,7 +11,7 @@ use gateway_core::ProviderError;
 use gateway_transport::TransportError;
 use serde_json::json;
 
-use crate::principals::TokenVerificationError;
+use crate::principals::{Capability, TokenVerificationError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
@@ -37,6 +37,8 @@ pub enum GatewayError {
     TokenUnauthorized(#[source] TokenVerificationError),
     #[error("token authorization failed: {0}")]
     TokenForbidden(#[source] TokenVerificationError),
+    #[error("token scope does not authorize `{0}`")]
+    ScopeInsufficient(Capability),
     #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
     #[error(transparent)]
@@ -70,6 +72,7 @@ impl GatewayError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::TokenUnauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::TokenForbidden(_) => StatusCode::FORBIDDEN,
+            Self::ScopeInsufficient(_) => StatusCode::FORBIDDEN,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::UnsupportedWire { .. } => StatusCode::BAD_REQUEST,
@@ -96,6 +99,7 @@ impl GatewayError {
             Self::BudgetUnavailable => "budget_unavailable",
             Self::Unauthorized => "unauthorized",
             Self::TokenUnauthorized(error) | Self::TokenForbidden(error) => error.code(),
+            Self::ScopeInsufficient(_) => "token_scope_insufficient",
             Self::NotImplemented(_) => "not_implemented",
             Self::BadRequest(_) => "bad_request",
             Self::UnsupportedWire { .. } => "unsupported_wire",
@@ -183,5 +187,23 @@ mod tests {
             .to_bytes();
         let forbidden_body = String::from_utf8(forbidden_body.to_vec()).unwrap();
         assert!(!forbidden_body.contains("caller-namespace"));
+    }
+
+    #[tokio::test]
+    async fn scope_error_names_only_the_static_capability() {
+        let response = GatewayError::ScopeInsufficient(Capability::Messages).into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "token_scope_insufficient");
+        assert_eq!(
+            body["error"]["message"],
+            "token scope does not authorize `messages`"
+        );
     }
 }
