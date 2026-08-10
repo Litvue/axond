@@ -267,7 +267,7 @@ mod tests {
     use super::*;
     use crate::config::StoreUnavailable;
     use std::net::SocketAddr;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::watch;
     use tokio::task::JoinHandle;
@@ -362,6 +362,101 @@ mod tests {
         fn drop(&mut self) {
             self.task.abort();
         }
+    }
+
+    struct RedisStub {
+        address: SocketAddr,
+        task: JoinHandle<()>,
+    }
+
+    impl RedisStub {
+        async fn start(respond_to_ping: bool, stall_after_ping: bool) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind Redis stub");
+            let address = listener.local_addr().expect("stub address");
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    tokio::spawn(handle_stub_connection(
+                        stream,
+                        respond_to_ping,
+                        stall_after_ping,
+                    ));
+                }
+            });
+            Self { address, task }
+        }
+
+        fn url(&self) -> String {
+            format!("redis://{}/", self.address)
+        }
+    }
+
+    async fn handle_stub_connection(
+        stream: TcpStream,
+        respond_to_ping: bool,
+        stall_after_ping: bool,
+    ) {
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        loop {
+            let Some(command) = read_resp_command(&mut reader).await else {
+                return;
+            };
+            let is_ping = command
+                .first()
+                .is_some_and(|argument| argument.eq_ignore_ascii_case(b"PING"));
+            if is_ping {
+                if !respond_to_ping {
+                    std::future::pending::<()>().await;
+                }
+                if write_half.write_all(b"+PONG\r\n").await.is_err() {
+                    return;
+                }
+                if stall_after_ping {
+                    std::future::pending::<()>().await;
+                }
+            } else if write_half.write_all(b"+OK\r\n").await.is_err() {
+                return;
+            }
+        }
+    }
+
+    impl Drop for RedisStub {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn read_resp_command(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    ) -> Option<Vec<Vec<u8>>> {
+        let mut line = Vec::new();
+        reader.read_until(b'\n', &mut line).await.ok()?;
+        let count = std::str::from_utf8(line.strip_prefix(b"*")?.strip_suffix(b"\r\n")?)
+            .ok()?
+            .parse::<usize>()
+            .ok()?;
+        let mut command = Vec::with_capacity(count);
+        for _ in 0..count {
+            line.clear();
+            reader.read_until(b'\n', &mut line).await.ok()?;
+            let length = std::str::from_utf8(line.strip_prefix(b"$")?.strip_suffix(b"\r\n")?)
+                .ok()?
+                .parse::<usize>()
+                .ok()?;
+            let mut argument = vec![0; length + 2];
+            reader.read_exact(&mut argument).await.ok()?;
+            if !argument.ends_with(b"\r\n") {
+                return None;
+            }
+            argument.truncate(length);
+            command.push(argument);
+        }
+        Some(command)
     }
 
     async fn proxy(client: TcpStream, server: TcpStream, mode: &mut watch::Receiver<RelayMode>) {
@@ -573,6 +668,61 @@ mod tests {
         assert!(
             recovered,
             "same limiter did not recover after relay forwarding was restored"
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_policy_is_exercised_through_hermetic_acquire() {
+        let stub = RedisStub::start(true, true).await;
+        let timeout = Duration::from_millis(40);
+        let deny = RedisRateLimiter::connect(
+            &stub.url(),
+            format!("axond:test:{}", next_id()),
+            1,
+            Duration::from_secs(5),
+            timeout,
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect deny limiter");
+        let allow = RedisRateLimiter::connect(
+            &stub.url(),
+            format!("axond:test:{}", next_id()),
+            1,
+            Duration::from_secs(5),
+            timeout,
+            StoreUnavailable::Allow,
+        )
+        .await
+        .expect("connect allow limiter");
+
+        assert!(matches!(
+            deny.acquire(&key()).await,
+            Err(RateLimitError::StoreUnavailable)
+        ));
+        assert!(allow.acquire(&key()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_is_bounded_when_ping_never_answers() {
+        let stub = RedisStub::start(false, false).await;
+        let timeout = Duration::from_millis(40);
+        let started = std::time::Instant::now();
+        let result = RedisRateLimiter::connect(
+            &stub.url(),
+            "axond:test".into(),
+            1,
+            Duration::from_secs(1),
+            timeout,
+            StoreUnavailable::Deny,
+        )
+        .await;
+
+        assert!(matches!(result, Err(RedisConnectError::Timeout { .. })));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "connect timeout was not bounded: {:?}",
+            started.elapsed()
         );
     }
 
