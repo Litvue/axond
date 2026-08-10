@@ -243,14 +243,35 @@ Both need a restart.
 
 ## Sizing and stateful opt-ins
 
-Nothing in the default posture needs a datastore. Turn one on only for what you
-actually want:
+Choose the state tier before sizing the deployment. Tiers describe the state
+backends axond itself depends on, not provider egress: upstream provider calls
+still use the network at Tier 0. Tier 0 is config-only and has no datastore;
+credential health, circuits, and in-memory budgets are per replica. The
+hermetic CI gate in [ADR 0018](./adr/0018-tier-0-hermetic-boot-gate.md) proves
+Tier 0 boot-and-serve on every PR.
 
-| Want | Turn on | Costs |
-| --- | --- | --- |
-| Durable usage rows | `[[usage_sink]] kind = "postgres"` | A Postgres role and the [`usage_v1.sql`](../ops/postgres/usage_v1.sql) table. |
-| Usage in your trace backend | `[[usage_sink]] kind = "otlp"` | Requires `OTEL_EXPORTER_OTLP_ENDPOINT`. |
-| A spend cap across replicas | `[budget] backend = "redis"` or `"postgres"` | Redis, or the [`budget_v1.sql`](../ops/postgres/budget_v1.sql) tables. |
+Tier 1 adds Redis for the only shipped Tier 1 feature today, shared budget
+enforcement. Redis availability becomes part of admission for every budgeted
+request; the default `on_unavailable = "deny"` fails closed with
+`503 budget_unavailable`. Exact inbound rate limiting and precise per-token
+revocation are future, not-yet-shipped Tier 1 declarations, not current
+capabilities.
+
+Tier 2 adds Postgres-backed durable usage and shared budgets. It requires
+database roles, boot-time DSN resolution, ordered migrations, and explicit
+backup/restore ownership. A Postgres dependency is therefore part of startup,
+and migrations must precede a binary that writes a new usage schema. The
+one-owner rule is described in the [configuration reference](./configuration.md#state-tiers):
+namespaces, providers, aliases, prices, and provider credentials remain
+config-owned; only callers and keys may become store-owned.
+
+| Tier | Want | Turn on | Costs |
+| --- | --- | --- | --- |
+| 0 | Default operation, local health, failover, reload, stdout usage, or an approximate per-replica spend cap | Omit `[[usage_sink]]` and `[budget]`, or use `[budget] backend = "in-memory"` | No datastore; a fleet has one in-memory budget per replica. |
+| 0* | Usage in your trace backend | `[[usage_sink]] kind = "otlp"` | Requires `OTEL_EXPORTER_OTLP_ENDPOINT` at boot; Tier 0 state but not hermetic, so it is outside the Tier 0 CI lane. |
+| 1 | A spend cap across replicas | `[budget] backend = "redis"` | Redis availability couples budgeted admission to Redis; `deny` fails closed. |
+| 2 | Durable usage rows | `[[usage_sink]] kind = "postgres"` | A Postgres role, the [`usage_v1.sql`](../ops/postgres/usage_v1.sql) table, ordered additive migrations, and backup/restore ownership. |
+| 2 | A spend cap across replicas | `[budget] backend = "postgres"` | Postgres availability and the [`budget_v1.sql`](../ops/postgres/budget_v1.sql) tables. |
 
 For upgrades, apply each additive `usage_v1_<sequence>_<name>.sql` migration in
 filename order before deploying a gateway that writes its new column. Otherwise

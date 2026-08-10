@@ -28,7 +28,9 @@ cargo test --all-features
 - **Keep `gateway-core` I/O-free.** No HTTP client, no runtime, no config, no
   secrets in the core crate — that is what keeps provider-wire logic testable in
   isolation.
-- **Significant decisions get an ADR** in `docs/adr` in the same PR.
+- **Significant decisions get an ADR** in `docs/adr` in the same PR. Start from
+  the [ADR template](./docs/adr/template.md), including its required state-tier
+  declaration.
 
 ## License
 

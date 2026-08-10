@@ -199,11 +199,20 @@ The verifier requires these claims:
 five-second clock-skew allowance. Unknown claims are otherwise ignored by the
 current verifier.
 
+`max_request_microdollars` is an optional admission-time per-request ceiling
+in microdollars. The gateway compares it with the pre-dispatch estimate before
+reservation; a cumulative per-token cap is not stateless and belongs to the
+Tier 1 work in ADR 0017. An unlimited token omits the claim: a ceiling of `0`
+admits nothing, because any priced request estimates above it. Estimates are
+whole microdollars, so a cheap request against a cheap alias can estimate `0`
+and pass any ceiling.
+
 ADR 0016 describes three narrowing claims. `scope` is enforced by route
 capability and can be emitted with repeatable `--scope` flags:
-`chat`, `messages`, `embeddings`, and `models`. `aliases` and
-`max_request_microdollars` remain unimplemented and are not emitted by
-`axond mint`. See ADR 0019 for the derived namespace authority rules.
+`chat`, `messages`, `embeddings`, and `models`. `max_request_microdollars` is
+enforced at admission time against the pre-dispatch estimate and is emitted by
+`axond mint --max-request-microdollars`. Only `aliases` remains unimplemented
+(see #61). See ADR 0019 for the derived namespace authority rules.
 
 ## 5. Rotation runbook
 

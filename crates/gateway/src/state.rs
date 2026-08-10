@@ -180,6 +180,7 @@ impl ConfigSnapshot {
                     subject: label.to_owned(),
                     signer_kid: None,
                     scope: None,
+                    max_request_microdollars: None,
                 },
             });
             gateway_key_fingerprints

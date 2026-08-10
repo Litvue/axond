@@ -99,6 +99,13 @@ fn cli() -> Command {
                         .help("Route capability claim; repeat for multiple capabilities"),
                 )
                 .arg(
+                    Arg::new("max-request-microdollars")
+                        .long("max-request-microdollars")
+                        .value_name("MICRODOLLARS")
+                        .value_parser(clap::value_parser!(u64))
+                        .help("Optional per-request cost ceiling in microdollars"),
+                )
+                .arg(
                     Arg::new("config")
                         .long("config")
                         .value_name("PATH")

@@ -125,10 +125,17 @@ mint successfully against the policy ceiling and then be rejected by the
 gateway if it exceeds the configured `max_ttl`.
 
 The current minter emits only claims the verifier enforces. It deliberately
-does not emit `aliases` or `max_request_microdollars` until the corresponding
-authorization controls exist; an unenforced narrowing claim would create a
-misleading credential. Route `scope` capabilities are now enforced as described
-in ADR 0019 and may be emitted by `axond mint`.
+does not emit `aliases` until the corresponding authorization controls exist;
+an unenforced narrowing claim would create a misleading credential. Route
+`scope` capabilities are enforced as described in ADR 0019 and may be emitted by
+`axond mint`. `max_request_microdollars` is enforced at admission time only:
+the gateway compares it with the pre-dispatch estimate immediately before the
+budget reservation, and rejects an over-ceiling request with a typed 403
+`request_cost_ceiling_exceeded`, distinct from the 429 `budget_exceeded`
+tenant cumulative cap in ADR 0010. The reservation and settlement policy is
+unchanged, so actual usage above the estimate is still charged at what it
+consumed. A cumulative per-token cap is not stateless and is outside this
+claim; it belongs to the Tier 1 work in ADR 0017.
 
 `POST /v1/tokens` is an opt-in alternative for deployments where callers cannot
 run a minter. It is authenticated by a static gateway key authorized to mint

@@ -171,7 +171,9 @@ namespace = "acme"
 # the operator's breakglass credential. Tier 0 verification is stateless and
 # has no Redis/Postgres runtime dependency. `scope` is enforced as a route
 # capability and can be emitted with repeatable `axond mint --scope` flags.
-# `aliases` and `max_request_microdollars` remain unimplemented.
+# `max_request_microdollars` is enforced at admission time against the
+# pre-dispatch estimate and can be emitted by `axond mint`; only `aliases`
+# remains unimplemented.
 #
 # [gateway_token]
 # audience = "acme-production"

@@ -35,6 +35,15 @@ env:
 jobs:
   release-please:
     if: github.event_name == 'push'
+    # release-please force-updates the release branch on every run, so two runs
+    # for main in parallel leave one of them pushing the lockfile sync onto a
+    # ref the other has already replaced. Scope the queue to this job: only its
+    # lockfile-sync push needs serialization, while the per-tag artifact lanes
+    # must not queue behind each other. Queue instead of cancelling: a cancelled
+    # run is the one that would have synced the lockfile for its merge.
+    concurrency:
+      group: release-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -71,21 +80,40 @@ jobs:
         with:
           ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
           token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
-      - name: Sync Cargo.lock
+      - name: Install the sync toolchain
         if: ${{ steps.release.outputs.pr }}
-        run: |
-          rustup toolchain install stable --profile minimal
-          cargo update --workspace
-      - name: Commit lockfile
+        run: rustup toolchain install stable --profile minimal
+      # The job concurrency group serializes lockfile sync for main, but a
+      # dispatch or a manual push to the release branch can still move it under
+      # this job, so every attempt re-syncs onto the remote tip rather than
+      # pushing a commit built on a stale checkout. A force push is deliberately
+      # avoided: the goal is to include release-please's regenerated content,
+      # not overwrite it.
+      - name: Sync Cargo.lock onto the release branch
         if: ${{ steps.release.outputs.pr }}
+        env:
+          RELEASE_BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
         run: |
-          if ! git diff --quiet Cargo.lock; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add Cargo.lock
-            git commit -m "chore: sync Cargo.lock for release"
-            git push
-          fi
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          for attempt in 1 2 3; do
+            git fetch --force origin "$RELEASE_BRANCH"
+            git reset --hard FETCH_HEAD
+            cargo update --workspace
+            if git diff --quiet Cargo.lock; then
+              echo "Cargo.lock is already in sync with $RELEASE_BRANCH"
+              exit 0
+            fi
+            git commit -m "chore: sync Cargo.lock for release" -- Cargo.lock
+            if git push origin "HEAD:$RELEASE_BRANCH"; then
+              exit 0
+            fi
+            echo "$RELEASE_BRANCH moved during attempt $attempt; re-syncing onto its new tip" >&2
+            sleep $((attempt * 5))
+          done
+          echo "could not sync Cargo.lock onto $RELEASE_BRANCH after 3 attempts" >&2
+          exit 1
 
   release-metadata:
     name: Resolve release metadata

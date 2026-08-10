@@ -250,6 +250,15 @@ impl InMemoryBudget {
                 || now.saturating_duration_since(ledger.last_touched) <= self.idle_ttl
         });
     }
+
+    #[cfg(test)]
+    pub fn outstanding(&self, key: &BudgetKey) -> u64 {
+        self.ledgers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map_or(0, Ledger::outstanding)
+    }
 }
 
 #[async_trait]
