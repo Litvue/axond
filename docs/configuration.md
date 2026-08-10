@@ -187,9 +187,14 @@ of strings, matched as a case-sensitive union: a string without `*` is an exact
 alias; one `*` at the end is a prefix match (`foo*`); one at the beginning is a
 suffix match (`*foo`); and bare `*` matches every alias. Empty strings, a `*`
 in the middle, or more than one `*` are invalid and reject the request with
-`403`. An empty array permits no aliases. The claim can only narrow the
+`403`. An empty array permits no aliases, and a claim that is present but not an
+array of strings — including `null` — is invalid. The claim can only narrow the
 namespace's existing authority: it never adds aliases the namespace cannot
 already reach. Static gateway keys remain unrestricted.
+
+The check runs before the alias is looked up, so a disallowed alias returns `403`
+whether or not it is configured and regardless of whether the endpoint supports
+the target's wire protocol.
 
 ## `[reload]`
 
