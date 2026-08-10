@@ -199,11 +199,20 @@ The verifier requires these claims:
 five-second clock-skew allowance. Unknown claims are otherwise ignored by the
 current verifier.
 
-ADR 0016 describes three narrowing claims. `scope` and
-`max_request_microdollars` are **not enforced by the current gateway and are not
-emitted by `axond mint`**; their enforcement and minting are tracked by #60 and
-#62. The `aliases` claim is enforced both before dispatch and in the caller's
-`/v1/models` view. It is a repeatable, case-sensitive pattern restriction:
+`max_request_microdollars` is an optional admission-time per-request ceiling
+in microdollars. The gateway compares it with the pre-dispatch estimate before
+reservation; a cumulative per-token cap is not stateless and belongs to the
+Tier 1 work in ADR 0017. An unlimited token omits the claim: a ceiling of `0`
+admits nothing, because any priced request estimates above it. Estimates are
+whole microdollars, so a cheap request against a cheap alias can estimate `0`
+and pass any ceiling. It is enforced at admission time and emitted by
+`axond mint --max-request-microdollars`.
+
+ADR 0016 describes three narrowing claims. `scope` is **not enforced by the
+current gateway and is not emitted by `axond mint`**; its enforcement and
+minting are tracked by #60. The `aliases` claim is enforced both before
+dispatch and in the caller's `/v1/models` view. It is a repeatable,
+case-sensitive pattern restriction:
 
 ```bash
 axond mint --kid acme-2026-08 --key-env SIGN_KEY --namespace acme \

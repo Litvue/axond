@@ -489,6 +489,15 @@ async fn serve(
     };
     let estimate = route.estimate(&body);
     let estimated_cost = model.targets[0].price.cost_microdollars(estimate);
+    if let Some(ceiling) = caller.max_request_microdollars
+        && estimated_cost > ceiling
+    {
+        return Err(GatewayError::RequestCostCeilingExceeded {
+            alias: alias.clone(),
+            estimated_microdollars: estimated_cost,
+            ceiling_microdollars: ceiling,
+        });
+    }
     let reservation = match state.0.budget.reserve(&budget_key, estimated_cost).await {
         Admission::Allowed(reservation) => reservation,
         Admission::Denied(Denial::Exceeded) => return Err(GatewayError::BudgetExceeded(alias)),
@@ -515,13 +524,14 @@ async fn serve(
         .await;
     }
 
+    let reservation = BudgetReservation::new(state.clone(), budget_key, reservation);
     let outcome =
         match dispatch_with_failover(&state, &snapshot, &caller, model, &body, &wire).await {
             Ok(outcome) => outcome,
             Err(err) => {
                 // Nothing reached a provider, so nothing was consumed: the whole
                 // estimate goes back rather than lingering until it expires.
-                state.0.budget.release(&budget_key, &reservation).await;
+                reservation.release().await;
                 return Err(err);
             }
         };
@@ -530,7 +540,7 @@ async fn serve(
         Ok(response) => {
             let usage = to_usage(&response.usage);
             let cost = served.price.cost_microdollars(usage);
-            state.0.budget.settle(&budget_key, &reservation, cost).await;
+            reservation.settle(cost).await;
             record_usage(
                 &state,
                 RecordArgs {
@@ -559,7 +569,7 @@ async fn serve(
             // measure. Spend is therefore genuinely unknowable and charged as
             // zero — the streamed path, which can measure what it relayed,
             // charges its partial spend.
-            state.0.budget.release(&budget_key, &reservation).await;
+            reservation.release().await;
             record_usage(
                 &state,
                 RecordArgs {
@@ -926,6 +936,62 @@ struct BudgetHold {
     estimated_input_tokens: u64,
 }
 
+/// A buffered request's reservation must be reconciled even when its handler is
+/// dropped while the upstream request is in flight. Streaming `Accounting`
+/// covers cancellation once the relay exists; this guard covers the buffered path.
+struct BudgetReservation {
+    state: AppState,
+    key: BudgetKey,
+    reservation: Option<Reservation>,
+}
+
+impl BudgetReservation {
+    fn new(state: AppState, key: BudgetKey, reservation: Reservation) -> Self {
+        Self {
+            state,
+            key,
+            reservation: Some(reservation),
+        }
+    }
+
+    /// Disarm before awaiting so dropping the guard after settlement cannot
+    /// submit a second budget operation.
+    async fn settle(mut self, actual_microdollars: u64) {
+        let reservation = self
+            .reservation
+            .take()
+            .expect("budget reservation guard must be armed");
+        self.state
+            .0
+            .budget
+            .settle(&self.key, &reservation, actual_microdollars)
+            .await;
+    }
+
+    /// Disarm before awaiting so the explicit release and the drop fallback
+    /// cannot both reconcile the same hold.
+    async fn release(mut self) {
+        let reservation = self
+            .reservation
+            .take()
+            .expect("budget reservation guard must be armed");
+        self.state.0.budget.release(&self.key, &reservation).await;
+    }
+}
+
+impl Drop for BudgetReservation {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let state = self.state.clone();
+        let key = self.key.clone();
+        streaming::spawn_settlement(async move {
+            state.0.budget.release(&key, &reservation).await;
+        });
+    }
+}
+
 /// Mutable bookkeeping shared by the buffered and streaming failover walks: how
 /// many upstream attempts have been made, which targets were circuit-skipped,
 /// and the reason to surface if nothing ever dispatched.
@@ -1231,9 +1297,11 @@ mod tests {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde::Serialize;
     use std::collections::HashMap;
+    use std::future::pending;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tokio::sync::oneshot;
     use tower::util::ServiceExt;
 
     /// The inbound key every test config declares, and the secret the caller
@@ -1413,6 +1481,8 @@ targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdol
         aud: &'static str,
         ns: &'static str,
         sub: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_request_microdollars: Option<u64>,
     }
 
     #[tokio::test]
@@ -1480,6 +1550,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             aud: "test-audience",
             ns: "platform",
             sub: "token-caller",
+            max_request_microdollars: None,
         };
         let mut header = Header::new(Algorithm::HS256);
         header.kid = Some("route-kid".to_owned());
@@ -1556,6 +1627,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             subject: "restricted".to_owned(),
             signer_kid: Some("test-kid".to_owned()),
             alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
+            max_request_microdollars: None,
         };
         let response = list_models(Extension(snapshot), Extension(caller))
             .await
@@ -1681,6 +1753,7 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
                     subject: "restricted".to_owned(),
                     signer_kid: Some("test-kid".to_owned()),
                     alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
+                    max_request_microdollars: None,
                 },
             )
             .await
@@ -2016,6 +2089,23 @@ targets = [
         }
     }
 
+    struct SharedBudget(Arc<crate::budget::InMemoryBudget>);
+
+    #[async_trait::async_trait]
+    impl crate::budget::BudgetStore for SharedBudget {
+        fn name(&self) -> &'static str {
+            "shared_test"
+        }
+
+        async fn reserve(&self, key: &BudgetKey, estimated: u64) -> Admission {
+            self.0.reserve(key, estimated).await
+        }
+
+        async fn settle(&self, key: &BudgetKey, reservation: &Reservation, actual: u64) {
+            self.0.settle(key, reservation, actual).await;
+        }
+    }
+
     /// One target, one credential, and the budget store under test.
     fn budgeted_state(base_url: &str, budget: Box<dyn crate::budget::BudgetStore>) -> AppState {
         let cfg = Config::from_toml_str(&format!(
@@ -2045,6 +2135,74 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         let env = env_with([("K1", "sk-test")]);
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
         AppState::new(cfg, &env, UsageFanout::new(sinks), budget).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_request_over_its_ceiling_is_rejected_before_reservation_or_dispatch() {
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let budget = RecordingBudget::default();
+        let state = budgeted_state(&base_url, Box::new(budget.clone()));
+        let snapshot = state.config();
+        let caller = InboundKey {
+            namespace: "platform".to_owned(),
+            subject: "ceiling-caller".to_owned(),
+            signer_kid: Some("test-kid".to_owned()),
+            alias_scope: None,
+            max_request_microdollars: Some(1),
+        };
+        let body = json!({"model": "gpt-4o", "messages": []});
+
+        let error = serve(
+            state,
+            HeaderMap::new(),
+            body,
+            Route::ChatCompletions,
+            snapshot,
+            caller,
+        )
+        .await
+        .expect_err("the estimate exceeds the caller ceiling");
+
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "request_cost_ceiling_exceeded");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert!(budget.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_request_under_its_ceiling_still_reserves_and_dispatches() {
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let budget = RecordingBudget::default();
+        let state = budgeted_state(&base_url, Box::new(budget.clone()));
+        let snapshot = state.config();
+        let caller = InboundKey {
+            namespace: "platform".to_owned(),
+            subject: "ceiling-caller".to_owned(),
+            signer_kid: Some("test-kid".to_owned()),
+            alias_scope: None,
+            max_request_microdollars: Some(10_000),
+        };
+        let body = json!({"model": "gpt-4o", "messages": []});
+
+        let response = serve(
+            state,
+            HeaderMap::new(),
+            body,
+            Route::ChatCompletions,
+            snapshot,
+            caller,
+        )
+        .await
+        .expect("the estimate is under the caller ceiling");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(hits.load(Ordering::SeqCst) > 0);
+        assert!(!budget.0.lock().unwrap().is_empty());
     }
 
     /// The reserved estimate is a ceiling, not the charge: a completed request
@@ -2088,6 +2246,58 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         let ledger = budget.0.lock().unwrap();
         assert_eq!(ledger.len(), 1);
         assert_eq!(ledger[0].1, 0);
+    }
+
+    /// A cancelled buffered handler drops its reservation guard while the
+    /// dispatcher is waiting for the provider; the detached release must run
+    /// before the next request can observe the ledger.
+    #[tokio::test]
+    async fn a_cancelled_buffered_request_releases_its_reservation() {
+        let (started_tx, started_rx) = oneshot::channel();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let upstream = Router::new().route(
+            "/chat/completions",
+            post({
+                let started_tx = started_tx.clone();
+                move || async move {
+                    if let Some(started_tx) = started_tx.lock().unwrap().take() {
+                        let _ = started_tx.send(());
+                    }
+                    pending::<()>().await;
+                    StatusCode::OK.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let budget = Arc::new(crate::budget::InMemoryBudget::new(10_000));
+        let state = budgeted_state(
+            &format!("http://{addr}"),
+            Box::new(SharedBudget(budget.clone())),
+        );
+        let request = tokio::spawn(router(state).oneshot(chat_request()));
+        started_rx.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+
+        let key = BudgetKey {
+            namespace: "platform".to_owned(),
+            subject: "AXOND_INBOUND_KEY".to_owned(),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let outstanding = budget.outstanding(&key);
+            if outstanding == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "reservation was not released before timeout; outstanding={outstanding}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// The two denials are different answers to the caller: over-cap is the

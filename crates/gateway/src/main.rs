@@ -100,6 +100,13 @@ fn cli() -> Command {
                         .help("Audience claim; defaults from a matching verifier config"),
                 )
                 .arg(
+                    Arg::new("max-request-microdollars")
+                        .long("max-request-microdollars")
+                        .value_name("MICRODOLLARS")
+                        .value_parser(clap::value_parser!(u64))
+                        .help("Optional per-request cost ceiling in microdollars"),
+                )
+                .arg(
                     Arg::new("config")
                         .long("config")
                         .value_name("PATH")
