@@ -10,6 +10,7 @@ use redis::aio::ConnectionManager;
 use redis::{Client, Script};
 use ring::rand::{SecureRandom, SystemRandom};
 use thiserror::Error;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use super::{PermitRelease, RateLimitError, RateLimitKey, RateLimitPermit, RateLimiter};
 use crate::config::StoreUnavailable;
@@ -40,6 +41,12 @@ return 1
 
 const RELEASE: &str = "redis.call('HDEL', KEYS[1], ARGV[1]); return 1";
 const RELEASE_MAX_ATTEMPTS: usize = 8;
+const RELEASE_RETRY_CONCURRENCY: usize = 16;
+const RELEASE_RETRY_WINDOW_MULTIPLIER: u32 = 10;
+
+// Keep fresh-connection retries below a small fixed concurrency cap; the
+// shared manager's first attempt remains available to every release.
+static RELEASE_RETRY_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
 
 pub(crate) struct RedisRelease {
     connection: ConnectionManager,
@@ -58,12 +65,15 @@ impl RedisRelease {
             return;
         };
         handle.spawn(async move {
+            // This fixed margin covers each attempt's bounded connect and invoke
+            // plus capped exponential backoff; the TTL cap makes later retries pointless.
             let retry_window = self
                 .timeout
-                .saturating_mul((RELEASE_MAX_ATTEMPTS * 5) as u32)
+                .saturating_mul(
+                    RELEASE_RETRY_WINDOW_MULTIPLIER.saturating_mul(RELEASE_MAX_ATTEMPTS as u32),
+                )
                 .min(self.lease_ttl);
             let deadline = tokio::time::Instant::now() + retry_window;
-            let backoff = self.timeout.min(Duration::from_millis(25));
             let mut connection = self.connection;
 
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -79,11 +89,20 @@ impl RedisRelease {
                 tracing::debug!("rate-limit lease release failed; retrying on a fresh connection");
             }
 
+            let Some(_retry_permit) = try_release_retry_permit(release_retry_semaphore()) else {
+                tracing::debug!("rate-limit lease release retry limit reached; lease will expire");
+                return;
+            };
             for attempt in 2..=RELEASE_MAX_ATTEMPTS {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
                     break;
                 }
+                let backoff = self
+                    .timeout
+                    .min(Duration::from_millis(25))
+                    .saturating_mul(2_u32.pow((attempt - 2) as u32))
+                    .min(Duration::from_millis(200));
                 tokio::time::sleep(backoff.min(remaining)).await;
 
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -103,6 +122,9 @@ impl RedisRelease {
                     continue;
                 };
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
                 let result = tokio::time::timeout(
                     self.timeout.min(remaining),
                     Self::invoke(&self.script, &self.key, &self.lease_id, &mut connection),
@@ -131,6 +153,14 @@ impl RedisRelease {
             .invoke_async(connection)
             .await
     }
+}
+
+fn release_retry_semaphore() -> &'static Semaphore {
+    RELEASE_RETRY_SEMAPHORE.get_or_init(|| Semaphore::new(RELEASE_RETRY_CONCURRENCY))
+}
+
+fn try_release_retry_permit(semaphore: &Semaphore) -> Option<SemaphorePermit<'_>> {
+    semaphore.try_acquire().ok()
 }
 
 pub struct RedisRateLimiter {
@@ -337,6 +367,10 @@ mod tests {
     use super::*;
     use crate::config::StoreUnavailable;
     use std::net::SocketAddr;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::watch;
@@ -499,6 +533,143 @@ mod tests {
     impl Drop for RedisStub {
         fn drop(&mut self) {
             self.task.abort();
+        }
+    }
+
+    struct RedisRetryStub {
+        address: SocketAddr,
+        connections: Arc<AtomicUsize>,
+        stalled_lease: Arc<Mutex<Option<Vec<u8>>>>,
+        released_lease: Arc<Mutex<Option<Vec<u8>>>>,
+        release_connection: Arc<AtomicUsize>,
+        task: JoinHandle<()>,
+    }
+
+    impl RedisRetryStub {
+        async fn start() -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind Redis retry stub");
+            let address = listener.local_addr().expect("retry stub address");
+            let connections = Arc::new(AtomicUsize::new(0));
+            let stalled_lease = Arc::new(Mutex::new(None));
+            let released_lease = Arc::new(Mutex::new(None));
+            let release_connection = Arc::new(AtomicUsize::new(0));
+            let task = {
+                let connections = connections.clone();
+                let stalled_lease = stalled_lease.clone();
+                let released_lease = released_lease.clone();
+                let release_connection = release_connection.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let Ok((stream, _)) = listener.accept().await else {
+                            break;
+                        };
+                        let connection = connections.fetch_add(1, Ordering::Relaxed) + 1;
+                        tokio::spawn(handle_retry_connection(
+                            stream,
+                            connection,
+                            connection == 1,
+                            stalled_lease.clone(),
+                            released_lease.clone(),
+                            release_connection.clone(),
+                        ));
+                    }
+                })
+            };
+            Self {
+                address,
+                connections,
+                stalled_lease,
+                released_lease,
+                release_connection,
+                task,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("redis://{}/", self.address)
+        }
+    }
+
+    impl Drop for RedisRetryStub {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn handle_retry_connection(
+        stream: TcpStream,
+        connection: usize,
+        stall_acquire: bool,
+        stalled_lease: Arc<Mutex<Option<Vec<u8>>>>,
+        released_lease: Arc<Mutex<Option<Vec<u8>>>>,
+        release_connection: Arc<AtomicUsize>,
+    ) {
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        let mut loaded_hash = None;
+        let mut loaded_release = false;
+        loop {
+            let Some(command) = read_resp_command(&mut reader).await else {
+                return;
+            };
+            let name = command.first().map(Vec::as_slice).unwrap_or_default();
+            if name.eq_ignore_ascii_case(b"PING") {
+                if write_half.write_all(b"+PONG\r\n").await.is_err() {
+                    return;
+                }
+            } else if stall_acquire && name.eq_ignore_ascii_case(b"EVALSHA") {
+                if let Some(lease_id) = command.get(7) {
+                    *stalled_lease.lock().unwrap() = Some(lease_id.clone());
+                }
+                std::future::pending::<()>().await;
+            } else if name.eq_ignore_ascii_case(b"EVALSHA") {
+                if loaded_release
+                    && loaded_hash.as_deref().map(str::as_bytes)
+                        == command.get(1).map(Vec::as_slice)
+                {
+                    if let Some(lease_id) = command.get(4) {
+                        *released_lease.lock().unwrap() = Some(lease_id.clone());
+                    }
+                    release_connection.store(connection, Ordering::Relaxed);
+                    if write_half.write_all(b":1\r\n").await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                if write_half
+                    .write_all(b"-NOSCRIPT No matching script\r\n")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            } else if name.eq_ignore_ascii_case(b"SCRIPT")
+                && command
+                    .get(1)
+                    .is_some_and(|argument| argument.eq_ignore_ascii_case(b"LOAD"))
+            {
+                let Some(script) = command.get(2) else {
+                    return;
+                };
+                let hash = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, script)
+                    .as_ref()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                loaded_hash = Some(hash.clone());
+                loaded_release = script.windows(4).any(|window| window == b"HDEL");
+                if write_half
+                    .write_all(format!("${}\r\n{}\r\n", hash.len(), hash).as_bytes())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            } else if write_half.write_all(b"+OK\r\n").await.is_err() {
+                return;
+            }
         }
     }
 
@@ -776,6 +947,54 @@ mod tests {
             Err(RateLimitError::StoreUnavailable)
         ));
         assert!(allow.acquire(&key()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_release_retries_on_a_fresh_connection() {
+        let stub = RedisRetryStub::start().await;
+        let timeout = Duration::from_millis(40);
+        let limiter = RedisRateLimiter::connect(
+            &stub.url(),
+            format!("axond:test:{}", next_id()),
+            1,
+            Duration::from_secs(5),
+            timeout,
+            timeout,
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect limiter");
+
+        assert!(matches!(
+            limiter.acquire(&key()).await,
+            Err(RateLimitError::StoreUnavailable)
+        ));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            let stalled_lease = stub.stalled_lease.lock().unwrap().clone();
+            let released_lease = stub.released_lease.lock().unwrap().clone();
+            if let (Some(stalled_lease), Some(released_lease)) = (stalled_lease, released_lease) {
+                assert!(stub.connections.load(Ordering::Relaxed) >= 2);
+                assert!(stub.release_connection.load(Ordering::Relaxed) >= 2);
+                assert_eq!(released_lease, stalled_lease);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("compensating release was not observed on a fresh connection");
+    }
+
+    #[test]
+    fn release_retry_semaphore_refuses_exhaustion_without_queueing() {
+        let semaphore = Semaphore::new(RELEASE_RETRY_CONCURRENCY);
+        let permits = (0..RELEASE_RETRY_CONCURRENCY)
+            .map(|_| try_release_retry_permit(&semaphore).expect("reserve retry permit"))
+            .collect::<Vec<_>>();
+
+        assert!(try_release_retry_permit(&semaphore).is_none());
+        drop(permits);
+        assert!(try_release_retry_permit(&semaphore).is_some());
     }
 
     #[tokio::test]
