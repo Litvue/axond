@@ -76,11 +76,12 @@ implementation is available for development and single-replica deployments,
 but it provides only approximately `limit ÷ replicas` when replicas share a
 nominal limit and is not an exact fleet-wide control.
 
-Redis provides the exact Tier 1 implementation using a token-bucket or GCRA
-algorithm. It reuses the existing `[budget]` DSN and connection convention
-rather than creating a second datastore configuration story. If a configured
-Redis limiter is unavailable, its documented admission policy is bounded and
-fail-closed, consistent with the shared budget precedent in ADR 0010.
+Redis provides the exact Tier 1 implementation using expiring leases for
+in-flight concurrency. It reuses the existing `[budget]` DSN and connection
+convention rather than creating a second datastore configuration story. If a
+configured Redis limiter is unavailable, its documented admission policy is
+bounded and fail-closed, consistent with the shared budget precedent in ADR
+0010.
 
 ### Explicitly rejected or deferred
 
@@ -136,9 +137,31 @@ Per-model and hierarchical budget caps remain the existing opt-in
   `Retry-After`, because an upstream request has no honest deadline. Redis
   (#65) will slot behind the same trait without changing key semantics,
   placement, error shape, or the `NoLimit` default.
-- The Redis schema and algorithm parameters for rate limiting and `jti`
-  revocation remain open.
+- The Redis schema and algorithm parameters for `jti` revocation remain open.
 - A future self-serve identity product must define its administrative auth
   separately; this ADR does not create a runtime control plane.
 - The tier labels should be included in future feature ADRs and deployment
   documentation so operators can choose a tier deliberately.
+
+## Amendment (2026-08-10)
+
+Issue #65 ships the Tier 1 Redis rate limiter. It enforces the existing
+`(namespace, subject)` policy as exact fleet-wide **in-flight concurrency**, not
+RPM or TPM: each admission creates a lease in one Redis hash and the owned
+permit releases that lease on drop. Token-bucket and GCRA algorithms remain
+deferred to the future issue that adds a rate-window policy.
+
+The key is
+`<key_prefix>:{<namespace>|<subject>}:leases`, with
+`key_prefix = "axond:rate_limit"` by default. Hash tags keep each key's script
+atomic and cluster-compatible. Each hash field is `lease_id -> expires_at_ms`;
+the acquire script removes expired fields, counts live leases, and admits only
+when the count is below `max_in_flight_per_subject`. The hash TTL is twice the
+lease TTL, and the lease expiry is the crash-safety backstop when a replica
+cannot drop its permit.
+
+The limiter reuses the Redis budget's `dsn_env` when its own reference is
+omitted, so a single-Redis deployment has one connection-string reference.
+Redis connects and PINGs at boot. Each operation has a bounded timeout and the
+default `on_unavailable = "deny"` fails closed with
+`503 rate_limit_unavailable`; `allow` is an explicit fail-open exception.

@@ -39,6 +39,7 @@ struct Instruments {
     budget_retained_subjects: Gauge<u64>,
     rate_limit_denials: Counter<u64>,
     rate_limit_capacity_denials: Counter<u64>,
+    rate_limit_unavailable_denials: Counter<u64>,
 }
 
 static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
@@ -135,6 +136,10 @@ impl Instruments {
             rate_limit_capacity_denials: meter
                 .u64_counter("axond.rate_limit.capacity_denials")
                 .with_description("Inbound rate-limit admissions denied by subject-map capacity.")
+                .build(),
+            rate_limit_unavailable_denials: meter
+                .u64_counter("axond.rate_limit.unavailable_denials")
+                .with_description("Rate-limit admissions denied because the store was unavailable.")
                 .build(),
         }
     }
@@ -261,6 +266,13 @@ pub fn record_rate_limit_capacity_denial() {
         return;
     };
     instruments.rate_limit_capacity_denials.add(1, &[]);
+}
+
+pub fn record_rate_limit_unavailable_denial() {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.rate_limit_unavailable_denials.add(1, &[]);
 }
 
 /// Publish a target's circuit state. Ordered failover (which owns the breaker)

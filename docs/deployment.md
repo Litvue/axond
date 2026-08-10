@@ -250,12 +250,10 @@ credential health, circuits, and in-memory budgets are per replica. The
 hermetic CI gate in [ADR 0018](./adr/0018-tier-0-hermetic-boot-gate.md) proves
 Tier 0 boot-and-serve on every PR.
 
-Tier 1 adds Redis for the only shipped Tier 1 feature today, shared budget
-enforcement. Redis availability becomes part of admission for every budgeted
-request; the default `on_unavailable = "deny"` fails closed with
-`503 budget_unavailable`. Exact inbound rate limiting and precise per-token
-revocation are future, not-yet-shipped Tier 1 declarations, not current
-capabilities.
+Tier 1 adds Redis for shared budget enforcement and exact inbound in-flight
+rate limiting. Redis availability becomes part of the selected admission path;
+the default `on_unavailable = "deny"` fails closed with `503 budget_unavailable`
+or `503 rate_limit_unavailable`. Precise per-token revocation remains future.
 
 Tier 2 adds Postgres-backed durable usage and shared budgets. It requires
 database roles, boot-time DSN resolution, ordered migrations, and explicit

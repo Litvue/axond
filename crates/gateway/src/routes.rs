@@ -542,8 +542,16 @@ async fn serve(
         .rate_limiter
         .acquire(&rate_limit_key)
         .await
-        .map_err(|_| GatewayError::RateLimitExceeded {
-            retry_after_seconds: None,
+        .map_err(|error| match error {
+            crate::rate_limit::RateLimitError::StoreUnavailable => {
+                GatewayError::RateLimitUnavailable
+            }
+            crate::rate_limit::RateLimitError::Exceeded
+            | crate::rate_limit::RateLimitError::SubjectCapacityExceeded => {
+                GatewayError::RateLimitExceeded {
+                    retry_after_seconds: None,
+                }
+            }
         })?;
 
     // Budget is denominated in micro-dollars. Hold a conservative cost estimate

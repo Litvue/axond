@@ -492,6 +492,8 @@ pub enum RateLimitBackend {
     None,
     /// Per-replica in-flight holds and counters.
     InMemory,
+    /// Exact shared leases across replicas.
+    Redis,
 }
 
 impl RateLimitBackend {
@@ -499,11 +501,12 @@ impl RateLimitBackend {
         match self {
             Self::None => "none",
             Self::InMemory => "in-memory",
+            Self::Redis => "redis",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RateLimitConfig {
     /// Selects the inbound concurrency backend.
     #[serde(default)]
@@ -514,6 +517,21 @@ pub struct RateLimitConfig {
     /// Maximum number of active caller keys retained by the in-memory backend.
     #[serde(default = "default_max_subjects")]
     pub max_subjects: usize,
+    /// Name of the env var holding the Redis connection string.
+    #[serde(default)]
+    pub dsn_env: Option<String>,
+    /// Redis key namespace.
+    #[serde(default)]
+    pub key_prefix: Option<String>,
+    /// What to do when Redis cannot enforce the limit.
+    #[serde(default)]
+    pub on_unavailable: StoreUnavailable,
+    /// How long an abandoned lease remains live.
+    #[serde(default = "default_lease_ttl_seconds")]
+    pub lease_ttl_seconds: u64,
+    /// Bounded timeout for each Redis operation.
+    #[serde(default = "default_rate_limit_timeout_ms")]
+    pub timeout_ms: u64,
 }
 
 impl Default for RateLimitConfig {
@@ -522,12 +540,25 @@ impl Default for RateLimitConfig {
             backend: RateLimitBackend::None,
             max_in_flight_per_subject: default_max_in_flight_per_subject(),
             max_subjects: default_max_subjects(),
+            dsn_env: None,
+            key_prefix: None,
+            on_unavailable: StoreUnavailable::Deny,
+            lease_ttl_seconds: default_lease_ttl_seconds(),
+            timeout_ms: default_rate_limit_timeout_ms(),
         }
     }
 }
 
 fn default_max_in_flight_per_subject() -> usize {
     16
+}
+
+fn default_lease_ttl_seconds() -> u64 {
+    300
+}
+
+fn default_rate_limit_timeout_ms() -> u64 {
+    250
 }
 
 impl BudgetConfig {
@@ -544,8 +575,17 @@ impl BudgetConfig {
     }
 }
 
+impl RateLimitConfig {
+    pub fn key_prefix(&self) -> String {
+        self.key_prefix
+            .clone()
+            .unwrap_or_else(|| DEFAULT_RATE_LIMIT_KEY_PREFIX.to_owned())
+    }
+}
+
 const DEFAULT_BUDGET_TABLE: &str = "axond_budget";
 const DEFAULT_BUDGET_KEY_PREFIX: &str = "axond:budget";
+const DEFAULT_RATE_LIMIT_KEY_PREFIX: &str = "axond:rate_limit";
 
 fn default_reservation_ttl_seconds() -> u64 {
     300
@@ -1135,6 +1175,34 @@ impl Config {
                 rate_limit.backend.as_str()
             )));
         }
+        if rate_limit.backend == RateLimitBackend::Redis {
+            if rate_limit.lease_ttl_seconds == 0 {
+                return Err(ConfigError::Invalid(
+                    "rate_limit `redis`: lease_ttl_seconds must be at least 1".into(),
+                ));
+            }
+            if rate_limit.timeout_ms == 0 {
+                return Err(ConfigError::Invalid(
+                    "rate_limit `redis`: timeout_ms must be at least 1".into(),
+                ));
+            }
+            let has_rate_limit_dsn = rate_limit
+                .dsn_env
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty());
+            let has_budget_fallback = self.budget.backend == BudgetBackend::Redis
+                && self
+                    .budget
+                    .dsn_env
+                    .as_deref()
+                    .is_some_and(|name| !name.trim().is_empty());
+            if !has_rate_limit_dsn && !has_budget_fallback {
+                return Err(ConfigError::Invalid(
+                    "rate_limit `redis`: `dsn_env` must name the env var holding the connection string (or use the Redis budget `dsn_env` fallback)"
+                        .into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1489,6 +1557,32 @@ audience = "test"
         for section in [
             "[rate_limit]\nbackend = \"in-memory\"\nmax_in_flight_per_subject = 0",
             "[rate_limit]\nbackend = \"in-memory\"\nmax_subjects = 0",
+        ] {
+            assert!(Config::from_toml_str(&format!("{VALID}\n{section}\n")).is_err());
+        }
+    }
+
+    #[test]
+    fn redis_rate_limit_reads_defaults_and_budget_dsn_fallback() {
+        let cfg = Config::from_toml_str(&format!(
+            "{VALID}\n[budget]\nbackend = \"redis\"\nlimit_microdollars = 1\ndsn_env = \"REDIS_URL\"\n[rate_limit]\nbackend = \"redis\"\n"
+        ))
+        .expect("valid config");
+        assert_eq!(cfg.rate_limit.lease_ttl_seconds, 300);
+        assert_eq!(cfg.rate_limit.timeout_ms, 250);
+        assert_eq!(cfg.rate_limit.key_prefix(), "axond:rate_limit");
+        assert_eq!(
+            crate::rate_limit::resolve_dsn_env(&cfg.rate_limit, &cfg.budget),
+            Some("REDIS_URL")
+        );
+    }
+
+    #[test]
+    fn redis_rate_limit_rejects_missing_dsn_and_zero_bounds() {
+        for section in [
+            "[rate_limit]\nbackend = \"redis\"",
+            "[rate_limit]\nbackend = \"redis\"\nlease_ttl_seconds = 0\ndsn_env = \"R\"",
+            "[rate_limit]\nbackend = \"redis\"\ntimeout_ms = 0\ndsn_env = \"R\"",
         ] {
             assert!(Config::from_toml_str(&format!("{VALID}\n{section}\n")).is_err());
         }

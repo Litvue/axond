@@ -31,6 +31,8 @@ pub enum GatewayError {
     },
     #[error("budget store is unavailable")]
     BudgetUnavailable,
+    #[error("rate-limit store is unavailable")]
+    RateLimitUnavailable,
     #[error("inbound concurrency limit exceeded")]
     RateLimitExceeded { retry_after_seconds: Option<u64> },
     #[error("unauthorized")]
@@ -71,6 +73,7 @@ impl GatewayError {
             // Fail-closed: the cap cannot be enforced, so the request is a
             // dependency failure rather than an over-cap caller (ADR 0010).
             Self::BudgetUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::RateLimitUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::RateLimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::TokenUnauthorized(_) => StatusCode::UNAUTHORIZED,
@@ -100,6 +103,7 @@ impl GatewayError {
             Self::BudgetExceeded(_) => "budget_exceeded",
             Self::RequestCostCeilingExceeded { .. } => "request_cost_ceiling_exceeded",
             Self::BudgetUnavailable => "budget_unavailable",
+            Self::RateLimitUnavailable => "rate_limit_unavailable",
             Self::RateLimitExceeded { .. } => "rate_limited",
             Self::Unauthorized => "unauthorized",
             Self::TokenUnauthorized(error) | Self::TokenForbidden(error) => error.code(),
@@ -178,6 +182,9 @@ mod tests {
         let budget = GatewayError::BudgetExceeded("gpt-4o".to_owned());
         assert_eq!(budget.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(budget.code(), "budget_exceeded");
+        let unavailable = GatewayError::RateLimitUnavailable;
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.code(), "rate_limit_unavailable");
     }
 
     #[tokio::test]

@@ -71,7 +71,7 @@ impl Reloader {
                 bind: booted.config.server.bind,
                 usage_sink: booted.config.usage_sink.clone(),
                 budget: booted.config.budget.clone(),
-                rate_limit: booted.config.rate_limit,
+                rate_limit: booted.config.rate_limit.clone(),
             },
             path,
             state,
