@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,16 +8,56 @@ use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header, errors::ErrorKind as JwtErrorKind,
 };
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+use serde_json::Value;
 
+use crate::aliases::AliasScope;
 use crate::config::{Config, GatewayVerifierAlgorithm};
 use crate::key_material::{self, KeyMaterialError};
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum Capability {
+    Chat,
+    Messages,
+    Embeddings,
+    Models,
+}
+
+impl Capability {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "chat" => Some(Self::Chat),
+            "messages" => Some(Self::Messages),
+            "embeddings" => Some(Self::Embeddings),
+            "models" => Some(Self::Models),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Messages => "messages",
+            Self::Embeddings => "embeddings",
+            Self::Models => "models",
+        }
+    }
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
 
 #[derive(Clone)]
 pub struct InboundKey {
     pub namespace: String,
     pub subject: String,
     pub signer_kid: Option<String>,
+    pub scope: Option<HashSet<Capability>>,
+    pub alias_scope: Option<AliasScope>,
+    pub max_request_microdollars: Option<u64>,
 }
 
 pub(crate) struct GatewayKeyEntry {
@@ -85,6 +125,14 @@ pub enum TokenVerificationError {
     UnknownNamespace { namespace: String },
     #[error("verifier `{kid}` is not permitted for namespace `{namespace}`")]
     SignerNotPermitted { kid: String, namespace: String },
+    #[error("token is not permitted to use alias `{alias}`")]
+    AliasNotPermitted { alias: String },
+    #[error("token aliases claim is invalid")]
+    InvalidAliasClaim,
+    #[error(
+        "token for namespace `{namespace}` and subject `{subject}` was issued before its revocation epoch"
+    )]
+    IssuedBeforeEpoch { namespace: String, subject: String },
 }
 
 impl TokenVerificationError {
@@ -101,6 +149,9 @@ impl TokenVerificationError {
             Self::InvalidLifetime { .. } => "token_invalid_lifetime",
             Self::UnknownNamespace { .. } => "token_unknown_namespace",
             Self::SignerNotPermitted { .. } => "token_signer_not_permitted",
+            Self::AliasNotPermitted { .. } => "token_alias_not_permitted",
+            Self::InvalidAliasClaim => "token_alias_claim_invalid",
+            Self::IssuedBeforeEpoch { .. } => "token_issued_before_epoch",
         }
     }
 }
@@ -153,10 +204,17 @@ struct ResolvedVerifier {
     fingerprint: String,
 }
 
+#[derive(Default)]
+struct NamespaceEpoch {
+    namespace_min_iat: Option<u64>,
+    subjects: HashMap<String, u64>,
+}
+
 pub struct TokenVerifier {
     audience: String,
     namespaces: HashSet<String>,
     verifiers: Vec<ResolvedVerifier>,
+    epochs: HashMap<String, NamespaceEpoch>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +224,38 @@ struct TokenClaims {
     jti: Option<String>,
     ns: Option<String>,
     sub: Option<String>,
+    scope: Option<RawScope>,
+    // Keep this loose so a wrong JSON type becomes a typed 403, not a 401 decode failure.
+    #[serde(default, deserialize_with = "deserialize_optional_value")]
+    aliases: Option<Option<Value>>,
+    max_request_microdollars: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawScope {
+    String(String),
+    Array(Vec<String>),
+}
+
+impl RawScope {
+    fn capabilities(self) -> HashSet<Capability> {
+        let values = match self {
+            Self::String(value) => value.split_whitespace().map(str::to_owned).collect(),
+            Self::Array(values) => values,
+        };
+        values
+            .iter()
+            .filter_map(|value| Capability::parse(value))
+            .collect()
+    }
+}
+
+fn deserialize_optional_value<'de, D>(deserializer: D) -> Result<Option<Option<Value>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Some(Option::<Value>::deserialize(deserializer)?))
 }
 
 impl TokenVerifier {
@@ -187,6 +277,15 @@ impl TokenVerifier {
             .iter()
             .map(|namespace| namespace.id.clone())
             .collect();
+        let mut epochs: HashMap<String, NamespaceEpoch> = HashMap::new();
+        for epoch in &config.gateway_token_epoch {
+            let namespace = epochs.entry(epoch.namespace.clone()).or_default();
+            if let Some(subject) = &epoch.subject {
+                namespace.subjects.insert(subject.clone(), epoch.min_iat);
+            } else {
+                namespace.namespace_min_iat = Some(epoch.min_iat);
+            }
+        }
         let mut verifiers = Vec::with_capacity(config.gateway_verifier.len());
         for verifier in &config.gateway_verifier {
             let source =
@@ -291,6 +390,7 @@ impl TokenVerifier {
             audience,
             namespaces,
             verifiers,
+            epochs,
         }))
     }
 
@@ -418,15 +518,46 @@ impl PrincipalStore for TokenVerifier {
                 },
             ));
         }
+        let alias_scope = match claims.aliases {
+            None => None,
+            Some(Some(value)) => Some(
+                AliasScope::parse(serde_json::from_value::<Vec<String>>(value).map_err(|_| {
+                    PrincipalStoreError::Forbidden(TokenVerificationError::InvalidAliasClaim)
+                })?)
+                .map_err(|_| {
+                    PrincipalStoreError::Forbidden(TokenVerificationError::InvalidAliasClaim)
+                })?,
+            ),
+            Some(None) => {
+                return Err(PrincipalStoreError::Forbidden(
+                    TokenVerificationError::InvalidAliasClaim,
+                ));
+            }
+        };
         let subject = claims.sub.filter(|subject| !subject.is_empty()).ok_or(
             PrincipalStoreError::Unauthorized(TokenVerificationError::MissingClaim {
                 claim: "sub".to_owned(),
             }),
         )?;
+        let epoch = self.epochs.get(namespace.as_str()).and_then(|namespace| {
+            namespace
+                .subjects
+                .get(subject.as_str())
+                .copied()
+                .or(namespace.namespace_min_iat)
+        });
+        if epoch.is_some_and(|min_iat| iat < min_iat) {
+            return Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::IssuedBeforeEpoch { namespace, subject },
+            ));
+        }
         Ok(Some(InboundKey {
             namespace,
             subject,
             signer_kid: Some(verifier.kid.clone()),
+            scope: claims.scope.map(RawScope::capabilities),
+            alias_scope,
+            max_request_microdollars: claims.max_request_microdollars,
         }))
     }
 }
@@ -644,6 +775,9 @@ mod tests {
                 namespace: "platform".to_owned(),
                 subject: "AXOND_KEY".to_owned(),
                 signer_kid: None,
+                scope: None,
+                alias_scope: None,
+                max_request_microdollars: None,
             },
         }]))
     }
@@ -794,6 +928,12 @@ mod tests {
         ns: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         sub: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scope: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aliases: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_request_microdollars: Option<u64>,
     }
 
     const ED_PRIVATE_PK8: &[u8] = &[
@@ -916,6 +1056,9 @@ max_ttl = "15m"
             jti: Some("jti-1".to_owned()),
             ns: Some(namespace.to_owned()),
             sub: Some("caller-1".to_owned()),
+            scope: None,
+            aliases: None,
+            max_request_microdollars: None,
         }
     }
 
@@ -939,6 +1082,126 @@ max_ttl = "15m"
         assert_eq!(principal.namespace, "acme");
         assert_eq!(principal.subject, "caller-1");
         assert_eq!(principal.signer_kid.as_deref(), Some("ed-test"));
+        assert_eq!(principal.max_request_microdollars, None);
+    }
+
+    #[tokio::test]
+    async fn token_verifier_resolves_an_optional_request_cost_ceiling() {
+        let verifier = token_verifier();
+        let mut claims = valid_claims();
+        claims.max_request_microdollars = Some(42);
+        let principal = verifier
+            .resolve(&Presented {
+                credential: &signed_token(claims),
+            })
+            .await
+            .expect("valid token resolves")
+            .expect("valid token returns a principal");
+        assert_eq!(principal.max_request_microdollars, Some(42));
+    }
+
+    #[tokio::test]
+    async fn malformed_request_cost_ceiling_is_a_malformed_token() {
+        let verifier = token_verifier();
+        let claims = serde_json::json!({
+            "exp": unix_now() + 900,
+            "iat": unix_now(),
+            "jti": "jti-1",
+            "aud": "test-audience",
+            "ns": "acme",
+            "sub": "caller-1",
+            "max_request_microdollars": "42"
+        });
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some("ed-test".to_owned());
+        let token = format!(
+            "axt1.{}",
+            encode(&header, &claims, &EncodingKey::from_ed_der(ED_PRIVATE_PK8))
+                .expect("test token signs")
+        );
+        assert!(matches!(
+            verifier.resolve(&Presented { credential: &token }).await,
+            Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::Malformed
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn token_scope_accepts_oauth_string_and_discards_unknown_capabilities() {
+        let verifier = token_verifier();
+        let mut claims = valid_claims();
+        claims.scope = Some(serde_json::json!("chat unknown models"));
+        let principal = verifier
+            .resolve(&Presented {
+                credential: &signed_token(claims),
+            })
+            .await
+            .expect("valid token resolves")
+            .expect("valid token returns a principal");
+        let scope = principal.scope.expect("scope is present");
+        assert!(scope.contains(&Capability::Chat));
+        assert!(scope.contains(&Capability::Models));
+        assert_eq!(scope.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn token_scope_accepts_an_empty_array_as_an_empty_scope() {
+        let verifier = token_verifier();
+        let mut claims = valid_claims();
+        claims.scope = Some(serde_json::json!([]));
+        let principal = verifier
+            .resolve(&Presented {
+                credential: &signed_token(claims),
+            })
+            .await
+            .expect("valid token resolves")
+            .expect("valid token returns a principal");
+        assert!(principal.scope.expect("scope is present").is_empty());
+    }
+
+    #[tokio::test]
+    async fn token_verifier_resolves_alias_scope_and_rejects_invalid_claims() {
+        let verifier = token_verifier();
+        let mut restricted = valid_claims();
+        restricted.aliases = Some(serde_json::json!(["gpt-*", "claude-3"]));
+        let principal = verifier
+            .resolve(&Presented {
+                credential: &signed_token(restricted),
+            })
+            .await
+            .expect("restricted token resolves")
+            .expect("restricted token returns a principal");
+        let scope = principal.alias_scope.as_ref().expect("scope is present");
+        assert!(scope.permits("gpt-4o"));
+        assert!(scope.permits("claude-3"));
+        assert!(!scope.permits("other"));
+
+        let mut invalid = valid_claims();
+        invalid.aliases = Some(serde_json::json!(["foo*bar"]));
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(invalid),
+                })
+                .await,
+            Err(PrincipalStoreError::Forbidden(
+                TokenVerificationError::InvalidAliasClaim
+            ))
+        ));
+
+        let mut null = valid_claims();
+        null.aliases = Some(Value::Null);
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(null),
+                })
+                .await,
+            Err(PrincipalStoreError::Forbidden(
+                TokenVerificationError::InvalidAliasClaim
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -1244,6 +1507,95 @@ max_ttl = "15m"
                 TokenVerificationError::NotYetValid
             ))
         ));
+    }
+
+    /// Namespace epochs reject older issuance times, preserve the exact
+    /// boundary, and let a subject-specific entry override the namespace-wide
+    /// policy.
+    #[tokio::test]
+    async fn token_verifier_enforces_most_specific_issuance_epochs() {
+        let now = unix_now();
+        let namespace_epoch = now - 100;
+        let subject_epoch = now - 200;
+        let config = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_key]]
+env = "STATIC_KEY"
+namespace = "platform"
+
+[gateway_token]
+audience = "test-audience"
+
+[[gateway_verifier]]
+kid = "ed-test"
+alg = "EdDSA"
+env = "ED_PUBLIC"
+namespaces = ["platform"]
+max_ttl = "15m"
+
+[[gateway_token_epoch]]
+namespace = "platform"
+min_iat = {namespace_epoch}
+
+[[gateway_token_epoch]]
+namespace = "platform"
+subject = "spared"
+min_iat = {subject_epoch}
+"#,
+        ))
+        .expect("epoch verifier config");
+        let env = HashMap::from([
+            ("STATIC_KEY".to_owned(), "static-secret".to_owned()),
+            ("ED_PUBLIC".to_owned(), BASE64.encode(ED_PUBLIC_RAW)),
+        ]);
+        let verifier = TokenVerifier::build(&config, &env)
+            .expect("test verifier builds")
+            .expect("verifier is configured");
+
+        let mut rejected = valid_claims_for("platform");
+        rejected.iat = Some(namespace_epoch - 1);
+        rejected.exp = Some(namespace_epoch - 1 + 899);
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(rejected),
+                })
+                .await,
+            Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::IssuedBeforeEpoch { .. }
+            ))
+        ));
+
+        let mut boundary = valid_claims_for("platform");
+        boundary.iat = Some(namespace_epoch);
+        boundary.exp = Some(namespace_epoch + 900);
+        assert!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(boundary),
+                })
+                .await
+                .expect("boundary token resolves")
+                .is_some()
+        );
+
+        let mut spared = valid_claims_for("platform");
+        spared.sub = Some("spared".to_owned());
+        spared.iat = Some(subject_epoch + 1);
+        spared.exp = Some(subject_epoch + 1 + 900);
+        assert!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(spared),
+                })
+                .await
+                .expect("subject override resolves")
+                .is_some()
+        );
     }
 
     #[test]

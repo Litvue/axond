@@ -12,10 +12,10 @@
 //!
 //! Not everything a config file describes can be replaced in a live process.
 //! The listening socket is already bound, the usage sinks already own
-//! connections and flush tasks, and the budget store already owns its
-//! reservations, so changes to `[server] bind`, `[[usage_sink]]`, and
-//! `[budget]` (including `limit_microdollars`) are reported and ignored until
-//! the next restart.
+//! connections and flush tasks, and the budget store and rate limiter already
+//! own their state, so changes to `[server] bind`, `[[usage_sink]]`, `[budget]`
+//! (including `limit_microdollars`), and `[rate_limit]` are reported and
+//! ignored until the next restart.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::config::{BudgetConfig, Config, ConfigError, Reload, UsageSinkConfig};
+use crate::config::{BudgetConfig, Config, ConfigError, RateLimitConfig, Reload, UsageSinkConfig};
 use crate::state::{AppState, ConfigSnapshot, SnapshotError};
 use crate::telemetry;
 
@@ -47,6 +47,7 @@ struct Boot {
     bind: SocketAddr,
     usage_sink: Vec<UsageSinkConfig>,
     budget: BudgetConfig,
+    rate_limit: RateLimitConfig,
 }
 
 /// Owns the config path and the state whose snapshot it replaces.
@@ -70,6 +71,7 @@ impl Reloader {
                 bind: booted.config.server.bind,
                 usage_sink: booted.config.usage_sink.clone(),
                 budget: booted.config.budget.clone(),
+                rate_limit: booted.config.rate_limit,
             },
             path,
             state,
@@ -196,6 +198,7 @@ pub struct ReloadSummary {
     pub credentials: Delta,
     pub gateway_keys: Delta,
     pub gateway_verifiers: Delta,
+    pub gateway_token_epochs: Delta,
     pub gateway_token_audience: Delta,
     pub gateway_key_fingerprints: HashMap<String, String>,
     pub gateway_verifier_fingerprints: HashMap<String, String>,
@@ -205,6 +208,8 @@ pub struct ReloadSummary {
     pub usage_sinks_changed: bool,
     /// `[budget]` differs from the booted store configuration.
     pub budget_changed: bool,
+    /// `[rate_limit]` differs from the booted limiter configuration.
+    pub rate_limit_changed: bool,
 }
 
 /// The added and removed identifiers of one config collection.
@@ -300,6 +305,20 @@ impl ReloadSummary {
                         &after.gateway_verifier_fingerprints,
                     )),
             ),
+            gateway_token_epochs: Delta::between(
+                before_config
+                    .gateway_token_epoch
+                    .iter()
+                    .map(gateway_token_epoch_key),
+                after_config
+                    .gateway_token_epoch
+                    .iter()
+                    .map(gateway_token_epoch_key),
+            )
+            .with_changed(gateway_token_epoch_definition_changes(
+                before_config,
+                after_config,
+            )),
             gateway_token_audience: Delta::between(
                 before_config
                     .gateway_token
@@ -315,6 +334,7 @@ impl ReloadSummary {
             bind_changed: boot.bind != after_config.server.bind,
             usage_sinks_changed: boot.usage_sink != after_config.usage_sink,
             budget_changed: boot.budget != after_config.budget,
+            rate_limit_changed: boot.rate_limit != after_config.rate_limit,
         }
     }
 
@@ -326,6 +346,7 @@ impl ReloadSummary {
             && self.credentials.is_empty()
             && self.gateway_keys.is_empty()
             && self.gateway_verifiers.is_empty()
+            && self.gateway_token_epochs.is_empty()
             && self.gateway_token_audience.is_empty()
     }
 
@@ -339,10 +360,12 @@ impl ReloadSummary {
             credentials = %self.credentials,
             gateway_keys = %self.gateway_keys,
             gateway_verifiers = %self.gateway_verifiers,
+            gateway_token_epochs = %self.gateway_token_epochs,
             gateway_token_audience = %self.gateway_token_audience,
             gateway_key_fingerprints = ?self.gateway_key_fingerprints,
             gateway_verifier_fingerprints = ?self.gateway_verifier_fingerprints,
             budget_changed = self.budget_changed,
+            rate_limit_changed = self.rate_limit_changed,
             changed = !self.is_empty(),
             "config reloaded"
         );
@@ -361,12 +384,24 @@ impl ReloadSummary {
                 "`[budget]` changed, but the budget store is already serving; restart to apply it"
             );
         }
+        if self.rate_limit_changed {
+            tracing::warn!(
+                "`[rate_limit]` changed, but the limiter is already serving; restart to apply it"
+            );
+        }
     }
 }
 
 /// `namespace/provider/label` — the pool member a credential entry declares.
 fn credential_key(c: &crate::config::Credential) -> String {
     format!("{}/{}/{}", c.namespace, c.provider, c.label())
+}
+
+fn gateway_token_epoch_key(epoch: &crate::config::GatewayTokenEpoch) -> String {
+    match epoch.subject.as_deref() {
+        Some(subject) => format!("{}/{}", epoch.namespace, subject),
+        None => epoch.namespace.clone(),
+    }
 }
 
 impl Delta {
@@ -402,6 +437,26 @@ fn verifier_definition_changes(before: &Config, after: &Config) -> Vec<String> {
                 || before.max_ttl != after.max_ttl)
                 .then(|| (*kid).to_owned())
         })
+        .collect::<Vec<_>>();
+    changed.sort();
+    changed
+}
+
+fn gateway_token_epoch_definition_changes(before: &Config, after: &Config) -> Vec<String> {
+    let before: HashMap<String, u64> = before
+        .gateway_token_epoch
+        .iter()
+        .map(|epoch| (gateway_token_epoch_key(epoch), epoch.min_iat))
+        .collect();
+    let after: HashMap<String, u64> = after
+        .gateway_token_epoch
+        .iter()
+        .map(|epoch| (gateway_token_epoch_key(epoch), epoch.min_iat))
+        .collect();
+    let mut changed = before
+        .iter()
+        .filter(|(key, min_iat)| after.get(*key).is_some_and(|current| current != *min_iat))
+        .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
     changed.sort();
     changed
@@ -602,6 +657,39 @@ name = "acme-fast"
 targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdollars_per_million = 150000, output_microdollars_per_million = 600000 } }]
 "#;
 
+    const WITH_MINTED_NAMESPACES: &str = r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[namespace]]
+id = "acme"
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "PLATFORM_OPENAI_KEY"
+
+[[gateway_key]]
+env = "AXOND_INBOUND_KEY"
+namespace = "platform"
+
+[gateway_token]
+audience = "reload-test"
+
+[[gateway_verifier]]
+kid = "reload-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform", "acme"]
+max_ttl = "15m"
+"#;
+
     fn state_from(file: &ConfigFile) -> AppState {
         let config = Config::load(file.path()).expect("valid boot config");
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
@@ -685,6 +773,131 @@ targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdo
         );
         let aliases = listed_aliases(&state).await;
         assert!(aliases.contains(&"acme-fast".to_string()));
+    }
+
+    /// An epoch-only edit is visible in the applied reload summary, while a
+    /// second reload of the same content is a no-op.
+    #[tokio::test]
+    async fn reload_summary_reports_token_epoch_changes_and_noop_reloads() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+        let epoch_config = format!(
+            "{PLATFORM_ONLY}\n[[gateway_token_epoch]]\nnamespace = \"platform\"\nmin_iat = 1\n"
+        );
+
+        file.rewrite(&epoch_config);
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("epoch candidate is valid");
+        assert_eq!(
+            summary.gateway_token_epochs.added,
+            vec!["platform".to_string()]
+        );
+        assert!(summary.gateway_token_epochs.removed.is_empty());
+        assert!(summary.gateway_token_epochs.changed.is_empty());
+        assert!(!summary.is_empty());
+
+        file.rewrite(&epoch_config.replace("min_iat = 1", "min_iat = 2"));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("changed epoch candidate is valid");
+        assert_eq!(
+            summary.gateway_token_epochs.changed,
+            vec!["platform".to_string()]
+        );
+
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("no-op candidate is valid");
+        assert!(summary.gateway_token_epochs.is_empty());
+        assert!(summary.is_empty());
+    }
+
+    /// An issuance epoch is part of the immutable candidate snapshot: SIGHUP
+    /// applies it to one namespace while a different namespace keeps serving.
+    #[tokio::test]
+    async fn minted_token_epochs_apply_after_reload_without_affecting_other_namespaces() {
+        let file = ConfigFile::new(WITH_MINTED_NAMESPACES);
+        let state = state_from(&file);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs();
+        let make_token = |namespace: &str| {
+            let claims = ReloadTokenClaims {
+                exp: now + 890,
+                iat: now - 10,
+                jti: format!("reload-{namespace}"),
+                ns: namespace.to_owned(),
+                sub: "reload-subject".to_owned(),
+                aud: "reload-test".to_owned(),
+            };
+            let mut header = Header::new(Algorithm::HS256);
+            header.kid = Some("reload-kid".to_owned());
+            format!(
+                "axt1.{}",
+                encode(
+                    &header,
+                    &claims,
+                    &EncodingKey::from_secret(b"jwt-test-secret-0123456789012345"),
+                )
+                .expect("token signs")
+            )
+        };
+        let platform_token = make_token("platform");
+        let acme_token = make_token("acme");
+        for token in [&platform_token, &acme_token] {
+            assert!(
+                state
+                    .config()
+                    .resolve_principal(&Presented { credential: token })
+                    .await
+                    .expect("token resolves")
+                    .is_some()
+            );
+        }
+
+        let reloader = Reloader::new(file.path(), state.clone());
+        file.rewrite(&format!(
+            "{WITH_MINTED_NAMESPACES}\n[[gateway_token_epoch]]\nnamespace = \"platform\"\nmin_iat = {}\n",
+            now
+        ));
+        reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("epoch candidate is valid");
+
+        assert!(matches!(
+            state
+                .config()
+                .resolve_principal(&Presented {
+                    credential: &platform_token
+                })
+                .await,
+            Err(crate::principals::PrincipalStoreError::Unauthorized(
+                crate::principals::TokenVerificationError::IssuedBeforeEpoch { .. }
+            ))
+        ));
+        assert!(
+            state
+                .config()
+                .resolve_principal(&Presented {
+                    credential: &acme_token
+                })
+                .await
+                .expect("other namespace resolves")
+                .is_some()
+        );
+        assert!(
+            state
+                .config()
+                .resolve_principal(&Presented {
+                    credential: "inbound-secret"
+                })
+                .await
+                .expect("static key resolves")
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -1057,6 +1270,28 @@ default = true
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
             .expect("budget removal is valid");
         assert!(!summary.budget_changed);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_changes_are_reported_as_restart_required() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+
+        file.rewrite(&format!(
+            "{PLATFORM_ONLY}\n[rate_limit]\nbackend = \"in-memory\"\nmax_in_flight_per_subject = 3\nmax_subjects = 32\n"
+        ));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("rate limit candidate is valid");
+        assert!(summary.rate_limit_changed);
+        assert!(summary.is_empty());
+
+        file.rewrite(PLATFORM_ONLY);
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("rate limit removal is valid");
+        assert!(!summary.rate_limit_changed);
     }
 
     /// Both triggers share one view of what has been acted on, so the watcher

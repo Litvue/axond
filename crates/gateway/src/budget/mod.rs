@@ -372,6 +372,18 @@ impl LedgerState {
     }
 }
 
+impl InMemoryBudget {
+    #[cfg(test)]
+    pub fn outstanding(&self, key: &BudgetKey) -> u64 {
+        self.ledger_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ledgers
+            .get(key)
+            .map_or(0, Ledger::outstanding)
+    }
+}
+
 #[async_trait]
 impl BudgetStore for InMemoryBudget {
     fn name(&self) -> &'static str {

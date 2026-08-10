@@ -66,6 +66,8 @@ metric and a usage row can never disagree.
 | `axond.config.generation` | gauge | — | `0` at boot, `+1` per applied reload. |
 | `axond.budget.capacity_denials` | counter | — | In-memory admissions denied because the ledger bound was exhausted. |
 | `axond.budget.retained_subjects` | gauge | — | In-memory ledgers retained after capacity-pressure pruning; watch against `max_subjects`. |
+| `axond.rate_limit.denials` | counter | — | Inbound concurrency admissions rejected. |
+| `axond.rate_limit.capacity_denials` | counter | — | In-memory admissions rejected because the bounded subject map is full. |
 
 ### What to alert on
 
@@ -74,6 +76,7 @@ metric and a usage row can never disagree.
 | Usage is being lost | `axond.usage.records_dropped` rate > 0, sustained | Spend data is gone and will not come back. Buffer or destination is undersized. |
 | A target is out | `axond.upstream.circuit_state = 2`, sustained | Every request is failing over (or failing) for that target. |
 | Budget denials | `axond.http.server.requests{status=429}` rising | Tenants are hitting their cap. |
+| Inbound concurrency denials | `axond.rate_limit.denials` rising | Authenticated callers are reaching their per-replica in-flight limit. |
 | Budget store down | `axond.http.server.requests{status=503}` rising | Fail-closed denial: fix the store, or the whole tenant is refused. |
 | Config drift across the fleet | `axond.config.generation` differs between replicas | A replica missed a reload and is serving stale routing or keys. |
 | Rejected reloads | `axond.config.reloads{outcome="rejected"}` > 0 | Someone edited the config into an invalid state; the old one is still serving. |

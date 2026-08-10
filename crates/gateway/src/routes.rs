@@ -46,7 +46,8 @@ use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, Target};
 use crate::credentials::{CredentialPlan, CredentialSource};
 use crate::error::GatewayError;
-use crate::principals::{Presented, PrincipalStoreError};
+use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
+use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::streaming::{self, Framing, StreamContext};
 use crate::telemetry;
@@ -59,9 +60,10 @@ pub fn router(state: AppState) -> Router {
             let route = (spec.router)();
             let route = match spec.auth {
                 AuthPosture::LivenessProbe => route,
-                AuthPosture::Authenticated => {
-                    route.layer(from_fn_with_state(state.clone(), authenticate_middleware))
-                }
+                AuthPosture::Authenticated => route.layer(from_fn_with_state(
+                    (state.clone(), spec.capability),
+                    authenticate_middleware,
+                )),
             };
             router.route(spec.path, route)
         })
@@ -81,6 +83,7 @@ enum AuthPosture {
 struct RouteSpec {
     path: &'static str,
     auth: AuthPosture,
+    capability: Option<Capability>,
     router: fn() -> MethodRouter<AppState>,
 }
 
@@ -91,36 +94,43 @@ fn route_specs() -> [RouteSpec; 7] {
         RouteSpec {
             path: "/healthz",
             auth: AuthPosture::LivenessProbe,
+            capability: None,
             router: || get(healthz),
         },
         RouteSpec {
             path: "/readyz",
             auth: AuthPosture::LivenessProbe,
+            capability: None,
             router: || get(readyz),
         },
         RouteSpec {
             path: "/v1/models",
             auth: AuthPosture::Authenticated,
+            capability: Some(Capability::Models),
             router: || get(list_models),
         },
         RouteSpec {
             path: "/v1/chat/completions",
             auth: AuthPosture::Authenticated,
+            capability: Some(Capability::Chat),
             router: || post(chat_completions),
         },
         RouteSpec {
             path: "/v1/messages",
             auth: AuthPosture::Authenticated,
+            capability: Some(Capability::Messages),
             router: || post(native_messages),
         },
         RouteSpec {
             path: "/v1/embeddings",
             auth: AuthPosture::Authenticated,
+            capability: Some(Capability::Embeddings),
             router: || post(embeddings),
         },
         RouteSpec {
             path: "/v1/responses",
             auth: AuthPosture::Authenticated,
+            capability: None,
             router: || post(responses),
         },
     ]
@@ -150,11 +160,15 @@ async fn list_models(
         .model
         .iter()
         .filter(|m| {
-            m.targets.iter().any(|t| {
-                snapshot
-                    .credentials
-                    .is_present(cfg, &caller.namespace, &t.provider)
-            })
+            caller
+                .alias_scope
+                .as_ref()
+                .is_none_or(|scope| scope.permits(&m.name))
+                && m.targets.iter().any(|t| {
+                    snapshot
+                        .credentials
+                        .is_present(cfg, &caller.namespace, &t.provider)
+                })
         })
         .map(|m| json!({ "id": m.name, "object": "model", "owned_by": "axond" }))
         .collect();
@@ -217,16 +231,57 @@ async fn authenticate(
 /// therefore cannot change what this request resolved; failures return `401`
 /// before any typed handler error, including `/v1/responses`'s `501`.
 async fn authenticate_middleware(
-    State(state): State<AppState>,
+    State((state, capability)): State<(AppState, Option<Capability>)>,
     headers: HeaderMap,
     mut request: Request,
     next: Next,
 ) -> Result<Response, GatewayError> {
     let snapshot = state.config();
     let caller = authenticate(&snapshot, &headers).await?;
+    if let Some(capability) = capability
+        && let Some(scope) = caller.scope.as_ref()
+        && (!scope.contains(&capability)
+            || !namespace_allows(&snapshot, &caller.namespace, capability))
+    {
+        debug!(
+            namespace = %caller.namespace,
+            subject = %caller.subject,
+            signer_kid = ?caller.signer_kid,
+            %capability,
+            "token scope denied route"
+        );
+        return Err(GatewayError::ScopeInsufficient(capability));
+    }
     request.extensions_mut().insert(snapshot);
     request.extensions_mut().insert(caller);
     Ok(next.run(request).await)
+}
+
+fn namespace_allows(snapshot: &ConfigSnapshot, namespace: &str, capability: Capability) -> bool {
+    let route = match capability {
+        Capability::Chat => Some(Route::ChatCompletions),
+        Capability::Messages => Some(Route::NativeMessages),
+        Capability::Embeddings => Some(Route::Embeddings),
+        Capability::Models => None,
+    };
+    let Some(route) = route else {
+        return true;
+    };
+    snapshot.config.model.iter().any(|model| {
+        model.targets.iter().any(|target| {
+            snapshot
+                .config
+                .provider(&target.provider)
+                .is_some_and(|provider| {
+                    route.serves(provider.kind)
+                        && snapshot.credentials.is_present(
+                            &snapshot.config,
+                            namespace,
+                            &target.provider,
+                        )
+                })
+        })
+    })
 }
 
 /// The wire shape a route speaks, which is the only thing that differs between
@@ -459,6 +514,14 @@ async fn serve(
         .ok_or_else(|| GatewayError::BadRequest("missing `model`".into()))?
         .to_string();
 
+    if let Some(scope) = &caller.alias_scope
+        && !scope.permits(&alias)
+    {
+        return Err(GatewayError::TokenForbidden(
+            TokenVerificationError::AliasNotPermitted { alias },
+        ));
+    }
+
     let model = cfg
         .model(&alias)
         .ok_or_else(|| GatewayError::UnknownModel(alias.clone()))?;
@@ -467,6 +530,21 @@ async fn serve(
         headers: route.wire_headers(&headers),
     };
     wire.check_targets(cfg, model, &alias)?;
+
+    // The permit is held for the request's lifetime: buffered paths drop it at
+    // scope end, and a stream moves it into the accounting owner that settles it.
+    let rate_limit_key = RateLimitKey {
+        namespace: caller.namespace.clone(),
+        subject: caller.subject.clone(),
+    };
+    let rate_limit_permit = state
+        .0
+        .rate_limiter
+        .acquire(&rate_limit_key)
+        .await
+        .map_err(|_| GatewayError::RateLimitExceeded {
+            retry_after_seconds: None,
+        })?;
 
     // Budget is denominated in micro-dollars. Hold a conservative cost estimate
     // from the first target's price before dispatch; settle the hold against the
@@ -477,6 +555,15 @@ async fn serve(
     };
     let estimate = route.estimate(&body);
     let estimated_cost = model.targets[0].price.cost_microdollars(estimate);
+    if let Some(ceiling) = caller.max_request_microdollars
+        && estimated_cost > ceiling
+    {
+        return Err(GatewayError::RequestCostCeilingExceeded {
+            alias: alias.clone(),
+            estimated_microdollars: estimated_cost,
+            ceiling_microdollars: ceiling,
+        });
+    }
     let reservation = match state.0.budget.reserve(&budget_key, estimated_cost).await {
         Admission::Allowed(reservation) => reservation,
         Admission::Denied(Denial::Exceeded) => return Err(GatewayError::BudgetExceeded(alias)),
@@ -497,19 +584,21 @@ async fn serve(
                     key: budget_key,
                     reservation,
                     estimated_input_tokens: estimate.input_tokens,
+                    permit: Some(rate_limit_permit),
                 },
             },
         )
         .await;
     }
 
+    let reservation = BudgetReservation::new(state.clone(), budget_key, reservation);
     let outcome =
         match dispatch_with_failover(&state, &snapshot, &caller, model, &body, &wire).await {
             Ok(outcome) => outcome,
             Err(err) => {
                 // Nothing reached a provider, so nothing was consumed: the whole
                 // estimate goes back rather than lingering until it expires.
-                state.0.budget.release(&budget_key, &reservation).await;
+                reservation.release().await;
                 return Err(err);
             }
         };
@@ -518,7 +607,7 @@ async fn serve(
         Ok(response) => {
             let usage = to_usage(&response.usage);
             let cost = served.price.cost_microdollars(usage);
-            state.0.budget.settle(&budget_key, &reservation, cost).await;
+            reservation.settle(cost).await;
             record_usage(
                 &state,
                 RecordArgs {
@@ -547,7 +636,7 @@ async fn serve(
             // measure. Spend is therefore genuinely unknowable and charged as
             // zero — the streamed path, which can measure what it relayed,
             // charges its partial spend.
-            state.0.budget.release(&budget_key, &reservation).await;
+            reservation.release().await;
             record_usage(
                 &state,
                 RecordArgs {
@@ -739,7 +828,7 @@ async fn stream_with_failover(
         alias,
         body,
         wire,
-        hold,
+        mut hold,
     } = request;
     let cfg = &snapshot.config;
     let policy = FailoverPolicy;
@@ -794,6 +883,7 @@ async fn stream_with_failover(
             price: target.price,
             budget_key: hold.key.clone(),
             reservation: hold.reservation.clone(),
+            rate_limit_permit: None,
             estimated_input_tokens: hold.estimated_input_tokens,
             attempts: 0,
         };
@@ -848,6 +938,7 @@ async fn stream_with_failover(
 
         match opened {
             Ok(bytes) => {
+                ctx.rate_limit_permit = hold.permit.take();
                 record_target_success(snapshot, target, &circuit_key);
                 telemetry::record_routing(
                     &ctx.namespace,
@@ -884,6 +975,7 @@ async fn stream_with_failover(
     if let Some(err) = walk.last_error.take() {
         if let Some((mut ctx, started)) = last_ctx {
             ctx.attempts = walk.attempts;
+            ctx.rate_limit_permit = hold.permit.take();
             streaming::settle_upstream_error(state.clone(), ctx, started);
         } else {
             state.0.budget.release(&hold.key, &hold.reservation).await;
@@ -912,6 +1004,63 @@ struct BudgetHold {
     key: BudgetKey,
     reservation: Reservation,
     estimated_input_tokens: u64,
+    permit: Option<RateLimitPermit>,
+}
+
+/// A buffered request's reservation must be reconciled even when its handler is
+/// dropped while the upstream request is in flight. Streaming `Accounting`
+/// covers cancellation once the relay exists; this guard covers the buffered path.
+struct BudgetReservation {
+    state: AppState,
+    key: BudgetKey,
+    reservation: Option<Reservation>,
+}
+
+impl BudgetReservation {
+    fn new(state: AppState, key: BudgetKey, reservation: Reservation) -> Self {
+        Self {
+            state,
+            key,
+            reservation: Some(reservation),
+        }
+    }
+
+    /// Disarm before awaiting so dropping the guard after settlement cannot
+    /// submit a second budget operation.
+    async fn settle(mut self, actual_microdollars: u64) {
+        let reservation = self
+            .reservation
+            .take()
+            .expect("budget reservation guard must be armed");
+        self.state
+            .0
+            .budget
+            .settle(&self.key, &reservation, actual_microdollars)
+            .await;
+    }
+
+    /// Disarm before awaiting so the explicit release and the drop fallback
+    /// cannot both reconcile the same hold.
+    async fn release(mut self) {
+        let reservation = self
+            .reservation
+            .take()
+            .expect("budget reservation guard must be armed");
+        self.state.0.budget.release(&self.key, &reservation).await;
+    }
+}
+
+impl Drop for BudgetReservation {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let state = self.state.clone();
+        let key = self.key.clone();
+        streaming::spawn_settlement(async move {
+            state.0.budget.release(&key, &reservation).await;
+        });
+    }
 }
 
 /// Mutable bookkeeping shared by the buffered and streaming failover walks: how
@@ -1209,18 +1358,22 @@ async fn record_usage(state: &AppState, args: RecordArgs<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aliases::AliasScope;
     use crate::budget::NoBudget;
     use crate::config::Config;
+    use crate::rate_limit::{InMemoryRateLimiter, NoLimit, RateLimitKey, RateLimiter};
     use crate::usage::{StdoutSink, UsageFanout, UsageSink};
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{Method, Request, StatusCode};
     use http_body_util::BodyExt;
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde::Serialize;
     use std::collections::HashMap;
+    use std::future::pending;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tokio::sync::oneshot;
     use tower::util::ServiceExt;
 
     /// The inbound key every test config declares, and the secret the caller
@@ -1270,20 +1423,408 @@ env = "AXOND_PLATFORM_OPENAI"
 
 {GATEWAY_KEY}
 
+[gateway_token]
+audience = "test-audience"
+
+[[gateway_verifier]]
+kid = "scope-test-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+
 [[model]]
 name = "gpt-4o"
 targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }} }}]
+
+[[model]]
+name = "claude-3"
+targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }} }}]
 "#
         ))
         .unwrap();
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        let mut env = env_with([("AXOND_PLATFORM_OPENAI", "sk-platform-test")]);
+        env.insert(
+            "JWT_SECRET".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        );
+        AppState::new(cfg, &env, UsageFanout::new(sinks), Box::new(NoBudget))
+            .expect("credentials resolve")
+    }
+
+    #[test]
+    fn namespace_authority_follows_reachable_provider_wires() {
+        let snapshot = test_state().config();
+        assert!(namespace_allows(&snapshot, "platform", Capability::Models));
+        assert!(namespace_allows(&snapshot, "platform", Capability::Chat));
+        assert!(namespace_allows(
+            &snapshot,
+            "platform",
+            Capability::Embeddings
+        ));
+        assert!(!namespace_allows(
+            &snapshot,
+            "platform",
+            Capability::Messages
+        ));
+    }
+
+    async fn scoped_route_state() -> AppState {
+        let (chat_url, _) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let (messages_url, _) = native_upstream(
+            "/messages",
+            Json(json!({
+                "id": "msg-1",
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            }))
+            .into_response(),
+        )
+        .await;
+        let (embeddings_url, _) = native_upstream(
+            "/embeddings",
+            Json(json!({
+                "object": "list",
+                "data": [],
+                "usage": { "prompt_tokens": 1, "total_tokens": 1 }
+            }))
+            .into_response(),
+        )
+        .await;
+        let config = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "chat"
+kind = "openai"
+base_url = "{chat_url}"
+
+[[provider]]
+id = "messages"
+kind = "anthropic"
+base_url = "{messages_url}"
+
+[[provider]]
+id = "embeddings"
+kind = "openai"
+base_url = "{embeddings_url}"
+
+[[credential]]
+namespace = "platform"
+provider = "chat"
+env = "CHAT_KEY"
+
+[[credential]]
+namespace = "platform"
+provider = "messages"
+env = "MESSAGES_KEY"
+
+[[credential]]
+namespace = "platform"
+provider = "embeddings"
+env = "EMBEDDINGS_KEY"
+
+[[gateway_key]]
+env = "STATIC_KEY"
+namespace = "platform"
+
+[gateway_token]
+audience = "scope-tests"
+
+[[gateway_verifier]]
+kid = "scope-test-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+
+[[model]]
+name = "chat-model"
+targets = [{{ provider = "chat", model = "chat-model", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+
+[[model]]
+name = "messages-model"
+targets = [{{ provider = "messages", model = "messages-model", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+
+[[model]]
+name = "embeddings-model"
+targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+"#
+        ))
+        .expect("scope test config");
+        let env = HashMap::from([
+            ("CHAT_KEY".to_owned(), "chat-key".to_owned()),
+            ("MESSAGES_KEY".to_owned(), "messages-key".to_owned()),
+            ("EMBEDDINGS_KEY".to_owned(), "embeddings-key".to_owned()),
+            ("STATIC_KEY".to_owned(), "static-key".to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
         AppState::new(
-            cfg,
-            &env_with([("AXOND_PLATFORM_OPENAI", "sk-platform-test")]),
-            UsageFanout::new(sinks),
+            config,
+            &env,
+            UsageFanout::new(vec![Box::new(StdoutSink)]),
             Box::new(NoBudget),
         )
-        .expect("credentials resolve")
+        .expect("scope test state")
+    }
+
+    fn scoped_token(scope: Option<Vec<&'static str>>) -> String {
+        scoped_token_for("scope-tests", scope)
+    }
+
+    fn scoped_token_for(audience: &'static str, scope: Option<Vec<&'static str>>) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let claims = TestTokenClaims {
+            exp: now + 900,
+            iat: now,
+            jti: "scope-test-jti",
+            aud: audience,
+            ns: "platform",
+            sub: "scope-caller",
+            scope,
+            max_request_microdollars: None,
+        };
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("scope-test-kid".to_owned());
+        format!(
+            "axt1.{}",
+            encode(
+                &header,
+                &claims,
+                &EncodingKey::from_secret(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .expect("scope test token")
+        )
+    }
+
+    async fn assert_scope_denial(response: Response, capability: &str) {
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "token_scope_insufficient");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(capability),
+            "scope denial did not name {capability}: {body}"
+        );
+    }
+
+    async fn scoped_route_request(state: AppState, path: &str, token: &str) -> Response {
+        let (method, body) = match path {
+            "/v1/models" => (Method::GET, Vec::new()),
+            "/v1/chat/completions" => (
+                Method::POST,
+                serde_json::to_vec(&json!({
+                    "model": "chat-model",
+                    "messages": []
+                }))
+                .unwrap(),
+            ),
+            "/v1/messages" => (
+                Method::POST,
+                serde_json::to_vec(&json!({
+                    "model": "messages-model",
+                    "max_tokens": 16,
+                    "messages": []
+                }))
+                .unwrap(),
+            ),
+            "/v1/embeddings" => (
+                Method::POST,
+                serde_json::to_vec(&json!({
+                    "model": "embeddings-model",
+                    "input": ["hello"]
+                }))
+                .unwrap(),
+            ),
+            _ => panic!("unknown scoped route {path}"),
+        };
+        router(state)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn scoped_models_token_allows_models_and_denies_chat() {
+        let state = scoped_route_state().await;
+        assert_scope_denial(
+            scoped_route_request(
+                state.clone(),
+                "/v1/models",
+                &scoped_token(Some(vec!["chat"])),
+            )
+            .await,
+            "models",
+        )
+        .await;
+        assert_eq!(
+            scoped_route_request(state, "/v1/models", &scoped_token(Some(vec!["models"])))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_chat_token_allows_chat_and_denies_embeddings() {
+        let state = scoped_route_state().await;
+        assert_scope_denial(
+            scoped_route_request(
+                state.clone(),
+                "/v1/chat/completions",
+                &scoped_token(Some(vec!["embeddings"])),
+            )
+            .await,
+            "chat",
+        )
+        .await;
+        assert_eq!(
+            scoped_route_request(
+                state,
+                "/v1/chat/completions",
+                &scoped_token(Some(vec!["chat"]))
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_messages_token_allows_messages_and_denies_chat() {
+        let state = scoped_route_state().await;
+        assert_scope_denial(
+            scoped_route_request(
+                state.clone(),
+                "/v1/messages",
+                &scoped_token(Some(vec!["chat"])),
+            )
+            .await,
+            "messages",
+        )
+        .await;
+        assert_eq!(
+            scoped_route_request(state, "/v1/messages", &scoped_token(Some(vec!["messages"])),)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_embeddings_token_allows_embeddings_and_denies_messages() {
+        let state = scoped_route_state().await;
+        assert_scope_denial(
+            scoped_route_request(
+                state.clone(),
+                "/v1/embeddings",
+                &scoped_token(Some(vec!["messages"])),
+            )
+            .await,
+            "embeddings",
+        )
+        .await;
+        assert_eq!(
+            scoped_route_request(
+                state,
+                "/v1/embeddings",
+                &scoped_token(Some(vec!["embeddings"])),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_less_tokens_and_static_keys_reach_all_provider_routes() {
+        for path in [
+            "/v1/models",
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1/embeddings",
+        ] {
+            assert_eq!(
+                scoped_route_request(scoped_route_state().await, path, &scoped_token(None))
+                    .await
+                    .status(),
+                StatusCode::OK,
+                "scope-less token denied {path}"
+            );
+            assert_eq!(
+                scoped_route_request(scoped_route_state().await, path, "static-key")
+                    .await
+                    .status(),
+                StatusCode::OK,
+                "static key denied {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_token_cannot_grant_a_route_the_namespace_lacks() {
+        let body = serde_json::to_vec(&json!({ "model": "gpt-4o", "messages": [] })).expect("body");
+        let response = router(test_state())
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header(
+                        "authorization",
+                        format!(
+                            "Bearer {}",
+                            scoped_token_for("test-audience", Some(vec!["messages"]),)
+                        ),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_scope_denial(response, "messages").await;
+    }
+
+    #[tokio::test]
+    async fn scoped_token_on_responses_keeps_the_typed_501() {
+        let response = router(test_state())
+            .oneshot(
+                Request::post("/v1/responses")
+                    .header(
+                        "authorization",
+                        format!(
+                            "Bearer {}",
+                            scoped_token_for("test-audience", Some(vec!["chat"]))
+                        ),
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "not_implemented");
     }
 
     /// Inbound auth is enforced for every configured key set: the wrong
@@ -1396,6 +1937,10 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         aud: &'static str,
         ns: &'static str,
         sub: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scope: Option<Vec<&'static str>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_request_microdollars: Option<u64>,
     }
 
     #[tokio::test]
@@ -1463,6 +2008,8 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             aud: "test-audience",
             ns: "platform",
             sub: "token-caller",
+            scope: None,
+            max_request_microdollars: None,
         };
         let mut header = Header::new(Algorithm::HS256);
         header.kid = Some("route-kid".to_owned());
@@ -1488,6 +2035,100 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].subject, "token-caller");
         assert_eq!(records[0].signer_kid.as_deref(), Some("route-kid"));
+    }
+
+    /// An epoch rejection is a typed authentication failure, so HTTP clients
+    /// can distinguish it from an ordinary expired-token response.
+    #[tokio::test]
+    async fn an_epoch_rejected_token_returns_a_distinct_401_error_code() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_key]]
+env = "STATIC_KEY"
+namespace = "platform"
+
+[gateway_token]
+audience = "test-audience"
+
+[[gateway_verifier]]
+kid = "route-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+
+[[gateway_token_epoch]]
+namespace = "platform"
+min_iat = {}
+"#,
+            now + 1
+        ))
+        .expect("epoch test config");
+        let env = HashMap::from([
+            ("STATIC_KEY".to_owned(), "static-secret".to_owned()),
+            ("JWT_SECRET".to_owned(), "a".repeat(32)),
+        ]);
+        let state = AppState::new(
+            cfg,
+            &env,
+            UsageFanout::new(vec![Box::new(StdoutSink)]),
+            Box::new(NoBudget),
+        )
+        .expect("state");
+        let claims = TestTokenClaims {
+            exp: now + 900,
+            iat: now,
+            jti: "route-epoch-jti",
+            aud: "test-audience",
+            ns: "platform",
+            sub: "epoch-caller",
+            scope: None,
+            max_request_microdollars: None,
+        };
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("route-kid".to_owned());
+        let token = format!(
+            "axt1.{}",
+            encode(
+                &header,
+                &claims,
+                &EncodingKey::from_secret(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .expect("token")
+        );
+        let response = router(state)
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []}))
+                            .expect("body"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body: Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes(),
+        )
+        .expect("json error body");
+        assert_eq!(body["error"]["type"], "token_issued_before_epoch");
+        assert_ne!(body["error"]["type"], "token_expired");
     }
 
     #[tokio::test]
@@ -1527,6 +2168,28 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["data"][0]["id"], "gpt-4o");
+    }
+
+    #[tokio::test]
+    async fn models_intersect_namespace_access_with_alias_scope() {
+        let state = test_state();
+        let snapshot = state.config();
+        let caller = InboundKey {
+            namespace: "platform".to_owned(),
+            subject: "restricted".to_owned(),
+            signer_kid: Some("test-kid".to_owned()),
+            scope: None,
+            alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
+            max_request_microdollars: None,
+        };
+        let response = list_models(Extension(snapshot), Extension(caller))
+            .await
+            .unwrap()
+            .into_response();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"].as_array().unwrap().len(), 1);
         assert_eq!(json["data"][0]["id"], "gpt-4o");
     }
 
@@ -1627,6 +2290,35 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "unknown_model");
+    }
+
+    #[tokio::test]
+    async fn a_disallowed_alias_is_forbidden_before_model_lookup() {
+        let state = test_state();
+        for alias in ["claude-3", "does-not-exist"] {
+            let response = serve(
+                state.clone(),
+                HeaderMap::new(),
+                json!({"model": alias, "messages": []}),
+                Route::ChatCompletions,
+                state.config(),
+                InboundKey {
+                    namespace: "platform".to_owned(),
+                    subject: "restricted".to_owned(),
+                    signer_kid: Some("test-kid".to_owned()),
+                    scope: None,
+                    alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
+                    max_request_microdollars: None,
+                },
+            )
+            .await
+            .unwrap_err()
+            .into_response();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"]["type"], "token_alias_not_permitted");
+        }
     }
 
     /// Deferred past beta, but the route still answers for itself: a caller
@@ -1952,8 +2644,64 @@ targets = [
         }
     }
 
+    struct SharedLimiter(Arc<InMemoryRateLimiter>);
+
+    #[async_trait::async_trait]
+    impl RateLimiter for SharedLimiter {
+        fn name(&self) -> &'static str {
+            "shared-test"
+        }
+
+        async fn acquire(
+            &self,
+            key: &RateLimitKey,
+        ) -> Result<crate::rate_limit::RateLimitPermit, crate::rate_limit::RateLimitError> {
+            self.0.acquire(key).await
+        }
+    }
+
+    struct RejectingBudget;
+
+    #[async_trait::async_trait]
+    impl crate::budget::BudgetStore for RejectingBudget {
+        fn name(&self) -> &'static str {
+            "rejecting"
+        }
+
+        async fn reserve(&self, _key: &BudgetKey, _estimate: u64) -> Admission {
+            Admission::Denied(Denial::Exceeded)
+        }
+
+        async fn settle(&self, _key: &BudgetKey, _reservation: &Reservation, _actual: u64) {}
+    }
+
+    struct SharedBudget(Arc<crate::budget::InMemoryBudget>);
+
+    #[async_trait::async_trait]
+    impl crate::budget::BudgetStore for SharedBudget {
+        fn name(&self) -> &'static str {
+            "shared_test"
+        }
+
+        async fn reserve(&self, key: &BudgetKey, estimated: u64) -> Admission {
+            self.0.reserve(key, estimated).await
+        }
+
+        async fn settle(&self, key: &BudgetKey, reservation: &Reservation, actual: u64) {
+            self.0.settle(key, reservation, actual).await;
+        }
+    }
+
     /// One target, one credential, and the budget store under test.
     fn budgeted_state(base_url: &str, budget: Box<dyn crate::budget::BudgetStore>) -> AppState {
+        budgeted_state_with_limiter(base_url, budget, Box::new(NoLimit))
+    }
+
+    fn budgeted_state_with_limiter(
+        base_url: &str,
+        budget: Box<dyn crate::budget::BudgetStore>,
+        rate_limiter: Box<dyn RateLimiter>,
+    ) -> AppState {
         let cfg = Config::from_toml_str(&format!(
             r#"
 [[namespace]]
@@ -1980,7 +2728,122 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         .unwrap();
         let env = env_with([("K1", "sk-test")]);
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
-        AppState::new(cfg, &env, UsageFanout::new(sinks), budget).unwrap()
+        AppState::new_with_rate_limiter(cfg, &env, UsageFanout::new(sinks), budget, rate_limiter)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn limiter_runs_before_budget_reservation() {
+        let limiter = Arc::new(InMemoryRateLimiter::new(1, 10));
+        let held = limiter
+            .acquire(&RateLimitKey {
+                namespace: "platform".to_owned(),
+                subject: "AXOND_INBOUND_KEY".to_owned(),
+            })
+            .await
+            .expect("held permit");
+        let budget = RecordingBudget::default();
+        let state = budgeted_state_with_limiter(
+            "http://127.0.0.1:1",
+            Box::new(budget.clone()),
+            Box::new(SharedLimiter(Arc::clone(&limiter))),
+        );
+        let response = router(state).oneshot(chat_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let no_retry_after = response.headers().get("retry-after").is_none();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limited");
+        assert!(no_retry_after);
+        assert!(budget.0.lock().unwrap().is_empty());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn budget_denial_does_not_leave_limiter_saturated() {
+        let limiter = Arc::new(InMemoryRateLimiter::new(1, 10));
+        let state = budgeted_state_with_limiter(
+            "http://127.0.0.1:1",
+            Box::new(RejectingBudget),
+            Box::new(SharedLimiter(Arc::clone(&limiter))),
+        );
+        for _ in 0..2 {
+            let response = router(state.clone()).oneshot(chat_request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["type"], "budget_exceeded");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_over_its_ceiling_is_rejected_before_reservation_or_dispatch() {
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let budget = RecordingBudget::default();
+        let state = budgeted_state(&base_url, Box::new(budget.clone()));
+        let snapshot = state.config();
+        let caller = InboundKey {
+            namespace: "platform".to_owned(),
+            subject: "ceiling-caller".to_owned(),
+            signer_kid: Some("test-kid".to_owned()),
+            scope: None,
+            alias_scope: None,
+            max_request_microdollars: Some(1),
+        };
+        let body = json!({"model": "gpt-4o", "messages": []});
+
+        let error = serve(
+            state,
+            HeaderMap::new(),
+            body,
+            Route::ChatCompletions,
+            snapshot,
+            caller,
+        )
+        .await
+        .expect_err("the estimate exceeds the caller ceiling");
+
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "request_cost_ceiling_exceeded");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert!(budget.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_request_under_its_ceiling_still_reserves_and_dispatches() {
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let budget = RecordingBudget::default();
+        let state = budgeted_state(&base_url, Box::new(budget.clone()));
+        let snapshot = state.config();
+        let caller = InboundKey {
+            namespace: "platform".to_owned(),
+            subject: "ceiling-caller".to_owned(),
+            signer_kid: Some("test-kid".to_owned()),
+            scope: None,
+            alias_scope: None,
+            max_request_microdollars: Some(10_000),
+        };
+        let body = json!({"model": "gpt-4o", "messages": []});
+
+        let response = serve(
+            state,
+            HeaderMap::new(),
+            body,
+            Route::ChatCompletions,
+            snapshot,
+            caller,
+        )
+        .await
+        .expect("the estimate is under the caller ceiling");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(hits.load(Ordering::SeqCst) > 0);
+        assert!(!budget.0.lock().unwrap().is_empty());
     }
 
     /// The reserved estimate is a ceiling, not the charge: a completed request
@@ -2024,6 +2887,58 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         let ledger = budget.0.lock().unwrap();
         assert_eq!(ledger.len(), 1);
         assert_eq!(ledger[0].1, 0);
+    }
+
+    /// A cancelled buffered handler drops its reservation guard while the
+    /// dispatcher is waiting for the provider; the detached release must run
+    /// before the next request can observe the ledger.
+    #[tokio::test]
+    async fn a_cancelled_buffered_request_releases_its_reservation() {
+        let (started_tx, started_rx) = oneshot::channel();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let upstream = Router::new().route(
+            "/chat/completions",
+            post({
+                let started_tx = started_tx.clone();
+                move || async move {
+                    if let Some(started_tx) = started_tx.lock().unwrap().take() {
+                        let _ = started_tx.send(());
+                    }
+                    pending::<()>().await;
+                    StatusCode::OK.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let budget = Arc::new(crate::budget::InMemoryBudget::new(10_000));
+        let state = budgeted_state(
+            &format!("http://{addr}"),
+            Box::new(SharedBudget(budget.clone())),
+        );
+        let request = tokio::spawn(router(state).oneshot(chat_request()));
+        started_rx.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+
+        let key = BudgetKey {
+            namespace: "platform".to_owned(),
+            subject: "AXOND_INBOUND_KEY".to_owned(),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let outstanding = budget.outstanding(&key);
+            if outstanding == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "reservation was not released before timeout; outstanding={outstanding}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// The two denials are different answers to the caller: over-cap is the

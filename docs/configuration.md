@@ -20,6 +20,34 @@ Loading order: the TOML file (`AXOND_CONFIG`, default `axond.toml`), then
 separator (`AXOND_SERVER__BIND=0.0.0.0:9090`). The override layer is for scalars
 in containerized deploys; structure belongs in the file.
 
+## State tiers
+
+State tiers describe the state backends axond itself depends on, not provider
+egress: upstream provider calls still use the network at Tier 0.
+
+| Config section | State tier |
+| --- | --- |
+| `[server]`, `[[namespace]]`, `[[provider]]`, `[[model]]`, `[[credential]]` | Tier 0: config-only. |
+| `[credential_pool]`, `[failover]` | Tier 0: in-memory, per replica. |
+| `[[gateway_key]]`, `[gateway_token]`, `[[gateway_verifier]]`, `[[gateway_token_epoch]]`, offline `keygen`/`mint` | Tier 0: config, referenced files, and environment only. |
+| `[reload]` | Tier 0: reload reads the config file, referenced key-material files, and process environment. |
+| `[[usage_sink]]` omitted or `kind = "stdout"` | Tier 0: one JSON line on stdout. |
+| `[[usage_sink]] kind = "otlp"` | Tier 0 state, but not hermetic: a collector is a boot-time dependency, so this is outside the hermetic Tier 0 CI lane. |
+| `[[usage_sink]] kind = "postgres"` | Tier 2: durable usage rows. |
+| `[budget] backend = "none"` or `"in-memory"` | Tier 0; in-memory state is per replica and approximate. |
+| `[budget] backend = "redis"` | Tier 1: the only shipped Tier 1 feature today. |
+| `[budget] backend = "postgres"` | Tier 2: shared caps. |
+| `/healthz`, `/readyz` | Tier 0. |
+
+Namespaces, providers, aliases, prices, and provider credentials are
+permanently config-owned and reload through ADR 0011. Only callers and keys may
+ever become store-owned at Tier 2; nothing is defined in both. A database may
+not override namespace provider access, an alias's target, a price, or the
+credential pool. Even at Tier 2, a token verifier intersects token claims with
+config-owned namespace authority (ADR 0016). See
+[ADR 0017](./adr/0017-state-tiers-and-optional-backends.md) and the hermetic
+[Tier 0 gate](./adr/0018-tier-0-hermetic-boot-gate.md).
+
 ## `[server]`
 
 | Key | Type | Default | Meaning |
@@ -77,7 +105,7 @@ Several entries for the same pair form that pair's **pool**
 | `id` | string | the `env` name | Non-secret attribution label; lands on usage records as `credential_id`. Duplicates within one pool are rejected. |
 | `weight` | integer | `1` | Share of pool traffic under the `weighted` strategy. `0` is rejected — remove the entry instead. |
 
-## `[credential_pool]`
+## `[credential_pool]` — Tier 0, in-memory per replica
 
 Pool-wide policy for every `(namespace, provider)` pair that binds more than one
 credential.
@@ -91,7 +119,7 @@ credential.
 Parking is per credential, never per target: a rate-limited key is skipped while
 the same target keeps serving every other key.
 
-## `[failover]`
+## `[failover]` — Tier 0, in-memory per replica
 
 The outer loop around pool dispatch: an alias's targets, in order
 ([ADR 0008](./adr/0008-target-failover-and-circuit-scope.md)).
@@ -106,7 +134,7 @@ The outer loop around pool dispatch: an alias's targets, in order
 Circuits are in-memory and per replica, consistent with running stateless
 ([ADR 0002](./adr/0002-stateless-by-default-stateful-by-opt-in.md)).
 
-## `[[gateway_key]]` — inbound authentication (required)
+## `[[gateway_key]]` — inbound authentication (required, Tier 0)
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -137,7 +165,7 @@ secret — the caller's namespace would be ambiguous. Callers present the token 
 table. The usage record's `subject` is the env var's *name*
 ([ADR 0013](./adr/0013-inbound-auth-fails-closed.md)).
 
-## `[gateway_token]` — minted-token deployment policy
+## `[gateway_token]` — minted-token deployment policy (Tier 0)
 
 This section is optional when the gateway uses only static gateway keys. It is
 required when any `[[gateway_verifier]]` is declared: the verifier needs one
@@ -151,7 +179,7 @@ The audience is config-owned and is applied to every verifier. A token with a
 different audience is rejected. The value is not a secret and is written
 directly in TOML.
 
-## `[[gateway_verifier]]` — minted-token verification (optional)
+## `[[gateway_verifier]]` — minted-token verification (optional, Tier 0)
 
 Verifiers are additive to the required static gateway keys. They resolve
 `axt1.` compact JWS credentials without a per-caller registry or a runtime
@@ -182,7 +210,39 @@ signature on every token. At least one static `[[gateway_key]]` remains
 mandatory as breakglass access. See the [minted identity guide](./minted-token-guide.md)
 for the new-`kid` rotation procedure and the Tier 0/Tier 1 revocation boundary.
 
-## `[reload]`
+An optional `aliases` claim narrows the aliases the token may use. It is an array
+of strings, matched as a case-sensitive union: a string without `*` is an exact
+alias; one `*` at the end is a prefix match (`foo*`); one at the beginning is a
+suffix match (`*foo`); and bare `*` matches every alias. Empty strings, a `*`
+in the middle, or more than one `*` are invalid and reject the request with
+`403`. An empty array permits no aliases, and a claim that is present but not an
+array of strings — including `null` — is invalid. The claim can only narrow the
+namespace's existing authority: it never adds aliases the namespace cannot
+already reach. Static gateway keys remain unrestricted.
+
+The check runs before the alias is looked up, so a disallowed alias returns `403`
+whether or not it is configured and regardless of whether the endpoint supports
+the target's wire protocol.
+
+## `[[gateway_token_epoch]]` — minted-token issuance revocation (optional)
+
+An issuance epoch invalidates minted tokens whose `iat` is earlier than the
+configured instant. It is applied when the config is reloaded, so changing an
+epoch and sending `SIGHUP` revokes matching tokens without a restart.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `namespace` | string | — | Declared namespace whose minted tokens are affected. Required. |
+| `subject` | string | omitted | Optional subject-specific override. If present, this entry is the only epoch used for that subject; otherwise the namespace-wide entry applies. |
+| `min_iat` | integer or RFC 3339 UTC string | — | Earliest accepted token issuance time, as Unix seconds or a timestamp such as `2026-08-10T12:00:00Z`. Required. |
+
+Entries must use declared namespaces and may not duplicate a
+`(namespace, subject)` pair. A namespace-wide epoch cannot spare one subject;
+use a per-subject entry with an earlier epoch when that exception is needed.
+Epochs affect minted `axt1.` tokens only. Static `[[gateway_key]]` credentials
+remain valid.
+
+## `[reload]` — Tier 0
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -196,15 +256,21 @@ or via an atomic rename is therefore reload-reachable without a process
 restart. `[[namespace]]` changes are reloadable and appear in the reported
 namespace delta, but the namespace count used for in-memory budget retention
 floors is captured at boot and does not resize until restart. `[server] bind`,
-`[[usage_sink]]`, and `[budget]`
+`[[usage_sink]]`, `[budget]`, and `[rate_limit]`
 changes warn and are ignored until restart; this includes
 `limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
 
-## `[[usage_sink]]` — opt-in, datastore for `postgres`
+## `[[usage_sink]]` — Tier 0 by default; Tier 2 for `postgres`
 
 Omit the section entirely for the default: one JSON line per record on stdout,
 no datastore ([ADR 0009](./adr/0009-durable-usage-sinks.md)). The row shape is a
 versioned interface — see [`docs/usage-schema.md`](./usage-schema.md).
+
+`kind = "stdout"` is Tier 0. `kind = "otlp"` is Tier 0 state (no datastore,
+nothing to migrate), but not hermetic: it adds a collector dependency at boot
+and is excluded from the hermetic Tier 0 CI lane. `kind = "postgres"` is Tier 2
+and requires the Postgres role, `ops/postgres/usage_v1.sql`, ordered additive
+migrations, and backup/restore ownership.
 
 | Key | Type | Default | Applies to | Meaning |
 | --- | --- | --- | --- | --- |
@@ -224,11 +290,17 @@ A configured sink connects **at boot**, so a bad DSN refuses to start rather
 than dropping records later. Afterwards the sink is off the request path and a
 stalled destination drops with a count rather than delaying a request.
 
-## `[budget]` — opt-in budget enforcement
+## `[budget]` — opt-in budget enforcement (Tier 0, 1, or 2 by backend)
 
 Omit the section for the default: no cap, no datastore
 ([ADR 0010](./adr/0010-shared-budget-backends-and-charging-policy.md)). The cap
 is per `(namespace, subject)` — that is, per gateway key — in micro-dollars.
+
+`backend = "none"` and `"in-memory"` are Tier 0; in-memory enforcement is
+per-replica and approximate. `backend = "redis"` is Tier 1 and is the only
+shipped Tier 1 feature today; with the default `on_unavailable = "deny"`, an
+unavailable Redis answers `503 budget_unavailable`. `backend = "postgres"` is
+Tier 2 and shares the cap through Postgres.
 
 | Key | Type | Default | Applies to | Meaning |
 | --- | --- | --- | --- | --- |
@@ -247,6 +319,24 @@ Enforcement holds a priced estimate before dispatch and settles it against
 measured spend afterwards, so concurrent requests cannot collectively overshoot.
 A cancelled or failed request is charged what it actually consumed — not the
 estimate, and not always zero.
+
+## `[rate_limit]` — opt-in inbound concurrency enforcement
+
+Omit this section for the Tier 0 default: `NoLimit` has zero state and no
+network dependency. The in-memory backend limits concurrent requests per
+`(namespace, subject)` and is per-replica. With N replicas sharing a nominal
+limit, each replica enforces approximately `limit ÷ N`; it cannot enforce
+fleet-wide concurrency.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `backend` | `none` \| `in-memory` | `none` | Selects the default no-op or bounded in-memory limiter. |
+| `max_in_flight_per_subject` | integer | `16` | Maximum concurrent dispatches for one authenticated caller. Must be nonzero when `backend = "in-memory"`. |
+| `max_subjects` | integer | `10000` | Maximum retained caller keys in the in-memory map. Must be nonzero when enabled; zero-count entries are evicted. |
+
+When `max_subjects` is reached, a new caller is refused rather than silently
+admitted without a limit; zero-in-flight entries are evicted on permit drop, so
+the map retains only active callers.
 
 ## Telemetry
 
