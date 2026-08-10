@@ -998,7 +998,6 @@ mod tests {
 
         let stub = RedisRetryStub::start().await;
         let timeout = Duration::from_millis(40);
-        let started = tokio::time::Instant::now();
         let mut limiter = RedisRateLimiter::connect(
             &stub.url(),
             format!("axond:test:{}", next_id()),
@@ -1017,11 +1016,10 @@ mod tests {
             Err(RateLimitError::StoreUnavailable)
         ));
 
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
-        assert!(
-            started.elapsed() >= Duration::from_millis(900),
-            "retry loop did not run through its bounded backoff attempts"
-        );
+        // The capped backoff across attempts 2..=8 is
+        // 25 + 50 + 100 + 200 + 200 + 200 + 200 = 975 ms; this window
+        // leaves headroom for a contended attempt to show a second connection.
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
         assert_eq!(stub.connections.load(Ordering::Relaxed), 1);
         assert!(stub.released_lease.lock().unwrap().is_none());
     }
