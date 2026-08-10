@@ -1,7 +1,7 @@
 //! Exact cross-replica in-flight concurrency leases in Redis.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
@@ -109,6 +109,14 @@ struct SharedRecovery {
     replacement_notify: Arc<Notify>,
 }
 
+impl Drop for SharedRecovery {
+    fn drop(&mut self) {
+        // Store a wakeup so a worker between iterations observes that its
+        // Weak reference can no longer be upgraded and exits.
+        self.replacement_notify.notify_one();
+    }
+}
+
 impl SharedRecovery {
     fn request_replacement(&self) {
         self.replacement_notify.notify_one();
@@ -179,11 +187,22 @@ impl SharedRecovery {
         });
     }
 
-    async fn replacement_worker(self: Arc<Self>) {
+    async fn replacement_worker(worker: Weak<Self>) {
         loop {
-            self.replacement_notify.notified().await;
-            let generation = self.connection.load_full().generation;
-            self.schedule_replacement(generation);
+            let notify = match worker.upgrade() {
+                Some(recovery) => recovery.replacement_notify.clone(),
+                None => return,
+            };
+            notify.notified().await;
+            let Some(recovery) = worker.upgrade() else {
+                return;
+            };
+            // Re-read the current generation after waking. If a newer
+            // generation was already published, its lower suspect marker
+            // makes schedule_replacement a safe no-op; otherwise this is the
+            // generation that still needs repair.
+            let generation = recovery.connection.load_full().generation;
+            recovery.schedule_replacement(generation);
         }
     }
 }
@@ -425,7 +444,9 @@ impl RedisRateLimiter {
             invoke_semaphore: Arc::new(Semaphore::new(SHARED_INVOKE_CONCURRENCY)),
             replacement_notify: Arc::new(Notify::new()),
         });
-        tokio::spawn(recovery.clone().replacement_worker());
+        tokio::spawn(SharedRecovery::replacement_worker(Arc::downgrade(
+            &recovery,
+        )));
         Ok(Self {
             key_prefix,
             max_in_flight,
