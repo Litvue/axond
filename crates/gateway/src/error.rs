@@ -21,6 +21,14 @@ pub enum GatewayError {
     NoCredential { namespace: String, provider: String },
     #[error("budget exceeded for model `{0}`")]
     BudgetExceeded(String),
+    #[error(
+        "request cost ceiling exceeded for model `{alias}`: estimated {estimated_microdollars} microdollars exceeds the per-request ceiling of {ceiling_microdollars} microdollars"
+    )]
+    RequestCostCeilingExceeded {
+        alias: String,
+        estimated_microdollars: u64,
+        ceiling_microdollars: u64,
+    },
     #[error("budget store is unavailable")]
     BudgetUnavailable,
     #[error("unauthorized")]
@@ -55,6 +63,7 @@ impl GatewayError {
             Self::UnknownModel(_) => StatusCode::NOT_FOUND,
             Self::NoCredential { .. } => StatusCode::BAD_GATEWAY,
             Self::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::RequestCostCeilingExceeded { .. } => StatusCode::FORBIDDEN,
             // Fail-closed: the cap cannot be enforced, so the request is a
             // dependency failure rather than an over-cap caller (ADR 0010).
             Self::BudgetUnavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -83,6 +92,7 @@ impl GatewayError {
             Self::UnknownModel(_) => "unknown_model",
             Self::NoCredential { .. } => "no_credential",
             Self::BudgetExceeded(_) => "budget_exceeded",
+            Self::RequestCostCeilingExceeded { .. } => "request_cost_ceiling_exceeded",
             Self::BudgetUnavailable => "budget_unavailable",
             Self::Unauthorized => "unauthorized",
             Self::TokenUnauthorized(error) | Self::TokenForbidden(error) => error.code(),
@@ -129,6 +139,21 @@ mod tests {
         });
         assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
         assert_eq!(forbidden.code(), "token_unknown_namespace");
+    }
+
+    #[test]
+    fn request_cost_ceiling_and_budget_errors_are_distinct() {
+        let ceiling = GatewayError::RequestCostCeilingExceeded {
+            alias: "gpt-4o".to_owned(),
+            estimated_microdollars: 11,
+            ceiling_microdollars: 10,
+        };
+        assert_eq!(ceiling.status(), StatusCode::FORBIDDEN);
+        assert_eq!(ceiling.code(), "request_cost_ceiling_exceeded");
+
+        let budget = GatewayError::BudgetExceeded("gpt-4o".to_owned());
+        assert_eq!(budget.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(budget.code(), "budget_exceeded");
     }
 
     #[tokio::test]

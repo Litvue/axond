@@ -28,6 +28,13 @@ struct MintClaims {
     jti: String,
     ns: String,
     sub: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_request_microdollars: Option<u64>,
+}
+
+struct MintOptions {
+    ttl: Duration,
+    max_request_microdollars: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -112,6 +119,7 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
     }
 
     let ttl = parse_duration(required(args, "ttl")?)?;
+    let max_request_microdollars = args.get_one::<u64>("max-request-microdollars").copied();
     let policy_ceiling = Duration::from_secs(MAX_GATEWAY_VERIFIER_TTL_SECONDS);
     if ttl.is_zero() {
         bail!("requested TTL must be at least 1 second");
@@ -165,7 +173,10 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
         namespace,
         subject,
         &audience,
-        ttl,
+        MintOptions {
+            ttl,
+            max_request_microdollars,
+        },
     )
 }
 
@@ -176,17 +187,18 @@ fn mint_token(
     namespace: &str,
     subject: &str,
     audience: &str,
-    ttl: Duration,
+    options: MintOptions,
 ) -> Result<String> {
     let encoding_key = encoding_key(algorithm, key_material, kid)?;
     let now = unix_now()?;
     let claims = MintClaims {
-        exp: now + ttl.as_secs(),
+        exp: now + options.ttl.as_secs(),
         iat: now,
         aud: audience.to_owned(),
         jti: random_jti()?,
         ns: namespace.to_owned(),
         sub: subject.to_owned(),
+        max_request_microdollars: options.max_request_microdollars,
     };
     let mut header = Header::new(algorithm.jwt());
     header.kid = Some(kid.to_owned());
@@ -457,7 +469,10 @@ max_ttl = "15m"
             "acme",
             "caller",
             "configured-audience",
-            Duration::from_secs(600),
+            MintOptions {
+                ttl: Duration::from_secs(600),
+                max_request_microdollars: None,
+            },
         )
         .unwrap();
         let principal = verifier
@@ -486,7 +501,10 @@ max_ttl = "15m"
             "acme",
             "caller",
             "configured-audience",
-            Duration::from_secs(600),
+            MintOptions {
+                ttl: Duration::from_secs(600),
+                max_request_microdollars: None,
+            },
         )
         .unwrap();
         let principal = verifier
@@ -521,6 +539,8 @@ max_ttl = "15m"
             "1s",
             "--audience",
             "configured-audience",
+            "--max-request-microdollars",
+            "123",
         ]);
         let token = mint_from_args(&args, Some(config), secret).unwrap();
         let principal = verifier
@@ -531,6 +551,7 @@ max_ttl = "15m"
         assert_eq!(principal.namespace, "acme");
         assert_eq!(principal.subject, "caller");
         assert_eq!(principal.signer_kid.as_deref(), Some("hs-kid"));
+        assert_eq!(principal.max_request_microdollars, Some(123));
     }
 
     #[tokio::test]
@@ -549,7 +570,10 @@ max_ttl = "15m"
             "acme",
             "caller",
             "configured-audience",
-            Duration::from_secs(600),
+            MintOptions {
+                ttl: Duration::from_secs(600),
+                max_request_microdollars: None,
+            },
         )
         .unwrap();
         let principal = verifier
@@ -590,7 +614,10 @@ max_ttl = "15m"
             "acme",
             "generated-caller",
             "configured-audience",
-            Duration::from_secs(600),
+            MintOptions {
+                ttl: Duration::from_secs(600),
+                max_request_microdollars: None,
+            },
         )
         .unwrap();
         let principal = verifier
@@ -827,7 +854,10 @@ max_ttl = "15m"
             "acme",
             "caller",
             "configured-audience",
-            Duration::from_secs(600),
+            MintOptions {
+                ttl: Duration::from_secs(600),
+                max_request_microdollars: None,
+            },
         )
         .unwrap();
         assert!(matches!(

@@ -18,6 +18,7 @@ pub struct InboundKey {
     pub namespace: String,
     pub subject: String,
     pub signer_kid: Option<String>,
+    pub max_request_microdollars: Option<u64>,
 }
 
 pub(crate) struct GatewayKeyEntry {
@@ -178,6 +179,7 @@ struct TokenClaims {
     jti: Option<String>,
     ns: Option<String>,
     sub: Option<String>,
+    max_request_microdollars: Option<u64>,
 }
 
 impl TokenVerifier {
@@ -461,6 +463,7 @@ impl PrincipalStore for TokenVerifier {
             namespace,
             subject,
             signer_kid: Some(verifier.kid.clone()),
+            max_request_microdollars: claims.max_request_microdollars,
         }))
     }
 }
@@ -678,6 +681,7 @@ mod tests {
                 namespace: "platform".to_owned(),
                 subject: "AXOND_KEY".to_owned(),
                 signer_kid: None,
+                max_request_microdollars: None,
             },
         }]))
     }
@@ -828,6 +832,8 @@ mod tests {
         ns: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         sub: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_request_microdollars: Option<u64>,
     }
 
     const ED_PRIVATE_PK8: &[u8] = &[
@@ -950,6 +956,7 @@ max_ttl = "15m"
             jti: Some("jti-1".to_owned()),
             ns: Some(namespace.to_owned()),
             sub: Some("caller-1".to_owned()),
+            max_request_microdollars: None,
         }
     }
 
@@ -973,6 +980,49 @@ max_ttl = "15m"
         assert_eq!(principal.namespace, "acme");
         assert_eq!(principal.subject, "caller-1");
         assert_eq!(principal.signer_kid.as_deref(), Some("ed-test"));
+        assert_eq!(principal.max_request_microdollars, None);
+    }
+
+    #[tokio::test]
+    async fn token_verifier_resolves_an_optional_request_cost_ceiling() {
+        let verifier = token_verifier();
+        let mut claims = valid_claims();
+        claims.max_request_microdollars = Some(42);
+        let principal = verifier
+            .resolve(&Presented {
+                credential: &signed_token(claims),
+            })
+            .await
+            .expect("valid token resolves")
+            .expect("valid token returns a principal");
+        assert_eq!(principal.max_request_microdollars, Some(42));
+    }
+
+    #[tokio::test]
+    async fn malformed_request_cost_ceiling_is_a_malformed_token() {
+        let verifier = token_verifier();
+        let claims = serde_json::json!({
+            "exp": unix_now() + 900,
+            "iat": unix_now(),
+            "jti": "jti-1",
+            "aud": "test-audience",
+            "ns": "acme",
+            "sub": "caller-1",
+            "max_request_microdollars": "42"
+        });
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some("ed-test".to_owned());
+        let token = format!(
+            "axt1.{}",
+            encode(&header, &claims, &EncodingKey::from_ed_der(ED_PRIVATE_PK8))
+                .expect("test token signs")
+        );
+        assert!(matches!(
+            verifier.resolve(&Presented { credential: &token }).await,
+            Err(PrincipalStoreError::Unauthorized(
+                TokenVerificationError::Malformed
+            ))
+        ));
     }
 
     #[tokio::test]
