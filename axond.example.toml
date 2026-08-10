@@ -366,8 +366,11 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # In-memory budgets keep state per replica and are approximate. Idle eviction
 # can reset accumulated spend, so use Redis when the cap must be exact.
 # max_subjects is shared with derived equal per-namespace floors
-# (max_subjects / configured namespace count); namespaces may burst into unused
-# headroom, and changing the configured namespaces or ceiling requires restart.
+# (max_subjects / configured namespace count). A namespace may use headroom not
+# reserved for another configured namespace's unmet floor. With many configured
+# but inactive namespaces, the table can be mostly empty while an active one
+# gets 503s; size max_subjects for the busiest namespace, not the fleet average.
+# Changing the configured namespaces or ceiling requires restart.
 # [budget]
 # backend = "in-memory"
 # limit_microdollars = 10_000_000

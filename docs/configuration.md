@@ -193,7 +193,10 @@ A reload re-runs the full boot validation against the current file, current
 process environment, and referenced key-material files; a bad candidate is
 rejected and the running config keeps serving. Replacing file contents in place
 or via an atomic rename is therefore reload-reachable without a process
-restart. `[server] bind`, `[[usage_sink]]`, and `[budget]`
+restart. `[[namespace]]` changes are reloadable and appear in the reported
+namespace delta, but the namespace count used for in-memory budget retention
+floors is captured at boot and does not resize until restart. `[server] bind`,
+`[[usage_sink]]`, and `[budget]`
 changes warn and are ignored until restart; this includes
 `limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
 
@@ -238,7 +241,7 @@ is per `(namespace, subject)` — that is, per gateway key — in micro-dollars.
 | `key_prefix` | string | `axond:budget` | `redis` | Key namespace for budget state. |
 | `reservation_ttl_seconds` | integer | `300` | every backend but `none` | How long a hold survives a replica that died mid-request. Should exceed the longest expected request. Zero is rejected. |
 | `idle_ttl_seconds` | integer | `3600` | `in-memory` | Idle time before an unheld ledger may be pruned when `max_subjects` is reached. In-memory state is per-replica and approximate; zero is rejected. |
-| `max_subjects` | integer | `10000` | `in-memory` | Maximum retained `(namespace, subject)` ledgers. Configured namespaces derive an equal guaranteed floor (`max_subjects / namespace_count`, minimum 1) and may burst into genuinely unused headroom; eviction is same-namespace-only and lazy. If no namespaces are configured, or the ceiling is smaller than their count, the previous global behavior is retained. This is restart-required; exact cross-replica retention and enforcement still needs Redis. Zero is rejected. |
+| `max_subjects` | integer | `10000` | `in-memory` | Maximum retained `(namespace, subject)` ledgers. Configured namespaces derive an equal guaranteed floor (`max_subjects / namespace_count`, minimum 1); a namespace may use headroom only when it is not reserved for another configured namespace's unmet floor. Eviction is same-namespace-only and lazy. If no namespaces are configured, or the ceiling is smaller than their count, the previous global behavior is retained. The namespace count is captured at boot, so this and `max_subjects` require a restart; exact cross-replica retention and enforcement still needs Redis. Zero is rejected. |
 
 Enforcement holds a priced estimate before dispatch and settles it against
 measured spend afterwards, so concurrent requests cannot collectively overshoot.
