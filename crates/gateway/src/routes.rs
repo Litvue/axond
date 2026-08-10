@@ -503,13 +503,14 @@ async fn serve(
         .await;
     }
 
+    let reservation = BudgetReservation::new(state.clone(), budget_key, reservation);
     let outcome =
         match dispatch_with_failover(&state, &snapshot, &caller, model, &body, &wire).await {
             Ok(outcome) => outcome,
             Err(err) => {
                 // Nothing reached a provider, so nothing was consumed: the whole
                 // estimate goes back rather than lingering until it expires.
-                state.0.budget.release(&budget_key, &reservation).await;
+                reservation.release().await;
                 return Err(err);
             }
         };
@@ -518,7 +519,7 @@ async fn serve(
         Ok(response) => {
             let usage = to_usage(&response.usage);
             let cost = served.price.cost_microdollars(usage);
-            state.0.budget.settle(&budget_key, &reservation, cost).await;
+            reservation.settle(cost).await;
             record_usage(
                 &state,
                 RecordArgs {
@@ -547,7 +548,7 @@ async fn serve(
             // measure. Spend is therefore genuinely unknowable and charged as
             // zero — the streamed path, which can measure what it relayed,
             // charges its partial spend.
-            state.0.budget.release(&budget_key, &reservation).await;
+            reservation.release().await;
             record_usage(
                 &state,
                 RecordArgs {
@@ -914,6 +915,63 @@ struct BudgetHold {
     estimated_input_tokens: u64,
 }
 
+/// A buffered request's reservation must be reconciled even when its handler is
+/// dropped while the upstream request is in flight. The streaming path gets the
+/// same guarantee from its streaming accounting guard, but its relay owns additional
+/// usage state that does not belong on this small buffered-path guard.
+struct BudgetReservation {
+    state: AppState,
+    key: BudgetKey,
+    reservation: Option<Reservation>,
+}
+
+impl BudgetReservation {
+    fn new(state: AppState, key: BudgetKey, reservation: Reservation) -> Self {
+        Self {
+            state,
+            key,
+            reservation: Some(reservation),
+        }
+    }
+
+    /// Disarm before awaiting so dropping the guard after settlement cannot
+    /// submit a second budget operation.
+    async fn settle(mut self, actual_microdollars: u64) {
+        let reservation = self
+            .reservation
+            .take()
+            .expect("budget reservation guard must be armed");
+        self.state
+            .0
+            .budget
+            .settle(&self.key, &reservation, actual_microdollars)
+            .await;
+    }
+
+    /// Disarm before awaiting so the explicit release and the drop fallback
+    /// cannot both reconcile the same hold.
+    async fn release(mut self) {
+        let reservation = self
+            .reservation
+            .take()
+            .expect("budget reservation guard must be armed");
+        self.state.0.budget.release(&self.key, &reservation).await;
+    }
+}
+
+impl Drop for BudgetReservation {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let state = self.state.clone();
+        let key = self.key.clone();
+        streaming::spawn_settlement(async move {
+            state.0.budget.release(&key, &reservation).await;
+        });
+    }
+}
+
 /// Mutable bookkeeping shared by the buffered and streaming failover walks: how
 /// many upstream attempts have been made, which targets were circuit-skipped,
 /// and the reason to surface if nothing ever dispatched.
@@ -1218,9 +1276,11 @@ mod tests {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde::Serialize;
     use std::collections::HashMap;
+    use std::future::pending;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tokio::sync::oneshot;
     use tower::util::ServiceExt;
 
     /// The inbound key every test config declares, and the secret the caller
@@ -1952,6 +2012,23 @@ targets = [
         }
     }
 
+    struct SharedBudget(Arc<crate::budget::InMemoryBudget>);
+
+    #[async_trait::async_trait]
+    impl crate::budget::BudgetStore for SharedBudget {
+        fn name(&self) -> &'static str {
+            "shared_test"
+        }
+
+        async fn reserve(&self, key: &BudgetKey, estimated: u64) -> Admission {
+            self.0.reserve(key, estimated).await
+        }
+
+        async fn settle(&self, key: &BudgetKey, reservation: &Reservation, actual: u64) {
+            self.0.settle(key, reservation, actual).await;
+        }
+    }
+
     /// One target, one credential, and the budget store under test.
     fn budgeted_state(base_url: &str, budget: Box<dyn crate::budget::BudgetStore>) -> AppState {
         let cfg = Config::from_toml_str(&format!(
@@ -2024,6 +2101,50 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         let ledger = budget.0.lock().unwrap();
         assert_eq!(ledger.len(), 1);
         assert_eq!(ledger[0].1, 0);
+    }
+
+    /// A cancelled buffered handler drops its reservation guard while the
+    /// dispatcher is waiting for the provider; the detached release must run
+    /// before the next request can observe the ledger.
+    #[tokio::test]
+    async fn a_cancelled_buffered_request_releases_its_reservation() {
+        let (started_tx, started_rx) = oneshot::channel();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let upstream = Router::new().route(
+            "/chat/completions",
+            post({
+                let started_tx = started_tx.clone();
+                move || async move {
+                    if let Some(started_tx) = started_tx.lock().unwrap().take() {
+                        let _ = started_tx.send(());
+                    }
+                    pending::<()>().await;
+                    StatusCode::OK.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let budget = Arc::new(crate::budget::InMemoryBudget::new(10_000));
+        let state = budgeted_state(
+            &format!("http://{addr}"),
+            Box::new(SharedBudget(budget.clone())),
+        );
+        let request = tokio::spawn(router(state).oneshot(chat_request()));
+        started_rx.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let key = BudgetKey {
+            namespace: "platform".to_owned(),
+            subject: "AXOND_INBOUND_KEY".to_owned(),
+        };
+        assert_eq!(budget.outstanding(&key), 0);
     }
 
     /// The two denials are different answers to the caller: over-cap is the
