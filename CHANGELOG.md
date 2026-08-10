@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.6](https://github.com/Litvue/axond/compare/v0.1.5...v0.1.6) (2026-08-10)
+
+
+### Bug Fixes
+
+* **limits:** make Redis reply attribution observable via echoed lease ids ([bbb9282](https://github.com/Litvue/axond/commit/bbb928248f8e5bd3a3f075a3fc04eb8ef0c6894c))
+* **rate-limit:** decouple invoke deadline and handoff ([11244a6](https://github.com/Litvue/axond/commit/11244a6536ea1f2145291ddf77d0c62540795dee))
+* **rate-limit:** echo acquire lease ids ([cdf4a9c](https://github.com/Litvue/axond/commit/cdf4a9c338e643db6232bd66d76e438dac101723))
+* **rate-limit:** make timeout handoff observable ([52859a2](https://github.com/Litvue/axond/commit/52859a2ada942d97920948047a973f2f5b5eec94))
+* **rate-limit:** preserve timeout handoff attribution ([e2893d8](https://github.com/Litvue/axond/commit/e2893d855f748387be7c36bcf0e69030c983413d))
+* **rate-limit:** share mismatch escalation path ([1ca5d22](https://github.com/Litvue/axond/commit/1ca5d2226a3008a959da2969ca5da2ac64d56159))
+* **rate-limit:** unify abandoned result compensation ([53c3f02](https://github.com/Litvue/axond/commit/53c3f02db6628b91c0d35824b7282c54b32b160b))
+
 ## [0.1.5](https://github.com/Litvue/axond/compare/v0.1.4...v0.1.5) (2026-08-10)
 
 
