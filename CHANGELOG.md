@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.1.5](https://github.com/Litvue/axond/compare/v0.1.4...v0.1.5) (2026-08-10)
+
+
+### Bug Fixes
+
+* bound Redis lease release retries ([50bcb68](https://github.com/Litvue/axond/commit/50bcb685c31b767e5d583687c6d2d990fa18b37f))
+* continue contended Redis retry attempts ([051b408](https://github.com/Litvue/axond/commit/051b4083a89b7f821ea8f09838eb85c12cffcca5))
+* derive Redis release budget from admission timeout ([312158e](https://github.com/Litvue/axond/commit/312158e8d1e3b28322d3cbc574c7ac06e20b9a09))
+* **limits:** bound owned Redis invokes and stop treating saturation as poisoning ([ab678a1](https://github.com/Litvue/axond/commit/ab678a1915fefaeea08e4a21b73f8a3dc5f4fee5))
+* **limits:** retire poisoned Redis limiter connections after a cancelled request ([af0200e](https://github.com/Litvue/axond/commit/af0200e5426057f0107f7cedab3566fc482394b2))
+* **limits:** retry ambiguous Redis lease releases on a fresh connection ([9569bc9](https://github.com/Litvue/axond/commit/9569bc9f5d1876813484f315bd41e63179c878f1))
+* narrow Redis retry permit scope ([8686e39](https://github.com/Litvue/axond/commit/8686e397d4983810c274b6daa016c39d6cd91cdd))
+* **rate-limit:** bound owned Redis invokes ([b6e24ae](https://github.com/Litvue/axond/commit/b6e24ae18d96d6677d735e374c58e98d632a1ce1))
+* **rate-limit:** preserve ambiguous acquire compensation ([6c8549e](https://github.com/Litvue/axond/commit/6c8549e78e740cd85441ce3b42e327bd98f3980c))
+* **rate-limit:** release recovery worker state ([405bb41](https://github.com/Litvue/axond/commit/405bb411b8378b34470aa9a4caad96213d77a273))
+* recover poisoned Redis limiter connections ([e988303](https://github.com/Litvue/axond/commit/e988303ae6f10ff7fffa647a3ec232c9e27098ed))
+* retire Redis generations on dropped invokes ([8d0f505](https://github.com/Litvue/axond/commit/8d0f505e841a73e896776ae2fa836d6dacbc14b3))
+* retire shared Redis connections on release timeout ([4449d18](https://github.com/Litvue/axond/commit/4449d1817d2e9dcfb74d1799b623aeb13ac85705))
+* retry ambiguous Redis lease releases ([a27a49a](https://github.com/Litvue/axond/commit/a27a49ae32e1703850662429b11c02bc8ff0f6cc))
+* reuse healthy current Redis connections ([dd005ca](https://github.com/Litvue/axond/commit/dd005ca57e3dfb8e6cf3cb4c89982b5aaa4963a6))
+* scope Redis suspicion to connection generations ([fe2f320](https://github.com/Litvue/axond/commit/fe2f320dcc77ff246f8cf8067d5216a467090413))
+* skip suspect Redis connection for release ([ab6f627](https://github.com/Litvue/axond/commit/ab6f627fcd26501c6b60b6f5581b97d29dc990eb))
+
+
+### Documentation
+
+* document the stateful test service resolver ([0ffd529](https://github.com/Litvue/axond/commit/0ffd5292b4480074aa155985868cae17d466ea42))
+* record the release retry concurrency cap ([06066f4](https://github.com/Litvue/axond/commit/06066f4009f81fba5e509834c5d4a2f6ad688b88))
+* tighten the lease release backstop wording ([e5ebe4f](https://github.com/Litvue/axond/commit/e5ebe4f0b270a8cb34b6e8ea5de70575ecf133d9))
+
+
+### Tests
+
+* cover exhausted Redis release retries ([6d9e097](https://github.com/Litvue/axond/commit/6d9e097367655abb09c38803ddde37d10aa1a097))
+* model dropped Redis responses faithfully ([63fbcd7](https://github.com/Litvue/axond/commit/63fbcd797bb2c67b9003cd0ed7ad2993f90d63b3))
+* remove vacuous retry assertion ([154acc2](https://github.com/Litvue/axond/commit/154acc2a6c469e59d7f35a5f3038260b62154b94))
+* restore pre-existing Redis recovery sequence ([d72d27e](https://github.com/Litvue/axond/commit/d72d27ef8106f29e6e2f2b141db78cc855d33f0f))
+
+
+### Continuous Integration
+
+* run stateful datastore tests ([1a3a7a3](https://github.com/Litvue/axond/commit/1a3a7a385d84c2b8813dda33d65771893239c358))
+* run the Redis and Postgres stateful tests in CI ([aa2820a](https://github.com/Litvue/axond/commit/aa2820a0755c26045d2bd8a811ee5f5d4db4c7b6))
+
 ## [0.1.4](https://github.com/Litvue/axond/compare/v0.1.3...v0.1.4) (2026-08-10)
 
 
