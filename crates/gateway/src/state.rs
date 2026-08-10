@@ -179,6 +179,7 @@ impl ConfigSnapshot {
                     namespace: k.namespace.clone(),
                     subject: label.to_owned(),
                     signer_kid: None,
+                    alias_scope: None,
                     max_request_microdollars: None,
                 },
             });

@@ -8,8 +8,10 @@ use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header, errors::ErrorKind as JwtErrorKind,
 };
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+use serde_json::Value;
 
+use crate::aliases::AliasScope;
 use crate::config::{Config, GatewayVerifierAlgorithm};
 use crate::key_material::{self, KeyMaterialError};
 
@@ -18,6 +20,7 @@ pub struct InboundKey {
     pub namespace: String,
     pub subject: String,
     pub signer_kid: Option<String>,
+    pub alias_scope: Option<AliasScope>,
     pub max_request_microdollars: Option<u64>,
 }
 
@@ -86,6 +89,10 @@ pub enum TokenVerificationError {
     UnknownNamespace { namespace: String },
     #[error("verifier `{kid}` is not permitted for namespace `{namespace}`")]
     SignerNotPermitted { kid: String, namespace: String },
+    #[error("token is not permitted to use alias `{alias}`")]
+    AliasNotPermitted { alias: String },
+    #[error("token aliases claim is invalid")]
+    InvalidAliasClaim,
     #[error(
         "token for namespace `{namespace}` and subject `{subject}` was issued before its revocation epoch"
     )]
@@ -106,6 +113,8 @@ impl TokenVerificationError {
             Self::InvalidLifetime { .. } => "token_invalid_lifetime",
             Self::UnknownNamespace { .. } => "token_unknown_namespace",
             Self::SignerNotPermitted { .. } => "token_signer_not_permitted",
+            Self::AliasNotPermitted { .. } => "token_alias_not_permitted",
+            Self::InvalidAliasClaim => "token_alias_claim_invalid",
             Self::IssuedBeforeEpoch { .. } => "token_issued_before_epoch",
         }
     }
@@ -179,7 +188,17 @@ struct TokenClaims {
     jti: Option<String>,
     ns: Option<String>,
     sub: Option<String>,
+    // Keep this loose so a wrong JSON type becomes a typed 403, not a 401 decode failure.
+    #[serde(default, deserialize_with = "deserialize_optional_value")]
+    aliases: Option<Option<Value>>,
     max_request_microdollars: Option<u64>,
+}
+
+fn deserialize_optional_value<'de, D>(deserializer: D) -> Result<Option<Option<Value>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Some(Option::<Value>::deserialize(deserializer)?))
 }
 
 impl TokenVerifier {
@@ -442,6 +461,22 @@ impl PrincipalStore for TokenVerifier {
                 },
             ));
         }
+        let alias_scope = match claims.aliases {
+            None => None,
+            Some(Some(value)) => Some(
+                AliasScope::parse(serde_json::from_value::<Vec<String>>(value).map_err(|_| {
+                    PrincipalStoreError::Forbidden(TokenVerificationError::InvalidAliasClaim)
+                })?)
+                .map_err(|_| {
+                    PrincipalStoreError::Forbidden(TokenVerificationError::InvalidAliasClaim)
+                })?,
+            ),
+            Some(None) => {
+                return Err(PrincipalStoreError::Forbidden(
+                    TokenVerificationError::InvalidAliasClaim,
+                ));
+            }
+        };
         let subject = claims.sub.filter(|subject| !subject.is_empty()).ok_or(
             PrincipalStoreError::Unauthorized(TokenVerificationError::MissingClaim {
                 claim: "sub".to_owned(),
@@ -463,6 +498,7 @@ impl PrincipalStore for TokenVerifier {
             namespace,
             subject,
             signer_kid: Some(verifier.kid.clone()),
+            alias_scope,
             max_request_microdollars: claims.max_request_microdollars,
         }))
     }
@@ -681,6 +717,7 @@ mod tests {
                 namespace: "platform".to_owned(),
                 subject: "AXOND_KEY".to_owned(),
                 signer_kid: None,
+                alias_scope: None,
                 max_request_microdollars: None,
             },
         }]))
@@ -833,6 +870,8 @@ mod tests {
         #[serde(skip_serializing_if = "Option::is_none")]
         sub: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        aliases: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         max_request_microdollars: Option<u64>,
     }
 
@@ -956,6 +995,7 @@ max_ttl = "15m"
             jti: Some("jti-1".to_owned()),
             ns: Some(namespace.to_owned()),
             sub: Some("caller-1".to_owned()),
+            aliases: None,
             max_request_microdollars: None,
         }
     }
@@ -1021,6 +1061,50 @@ max_ttl = "15m"
             verifier.resolve(&Presented { credential: &token }).await,
             Err(PrincipalStoreError::Unauthorized(
                 TokenVerificationError::Malformed
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn token_verifier_resolves_alias_scope_and_rejects_invalid_claims() {
+        let verifier = token_verifier();
+        let mut restricted = valid_claims();
+        restricted.aliases = Some(serde_json::json!(["gpt-*", "claude-3"]));
+        let principal = verifier
+            .resolve(&Presented {
+                credential: &signed_token(restricted),
+            })
+            .await
+            .expect("restricted token resolves")
+            .expect("restricted token returns a principal");
+        let scope = principal.alias_scope.as_ref().expect("scope is present");
+        assert!(scope.permits("gpt-4o"));
+        assert!(scope.permits("claude-3"));
+        assert!(!scope.permits("other"));
+
+        let mut invalid = valid_claims();
+        invalid.aliases = Some(serde_json::json!(["foo*bar"]));
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(invalid),
+                })
+                .await,
+            Err(PrincipalStoreError::Forbidden(
+                TokenVerificationError::InvalidAliasClaim
+            ))
+        ));
+
+        let mut null = valid_claims();
+        null.aliases = Some(Value::Null);
+        assert!(matches!(
+            verifier
+                .resolve(&Presented {
+                    credential: &signed_token(null),
+                })
+                .await,
+            Err(PrincipalStoreError::Forbidden(
+                TokenVerificationError::InvalidAliasClaim
             ))
         ));
     }
