@@ -46,7 +46,7 @@ use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, Target};
 use crate::credentials::{CredentialPlan, CredentialSource};
 use crate::error::GatewayError;
-use crate::principals::{Presented, PrincipalStoreError};
+use crate::principals::{Capability, Presented, PrincipalStoreError};
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::streaming::{self, Framing, StreamContext};
 use crate::telemetry;
@@ -59,9 +59,10 @@ pub fn router(state: AppState) -> Router {
             let route = (spec.router)();
             let route = match spec.auth {
                 AuthPosture::LivenessProbe => route,
-                AuthPosture::Authenticated => {
-                    route.layer(from_fn_with_state(state.clone(), authenticate_middleware))
-                }
+                AuthPosture::Authenticated => route.layer(from_fn_with_state(
+                    (state.clone(), spec.capability),
+                    authenticate_middleware,
+                )),
             };
             router.route(spec.path, route)
         })
@@ -81,6 +82,7 @@ enum AuthPosture {
 struct RouteSpec {
     path: &'static str,
     auth: AuthPosture,
+    capability: Option<Capability>,
     router: fn() -> MethodRouter<AppState>,
 }
 
@@ -91,36 +93,43 @@ fn route_specs() -> [RouteSpec; 7] {
         RouteSpec {
             path: "/healthz",
             auth: AuthPosture::LivenessProbe,
+            capability: None,
             router: || get(healthz),
         },
         RouteSpec {
             path: "/readyz",
             auth: AuthPosture::LivenessProbe,
+            capability: None,
             router: || get(readyz),
         },
         RouteSpec {
             path: "/v1/models",
             auth: AuthPosture::Authenticated,
+            capability: Some(Capability::Models),
             router: || get(list_models),
         },
         RouteSpec {
             path: "/v1/chat/completions",
             auth: AuthPosture::Authenticated,
+            capability: Some(Capability::Chat),
             router: || post(chat_completions),
         },
         RouteSpec {
             path: "/v1/messages",
             auth: AuthPosture::Authenticated,
+            capability: Some(Capability::Messages),
             router: || post(native_messages),
         },
         RouteSpec {
             path: "/v1/embeddings",
             auth: AuthPosture::Authenticated,
+            capability: Some(Capability::Embeddings),
             router: || post(embeddings),
         },
         RouteSpec {
             path: "/v1/responses",
             auth: AuthPosture::Authenticated,
+            capability: None,
             router: || post(responses),
         },
     ]
@@ -217,16 +226,57 @@ async fn authenticate(
 /// therefore cannot change what this request resolved; failures return `401`
 /// before any typed handler error, including `/v1/responses`'s `501`.
 async fn authenticate_middleware(
-    State(state): State<AppState>,
+    State((state, capability)): State<(AppState, Option<Capability>)>,
     headers: HeaderMap,
     mut request: Request,
     next: Next,
 ) -> Result<Response, GatewayError> {
     let snapshot = state.config();
     let caller = authenticate(&snapshot, &headers).await?;
+    if let Some(capability) = capability
+        && let Some(scope) = caller.scope.as_ref()
+        && (!scope.contains(&capability)
+            || !namespace_allows(&snapshot, &caller.namespace, capability))
+    {
+        debug!(
+            namespace = %caller.namespace,
+            subject = %caller.subject,
+            signer_kid = ?caller.signer_kid,
+            %capability,
+            "token scope denied route"
+        );
+        return Err(GatewayError::ScopeInsufficient(capability));
+    }
     request.extensions_mut().insert(snapshot);
     request.extensions_mut().insert(caller);
     Ok(next.run(request).await)
+}
+
+fn namespace_allows(snapshot: &ConfigSnapshot, namespace: &str, capability: Capability) -> bool {
+    let route = match capability {
+        Capability::Chat => Some(Route::ChatCompletions),
+        Capability::Messages => Some(Route::NativeMessages),
+        Capability::Embeddings => Some(Route::Embeddings),
+        Capability::Models => None,
+    };
+    let Some(route) = route else {
+        return true;
+    };
+    snapshot.config.model.iter().any(|model| {
+        model.targets.iter().any(|target| {
+            snapshot
+                .config
+                .provider(&target.provider)
+                .is_some_and(|provider| {
+                    route.serves(provider.kind)
+                        && snapshot.credentials.is_present(
+                            &snapshot.config,
+                            namespace,
+                            &target.provider,
+                        )
+                })
+        })
+    })
 }
 
 /// The wire shape a route speaks, which is the only thing that differs between
@@ -1213,7 +1263,7 @@ mod tests {
     use crate::config::Config;
     use crate::usage::{StdoutSink, UsageFanout, UsageSink};
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{Method, Request, StatusCode};
     use http_body_util::BodyExt;
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde::Serialize;
@@ -1270,6 +1320,16 @@ env = "AXOND_PLATFORM_OPENAI"
 
 {GATEWAY_KEY}
 
+[gateway_token]
+audience = "test-audience"
+
+[[gateway_verifier]]
+kid = "scope-test-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+
 [[model]]
 name = "gpt-4o"
 targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }} }}]
@@ -1277,13 +1337,386 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         ))
         .unwrap();
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        let mut env = env_with([("AXOND_PLATFORM_OPENAI", "sk-platform-test")]);
+        env.insert(
+            "JWT_SECRET".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        );
+        AppState::new(cfg, &env, UsageFanout::new(sinks), Box::new(NoBudget))
+            .expect("credentials resolve")
+    }
+
+    #[test]
+    fn namespace_authority_follows_reachable_provider_wires() {
+        let snapshot = test_state().config();
+        assert!(namespace_allows(&snapshot, "platform", Capability::Models));
+        assert!(namespace_allows(&snapshot, "platform", Capability::Chat));
+        assert!(namespace_allows(
+            &snapshot,
+            "platform",
+            Capability::Embeddings
+        ));
+        assert!(!namespace_allows(
+            &snapshot,
+            "platform",
+            Capability::Messages
+        ));
+    }
+
+    async fn scoped_route_state() -> AppState {
+        let (chat_url, _) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let (messages_url, _) = native_upstream(
+            "/messages",
+            Json(json!({
+                "id": "msg-1",
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            }))
+            .into_response(),
+        )
+        .await;
+        let (embeddings_url, _) = native_upstream(
+            "/embeddings",
+            Json(json!({
+                "object": "list",
+                "data": [],
+                "usage": { "prompt_tokens": 1, "total_tokens": 1 }
+            }))
+            .into_response(),
+        )
+        .await;
+        let config = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "chat"
+kind = "openai"
+base_url = "{chat_url}"
+
+[[provider]]
+id = "messages"
+kind = "anthropic"
+base_url = "{messages_url}"
+
+[[provider]]
+id = "embeddings"
+kind = "openai"
+base_url = "{embeddings_url}"
+
+[[credential]]
+namespace = "platform"
+provider = "chat"
+env = "CHAT_KEY"
+
+[[credential]]
+namespace = "platform"
+provider = "messages"
+env = "MESSAGES_KEY"
+
+[[credential]]
+namespace = "platform"
+provider = "embeddings"
+env = "EMBEDDINGS_KEY"
+
+[[gateway_key]]
+env = "STATIC_KEY"
+namespace = "platform"
+
+[gateway_token]
+audience = "scope-tests"
+
+[[gateway_verifier]]
+kid = "scope-test-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+
+[[model]]
+name = "chat-model"
+targets = [{{ provider = "chat", model = "chat-model", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+
+[[model]]
+name = "messages-model"
+targets = [{{ provider = "messages", model = "messages-model", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+
+[[model]]
+name = "embeddings-model"
+targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+"#
+        ))
+        .expect("scope test config");
+        let env = HashMap::from([
+            ("CHAT_KEY".to_owned(), "chat-key".to_owned()),
+            ("MESSAGES_KEY".to_owned(), "messages-key".to_owned()),
+            ("EMBEDDINGS_KEY".to_owned(), "embeddings-key".to_owned()),
+            ("STATIC_KEY".to_owned(), "static-key".to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
         AppState::new(
-            cfg,
-            &env_with([("AXOND_PLATFORM_OPENAI", "sk-platform-test")]),
-            UsageFanout::new(sinks),
+            config,
+            &env,
+            UsageFanout::new(vec![Box::new(StdoutSink)]),
             Box::new(NoBudget),
         )
-        .expect("credentials resolve")
+        .expect("scope test state")
+    }
+
+    fn scoped_token(scope: Option<Vec<&'static str>>) -> String {
+        scoped_token_for("scope-tests", scope)
+    }
+
+    fn scoped_token_for(audience: &'static str, scope: Option<Vec<&'static str>>) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let claims = TestTokenClaims {
+            exp: now + 900,
+            iat: now,
+            jti: "scope-test-jti",
+            aud: audience,
+            ns: "platform",
+            sub: "scope-caller",
+            scope,
+        };
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("scope-test-kid".to_owned());
+        format!(
+            "axt1.{}",
+            encode(
+                &header,
+                &claims,
+                &EncodingKey::from_secret(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .expect("scope test token")
+        )
+    }
+
+    async fn assert_scope_denial(response: Response, capability: &str) {
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "token_scope_insufficient");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(capability),
+            "scope denial did not name {capability}: {body}"
+        );
+    }
+
+    async fn scoped_route_request(state: AppState, path: &str, token: &str) -> Response {
+        let (method, body) = match path {
+            "/v1/models" => (Method::GET, Vec::new()),
+            "/v1/chat/completions" => (
+                Method::POST,
+                serde_json::to_vec(&json!({
+                    "model": "chat-model",
+                    "messages": []
+                }))
+                .unwrap(),
+            ),
+            "/v1/messages" => (
+                Method::POST,
+                serde_json::to_vec(&json!({
+                    "model": "messages-model",
+                    "max_tokens": 16,
+                    "messages": []
+                }))
+                .unwrap(),
+            ),
+            "/v1/embeddings" => (
+                Method::POST,
+                serde_json::to_vec(&json!({
+                    "model": "embeddings-model",
+                    "input": ["hello"]
+                }))
+                .unwrap(),
+            ),
+            _ => panic!("unknown scoped route {path}"),
+        };
+        router(state)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn scoped_models_token_allows_models_and_denies_chat() {
+        let state = scoped_route_state().await;
+        assert_scope_denial(
+            scoped_route_request(
+                state.clone(),
+                "/v1/models",
+                &scoped_token(Some(vec!["chat"])),
+            )
+            .await,
+            "models",
+        )
+        .await;
+        assert_eq!(
+            scoped_route_request(state, "/v1/models", &scoped_token(Some(vec!["models"])))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_chat_token_allows_chat_and_denies_embeddings() {
+        let state = scoped_route_state().await;
+        assert_scope_denial(
+            scoped_route_request(
+                state.clone(),
+                "/v1/chat/completions",
+                &scoped_token(Some(vec!["embeddings"])),
+            )
+            .await,
+            "chat",
+        )
+        .await;
+        assert_eq!(
+            scoped_route_request(
+                state,
+                "/v1/chat/completions",
+                &scoped_token(Some(vec!["chat"]))
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_messages_token_allows_messages_and_denies_chat() {
+        let state = scoped_route_state().await;
+        assert_scope_denial(
+            scoped_route_request(
+                state.clone(),
+                "/v1/messages",
+                &scoped_token(Some(vec!["chat"])),
+            )
+            .await,
+            "messages",
+        )
+        .await;
+        assert_eq!(
+            scoped_route_request(state, "/v1/messages", &scoped_token(Some(vec!["messages"])),)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_embeddings_token_allows_embeddings_and_denies_messages() {
+        let state = scoped_route_state().await;
+        assert_scope_denial(
+            scoped_route_request(
+                state.clone(),
+                "/v1/embeddings",
+                &scoped_token(Some(vec!["messages"])),
+            )
+            .await,
+            "embeddings",
+        )
+        .await;
+        assert_eq!(
+            scoped_route_request(
+                state,
+                "/v1/embeddings",
+                &scoped_token(Some(vec!["embeddings"])),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_less_tokens_and_static_keys_reach_all_provider_routes() {
+        for path in [
+            "/v1/models",
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1/embeddings",
+        ] {
+            assert_eq!(
+                scoped_route_request(scoped_route_state().await, path, &scoped_token(None))
+                    .await
+                    .status(),
+                StatusCode::OK,
+                "scope-less token denied {path}"
+            );
+            assert_eq!(
+                scoped_route_request(scoped_route_state().await, path, "static-key")
+                    .await
+                    .status(),
+                StatusCode::OK,
+                "static key denied {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_token_cannot_grant_a_route_the_namespace_lacks() {
+        let body = serde_json::to_vec(&json!({ "model": "gpt-4o", "messages": [] })).expect("body");
+        let response = router(test_state())
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header(
+                        "authorization",
+                        format!(
+                            "Bearer {}",
+                            scoped_token_for("test-audience", Some(vec!["messages"]),)
+                        ),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_scope_denial(response, "messages").await;
+    }
+
+    #[tokio::test]
+    async fn scoped_token_on_responses_keeps_the_typed_501() {
+        let response = router(test_state())
+            .oneshot(
+                Request::post("/v1/responses")
+                    .header(
+                        "authorization",
+                        format!(
+                            "Bearer {}",
+                            scoped_token_for("test-audience", Some(vec!["chat"]))
+                        ),
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "not_implemented");
     }
 
     /// Inbound auth is enforced for every configured key set: the wrong
@@ -1396,6 +1829,8 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         aud: &'static str,
         ns: &'static str,
         sub: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scope: Option<Vec<&'static str>>,
     }
 
     #[tokio::test]
@@ -1463,6 +1898,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             aud: "test-audience",
             ns: "platform",
             sub: "token-caller",
+            scope: None,
         };
         let mut header = Header::new(Algorithm::HS256);
         header.kid = Some("route-kid".to_owned());

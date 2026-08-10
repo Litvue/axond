@@ -13,11 +13,47 @@ use serde::Deserialize;
 use crate::config::{Config, GatewayVerifierAlgorithm};
 use crate::key_material::{self, KeyMaterialError};
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum Capability {
+    Chat,
+    Messages,
+    Embeddings,
+    Models,
+}
+
+impl Capability {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "chat" => Some(Self::Chat),
+            "messages" => Some(Self::Messages),
+            "embeddings" => Some(Self::Embeddings),
+            "models" => Some(Self::Models),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Messages => "messages",
+            Self::Embeddings => "embeddings",
+            Self::Models => "models",
+        }
+    }
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 #[derive(Clone)]
 pub struct InboundKey {
     pub namespace: String,
     pub subject: String,
     pub signer_kid: Option<String>,
+    pub scope: Option<HashSet<Capability>>,
 }
 
 pub(crate) struct GatewayKeyEntry {
@@ -166,6 +202,27 @@ struct TokenClaims {
     jti: Option<String>,
     ns: Option<String>,
     sub: Option<String>,
+    scope: Option<RawScope>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawScope {
+    String(String),
+    Array(Vec<String>),
+}
+
+impl RawScope {
+    fn capabilities(self) -> HashSet<Capability> {
+        let values = match self {
+            Self::String(value) => value.split_whitespace().map(str::to_owned).collect(),
+            Self::Array(values) => values,
+        };
+        values
+            .iter()
+            .filter_map(|value| Capability::parse(value))
+            .collect()
+    }
 }
 
 impl TokenVerifier {
@@ -427,6 +484,7 @@ impl PrincipalStore for TokenVerifier {
             namespace,
             subject,
             signer_kid: Some(verifier.kid.clone()),
+            scope: claims.scope.map(RawScope::capabilities),
         }))
     }
 }
@@ -644,6 +702,7 @@ mod tests {
                 namespace: "platform".to_owned(),
                 subject: "AXOND_KEY".to_owned(),
                 signer_kid: None,
+                scope: None,
             },
         }]))
     }
@@ -794,6 +853,8 @@ mod tests {
         ns: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         sub: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scope: Option<serde_json::Value>,
     }
 
     const ED_PRIVATE_PK8: &[u8] = &[
@@ -916,6 +977,7 @@ max_ttl = "15m"
             jti: Some("jti-1".to_owned()),
             ns: Some(namespace.to_owned()),
             sub: Some("caller-1".to_owned()),
+            scope: None,
         }
     }
 
@@ -939,6 +1001,39 @@ max_ttl = "15m"
         assert_eq!(principal.namespace, "acme");
         assert_eq!(principal.subject, "caller-1");
         assert_eq!(principal.signer_kid.as_deref(), Some("ed-test"));
+    }
+
+    #[tokio::test]
+    async fn token_scope_accepts_oauth_string_and_discards_unknown_capabilities() {
+        let verifier = token_verifier();
+        let mut claims = valid_claims();
+        claims.scope = Some(serde_json::json!("chat unknown models"));
+        let principal = verifier
+            .resolve(&Presented {
+                credential: &signed_token(claims),
+            })
+            .await
+            .expect("valid token resolves")
+            .expect("valid token returns a principal");
+        let scope = principal.scope.expect("scope is present");
+        assert!(scope.contains(&Capability::Chat));
+        assert!(scope.contains(&Capability::Models));
+        assert_eq!(scope.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn token_scope_accepts_an_empty_array_as_an_empty_scope() {
+        let verifier = token_verifier();
+        let mut claims = valid_claims();
+        claims.scope = Some(serde_json::json!([]));
+        let principal = verifier
+            .resolve(&Presented {
+                credential: &signed_token(claims),
+            })
+            .await
+            .expect("valid token resolves")
+            .expect("valid token returns a principal");
+        assert!(principal.scope.expect("scope is present").is_empty());
     }
 
     #[tokio::test]

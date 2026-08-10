@@ -18,6 +18,10 @@ breaking them is a deliberate, documented act — not that they are frozen.
 | `GET /healthz`, `GET /readyz` | **supported** | liveness / readiness text | n/a |
 | `POST /v1/responses` | **deferred** — typed `501 not_implemented` | OpenAI Responses | — |
 
+Scoped minted callers receive a typed `403 token_scope_insufficient` when their
+scope does not include a route capability or the namespace cannot serve it.
+Static gateway keys and scope-less tokens retain their existing route behavior.
+
 Deferred routes are still routes: they answer with a typed error naming their
 own deferral, so a `501` can never be confused with a wrong `base_url`.
 

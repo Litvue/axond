@@ -93,6 +93,12 @@ fn cli() -> Command {
                         .help("Audience claim; defaults from a matching verifier config"),
                 )
                 .arg(
+                    Arg::new("scope")
+                        .long("scope")
+                        .action(ArgAction::Append)
+                        .help("Route capability claim; repeat for multiple capabilities"),
+                )
+                .arg(
                     Arg::new("config")
                         .long("config")
                         .value_name("PATH")
