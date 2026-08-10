@@ -1,3 +1,9 @@
+//! Datastore DSNs for the tests that need a real Redis or Postgres.
+//!
+//! Absent configuration skips those tests, so the suite stays runnable with no
+//! datastore. `AXOND_TEST_REQUIRE_SERVICES=1` inverts that: a missing variable
+//! panics, so CI cannot report a green run for tests that never executed.
+
 fn resolve(variable: &str, value: Option<String>, require_services: bool) -> Option<String> {
     match value {
         Some(value) => Some(value),
