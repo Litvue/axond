@@ -167,8 +167,8 @@ default `on_unavailable = "deny"` fails closed with
 `503 rate_limit_unavailable`; `allow` is an explicit fail-open exception.
 When an ambiguous acquire may have created a lease, its compensating release is
 fire-and-forget with bounded retries; retries open fresh Redis connections
-instead of waiting behind the timed-out shared connection, while lease expiry
-remains the final backstop. A process-wide cap limits how many releases retry
-at once, so an outage cannot amplify connection pressure on the failing server:
-contended attempts are skipped rather than queued, while the attempt count and
-deadline bound the effort and lease expiry remains the final backstop.
+instead of waiting behind the timed-out shared connection. A process-wide cap
+limits how many releases retry at once, so an outage cannot amplify connection
+pressure on the failing server: contended attempts are skipped rather than
+queued, while the attempt count and deadline bound the effort. Lease expiry
+remains the final backstop.
