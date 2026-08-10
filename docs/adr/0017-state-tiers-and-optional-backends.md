@@ -175,16 +175,25 @@ remains the final backstop.
 
 A dropped in-flight response wait can poison a multiplexed connection's reply
 alignment, so abandoning a caller's wait does not abandon the Redis operation:
-the invoke runs in its own task and its result is consumed in order. Outstanding
-shared invokes are bounded by a non-queuing per-manager cap; when that cap is
-exhausted, the limiter refuses rather than adding another waiter. Permit
+the invoke runs in its own task and its result is consumed in order. Each
+owned invoke has a finite task deadline; when it expires, the invoke is dropped,
+its permit is reclaimed, and the guard retires that generation before any future
+request can use it. This cancellation is safe because a retired generation is
+never read again. Outstanding shared invokes are bounded by a non-queuing
+per-manager cap; when that cap is exhausted, the limiter refuses that request
+without retiring a healthy connection or queueing another waiter. Permit
 releases use a separate, generous bounded retry budget derived from the
-configured admission timeout. Retirement is reserved for a genuinely abandoned
-invoke or an exhausted cap, and starts the bounded replacement asynchronously.
-If an acquire outcome is unattributable, compensation assumes that a lease
-exists and cleans it up; only a definite `0` proves that no lease was created.
-When a response is lost, later replies can be delivered to the wrong waiter;
-an unattributable admission result is therefore unknown, not a denial.
+configured admission timeout; the shared release attempt is bounded by the same
+budget before fresh-connection retries begin. Retirement starts replacement
+asynchronously and remains single-flight and generation-safe.
+redis-rs 1.4.1's documented source default is
+`DEFAULT_RESPONSE_TIMEOUT = Some(Duration::from_millis(500))`
+(`src/client.rs`); axond disables it because that internal cancellation could
+drop a multiplexed waiter and misalign later replies. If an acquire outcome is
+unattributable, compensation assumes that a lease exists and cleans it up; only
+a definite `0` proves that no lease was created. When a response is lost, later
+replies can be delivered to the wrong waiter; an unattributable admission
+result is therefore unknown, not a denial.
 The limiter refuses new admissions while a bounded replacement is in flight.
 Results from a retired generation are unknown, so the existing unavailable
 policy applies rather than trusting an admission or denial.
