@@ -157,7 +157,7 @@ async fn serve() -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("usage sink configuration failed: {e}"))?,
     );
-    let budget: Box<dyn BudgetStore> = budget::build(&config.budget, &env)
+    let budget: Box<dyn BudgetStore> = budget::build(&config.budget, &env, config.namespace.len())
         .await
         .map_err(|e| anyhow::anyhow!("budget configuration failed: {e}"))?;
     tracing::info!(backend = budget.name(), "budget enforcement");

@@ -238,7 +238,7 @@ is per `(namespace, subject)` — that is, per gateway key — in micro-dollars.
 | `key_prefix` | string | `axond:budget` | `redis` | Key namespace for budget state. |
 | `reservation_ttl_seconds` | integer | `300` | every backend but `none` | How long a hold survives a replica that died mid-request. Should exceed the longest expected request. Zero is rejected. |
 | `idle_ttl_seconds` | integer | `3600` | `in-memory` | Idle time before an unheld ledger may be pruned when `max_subjects` is reached. In-memory state is per-replica and approximate; zero is rejected. |
-| `max_subjects` | integer | `10000` | `in-memory` | Maximum retained `(namespace, subject)` ledgers. When full, unheld idle ledgers are pruned lazily; zero is rejected. Use Redis for exact caps. |
+| `max_subjects` | integer | `10000` | `in-memory` | Maximum retained `(namespace, subject)` ledgers. Configured namespaces derive an equal guaranteed floor (`max_subjects / namespace_count`, minimum 1) and may burst into genuinely unused headroom; eviction is same-namespace-only and lazy. If no namespaces are configured, or the ceiling is smaller than their count, the previous global behavior is retained. This is restart-required; exact cross-replica retention and enforcement still needs Redis. Zero is rejected. |
 
 Enforcement holds a priced estimate before dispatch and settles it against
 measured spend afterwards, so concurrent requests cannot collectively overshoot.
