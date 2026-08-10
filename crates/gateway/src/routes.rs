@@ -2137,14 +2137,22 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
 
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
         let key = BudgetKey {
             namespace: "platform".to_owned(),
             subject: "AXOND_INBOUND_KEY".to_owned(),
         };
-        assert_eq!(budget.outstanding(&key), 0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let outstanding = budget.outstanding(&key);
+            if outstanding == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "reservation was not released before timeout; outstanding={outstanding}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// The two denials are different answers to the caller: over-cap is the
