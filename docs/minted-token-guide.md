@@ -205,13 +205,24 @@ reservation; a cumulative per-token cap is not stateless and belongs to the
 Tier 1 work in ADR 0017. An unlimited token omits the claim: a ceiling of `0`
 admits nothing, because any priced request estimates above it. Estimates are
 whole microdollars, so a cheap request against a cheap alias can estimate `0`
-and pass any ceiling.
-
-ADR 0016 describes three narrowing claims: `scope` and `aliases` are not yet
-enforced by the current gateway or emitted by `axond mint` (see #60 and #61).
-`max_request_microdollars` is enforced at admission time against the
-pre-dispatch estimate and is emitted by
+and pass any ceiling. It is enforced at admission time and emitted by
 `axond mint --max-request-microdollars`.
+
+ADR 0016 describes three narrowing claims. `scope` is **not enforced by the
+current gateway and is not emitted by `axond mint`**; its enforcement and
+minting are tracked by #60. The `aliases` claim is enforced both before
+dispatch and in the caller's `/v1/models` view. It is a repeatable,
+case-sensitive pattern restriction:
+
+```bash
+axond mint --kid acme-2026-08 --key-env SIGN_KEY --namespace acme \
+  --subject alice --ttl 15m --config axond.toml \
+  --alias "gpt-4o" --alias "claude-*"
+```
+
+The claim is omitted when no `--alias` is supplied. Its exact glob syntax,
+including fail-closed empty-array and invalid-pattern behavior, is documented
+under `[[gateway_verifier]]` in [configuration.md](./configuration.md).
 
 ## 5. Rotation runbook
 
@@ -277,16 +288,35 @@ coarsest to most targeted:
 1. **Short TTLs.** Limit the lifetime and wait for tokens to expire.
 2. **Remove a `kid`.** Reloading without a verifier revokes every token signed
    by that `kid`.
-3. **`min_iat` epoch (#63).** A future config/state control can reject tokens
-   issued before a namespace or subject epoch.
+3. **`min_iat` epoch (#63).** Set a namespace-wide or per-subject issuance
+   epoch to reject tokens issued before that instant. This is a shipped Tier 0
+   config control and applies on reload:
+
+   ```toml
+   [[gateway_token_epoch]]
+   namespace = "acme"
+   min_iat = "2026-08-10T12:00:00Z"
+   ```
+
+   Edit the config and send `SIGHUP`:
+
+   ```console
+   $ kill -HUP "$(pidof axond)"
+   ```
+
+   The next snapshot rejects older `acme` tokens with
+   `token_issued_before_epoch` and leaves other namespaces unchanged. A
+   namespace-wide epoch affects every subject in that namespace; to spare one
+   subject, add a per-subject entry with an earlier `min_iat`, which overrides
+   the namespace-wide entry for that subject.
 4. **`jti` denylist (#68).** A future opt-in denylist can reject one token by
    its mandatory `jti`.
 
-The `min_iat` and denylist controls are not current Tier 0 configuration
-features. Precise single-token revocation requires **Tier 1** shared state,
-as defined by ADR 0017; in this design that means Redis-backed enforcement.
-Tier 1 availability and its fail-closed behavior must be treated as part of
-the selected request path.
+The `jti` denylist is not a current Tier 0 configuration feature. Precise
+single-token revocation still requires **Tier 1** shared state, as defined by
+ADR 0017; in this design that means Redis-backed enforcement. Tier 1
+availability and its fail-closed behavior must be treated as part of the
+selected request path.
 
 ## 7. Delegation and attribution
 

@@ -125,16 +125,18 @@ mint successfully against the policy ceiling and then be rejected by the
 gateway if it exceeds the configured `max_ttl`.
 
 The current minter emits only claims the verifier enforces. It deliberately
-does not emit `scope` or `aliases` until the corresponding authorization
-controls exist; an unenforced narrowing claim would create a misleading
-credential. `max_request_microdollars` is enforced at admission time only:
-the gateway compares it with the pre-dispatch estimate immediately before the
-budget reservation, and rejects an over-ceiling request with a typed 403
+does not emit `scope` until the corresponding authorization control exists;
+an unenforced narrowing claim would create a misleading credential. The
+`aliases` claim is enforced at dispatch and in the `/v1/models` view, and is
+emitted by `axond mint --alias`. `max_request_microdollars` is enforced at
+admission time: the gateway compares it with the pre-dispatch estimate before
+the budget reservation and rejects an over-ceiling request with typed 403
 `request_cost_ceiling_exceeded`, distinct from the 429 `budget_exceeded`
-tenant cumulative cap in ADR 0010. The reservation and settlement policy is
-unchanged, so actual usage above the estimate is still charged at what it
-consumed. A cumulative per-token cap is not stateless and is outside this
-claim; it belongs to the Tier 1 work in ADR 0017.
+tenant cumulative cap in ADR 0010. It is emitted by `axond mint`; the
+reservation and settlement policy is unchanged, so actual usage above the
+estimate is still charged at what it consumed. A cumulative per-token cap is
+not stateless and is outside this claim; it belongs to the Tier 1 work in
+ADR 0017.
 
 `POST /v1/tokens` is an opt-in alternative for deployments where callers cannot
 run a minter. It is authenticated by a static gateway key authorized to mint

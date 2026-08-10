@@ -52,6 +52,10 @@ pub struct Config {
     /// keys and require a deployment audience when any are configured.
     #[serde(default)]
     pub gateway_verifier: Vec<GatewayVerifier>,
+    /// Issuance epochs that invalidate older minted tokens without runtime
+    /// revocation state.
+    #[serde(default)]
+    pub gateway_token_epoch: Vec<GatewayTokenEpoch>,
     #[serde(default)]
     pub gateway_token: Option<GatewayToken>,
     /// Where raw usage records go. Empty means the no-datastore default: one
@@ -598,6 +602,15 @@ pub struct GatewayToken {
     pub audience: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct GatewayTokenEpoch {
+    pub namespace: String,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(deserialize_with = "deserialize_gateway_min_iat")]
+    pub min_iat: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum GatewayVerifierAlgorithm {
     #[serde(rename = "EdDSA")]
@@ -688,6 +701,98 @@ fn parse_gateway_ttl(value: &str) -> Result<u64, String> {
     number
         .checked_mul(multiplier)
         .ok_or_else(|| "max_ttl is too large".to_owned())
+}
+
+fn deserialize_gateway_min_iat<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Number(number) => number.as_u64().ok_or_else(|| {
+            serde::de::Error::custom("min_iat must be a non-negative unix-seconds integer")
+        }),
+        serde_json::Value::String(text) => {
+            parse_gateway_rfc3339_utc(&text).map_err(serde::de::Error::custom)
+        }
+        _ => Err(serde::de::Error::custom(
+            "min_iat must be a unix-seconds integer or an RFC 3339 UTC timestamp",
+        )),
+    }
+}
+
+fn parse_gateway_rfc3339_utc(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    let value = value
+        .strip_suffix('Z')
+        .ok_or_else(|| "min_iat must be an RFC 3339 UTC timestamp ending in `Z`".to_owned())?;
+    let (date_time, fraction) = match value.split_once('.') {
+        Some((date_time, fraction)) => (date_time, Some(fraction)),
+        None => (value, None),
+    };
+    let bytes = date_time.as_bytes();
+    if bytes.len() != 19
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || !bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| [4, 7, 10, 13, 16].contains(&index) || byte.is_ascii_digit())
+    {
+        return Err(
+            "min_iat must be an RFC 3339 UTC timestamp such as `2026-08-10T12:00:00Z`".into(),
+        );
+    }
+    if let Some(fraction) = fraction
+        && (fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err("min_iat fractional seconds must contain only digits".into());
+    }
+    let number = |start, end| {
+        date_time[start..end]
+            .parse::<u32>()
+            .expect("validated timestamp digits")
+    };
+    let year = number(0, 4);
+    let month = number(5, 7);
+    let day = number(8, 10);
+    let hour = number(11, 13);
+    let minute = number(14, 16);
+    let second = number(17, 19);
+    if year == 0 || !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return Err("min_iat is not a valid UTC instant".into());
+    }
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days_in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if day == 0 || day > days_in_month {
+        return Err("min_iat is not a valid UTC instant".into());
+    }
+    let days = days_from_civil(year as i64, month as i64, day as i64);
+    let seconds = days
+        .checked_mul(86_400)
+        .and_then(|seconds| {
+            seconds.checked_add(hour as i64 * 3_600 + minute as i64 * 60 + second as i64)
+        })
+        .ok_or_else(|| "min_iat is outside the supported unix timestamp range".to_owned())?;
+    u64::try_from(seconds).map_err(|_| "min_iat must not be before the unix epoch".into())
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = (if year >= 0 { year } else { year - 399 }) / 400;
+    let year_of_era = year - era * 400;
+    let month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146097 + day_of_era - 719468
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -821,9 +926,46 @@ impl Config {
         }
         self.validate_gateway_keys(&namespaces)?;
         self.validate_gateway_verifiers(&namespaces)?;
+        self.validate_gateway_token_epochs(&namespaces)?;
         self.validate_usage_sinks()?;
         self.validate_budget()?;
         self.validate_rate_limit()?;
+        Ok(())
+    }
+
+    fn validate_gateway_token_epochs(
+        &self,
+        namespaces: &HashMap<&str, &Namespace>,
+    ) -> Result<(), ConfigError> {
+        let mut entries = HashMap::new();
+        for epoch in &self.gateway_token_epoch {
+            if !namespaces.contains_key(epoch.namespace.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "gateway_token_epoch references undefined namespace `{}`",
+                    epoch.namespace
+                )));
+            }
+            if epoch
+                .subject
+                .as_deref()
+                .is_some_and(|subject| subject.trim().is_empty())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "gateway_token_epoch subject for namespace `{}` must not be empty",
+                    epoch.namespace
+                )));
+            }
+            let subject = epoch.subject.as_deref().unwrap_or("");
+            if entries
+                .insert((epoch.namespace.as_str(), subject), ())
+                .is_some()
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate gateway_token_epoch for namespace `{}` subject `{}`",
+                    epoch.namespace, subject
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1249,6 +1391,57 @@ audience = "test"
         let cfg = Config::from_toml_str(VALID).expect("valid config");
         assert_eq!(cfg.default_namespace(), "platform");
         assert!(cfg.model("gpt-4o").is_some());
+    }
+
+    /// Epochs accept both the compact unix representation and an explicit UTC
+    /// instant, while malformed timestamps fail during config loading.
+    #[test]
+    fn parses_gateway_token_epoch_instants() {
+        let config = format!(
+            "{VALID}\n[[gateway_token_epoch]]\nnamespace = \"platform\"\nmin_iat = 1_786_380_000\n[[gateway_token_epoch]]\nnamespace = \"platform\"\nsubject = \"caller\"\nmin_iat = \"2026-08-10T12:00:00Z\"\n"
+        );
+        let cfg = Config::from_toml_str(&config).expect("epoch config");
+        assert_eq!(cfg.gateway_token_epoch[0].min_iat, 1_786_380_000);
+        assert_eq!(cfg.gateway_token_epoch[1].min_iat, 1_786_363_200);
+
+        let malformed = format!(
+            "{VALID}\n[[gateway_token_epoch]]\nnamespace = \"platform\"\nmin_iat = \"2026-08-10T12:00:00+01:00\"\n"
+        );
+        let error = Config::from_toml_str(&malformed).expect_err("non-UTC offset must fail");
+        assert!(error.to_string().contains("RFC 3339"), "{error}");
+    }
+
+    /// An epoch must name a declared namespace and each namespace/subject pair
+    /// has exactly one effective policy.
+    #[test]
+    fn rejects_unknown_and_duplicate_gateway_token_epochs() {
+        let unknown =
+            format!("{VALID}\n[[gateway_token_epoch]]\nnamespace = \"ghost\"\nmin_iat = 1\n");
+        assert!(
+            Config::from_toml_str(&unknown)
+                .expect_err("unknown namespace must fail")
+                .to_string()
+                .contains("undefined namespace")
+        );
+
+        let duplicate = format!(
+            "{VALID}\n[[gateway_token_epoch]]\nnamespace = \"platform\"\nmin_iat = 1\n[[gateway_token_epoch]]\nnamespace = \"platform\"\nmin_iat = 2\n"
+        );
+        assert!(
+            Config::from_toml_str(&duplicate)
+                .expect_err("duplicate namespace epoch must fail")
+                .to_string()
+                .contains("duplicate")
+        );
+
+        for subject in ["", "   "] {
+            let blank_subject = format!(
+                "{VALID}\n[[gateway_token_epoch]]\nnamespace = \"platform\"\nsubject = \"{subject}\"\nmin_iat = 1\n"
+            );
+            let error = Config::from_toml_str(&blank_subject).expect_err("blank subject must fail");
+            assert!(error.to_string().contains("subject"), "{error}");
+            assert!(error.to_string().contains("empty"), "{error}");
+        }
     }
 
     #[test]
