@@ -469,6 +469,8 @@ async fn serve(
     };
     wire.check_targets(cfg, model, &alias)?;
 
+    // The permit is held for the request's lifetime: buffered paths drop it at
+    // scope end, and a stream moves it into the accounting owner that settles it.
     let rate_limit_key = RateLimitKey {
         namespace: caller.namespace.clone(),
         subject: caller.subject.clone(),
@@ -481,7 +483,6 @@ async fn serve(
         .map_err(|_| GatewayError::RateLimitExceeded {
             retry_after_seconds: None,
         })?;
-    // Held for the request lifetime: buffered paths drop it at scope end; streams move it into accounting.
 
     // Budget is denominated in micro-dollars. Hold a conservative cost estimate
     // from the first target's price before dispatch; settle the hold against the
