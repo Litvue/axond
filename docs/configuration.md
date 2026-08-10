@@ -29,7 +29,7 @@ egress: upstream provider calls still use the network at Tier 0.
 | --- | --- |
 | `[server]`, `[[namespace]]`, `[[provider]]`, `[[model]]`, `[[credential]]` | Tier 0: config-only. |
 | `[credential_pool]`, `[failover]` | Tier 0: in-memory, per replica. |
-| `[[gateway_key]]`, `[gateway_token]`, `[[gateway_verifier]]`, offline `keygen`/`mint` | Tier 0: config, referenced files, and environment only. |
+| `[[gateway_key]]`, `[gateway_token]`, `[[gateway_verifier]]`, `[[gateway_token_epoch]]`, offline `keygen`/`mint` | Tier 0: config, referenced files, and environment only. |
 | `[reload]` | Tier 0: reload reads the config file, referenced key-material files, and process environment. |
 | `[[usage_sink]]` omitted or `kind = "stdout"` | Tier 0: one JSON line on stdout. |
 | `[[usage_sink]] kind = "otlp"` | Tier 0 state, but not hermetic: a collector is a boot-time dependency, so this is outside the hermetic Tier 0 CI lane. |

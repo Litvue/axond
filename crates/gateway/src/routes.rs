@@ -1614,6 +1614,7 @@ min_iat = {}
             aud: "test-audience",
             ns: "platform",
             sub: "epoch-caller",
+            max_request_microdollars: None,
         };
         let mut header = Header::new(Algorithm::HS256);
         header.kid = Some("route-kid".to_owned());

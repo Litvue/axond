@@ -61,7 +61,7 @@ Tier 0.
 
 | Tier | What it buys | What it costs |
 | --- | --- | --- |
-| **0 — config-only** | Namespaces, providers, aliases, prices, credentials, pools, failover, reload, gateway keys and minted-token verification, stdout usage, local budgets, and health probes. | No datastore. In-memory health and budgets are per replica; the default is no budget. This is the hermetic [`ops/tier0-gate.sh`](./ops/tier0-gate.sh) CI posture proved on every PR by [ADR 0018](./docs/adr/0018-tier-0-hermetic-boot-gate.md). |
+| **0 — config-only** | Namespaces, providers, aliases, prices, credentials, pools, failover, reload, gateway keys, minted-token verification and issuance epochs, stdout usage, local budgets, and health probes. | No datastore. In-memory health and budgets are per replica; the default is no budget. This is the hermetic [`ops/tier0-gate.sh`](./ops/tier0-gate.sh) CI posture proved on every PR by [ADR 0018](./docs/adr/0018-tier-0-hermetic-boot-gate.md). |
 | **1 — Redis** | Shared budget enforcement today. | Redis availability is part of admission for every budgeted request; `on_unavailable = "deny"` (the default) returns `503 budget_unavailable`. |
 | **2 — Postgres** | Durable usage rows and shared Postgres-backed budgets; a future store-owned caller/key lifecycle. | A Postgres role, ordered migrations, backup/restore ownership, and boot-time DSN resolution. |
 
@@ -221,6 +221,15 @@ alg = "EdDSA"
 env = "GW_VERIFY_ACME_2026_08"
 namespaces = ["acme"]
 max_ttl = "15m"
+```
+
+To revoke older minted tokens for a namespace on reload, add an issuance
+epoch; a per-subject entry overrides the namespace-wide value for that subject:
+
+```toml
+[[gateway_token_epoch]]
+namespace = "acme"
+min_iat = "2026-08-10T12:00:00Z"
 ```
 
 The verifier accepts `axt1.` compact JWS credentials alongside static keys.
