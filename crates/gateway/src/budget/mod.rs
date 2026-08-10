@@ -333,7 +333,13 @@ impl InMemoryBudget {
             .namespace_count
             .saturating_sub(state.namespace_counts.len())
             .saturating_sub(usize::from(!requesting_present));
-        present_other_shortfall.saturating_add(absent_other_count.saturating_mul(self.floor))
+        let reservation =
+            present_other_shortfall.saturating_add(absent_other_count.saturating_mul(self.floor));
+        let free = self.max_subjects.saturating_sub(state.ledgers.len());
+        let requesting_shortfall = self
+            .floor
+            .saturating_sub(state.namespace_counts.get(namespace).copied().unwrap_or(0));
+        reservation.min(free.saturating_sub(requesting_shortfall))
     }
 }
 
@@ -915,6 +921,75 @@ mod tests {
             subject: "never-seen".into(),
         };
         assert!(matches!(budget.reserve(&b, 1).await, Admission::Allowed(_)));
+    }
+
+    #[tokio::test]
+    async fn post_reload_namespace_growth_does_not_lock_out_free_capacity() {
+        let budget = InMemoryBudget::with_namespace_count(
+            1_000,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            10,
+            2,
+        );
+        {
+            let mut state = budget.ledger_state.lock().unwrap();
+            for namespace in ["a", "b", "c", "d"] {
+                for subject in ["1", "2"] {
+                    state.entry_or_default(&BudgetKey {
+                        namespace: namespace.into(),
+                        subject: subject.into(),
+                    });
+                }
+            }
+        }
+
+        let admission = budget
+            .reserve(
+                &BudgetKey {
+                    namespace: "a".into(),
+                    subject: "new".into(),
+                },
+                1,
+            )
+            .await;
+        assert!(matches!(admission, Admission::Allowed(_)));
+        assert!(budget.ledger_state.lock().unwrap().ledgers.len() <= budget.max_subjects);
+    }
+
+    #[tokio::test]
+    async fn nominal_namespace_count_preserves_full_capacity_isolation() {
+        let budget = InMemoryBudget::with_namespace_count(
+            1_000,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            4,
+            2,
+        );
+        {
+            let mut state = budget.ledger_state.lock().unwrap();
+            for namespace in ["a", "b"] {
+                for subject in ["1", "2"] {
+                    state.entry_or_default(&BudgetKey {
+                        namespace: namespace.into(),
+                        subject: subject.into(),
+                    });
+                }
+            }
+        }
+
+        assert_eq!(
+            budget
+                .reserve(
+                    &BudgetKey {
+                        namespace: "a".into(),
+                        subject: "new".into(),
+                    },
+                    1,
+                )
+                .await,
+            Admission::Denied(Denial::StoreUnavailable)
+        );
     }
 
     #[tokio::test]
