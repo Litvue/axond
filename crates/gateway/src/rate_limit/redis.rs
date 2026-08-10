@@ -245,12 +245,8 @@ fn mark_mismatched_result(
     true
 }
 
-fn should_compensate_abandoned_send(
-    result: &OwnedAcquireResult,
-    result_untrusted: bool,
-    send_failed: bool,
-) -> bool {
-    send_failed && compensate_abandoned_result(result, result_untrusted)
+fn should_compensate_abandoned_send(result: &OwnedAcquireResult, result_untrusted: bool) -> bool {
+    compensate_abandoned_result(result, result_untrusted)
 }
 
 #[derive(Clone)]
@@ -700,8 +696,8 @@ impl RateLimiter for RedisRateLimiter {
             if ambiguous {
                 abandoned_release.clone().spawn();
             }
-            let compensate_on_send_failure = mismatched_lease_id
-                || should_compensate_abandoned_send(&result, result_untrusted, true);
+            let compensate_on_send_failure =
+                mismatched_lease_id || should_compensate_abandoned_send(&result, result_untrusted);
             if sender.send(result).is_err() && compensate_on_send_failure {
                 abandoned_release.spawn();
             }
@@ -719,7 +715,6 @@ impl RateLimiter for RedisRateLimiter {
                         &lease_id,
                     );
                     if mismatched_lease_id {
-                        self.mark_connection_suspect(connection_generation);
                         release.spawn();
                         return self
                             .unavailable("shared Redis response echoed a different lease id");
@@ -754,10 +749,17 @@ impl RateLimiter for RedisRateLimiter {
             }
         };
         let result_untrusted = result_is_untrusted(&self.recovery, connection_generation);
-        let mismatched_lease_id =
-            matches!(&result, Ok(Ok(Ok(Ok((_, echoed_lease_id))))) if echoed_lease_id != &lease_id);
+        let mismatched_lease_id = if let Ok(Ok(owned_result)) = &result {
+            mark_mismatched_result(
+                &self.recovery,
+                connection_generation,
+                owned_result,
+                &lease_id,
+            )
+        } else {
+            false
+        };
         if mismatched_lease_id {
-            self.mark_connection_suspect(connection_generation);
             release.spawn();
             return self.unavailable("shared Redis response echoed a different lease id");
         }
@@ -2264,7 +2266,7 @@ mod tests {
             "a healthy current generation must remain trusted"
         );
         assert!(
-            !should_compensate_abandoned_send(&denial, result_untrusted, true),
+            !should_compensate_abandoned_send(&denial, result_untrusted),
             "a trusted definite denial proves no lease was created"
         );
         assert!(
@@ -2272,7 +2274,7 @@ mod tests {
             "a denial from a retired generation is unattributable and must compensate"
         );
         assert!(
-            !should_compensate_abandoned_send(&denial, false, true),
+            !should_compensate_abandoned_send(&denial, false),
             "a trusted denial sent to an abandoned wait must not compensate"
         );
         let mismatch = Ok(Ok((1, "someone-else".to_owned())));
