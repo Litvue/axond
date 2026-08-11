@@ -44,7 +44,7 @@ use serde_json::{Value, json};
 use tracing::{Instrument, debug, warn};
 
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
-use crate::config::{Model, Provider, ProviderKind, Target};
+use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target};
 use crate::credentials::{CredentialLease, CredentialPlan, CredentialSource};
 use crate::error::GatewayError;
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
@@ -323,11 +323,13 @@ impl Route {
     /// translates between wires, so an alias whose target cannot serve the shape
     /// is a configuration mistake worth naming.
     fn serves(self, kind: ProviderKind) -> bool {
+        self.wire() == kind.wire()
+    }
+
+    fn wire(self) -> ProviderWire {
         match self {
-            Self::ChatCompletions | Self::Embeddings => {
-                matches!(kind, ProviderKind::Openai | ProviderKind::OpenaiCompatible)
-            }
-            Self::NativeMessages => kind == ProviderKind::Anthropic,
+            Self::ChatCompletions | Self::Embeddings => ProviderWire::Openai,
+            Self::NativeMessages => ProviderWire::Anthropic,
         }
     }
 
