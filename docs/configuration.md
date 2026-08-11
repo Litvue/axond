@@ -142,6 +142,7 @@ Circuits are in-memory and per replica, consistent with running stateless
 | `env` | string | — | *Name* of the environment variable holding the inbound token. Exactly one of `env` and `file` must be non-empty. |
 | `file` | string | — | Path to a UTF-8 file holding the inbound token. Exactly one of `file` and `env` must be non-empty; the file is re-read on every reload. |
 | `namespace` | string | — | Namespace the bearer is served under. Undefined is rejected. |
+| `can_mint` | boolean | `false` | Authorizes this static key to use the opt-in in-gateway minting endpoint. |
 
 Exactly one source (`env` or `file`) is permitted per entry; both declared or
 neither declared is a config error. File contents are read without trimming:
@@ -165,6 +166,21 @@ secret — the caller's namespace would be ambiguous. Callers present the token 
 `Authorization: Bearer <token>` or `x-api-key: <token>`; both read the same
 table. The usage record's `subject` is the env var's *name*
 ([ADR 0013](./adr/0013-inbound-auth-fails-closed.md)).
+
+## `[gateway_minting]` — in-gateway token issuance (optional, Tier 0)
+
+This section is absent by default; its presence registers `POST /v1/tokens`. It requires a static `[[gateway_key]]` with `can_mint = true` and places a signing key in the gateway.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `kid` | string | — | Existing verifier key identifier used for the minted token. |
+| `env` / `file` | string | — | Exactly one signing-material source; resolved at boot and reload. |
+| `max_ttl` | duration | verifier `max_ttl` | Issuance ceiling, never above the matching verifier's ceiling and at most 24h. |
+| `scope` | array of string | — | Optional capability ceiling. Omitted requests inherit it. |
+| `aliases` | array of string | — | Optional alias-pattern ceiling. Omitted requests inherit it. |
+| `max_request_microdollars` | u64 | — | Optional per-request ceiling. Omitted requests inherit it. |
+
+The route is registered only at boot. Enabling minting on reload is reported but requires a restart; removing it takes effect immediately and returns a typed 404. Key material and ceilings otherwise reload normally. Enabling this feature means every replica with minting enabled holds signing material: a compromised replica can forge tokens, and it loses Ed25519's verification-only benefit. Keep offline `axond mint` as the default, and consider a separately deployed minting replica set with short `max_ttl`.
 
 ## `[gateway_token]` — minted-token deployment policy (Tier 0)
 
