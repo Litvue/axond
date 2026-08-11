@@ -233,7 +233,6 @@ impl ConfigSnapshot {
                     max_request_microdollars: None,
                     jti: None,
                     can_mint: k.can_mint,
-                    jti: None,
                 },
             });
             gateway_key_fingerprints

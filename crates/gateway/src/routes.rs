@@ -212,7 +212,12 @@ async fn mint_tokens(
         minting
             .scope
             .as_ref()
-            .map(|scope| scope.iter().map(|capability| capability.name()).collect())
+            .map(|scope| {
+                scope
+                    .iter()
+                    .map(|capability| capability.name().to_owned())
+                    .collect()
+            })
             .unwrap_or_else(|| {
                 [
                     Capability::Chat,
@@ -224,7 +229,7 @@ async fn mint_tokens(
                 ]
                 .into_iter()
                 .filter(|capability| !capability.is_operator_only())
-                .map(Capability::name)
+                .map(|capability| capability.name().to_owned())
                 .collect()
             })
     });
@@ -1754,7 +1759,7 @@ env = "AXOND_PLATFORM_OPENAI"
 {GATEWAY_KEY}
 
 [gateway_token]
-audience = "test-audience"
+audience = "{audience}"
 
 [[gateway_verifier]]
 kid = "scope-test-kid"
@@ -1785,6 +1790,10 @@ targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdol
 
     fn minting_state() -> AppState {
         minting_state_with_epochs("")
+    }
+
+    fn minting_state_without_scope() -> AppState {
+        minting_state_with_scope_audience_epochs("", "test-audience", "")
     }
 
     fn minting_state_with_epochs(epochs: &str) -> AppState {
@@ -3238,7 +3247,6 @@ min_iat = {}
             max_request_microdollars: None,
             jti: None,
             can_mint: false,
-            jti: None,
         };
         let response = list_models(Extension(snapshot), Extension(caller))
             .await
@@ -3368,7 +3376,6 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
                     max_request_microdollars: None,
                     jti: None,
                     can_mint: false,
-                    jti: None,
                 },
             )
             .await
@@ -3932,7 +3939,6 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             max_request_microdollars: Some(1),
             jti: None,
             can_mint: false,
-            jti: None,
         };
         let body = json!({"model": "gpt-4o", "messages": []});
 
@@ -3972,7 +3978,6 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             max_request_microdollars: Some(10_000),
             jti: None,
             can_mint: false,
-            jti: None,
         };
         let body = json!({"model": "gpt-4o", "messages": []});
 
