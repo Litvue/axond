@@ -8,7 +8,7 @@ use super::{RevocationError, RevocationStore, unavailable, validate_expiry};
 use crate::config::StoreUnavailable;
 use crate::usage::validate_table_name;
 
-const SCHEMA_DDL: &str = include_str!("../../../../ops/postgres/revocation_v1.sql");
+const SCHEMA_DDL: &str = include_str!("../../sql/revocation_v1.sql");
 
 pub struct PostgresRevocation {
     table: String,

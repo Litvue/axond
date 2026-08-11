@@ -394,8 +394,8 @@ config-owned; only callers and keys may become store-owned.
 | 0 | Default operation, local health, failover, reload, stdout usage, or an approximate per-replica spend cap | Omit `[[usage_sink]]` and `[budget]`, or use `[budget] backend = "in-memory"` | No datastore; a fleet has one in-memory budget per replica. |
 | 0* | Usage in your trace backend | `[[usage_sink]] kind = "otlp"` | Requires `OTEL_EXPORTER_OTLP_ENDPOINT` at boot; Tier 0 state but not hermetic, so it is outside the Tier 0 CI lane. |
 | 1 | A spend cap across replicas | `[budget] backend = "redis"` | Redis availability couples budgeted admission to Redis; `deny` fails closed. |
-| 2 | Durable usage rows | `[[usage_sink]] kind = "postgres"` | A Postgres role, the [`usage_v2.sql`](../ops/postgres/usage_v2.sql) table, ordered additive migrations, and backup/restore ownership. |
-| 2 | A spend cap across replicas | `[budget] backend = "postgres"` | Postgres availability and the [`budget_v1.sql`](../ops/postgres/budget_v1.sql) tables. |
+| 2 | Durable usage rows | `[[usage_sink]] kind = "postgres"` | A Postgres role, the [`usage_v2.sql`](../crates/gateway/sql/usage_v2.sql) table, ordered additive migrations, and backup/restore ownership. |
+| 2 | A spend cap across replicas | `[budget] backend = "postgres"` | Postgres availability and the [`budget_v1.sql`](../crates/gateway/sql/budget_v1.sql) tables. |
 
 For upgrades, apply each additive `usage_v1_<sequence>_<name>.sql` migration in
 filename order before deploying a gateway that writes its new column. Otherwise

@@ -9,7 +9,7 @@
 //! replica that dies mid-request cannot leak a hold.
 //!
 //! The schema lands in an adopter's own database, so it is treated as an
-//! interface: it ships as [`ops/postgres/budget_v1.sql`](../../../../ops/postgres/budget_v1.sql)
+//! interface: it ships as [`crates/gateway/sql/budget_v1.sql`](../../sql/budget_v1.sql)
 //! and a change to the row shape is a new versioned file rather than an edit.
 
 use std::time::Duration;
@@ -24,7 +24,7 @@ const BACKEND: &str = "postgres";
 
 /// The DDL for the current schema version, shared with operators who apply it
 /// themselves.
-const SCHEMA_DDL: &str = include_str!("../../../../ops/postgres/budget_v1.sql");
+const SCHEMA_DDL: &str = include_str!("../../sql/budget_v1.sql");
 
 /// The table name the shipped DDL uses; substituted when another is configured.
 const DEFAULT_TABLE: &str = "axond_budget";

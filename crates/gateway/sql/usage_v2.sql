@@ -4,7 +4,7 @@
 -- table, or use this file for a fresh installation before enabling a
 -- kind = "postgres" usage sink:
 --
---     psql "$AXOND_USAGE_POSTGRES_DSN" -f ops/postgres/usage_v2.sql
+--     psql "$AXOND_USAGE_POSTGRES_DSN" -f crates/gateway/sql/usage_v2.sql
 --
 -- Version 2 makes the cache counters part of the canonical usage record and
 -- defines input_tokens as the non-cached prompt remainder.

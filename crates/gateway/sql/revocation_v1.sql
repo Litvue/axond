@@ -3,7 +3,7 @@
 -- Apply once per database before enabling `backend = "postgres"` under
 -- `[revocation]`:
 --
---     psql "$AXOND_REVOCATION_POSTGRES_DSN" -f ops/postgres/revocation_v1.sql
+--     psql "$AXOND_REVOCATION_POSTGRES_DSN" -f crates/gateway/sql/revocation_v1.sql
 --
 -- The gateway can apply this itself with `create_table = true`, which runs the
 -- same statements (with the table names substituted). Never edit this file in

@@ -40,12 +40,12 @@ confidence-threshold = 0.9
 
 [bans]
 multiple-versions = "warn"
-# The workspace's own crates (gateway-core, gateway-transport) are path deps with
-# no version requirement, which reads as a wildcard. That is intentional for an
-# internal workspace, and pinning a version here would drift from the single
-# release-please-managed workspace version, so wildcards are allowed rather than
-# denied. External floating ranges are caught in review.
-wildcards = "allow"
+# Every dependency, including the workspace's own published crates, carries a
+# version requirement: `gateway-core` and `gateway-transport` are `path` + exact
+# workspace `version` in `[workspace.dependencies]` so the packaged crates
+# resolve from crates.io. Nothing may reintroduce a wildcard — crates.io rejects
+# a wildcard dependency on publish, so this check fails the release early.
+wildcards = "deny"
 
 [sources]
 unknown-registry = "deny"

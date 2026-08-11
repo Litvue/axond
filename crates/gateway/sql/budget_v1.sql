@@ -4,7 +4,7 @@
 -- Apply once per database before enabling `backend = "postgres"` under
 -- `[budget]`:
 --
---     psql "$AXOND_BUDGET_POSTGRES_DSN" -f ops/postgres/budget_v1.sql
+--     psql "$AXOND_BUDGET_POSTGRES_DSN" -f crates/gateway/sql/budget_v1.sql
 --
 -- The gateway can apply this itself with `create_table = true`, which runs the
 -- same statements (with the table names substituted). Never edit this file in

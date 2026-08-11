@@ -163,6 +163,24 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # A registry release cannot be repaired after the fact, so the packaging that
+  # `release-please.yml` performs at the tag is exercised here on every change:
+  # each package must build from its own `.crate` tarball, with versions aligned
+  # and no file left behind by an `include` that drifted from the sources.
+  publish-dry-run:
+    name: crates.io packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - name: Package and publish dry-run in dependency order
+        run: bash ops/publish-crates.sh --dry-run
+
   dependency-policy:
     name: Dependency policy
     runs-on: ubuntu-latest
@@ -238,6 +256,7 @@ jobs:
       - stateful-tests
       - sdk-compat
       - docs
+      - publish-dry-run
       - dependency-policy
       - static-binary
       - docker-smoke
@@ -253,6 +272,7 @@ jobs:
           test "${{ needs.stateful-tests.result }}" = success
           test "${{ needs.sdk-compat.result }}" = success
           test "${{ needs.docs.result }}" = success
+          test "${{ needs.publish-dry-run.result }}" = success
           test "${{ needs.dependency-policy.result }}" = success
           test "${{ needs.static-binary.result }}" = success
           test "${{ needs.docker-smoke.result }}" = success

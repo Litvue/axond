@@ -2,13 +2,15 @@ name: Release
 
 # release-please tracks Conventional Commits on main, keeps a release PR open,
 # and on merge tags `v<major>.<minor>.<patch>` and cuts a GitHub release. That
-# release fans out into three shipped artifacts, each built from the tagged
-# commit: cross-platform binaries, a signed + attested OCI image, and the
-# checksums/SBOM evidence attached to the release.
+# release fans out into the shipped artifacts, each built from the tagged
+# commit: cross-platform binaries, a signed + attested OCI image, the
+# checksums/SBOM evidence attached to the release, and — last, because it is the
+# only irreversible one — the three crates.io packages.
 #
 # A `workflow_dispatch` with an existing release tag re-runs the artifact lanes
 # for a release that already exists (repair path); it never creates a tag or
-# release.
+# release. Because the crates.io lane skips versions already on the registry,
+# that same dispatch resumes a release whose publish only partly succeeded.
 
 on:
   push:
@@ -394,3 +396,77 @@ jobs:
         run: |
           test "${{ needs.release-binaries.result }}" = success
           test "${{ needs.release-image.result }}" = success
+
+  # crates.io is the one irreversible lane: a published version can be yanked
+  # but never replaced or removed. So it runs last, only after the tagged
+  # commit's CI is green and every artifact lane has succeeded, and it is
+  # idempotent — a version already on the registry is skipped, which makes a
+  # re-dispatch of this workflow the resume path for a partial release
+  # (RELEASE.md, "Recovering a partial crates.io release").
+  release-crates:
+    name: crates.io publish
+    needs:
+      - release-metadata
+      - release-success
+    if: needs.release-metadata.outputs.release_created == 'true'
+    # Serialize per tag so a re-dispatch cannot race the original run into a
+    # duplicate upload; never cancel, because a cancelled publish is the one
+    # that may have uploaded without recording it.
+    concurrency:
+      group: release-crates-${{ needs.release-metadata.outputs.tag_name }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    # Holds CARGO_REGISTRY_TOKEN, so the token is reachable only from this job
+    # and any environment protection rules apply before it is exposed.
+    environment: crates-io
+    permissions:
+      contents: read
+      # Reading the tagged commit's check runs, nothing more: this job has no
+      # reason to write to the repository or the release.
+      checks: read
+    env:
+      RELEASE_TAG: ${{ needs.release-metadata.outputs.tag_name }}
+      RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+    steps:
+      # The artifact lanes above rebuild the tagged commit but do not re-run the
+      # full test matrix, so require the commit's own `CI Success` aggregate
+      # rather than assuming the release PR merged green.
+      - name: Require CI to be green for the released commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ needs.release-metadata.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            conclusion="$(
+              gh api "/repos/${GITHUB_REPOSITORY}/commits/${COMMIT_SHA}/check-runs?per_page=100" \
+                --jq '[.check_runs[] | select(.name == "CI Success")]
+                      | sort_by(.started_at) | last | .conclusion // "pending"'
+            )"
+            case "$conclusion" in
+              success)
+                echo "CI Success is green for $COMMIT_SHA"
+                exit 0
+                ;;
+              pending | null | "")
+                echo "attempt $attempt: CI Success has not concluded for $COMMIT_SHA yet"
+                sleep 30
+                ;;
+              *)
+                echo "CI Success concluded '$conclusion' for $COMMIT_SHA; refusing to publish" >&2
+                exit 1
+                ;;
+            esac
+          done
+          echo "CI Success did not conclude for $COMMIT_SHA within 30 minutes; refusing to publish" >&2
+          exit 1
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-metadata.outputs.tag_name }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Publish gateway-core, gateway-transport, then axond
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: bash ops/publish-crates.sh "$RELEASE_VERSION"

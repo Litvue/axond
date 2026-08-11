@@ -151,7 +151,7 @@ approved and FSF free, with no attribution obligation on binaries. Nothing else 
 the supply-chain policy changes. Postgres reuses the
 existing `tokio-postgres` stack, including its TLS connector, rather than adding a
 second one; its schema ships as
-[`ops/postgres/budget_v1.sql`](../../ops/postgres/budget_v1.sql) and is versioned
+[`crates/gateway/sql/budget_v1.sql`](../../crates/gateway/sql/budget_v1.sql) and is versioned
 by the same rule as the usage table — a change to the row shape is a new file.
 
 ## Consequences

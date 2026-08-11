@@ -2,9 +2,17 @@
 name = "gateway-transport"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "HTTP transport for the Axond gateway: credential injection, timeouts, retries, and connection pooling around gateway-core adapters."
+keywords = ["llm", "gateway", "http", "streaming", "proxy"]
+categories = ["web-programming::http-client", "api-bindings"]
+# Only the library sources ship; the workspace README is added by Cargo because
+# `readme` is inherited from the workspace.
+include = ["src/**/*.rs"]
 
 [dependencies]
 gateway-core.workspace = true

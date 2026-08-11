@@ -2,7 +2,7 @@
 --
 -- Apply once per database before enabling a `kind = "postgres"` usage sink:
 --
---     psql "$AXOND_USAGE_POSTGRES_DSN" -f ops/postgres/usage_v1.sql
+--     psql "$AXOND_USAGE_POSTGRES_DSN" -f crates/gateway/sql/usage_v1.sql
 --
 -- The gateway can apply this itself with `create_table = true`, which runs the
 -- same statements (with the table name substituted). Never edit this file in
