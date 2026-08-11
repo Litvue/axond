@@ -1,7 +1,8 @@
 # Docker Compose stateful quickstart configuration.
 #
-# This keeps the Tier 0 catalogue and routing from axond.quickstart.toml, then
-# opts into the shared backends shown in docs/deployment.md:
+# This duplicates axond.quickstart.toml because TOML has no include. Keep the
+# catalogue and routing sections in sync; only the trailing budget,
+# rate_limit, and usage_sink sections differ. The shared backends are:
 # - Tier 1: Redis-backed budget and inbound rate limiting. Redis is now part of
 #   admission and the default `deny` policy fails closed when it is unavailable.
 # - Tier 2: Postgres durable usage rows. `create_table = true` applies the

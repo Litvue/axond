@@ -94,14 +94,14 @@ curl http://localhost:8080/healthz
 ```
 
 The first Compose build compiles the static musl release and can take several
-minutes. To call the authenticated catalogue, use the key from `.env`:
+minutes. To call the authenticated catalogue:
 
 ```bash
-curl -H "Authorization: Bearer $GW_INBOUND_PLATFORM_KEY" \
+curl -H "Authorization: Bearer quickstart-platform-key" \
   http://localhost:8080/v1/models
 ```
 
-For the source-based configuration path:
+For a source-based configuration path, use the full annotated reference:
 
 ```bash
 cp axond.example.toml axond.toml      # edit providers/models/namespaces

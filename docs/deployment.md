@@ -36,20 +36,17 @@ ok
 {"data":[{"id":"gpt-4o","object":"model","owned_by":"axond"},{"id":"claude-sonnet","object":"model","owned_by":"axond"},{"id":"text-embedding-3-small","object":"model","owned_by":"axond"}],"object":"list"}
 ```
 
-With a real OpenAI key in `GW_PLATFORM_OPENAI_API_KEY`, the final request
-returns the provider's normal successful chat-completion JSON. With the
-committed placeholder value,
-the request reaches OpenAI and returns this observed typed provider error
-instead; do not treat that response as a successful completion:
+With the committed placeholder key, the chat request returns HTTP `502` and
+the following typed provider error:
 
 ```text
 {"error":{"message":"invalid provider request: Incorrect API key provided: placehol**********-key. You can find your API key at https://platform.openai.com/account/api-keys.","type":"invalid_request"}}
 ```
 
-The HTTP status for that placeholder response is `502`. A real provider key
-returns the provider's successful completion response and an HTTP `200`; the
-successful response body depends on the model and prompt and is intentionally
-not fabricated here.
+A real key in `GW_PLATFORM_OPENAI_API_KEY` returns the provider's normal HTTP
+`200` chat-completion response.
+
+Run `just quickstart-smoke` to execute exactly these default-stack commands.
 
 To try the stateful variant, select the Tier 1 Redis budget/rate-limit backends
 and the Tier 2 Postgres durable usage sink:
@@ -65,6 +62,20 @@ docker compose -f docker-compose.yml -f docker-compose.stateful.yml \
 The stateful configuration creates the Postgres usage table at boot. Redis and
 Postgres are required dependencies in this path; admission fails closed when
 Redis is unavailable, and usage rows are durable in Postgres.
+
+After a request, check the durable Tier 2 usage row with:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.stateful.yml \
+  --profile stateful exec -T postgres psql -U postgres -d axond -Atc \
+  "select count(*) from axond_usage;"
+```
+
+Observed output after the placeholder chat request:
+
+```text
+1
+```
 
 ## What you need before you start
 
