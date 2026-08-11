@@ -125,10 +125,23 @@ jobs:
           python-version: '3.12'
       - name: Build the gateway the SDKs will talk to
         run: cargo build -p axond --locked
+      - name: Check compatibility lock inputs
+        run: |
+          set -euo pipefail
+          # Keep every direct input pin present in the generated lockfile.
+          mapfile -t pins < <(grep -E '^[A-Za-z0-9_.-]+==' tests/compat/requirements.in || true)
+          ((${#pins[@]} > 0)) || { echo "no direct pins found" >&2; exit 1; }
+          for pin in "${pins[@]}"; do
+            escaped_pin="$(printf '%s' "$pin" | sed 's/[.[\*^$()+?{|\\]/\\&/g')"
+            grep -Eq "^${escaped_pin}([[:space:];\\]|$)" tests/compat/requirements.txt || {
+              echo "missing direct pin in lockfile: $pin" >&2
+              exit 1
+            }
+          done
       # Hermetic: the SDKs are pointed at a local fake upstream serving the
       # committed fixtures, so this lane makes no provider call and needs no key.
       - name: Install the pinned provider SDKs
-        run: pip install -r tests/compat/requirements.txt
+        run: pip install --require-hashes -r tests/compat/requirements.txt
       - name: Drive axond with the vendors' own SDKs
         run: pytest tests/compat -q
         env:
