@@ -9,7 +9,7 @@ Accepted
 ## Context
 
 The gateway serves `/v1/chat/completions`, `/v1/messages`, `/v1/embeddings`, and
-now `/v1/responses` as native provider routes. Before ADR 0021, Responses
+now `/v1/responses` as native provider routes. Before ADR 0022, Responses
 answered with a typed `501`. That left the Anthropic
 half of the market reachable only by sending an OpenAI-shaped request to an
 Anthropic target and letting the adapter translate it — the arrangement the
@@ -108,7 +108,7 @@ real means routing an OpenAI-shaped chat request to a provider's *own* endpoint
 and translating both directions, which is a decision of its own rather than a
 silent fallback.
 
-**Superseded for `/v1/responses` by [ADR 0021](./0021-openai-responses-passthrough.md).**
+**Superseded for `/v1/responses` by [ADR 0022](./0022-openai-responses-passthrough.md).**
 Responses is now served natively on the shared path. Its provider-side
 statefulness is handled by considering only the alias's first configured target
 and first configured credential for requests with `previous_response_id`, while
@@ -141,4 +141,4 @@ allowing.
   estimate (ADR 0010), exactly as the OpenAI-shaped path does.
 - `/v1/responses` is now served by the shared native passthrough path. Its
   statefulness, target pinning, and Responses-specific stream framing are
-  defined by ADR 0021.
+  defined by ADR 0022.

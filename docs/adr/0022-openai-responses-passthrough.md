@@ -1,4 +1,4 @@
-# 21. OpenAI Responses native passthrough
+# 22. OpenAI Responses native passthrough
 
 Date: 2026-08-11
 
