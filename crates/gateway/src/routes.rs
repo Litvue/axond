@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Extension, Request, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
@@ -165,7 +165,7 @@ async fn mint_tokens(
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
     body: Result<Json<MintTokenRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<Value>, GatewayError> {
+) -> Result<(HeaderMap, Json<Value>), GatewayError> {
     let minting = snapshot
         .gateway_minting
         .as_ref()
@@ -258,13 +258,21 @@ async fn mint_tokens(
         scope,
     })
     .map_err(|error| GatewayError::BadRequest(error.to_string()))?;
-    Ok(Json(json!({
-        "token": minted.token,
-        "exp": minted.exp,
-        "expires_in": ttl.as_secs(),
-        "namespace": caller.namespace,
-        "sub": request.sub,
-    })))
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    Ok((
+        headers,
+        Json(json!({
+            "token": minted.token,
+            "exp": minted.exp,
+            "expires_in": ttl.as_secs(),
+            "namespace": caller.namespace,
+            "sub": request.sub,
+        })),
+    ))
 }
 
 async fn healthz() -> &'static str {
@@ -1672,6 +1680,25 @@ max_request_microdollars = 1000
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
         (status, body)
+    }
+
+    #[tokio::test]
+    async fn minting_response_is_not_cacheable() {
+        let response = router(minting_state())
+            .oneshot(
+                Request::post("/v1/tokens")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer mint-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"sub":"agent"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(axum::http::header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
     }
 
     #[test]
