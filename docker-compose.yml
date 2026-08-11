@@ -3,7 +3,7 @@ services:
     build: .
     image: ${AXOND_IMAGE:-axond:quickstart}
     ports:
-      - "8080:8080"
+      - "${AXOND_QUICKSTART_HOST_PORT:-127.0.0.1:8080}:8080"
     environment:
       AXOND_CONFIG: /etc/axond/axond.toml
       GW_PLATFORM_OPENAI_API_KEY: ${GW_PLATFORM_OPENAI_API_KEY:?set it in .env}

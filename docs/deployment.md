@@ -14,6 +14,9 @@ This path builds the local distroless image from the Dockerfile rather than
 pulling a registry image. The first build compiles the static musl release and
 can take several minutes; later starts reuse the cached image.
 
+The example inbound keys are public values for local use only. Replace them
+before exposing the gateway beyond your own machine.
+
 ```bash
 git clone https://github.com/Litvue/axond.git
 cd axond
@@ -23,9 +26,11 @@ curl http://localhost:8080/healthz
 curl -H 'Authorization: Bearer quickstart-platform-key' \
   http://localhost:8080/v1/models
 curl -X POST http://localhost:8080/v1/chat/completions \
+  -w '\nHTTP %{http_code}\n' \
   -H 'Authorization: Bearer quickstart-platform-key' \
   -H 'content-type: application/json' \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Say hello in one word."}]}'
+docker compose down -v
 ```
 
 The health probe returns `ok`, and the authenticated catalogue lists the
@@ -37,44 +42,71 @@ ok
 ```
 
 With the committed placeholder key, the chat request returns HTTP `502` and
-the following typed provider error:
+an example of the following typed provider error:
 
 ```text
 {"error":{"message":"invalid provider request: Incorrect API key provided: placehol**********-key. You can find your API key at https://platform.openai.com/account/api-keys.","type":"invalid_request"}}
+HTTP 502
 ```
 
 A real key in `GW_PLATFORM_OPENAI_API_KEY` returns the provider's normal HTTP
 `200` chat-completion response.
 
-Run `just quickstart-smoke` to execute exactly these default-stack commands.
+The exact provider message varies with network and provider responses; an
+air-gapped run returns a typed `upstream_transport` error instead. Keep `.env`
+until after `docker compose down -v`, because required-variable interpolation
+runs before every Compose command. To run `just quickstart-smoke`, tear down
+the quickstart first because the smoke uses the same host port. If port 8080
+is occupied by another local stack, use
+`AXOND_QUICKSTART_SMOKE_PORT=18080 just quickstart-smoke`.
 
 To try the stateful variant, select the Tier 1 Redis budget/rate-limit backends
 and the Tier 2 Postgres durable usage sink:
 
 ```bash
-AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml docker compose \
+export AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml
+docker compose \
   -f docker-compose.yml -f docker-compose.stateful.yml \
   --profile stateful up -d --build
-docker compose -f docker-compose.yml -f docker-compose.stateful.yml \
-  --profile stateful down -v
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -w '\nHTTP %{http_code}\n' \
+  -H 'Authorization: Bearer quickstart-platform-key' \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Say hello in one word."}]}'
 ```
 
 The stateful configuration creates the Postgres usage table at boot. Redis and
 Postgres are required dependencies in this path; admission fails closed when
 Redis is unavailable, and usage rows are durable in Postgres.
 
-After a request, check the durable Tier 2 usage row with:
+After the chat request, the usage sink batches rows. Poll for the durable Tier
+2 usage row with:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.stateful.yml \
-  --profile stateful exec -T postgres psql -U postgres -d axond -Atc \
-  "select count(*) from axond_usage;"
+for attempt in $(seq 1 12); do
+  count="$(docker compose -f docker-compose.yml -f docker-compose.stateful.yml \
+    --profile stateful exec -T postgres psql -U postgres -d axond -Atc \
+    "select count(*) from axond_usage;")"
+  if [ "$count" = 1 ]; then
+    printf '%s\n' "$count"
+    break
+  fi
+  sleep 1
+done
+test "$count" = 1
 ```
 
 Observed output after the placeholder chat request:
 
 ```text
 1
+```
+
+Keep `.env` in place for this query and for teardown. When finished:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.stateful.yml \
+  --profile stateful down -v
 ```
 
 ## What you need before you start

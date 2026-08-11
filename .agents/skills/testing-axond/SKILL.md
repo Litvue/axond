@@ -216,3 +216,48 @@ exercises the temp-file cleanup trap, temporarily make `tests/compat/fake_upstre
 ## Devin Secrets Needed
 
 None. All of the above runs offline with placeholder values.
+
+## Testing the Docker Compose quickstart
+
+The repo ships a Compose quickstart (`docker-compose.yml`, `docker-compose.stateful.yml`
+overlay, `ops/compose/*.toml`, `ops/compose/env.example`, `ops/compose-smoke.sh`,
+`just quickstart-smoke`) documented in `docs/deployment.md#5-minute-quickstart`.
+
+```bash
+cp ops/compose/env.example .env      # compose uses `${VAR:?set it in .env}` — no .env, no boot
+docker compose up -d --build         # warm image cache: ~45s; cold musl build: minutes
+curl http://localhost:8080/healthz   # -> ok
+docker compose down -v               # keep .env until after this command
+just quickstart-smoke                # tear down first; own project name, needs host 8080 free
+```
+
+- Every compose command (including `docker compose down`) needs `.env` to exist, because
+  the required-variable interpolation runs first. Deleting `.env` before teardown leaves
+  containers running with a confusing "required variable ... is missing a value" error.
+- `just quickstart-smoke` publishes on host port 8080 by default
+  (`AXOND_QUICKSTART_SMOKE_PORT=18080` overrides). If a quickstart stack is already up,
+  tear it down first or use the override.
+- The stateful path needs both files plus the config override, and the same flags on every
+  follow-up command:
+
+```bash
+export AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml
+docker compose -f docker-compose.yml -f docker-compose.stateful.yml --profile stateful up -d
+```
+
+- Proving Redis is really in admission (not silently ignored): `docker compose ... stop redis`,
+  then POST `/v1/chat/completions` → `503` `rate_limit_unavailable` (or `budget_unavailable`).
+  `/v1/models` still answers `200`, so only the dispatch path is gated. After
+  `start redis`, expect ~10-15s of transient `503`s before requests flow again — do not
+  read the first failure after a restart as a bug.
+- Redis holds no keys for a request that never spends (cost 0), so `redis-cli KEYS '*'`
+  being empty is not evidence Redis is unwired; use the fail-closed probe above instead.
+- Postgres usage rows are batched: `select count(*) from axond_usage` immediately after a
+  request returns `0` and flips to `1` a few seconds later. Always poll before asserting,
+  as shown in the deployment guide.
+- With the committed placeholder provider key and network egress, dispatch returns `502`
+  `invalid_request` carrying OpenAI's "Incorrect API key provided: placehol**********-key"
+  text. That body depends on reaching api.openai.com; air-gapped runs get
+  `upstream_transport` instead, so assert "typed error" rather than that exact string.
+- Boot/config failures stay visible: the service sets no restart policy, so a bad config
+  leaves an `Exited (1)` container and the error is the last line of `docker compose logs`.
