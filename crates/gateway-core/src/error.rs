@@ -91,6 +91,16 @@ impl ProviderError {
     pub fn is_stream_rate_limited(&self) -> bool {
         matches!(self, Self::RateLimitedStream(_))
     }
+
+    pub fn is_credential_rate_limited(&self) -> bool {
+        match self {
+            Self::RateLimitedStream(_) => true,
+            Self::Dependency(failures) => {
+                failures.iter().any(|failure| failure.status == Some(429))
+            }
+            _ => false,
+        }
+    }
 }
 
 fn extract_message(body: &str) -> String {
@@ -124,6 +134,12 @@ fn is_context_length_error(text: &str) -> bool {
 
 /// Recognize only explicit provider rate-limit markers in an SSE JSON payload.
 pub fn is_rate_limit_payload(value: &serde_json::Value) -> bool {
+    let error = value.get("error");
+    let error_shaped =
+        error.is_some() || value.get("type").and_then(serde_json::Value::as_str) == Some("error");
+    if !error_shaped {
+        return false;
+    }
     let status_is_429 = [value.get("status"), value.pointer("/error/status")]
         .into_iter()
         .flatten()
@@ -211,6 +227,7 @@ mod tests {
             r#"{"error":{"type":"overloaded_error"}}"#,
             r#"{"error":{"message":"try again later"}}"#,
             r#"{"status":500}"#,
+            r#"{"type":"rate_limits.updated","rate_limits":{"requests":10}}"#,
         ] {
             let value: serde_json::Value = serde_json::from_str(body).unwrap();
             assert!(!is_rate_limit_payload(&value), "{body}");

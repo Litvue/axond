@@ -1146,6 +1146,7 @@ async fn stream_with_failover(
                         walk.attempts += 1;
                         break 'targets;
                     }
+                    break;
                 }
             }
         }
@@ -1469,10 +1470,7 @@ async fn dispatch_over_pool(
 /// so it parks that key and falls to the next. Every other upstream failure is
 /// the target's problem, not the key's.
 fn is_credential_exhausted(err: &TransportError) -> bool {
-    let TransportError::Provider(ProviderError::Dependency(failures)) = err else {
-        return false;
-    };
-    failures.iter().any(|failure| failure.status == Some(429))
+    matches!(err, TransportError::Provider(error) if error.is_credential_rate_limited())
 }
 
 fn to_usage(u: &gateway_core::ModelUsage) -> Usage {

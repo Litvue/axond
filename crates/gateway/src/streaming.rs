@@ -88,7 +88,7 @@ pub struct RotationHandle {
 }
 
 fn is_stream_rate_limited(err: &TransportError) -> bool {
-    matches!(err, TransportError::Provider(error) if error.is_stream_rate_limited())
+    matches!(err, TransportError::Provider(error) if error.is_credential_rate_limited())
 }
 
 impl RotationHandle {
@@ -381,7 +381,7 @@ impl Relay {
                             match self.decoder.decode(event) {
                                 Ok(decoded) => self.emit(decoded),
                                 Err(err)
-                                    if err.is_stream_rate_limited()
+                                    if err.is_credential_rate_limited()
                                         && self.framing == Framing::OpenAiSse
                                         && !self.queued_downstream =>
                                 {
@@ -743,8 +743,11 @@ mod tests {
         OpenAiCompatibleAdapter, ProviderAdapter, ProviderError, ProviderStreamEvent, SseEvent,
         Surface, is_rate_limit_payload,
     };
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
     use serde_json::json;
     use tower::util::ServiceExt;
+    use tracing_subscriber::layer::SubscriberExt;
 
     use crate::budget::{Admission, BudgetStore, Denial};
     use crate::config::Config;
@@ -1632,6 +1635,97 @@ targets = [
         assert_eq!(record["input_tokens"], 8);
         assert_eq!(record["output_tokens"], 3);
         assert_eq!(ledger.settlements().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rotation_skips_rate_limited_reopens_before_serving() {
+        let ledger = Arc::new(Ledger::default());
+        let opens = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let opens_for_opener = opens.clone();
+        let opener = move |_lease: CredentialLease, _attempt: u32, _index: usize| {
+            let opens = opens_for_opener.clone();
+            Box::pin(async move {
+                if opens.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err(gateway_transport::TransportError::Provider(
+                        ProviderError::from_upstream("test", 429, "rate limited"),
+                    ))
+                } else {
+                    Ok(test_opened_stream(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\ndata: [DONE]\n\n",
+                    ))
+                }
+            }) as futures::future::BoxFuture<'static, _>
+        };
+        let failures_for_callback = failures.clone();
+        let response = relay_opened(
+            state_for("http://127.0.0.1:1", ledger.clone()),
+            context(),
+            OpenAiCompatibleAdapter::openai()
+                .stream_decoder(Surface::ChatCompletions)
+                .expect("decoder"),
+            futures::stream::iter(vec![Ok(Bytes::from_static(
+                b"data: {\"error\":{\"type\":\"rate_limit_exceeded\"}}\n\n",
+            ))])
+            .boxed(),
+            Instant::now(),
+            Framing::OpenAiSse,
+            Some(RotationHandle::new(
+                vec![test_lease("b"), test_lease("c"), test_lease("d")],
+                1,
+                1,
+                opener,
+                move |_| {
+                    failures_for_callback.fetch_add(1, Ordering::SeqCst);
+                },
+                |_| {},
+            )),
+        );
+        let mut body = response.into_body().into_data_stream();
+        let mut output = String::new();
+        while let Some(chunk) = body.next().await {
+            output.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+        }
+        assert!(output.contains("\"content\":\"c\""));
+        assert_eq!(opens.load(Ordering::SeqCst), 3);
+        assert_eq!(failures.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_open_429_closes_lease_as_rate_limited() {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("axond-test")));
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _default = tracing::dispatcher::set_default(&dispatch);
+        let attempt = telemetry::upstream_attempt_span(0, "openai", "gpt-4o", "platform");
+        let result =
+            open_stream_with_attempt_span(&context(), &attempt, "rate-limited", 0, async {
+                Err(TransportError::Provider(ProviderError::from_upstream(
+                    "test",
+                    429,
+                    "rate limited",
+                )))
+            })
+            .await;
+        assert!(result.is_err());
+        drop(attempt);
+        provider.force_flush().unwrap();
+        let lease = exporter
+            .get_finished_spans()
+            .unwrap()
+            .into_iter()
+            .find(|span| span.name == "axond.credential.lease")
+            .expect("lease span");
+        let status = lease
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == "axond.status")
+            .map(|kv| kv.value.to_string());
+        assert_eq!(status.as_deref(), Some("rate_limited"));
     }
 
     #[tokio::test]

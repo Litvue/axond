@@ -345,4 +345,25 @@ mod tests {
             })]
         );
     }
+
+    #[test]
+    fn informational_rate_limits_updated_event_is_not_a_stream_error() {
+        let mut decoder = OpenAiCompatibleAdapter::openai()
+            .stream_decoder(Surface::Responses)
+            .unwrap();
+        let events = decoder
+            .decode(SseEvent {
+                event: None,
+                data: json!({
+                    "type": "rate_limits.updated",
+                    "rate_limits": { "requests": 10 }
+                })
+                .to_string(),
+            })
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [ProviderStreamEvent::Data { .. }]
+        ));
+    }
 }
