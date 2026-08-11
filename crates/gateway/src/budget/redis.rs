@@ -965,7 +965,9 @@ mod tests {
         let prefix = prefix();
         migrate_v1_to_v2(&url, &prefix).await.expect("migrate");
         let mut expiring = namespace_settings(1_000, 1_000);
-        expiring.reservation_ttl = Duration::from_millis(50);
+        // Long enough that the denial below cannot race the expiry it is
+        // asserting has *not* happened yet, on a loaded CI runner.
+        expiring.reservation_ttl = Duration::from_secs(2);
         let store = RedisBudget::connect(&url, prefix, expiring)
             .await
             .expect("connect");
@@ -986,7 +988,7 @@ mod tests {
             store.reserve(&second, 900).await,
             Admission::Denied(Denial::Exceeded)
         );
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
         assert!(matches!(
             store.reserve(&second, 900).await,
             Admission::Allowed(_)

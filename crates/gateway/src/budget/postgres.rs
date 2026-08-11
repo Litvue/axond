@@ -780,7 +780,9 @@ mod tests {
             return;
         };
         let mut expiring = namespace_settings(1_000, 1_000);
-        expiring.reservation_ttl = Duration::from_millis(50);
+        // Long enough that the denial below cannot race the expiry it is
+        // asserting has *not* happened yet, on a loaded CI runner.
+        expiring.reservation_ttl = Duration::from_secs(2);
         let store = namespace_store(&dsn, "axond_budget_ns_expiry_test", expiring).await;
         let died = BudgetKey {
             namespace: "acme".into(),
@@ -799,7 +801,7 @@ mod tests {
             store.reserve(&alive, 900).await,
             Admission::Denied(Denial::Exceeded)
         );
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
         // The dead replica's hold is reclaimed for the namespace, not just for
         // the subject that made it.
         assert!(matches!(
