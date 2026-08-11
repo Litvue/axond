@@ -489,11 +489,11 @@ but no backfilled row, so the cap can neither begin from zero nor be quietly
 bypassed. To return to per-subject-only enforcement, stop the fleet and drop the
 two `<table>_namespace_fence` triggers.
 
-The declaration the fence looks for is a session setting, sent once per
-connection, so **point the budget DSN at Postgres directly or at a pooler in
-session mode**. A pooler in *transaction* mode may run the declaration on one
-backend and the writes on another, in which case boot succeeds and then every
-reserve and settlement is rejected by the fence. `create_table = true` also
+The declaration the fence looks for is sent once per connection *and* again, as
+`SET LOCAL`, inside every transaction that reserves or settles. So a pooler in
+transaction mode cannot route a write to a backend where the declaration never
+ran — which would otherwise have booted cleanly and then had every reserve and
+settlement rejected by the fence. `create_table = true` also
 re-applies the DDL on boot, but skips the v2 file once the schema is installed and
 backfilled, so a restart does not re-take the `EXCLUSIVE` lock or re-run the
 aggregate against a live fleet.

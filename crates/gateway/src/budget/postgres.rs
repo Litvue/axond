@@ -55,6 +55,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// have not said this, which is what stops a replica configured without the cap
 /// from charging a subject while leaving the namespace total behind.
 const NAMESPACE_CAP_DECLARATION: &str = "SET axond.budget_namespace_cap = 'on'";
+/// The same declaration, scoped to one transaction. Sent inside every transaction
+/// that writes, so the fence holds even when the session it was declared on is
+/// not the backend the transaction runs on — a pooler in transaction mode can
+/// route the two apart.
+const NAMESPACE_CAP_DECLARATION_LOCAL: &str = "SET LOCAL axond.budget_namespace_cap = 'on'";
 
 #[derive(Debug, Clone)]
 pub struct PostgresBudgetSettings {
@@ -258,9 +263,9 @@ impl PostgresBudget {
         });
         if self.settings.enforces_namespace_cap() {
             // Every connection, not just the first: the fence is per session, and
-            // a reconnect after a failure gets a fresh one. Being per session, it
-            // also assumes the DSN reaches a backend directly (or through a pooler
-            // in session mode); see `docs/deployment.md`.
+            // a reconnect after a failure gets a fresh one. Each writing
+            // transaction re-declares it locally as well, for a pooler that may
+            // not give this session's backend to that transaction.
             client.batch_execute(NAMESPACE_CAP_DECLARATION).await?;
         }
         Ok(client)
@@ -370,6 +375,11 @@ impl PostgresBudget {
         let reservations = self.reservation_table();
         let amount = bigint(reservation.estimate_microdollars);
         let transaction = client.transaction().await?;
+        if self.settings.enforces_namespace_cap() {
+            transaction
+                .batch_execute(NAMESPACE_CAP_DECLARATION_LOCAL)
+                .await?;
+        }
 
         // The namespace row is taken first, and by both operations, so the two
         // scopes always lock in one order and cannot deadlock against each other.
@@ -523,6 +533,11 @@ impl PostgresBudget {
         let reservations = self.reservation_table();
         let charge = bigint(actual_microdollars);
         let transaction = client.transaction().await?;
+        if self.settings.enforces_namespace_cap() {
+            transaction
+                .batch_execute(NAMESPACE_CAP_DECLARATION_LOCAL)
+                .await?;
+        }
         // Namespace row first, then the subject row, then the reservation row:
         // the same order `try_hold` takes them, so a settlement and a reserve on
         // one namespace cannot deadlock against each other. Both scopes are
@@ -1037,6 +1052,72 @@ mod tests {
             capped.reserve(&key, 401).await,
             Admission::Denied(Denial::Exceeded),
             "the namespace has 600 of its 1000 spent, and nothing slipped past"
+        );
+    }
+
+    /// The fence's declaration is a session setting, and a pooler in transaction
+    /// mode can run it on one backend and the writes on another. Both writing
+    /// transactions therefore re-declare it locally, which has to be enough on a
+    /// session that never declared anything — and has to stay scoped to that
+    /// transaction, or it would be indistinguishable from the session-wide one.
+    #[tokio::test]
+    async fn a_transaction_carries_the_fence_declaration_itself() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let table = "axond_budget_ns_local_declaration_test";
+        let store = namespace_store(&dsn, table, namespace_settings(1_000, 1_000)).await;
+
+        // A session as a transaction pooler would hand it over: nothing declared.
+        let (mut undeclared, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(connection);
+        let insert = format!(
+            "INSERT INTO {table} (namespace, subject, spent_microdollars)
+             VALUES ('acme', 'pooled', 10)"
+        );
+
+        let declared = undeclared.transaction().await.expect("begin");
+        declared
+            .batch_execute(NAMESPACE_CAP_DECLARATION_LOCAL)
+            .await
+            .expect("declare for this transaction");
+        declared.execute(&insert, &[]).await.expect(
+            "the fence must accept a transaction that declares the cap itself, \
+             whatever the session did",
+        );
+        declared.commit().await.expect("commit");
+
+        // And the declaration did not outlive it, so the fence is still fencing.
+        let silent = undeclared.transaction().await.expect("begin");
+        let rejected = silent
+            .execute(&insert, &[])
+            .await
+            .expect_err("a transaction that declares nothing is still refused");
+        let raised = rejected
+            .as_db_error()
+            .map(|error| error.message().to_owned())
+            .unwrap_or_default();
+        assert!(
+            raised.contains("namespace spend cap"),
+            "the fence must be what refused it: {rejected} ({raised})"
+        );
+        drop(silent);
+
+        // The store itself keeps working, declaration and all.
+        let key = BudgetKey {
+            namespace: "acme".into(),
+            subject: "honest".into(),
+        };
+        let Admission::Allowed(held) = store.reserve(&key, 100).await else {
+            panic!("a reserve declares the cap inside its own transaction");
+        };
+        store.settle(&key, &held, 100).await;
+        assert_eq!(
+            store.reserve(&key, 901).await,
+            Admission::Denied(Denial::Exceeded),
+            "the settlement landed against the subject and the namespace alike"
         );
     }
 
