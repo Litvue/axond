@@ -543,8 +543,7 @@ mod tests {
             "the constrained second chunk must fail"
         );
 
-        let guard = sink.client.lock().await;
-        let client = guard.as_ref().expect("reconnected");
+        let client = sink.connect_client().await.expect("reconnect");
         let rows = client
             .query_one(&format!("SELECT count(*) FROM {table}"), &[])
             .await
