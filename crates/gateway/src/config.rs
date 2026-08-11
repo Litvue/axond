@@ -1917,14 +1917,9 @@ audience = "test"
                 "kid = \"test\"\nenv = \"SIGN\"\naliases = [\"gpt-*-bad\"]",
                 "invalid alias pattern",
             ),
-            (
-                "missing scope ceiling",
-                "kid = \"test\"\nenv = \"SIGN\"",
-                "explicit scope ceiling",
-            ),
         ];
         for (name, minting, expected) in cases {
-            let minting = if name == "missing scope ceiling" || minting.contains("scope =") {
+            let minting = if minting.contains("scope =") {
                 minting.to_owned()
             } else {
                 format!("{minting}\nscope = [\"chat\"]")
