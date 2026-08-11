@@ -36,12 +36,14 @@ reload silently create a new privileged endpoint.
 
 Every request is narrowed against ceilings owned by `[gateway_minting]`:
 `ttl_seconds`, `scope`, `aliases`, and `max_request_microdollars` cannot
-exceed the configured authority. An omitted field inherits its configured
-ceiling; when `scope` has no configured ceiling, an omitted scope uses the
-ordinary capability posture and operator-only capabilities must be explicitly
-granted. Every effective capability, including inherited capabilities, must
-also be held by the minting key itself. Omission must never widen a token into
-an unrestricted one. The
+exceed the configured authority. An omitted scope or microdollar limit inherits
+its configured ceiling; when `scope` has no configured ceiling, an omitted
+scope uses the ordinary capability posture. An omitted alias ceiling permits
+`*`, while dispatch still narrows aliases to those the namespace can already
+reach. Operator-only capabilities are rejected in a configured minting
+ceiling because they can never be minted by this endpoint. Every effective
+capability, including inherited capabilities, must also be held by the minting
+key itself. Omission must never widen a token into an unrestricted one. The
 namespace is derived from the authorized static caller and cannot be supplied
 by the request.
 
