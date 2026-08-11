@@ -35,7 +35,7 @@ compat:
 
 # Refresh the hash-pinned provider-SDK lockfile, excluding releases newer than a week.
 compat-lock:
-    uv pip compile --generate-hashes --universal --python-version 3.12 --exclude-newer "$(date -u -d '7 days ago' '+%Y-%m-%dT%H:%M:%SZ')" -o tests/compat/requirements.txt tests/compat/requirements.in
+    uv pip compile --generate-hashes --universal --python-version 3.10 --exclude-newer "$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"))')" -o tests/compat/requirements.txt tests/compat/requirements.in
 
 # The heavy SSE soak: hundreds of concurrent streams with cancels and drops.
 # The short subset runs in `just test`; this is the long one.

@@ -38,8 +38,9 @@ The SDK compatibility lane uses the hash-pinned lockfile at
 [`tests/compat/requirements.txt`](./tests/compat/requirements.txt). Refresh it
 with `just compat-lock`; the recipe resolves from
 [`requirements.in`](./tests/compat/requirements.in) while excluding releases
-published less than seven days ago. Review the generated diff, then run
-`just compat`.
+published less than seven days ago. The refresh requires
+[`uv`](https://docs.astral.sh/uv/getting-started/installation/) on `PATH`.
+Review the generated diff, then run `just compat`.
 
 ## Conventions
 

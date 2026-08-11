@@ -125,6 +125,15 @@ jobs:
           python-version: '3.12'
       - name: Build the gateway the SDKs will talk to
         run: cargo build -p axond --locked
+      - name: Check compatibility lock inputs
+        run: |
+          # Keep every direct input pin present in the generated lockfile.
+          while IFS= read -r pin; do
+            grep -Fq -- "$pin" tests/compat/requirements.txt || {
+              echo "missing direct pin in lockfile: $pin" >&2
+              exit 1
+            }
+          done < <(grep -E '^[A-Za-z0-9_.-]+==' tests/compat/requirements.in)
       # Hermetic: the SDKs are pointed at a local fake upstream serving the
       # committed fixtures, so this lane makes no provider call and needs no key.
       - name: Install the pinned provider SDKs
