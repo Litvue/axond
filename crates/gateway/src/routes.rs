@@ -207,36 +207,21 @@ async fn mint_tokens(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let requested = parsed.iter().copied().collect::<HashSet<_>>();
             if let Some(ceiling) = &minting.scope
-                && !parsed
-                    .iter()
-                    .copied()
-                    .collect::<HashSet<_>>()
-                    .is_subset(ceiling)
+                && !requested.is_subset(ceiling)
             {
                 return Err(GatewayError::MintClaimsNotNarrowing);
             }
-            if minting.scope.is_none()
-                && parsed
-                    .iter()
-                    .any(|capability| capability.is_operator_only())
+            if requested
+                .iter()
+                .any(|capability| !caller_holds_capability(&caller, *capability))
             {
                 return Err(GatewayError::MintClaimsNotNarrowing);
             }
             Some(parsed)
         }
-        None => Some(
-            minting
-                .scope
-                .as_ref()
-                .map(|values| values.iter().copied().collect())
-                .unwrap_or_else(|| {
-                    Capability::ALL
-                        .into_iter()
-                        .filter(|capability| !capability.is_operator_only())
-                        .collect()
-                }),
-        ),
+        None => Some(minting.scope.as_ref().unwrap().iter().copied().collect()),
     };
     let aliases = match request.aliases {
         Some(values) => {
@@ -307,6 +292,15 @@ async fn mint_tokens(
         "sub": subject,
         })),
     ))
+}
+
+fn caller_holds_capability(caller: &InboundKey, capability: Capability) -> bool {
+    caller
+        .scope
+        .as_ref()
+        .map_or(!capability.is_operator_only(), |scope| {
+            scope.contains(&capability)
+        })
 }
 
 async fn healthz() -> &'static str {
@@ -1765,10 +1759,6 @@ targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdol
         minting_state_with_scope_audience_epochs("scope = [\"chat\", \"models\"]", audience, epochs)
     }
 
-    fn minting_state_without_scope() -> AppState {
-        minting_state_with_scope_audience_epochs("", "test-audience", "")
-    }
-
     fn minting_state_with_scope_audience_epochs(
         scope: &str,
         audience: &str,
@@ -1857,9 +1847,14 @@ max_request_microdollars = 1000
     }
 
     #[tokio::test]
-    async fn omitted_scope_ceiling_rejects_operator_capability() {
+    async fn minting_key_cannot_escalate_operator_capability() {
+        let state = minting_state_with_scope_audience_epochs(
+            "scope = [\"credentials\", \"credentials:all\"]",
+            "test-audience",
+            "",
+        );
         let (status, body) = mint_request(
-            minting_state_without_scope(),
+            state,
             json!({
                 "sub": "agent",
                 "scope": ["credentials:all"],
@@ -1868,37 +1863,6 @@ max_request_microdollars = 1000
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"]["type"], "mint_claims_not_narrowing");
-
-        let response = router(minting_state_without_scope())
-            .oneshot(
-                Request::get("/v1/credentials?namespaces=all")
-                    .header(axum::http::header::AUTHORIZATION, "Bearer mint-key")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn explicit_operator_scope_ceiling_allows_credentials_view() {
-        let state = minting_state_with_scope_audience_epochs(
-            "scope = [\"credentials\", \"credentials:all\"]",
-            "test-audience",
-            "",
-        );
-        let (status, body) = mint_request(
-            state.clone(),
-            json!({"sub": "agent", "scope": ["credentials", "credentials:all"]}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let token = body["token"].as_str().unwrap();
-        let response = scoped_route_request(state, "/v1/credentials?namespaces=all", token).await;
-        let status = response.status();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(status, StatusCode::OK, "response body: {body:?}");
     }
 
     #[tokio::test]

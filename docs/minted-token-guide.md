@@ -40,27 +40,38 @@ mint another token.
 fanout: issuance is unthrottled and unrecorded in the gateway by design. The
 available controls are a short `max_ttl`, removing the signing `kid` to revoke
 all tokens for that verifier, and `[[gateway_token_epoch]]` `min_iat` to revoke
-tokens issued before a configured time. The token itself is the issuance
-receipt; this Tier 0 path does not maintain an issuance registry.
+tokens issued before a configured time. Epochs are the revocation mechanism for
+minted tokens, so every deployment that enables gateway minting must configure
+the applicable namespace epochs. The token itself is the issuance receipt; this
+Tier 0 path does not maintain an issuance registry.
 
 Because `sub` is caller-chosen, a trusted minting key can rotate subjects and
 give each new `(namespace, subject)` a fresh budget ledger and per-subject
-`max_in_flight_per_subject` allowance. Per-subject budgets are therefore not a
-ceiling on a minting namespace, and `max_request_microdollars` limits one
-request rather than cumulative spend. Keep minting namespaces separate from
-namespaces where those controls are the spend boundary, treat `can_mint` as
-trusted for the whole namespace, and keep `max_ttl` short.
+`max_in_flight_per_subject` allowance. `BudgetConfig::limit_microdollars` is
+the cap per `(namespace, subject)`; there is no namespace-wide cap, so a
+`can_mint` key has unbounded namespace spend authority by construction while
+minting is enabled. `max_request_microdollars` limits one request rather than
+cumulative spend. Treat `can_mint` as operator-level trust, never hand it to a
+downstream service, and keep minting namespaces separate from namespaces where
+per-subject controls are the spend boundary. This is the blocker for
+recommending minting; file the follow-up issue for a namespace-level budget
+cap. Request throttling would only slow subject accumulation because minted
+tokens outlive the request that created them and would not bound total spend.
+Keep `max_ttl` short.
 
 ```bash
 curl -s https://gateway.example/v1/tokens -H "Authorization: Bearer $GW_INBOUND_PLATFORM_KEY" -H 'content-type: application/json' -d '{"sub":"agent-7","ttl_seconds":300,"scope":["chat"],"aliases":["gpt-4o"],"max_request_microdollars":500}'
 # {"token":"axt1.…","exp":...,"expires_in":300,"namespace":"platform","sub":"agent-7"}
 ```
 
-Enabling this puts a **signing** key in the gateway. A compromised minting
-replica becomes a forgery capability and loses Ed25519's
-verification-only-replica benefit. Keep offline `axond mint` as the default; if
-HTTP minting is necessary, use a separately deployed replica set and keep
-`max_ttl` short.
+Enabling this puts the **private signing** key in the published config
+snapshot on every replica that has minting enabled. A compromised minting
+replica becomes a forgery capability for every namespace its verifier permits,
+and loses Ed25519's verification-only-replica benefit. The verifier retains
+only public key material; that is not the concern here. Keep offline
+`axond mint` as the default; if HTTP minting is necessary, run it on dedicated
+replicas that do not serve dispatch traffic, and reference the private signing
+key only in that deployment's config. Keep `max_ttl` short.
 
 ## 1. Keep a static breakglass key
 

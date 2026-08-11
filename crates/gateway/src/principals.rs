@@ -27,15 +27,6 @@ pub enum Capability {
 }
 
 impl Capability {
-    pub(crate) const ALL: [Self; 6] = [
-        Self::Chat,
-        Self::Messages,
-        Self::Embeddings,
-        Self::Models,
-        Self::Credentials,
-        Self::CredentialsAll,
-    ];
-
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "chat" => Some(Self::Chat),

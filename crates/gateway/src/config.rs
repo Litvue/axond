@@ -1354,6 +1354,11 @@ impl Config {
                 ConfigError::Invalid(format!("gateway_minting aliases: {error}"))
             })?;
         }
+        if minting.scope.is_none() {
+            return Err(ConfigError::Invalid(
+                "gateway_minting must declare an explicit scope ceiling".into(),
+            ));
+        }
         let minting_keys = self
             .gateway_key
             .iter()
@@ -1917,8 +1922,18 @@ audience = "test"
                 "kid = \"test\"\nenv = \"SIGN\"\naliases = [\"gpt-*-bad\"]",
                 "invalid alias pattern",
             ),
+            (
+                "missing scope ceiling",
+                "kid = \"test\"\nenv = \"SIGN\"",
+                "explicit scope ceiling",
+            ),
         ];
         for (name, minting, expected) in cases {
+            let minting = if name == "missing scope ceiling" || minting.contains("scope =") {
+                minting.to_owned()
+            } else {
+                format!("{minting}\nscope = [\"chat\"]")
+            };
             let extra_namespace = if name == "unauthorized namespace" {
                 "\n[[namespace]]\nid = \"other\"\n"
             } else {
