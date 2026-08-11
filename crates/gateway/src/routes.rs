@@ -1771,6 +1771,10 @@ targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdol
         minting_state_with_scope_audience_epochs("scope = [\"chat\", \"models\"]", audience, epochs)
     }
 
+    fn minting_state_without_scope() -> AppState {
+        minting_state_with_scope_audience_epochs("", "test-audience", "")
+    }
+
     fn minting_state_with_scope_audience_epochs(
         scope: &str,
         audience: &str,
@@ -1867,6 +1871,9 @@ max_request_microdollars = 1000
         let response =
             scoped_route_request(state, "/v1/credentials?namespaces=all", token).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn minting_key_cannot_escalate_operator_capability() {
         let state = minting_state_with_scope_audience_epochs(
             "scope = [\"credentials\", \"credentials:all\"]",
@@ -1883,7 +1890,6 @@ max_request_microdollars = 1000
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"]["type"], "mint_claims_not_narrowing");
-    }
     }
 
     #[tokio::test]
