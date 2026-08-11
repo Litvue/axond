@@ -765,8 +765,12 @@ fn map_stop_reason(stop_reason: Option<&str>, saw_tool_call: bool) -> &'static s
 }
 
 fn openai_usage(usage: ModelUsage) -> Value {
+    // OpenAI has no cache-write field, so the read/write distinction is lost
+    // when translating the disjoint provider counters into its wire format.
     json!({
-        "prompt_tokens": usage.input_tokens,
+        "prompt_tokens": usage.input_tokens
+            .saturating_add(usage.cache_read_tokens)
+            .saturating_add(usage.cache_write_tokens),
         "completion_tokens": usage.output_tokens,
         "total_tokens": usage.total_tokens(),
         "completion_tokens_details": {
@@ -826,6 +830,45 @@ fn anthropic_usage(value: &Value) -> ModelUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::chat_usage;
+
+    #[test]
+    fn cached_usage_round_trips_through_both_provider_conventions() {
+        for wire in [
+            json!({
+                "prompt_tokens": 22,
+                "completion_tokens": 9,
+                "prompt_tokens_details": { "cached_tokens": 3 }
+            }),
+            json!({
+                "input_tokens": 19,
+                "output_tokens": 9,
+                "cache_read_input_tokens": 3
+            }),
+        ] {
+            let usage = chat_usage(&wire);
+            assert_eq!(chat_usage(&openai_usage(usage)), usage);
+        }
+    }
+
+    #[test]
+    fn cache_writes_fold_into_openai_prompt_total() {
+        let usage = ModelUsage {
+            input_tokens: 19,
+            output_tokens: 9,
+            cache_read_tokens: 3,
+            cache_write_tokens: 4,
+            ..ModelUsage::default()
+        };
+        let wire = openai_usage(usage);
+        assert_eq!(wire["prompt_tokens"], 26);
+        assert_eq!(wire["completion_tokens"], 9);
+        assert_eq!(wire["total_tokens"], 35);
+        assert_eq!(
+            wire["total_tokens"],
+            wire["prompt_tokens"].as_u64().unwrap() + wire["completion_tokens"].as_u64().unwrap()
+        );
+    }
 
     #[test]
     fn translates_openai_messages_tools_and_usage() {
@@ -1030,7 +1073,7 @@ mod tests {
             _ => None,
         });
         let terminal = terminal.expect("terminal chunk");
-        assert_eq!(terminal["usage"]["prompt_tokens"], 12);
+        assert_eq!(terminal["usage"]["prompt_tokens"], 17);
         assert_eq!(terminal["usage"]["completion_tokens"], 5);
         assert_eq!(terminal["usage"]["total_tokens"], 22);
         assert_eq!(

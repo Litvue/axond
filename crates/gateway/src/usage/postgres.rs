@@ -2,7 +2,7 @@
 //!
 //! The schema is the expensive part of this sink — it lands in an adopter's own
 //! database and is read by their billing queries — so it is treated as an API:
-//! it lives in [`ops/postgres/usage_v1.sql`](../../../../ops/postgres/usage_v1.sql),
+//! it lives in [`ops/postgres/usage_v2.sql`](../../../../ops/postgres/usage_v2.sql),
 //! every row carries `schema_version`, and a change to the row shape is a new
 //! versioned file rather than an edit (ADR 0009).
 //!
@@ -25,7 +25,7 @@ use super::{ObservedRecord, SinkFailure, UsageRecord, UsageSink, UsageSinkError}
 /// The DDL for the current schema version, shared with operators who apply it
 /// themselves. The table and the serialized record are one schema with one
 /// version — [`UsageRecord::SCHEMA_VERSION`] — not two that can drift.
-const SCHEMA_DDL: &str = include_str!("../../../../ops/postgres/usage_v1.sql");
+const SCHEMA_DDL: &str = include_str!("../../../../ops/postgres/usage_v2.sql");
 
 /// Additive migrations for the current schema version. These are applied after
 /// the base DDL for fresh tables; existing installations apply them before
@@ -40,10 +40,9 @@ const DEFAULT_TABLE: &str = "axond_usage";
 /// the two do not rewrite each other. Not valid SQL, and never left in the DDL.
 const INDEX_PREFIX_PLACEHOLDER: &str = "\u{1}index_prefix\u{1}";
 
-/// Columns written per row, in parameter order. `reasoning_tokens`,
-/// `cache_read_tokens`, and `cache_write_tokens` exist in the table but are not
-/// written: the canonical record does not carry them yet.
-const COLUMNS: [&str; 20] = [
+/// Columns written per row, in parameter order. `reasoning_tokens` remains
+/// reserved for a future schema version; the cache counters are canonical.
+const COLUMNS: [&str; 22] = [
     "schema_version",
     "request_id",
     "trace_id",
@@ -57,6 +56,8 @@ const COLUMNS: [&str; 20] = [
     "credential_id",
     "status",
     "input_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
     "output_tokens",
     "cost_microdollars",
     "catalog_version",
@@ -70,7 +71,8 @@ const COLUMNS: [&str; 20] = [
 /// bind at most 65535 values.
 const MAX_BIND_PARAMETERS: usize = u16::MAX as usize;
 
-/// Rows one INSERT can carry. Batches larger than this are split.
+/// Rows one INSERT can carry. Configured batches larger than this are split
+/// into sequential statements by `record_batch`.
 pub const MAX_ROWS_PER_STATEMENT: usize = MAX_BIND_PARAMETERS / COLUMNS.len();
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -151,21 +153,13 @@ impl PostgresSink {
         Ok(client)
     }
 
-    /// Insert one statement's worth of rows, reconnecting once if the
-    /// connection was stale.
-    async fn insert_chunk(&self, chunk: &[ObservedRecord]) -> Result<(), SinkFailure> {
-        let sql = insert_sql(&self.table, chunk.len());
-        let values: Vec<Vec<Box<dyn ToSql + Sync + Send>>> = chunk.iter().map(row).collect();
-        let params: Vec<&(dyn ToSql + Sync)> = values
-            .iter()
-            .flatten()
-            .map(|value| value.as_ref() as &(dyn ToSql + Sync))
-            .collect();
-
+    /// Insert all chunks in one transaction, reconnecting once if the
+    /// connection was stale or the transaction failed.
+    async fn insert_batch(&self, batch: &[ObservedRecord]) -> Result<(), SinkFailure> {
         let mut guard = self.client.lock().await;
         let mut last_error: Option<tokio_postgres::Error> = None;
         for _ in 0..2 {
-            let client = match guard.take() {
+            let mut client = match guard.take() {
                 Some(client) if !client.is_closed() => client,
                 _ => match self.connect_client().await {
                     Ok(client) => client,
@@ -175,14 +169,35 @@ impl PostgresSink {
                     }
                 },
             };
-            match client.execute(sql.as_str(), &params).await {
-                Ok(_) => {
+            let transaction = match client.transaction().await {
+                Ok(transaction) => transaction,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+            let result = async {
+                for chunk in batch.chunks(MAX_ROWS_PER_STATEMENT) {
+                    let sql = insert_sql(&self.table, chunk.len());
+                    let values: Vec<Vec<Box<dyn ToSql + Sync + Send>>> =
+                        chunk.iter().map(row).collect();
+                    let params: Vec<&(dyn ToSql + Sync)> = values
+                        .iter()
+                        .flatten()
+                        .map(|value| value.as_ref() as &(dyn ToSql + Sync))
+                        .collect();
+                    transaction.execute(sql.as_str(), &params).await?;
+                }
+                transaction.commit().await
+            }
+            .await;
+            match result {
+                Ok(()) => {
                     *guard = Some(client);
                     return Ok(());
                 }
-                // The connection is discarded either way: a statement that
-                // failed on a live connection is a schema or data problem, and
-                // retrying it on the same connection cannot help.
+                // The transaction is rolled back and the connection is
+                // discarded either way: a failed write is not safely reusable.
                 Err(e) => last_error = Some(e),
             }
         }
@@ -207,10 +222,7 @@ impl UsageSink for PostgresSink {
     }
 
     async fn record_batch(&self, batch: &[ObservedRecord]) -> Result<(), SinkFailure> {
-        for chunk in batch.chunks(MAX_ROWS_PER_STATEMENT) {
-            self.insert_chunk(chunk).await?;
-        }
-        Ok(())
+        self.insert_batch(batch).await
     }
 }
 
@@ -276,6 +288,8 @@ fn row(observed: &ObservedRecord) -> Vec<Box<dyn ToSql + Sync + Send>> {
         Box::new(record.credential_id.clone()),
         Box::new(record.status.as_str().to_owned()),
         Box::new(bigint(record.input_tokens)),
+        Box::new(bigint(record.cache_read_tokens)),
+        Box::new(bigint(record.cache_write_tokens)),
         Box::new(bigint(record.output_tokens)),
         Box::new(bigint(record.cost_microdollars)),
         Box::new(bigint(record.catalog_version)),
@@ -332,8 +346,8 @@ mod tests {
                 "column `{column}` is written but not declared in the base or additive DDL"
             );
         }
-        assert_eq!(UsageRecord::SCHEMA_VERSION, 1);
-        assert!(SCHEMA_DDL.contains("version 1"));
+        assert_eq!(UsageRecord::SCHEMA_VERSION, 2);
+        assert!(SCHEMA_DDL.contains("version 2"));
     }
 
     #[test]
@@ -476,5 +490,64 @@ mod tests {
         assert_eq!(rows[0].get::<_, &str>(1), "acme");
         assert_eq!(rows[0].get::<_, i64>(2), 640);
         assert_eq!(rows[0].get::<_, i64>(3), 812);
+    }
+
+    #[tokio::test]
+    async fn a_later_chunk_failure_rolls_back_the_whole_batch() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let table = "axond_usage_atomicity_test";
+        let sink = PostgresSink::connect(
+            &dsn,
+            PostgresSinkSettings {
+                table: table.to_owned(),
+                create_table: true,
+            },
+        )
+        .await
+        .expect("connect");
+        {
+            let guard = sink.client.lock().await;
+            let client = guard.as_ref().expect("connected");
+            client
+                .execute(&format!("TRUNCATE {table}"), &[])
+                .await
+                .expect("truncate");
+            client
+                .execute(
+                    &format!(
+                        "ALTER TABLE {table} DROP CONSTRAINT IF EXISTS atomicity_test_request_id"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("drop prior failure constraint");
+            client
+                .execute(
+                    &format!(
+                        "ALTER TABLE {table} ADD CONSTRAINT atomicity_test_request_id \
+                         CHECK (request_id <> 'fail-later')"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("add failure constraint");
+        }
+
+        let mut batch: Vec<ObservedRecord> =
+            (0..=MAX_ROWS_PER_STATEMENT).map(|_| observed()).collect();
+        batch.last_mut().expect("second chunk").record.request_id = "fail-later".into();
+        assert!(
+            sink.record_batch(&batch).await.is_err(),
+            "the constrained second chunk must fail"
+        );
+
+        let client = sink.connect_client().await.expect("reconnect");
+        let rows = client
+            .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+            .await
+            .expect("count");
+        assert_eq!(rows.get::<_, i64>(0), 0);
     }
 }

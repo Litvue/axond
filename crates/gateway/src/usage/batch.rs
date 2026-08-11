@@ -26,9 +26,8 @@ use super::{DropReason, ObservedRecord, SinkFailure, UsageRecord, UsageSink};
 pub struct BatchSettings {
     /// Records the buffer holds before the fan-out starts dropping.
     pub capacity: usize,
-    /// Rows per write. The Postgres sink binds one parameter set per row, so
-    /// this is bounded by the wire protocol's parameter limit (see
-    /// [`super::postgres`]).
+    /// Rows accumulated before a write. The Postgres sink splits larger
+    /// batches across statements while preserving one flush outcome.
     pub max_batch: usize,
     /// How long a partial batch waits for company before it is written anyway.
     pub flush_interval: Duration,
@@ -108,7 +107,7 @@ async fn flush_loop(
     settings: BatchSettings,
     dropped: Arc<AtomicU64>,
 ) {
-    let mut batch: Vec<ObservedRecord> = Vec::with_capacity(settings.max_batch);
+    let mut batch: Vec<ObservedRecord> = Vec::with_capacity(settings.max_batch.min(1024));
     loop {
         let Some(first) = rx.recv().await else {
             return;

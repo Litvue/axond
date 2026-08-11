@@ -313,7 +313,7 @@ versioned interface — see [`docs/usage-schema.md`](./usage-schema.md).
 `kind = "stdout"` is Tier 0. `kind = "otlp"` is Tier 0 state (no datastore,
 nothing to migrate), but not hermetic: it adds a collector dependency at boot
 and is excluded from the hermetic Tier 0 CI lane. `kind = "postgres"` is Tier 2
-and requires the Postgres role, `ops/postgres/usage_v1.sql`, ordered additive
+and requires the Postgres role, `ops/postgres/usage_v2.sql`, ordered additive
 migrations, and backup/restore ownership.
 
 | Key | Type | Default | Applies to | Meaning |
@@ -323,8 +323,17 @@ migrations, and backup/restore ownership.
 | `table` | string | `axond_usage` | `postgres` | Destination table; `schema.table` allowed. Validated as an identifier, so it cannot carry SQL. |
 | `create_table` | bool | `false` | `postgres` | Apply the shipped DDL at boot. Off because most deployments give the gateway's role no DDL rights. |
 | `buffer_capacity` | integer | `10000` | `postgres` | Records buffered before the fan-out drops. Must be ≥ 1. |
-| `max_batch` | integer | `500` | `postgres` | Rows per statement. Must be between 1 and the statement parameter budget. |
+| `max_batch` | integer | `500` | `postgres` | Records accumulated before a flush. Must be ≥ 1 and no greater than `buffer_capacity`; the sink splits large batches across statements as needed. |
 | `flush_interval_ms` | integer | `1000` | `postgres` | How long a partial batch waits. Must be ≥ 1. |
+
+`max_batch` was previously capped by the INSERT parameter budget, which moved
+whenever a column was added; it is now bounded by `buffer_capacity` instead, so
+the cap no longer shifts under a schema change. A config setting `max_batch`
+above its sink's `buffer_capacity` booted before this release and is now a boot
+error: lower `max_batch`, or raise `buffer_capacity` to match.
+When `max_batch` is omitted, the default of `500` is clamped to
+`buffer_capacity` instead, so a smaller operator-configured buffer remains a
+valid upgrade path and runs with the smaller effective batch size.
 
 `kind = "otlp"` emits usage as OTel log records on the exporter telemetry
 already installed, so it needs `OTEL_EXPORTER_OTLP_ENDPOINT`; the SDK's batch

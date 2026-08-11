@@ -59,7 +59,10 @@ metric and a usage row can never disagree.
 | `axond.request.count` | counter | `axond.namespace`, `gen_ai.request.model`, `axond.target.provider`, `axond.target.model`, `axond.credential_source`, `axond.status` | Per-tenant / per-model volume and outcome mix. |
 | `axond.request.duration` | histogram (ms) | same | End-to-end gateway latency. |
 | `axond.request.time_to_first_token` | histogram (ms) | same | TTFT — the number streaming users feel. |
-| `axond.tokens.input` / `axond.tokens.output` | counters | same | Token volume. |
+| `axond.tokens.input` | counter | same | Non-cached prompt remainder. |
+| `axond.tokens.cache_read` | counter | same | Prompt tokens served from cache. |
+| `axond.tokens.cache_write` | counter | same | Prompt tokens written to cache. |
+| `axond.tokens.output` | counter | same | Completion token volume. |
 | `axond.cost.microdollars` | counter (µUSD) | same | Spend, priced from the target catalogue. |
 | `axond.upstream.errors` | counter | same | Upstream failure rate by target. |
 | `axond.upstream.circuit_state` | gauge | `axond.target.provider`, `axond.target.model` | `0` closed, `1` half-open, `2` open. |

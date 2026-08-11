@@ -683,7 +683,10 @@ impl Accounting {
     fn chargeable_usage(&self) -> ModelUsage {
         const CHARS_PER_TOKEN: usize = 4;
         if self.carried_output_tokens == 0
-            && (self.usage.input_tokens > 0 || self.usage.output_tokens > 0)
+            && (self.usage.input_tokens > 0
+                || self.usage.output_tokens > 0
+                || self.usage.cache_read_tokens > 0
+                || self.usage.cache_write_tokens > 0)
         {
             return self.usage;
         }
@@ -739,6 +742,8 @@ impl Accounting {
             trace_id: self.ctx.trace_id.clone(),
             status,
             input_tokens: usage.input_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
             output_tokens: usage.output_tokens,
             cost_microdollars: cost,
             catalog_version: 0,
@@ -1051,7 +1056,7 @@ env = "GW_TEST_OPENAI_KEY"
 
 [[model]]
 name = "gpt-4o"
-targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000 }} }}]
+targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000, cache_read_microdollars_per_million = 1000000 }} }}]
 "#
         ))
         .expect("config")
@@ -1133,6 +1138,11 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         "data: [DONE]\n\n",
     );
 
+    const CACHE_ONLY_STREAM: &str = concat!(
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":5}}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
     #[tokio::test]
     async fn relays_events_and_settles_one_usage_record() {
         let ledger = Arc::new(Ledger::default());
@@ -1167,6 +1177,29 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         // 11 input @ 1 µ$/token + 3 output @ 2 µ$/token.
         assert_eq!(record["cost_microdollars"], 17);
         assert_eq!(ledger.settlements(), vec![17]);
+    }
+
+    #[tokio::test]
+    async fn cache_only_provider_usage_is_charged_when_output_is_zero() {
+        let ledger = Arc::new(Ledger::default());
+        let base_url = upstream_serving(CACHE_ONLY_STREAM).await;
+        let resp = router(state_for(&base_url, ledger.clone()))
+            .oneshot(stream_request())
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body().into_data_stream();
+        while let Some(chunk) = body.next().await {
+            let _ = chunk.expect("chunk");
+        }
+
+        let record = settled(&ledger).await;
+        assert_eq!(record["input_tokens"], 0);
+        assert_eq!(record["cache_read_tokens"], 5);
+        assert_eq!(record["output_tokens"], 0);
+        assert_eq!(record["cost_microdollars"], 5);
+        assert_eq!(ledger.settlements(), vec![5]);
     }
 
     /// Anthropic's own event stream, including a signed thinking block and the

@@ -313,7 +313,7 @@ mod tests {
                 })
                 .unwrap(),
             vec![ProviderStreamEvent::Done(ModelUsage {
-                input_tokens: 10,
+                input_tokens: 7,
                 output_tokens: 5,
                 reasoning_tokens: 2,
                 cache_read_tokens: 3,
@@ -342,7 +342,7 @@ mod tests {
         assert_eq!(
             responses.finish().unwrap(),
             vec![ProviderStreamEvent::Done(ModelUsage {
-                input_tokens: 20,
+                input_tokens: 16,
                 output_tokens: 8,
                 reasoning_tokens: 6,
                 cache_read_tokens: 4,

@@ -116,6 +116,14 @@ fn attributes(record: &UsageRecord) -> Vec<(&'static str, AnyValue)> {
             AnyValue::Int(clamped(record.input_tokens)),
         ),
         (
+            "gen_ai.usage.cache_read_tokens",
+            AnyValue::Int(clamped(record.cache_read_tokens)),
+        ),
+        (
+            "gen_ai.usage.cache_write_tokens",
+            AnyValue::Int(clamped(record.cache_write_tokens)),
+        ),
+        (
             "gen_ai.usage.output_tokens",
             AnyValue::Int(clamped(record.output_tokens)),
         ),

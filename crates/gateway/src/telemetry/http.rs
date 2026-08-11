@@ -122,6 +122,8 @@ fn server_span<B>(request: &Request<B>, method: &str, route: &str) -> Span {
         axond.status = Empty,
         axond.retry_count = Empty,
         gen_ai.usage.input_tokens = Empty,
+        gen_ai.usage.cache_read_tokens = Empty,
+        gen_ai.usage.cache_write_tokens = Empty,
         gen_ai.usage.output_tokens = Empty,
         axond.cost_microdollars = Empty,
         axond.latency_ms = Empty,
@@ -168,15 +170,20 @@ mod tests {
     /// The handler stands in for `chat_completions`: it opens one attempt span
     /// per upstream call, exactly as the route does.
     async fn dispatch() -> &'static str {
+        let server = Span::current();
         let attempt = upstream_attempt_span(0, "openai", "gpt-4o", "platform");
-        let _entered = attempt.enter();
-        let parked = credential_lease_span("parked", "platform", 0);
-        finish_credential_lease(&parked, LEASE_PARKED);
-        let rate_limited = credential_lease_span("a", "platform", 1);
-        finish_credential_lease(&rate_limited, LEASE_RATE_LIMITED);
-        let served = credential_lease_span("b", "platform", 2);
-        finish_credential_lease(&served, LEASE_SERVED);
-        finish_upstream_attempt(&attempt, ATTEMPT_OK, 12, Some(12));
+        {
+            let _entered = attempt.enter();
+            let parked = credential_lease_span("parked", "platform", 0);
+            finish_credential_lease(&parked, LEASE_PARKED);
+            let rate_limited = credential_lease_span("a", "platform", 1);
+            finish_credential_lease(&rate_limited, LEASE_RATE_LIMITED);
+            let served = credential_lease_span("b", "platform", 2);
+            finish_credential_lease(&served, LEASE_SERVED);
+            finish_upstream_attempt(&attempt, ATTEMPT_OK, 12, Some(12));
+        }
+        server.record("gen_ai.usage.cache_read_tokens", 3_u64);
+        server.record("gen_ai.usage.cache_write_tokens", 4_u64);
         "ok"
     }
 
@@ -256,6 +263,14 @@ mod tests {
         assert_eq!(
             attribute(server, "http.response.status_code").as_deref(),
             Some("200")
+        );
+        assert_eq!(
+            attribute(server, "gen_ai.usage.cache_read_tokens").as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            attribute(server, "gen_ai.usage.cache_write_tokens").as_deref(),
+            Some("4")
         );
         assert_eq!(attribute(attempt, "axond.ttft_ms").as_deref(), Some("12"));
         assert_eq!(
