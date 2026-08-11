@@ -234,7 +234,8 @@ async fn mint_tokens(
                 .map(|values| values.iter().copied().collect())
                 .unwrap_or_else(|| {
                     Capability::ALL
-                        .into_iter()
+                        .iter()
+                        .copied()
                         .filter(|capability| !capability.is_operator_only())
                         .collect()
                 }),
@@ -2171,10 +2172,21 @@ max_request_microdollars = 1000
     }
 
     async fn mint_request(state: AppState, body: Value) -> (StatusCode, Value) {
+        mint_request_with_credential(state, "mint-key", body).await
+    }
+
+    async fn mint_request_with_credential(
+        state: AppState,
+        credential: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
         let response = router(state)
             .oneshot(
                 Request::post("/v1/tokens")
-                    .header(axum::http::header::AUTHORIZATION, "Bearer mint-key")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {credential}"),
+                    )
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
@@ -2236,6 +2248,42 @@ max_request_microdollars = 1000
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn default_scope_minted_token_reaches_responses() {
+        let state = scoped_route_state().await;
+        let mut config = state.config().config.clone();
+        config.gateway_key[0].can_mint = true;
+        config.gateway_minting = Some(crate::config::GatewayMinting {
+            kid: "scope-test-kid".to_owned(),
+            env: Some("JWT_SECRET".to_owned()),
+            file: None,
+            max_ttl: None,
+            scope: None,
+            aliases: None,
+            max_request_microdollars: None,
+        });
+        let env = HashMap::from([
+            ("CHAT_KEY".to_owned(), "chat-key".to_owned()),
+            ("MESSAGES_KEY".to_owned(), "messages-key".to_owned()),
+            ("EMBEDDINGS_KEY".to_owned(), "embeddings-key".to_owned()),
+            ("RESPONSES_KEY".to_owned(), "responses-key".to_owned()),
+            ("STATIC_KEY".to_owned(), "static-key".to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
+        state.publish(ConfigSnapshot::build(config, &env, 0).expect("minting snapshot"));
+
+        let (status, body) =
+            mint_request_with_credential(state.clone(), "static-key", json!({"sub": "agent"}))
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = body["token"].as_str().expect("minted token");
+        let response = scoped_route_request(state, "/v1/responses", token).await;
         assert_eq!(response.status(), StatusCode::OK);
     }
 
