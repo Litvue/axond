@@ -346,6 +346,7 @@ async fn require_migrated_layout(
             ),
         ));
     }
+    require_no_pending_claims(connection, key_prefix).await?;
     let legacy = count_legacy_keys(connection, key_prefix).await?;
     if legacy > 0 {
         return Err(BudgetError::invalid(
@@ -380,7 +381,36 @@ async fn require_unmigrated_layout(
             ),
         ));
     }
-    Ok(())
+    // Also with the marker unset: a first migration that died mid-carry has
+    // already deleted the v1 counter it claimed, so booting the old layout would
+    // serve that subject a budget short of what it has spent.
+    require_no_pending_claims(connection, key_prefix).await
+}
+
+/// Claims a migration took but did not finish applying. The v1 counter they came
+/// from is already deleted, so nothing else accounts for that spend and no other
+/// boot check can see it: `PENDING` matches neither [`legacy_patterns`] nor any v2
+/// key. Serving would under-count both the subject and its namespace by whatever
+/// is parked here, so it is refused and the migration is re-run to finish them.
+async fn require_no_pending_claims(
+    connection: &mut ConnectionManager,
+    key_prefix: &str,
+) -> Result<(), BudgetError> {
+    let pending = scan(connection, &format!("{key_prefix}:{{*}}{PENDING}")).await?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    Err(BudgetError::invalid(
+        BACKEND,
+        format!(
+            "{} interrupted migration claim(s) are outstanding under `{key_prefix}` (for example \
+             `{}`): a `axond budget migrate-redis` run was cut short after taking spend off the v1 \
+             key and before adding it to the v2 counters, so that spend is in neither. Re-run \
+             `axond budget migrate-redis`, which finishes them exactly once.",
+            pending.len(),
+            pending[0]
+        ),
+    ))
 }
 
 async fn count_legacy_keys(
@@ -1456,6 +1486,86 @@ mod tests {
             "400 carried, 250 settled under v2, 150 recovered: the recovery added \
              its delta instead of overwriting the total"
         );
+    }
+
+    /// An interrupted claim holds spend that neither layout accounts for, and the
+    /// layout marker is already set once a first migration has succeeded — so
+    /// neither configuration may boot while one is outstanding, or the cap would
+    /// silently be short by whatever is parked in it.
+    #[tokio::test]
+    async fn an_outstanding_migration_claim_stops_either_configuration_booting() {
+        let Some(url) = crate::test_services::redis_url() else {
+            return;
+        };
+        let prefix = prefix();
+        let k = BudgetKey {
+            namespace: "acme".into(),
+            subject: "first".into(),
+        };
+        let store = namespace_store(&url, &prefix, 1_000, 1_000).await;
+        let Admission::Allowed(held) = store.reserve(&k, 400).await else {
+            panic!("migrated state serves as usual");
+        };
+        store.settle(&k, &held, 400).await;
+        drop(store);
+
+        // A stray v1 write, and a recovery run that died between claiming it and
+        // adding it to the v2 counters: the v1 key is gone, the claim holds 150.
+        let client = ::redis::Client::open(url.as_str()).expect("client");
+        let mut connection = ConnectionManager::new(client).await.expect("connect");
+        let scope = format!("{prefix}:{{acme|first}}");
+        let _: () = connection
+            .set(format!("{scope}:spent"), 150)
+            .await
+            .expect("stray v1 spend");
+        let claim: Option<String> = Script::new(DRAIN_V1)
+            .prepare_invoke()
+            .key(format!("{scope}:spent"))
+            .key(format!("{scope}{PENDING}"))
+            .key(format!("{scope}{SEQ}"))
+            .invoke_async(&mut connection)
+            .await
+            .expect("claim");
+        assert!(claim.is_some(), "the claim took the v1 counter");
+
+        // The cap-aware configuration must refuse, even though the marker is set
+        // and no v1 key is left for the legacy check to find.
+        let refused = RedisBudget::connect(&url, prefix.clone(), namespace_settings(1_000, 1_000))
+            .await
+            .err()
+            .expect("an outstanding claim must fail at boot");
+        assert!(
+            format!("{refused}").contains("migrate-redis"),
+            "the error must point at the migration: {refused}"
+        );
+
+        // And so must the cap-less one with the marker gone — a *first* migration
+        // interrupted the same way leaves the same orphaned spend, which the old
+        // layout would simply not see.
+        let _: i64 = connection
+            .del(layout_key(&prefix))
+            .await
+            .expect("unmark the layout");
+        let refused = RedisBudget::connect(&url, prefix.clone(), settings(1_000))
+            .await
+            .err()
+            .expect("an outstanding claim must fail at boot for the old layout too");
+        assert!(
+            format!("{refused}").contains("migrate-redis"),
+            "the error must point at the migration: {refused}"
+        );
+
+        // Finishing the migration is what clears it, and the claim is added to
+        // the spend already there rather than replacing it.
+        let recovery = migrate_v1_to_v2(&url, &prefix, &namespaces())
+            .await
+            .expect("resume");
+        assert_eq!(recovery.carried_microdollars, 150);
+        assert_eq!(spent(&url, &prefix, &k).await, 550);
+        assert_eq!(namespace_spent(&url, &prefix, "acme").await, 550);
+        RedisBudget::connect(&url, prefix.clone(), namespace_settings(1_000, 1_000))
+            .await
+            .expect("a finished migration boots");
     }
 
     /// A carry is claimed on the v1 side and applied on the v2 side, and either
