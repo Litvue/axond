@@ -31,6 +31,7 @@ AXOND_QUICKSTART_CONFIG=./ops/compose/axond.quickstart.toml \
   "${compose[@]}" up -d --build
 healthy=false
 for attempt in $(seq 1 60); do
+  : > /tmp/axond-compose-healthz
   if curl --fail --silent "${base_url}/healthz" >/tmp/axond-compose-healthz; then
     healthy=true
     break
@@ -44,22 +45,31 @@ if [[ "$healthy" != true ]]; then
 fi
 
 printf 'healthz: '
-curl --fail --silent "${base_url}/healthz"
+: > /tmp/axond-compose-healthz
+curl --fail --silent "${base_url}/healthz" >/tmp/axond-compose-healthz
+cat /tmp/axond-compose-healthz
 echo
 printf 'readyz: '
-curl --fail --silent "${base_url}/readyz"
+: > /tmp/axond-compose-readyz
+curl --fail --silent "${base_url}/readyz" >/tmp/axond-compose-readyz
+cat /tmp/axond-compose-readyz
 echo
 printf 'platform models: '
+: > /tmp/axond-compose-platform-models
 curl --fail --silent \
   -H "Authorization: Bearer ${GW_INBOUND_PLATFORM_KEY}" \
-  "${base_url}/v1/models"
+  "${base_url}/v1/models" >/tmp/axond-compose-platform-models
+cat /tmp/axond-compose-platform-models
 echo
 printf 'acme models: '
+: > /tmp/axond-compose-acme-models
 curl --fail --silent \
   -H "Authorization: Bearer ${GW_INBOUND_ACME_KEY}" \
-  "${base_url}/v1/models"
+  "${base_url}/v1/models" >/tmp/axond-compose-acme-models
+cat /tmp/axond-compose-acme-models
 echo
 printf 'unauthenticated models: '
+: > /tmp/axond-compose-unauth
 unauth_status="$(curl --silent --show-error --output /tmp/axond-compose-unauth \
   --write-out '%{http_code}' "${base_url}/v1/models")"
 [[ "$unauth_status" == 401 ]]
@@ -67,6 +77,7 @@ printf '%s ' "$unauth_status"
 cat /tmp/axond-compose-unauth
 echo
 printf 'placeholder chat/completions: '
+: > /tmp/axond-compose-chat
 if chat_status="$(curl --silent --show-error --output /tmp/axond-compose-chat \
     --connect-timeout 5 --max-time 30 \
     --write-out '%{http_code}' \
