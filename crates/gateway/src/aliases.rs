@@ -3,7 +3,7 @@
 //! only narrow configured authority, never widen it.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum AliasPattern {
+pub(crate) enum AliasPattern {
     Exact(String),
     Prefix(String),
     Suffix(String),
@@ -58,6 +58,40 @@ impl AliasScope {
             AliasPattern::Any => true,
         })
     }
+
+    pub fn subsumes(&self, pattern: &AliasPattern) -> bool {
+        self.patterns
+            .iter()
+            .any(|ceiling| match (ceiling, pattern) {
+                (AliasPattern::Any, _) => true,
+                (AliasPattern::Exact(left), AliasPattern::Exact(right)) => left == right,
+                (AliasPattern::Prefix(left), AliasPattern::Exact(right)) => right.starts_with(left),
+                (AliasPattern::Prefix(left), AliasPattern::Prefix(right)) => {
+                    right.starts_with(left)
+                }
+                (AliasPattern::Suffix(left), AliasPattern::Exact(right)) => right.ends_with(left),
+                (AliasPattern::Suffix(left), AliasPattern::Suffix(right)) => right.ends_with(left),
+                _ => false,
+            })
+    }
+
+    pub fn is_subset_of(&self, ceiling: &Self) -> bool {
+        self.patterns
+            .iter()
+            .all(|pattern| ceiling.subsumes(pattern))
+    }
+
+    pub fn patterns_for_claim(&self) -> Vec<String> {
+        self.patterns
+            .iter()
+            .map(|pattern| match pattern {
+                AliasPattern::Exact(value) => value.clone(),
+                AliasPattern::Prefix(value) => format!("{value}*"),
+                AliasPattern::Suffix(value) => format!("*{value}"),
+                AliasPattern::Any => "*".to_owned(),
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -88,5 +122,17 @@ mod tests {
                 .unwrap()
                 .permits("anything")
         );
+    }
+
+    #[test]
+    fn prefix_does_not_subsume_other_globs() {
+        let ceiling = AliasScope::parse(["gpt-*"]).unwrap();
+        let any = AliasScope::parse(["*"]).unwrap();
+        let other = AliasScope::parse(["claude-*"]).unwrap();
+        let exact = AliasScope::parse(["gpt-4o"]).unwrap();
+        assert!(!ceiling.subsumes(&any.patterns[0]));
+        assert!(!ceiling.subsumes(&other.patterns[0]));
+        assert!(ceiling.subsumes(&exact.patterns[0]));
+        assert!(exact.is_subset_of(&ceiling));
     }
 }

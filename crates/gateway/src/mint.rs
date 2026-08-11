@@ -39,7 +39,7 @@ struct MintClaims {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum MintAlgorithm {
+pub(crate) enum MintAlgorithm {
     EdDsa,
     Hs256,
 }
@@ -186,7 +186,7 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
 
-    mint_token(MintRequest {
+    Ok(mint_token(MintRequest {
         kid,
         algorithm,
         key_material,
@@ -197,23 +197,24 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
         aliases,
         max_request_microdollars,
         scope,
-    })
+    })?
+    .0)
 }
 
-struct MintRequest<'a> {
-    kid: &'a str,
-    algorithm: MintAlgorithm,
-    key_material: &'a str,
-    namespace: &'a str,
-    subject: &'a str,
-    audience: &'a str,
-    ttl: Duration,
-    aliases: Option<Vec<String>>,
-    max_request_microdollars: Option<u64>,
-    scope: Option<Vec<Capability>>,
+pub(crate) struct MintRequest<'a> {
+    pub(crate) kid: &'a str,
+    pub(crate) algorithm: MintAlgorithm,
+    pub(crate) key_material: &'a str,
+    pub(crate) namespace: &'a str,
+    pub(crate) subject: &'a str,
+    pub(crate) audience: &'a str,
+    pub(crate) ttl: Duration,
+    pub(crate) aliases: Option<Vec<String>>,
+    pub(crate) max_request_microdollars: Option<u64>,
+    pub(crate) scope: Option<Vec<Capability>>,
 }
 
-fn mint_token(request: MintRequest<'_>) -> Result<String> {
+pub(crate) fn mint_token(request: MintRequest<'_>) -> Result<(String, u64)> {
     let MintRequest {
         kid,
         algorithm,
@@ -241,7 +242,18 @@ fn mint_token(request: MintRequest<'_>) -> Result<String> {
     };
     let mut header = Header::new(algorithm.jwt());
     header.kid = Some(kid.to_owned());
-    Ok(format!("axt1.{}", encode(&header, &claims, &encoding_key)?))
+    Ok((
+        format!("axt1.{}", encode(&header, &claims, &encoding_key)?),
+        claims.exp,
+    ))
+}
+
+pub(crate) fn validate_signing_material(
+    algorithm: MintAlgorithm,
+    value: &str,
+    kid: &str,
+) -> Result<()> {
+    encoding_key(algorithm, value, kid).map(|_| ())
 }
 
 pub fn keygen(args: &ArgMatches) -> Result<()> {
@@ -586,7 +598,8 @@ max_ttl = "15m"
             max_request_microdollars: None,
             scope: None,
         })
-        .unwrap();
+        .unwrap()
+        .0;
         let principal = verifier
             .resolve(&Presented { credential: &token })
             .await
@@ -618,7 +631,8 @@ max_ttl = "15m"
             max_request_microdollars: None,
             scope: None,
         })
-        .unwrap();
+        .unwrap()
+        .0;
         let principal = verifier
             .resolve(&Presented { credential: &token })
             .await
@@ -694,7 +708,8 @@ max_ttl = "15m"
             max_request_microdollars: None,
             scope: None,
         })
-        .unwrap();
+        .unwrap()
+        .0;
         let principal = verifier
             .resolve(&Presented { credential: &token })
             .await
@@ -738,7 +753,8 @@ max_ttl = "15m"
             max_request_microdollars: None,
             scope: None,
         })
-        .unwrap();
+        .unwrap()
+        .0;
         let principal = verifier
             .resolve(&Presented { credential: &token })
             .await
@@ -1005,7 +1021,8 @@ max_ttl = "15m"
             max_request_microdollars: None,
             scope: None,
         })
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(matches!(
             verifier.resolve(&Presented { credential: &token }).await,
             Err(PrincipalStoreError::Unauthorized(

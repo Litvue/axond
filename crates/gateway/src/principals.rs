@@ -65,6 +65,7 @@ pub struct InboundKey {
     pub alias_scope: Option<AliasScope>,
     pub max_request_microdollars: Option<u64>,
     pub jti: Option<String>,
+    pub can_mint: bool,
 }
 
 pub(crate) struct GatewayKeyEntry {
@@ -569,6 +570,8 @@ impl PrincipalStore for TokenVerifier {
             alias_scope,
             max_request_microdollars: claims.max_request_microdollars,
             jti: claims.jti,
+            // Token claims can never confer the ability to mint another token.
+            can_mint: false,
         }))
     }
 }
@@ -790,6 +793,7 @@ mod tests {
                 alias_scope: None,
                 max_request_microdollars: None,
                 jti: None,
+                can_mint: false,
             },
         }]))
     }
