@@ -209,6 +209,8 @@ pub struct ReloadSummary {
     pub gateway_key_fingerprints: HashMap<String, String>,
     pub gateway_verifier_fingerprints: HashMap<String, String>,
     pub gateway_minting_fingerprint: Option<String>,
+    /// Minting is configured, but no static key is authorized to use it.
+    pub gateway_minting_without_authorized_key: bool,
     /// `[server] bind` differs from what the process bound at startup.
     pub bind_changed: bool,
     /// `[[usage_sink]]` differs from the connected sinks.
@@ -394,6 +396,8 @@ impl ReloadSummary {
             gateway_key_fingerprints: after.gateway_key_fingerprints.clone(),
             gateway_verifier_fingerprints: after.gateway_verifier_fingerprints.clone(),
             gateway_minting_fingerprint: after.gateway_minting_fingerprint.clone(),
+            gateway_minting_without_authorized_key: after_config.gateway_minting.is_some()
+                && !after_config.gateway_key.iter().any(|key| key.can_mint),
             bind_changed: boot.bind != after_config.server.bind,
             usage_sinks_changed: boot.usage_sink != after_config.usage_sink,
             budget_changed: boot.budget != after_config.budget,
@@ -465,6 +469,11 @@ impl ReloadSummary {
         if self.gateway_minting_route_removed() {
             tracing::warn!(
                 "`[gateway_minting]` was removed; issuance is disabled immediately and `/v1/tokens` returns typed 404"
+            );
+        }
+        if self.gateway_minting_without_authorized_key {
+            tracing::warn!(
+                "`[gateway_minting]` is configured, but no gateway key has `can_mint = true`; `/v1/tokens` rejects every caller"
             );
         }
         if self.revocation_changed {
@@ -1041,6 +1050,18 @@ scope = ["chat", "models"]
         let removed = ReloadSummary::between(&boot, &enabled, &disabled);
         assert_eq!(removed.gateway_minting.removed, vec!["enabled".to_owned()]);
         assert!(removed.gateway_minting.changed.is_empty());
+
+        let no_authorized_key = ConfigSnapshot::build(
+            Config::from_toml_str(
+                &WITH_GATEWAY_MINTING.replace("can_mint = true", "can_mint = false"),
+            )
+            .unwrap(),
+            &minting_env(),
+            2,
+        )
+        .unwrap();
+        let warning = ReloadSummary::between(&boot, &no_authorized_key, &no_authorized_key);
+        assert!(warning.gateway_minting_without_authorized_key);
     }
 
     #[test]

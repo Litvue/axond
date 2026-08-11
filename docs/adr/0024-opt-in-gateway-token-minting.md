@@ -77,11 +77,12 @@ same gateway would reject.
 In-gateway minting necessarily places the private signing key in the published
 config snapshot on every replica that enables it. A compromised minting
 replica can therefore forge inbound identity for every namespace its verifier
-permits. `TokenVerifier` retains public verification material, which is not
-part of this concern. Deployments enabling minting should use dedicated
-replicas that do not serve dispatch traffic, keep the private signing key only
-in that deployment's config, keep all other replicas verification-only, and
-keep the minting TTL short.
+permits. EdDSA otherwise permits verification-only replicas to retain only
+public verification material; HS256 never had that property because each
+verifier already holds the forging secret. Deployments enabling EdDSA minting
+should use dedicated replicas that do not serve dispatch traffic, keep the
+private signing key only in that deployment's config, keep all other replicas
+verification-only, and keep the minting TTL short.
 
 ### State tier
 
@@ -100,10 +101,9 @@ and this decision does not raise the state tier of an existing deployment.
 - Boot and reload reject missing, malformed, or mismatched signing material
   before requests can observe it; the last good snapshot continues serving
   after a rejected reload.
-- Claim ceilings are centralized in configuration, but operators must plan
-  revocation edits carefully: removing the last `can_mint` flag alone is
-  rejected while `[gateway_minting]` remains present. Removing both the
-  section and the flags disables issuance on reload.
+- Claim ceilings are centralized in configuration. A configured section with
+  no `can_mint = true` key remains valid but rejects every mint caller, and
+  reload logs that no key is authorized.
 - Precise per-token revocation, issuance accounting, rate limiting, and
   budget reservation remain follow-up work outside this stateless endpoint.
 - Per-subject budget and concurrency controls are not a namespace-wide
