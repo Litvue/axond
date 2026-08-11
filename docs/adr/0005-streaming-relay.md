@@ -75,6 +75,9 @@ as `event: error` with a typed payload, followed by `[DONE]`, and recorded as
 `upstream_error`. OpenAI-normalized framing may rotate to a remaining credential
 when an explicit rate-limit event arrives before any content is emitted; native
 byte-faithful framing never does. HTTP open-time failures rotate on both wires.
+Because the relay stops reading after a post-content rate-limit frame, any usage
+chunk that would have followed it is not observed and billing falls back to the
+relayed-character estimate.
 
 **Partial spend is charged, best-effort, through the existing
 `BudgetStore::commit`.** A cancelled stream commits the usage accrued at the

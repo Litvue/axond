@@ -1118,7 +1118,6 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 ProviderStreamEvent::Data { data, .. } => Some(data),
-                ProviderStreamEvent::Usage(_) => None,
                 ProviderStreamEvent::Done(_) => None,
             })
             .collect();

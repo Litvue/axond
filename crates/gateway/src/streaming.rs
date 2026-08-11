@@ -509,9 +509,6 @@ impl Relay {
                     self.accounting.usage = usage;
                     self.phase = Phase::Finished;
                 }
-                ProviderStreamEvent::Usage(usage) => {
-                    self.accounting.usage = usage;
-                }
             }
         }
     }
@@ -655,6 +652,9 @@ impl Accounting {
 
     fn fold_attempt(&mut self) {
         const CHARS_PER_TOKEN: usize = 4;
+        // Today the production decoders report usage only in terminal events,
+        // so a permitted pre-content rotation carries no provider usage. Keep
+        // this fallback for decoders that learn usage before rotation.
         let output = if self.usage.output_tokens > 0 {
             self.usage.output_tokens
         } else {
@@ -776,10 +776,7 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::routing::post;
     use futures::StreamExt;
-    use gateway_core::{
-        OpenAiCompatibleAdapter, ProviderAdapter, ProviderError, ProviderStreamEvent, SseEvent,
-        Surface, is_rate_limit_payload,
-    };
+    use gateway_core::{OpenAiCompatibleAdapter, ProviderAdapter, ProviderError, Surface};
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
     use serde_json::json;
@@ -1311,6 +1308,28 @@ data: [DONE]\n\n",
         assert_eq!(record["output_tokens"], 0);
     }
 
+    #[test]
+    fn fold_attempt_carries_reported_output_and_chargeable_usage_keeps_prompt_once() {
+        let mut accounting = Accounting::new(
+            state_for("http://127.0.0.1:1", Arc::new(Ledger::default())),
+            context(),
+            Instant::now(),
+        );
+        accounting.usage = ModelUsage {
+            input_tokens: 7,
+            output_tokens: 2,
+            ..ModelUsage::default()
+        };
+        accounting.fold_attempt();
+        assert_eq!(accounting.carried_output_tokens, 2);
+        assert_eq!(accounting.usage, ModelUsage::default());
+
+        accounting.usage.input_tokens = 5;
+        accounting.usage.output_tokens = 1;
+        assert_eq!(accounting.chargeable_usage().input_tokens, 5);
+        assert_eq!(accounting.chargeable_usage().output_tokens, 3);
+    }
+
     #[tokio::test]
     async fn multibyte_characters_survive_a_chunk_boundary() {
         let mut relay = Relay {
@@ -1620,40 +1639,6 @@ targets = [
         }
     }
 
-    #[derive(Default)]
-    struct UsagePreludeDecoder {
-        usage: ModelUsage,
-    }
-
-    impl ProviderStreamDecoder for UsagePreludeDecoder {
-        fn decode(&mut self, event: SseEvent) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
-            let data: Value = serde_json::from_str(&event.data)
-                .map_err(|error| ProviderError::InvalidStream(error.to_string()))?;
-            if is_rate_limit_payload(&data) {
-                return Err(ProviderError::RateLimitedStream(event.data));
-            }
-            if let Some(usage) = data.get("usage") {
-                self.usage.input_tokens = usage
-                    .get("prompt_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default();
-                self.usage.output_tokens = usage
-                    .get("completion_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default();
-                return Ok(vec![ProviderStreamEvent::Usage(self.usage)]);
-            }
-            Ok(vec![ProviderStreamEvent::Data {
-                event: event.event,
-                data,
-            }])
-        }
-
-        fn finish(&mut self) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
-            Ok(vec![ProviderStreamEvent::Done(self.usage)])
-        }
-    }
-
     fn test_lease(id: &str) -> CredentialLease {
         CredentialLease::test(id)
     }
@@ -1690,9 +1675,11 @@ targets = [
         let response = relay_opened(
             state,
             context(),
-            Box::new(UsagePreludeDecoder::default()),
+            OpenAiCompatibleAdapter::openai()
+                .stream_decoder(Surface::ChatCompletions)
+                .expect("decoder"),
             futures::stream::iter(vec![Ok(Bytes::from_static(
-                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\n\ndata: {\"error\":{\"type\":\"rate_limit_exceeded\"}}\n\n",
+                b"data: {\"error\":{\"type\":\"rate_limit_exceeded\"}}\n\n",
             ))])
             .boxed(),
             Instant::now(),
@@ -1709,52 +1696,10 @@ targets = [
         assert!(!output.contains("rate_limit_exceeded"));
         let record = settled(&ledger).await;
         assert_eq!(record["input_tokens"], 8);
-        assert_eq!(record["output_tokens"], 3);
+        assert_eq!(record["output_tokens"], 1);
         assert_eq!(ledger.settlements().len(), 1);
         assert_eq!(failures.load(Ordering::SeqCst), 1);
         assert_eq!(*failed_ids.lock().expect("failed ids"), ["a"]);
-    }
-
-    #[tokio::test]
-    async fn failed_rotation_preserves_reported_prompt_usage() {
-        let ledger = Arc::new(Ledger::default());
-        let rotation = RotationHandle::new(
-            Vec::new(),
-            test_lease("a"),
-            1,
-            |_lease: CredentialLease, _attempt: u32, _index: usize| {
-                Box::pin(async {
-                    Err(TransportError::Provider(ProviderError::from_upstream(
-                        "test",
-                        429,
-                        "rate limited",
-                    )))
-                }) as futures::future::BoxFuture<'static, _>
-            },
-            |_| {},
-            |_| {},
-        );
-        let response = relay_opened(
-            state_for("http://127.0.0.1:1", ledger.clone()),
-            context(),
-            Box::new(UsagePreludeDecoder::default()),
-            futures::stream::iter(vec![Ok(Bytes::from_static(
-                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\n\ndata: {\"error\":{\"type\":\"rate_limit_exceeded\"}}\n\n",
-            ))])
-            .boxed(),
-            Instant::now(),
-            Framing::OpenAiSse,
-            Some(rotation),
-        );
-        let mut body = response.into_body().into_data_stream();
-        while let Some(chunk) = body.next().await {
-            let _ = chunk.expect("chunk");
-        }
-
-        let record = settled(&ledger).await;
-        assert_eq!(record["status"], "upstream_error");
-        assert_eq!(record["input_tokens"], 7);
-        assert_eq!(record["output_tokens"], 2);
     }
 
     #[tokio::test]
