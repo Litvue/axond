@@ -48,17 +48,24 @@ by the request.
 Minting is stateless. The gateway writes no issuance registry, usage record,
 or issuance log, consistent with ADR 0016. Short `max_ttl` values and
 `[[gateway_token_epoch]]` `min_iat` remain the Tier 0 revocation controls.
+Epochs are the revocation mechanism for minted tokens, so every deployment
+that enables gateway minting must configure the applicable namespace epochs.
 Rate-limit permits and budget reservations are intentionally not acquired by
 `POST /v1/tokens`; this is a known accepted gap and a follow-up decision,
 rather than a reason to introduce state into the mint path.
 Because the minted `sub` is caller-chosen and budgets and inbound rate limits
 are keyed by `(namespace, subject)`, a minting key can rotate subjects to get
 fresh budget ledgers and per-subject concurrency allowances. Per-subject
-budgets are therefore not a namespace-wide spend ceiling, and
-`max_request_microdollars` limits one request rather than cumulative spend.
-Operators should isolate minting namespaces from namespaces that rely on those
-per-subject controls, treat `can_mint` as trusted for the whole namespace, and
-keep `max_ttl` short.
+budgets are therefore not a namespace-wide spend ceiling:
+`BudgetConfig::limit_microdollars` is a cap per `(namespace, subject)`, so
+`can_mint` has unbounded namespace spend authority by construction while
+minting is enabled. `can_mint` is operator-level trust and must not be handed
+to a downstream service. Namespace-level budget capping is the blocker for
+recommending minting and requires a follow-up issue. Request throttling is not
+a mitigation: minted tokens outlive the mint request, so throttling only slows
+accumulation of fresh subjects and bounds nothing. Operators should isolate
+minting namespaces from namespaces that rely on per-subject controls and keep
+`max_ttl` short.
 
 The gateway resolves and validates both sides of the signing relationship at
 boot and reload. Signing material must be well formed and must match the
@@ -67,11 +74,14 @@ and HS256 compares the secret in constant time. A mismatch is a typed,
 redacted snapshot error, so issuance cannot succeed with a token that the
 same gateway would reject.
 
-In-gateway minting necessarily places a signing key in the gateway. A
-compromised minting replica can therefore forge tokens, and an Ed25519
-verification-only replica benefit is lost on replicas that mint. Deployments
-should use a separately deployed minting replica set, keep all other replicas
-verification-only, and keep the minting TTL short.
+In-gateway minting necessarily places the private signing key in the published
+config snapshot on every replica that enables it. A compromised minting
+replica can therefore forge inbound identity for every namespace its verifier
+permits. `TokenVerifier` retains public verification material, which is not
+part of this concern. Deployments enabling minting should use dedicated
+replicas that do not serve dispatch traffic, keep the private signing key only
+in that deployment's config, keep all other replicas verification-only, and
+keep the minting TTL short.
 
 ### State tier
 

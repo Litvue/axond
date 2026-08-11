@@ -207,12 +207,9 @@ async fn mint_tokens(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let requested = parsed.iter().copied().collect::<HashSet<_>>();
             if let Some(ceiling) = &minting.scope
-                && !parsed
-                    .iter()
-                    .copied()
-                    .collect::<HashSet<_>>()
-                    .is_subset(ceiling)
+                && !requested.is_subset(ceiling)
             {
                 return Err(GatewayError::MintClaimsNotNarrowing);
             }
@@ -321,7 +318,6 @@ fn caller_can_mint_capability(
             scope.contains(&capability) && namespace_allows(snapshot, &caller.namespace, capability)
         })
 }
-
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -1778,10 +1774,6 @@ targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdol
         minting_state_with_scope_audience_epochs("scope = [\"chat\", \"models\"]", audience, epochs)
     }
 
-    fn minting_state_without_scope() -> AppState {
-        minting_state_with_scope_audience_epochs("", "test-audience", "")
-    }
-
     fn minting_state_with_scope_audience_epochs(
         scope: &str,
         audience: &str,
@@ -1870,9 +1862,14 @@ max_request_microdollars = 1000
     }
 
     #[tokio::test]
-    async fn omitted_scope_ceiling_rejects_operator_capability() {
+    async fn minting_key_cannot_escalate_operator_capability() {
+        let state = minting_state_with_scope_audience_epochs(
+            "scope = [\"credentials\", \"credentials:all\"]",
+            "test-audience",
+            "",
+        );
         let (status, body) = mint_request(
-            minting_state_without_scope(),
+            state,
             json!({
                 "sub": "agent",
                 "scope": ["credentials:all"],
@@ -1881,7 +1878,6 @@ max_request_microdollars = 1000
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"]["type"], "mint_claims_not_narrowing");
-
         let response = router(minting_state_without_scope())
             .oneshot(
                 Request::get("/v1/credentials?namespaces=all")
@@ -1937,6 +1933,7 @@ max_request_microdollars = 1000
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"]["type"], "mint_claims_not_narrowing");
+        }
     }
 
     #[tokio::test]

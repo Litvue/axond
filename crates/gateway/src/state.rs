@@ -586,6 +586,7 @@ max_ttl = "15m"
 [gateway_minting]
 kid = "test"
 env = "SIGNING_SECRET"
+scope = ["chat", "models"]
 "#,
         )
         .unwrap();
@@ -630,6 +631,7 @@ max_ttl = "15m"
 [gateway_minting]
 kid = "test"
 env = "SIGNING_KEY"
+scope = ["chat", "models"]
 "#,
         )
         .unwrap();
@@ -671,6 +673,7 @@ max_ttl = "15m"
 [gateway_minting]
 kid = "test"
 env = "SIGNING_SECRET"
+scope = ["chat", "models"]
 "#,
         )
         .unwrap();
@@ -715,6 +718,7 @@ max_ttl = "15m"
 [gateway_minting]
 kid = "test"
 env = "SIGNING_KEY"
+scope = ["chat", "models"]
 "#,
         )
         .unwrap();
