@@ -148,6 +148,8 @@ pub enum SnapshotError {
     InvalidMintingAliases { error: String },
     #[error("gateway_minting scope contains invalid capability `{value}`")]
     InvalidMintingCapability { value: String },
+    #[error("gateway_minting signing key `{reference}` does not match verifier `{kid}`")]
+    MintingKeyMismatch { kid: String, reference: String },
 }
 
 impl ConfigSnapshot {
@@ -244,13 +246,8 @@ impl ConfigSnapshot {
             .as_ref()
             .map(TokenVerifier::fingerprints)
             .unwrap_or_default();
-        let stores = verifier
-            .into_iter()
-            .map(|verifier| Box::new(verifier) as Box<dyn crate::principals::PrincipalStore>)
-            .collect();
-        let principals = PrincipalStoreChain::new(stores, config_principals)?;
         let gateway_minting = if let Some(minting) = config.gateway_minting.as_ref() {
-            let verifier = config
+            let config_verifier = config
                 .gateway_verifier
                 .iter()
                 .find(|verifier| verifier.kid == minting.kid)
@@ -272,7 +269,7 @@ impl ConfigSnapshot {
                     SnapshotError::InvalidMintingKeyFileUtf8 { path }
                 }
             })?;
-            let algorithm = match verifier.alg {
+            let algorithm = match config_verifier.alg {
                 GatewayVerifierAlgorithm::EdDsa => crate::mint::MintAlgorithm::EdDsa,
                 GatewayVerifierAlgorithm::Hs256 => crate::mint::MintAlgorithm::Hs256,
             };
@@ -282,6 +279,14 @@ impl ConfigSnapshot {
                     error: error.to_string(),
                 },
             )?;
+            if !verifier.as_ref().is_some_and(|verifier| {
+                verifier.signing_material_matches(&minting.kid, config_verifier.alg, &material)
+            }) {
+                return Err(SnapshotError::MintingKeyMismatch {
+                    kid: minting.kid.clone(),
+                    reference: minting.source_label().unwrap_or(&minting.kid).to_owned(),
+                });
+            }
             let audience = config
                 .gateway_token
                 .as_ref()
@@ -318,7 +323,7 @@ impl ConfigSnapshot {
                 algorithm,
                 key_material: SecretString::from(material),
                 audience,
-                max_ttl: minting.max_ttl.unwrap_or(verifier.max_ttl),
+                max_ttl: minting.max_ttl.unwrap_or(config_verifier.max_ttl),
                 scope,
                 aliases,
                 max_request_microdollars: minting.max_request_microdollars,
@@ -326,6 +331,11 @@ impl ConfigSnapshot {
         } else {
             None
         };
+        let stores = verifier
+            .into_iter()
+            .map(|verifier| Box::new(verifier) as Box<dyn crate::principals::PrincipalStore>)
+            .collect();
+        let principals = PrincipalStoreChain::new(stores, config_principals)?;
         let gateway_minting_fingerprint = config
             .gateway_minting
             .as_ref()
@@ -630,6 +640,93 @@ env = "SIGNING_KEY"
         let message = error.to_string();
         assert!(message.contains("SIGNING_KEY"));
         assert!(!message.contains("not-base64"));
+    }
+
+    #[test]
+    fn minting_signing_material_must_match_verifier_for_both_algorithms() {
+        let hs_config = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "platform"
+can_mint = true
+[gateway_token]
+audience = "test"
+[[gateway_verifier]]
+kid = "test"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+[gateway_minting]
+kid = "test"
+env = "SIGNING_SECRET"
+"#,
+        )
+        .unwrap();
+        let hs_secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+        let mut hs_env = HashMap::from([
+            ("AXOND_KEY".to_owned(), "static-secret".to_owned()),
+            ("JWT_SECRET".to_owned(), hs_secret.clone()),
+            ("SIGNING_SECRET".to_owned(), hs_secret.clone()),
+        ]);
+        assert!(ConfigSnapshot::build(hs_config.clone(), &hs_env, 0).is_ok());
+        hs_env.insert(
+            "SIGNING_SECRET".to_owned(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        );
+        let Err(error) = ConfigSnapshot::build(hs_config, &hs_env, 0) else {
+            panic!("mismatched HS256 material must fail");
+        };
+        let message = error.to_string();
+        assert!(message.contains("SIGNING_SECRET"));
+        assert!(!message.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+
+        let first = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let first_pair = Ed25519KeyPair::from_pkcs8(first.as_ref()).unwrap();
+        let second = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let config = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "platform"
+can_mint = true
+[gateway_token]
+audience = "test"
+[[gateway_verifier]]
+kid = "test"
+alg = "EdDSA"
+env = "VERIFYING_KEY"
+namespaces = ["platform"]
+max_ttl = "15m"
+[gateway_minting]
+kid = "test"
+env = "SIGNING_KEY"
+"#,
+        )
+        .unwrap();
+        let mut ed_env = HashMap::from([
+            ("AXOND_KEY".to_owned(), "static-secret".to_owned()),
+            (
+                "VERIFYING_KEY".to_owned(),
+                STANDARD.encode(first_pair.public_key().as_ref()),
+            ),
+            ("SIGNING_KEY".to_owned(), STANDARD.encode(first.as_ref())),
+        ]);
+        assert!(ConfigSnapshot::build(config.clone(), &ed_env, 0).is_ok());
+        ed_env.insert("SIGNING_KEY".to_owned(), STANDARD.encode(second.as_ref()));
+        let Err(error) = ConfigSnapshot::build(config, &ed_env, 0) else {
+            panic!("mismatched Ed25519 material must fail");
+        };
+        let message = error.to_string();
+        assert!(message.contains("SIGNING_KEY"));
+        assert!(!message.contains(&STANDARD.encode(second.as_ref())));
     }
 
     #[tokio::test]
