@@ -53,6 +53,7 @@ pub struct ProviderResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ProviderStreamEvent {
     Data { event: Option<String>, data: Value },
+    Usage(ModelUsage),
     Done(ModelUsage),
 }
 

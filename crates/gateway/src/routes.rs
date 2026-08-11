@@ -1038,7 +1038,6 @@ async fn stream_with_failover(
                         None,
                     );
                     ctx.rate_limit_permit = hold.permit.take();
-                    snapshot.credentials.record_success(lease);
                     record_target_success(&snapshot, target, &circuit_key);
                     telemetry::record_routing(
                         &ctx.namespace,

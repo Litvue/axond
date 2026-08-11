@@ -128,6 +128,10 @@ impl RotationHandle {
         (self.record_failure)(&self.serving);
     }
 
+    fn record_serving_success(&self) {
+        (self.record_success)(&self.serving);
+    }
+
     async fn open_next(
         &mut self,
     ) -> Result<Option<(CredentialLease, OpenedStream)>, TransportError> {
@@ -137,7 +141,6 @@ impl RotationHandle {
             let open = (self.opener)(lease.clone(), attempt, lease_index);
             match open.await {
                 Ok(opened) => {
-                    (self.record_success)(&lease);
                     self.serving = lease.clone();
                     return Ok(Some((lease, opened)));
                 }
@@ -357,6 +360,9 @@ impl Relay {
                 }
                 Phase::Finished => {
                     self.pending.extend(self.framing.done());
+                    if let Some(rotation) = self.rotation.as_ref() {
+                        rotation.record_serving_success();
+                    }
                     self.accounting.settle(Status::Ok);
                     self.phase = Phase::Ended;
                 }
@@ -387,6 +393,7 @@ impl Relay {
                                 Err(err)
                                     if err.is_credential_rate_limited()
                                         && self.framing == Framing::OpenAiSse
+                                        && matches!(self.phase, Phase::Streaming)
                                         && !self.queued_downstream =>
                                 {
                                     match self.rotate().await {
@@ -484,6 +491,9 @@ impl Relay {
                 ProviderStreamEvent::Done(usage) => {
                     self.accounting.usage = usage;
                     self.phase = Phase::Finished;
+                }
+                ProviderStreamEvent::Usage(usage) => {
+                    self.accounting.usage = usage;
                 }
             }
         }
@@ -1614,7 +1624,7 @@ targets = [
                     .get("completion_tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or_default();
-                return Ok(vec![ProviderStreamEvent::Done(self.usage)]);
+                return Ok(vec![ProviderStreamEvent::Usage(self.usage)]);
             }
             Ok(vec![ProviderStreamEvent::Data {
                 event: event.event,
@@ -1742,6 +1752,49 @@ targets = [
         assert!(output.contains("\"content\":\"c\""));
         assert_eq!(opens.load(Ordering::SeqCst), 3);
         assert_eq!(failures.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_after_done_does_not_reopen_the_stream() {
+        let ledger = Arc::new(Ledger::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_open = calls.clone();
+        let opener = move |_lease: CredentialLease, _attempt: u32, _index: usize| {
+            let calls = calls_for_open.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(test_opened_stream(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"replacement\"}}]}\n\ndata: [DONE]\n\n",
+                ))
+            }) as futures::future::BoxFuture<'static, _>
+        };
+        let response = relay_opened(
+            state_for("http://127.0.0.1:1", ledger),
+            context(),
+            OpenAiCompatibleAdapter::openai()
+                .stream_decoder(Surface::ChatCompletions)
+                .expect("decoder"),
+            futures::stream::iter(vec![Ok(Bytes::from_static(
+                b"data: [DONE]\n\ndata: {\"error\":{\"type\":\"rate_limit_exceeded\"}}\n\n",
+            ))])
+            .boxed(),
+            Instant::now(),
+            Framing::OpenAiSse,
+            Some(RotationHandle::new(
+                vec![test_lease("b")],
+                test_lease("a"),
+                1,
+                1,
+                opener,
+                |_| {},
+                |_| {},
+            )),
+        );
+        let mut body = response.into_body().into_data_stream();
+        while let Some(chunk) = body.next().await {
+            chunk.expect("chunk");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
