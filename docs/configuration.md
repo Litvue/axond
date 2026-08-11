@@ -194,7 +194,7 @@ signing key in the gateway.
 | `env` / `file` | string | — | Exactly one signing-material source; resolved at boot and reload. |
 | `max_ttl` | duration | verifier `max_ttl` | Issuance ceiling, never above the matching verifier's ceiling and at most 24h. When omitted, it tracks the verifier's `max_ttl`; raising that verifier ceiling also raises the issuance ceiling. |
 | `scope` | array of string | — | Required capability ceiling. Omitted requests inherit it; it must stay within the minting key's own authority. |
-| `aliases` | array of string | — | Optional alias-pattern ceiling. Omitted requests inherit it. |
+| `aliases` | array of string | — | Optional alias-pattern ceiling. When omitted, requests may use `*`; this is deliberate because aliases only select among models the namespace can already reach, while dispatch still enforces namespace authority. |
 | `max_request_microdollars` | u64 | — | Optional per-request ceiling. Omitted requests inherit it. |
 
 The route is registered only at boot. Enabling minting on reload is reported

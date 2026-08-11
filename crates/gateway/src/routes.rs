@@ -197,32 +197,35 @@ async fn mint_tokens(
     if ttl.is_zero() || ttl > minting.max_ttl {
         return Err(GatewayError::MintClaimsNotNarrowing);
     }
-    let scope = match request.scope {
-        Some(values) => {
-            let parsed = values
-                .iter()
-                .map(|value| {
-                    Capability::parse(value).ok_or_else(|| {
-                        GatewayError::BadRequest(format!("unknown scope capability `{value}`"))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let requested = parsed.iter().copied().collect::<HashSet<_>>();
-            if let Some(ceiling) = &minting.scope
-                && !requested.is_subset(ceiling)
-            {
-                return Err(GatewayError::MintClaimsNotNarrowing);
-            }
-            if requested
-                .iter()
-                .any(|capability| !caller_holds_capability(&caller, *capability))
-            {
-                return Err(GatewayError::MintClaimsNotNarrowing);
-            }
-            Some(parsed)
-        }
-        None => Some(minting.scope.as_ref().unwrap().iter().copied().collect()),
-    };
+    let scope_ceiling = minting
+        .scope
+        .as_ref()
+        .ok_or(GatewayError::MintClaimsNotNarrowing)?;
+    let values = request.scope.unwrap_or_else(|| {
+        scope_ceiling
+            .iter()
+            .map(|capability| capability.name().to_owned())
+            .collect()
+    });
+    let parsed = values
+        .iter()
+        .map(|value| {
+            Capability::parse(value).ok_or_else(|| {
+                GatewayError::BadRequest(format!("unknown scope capability `{value}`"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let requested = parsed.iter().copied().collect::<HashSet<_>>();
+    if !requested.is_subset(scope_ceiling) {
+        return Err(GatewayError::MintClaimsNotNarrowing);
+    }
+    if requested
+        .iter()
+        .any(|capability| !caller_holds_capability(&caller, *capability))
+    {
+        return Err(GatewayError::MintClaimsNotNarrowing);
+    }
+    let scope = Some(parsed);
     let aliases = match request.aliases {
         Some(values) => {
             let requested = AliasScope::parse(values.iter().map(String::as_str))
@@ -1847,20 +1850,54 @@ max_request_microdollars = 1000
     }
 
     #[tokio::test]
-    async fn minting_key_cannot_escalate_operator_capability() {
-        let state = minting_state_with_scope_audience_epochs(
-            "scope = [\"credentials\", \"credentials:all\"]",
-            "test-audience",
-            "",
-        );
-        let (status, body) = mint_request(
-            state,
-            json!({
-                "sub": "agent",
-                "scope": ["credentials:all"],
-            }),
+    async fn omitted_scope_cannot_inherit_operator_capability() {
+        let mut cfg = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_key]]
+env = "MINT_KEY"
+namespace = "platform"
+can_mint = true
+
+[gateway_token]
+audience = "test-audience"
+
+[[gateway_verifier]]
+kid = "mint-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+
+[gateway_minting]
+kid = "mint-kid"
+env = "JWT_SECRET"
+scope = ["credentials"]
+aliases = ["gpt-*"]
+max_request_microdollars = 1000
+"#,
         )
-        .await;
+        .expect("valid minting config");
+        cfg.gateway_minting.as_mut().expect("minting config").scope =
+            Some(vec!["credentials:all".to_owned()]);
+        let env = HashMap::from([
+            ("MINT_KEY".to_owned(), "mint-key".to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
+        let state = AppState::new(
+            cfg,
+            &env,
+            UsageFanout::new(vec![Box::new(StdoutSink)]),
+            Box::new(NoBudget),
+        )
+        .expect("state");
+        let (status, body) = mint_request(state, json!({"sub": "agent"})).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"]["type"], "mint_claims_not_narrowing");
     }

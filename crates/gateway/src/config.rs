@@ -1359,6 +1359,18 @@ impl Config {
                 "gateway_minting must declare an explicit scope ceiling".into(),
             ));
         }
+        let Some(scope) = minting.scope.as_ref() else {
+            return Err(ConfigError::Invalid(
+                "gateway_minting must declare an explicit scope ceiling".into(),
+            ));
+        };
+        if let Some(capability) = scope.iter().find_map(|value| {
+            Capability::parse(value).filter(|capability| capability.is_operator_only())
+        }) {
+            return Err(ConfigError::Invalid(format!(
+                "gateway_minting scope capability `{capability}` is not held by any can_mint gateway key"
+            )));
+        }
         let minting_keys = self
             .gateway_key
             .iter()
@@ -1926,6 +1938,11 @@ audience = "test"
                 "missing scope ceiling",
                 "kid = \"test\"\nenv = \"SIGN\"",
                 "explicit scope ceiling",
+            ),
+            (
+                "unheld scope capability",
+                "kid = \"test\"\nenv = \"SIGN\"\nscope = [\"credentials:all\"]",
+                "not held",
             ),
         ];
         for (name, minting, expected) in cases {
