@@ -33,6 +33,13 @@ scope, aliases, and microdollar limits inherit their configured ceilings, while
 requested values must narrow them and TTL must be between one second and the
 effective maximum. Minted tokens are never authorized to mint another token.
 
+`POST /v1/tokens` is intentionally outside the request rate limiter and usage
+fanout: issuance is unthrottled and unrecorded in the gateway by design. The
+available controls are a short `max_ttl`, removing the signing `kid` to revoke
+all tokens for that verifier, and `[[gateway_token_epoch]]` `min_iat` to revoke
+tokens issued before a configured time. The token itself is the issuance
+receipt; this Tier 0 path does not maintain an issuance registry.
+
 ```bash
 curl -s https://gateway.example/v1/tokens -H "Authorization: Bearer $GW_INBOUND_PLATFORM_KEY" -H 'content-type: application/json' -d '{"sub":"agent-7","ttl_seconds":300,"scope":["chat"],"aliases":["gpt-4o"],"max_request_microdollars":500}'
 # {"token":"axt1.…","exp":...,"expires_in":300,"namespace":"platform","sub":"agent-7"}
