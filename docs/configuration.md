@@ -118,7 +118,9 @@ credential.
 | `cooldown_seconds` | integer | `30` | How long a parked credential waits before a single half-open probe. Must be ≥ 1. |
 
 Parking is per credential, never per target: a rate-limited key is skipped while
-the same target keeps serving every other key.
+the same target keeps serving every other key. This applies to streamed opens;
+an OpenAI-normalized stream can rotate on an explicit rate-limit event before
+content is emitted. Native streams do not rotate after relay bytes begin.
 
 ## `[failover]` — Tier 0, in-memory per replica
 

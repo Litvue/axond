@@ -116,6 +116,12 @@ estimate.
   error, and nothing was relayed to measure), a stream that failed before its
   first byte, and anything rejected before dispatch. The hold is released in full.
 
+When an OpenAI-normalized stream rotates before content is emitted, the request
+still owns one reservation and produces one usage record. Input/prompt tokens
+are charged once, using serving-attempt usage or the original estimate; output
+usage from an abandoned attempt is carried forward, falling back to its
+relayed-character estimate when no provider output count exists.
+
 The measured partial figure lands on the canonical `UsageRecord`
 (`input_tokens`, `output_tokens`, `cost_microdollars`) with its real status
 (`client_cancelled` / `upstream_error`), so budgets and billing read the same

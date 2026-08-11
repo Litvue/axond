@@ -38,6 +38,12 @@ caller saw. TTFT is recorded on both; for a non-streamed response the first toke
 arrives with the last, so it equals the attempt latency, while the streaming
 relay times the first relayed chunk.
 
+Each target attempt also contains one `axond.credential.lease` child per
+credential considered. Lease spans identify the credential label, source,
+zero-based plan index, and close with `served`, `rate_limited`, `error`, or
+`parked`. A pre-content OpenAI stream rotation closes its first attempt and
+creates a new attempt span rather than holding a span open across the relay.
+
 A streamed request is the one case where the server span cannot hold the outcome:
 its accounting is attached to the response body, which by design outlives the
 handler (ADR 0005), so by settlement time the span has closed. The span therefore

@@ -75,12 +75,11 @@ without limit. Both, plus the per-target `failure_threshold` and
 `cooldown_seconds`, are configurable with sane defaults and are rejected at boot
 if zero — "fail at boot, not at request time".
 
-**Streaming fails over only while opening the upstream.** The relay is split into
-`open_stream` (attempt the connection + first response) and `relay_opened`
-(stream the committed body). The failover loop retries `open_stream` per target;
-the moment one opens, it hands off to `relay_opened` and there is no further
-failover. This keeps ADR 0005's terminal-error semantics intact: a mid-stream
-failure is still a single `error` event, never a retry.
+**Streaming separates open-time rotation from mid-relay rotation.** HTTP
+open-time 429s walk the credential plan on both wires. After opening, only an
+OpenAI-normalized stream may rotate on an explicit rate-limit event before
+content is emitted; native byte-faithful streams and partially delivered
+streams retain terminal-error semantics.
 
 **Attempt and target attribution are recorded.** Each target attempt emits one
 `axond.upstream.attempt` child span with an incrementing zero-based
@@ -104,6 +103,6 @@ transitions publish the existing per-target circuit-state gauge.
 - Breaker state is per-replica, so a target may be probed independently on each
   replica. A shared/coordinated breaker is intentionally deferred, consistent with
   the stateless-by-default posture.
-- Streaming still uses the first credential per target; per-credential rotation
-  mid-open for streams is deferred, as is reserve/release accounting for
-  partially-spent failed attempts.
+- A rotated stream keeps target-attempt accounting separate from lease attempts
+  and reconciles its one reservation by charging the prompt once plus carried
+  output from each consumed stream attempt.

@@ -404,12 +404,18 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                 }
                 Ok(events)
             }
-            Some("error") => Err(ProviderError::InvalidStream(
-                data.pointer("/error/message")
+            Some("error") => {
+                let message = data
+                    .pointer("/error/message")
                     .and_then(Value::as_str)
                     .unwrap_or("Anthropic stream error")
-                    .to_owned(),
-            )),
+                    .to_owned();
+                if crate::is_rate_limit_payload(&data) {
+                    Err(ProviderError::RateLimitedStream(message))
+                } else {
+                    Err(ProviderError::InvalidStream(message))
+                }
+            }
             _ => Ok(Vec::new()),
         }
     }

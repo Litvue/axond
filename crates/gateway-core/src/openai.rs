@@ -135,6 +135,9 @@ impl ProviderStreamDecoder for OpenAiStreamDecoder {
         }
         let data: Value = serde_json::from_str(&event.data)
             .map_err(|error| ProviderError::InvalidStream(error.to_string()))?;
+        if crate::is_rate_limit_payload(&data) {
+            return Err(ProviderError::RateLimitedStream(event.data));
+        }
         let usage = match self.surface {
             Surface::ChatCompletions => data.get("usage"),
             Surface::Responses => data

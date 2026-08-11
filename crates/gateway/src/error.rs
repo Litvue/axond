@@ -89,6 +89,7 @@ impl GatewayError {
                 ProviderError::ModelUnavailable(_) => StatusCode::BAD_GATEWAY,
                 ProviderError::Dependency(_) => StatusCode::BAD_GATEWAY,
                 ProviderError::InvalidStream(_) => StatusCode::BAD_GATEWAY,
+                ProviderError::RateLimitedStream(_) => StatusCode::BAD_GATEWAY,
                 ProviderError::AllCircuitsOpen(_) => StatusCode::SERVICE_UNAVAILABLE,
             },
             Self::Transport(TransportError::Provider(_)) => StatusCode::BAD_GATEWAY,

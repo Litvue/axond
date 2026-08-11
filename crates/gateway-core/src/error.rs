@@ -21,6 +21,8 @@ pub enum ProviderError {
     Dependency(Vec<DependencyFailure>),
     #[error("provider stream was invalid: {0}")]
     InvalidStream(String),
+    #[error("provider stream was rate limited: {0}")]
+    RateLimitedStream(String),
     #[error("all provider circuits are open")]
     AllCircuitsOpen(Vec<String>),
 }
@@ -34,6 +36,7 @@ impl ProviderError {
             Self::ModelUnavailable(_) => "model_unavailable",
             Self::Dependency(_) => "provider_dependency_failed",
             Self::InvalidStream(_) => "invalid_stream",
+            Self::RateLimitedStream(_) => "provider_rate_limited",
             Self::AllCircuitsOpen(_) => "all_provider_circuits_open",
         }
     }
@@ -84,6 +87,10 @@ impl ProviderError {
     pub fn affects_provider_health(&self) -> bool {
         matches!(self, Self::Dependency(_)) && self.is_retryable()
     }
+
+    pub fn is_stream_rate_limited(&self) -> bool {
+        matches!(self, Self::RateLimitedStream(_))
+    }
 }
 
 fn extract_message(body: &str) -> String {
@@ -113,6 +120,32 @@ fn is_context_length_error(text: &str) -> bool {
     ]
     .iter()
     .any(|signal| text.contains(signal))
+}
+
+/// Recognize only explicit provider rate-limit markers in an SSE JSON payload.
+pub fn is_rate_limit_payload(value: &serde_json::Value) -> bool {
+    let status_is_429 = [value.get("status"), value.pointer("/error/status")]
+        .into_iter()
+        .flatten()
+        .any(|status| {
+            status.as_u64() == Some(429) || status.as_str().is_some_and(|status| status == "429")
+        });
+    if status_is_429 {
+        return true;
+    }
+    [
+        value
+            .pointer("/error/type")
+            .and_then(serde_json::Value::as_str),
+        value
+            .pointer("/error/code")
+            .and_then(serde_json::Value::as_str),
+        value.pointer("/type").and_then(serde_json::Value::as_str),
+        value.pointer("/code").and_then(serde_json::Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|signal| signal.contains("rate_limit") || signal == "429")
 }
 
 #[cfg(test)]
@@ -162,5 +195,25 @@ mod tests {
         assert!(matches!(error, ProviderError::ModelUnavailable(_)));
         assert!(error.is_retryable());
         assert!(!error.affects_provider_health());
+    }
+
+    #[test]
+    fn recognizes_only_explicit_stream_rate_limit_shapes() {
+        for body in [
+            r#"{"type":"error","error":{"type":"rate_limit_error"}}"#,
+            r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+            r#"{"error":{"status":429}}"#,
+        ] {
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert!(is_rate_limit_payload(&value), "{body}");
+        }
+        for body in [
+            r#"{"error":{"type":"overloaded_error"}}"#,
+            r#"{"error":{"message":"try again later"}}"#,
+            r#"{"status":500}"#,
+        ] {
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert!(!is_rate_limit_payload(&value), "{body}");
+        }
     }
 }

@@ -21,8 +21,9 @@
 //! walk is the *outer* loop around credential-pool dispatch: each target has an
 //! in-memory per-target circuit breaker, a retryable upstream failure advances
 //! to the next target, and the walk is bounded by both a total attempt count and
-//! an overall wall-clock budget. Streaming can fail over only while opening the
-//! upstream; once bytes flow, a mid-stream failure is terminal.
+//! an overall wall-clock budget. Streaming rotates credentials while opening on
+//! both wires, and may rotate after an OpenAI-framed stream fails before content
+//! is emitted; native streams and partially delivered streams remain terminal.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,7 +45,7 @@ use tracing::{Instrument, debug, warn};
 
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, Target};
-use crate::credentials::{CredentialPlan, CredentialSource};
+use crate::credentials::{CredentialLease, CredentialPlan, CredentialSource};
 use crate::error::GatewayError;
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
 use crate::rate_limit::{RateLimitKey, RateLimitPermit};
@@ -389,6 +390,7 @@ impl Route {
 
 /// A route plus the wire headers this request carries upstream, threaded through
 /// the shared failover walk so both dispatch shapes reuse one request path.
+#[derive(Clone)]
 struct Wire {
     route: Route,
     headers: Vec<(&'static str, String)>,
@@ -581,7 +583,7 @@ async fn serve(
     if streamed {
         return stream_with_failover(
             &state,
-            &snapshot,
+            snapshot.clone(),
             &caller,
             model,
             StreamRequest {
@@ -821,13 +823,114 @@ async fn dispatch_with_failover(
     Err(walk.into_error())
 }
 
-/// Fail over across targets for a streamed request. Failover is only possible
-/// while opening the upstream — once the relay begins emitting, a mid-stream
-/// failure is terminal (ADR 0005), so this loop attempts the open per target and
-/// hands off to the relay the moment one succeeds.
+#[allow(clippy::too_many_arguments)]
+async fn open_stream_lease(
+    state: &AppState,
+    ctx: &StreamContext,
+    provider: &Provider,
+    target: &Target,
+    body: &Value,
+    wire: &Wire,
+    lease: &CredentialLease,
+    attempt: u32,
+    lease_index: usize,
+    attempt_span: Option<&tracing::Span>,
+) -> Result<
+    (
+        Box<dyn ProviderStreamDecoder>,
+        gateway_transport::ByteStream,
+    ),
+    TransportError,
+> {
+    let adapter = adapter_for(provider.kind);
+    let decoder = match wire.route {
+        Route::ChatCompletions => adapter
+            .stream_decoder(Surface::ChatCompletions)
+            .map_err(TransportError::Provider)?,
+        _ => Box::new(NativeMessagesDecoder::new()) as Box<dyn ProviderStreamDecoder>,
+    };
+    let upstream = Upstream {
+        base_url: provider.base_url.clone(),
+        api_key: lease.secret.clone(),
+        auth: auth_scheme(provider.kind),
+    };
+    let mut request_body = body.clone();
+    request_body["model"] = Value::String(target.model.clone());
+    let opened = match wire.route {
+        Route::ChatCompletions => {
+            let request = ProviderRequest {
+                model: target.model.clone(),
+                body: request_body,
+            };
+            match attempt_span {
+                Some(span) => {
+                    streaming::open_stream_with_attempt_span(
+                        ctx,
+                        span,
+                        &lease.id,
+                        lease_index,
+                        state.0.dispatcher.dispatch_stream(
+                            adapter.as_ref(),
+                            &upstream,
+                            Surface::ChatCompletions,
+                            request,
+                        ),
+                    )
+                    .await?
+                }
+                None => {
+                    streaming::open_stream(
+                        ctx,
+                        attempt,
+                        &lease.id,
+                        lease_index,
+                        state.0.dispatcher.dispatch_stream(
+                            adapter.as_ref(),
+                            &upstream,
+                            Surface::ChatCompletions,
+                            request,
+                        ),
+                    )
+                    .await?
+                }
+            }
+        }
+        _ => {
+            let call = wire.call(request_body, adapter.name());
+            match attempt_span {
+                Some(span) => {
+                    streaming::open_stream_with_attempt_span(
+                        ctx,
+                        span,
+                        &lease.id,
+                        lease_index,
+                        state.0.dispatcher.send_stream(&upstream, &call),
+                    )
+                    .await?
+                }
+                None => {
+                    streaming::open_stream(
+                        ctx,
+                        attempt,
+                        &lease.id,
+                        lease_index,
+                        state.0.dispatcher.send_stream(&upstream, &call),
+                    )
+                    .await?
+                }
+            }
+        }
+    };
+    Ok((decoder, opened))
+}
+
+/// Walk targets and their credential pools for a streamed request. HTTP
+/// open-time 429s rotate on both wires. The relay receives remaining leases for
+/// OpenAI-normalized framing, where a rate-limit event before content can be
+/// retried without splicing bytes already sent to the caller.
 async fn stream_with_failover(
     state: &AppState,
-    snapshot: &ConfigSnapshot,
+    snapshot: Arc<ConfigSnapshot>,
     caller: &InboundKey,
     model: &Model,
     request: StreamRequest<'_>,
@@ -864,120 +967,189 @@ async fn stream_with_failover(
             walk.note_missing_credential(&provider.id);
             continue;
         };
-        // The stream path uses the first credential in the pool; per-credential
-        // rotation mid-stream (skip-on-429) is a follow-up.
-        let Some(lease) = plan.attempts.first() else {
+        if plan.attempts.is_empty() {
             walk.note_missing_credential(&provider.id);
             continue;
-        };
-
-        let upstream = Upstream {
-            base_url: provider.base_url.clone(),
-            api_key: lease.secret.clone(),
-            auth: auth_scheme(provider.kind),
-        };
-        let mut req_body = body.clone();
-        req_body["model"] = Value::String(target.model.clone());
-        let mut ctx = StreamContext {
-            namespace: caller.namespace.clone(),
-            subject: caller.subject.clone(),
-            signer_kid: caller.signer_kid.clone(),
-            alias: alias.clone(),
-            target_provider: target.provider.clone(),
-            target_model: target.model.clone(),
-            source: plan.source,
-            credential_id: lease.id.clone(),
-            trace_id: telemetry::trace_id(),
-            price: target.price,
-            budget_key: hold.key.clone(),
-            reservation: hold.reservation.clone(),
-            rate_limit_permit: None,
-            estimated_input_tokens: hold.estimated_input_tokens,
-            attempts: 0,
-        };
-
-        let adapter = adapter_for(provider.kind);
-        // Decoder creation is a property of the provider kind, not the upstream,
-        // so its failure is the same for every remaining target — surface it
-        // rather than failing over. A native stream is relayed verbatim, so its
-        // decoder only observes usage.
-        let decoder = match wire.route {
-            Route::ChatCompletions => match adapter.stream_decoder(Surface::ChatCompletions) {
-                Ok(decoder) => decoder,
-                Err(err) => {
-                    state.0.budget.release(&hold.key, &hold.reservation).await;
-                    return Err(err.into());
+        }
+        let target_attempt = walk.attempts;
+        let attempt_started = Instant::now();
+        let attempt_span = telemetry::upstream_attempt_span(
+            target_attempt,
+            &target.provider,
+            &target.model,
+            UsageRecord::credential_source_str(plan.source),
+        );
+        for (index, skipped) in plan.parked.iter().enumerate() {
+            let span = attempt_span.in_scope(|| {
+                telemetry::credential_lease_span(
+                    &skipped.id,
+                    UsageRecord::credential_source_str(plan.source),
+                    index,
+                )
+            });
+            telemetry::finish_credential_lease(&span, telemetry::LEASE_PARKED);
+        }
+        for (lease_index, lease) in plan.attempts.iter().enumerate() {
+            let mut ctx = StreamContext {
+                namespace: caller.namespace.clone(),
+                subject: caller.subject.clone(),
+                signer_kid: caller.signer_kid.clone(),
+                alias: alias.clone(),
+                target_provider: target.provider.clone(),
+                target_model: target.model.clone(),
+                source: plan.source,
+                credential_id: lease.id.clone(),
+                trace_id: telemetry::trace_id(),
+                price: target.price,
+                budget_key: hold.key.clone(),
+                reservation: hold.reservation.clone(),
+                rate_limit_permit: None,
+                estimated_input_tokens: hold.estimated_input_tokens,
+                attempts: 0,
+            };
+            let started = Instant::now();
+            let opened = open_stream_lease(
+                state,
+                &ctx,
+                provider,
+                target,
+                &body,
+                wire,
+                lease,
+                target_attempt,
+                plan.parked.len() + lease_index,
+                Some(&attempt_span),
+            )
+            .await;
+            ctx.attempts = target_attempt + 1;
+            match opened {
+                Ok((decoder, bytes)) => {
+                    telemetry::finish_upstream_attempt(
+                        &attempt_span,
+                        telemetry::ATTEMPT_OK,
+                        attempt_started.elapsed().as_millis() as u64,
+                        None,
+                    );
+                    ctx.rate_limit_permit = hold.permit.take();
+                    snapshot.credentials.record_success(lease);
+                    record_target_success(&snapshot, target, &circuit_key);
+                    telemetry::record_routing(
+                        &ctx.namespace,
+                        &ctx.subject,
+                        &ctx.alias,
+                        &ctx.target_provider,
+                        &ctx.target_model,
+                        UsageRecord::credential_source_str(ctx.source),
+                    );
+                    let remaining = plan.attempts[lease_index + 1..].to_vec();
+                    let state_for_open = state.clone();
+                    let snapshot_for_open = snapshot.clone();
+                    let target_for_open = target.clone();
+                    let wire_for_open = wire.clone();
+                    let body_for_open = body.clone();
+                    let caller_for_open = caller.clone();
+                    let alias_for_open = alias.clone();
+                    let hold_key_for_open = hold.key.clone();
+                    let reservation_for_open = hold.reservation.clone();
+                    let estimate_for_open = hold.estimated_input_tokens;
+                    let source_for_open = plan.source;
+                    let opener =
+                        move |next_lease: CredentialLease, attempt: u32, lease_index: usize| {
+                            let state = state_for_open.clone();
+                            let snapshot = snapshot_for_open.clone();
+                            let target = target_for_open.clone();
+                            let wire = wire_for_open.clone();
+                            let body = body_for_open.clone();
+                            let caller = caller_for_open.clone();
+                            let alias = alias_for_open.clone();
+                            let budget_key = hold_key_for_open.clone();
+                            let reservation = reservation_for_open.clone();
+                            Box::pin(async move {
+                                let ctx = StreamContext {
+                                    namespace: caller.namespace,
+                                    subject: caller.subject,
+                                    signer_kid: caller.signer_kid,
+                                    alias,
+                                    target_provider: target.provider.clone(),
+                                    target_model: target.model.clone(),
+                                    source: source_for_open,
+                                    credential_id: next_lease.id.clone(),
+                                    trace_id: telemetry::trace_id(),
+                                    price: target.price,
+                                    budget_key,
+                                    reservation,
+                                    rate_limit_permit: None,
+                                    estimated_input_tokens: estimate_for_open,
+                                    attempts: 0,
+                                };
+                                open_stream_lease(
+                                    &state,
+                                    &ctx,
+                                    snapshot
+                                        .config
+                                        .provider(&target.provider)
+                                        .expect("provider snapshot"),
+                                    &target,
+                                    &body,
+                                    &wire,
+                                    &next_lease,
+                                    attempt,
+                                    lease_index,
+                                    None,
+                                )
+                                .await
+                                .map(|(decoder, bytes)| streaming::OpenedStream { decoder, bytes })
+                            }) as futures::future::BoxFuture<'static, _>
+                        };
+                    let snapshot_for_health = snapshot.clone();
+                    let rotation = streaming::RotationHandle::new(
+                        remaining,
+                        plan.parked.len() + lease_index + 1,
+                        target_attempt + 1,
+                        opener,
+                        move |lease| snapshot_for_health.credentials.record_failure(lease),
+                        {
+                            let snapshot = snapshot.clone();
+                            move |lease| snapshot.credentials.record_success(lease)
+                        },
+                    );
+                    return Ok(streaming::relay_opened(
+                        state.clone(),
+                        ctx,
+                        decoder,
+                        bytes,
+                        started,
+                        wire.route.framing(),
+                        Some(rotation),
+                    ));
                 }
-            },
-            _ => Box::new(NativeMessagesDecoder::new()) as Box<dyn ProviderStreamDecoder>,
-        };
-        let started = Instant::now();
-        let dispatcher = &state.0.dispatcher;
-        let opened = match wire.route {
-            Route::ChatCompletions => {
-                let request = ProviderRequest {
-                    model: target.model.clone(),
-                    body: req_body,
-                };
-                streaming::open_stream(
-                    &ctx,
-                    walk.attempts,
-                    dispatcher.dispatch_stream(
-                        adapter.as_ref(),
-                        &upstream,
-                        Surface::ChatCompletions,
-                        request,
-                    ),
-                )
-                .await
-            }
-            _ => {
-                let call = wire.call(req_body, adapter.name());
-                streaming::open_stream(
-                    &ctx,
-                    walk.attempts,
-                    dispatcher.send_stream(&upstream, &call),
-                )
-                .await
-            }
-        };
-        walk.attempts += 1;
-        ctx.attempts = walk.attempts;
-
-        match opened {
-            Ok(bytes) => {
-                ctx.rate_limit_permit = hold.permit.take();
-                record_target_success(snapshot, target, &circuit_key);
-                telemetry::record_routing(
-                    &ctx.namespace,
-                    &ctx.subject,
-                    &ctx.alias,
-                    &ctx.target_provider,
-                    &ctx.target_model,
-                    UsageRecord::credential_source_str(ctx.source),
-                );
-                return Ok(streaming::relay_opened(
-                    state.clone(),
-                    ctx,
-                    decoder,
-                    bytes,
-                    started,
-                    wire.route.framing(),
-                ));
-            }
-            Err(err) => {
-                record_target_failure(snapshot, target, &circuit_key, &err);
-                let has_next = index + 1 < walk.total
-                    && walk.attempts < max_attempts
-                    && Instant::now() < deadline;
-                let decision = policy.decide(&as_provider_error(&err), has_next);
-                last_ctx = Some((ctx, started));
-                walk.last_error = Some(err);
-                if decision == FailoverDecision::Return {
-                    break;
+                Err(err) if is_credential_exhausted(&err) => {
+                    snapshot.credentials.record_failure(lease);
+                    last_ctx = Some((ctx, started));
+                    walk.last_error = Some(err);
+                    continue;
+                }
+                Err(err) => {
+                    record_target_failure(&snapshot, target, &circuit_key, &err);
+                    let has_next = index + 1 < walk.total
+                        && walk.attempts < max_attempts
+                        && Instant::now() < deadline;
+                    let decision = policy.decide(&as_provider_error(&err), has_next);
+                    last_ctx = Some((ctx, started));
+                    walk.last_error = Some(err);
+                    if decision == FailoverDecision::Return {
+                        break;
+                    }
                 }
             }
         }
+        telemetry::finish_upstream_attempt(
+            &attempt_span,
+            telemetry::ATTEMPT_ERROR,
+            attempt_started.elapsed().as_millis() as u64,
+            None,
+        );
+        walk.attempts += 1;
     }
 
     if let Some(err) = walk.last_error.take() {
@@ -1195,7 +1367,21 @@ async fn dispatch_over_pool(
     let adapter = adapter_for(provider.kind);
     let mut exhausted: Option<PooledAttempt> = None;
 
-    for lease in &plan.attempts {
+    for (index, skipped) in plan.parked.iter().enumerate() {
+        let span = telemetry::credential_lease_span(
+            &skipped.id,
+            UsageRecord::credential_source_str(plan.source),
+            index,
+        );
+        telemetry::finish_credential_lease(&span, telemetry::LEASE_PARKED);
+    }
+
+    for (index, lease) in plan.attempts.iter().enumerate() {
+        let lease_span = telemetry::credential_lease_span(
+            &lease.id,
+            UsageRecord::credential_source_str(plan.source),
+            plan.parked.len() + index,
+        );
         let upstream = Upstream {
             base_url: provider.base_url.clone(),
             api_key: lease.secret.clone(),
@@ -1204,37 +1390,40 @@ async fn dispatch_over_pool(
                 ProviderKind::Openai | ProviderKind::OpenaiCompatible => AuthScheme::Bearer,
             },
         };
-        let result = match wire.route {
-            Route::ChatCompletions => {
-                let request = ProviderRequest {
-                    model: target_model.to_string(),
-                    body: body.clone(),
-                };
-                state
+        let result = async {
+            match wire.route {
+                Route::ChatCompletions => {
+                    let request = ProviderRequest {
+                        model: target_model.to_string(),
+                        body: body.clone(),
+                    };
+                    state
+                        .0
+                        .dispatcher
+                        .dispatch(
+                            adapter.as_ref(),
+                            &upstream,
+                            Surface::ChatCompletions,
+                            request,
+                        )
+                        .await
+                }
+                route => state
                     .0
                     .dispatcher
-                    .dispatch(
-                        adapter.as_ref(),
-                        &upstream,
-                        Surface::ChatCompletions,
-                        request,
-                    )
+                    .send(&upstream, &wire.call(body.clone(), adapter.name()))
                     .await
+                    .map(|body| ProviderResponse {
+                        usage: route.native_usage(&body),
+                        body,
+                    }),
             }
-            // Native: the provider's answer is handed back untouched, and only
-            // its usage block is read into the canonical record.
-            route => state
-                .0
-                .dispatcher
-                .send(&upstream, &wire.call(body.clone(), adapter.name()))
-                .await
-                .map(|body| ProviderResponse {
-                    usage: route.native_usage(&body),
-                    body,
-                }),
-        };
+        }
+        .instrument(lease_span.clone())
+        .await;
         match result {
             Ok(response) => {
+                telemetry::finish_credential_lease(&lease_span, telemetry::LEASE_SERVED);
                 snapshot.credentials.record_success(lease);
                 return PooledAttempt {
                     result: Ok(response),
@@ -1242,6 +1431,7 @@ async fn dispatch_over_pool(
                 };
             }
             Err(err) if is_credential_exhausted(&err) => {
+                telemetry::finish_credential_lease(&lease_span, telemetry::LEASE_RATE_LIMITED);
                 snapshot.credentials.record_failure(lease);
                 tracing::warn!(
                     provider = %provider.id,
@@ -1254,6 +1444,7 @@ async fn dispatch_over_pool(
                 });
             }
             Err(err) => {
+                telemetry::finish_credential_lease(&lease_span, telemetry::LEASE_ERROR);
                 return PooledAttempt {
                     result: Err(err),
                     credential_id: lease.id.clone(),

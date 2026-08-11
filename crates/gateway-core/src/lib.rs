@@ -17,7 +17,7 @@ pub use anthropic::{
 };
 pub use catalog::{CatalogError, CatalogModel, ModelCatalog, ModelPrice, Usage, UsageReceipt};
 pub use circuit::{CircuitBreaker, CircuitDecision, CircuitState};
-pub use error::{DependencyFailure, ProviderError};
+pub use error::{DependencyFailure, ProviderError, is_rate_limit_payload};
 pub use failover::{FailoverDecision, FailoverPolicy, FailoverTarget};
 pub use governance::{Admission, Governance, GovernanceKey, GovernanceLimits};
 pub use guardrail::{

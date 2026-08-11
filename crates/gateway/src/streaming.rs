@@ -15,6 +15,7 @@
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
@@ -22,6 +23,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use gateway_core::{
     ModelPrice, ModelUsage, ProviderStreamDecoder, ProviderStreamEvent, SseDecoder,
 };
@@ -30,7 +32,7 @@ use serde_json::{Value, json};
 use tracing::Instrument;
 
 use crate::budget::{BudgetKey, Reservation};
-use crate::credentials::CredentialSource;
+use crate::credentials::{CredentialLease, CredentialSource};
 use crate::rate_limit::RateLimitPermit;
 use crate::routes::next_request_id;
 use crate::state::AppState;
@@ -65,6 +67,84 @@ pub struct StreamContext {
     pub attempts: u32,
 }
 
+pub struct OpenedStream {
+    pub bytes: ByteStream,
+    pub decoder: Box<dyn ProviderStreamDecoder>,
+}
+
+pub struct RotationLease {
+    pub lease: CredentialLease,
+}
+
+type RotationOpener = Arc<
+    dyn Fn(CredentialLease, u32, usize) -> BoxFuture<'static, Result<OpenedStream, TransportError>>
+        + Send
+        + Sync,
+>;
+
+pub struct RotationHandle {
+    remaining: VecDeque<(RotationLease, usize)>,
+    opener: RotationOpener,
+    record_failure: Arc<dyn Fn(&CredentialLease) + Send + Sync>,
+    record_success: Arc<dyn Fn(&CredentialLease) + Send + Sync>,
+    next_attempt: u32,
+}
+
+fn is_stream_rate_limited(err: &TransportError) -> bool {
+    matches!(err, TransportError::Provider(error) if error.is_stream_rate_limited())
+}
+
+impl RotationHandle {
+    pub fn new(
+        leases: Vec<CredentialLease>,
+        first_lease_index: usize,
+        next_attempt: u32,
+        opener: impl Fn(
+            CredentialLease,
+            u32,
+            usize,
+        ) -> BoxFuture<'static, Result<OpenedStream, TransportError>>
+        + Send
+        + Sync
+        + 'static,
+        record_failure: impl Fn(&CredentialLease) + Send + Sync + 'static,
+        record_success: impl Fn(&CredentialLease) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            remaining: leases
+                .into_iter()
+                .enumerate()
+                .map(|(offset, lease)| (RotationLease { lease }, first_lease_index + offset))
+                .collect(),
+            opener: Arc::new(opener),
+            record_failure: Arc::new(record_failure),
+            record_success: Arc::new(record_success),
+            next_attempt,
+        }
+    }
+
+    async fn open_next(
+        &mut self,
+    ) -> Result<Option<(CredentialLease, OpenedStream)>, TransportError> {
+        while let Some((candidate, lease_index)) = self.remaining.pop_front() {
+            let lease = candidate.lease;
+            let attempt = self.next_attempt;
+            self.next_attempt += 1;
+            match (self.opener)(lease.clone(), attempt, lease_index).await {
+                Ok(opened) => {
+                    (self.record_success)(&lease);
+                    return Ok(Some((lease, opened)));
+                }
+                Err(err) if is_stream_rate_limited(&err) => {
+                    (self.record_failure)(&lease);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// Attempt to open one target's upstream stream, wrapped in its per-attempt
 /// child span. Returns the undecoded byte stream on success, or the transport
 /// error so the failover loop can decide whether to advance to the next target
@@ -77,6 +157,8 @@ pub struct StreamContext {
 pub async fn open_stream<F>(
     ctx: &StreamContext,
     attempt: u32,
+    lease_id: &str,
+    lease_index: usize,
     open: F,
 ) -> Result<ByteStream, TransportError>
 where
@@ -92,7 +174,8 @@ where
         &ctx.target_model,
         UsageRecord::credential_source_str(ctx.source),
     );
-    let opened = open.instrument(attempt_span.clone()).await;
+    let opened =
+        open_stream_with_attempt_span(ctx, &attempt_span, lease_id, lease_index, open).await;
     telemetry::finish_upstream_attempt(
         &attempt_span,
         if opened.is_ok() {
@@ -106,11 +189,41 @@ where
     opened
 }
 
+pub async fn open_stream_with_attempt_span<F>(
+    ctx: &StreamContext,
+    attempt_span: &tracing::Span,
+    lease_id: &str,
+    lease_index: usize,
+    open: F,
+) -> Result<ByteStream, TransportError>
+where
+    F: Future<Output = Result<ByteStream, TransportError>>,
+{
+    let lease_span = telemetry::credential_lease_span(
+        lease_id,
+        UsageRecord::credential_source_str(ctx.source),
+        lease_index,
+    );
+    let opened = async { open.instrument(lease_span.clone()).await }
+        .instrument(attempt_span.clone())
+        .await;
+    telemetry::finish_credential_lease(
+        &lease_span,
+        match &opened {
+            Ok(_) => telemetry::LEASE_SERVED,
+            Err(err) if is_stream_rate_limited(err) => telemetry::LEASE_RATE_LIMITED,
+            Err(_) => telemetry::LEASE_ERROR,
+        },
+    );
+    opened
+}
+
 /// Build the client-facing SSE response from an already-opened upstream stream.
 ///
-/// The caller has committed to this target (the first byte is about to flow),
-/// so there is no more failover: an upstream that fails mid-stream is surfaced
-/// as a terminal `error` event in the caller's framing.
+/// Native bytes are committed as they arrive and never rotate mid-relay.
+/// OpenAI-normalized streams may use the supplied handle only while no content
+/// has been emitted, because a second independent completion cannot safely
+/// resume a partially delivered wire.
 pub fn relay_opened(
     state: AppState,
     ctx: StreamContext,
@@ -118,6 +231,7 @@ pub fn relay_opened(
     bytes: ByteStream,
     started: Instant,
     framing: Framing,
+    rotation: Option<RotationHandle>,
 ) -> Response {
     let relay = Relay {
         bytes,
@@ -128,6 +242,8 @@ pub fn relay_opened(
         phase: Phase::Streaming,
         framing,
         accounting: Accounting::new(state, ctx, started),
+        rotation,
+        held: VecDeque::new(),
     };
 
     let body = Body::from_stream(futures::stream::unfold(relay, |mut relay| async move {
@@ -208,6 +324,8 @@ struct Relay {
     phase: Phase,
     framing: Framing,
     accounting: Accounting,
+    rotation: Option<RotationHandle>,
+    held: VecDeque<Bytes>,
 }
 
 impl Relay {
@@ -253,6 +371,17 @@ impl Relay {
                         for event in events {
                             match self.decoder.decode(event) {
                                 Ok(decoded) => self.emit(decoded),
+                                Err(err)
+                                    if err.is_stream_rate_limited()
+                                        && self.framing == Framing::OpenAiSse
+                                        && !self.accounting.emitted_content() =>
+                                {
+                                    if self.rotate().await {
+                                        return;
+                                    }
+                                    self.phase = Phase::Failed(err.to_string());
+                                    return;
+                                }
                                 Err(err) => {
                                     self.phase = Phase::Failed(err.to_string());
                                     return;
@@ -325,18 +454,49 @@ impl Relay {
         for event in events {
             match event {
                 ProviderStreamEvent::Data { event, data } => {
-                    self.accounting.mark_first_token();
+                    let content = relayed_text_len(&data);
+                    if content > 0 {
+                        self.accounting.mark_first_token();
+                    }
                     self.accounting.count_relayed(&data);
                     if self.framing.reemits() {
-                        self.pending.push_back(data_event(event.as_deref(), &data));
+                        let rendered = data_event(event.as_deref(), &data);
+                        if content == 0 && !self.accounting.emitted_content() {
+                            self.held.push_back(rendered);
+                        } else {
+                            self.pending.extend(self.held.drain(..));
+                            self.pending.push_back(rendered);
+                        }
                     }
                 }
                 ProviderStreamEvent::Done(usage) => {
                     self.accounting.usage = usage;
+                    self.pending.extend(self.held.drain(..));
                     self.phase = Phase::Finished;
                 }
             }
         }
+    }
+
+    async fn rotate(&mut self) -> bool {
+        let Some(rotation) = self.rotation.as_mut() else {
+            return false;
+        };
+        self.accounting.fold_attempt();
+        self.bytes = futures::stream::empty().boxed();
+        self.carry.clear();
+        self.sse = Some(SseDecoder::default());
+        self.decoder = match rotation.open_next().await {
+            Ok(Some((lease, opened))) => {
+                self.accounting.ctx.credential_id = lease.id.clone();
+                self.bytes = opened.bytes;
+                self.sse = Some(SseDecoder::default());
+                self.held.clear();
+                opened.decoder
+            }
+            Ok(None) | Err(_) => return false,
+        };
+        true
     }
 }
 
@@ -423,6 +583,7 @@ struct Accounting {
     /// Characters of generated text relayed to the client, which is the only
     /// measure of output a stream has before the provider's usage arrives.
     relayed_chars: usize,
+    carried_output_tokens: u64,
     /// Time to the first relayed token, which for a stream is the number a
     /// caller actually feels.
     ttft_ms: Option<u64>,
@@ -437,6 +598,7 @@ impl Accounting {
             started,
             usage: ModelUsage::default(),
             relayed_chars: 0,
+            carried_output_tokens: 0,
             ttft_ms: None,
             settled: false,
         }
@@ -451,23 +613,49 @@ impl Accounting {
         self.relayed_chars = self.relayed_chars.saturating_add(relayed_text_len(data));
     }
 
+    fn emitted_content(&self) -> bool {
+        self.relayed_chars > 0
+    }
+
+    fn fold_attempt(&mut self) {
+        const CHARS_PER_TOKEN: usize = 4;
+        let output = if self.usage.output_tokens > 0 {
+            self.usage.output_tokens
+        } else {
+            self.relayed_chars.div_ceil(CHARS_PER_TOKEN) as u64
+        };
+        self.carried_output_tokens = self.carried_output_tokens.saturating_add(output);
+        self.usage = ModelUsage::default();
+        self.relayed_chars = 0;
+    }
+
     /// The usage the request is charged for. The provider's own numbers win
     /// whenever they arrived; otherwise — a cancelled or broken stream — the
     /// charge is derived from what was measurably relayed, and a stream that
     /// produced nothing is charged nothing.
     fn chargeable_usage(&self) -> ModelUsage {
         const CHARS_PER_TOKEN: usize = 4;
-        if self.usage.input_tokens > 0 || self.usage.output_tokens > 0 {
-            return self.usage;
-        }
-        if self.relayed_chars == 0 {
+        let has_output = self.carried_output_tokens > 0
+            || self.usage.output_tokens > 0
+            || self.relayed_chars > 0;
+        if !has_output && self.usage.input_tokens == 0 {
             return ModelUsage::default();
         }
-        ModelUsage {
-            input_tokens: self.ctx.estimated_input_tokens,
-            output_tokens: self.relayed_chars.div_ceil(CHARS_PER_TOKEN) as u64,
-            ..ModelUsage::default()
-        }
+        let mut usage = self.usage;
+        usage.input_tokens = if self.usage.input_tokens > 0 {
+            self.usage.input_tokens
+        } else if has_output {
+            self.ctx.estimated_input_tokens
+        } else {
+            0
+        };
+        usage.output_tokens = self.carried_output_tokens
+            + if self.usage.output_tokens > 0 {
+                self.usage.output_tokens
+            } else {
+                self.relayed_chars.div_ceil(CHARS_PER_TOKEN) as u64
+            };
+        usage
     }
 
     fn settle(&mut self, status: Status) {
@@ -983,6 +1171,8 @@ targets = [{{ provider = "anthropic", model = "claude-sonnet-4-5", price = {{ in
                 context(),
                 Instant::now(),
             ),
+            rotation: None,
+            held: VecDeque::new(),
         };
         let text = "héllo — 日本語";
         let bytes = text.as_bytes();

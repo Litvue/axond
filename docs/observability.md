@@ -26,12 +26,15 @@ Logs are always JSON on stdout, filtered by `RUST_LOG` (default
 
 One `http.server.request` span per request, with one `axond.upstream.attempt`
 child per upstream call — so an ordered-failover walk reads as N attempt spans
-under one server span, the last carrying the status the caller saw.
+under one server span, the last carrying the status the caller saw. Each
+attempt contains one `axond.credential.lease` child for every attempted or
+parked credential.
 
 | Span | Key attributes |
 | --- | --- |
 | `http.server.request` | `http.request.method`, `http.route`, `http.response.status_code`, `axond.request_id`, `axond.namespace`, `axond.subject`, `gen_ai.request.model`, `axond.target.*`, `axond.credential_source`, `axond.status`, `axond.retry_count`, `gen_ai.usage.*`, `axond.cost_microdollars`, `axond.latency_ms`, `axond.ttft_ms` |
 | `axond.upstream.attempt` | `axond.attempt` (zero-based), `axond.target.provider`, `axond.target.model`, `axond.credential_source`, `axond.status`, `axond.latency_ms`, `axond.ttft_ms` |
+| `axond.credential.lease` | `axond.credential.id`, `axond.credential_source`, `axond.credential.index`, `axond.status` (`served`, `rate_limited`, `error`, `parked`) |
 | `axond.config.reload` | `axond.reload.trigger`, `axond.reload.outcome`, `axond.config.generation` |
 
 An inbound `traceparent` is **joined**, not replaced, and the context is

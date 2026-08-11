@@ -34,6 +34,7 @@ pub enum CredentialSource {
 
 /// One credential handed to a single upstream attempt. The `id` is a label, so
 /// it can be logged and attributed; the secret never is.
+#[derive(Clone)]
 pub struct CredentialLease {
     pub id: String,
     pub secret: SecretString,
@@ -44,6 +45,13 @@ pub struct CredentialLease {
 pub struct CredentialPlan {
     pub source: CredentialSource,
     pub attempts: Vec<CredentialLease>,
+    pub parked: Vec<CredentialSkip>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialSkip {
+    pub id: String,
+    pub reason: &'static str,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -321,18 +329,33 @@ impl Credentials {
         // Every credential is parked and none is due a probe. Health is
         // advisory, so the request still gets the rotation's first choice rather
         // than being failed on stale bookkeeping.
-        if attempts.is_empty() {
+        let forced = if attempts.is_empty() {
             attempts = parked
                 .first()
                 .map(|entry| vec![lease(entry)])
                 .into_iter()
                 .flatten()
                 .collect();
-        }
+            attempts.first().map(|lease| lease.id.clone())
+        } else {
+            None
+        };
         if attempts.is_empty() {
             return None;
         }
-        Some(CredentialPlan { source, attempts })
+        let parked = parked
+            .into_iter()
+            .filter(|entry| forced.as_deref() != Some(entry.id.as_str()))
+            .map(|entry| CredentialSkip {
+                id: entry.id.clone(),
+                reason: "parked",
+            })
+            .collect();
+        Some(CredentialPlan {
+            source,
+            attempts,
+            parked,
+        })
     }
 
     /// A credential served a request: clear its failure history.

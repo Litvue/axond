@@ -48,7 +48,10 @@ attempts, not just one key.
 
 **A `429` is attributed to the credential, not the target.** On a rate-limit or
 exhausted-quota response the request retries the *same* target with the next
-credential in the plan, and the failure counts against that credential only.
+credential in the plan, including streamed opens. An OpenAI-normalized stream
+may also rotate on an explicit rate-limit event before content is emitted;
+native streams and partially delivered streams remain terminal. The failure
+counts against that credential only.
 Every other upstream failure (5xx, transport, `404`) is a target-scoped signal
 and is left to target failover and the per-target breaker.
 
@@ -75,7 +78,8 @@ key with a platform key inside one request.
 **The serving credential is attributed on the usage record.** `UsageRecord` gains
 `credential_id` (the label, never the secret) alongside the existing
 `credential_source`, so per-key spend and per-key error rates fall out of the
-single canonical record. Skips are logged with the credential label.
+single canonical record. Skips are logged and represented by lease spans; the
+serving credential remains the one attributed on the usage record.
 
 ## Consequences
 
