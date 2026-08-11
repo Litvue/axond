@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use super::{RevocationError, RevocationStore, expiry_ms, unavailable, validate_expiry};
 use crate::config::StoreUnavailable;
-use crate::redis_support::{RedisConnection, RedisRecovery};
+use crate::redis_support::{RedisConnection, RedisRecovery, operation_liveness_timeout};
 
 pub struct RedisRevocation {
     connection: Arc<ArcSwap<RedisConnection>>,
@@ -75,6 +75,7 @@ impl RevocationStore for RedisRevocation {
             .load(std::sync::atomic::Ordering::Acquire)
             >= snapshot.generation
         {
+            self.recovery.mark_suspect(snapshot.generation);
             return unavailable(
                 self.on_unavailable,
                 "redis",
@@ -83,16 +84,18 @@ impl RevocationStore for RedisRevocation {
         }
         let key = self.key(jti);
         let timeout = self.timeout;
+        let liveness_timeout = operation_liveness_timeout(timeout);
         let recovery = self.recovery.clone();
         let task_recovery = recovery.clone();
         let generation = snapshot.generation;
         let connection = snapshot.manager.clone();
         // Keep the Redis future in an owned task to remove caller-side
-        // cancellation. Its deadline can still drop the multiplexed future,
-        // so the shared recovery retires that generation before reuse.
-        let result = tokio::spawn(async move {
+        // cancellation. The request deadline only ends the caller's wait;
+        // the longer liveness deadline owns future cancellation, and the
+        // shared recovery retires that generation if it fires.
+        let task = tokio::spawn(async move {
             let mut connection = connection;
-            let result = tokio::time::timeout(timeout, async move {
+            let result = tokio::time::timeout(liveness_timeout, async move {
                 redis::cmd("EXISTS")
                     .arg(key)
                     .query_async::<bool>(&mut connection)
@@ -103,10 +106,10 @@ impl RevocationStore for RedisRevocation {
                 task_recovery.mark_suspect(generation);
             }
             result
-        })
-        .await;
+        });
+        let result = tokio::time::timeout(timeout, task).await;
         match result {
-            Ok(Ok(Ok(value))) => {
+            Ok(Ok(Ok(Ok(value)))) => {
                 if recovery
                     .suspect_generation
                     .load(std::sync::atomic::Ordering::Acquire)
@@ -121,22 +124,40 @@ impl RevocationStore for RedisRevocation {
                 }
                 Ok(value)
             }
+            Ok(Ok(Ok(Err(_)))) | Err(_) => {
+                unavailable(self.on_unavailable, "redis", "operation timed out")
+            }
             Ok(Ok(Err(error))) => unavailable(self.on_unavailable, "redis", error),
-            Ok(Err(_)) | Err(_) => unavailable(self.on_unavailable, "redis", "operation timed out"),
+            Ok(Err(_)) => unavailable(self.on_unavailable, "redis", "operation failed"),
         }
     }
 
     async fn revoke(&self, jti: &str, expires_at: SystemTime) -> Result<(), RevocationError> {
         validate_expiry(expires_at)?;
         let expiry_ms = expiry_ms(expires_at)?;
+        let snapshot = self.connection.load_full();
+        if self
+            .recovery
+            .suspect_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            >= snapshot.generation
+        {
+            self.recovery.mark_suspect(snapshot.generation);
+            return Err(RevocationError::Unavailable {
+                backend: "redis",
+                message: "shared Redis connection is recovering".to_owned(),
+            });
+        }
         let key = self.key(jti);
         let timeout = self.timeout;
+        let liveness_timeout = operation_liveness_timeout(timeout);
         let recovery = self.recovery.clone();
-        let generation = self.connection.load_full().generation;
-        let connection = self.connection.load_full().manager.clone();
-        let result = tokio::spawn(async move {
+        let task_recovery = recovery.clone();
+        let generation = snapshot.generation;
+        let connection = snapshot.manager.clone();
+        let task = tokio::spawn(async move {
             let mut connection = connection;
-            let result = tokio::time::timeout(timeout, async move {
+            let result = tokio::time::timeout(liveness_timeout, async move {
                 redis::cmd("SET")
                     .arg(key)
                     .arg("")
@@ -147,20 +168,37 @@ impl RevocationStore for RedisRevocation {
             })
             .await;
             if result.is_err() {
-                recovery.mark_suspect(generation);
+                task_recovery.mark_suspect(generation);
             }
             result
-        })
-        .await;
+        });
+        let result = tokio::time::timeout(timeout, task).await;
         match result {
-            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Ok(Ok(())))) => {
+                if recovery
+                    .suspect_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    >= generation
+                    || recovery.connection.load_full().generation != generation
+                {
+                    return Err(RevocationError::Unavailable {
+                        backend: "redis",
+                        message: "shared Redis response became unattributable".to_owned(),
+                    });
+                }
+                Ok(())
+            }
+            Ok(Ok(Ok(Err(_)))) | Err(_) => Err(RevocationError::Unavailable {
+                backend: "redis",
+                message: "operation timed out".to_owned(),
+            }),
             Ok(Ok(Err(error))) => Err(RevocationError::Unavailable {
                 backend: "redis",
                 message: error.to_string(),
             }),
-            Ok(Err(_)) | Err(_) => Err(RevocationError::Unavailable {
+            Ok(Err(_)) => Err(RevocationError::Unavailable {
                 backend: "redis",
-                message: "operation timed out".to_owned(),
+                message: "operation failed".to_owned(),
             }),
         }
     }
@@ -169,7 +207,7 @@ impl RevocationStore for RedisRevocation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::task::JoinHandle;
@@ -177,6 +215,9 @@ mod tests {
     struct RevocationTimeoutStub {
         address: std::net::SocketAddr,
         connections: std::sync::Arc<AtomicUsize>,
+        drop_first: std::sync::Arc<AtomicBool>,
+        ping_failures: std::sync::Arc<AtomicUsize>,
+        response_delay_ms: std::sync::Arc<AtomicU64>,
         task: JoinHandle<()>,
     }
 
@@ -187,21 +228,36 @@ mod tests {
                 .expect("bind stub");
             let address = listener.local_addr().expect("stub address");
             let connections = std::sync::Arc::new(AtomicUsize::new(0));
+            let drop_first = std::sync::Arc::new(AtomicBool::new(true));
+            let ping_failures = std::sync::Arc::new(AtomicUsize::new(0));
+            let response_delay_ms = std::sync::Arc::new(AtomicU64::new(0));
             let task = {
                 let connections = connections.clone();
+                let drop_first = drop_first.clone();
+                let ping_failures = ping_failures.clone();
+                let response_delay_ms = response_delay_ms.clone();
                 tokio::spawn(async move {
                     loop {
                         let Ok((stream, _)) = listener.accept().await else {
                             return;
                         };
                         let connection = connections.fetch_add(1, Ordering::Relaxed);
-                        tokio::spawn(handle_timeout_connection(stream, connection));
+                        tokio::spawn(handle_timeout_connection(
+                            stream,
+                            connection,
+                            drop_first.clone(),
+                            ping_failures.clone(),
+                            response_delay_ms.clone(),
+                        ));
                     }
                 })
             };
             Self {
                 address,
                 connections,
+                drop_first,
+                ping_failures,
+                response_delay_ms,
                 task,
             }
         }
@@ -237,7 +293,13 @@ mod tests {
         Some(command)
     }
 
-    async fn handle_timeout_connection(stream: TcpStream, connection: usize) {
+    async fn handle_timeout_connection(
+        stream: TcpStream,
+        connection: usize,
+        drop_first: std::sync::Arc<AtomicBool>,
+        ping_failures: std::sync::Arc<AtomicUsize>,
+        response_delay_ms: std::sync::Arc<AtomicU64>,
+    ) {
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
         loop {
@@ -246,6 +308,15 @@ mod tests {
             };
             let name = command.first().map(Vec::as_slice).unwrap_or_default();
             if name.eq_ignore_ascii_case(b"PING") {
+                if connection != 0
+                    && ping_failures
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                            if count > 0 { Some(count - 1) } else { None }
+                        })
+                        .is_ok()
+                {
+                    return;
+                }
                 if write_half.write_all(b"+PONG\r\n").await.is_err() {
                     return;
                 }
@@ -254,10 +325,25 @@ mod tests {
                     return;
                 }
             } else if name.eq_ignore_ascii_case(b"EXISTS") {
-                if connection == 0 {
+                if connection == 0 && drop_first.load(Ordering::Relaxed) {
                     continue;
                 }
+                let delay = response_delay_ms.load(Ordering::Relaxed);
+                if delay != 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
                 if write_half.write_all(b":1\r\n").await.is_err() {
+                    return;
+                }
+            } else if name.eq_ignore_ascii_case(b"SET") {
+                if connection == 0 && drop_first.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let delay = response_delay_ms.load(Ordering::Relaxed);
+                if delay != 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+                if write_half.write_all(b"+OK\r\n").await.is_err() {
                     return;
                 }
             } else if write_half.write_all(b"+OK\r\n").await.is_err() {
@@ -309,7 +395,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn timed_out_lookup_retires_generation_before_next_lookup() {
+    async fn timed_out_operations_retire_generation_before_next_operation() {
         let stub = RevocationTimeoutStub::start().await;
         let store = RedisRevocation::connect(
             &stub.url(),
@@ -325,10 +411,11 @@ mod tests {
             store.is_revoked("timed-out-jti").await,
             Err(RevocationError::Unavailable { .. })
         ));
-        assert!(matches!(
-            store.is_revoked("during-replacement").await,
-            Err(RevocationError::Unavailable { .. })
-        ));
+        match store.is_revoked("during-replacement").await {
+            Ok(value) => assert!(value, "a revoked JTI must not be reported as active"),
+            Err(RevocationError::Unavailable { .. }) => {}
+            Err(error) => panic!("unexpected replacement error: {error:?}"),
+        }
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while stub.connections.load(Ordering::Relaxed) < 2
@@ -347,5 +434,116 @@ mod tests {
                 .expect("replacement lookup"),
             "a revoked JTI must not be reported as active after timeout recovery"
         );
+
+        let expiry = SystemTime::now() + Duration::from_secs(30);
+        let write_stub = RevocationTimeoutStub::start().await;
+        let write_store = RedisRevocation::connect(
+            &write_stub.url(),
+            "axond:test:revocation-write-timeout",
+            Duration::from_millis(25),
+            Duration::from_secs(1),
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect write store");
+        assert!(matches!(
+            write_store.revoke("timed-out-write", expiry).await,
+            Err(RevocationError::Unavailable { .. })
+        ));
+        match write_store.revoke("during-write-replacement", expiry).await {
+            Ok(()) => assert!(
+                write_store.connection.load_full().generation > 1,
+                "a write must not succeed from the retired generation"
+            ),
+            Err(RevocationError::Unavailable { .. }) => {}
+            Err(error) => panic!("unexpected write replacement error: {error:?}"),
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while write_stub.connections.load(Ordering::Relaxed) < 2
+            || write_store.connection.load_full().generation == 1
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "write replacement did not connect"
+            );
+            tokio::task::yield_now().await;
+        }
+        write_store
+            .revoke("write-after-replacement", expiry)
+            .await
+            .expect("replacement write");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn caller_timeout_does_not_retire_a_healthy_generation() {
+        let stub = RevocationTimeoutStub::start().await;
+        let store = RedisRevocation::connect(
+            &stub.url(),
+            "axond:test:revocation-slow",
+            Duration::from_millis(25),
+            Duration::from_secs(1),
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect");
+        let generation = store.connection.load_full().generation;
+        stub.drop_first.store(false, Ordering::Relaxed);
+        stub.response_delay_ms.store(100, Ordering::Relaxed);
+
+        assert!(matches!(
+            store.is_revoked("slow-jti").await,
+            Err(RevocationError::Unavailable { .. })
+        ));
+        tokio::time::sleep(Duration::from_millis(125)).await;
+        stub.response_delay_ms.store(0, Ordering::Relaxed);
+        assert!(store.is_revoked("healthy-jti").await.expect("lookup"));
+        assert_eq!(
+            store.connection.load_full().generation,
+            generation,
+            "a caller timeout must not retire a healthy generation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_replacement_is_retried_by_a_later_lookup() {
+        let stub = RevocationTimeoutStub::start().await;
+        let store = RedisRevocation::connect(
+            &stub.url(),
+            "axond:test:revocation-retry",
+            Duration::from_millis(25),
+            Duration::from_secs(1),
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect");
+        assert!(matches!(
+            store.is_revoked("timeout-jti").await,
+            Err(RevocationError::Unavailable { .. })
+        ));
+        stub.ping_failures.store(1, Ordering::Relaxed);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while stub.connections.load(Ordering::Relaxed) < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "replacement attempt did not connect"
+            );
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(store.connection.load_full().generation, 1);
+        stub.ping_failures.store(0, Ordering::Relaxed);
+        assert!(matches!(
+            store.is_revoked("retry-jti").await,
+            Err(RevocationError::Unavailable { .. })
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while store.connection.load_full().generation == 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "later lookup did not re-arm replacement"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(store.is_revoked("recovered-jti").await.expect("lookup"));
     }
 }

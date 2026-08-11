@@ -368,7 +368,7 @@ leftovers and are not removed on the request path.
 | `table` | string | `axond_revocation` | `postgres` | Revocation table, validated as an identifier. |
 | `create_table` | bool | `false` | `postgres` | Apply the shipped versioned DDL at boot. |
 | `on_unavailable` | `deny` \| `allow` | `deny` | shared | For outages after boot, fail closed with `503 revocation_unavailable`, or explicitly admit and warn. The backend connects and PINGs/`SELECT`s before the listener binds, so an unreachable store aborts startup for either value. |
-| `timeout_ms` | integer | `250` | shared | Bounded operation timeout; must be nonzero. |
+| `timeout_ms` | integer | `250` | shared | Maximum time a request waits for the operation; the owned Redis operation may continue under a longer liveness budget, and must be nonzero. |
 | `connect_timeout_ms` | integer | `5000` | shared | Bounded connection/PING timeout; must be nonzero. |
 
 ## Telemetry

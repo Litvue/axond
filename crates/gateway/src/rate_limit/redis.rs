@@ -47,17 +47,6 @@ const RELEASE_RETRY_CONCURRENCY: usize = 16;
 const RELEASE_RETRY_WINDOW_MULTIPLIER: u32 = 10;
 const REDIS_OPERATION_TIMEOUT_MULTIPLIER: u32 = 4;
 const RELEASE_TIMEOUT_FLOOR: Duration = Duration::from_secs(1);
-const INVOKE_TIMEOUT_FLOOR: Duration = Duration::from_millis(500);
-// The old 256-invoke cap with the 250 ms admission timeout allowed
-// 256 / 0.25 = 1,024 admissions per second before shedding. Owned invokes now
-// live for up to 1 second at that default, so 1,024 preserves that headroom:
-// 1,024 / 1 = 1,024 outstanding invokes per second. At a 2-second admission
-// timeout the liveness budget is 8 seconds, so this fixed ceiling intentionally
-// sheds at 1,024 / 8 = 128 admissions per second rather than allowing 8,192
-// stalled tasks. The cap is therefore a safety ceiling, not a configurable
-// throughput promise; configurability can be considered once production
-// concurrency data justifies it. Saturation refuses only the current request
-// and is not evidence that the socket failed.
 #[cfg(test)]
 const SHARED_INVOKE_CONCURRENCY: usize = crate::redis_support::INVOKE_CONCURRENCY;
 
@@ -301,12 +290,7 @@ fn release_timeout(admission_timeout: Duration) -> Duration {
 }
 
 fn invoke_timeout(admission_timeout: Duration) -> Duration {
-    // Use the same four-times admission shape as release_timeout, but a
-    // shorter floor keeps low-timeout configurations from delaying recovery
-    // longer than necessary while still allowing ordinary Redis latency.
-    admission_timeout
-        .saturating_mul(REDIS_OPERATION_TIMEOUT_MULTIPLIER)
-        .max(INVOKE_TIMEOUT_FLOOR)
+    crate::redis_support::operation_liveness_timeout(admission_timeout)
 }
 
 type OwnedAcquireResult = Result<redis::RedisResult<(i64, String)>, tokio::time::error::Elapsed>;
