@@ -1348,6 +1348,13 @@ impl Config {
                     )));
                 }
             }
+            if let Some(capability) = scope.iter().find_map(|value| {
+                Capability::parse(value).filter(|capability| capability.is_operator_only())
+            }) {
+                return Err(ConfigError::Invalid(format!(
+                    "gateway_minting scope capability `{capability}` can never be minted"
+                )));
+            }
         }
         if let Some(aliases) = &minting.aliases {
             AliasScope::parse(aliases.iter().map(String::as_str)).map_err(|error| {
@@ -1901,6 +1908,11 @@ audience = "test"
                 "bad capability",
                 "kid = \"test\"\nenv = \"SIGN\"\nscope = [\"not-a-capability\"]",
                 "unknown capability",
+            ),
+            (
+                "operator-only capability",
+                "kid = \"test\"\nenv = \"SIGN\"\nscope = [\"credentials:all\"]",
+                "can never be minted",
             ),
             (
                 "bad alias",

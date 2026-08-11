@@ -1870,81 +1870,6 @@ max_request_microdollars = 1000
     }
 
     #[tokio::test]
-    async fn omitted_scope_cannot_inherit_operator_capability() {
-        let mut cfg = Config::from_toml_str(
-            r#"
-[[namespace]]
-id = "platform"
-default = true
-
-[[gateway_key]]
-env = "MINT_KEY"
-namespace = "platform"
-can_mint = true
-
-[gateway_token]
-audience = "test-audience"
-
-[[gateway_verifier]]
-kid = "mint-kid"
-alg = "HS256"
-env = "JWT_SECRET"
-namespaces = ["platform"]
-max_ttl = "15m"
-
-[gateway_minting]
-kid = "mint-kid"
-env = "JWT_SECRET"
-scope = ["credentials"]
-aliases = ["gpt-*"]
-max_request_microdollars = 1000
-"#,
-        )
-        .expect("valid minting config");
-        cfg.gateway_minting.as_mut().expect("minting config").scope =
-            Some(vec!["credentials:all".to_owned()]);
-        let env = HashMap::from([
-            ("MINT_KEY".to_owned(), "mint-key".to_owned()),
-            (
-                "JWT_SECRET".to_owned(),
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-            ),
-        ]);
-        let state = AppState::new(
-            cfg,
-            &env,
-            UsageFanout::new(vec![Box::new(StdoutSink)]),
-            Box::new(NoBudget),
-        )
-        .expect("state");
-        let (status, body) = mint_request(state, json!({"sub": "agent"})).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body["error"]["type"], "mint_claims_not_narrowing");
-        let response = router(minting_state_without_scope())
-            .oneshot(
-                Request::get("/v1/credentials?namespaces=all")
-                    .header(axum::http::header::AUTHORIZATION, "Bearer mint-key")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-        let (status, body) = mint_request(
-            minting_state_with_scope_audience_epochs(
-                "scope = [\"credentials\", \"credentials:all\"]",
-                "test-audience",
-                "",
-            ),
-            json!({"sub": "agent", "scope": ["credentials:all"]}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body["error"]["type"], "mint_claims_not_narrowing");
-    }
-
-    #[tokio::test]
     async fn no_scope_ceiling_inherits_ordinary_capabilities() {
         let state = minting_state_without_scope();
         let (status, body) = mint_request(state.clone(), json!({"sub": "agent"})).await;
@@ -1960,21 +1885,6 @@ max_request_microdollars = 1000
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn inherited_operator_scope_is_rejected_when_minting_key_lacks_it() {
-        let (status, body) = mint_request(
-            minting_state_with_scope_audience_epochs(
-                "scope = [\"credentials\", \"credentials:all\"]",
-                "test-audience",
-                "",
-            ),
-            json!({"sub": "agent"}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body["error"]["type"], "mint_claims_not_narrowing");
     }
 
     #[tokio::test]
