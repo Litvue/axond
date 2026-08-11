@@ -1573,28 +1573,28 @@ impl Config {
     fn validate_usage_sinks(&self) -> Result<(), ConfigError> {
         for sink in &self.usage_sink {
             let kind = sink.kind.as_str();
-            if sink.buffer_capacity == 0 {
-                return Err(ConfigError::Invalid(format!(
-                    "usage_sink `{kind}`: buffer_capacity must be at least 1"
-                )));
-            }
-            if sink.max_batch == 0 {
-                return Err(ConfigError::Invalid(format!(
-                    "usage_sink `{kind}`: max_batch must be at least 1"
-                )));
-            }
-            if sink.max_batch_explicit && sink.max_batch > sink.buffer_capacity {
-                return Err(ConfigError::Invalid(format!(
-                    "usage_sink `{kind}`: max_batch ({}) must not exceed buffer_capacity ({})",
-                    sink.max_batch, sink.buffer_capacity
-                )));
-            }
-            if sink.flush_interval_ms == 0 {
-                return Err(ConfigError::Invalid(format!(
-                    "usage_sink `{kind}`: flush_interval_ms must be at least 1"
-                )));
-            }
             if sink.kind == UsageSinkKind::Postgres {
+                if sink.buffer_capacity == 0 {
+                    return Err(ConfigError::Invalid(format!(
+                        "usage_sink `{kind}`: buffer_capacity must be at least 1"
+                    )));
+                }
+                if sink.max_batch == 0 {
+                    return Err(ConfigError::Invalid(format!(
+                        "usage_sink `{kind}`: max_batch must be at least 1"
+                    )));
+                }
+                if sink.max_batch_explicit && sink.max_batch > sink.buffer_capacity {
+                    return Err(ConfigError::Invalid(format!(
+                        "usage_sink `{kind}`: max_batch ({}) must not exceed buffer_capacity ({})",
+                        sink.max_batch, sink.buffer_capacity
+                    )));
+                }
+                if sink.flush_interval_ms == 0 {
+                    return Err(ConfigError::Invalid(format!(
+                        "usage_sink `{kind}`: flush_interval_ms must be at least 1"
+                    )));
+                }
                 match sink.dsn_env.as_deref().map(str::trim) {
                     Some(dsn_env) if !dsn_env.is_empty() => {}
                     _ => {
@@ -2522,6 +2522,28 @@ dsn_env = "DSN"
                 "accepted `{bad}`"
             );
         }
+    }
+
+    #[test]
+    fn ignores_batch_validation_for_non_batching_sinks() {
+        let toml = format!(
+            r#"
+{VALID}
+
+[[usage_sink]]
+kind = "stdout"
+buffer_capacity = 0
+max_batch = 0
+flush_interval_ms = 0
+
+[[usage_sink]]
+kind = "otlp"
+buffer_capacity = 0
+max_batch = 0
+flush_interval_ms = 0
+"#
+        );
+        Config::from_toml_str(&toml).expect("non-batching sinks ignore batch settings");
     }
 
     #[test]

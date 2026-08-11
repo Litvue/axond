@@ -153,21 +153,13 @@ impl PostgresSink {
         Ok(client)
     }
 
-    /// Insert one statement's worth of rows, reconnecting once if the
-    /// connection was stale.
-    async fn insert_chunk(&self, chunk: &[ObservedRecord]) -> Result<(), SinkFailure> {
-        let sql = insert_sql(&self.table, chunk.len());
-        let values: Vec<Vec<Box<dyn ToSql + Sync + Send>>> = chunk.iter().map(row).collect();
-        let params: Vec<&(dyn ToSql + Sync)> = values
-            .iter()
-            .flatten()
-            .map(|value| value.as_ref() as &(dyn ToSql + Sync))
-            .collect();
-
+    /// Insert all chunks in one transaction, reconnecting once if the
+    /// connection was stale or the transaction failed.
+    async fn insert_batch(&self, batch: &[ObservedRecord]) -> Result<(), SinkFailure> {
         let mut guard = self.client.lock().await;
         let mut last_error: Option<tokio_postgres::Error> = None;
         for _ in 0..2 {
-            let client = match guard.take() {
+            let mut client = match guard.take() {
                 Some(client) if !client.is_closed() => client,
                 _ => match self.connect_client().await {
                     Ok(client) => client,
@@ -177,14 +169,35 @@ impl PostgresSink {
                     }
                 },
             };
-            match client.execute(sql.as_str(), &params).await {
-                Ok(_) => {
+            let transaction = match client.transaction().await {
+                Ok(transaction) => transaction,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+            let result = async {
+                for chunk in batch.chunks(MAX_ROWS_PER_STATEMENT) {
+                    let sql = insert_sql(&self.table, chunk.len());
+                    let values: Vec<Vec<Box<dyn ToSql + Sync + Send>>> =
+                        chunk.iter().map(row).collect();
+                    let params: Vec<&(dyn ToSql + Sync)> = values
+                        .iter()
+                        .flatten()
+                        .map(|value| value.as_ref() as &(dyn ToSql + Sync))
+                        .collect();
+                    transaction.execute(sql.as_str(), &params).await?;
+                }
+                transaction.commit().await
+            }
+            .await;
+            match result {
+                Ok(()) => {
                     *guard = Some(client);
                     return Ok(());
                 }
-                // The connection is discarded either way: a statement that
-                // failed on a live connection is a schema or data problem, and
-                // retrying it on the same connection cannot help.
+                // The transaction is rolled back and the connection is
+                // discarded either way: a failed write is not safely reusable.
                 Err(e) => last_error = Some(e),
             }
         }
@@ -209,10 +222,7 @@ impl UsageSink for PostgresSink {
     }
 
     async fn record_batch(&self, batch: &[ObservedRecord]) -> Result<(), SinkFailure> {
-        for chunk in batch.chunks(MAX_ROWS_PER_STATEMENT) {
-            self.insert_chunk(chunk).await?;
-        }
-        Ok(())
+        self.insert_batch(batch).await
     }
 }
 
@@ -480,5 +490,65 @@ mod tests {
         assert_eq!(rows[0].get::<_, &str>(1), "acme");
         assert_eq!(rows[0].get::<_, i64>(2), 640);
         assert_eq!(rows[0].get::<_, i64>(3), 812);
+    }
+
+    #[tokio::test]
+    async fn a_later_chunk_failure_rolls_back_the_whole_batch() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let table = "axond_usage_atomicity_test";
+        let sink = PostgresSink::connect(
+            &dsn,
+            PostgresSinkSettings {
+                table: table.to_owned(),
+                create_table: true,
+            },
+        )
+        .await
+        .expect("connect");
+        {
+            let guard = sink.client.lock().await;
+            let client = guard.as_ref().expect("connected");
+            client
+                .execute(&format!("TRUNCATE {table}"), &[])
+                .await
+                .expect("truncate");
+            client
+                .execute(
+                    &format!(
+                        "ALTER TABLE {table} DROP CONSTRAINT IF EXISTS atomicity_test_request_id"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("drop prior failure constraint");
+            client
+                .execute(
+                    &format!(
+                        "ALTER TABLE {table} ADD CONSTRAINT atomicity_test_request_id \
+                         CHECK (request_id <> 'fail-later')"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("add failure constraint");
+        }
+
+        let mut batch: Vec<ObservedRecord> =
+            (0..=MAX_ROWS_PER_STATEMENT).map(|_| observed()).collect();
+        batch.last_mut().expect("second chunk").record.request_id = "fail-later".into();
+        assert!(
+            sink.record_batch(&batch).await.is_err(),
+            "the constrained second chunk must fail"
+        );
+
+        let guard = sink.client.lock().await;
+        let client = guard.as_ref().expect("reconnected");
+        let rows = client
+            .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+            .await
+            .expect("count");
+        assert_eq!(rows.get::<_, i64>(0), 0);
     }
 }

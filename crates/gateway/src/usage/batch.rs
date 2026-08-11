@@ -26,9 +26,8 @@ use super::{DropReason, ObservedRecord, SinkFailure, UsageRecord, UsageSink};
 pub struct BatchSettings {
     /// Records the buffer holds before the fan-out starts dropping.
     pub capacity: usize,
-    /// Rows per write. The Postgres sink binds one parameter set per row, so
-    /// this is bounded by the wire protocol's parameter limit (see
-    /// [`super::postgres`]).
+    /// Rows accumulated before a write. The Postgres sink splits larger
+    /// batches across statements while preserving one flush outcome.
     pub max_batch: usize,
     /// How long a partial batch waits for company before it is written anyway.
     pub flush_interval: Duration,
