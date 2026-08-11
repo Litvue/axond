@@ -124,8 +124,11 @@ terminal: the relay emits an SSE `error` event on the already-`200` response,
 and the usage record settles as `partial` or `upstream_error`. An
 OpenAI-normalized stream may instead rotate to the next pooled credential when
 an explicit upstream rate-limit event arrives before anything is queued
- downstream; the additional lease span remains under the original upstream
- attempt and request trace.
+downstream; the additional lease span remains under the original upstream
+attempt and request trace. Rotation does not create another upstream attempt
+span: there is one attempt span per target attempt, while `attempts` and
+`axond.retry_count` remain target-scoped. The target-open attempt can be
+`ok` while a later lease child is `rate_limited`.
 
 ### Boot failures
 

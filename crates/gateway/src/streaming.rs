@@ -149,54 +149,6 @@ impl RotationHandle {
     }
 }
 
-/// Attempt to open one target's upstream stream, wrapped in its per-attempt
-/// child span. Returns the undecoded byte stream on success, or the transport
-/// error so the failover loop can decide whether to advance to the next target
-/// — failover is only possible here, *before* the first byte is relayed.
-///
-/// The open itself is supplied by the caller so an adapter-encoded and a native
-/// passthrough stream share one attempt-span and one failover walk. A
-/// non-success upstream status is reported before any bytes flow, so a failed
-/// open never yields a partially-consumed stream.
-pub async fn open_stream_with_parent<F>(
-    ctx: &StreamContext,
-    attempt: u32,
-    lease_id: &str,
-    lease_index: usize,
-    open: F,
-    parent: Option<Context>,
-) -> Result<ByteStream, TransportError>
-where
-    F: Future<Output = Result<ByteStream, TransportError>>,
-{
-    // The attempt span covers opening the stream, which is where a failed
-    // stream fails; the relayed body outlives it, so its TTFT is reported
-    // through the metrics at settlement instead.
-    let started = Instant::now();
-    let attempt_span = telemetry::upstream_attempt_span(
-        attempt,
-        &ctx.target_provider,
-        &ctx.target_model,
-        UsageRecord::credential_source_str(ctx.source),
-    );
-    if let Some(parent) = parent {
-        let _ = attempt_span.set_parent(parent);
-    }
-    let opened =
-        open_stream_with_attempt_span(ctx, &attempt_span, lease_id, lease_index, open).await;
-    telemetry::finish_upstream_attempt(
-        &attempt_span,
-        if opened.is_ok() {
-            telemetry::ATTEMPT_OK
-        } else {
-            telemetry::ATTEMPT_ERROR
-        },
-        started.elapsed().as_millis() as u64,
-        None,
-    );
-    opened
-}
-
 pub async fn open_stream_with_attempt_span<F>(
     ctx: &StreamContext,
     attempt_span: &tracing::Span,
@@ -1840,22 +1792,22 @@ targets = [
         let _default = tracing::dispatcher::set_default(&dispatch);
         let server = tracing::info_span!("http.server.request");
         let parent_context = server.context();
-        let result = open_stream_with_parent(
-            &context(),
-            0,
-            "rate-limited",
-            0,
-            async {
+        let attempt = telemetry::upstream_attempt_span(0, "test", "model", "platform");
+        let _ = attempt.set_parent(parent_context);
+        let entered = attempt.enter();
+        let result =
+            open_stream_with_attempt_span(&context(), &attempt, "rate-limited", 0, async {
                 Err(TransportError::Provider(ProviderError::from_upstream(
                     "test",
                     429,
                     "rate limited",
                 )))
-            },
-            Some(parent_context),
-        )
-        .await;
+            })
+            .await;
+        drop(entered);
         assert!(result.is_err());
+        telemetry::finish_upstream_attempt(&attempt, telemetry::ATTEMPT_ERROR, 0, None);
+        drop(attempt);
         drop(server);
         provider.force_flush().unwrap();
         let spans = exporter.get_finished_spans().unwrap();
