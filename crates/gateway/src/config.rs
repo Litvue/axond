@@ -1340,6 +1340,11 @@ impl Config {
             ));
         }
         if let Some(scope) = &minting.scope {
+            if scope.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "gateway_minting scope must contain at least one capability".into(),
+                ));
+            }
             for value in scope {
                 if Capability::parse(value).is_none() {
                     return Err(ConfigError::Invalid(format!(
@@ -1897,6 +1902,15 @@ audience = "test"
                 "unknown capability",
             ),
             (
+                "operator-only capability",
+                "kid = \"test\"\nenv = \"SIGN\"\nscope = [\"credentials:all\"]",
+                "can never be minted",
+            ),
+            (
+                "empty scope",
+                "kid = \"test\"\nenv = \"SIGN\"\nscope = []",
+                "at least one capability",
+            ),
                 "bad alias",
                 "kid = \"test\"\nenv = \"SIGN\"\naliases = [\"gpt-*-bad\"]",
                 "invalid alias pattern",

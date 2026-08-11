@@ -167,6 +167,8 @@ struct MintTokenRequest {
     max_request_microdollars: Option<u64>,
 }
 
+const MAX_MINT_SUBJECT_LENGTH: usize = 128;
+
 async fn mint_tokens(
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
@@ -184,6 +186,15 @@ async fn mint_tokens(
         return Err(GatewayError::BadRequest("`sub` must not be empty".into()));
     }
     let subject = request.sub.trim().to_owned();
+    if subject.chars().count() > MAX_MINT_SUBJECT_LENGTH
+        || !subject.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || matches!(character, '.' | '-')
+        })
+    {
+        return Err(GatewayError::BadRequest(format!(
+            "`sub` must be at most {MAX_MINT_SUBJECT_LENGTH} ASCII letters, digits, or `_.-`"
+        )));
+    }
     let epoch = snapshot.gateway_token_epoch(&caller.namespace, &subject);
     let iat = epoch
         .map(|min_iat| {
@@ -2843,9 +2854,12 @@ max_ttl = "15m"
             json!({"sub": "agent", "ns": "platform"}),
             json!({"sub": ""}),
             json!({"sub": "   "}),
+            json!({"sub": "a".repeat(MAX_MINT_SUBJECT_LENGTH + 1)}),
+            json!({"sub": "agent@example"}),
         ] {
-            let (status, _) = mint_request(minting_state(), body).await;
+            let (status, response) = mint_request(minting_state(), body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(response["error"]["type"], "bad_request");
         }
     }
 
