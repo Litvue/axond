@@ -799,8 +799,7 @@ mod tests {
         };
         let err = migrate_redis(&config, &[], &HashMap::new())
             .await
-            .err()
-            .expect("migrating without the cap must fail");
+            .expect_err("migrating without the cap must fail");
         assert!(
             format!("{err}").contains("namespace_limit_microdollars"),
             "the error must name the missing setting: {err}"
