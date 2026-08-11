@@ -1298,10 +1298,17 @@ impl Config {
         namespaces: &HashMap<&str, &Namespace>,
     ) -> Result<(), ConfigError> {
         let Some(minting) = &self.gateway_minting else {
-            if self.gateway_key.iter().any(|key| key.can_mint) {
-                return Err(ConfigError::Invalid(
-                    "`can_mint = true` requires `[gateway_minting]`".into(),
-                ));
+            let inert_keys = self
+                .gateway_key
+                .iter()
+                .filter(|key| key.can_mint)
+                .map(|key| key.source_label().unwrap_or("<unknown>").to_owned())
+                .collect::<Vec<_>>();
+            if !inert_keys.is_empty() {
+                tracing::warn!(
+                    keys = ?inert_keys,
+                    "`can_mint = true` is inert because `[gateway_minting]` is absent"
+                );
             }
             return Ok(());
         };
@@ -1967,8 +1974,8 @@ max_ttl = "15m"
     }
 
     #[test]
-    fn can_mint_without_gateway_minting_is_rejected() {
-        let error = Config::from_toml_str(
+    fn can_mint_without_gateway_minting_is_inert() {
+        let config = Config::from_toml_str(
             r#"
 [[namespace]]
 id = "platform"
@@ -1979,8 +1986,8 @@ namespace = "platform"
 can_mint = true
 "#,
         )
-        .expect_err("can_mint must require minting config");
-        assert!(error.to_string().contains("gateway_minting"), "{error}");
+        .expect("can_mint is inert without minting config");
+        assert!(config.gateway_minting.is_none());
     }
 
     #[test]

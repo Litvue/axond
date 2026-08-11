@@ -400,11 +400,14 @@ coarsest to most targeted:
    and subject, so the gateway does not mint tokens it would immediately
    reject with `token_issued_before_epoch`.
 
-To revoke in-gateway issuance entirely, remove `[gateway_minting]`; that takes
-effect on reload and is the fast path for shutting issuance off. Alternatively,
-setting every gateway key's `can_mint` to `false` leaves the section in place
-but makes the endpoint reject every caller with `mint_not_authorized`. Reload
-logs a warning when minting is configured without an authorized key.
+To revoke in-gateway issuance entirely, either remove `[gateway_minting]` or
+set every gateway key's `can_mint` to `false`. Removing the section takes effect
+on reload, leaves the boot-registered handler returning typed 404
+`minting_disabled`, and makes any remaining `can_mint = true` flags inert;
+reload logs name those keys. Clearing the final `can_mint` flag leaves the
+section in place but makes the endpoint reject every caller with
+`mint_not_authorized`; reload logs a warning when minting is configured without
+an authorized key.
 
 4. **`jti` denylist (#68).** A future opt-in denylist can reject one token by
    its mandatory `jti`.
