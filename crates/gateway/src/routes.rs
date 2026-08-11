@@ -949,6 +949,11 @@ async fn dispatch_with_failover(
     Err(walk.into_error())
 }
 
+enum StreamLeaseParent<'a> {
+    Attempt(&'a tracing::Span),
+    Rotation(opentelemetry::Context),
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn open_stream_lease(
     state: &AppState,
@@ -959,8 +964,7 @@ async fn open_stream_lease(
     wire: &Wire,
     lease: &CredentialLease,
     lease_index: usize,
-    attempt_span: Option<&tracing::Span>,
-    lease_parent: Option<opentelemetry::Context>,
+    parent: StreamLeaseParent<'_>,
 ) -> Result<
     (
         Box<dyn ProviderStreamDecoder>,
@@ -988,8 +992,8 @@ async fn open_stream_lease(
                 model: target.model.clone(),
                 body: request_body,
             };
-            match attempt_span {
-                Some(span) => {
+            match parent {
+                StreamLeaseParent::Attempt(span) => {
                     streaming::open_stream_with_attempt_span(
                         ctx,
                         span,
@@ -1004,39 +1008,28 @@ async fn open_stream_lease(
                     )
                     .await?
                 }
-                None => {
+                StreamLeaseParent::Rotation(parent) => {
                     let open = state.0.dispatcher.dispatch_stream(
                         adapter.as_ref(),
                         &upstream,
                         Surface::ChatCompletions,
                         request,
                     );
-                    if let Some(parent) = lease_parent {
-                        streaming::open_stream_with_lease_parent(
-                            ctx,
-                            &lease.id,
-                            lease_index,
-                            open,
-                            parent,
-                        )
-                        .await?
-                    } else {
-                        streaming::open_stream_with_attempt_span(
-                            ctx,
-                            attempt_span.expect("attempt span"),
-                            &lease.id,
-                            lease_index,
-                            open,
-                        )
-                        .await?
-                    }
+                    streaming::open_stream_with_lease_parent(
+                        ctx,
+                        &lease.id,
+                        lease_index,
+                        open,
+                        parent,
+                    )
+                    .await?
                 }
             }
         }
         _ => {
             let call = wire.call(request_body, adapter.name());
-            match attempt_span {
-                Some(span) => {
+            match parent {
+                StreamLeaseParent::Attempt(span) => {
                     streaming::open_stream_with_attempt_span(
                         ctx,
                         span,
@@ -1046,27 +1039,16 @@ async fn open_stream_lease(
                     )
                     .await?
                 }
-                None => {
+                StreamLeaseParent::Rotation(parent) => {
                     let open = state.0.dispatcher.send_stream(&upstream, &call);
-                    if let Some(parent) = lease_parent {
-                        streaming::open_stream_with_lease_parent(
-                            ctx,
-                            &lease.id,
-                            lease_index,
-                            open,
-                            parent,
-                        )
-                        .await?
-                    } else {
-                        streaming::open_stream_with_attempt_span(
-                            ctx,
-                            attempt_span.expect("attempt span"),
-                            &lease.id,
-                            lease_index,
-                            open,
-                        )
-                        .await?
-                    }
+                    streaming::open_stream_with_lease_parent(
+                        ctx,
+                        &lease.id,
+                        lease_index,
+                        open,
+                        parent,
+                    )
+                    .await?
                 }
             }
         }
@@ -1167,8 +1149,7 @@ async fn stream_with_failover(
                 wire,
                 lease,
                 plan.parked.len() + lease_index,
-                Some(&attempt_span),
-                None,
+                StreamLeaseParent::Attempt(&attempt_span),
             )
             .await;
             ctx.attempts = target_attempt + 1;
@@ -1242,8 +1223,7 @@ async fn stream_with_failover(
                                     &wire,
                                     &next_lease,
                                     lease_index,
-                                    None,
-                                    Some(parent_context),
+                                    StreamLeaseParent::Rotation(parent_context),
                                 )
                                 .await
                                 .map(|(decoder, bytes)| streaming::OpenedStream { decoder, bytes })

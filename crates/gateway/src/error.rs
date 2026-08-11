@@ -92,6 +92,9 @@ impl GatewayError {
                 ProviderError::ModelUnavailable(_) => StatusCode::BAD_GATEWAY,
                 ProviderError::Dependency(_) => StatusCode::BAD_GATEWAY,
                 ProviderError::InvalidStream(_) => StatusCode::BAD_GATEWAY,
+                // Stream decoder rate limits arrive after a 200 response and
+                // are relayed in-band; stream-open 429s are Dependency errors.
+                // This arm is therefore not an HTTP response path today.
                 ProviderError::RateLimitedStream(_) => StatusCode::BAD_GATEWAY,
                 ProviderError::AllCircuitsOpen(_) => StatusCode::SERVICE_UNAVAILABLE,
             },
