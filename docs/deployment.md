@@ -459,9 +459,19 @@ against the namespaces in your config. Neither half of that tag was escaped, so
 `{team|west|abc}` could mean namespace `team` or `team|west`; rather than guess,
 the migration stops with the offending key named, having moved and deleted
 nothing. That happens when a namespace has been removed from the config while its
-spend is still in Redis (add it back, or delete the key), or when one namespace id
-is a prefix of another such that both could own the key (rename, or migrate under
-a separate `key_prefix`).
+spend is still in Redis (add it back, or delete the key), when one namespace id is
+a prefix of another such that both could own the key (rename, or migrate under a
+separate `key_prefix`), and when a configured id matches but leaves a `|` in the
+subject — a match is not proof of ownership there, since the tag reads just as well
+as a longer namespace the config no longer declares.
+
+The last of those is the one no config change resolves: an old subject id
+containing a `|` cannot be attributed safely, so carry those keys into the new
+layout by hand or delete them (accepting the reset of those ledgers) before
+migrating. This is a property of the *old* keys only. The v2 layout escapes each
+identifier into its own key segment, so pipes in a namespace or subject id are
+unambiguous once carried — and a namespace id containing `|` migrates normally when
+the subject it leaves has no `|` of its own.
 
 In-flight reservations are not carried over, which is the other reason to stop
 traffic first.

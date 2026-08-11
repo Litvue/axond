@@ -716,6 +716,14 @@ async fn carry_forward(
 /// to a namespace that is not theirs. So the tag is resolved against the
 /// configured namespace ids instead of split, and anything that does not match
 /// exactly one of them is an error — the migration refuses rather than guesses.
+///
+/// Matching one id is not sufficient either: a remaining `|` in the subject means
+/// the tag also reads as a longer namespace, and a namespace absent from the
+/// config is the ordinary reason a key is left over in the first place. So those
+/// are refused as well, which is why a v1 subject id containing a `|` cannot be
+/// migrated automatically. Nothing constrains the v2 layout that way: it escapes
+/// each identifier into its own key segment, so pipes in either are unambiguous
+/// once carried.
 fn resolve_legacy_scope(
     key_prefix: &str,
     key: &str,
@@ -729,8 +737,9 @@ fn resolve_legacy_scope(
                 "the v1 budget key `{key}` cannot be attributed: {detail}. The v1 \
                  `{{namespace|subject}}` tag is unescaped, so it is resolved against the \
                  configured `[[namespace]]` ids rather than split; nothing has been migrated or \
-                 deleted. Configure the namespace this key belongs to (or delete the key if the \
-                 namespace is gone) and re-run the migration."
+                 deleted. Configure the namespace this key belongs to and re-run the migration \
+                 — or, if the tag cannot be read one way whatever is configured, carry this key \
+                 into the v2 layout by hand (or delete it, accepting the reset of that ledger)."
             ),
         )
     };
@@ -758,7 +767,18 @@ fn resolve_legacy_scope(
     matched.sort_by(|a, b| (&a.namespace, &a.subject).cmp(&(&b.namespace, &b.subject)));
     matched.dedup();
     match matched.len() {
-        1 => Ok(matched.remove(0)),
+        // One configured id matching is not proof that it owns the key: if the
+        // subject it leaves still holds a `|`, the same tag reads as a longer
+        // namespace that this config simply does not declare — which is exactly
+        // what a namespace removed while its spend was still in Redis looks like.
+        // Carrying it would merge one tenant's spend into another's and then
+        // delete the only evidence, so it is refused like any other ambiguity.
+        1 if !matched[0].subject.contains('|') => Ok(matched.remove(0)),
+        1 => Err(ambiguous(&format!(
+            "`{}` is a configured namespace id, but the tag's remainder (`{}`) holds a `|` too, so \
+             the tag reads equally as a longer namespace this config does not declare",
+            matched[0].namespace, matched[0].subject
+        ))),
         0 => Err(ambiguous(
             "no configured namespace id is a prefix of its tag",
         )),
@@ -977,10 +997,15 @@ mod tests {
             resolve_legacy_scope("axond:budget", key, ":spent", &namespaces)
         };
 
-        // A `|` in the subject is not a namespace boundary.
-        let parsed = resolve("axond:budget:{acme|sub|ject}:spent", &["acme"]).expect("resolved");
-        assert_eq!(parsed.namespace, "acme");
-        assert_eq!(parsed.subject, "sub|ject");
+        // `acme` matching is not proof it owns the key: the same tag reads as
+        // namespace `acme|sub`, which no config declares here but a removed one
+        // may have. Unattributable, so refused rather than merged into `acme`.
+        let unattributable = resolve("axond:budget:{acme|sub|ject}:spent", &["acme"])
+            .expect_err("a `|` left in the subject is a second reading of the tag");
+        assert!(
+            format!("{unattributable}").contains("holds a `|` too"),
+            "{unattributable}"
+        );
 
         // A `|` in the *namespace* would have been split off by a first-`|`
         // reading, moving `team|west`'s spend into a namespace called `team`.
@@ -1584,6 +1609,79 @@ mod tests {
             "400 carried, 250 settled under v2, 150 recovered: the recovery added \
              its delta instead of overwriting the total"
         );
+    }
+
+    /// A configured id being a prefix of a tag does not prove it owns the key: the
+    /// same tag reads as a longer namespace this config no longer declares, which
+    /// is what a namespace removed while its spend was still in Redis looks like.
+    /// Carrying it would merge one tenant's spend into another's and delete the
+    /// evidence, so it is refused with the keyspace untouched.
+    #[tokio::test]
+    async fn a_configured_namespace_that_is_only_a_prefix_does_not_claim_the_key() {
+        let Some(url) = crate::test_services::redis_url() else {
+            return;
+        };
+        let prefix = prefix();
+        let client = ::redis::Client::open(url.as_str()).expect("client");
+        let mut connection = ConnectionManager::new(client).await.expect("connect");
+        // Written by namespace `team|west`, which has since left the config.
+        let orphan = format!("{prefix}:{{team|west|abc}}:spent");
+        let _: () = connection.set(&orphan, 70).await.expect("orphan write");
+
+        let err = migrate_v1_to_v2(&url, &prefix, &["team".to_owned()])
+            .await
+            .expect_err("a prefix match over a `|`-bearing remainder must abort the migration");
+        assert!(format!("{err}").contains(&orphan), "{err}");
+
+        let left: Option<i64> = connection.get(&orphan).await.expect("read");
+        assert_eq!(left, Some(70), "nothing is moved or deleted on an abort");
+        assert_eq!(namespace_spent(&url, &prefix, "team").await, 0);
+        let marker: Option<String> = connection
+            .get(layout_key(&prefix))
+            .await
+            .expect("read marker");
+        assert_eq!(marker, None, "and nothing is stamped");
+
+        // A namespace id containing `|` still migrates, as long as what it leaves
+        // is a subject that cannot be read another way.
+        let report = migrate_v1_to_v2(&url, &prefix, &["team|west".to_owned()])
+            .await
+            .expect("the owning namespace resolves it");
+        assert_eq!(report.carried_microdollars, 70);
+        assert_eq!(namespace_spent(&url, &prefix, "team|west").await, 70);
+        assert_eq!(namespace_spent(&url, &prefix, "team").await, 0);
+    }
+
+    /// The v2 layout escapes each identifier into its own key segment, so a `|` in
+    /// either is only ambiguous in the v1 tag the migration has to read.
+    #[tokio::test]
+    async fn a_pipe_bearing_subject_is_unambiguous_under_the_v2_layout() {
+        let Some(url) = crate::test_services::redis_url() else {
+            return;
+        };
+        let prefix = prefix();
+        migrate_v1_to_v2(&url, &prefix, &namespaces())
+            .await
+            .expect("migrate an empty prefix");
+        let store = RedisBudget::connect(&url, prefix.clone(), namespace_settings(1_000, 1_000))
+            .await
+            .expect("connect");
+        let piped = BudgetKey {
+            namespace: "acme".into(),
+            subject: "sub|ject".into(),
+        };
+        let plain = BudgetKey {
+            namespace: "acme".into(),
+            subject: "sub".into(),
+        };
+        let Admission::Allowed(held) = store.reserve(&piped, 300).await else {
+            panic!("within both caps");
+        };
+        store.settle(&piped, &held, 300).await;
+
+        assert_eq!(spent(&url, &prefix, &piped).await, 300);
+        assert_eq!(spent(&url, &prefix, &plain).await, 0, "no key collision");
+        assert_eq!(namespace_spent(&url, &prefix, "acme").await, 300);
     }
 
     /// The sequence keys and the record of applied claims exist to make an
