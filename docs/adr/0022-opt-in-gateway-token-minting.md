@@ -62,10 +62,17 @@ budgets are therefore not a namespace-wide spend ceiling:
 `BudgetConfig::limit_microdollars` is a cap per `(namespace, subject)`, so
 `can_mint` has unbounded namespace spend authority by construction while
 minting is enabled. `can_mint` is operator-level trust and must not be handed
-to a downstream service. Namespace-level budget capping is the blocker for
-recommending minting and requires a follow-up issue. Request throttling is not
-a mitigation: minted tokens outlive the mint request, so throttling only slows
-accumulation of fresh subjects and bounds nothing. Operators should isolate
+to a downstream service. The blocker this ADR recorded — namespace-level budget
+capping — is now available:
+`BudgetConfig::namespace_limit_microdollars` caps everything a namespace spends
+across all its subjects, enforced exactly on the `redis` and `postgres` backends
+([ADR 0010](./0010-shared-budget-backends-and-charging-policy.md)). Every
+deployment that enables minting should set it in the minting namespaces, since it
+is what converts subject rotation from spend authority into a shared ceiling; the
+`in-memory` and `none` backends cannot enforce it and reject it at boot.
+Request throttling is not a mitigation: minted tokens outlive the mint request,
+so throttling only slows accumulation of fresh subjects and bounds nothing.
+Operators should isolate
 minting namespaces from namespaces that rely on per-subject controls and keep
 `max_ttl` short.
 
@@ -109,5 +116,7 @@ and this decision does not raise the state tier of an existing deployment.
 - Precise per-token revocation, issuance accounting, rate limiting, and
   budget reservation remain follow-up work outside this stateless endpoint.
 - Per-subject budget and concurrency controls are not a namespace-wide
-  ceiling when callers can choose fresh subjects; namespace isolation and
-  short-lived tokens are the accepted operational mitigation.
+  ceiling when callers can choose fresh subjects. The spend half of that gap is
+  now closable with `namespace_limit_microdollars` on a shared budget backend,
+  which minting deployments should set; namespace isolation and short-lived
+  tokens remain the mitigation for the concurrency half.

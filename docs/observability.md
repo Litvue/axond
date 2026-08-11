@@ -71,6 +71,7 @@ metric and a usage row can never disagree.
 | `axond.config.reloads` | counter | `axond.reload.trigger`, `axond.reload.outcome` | Reload attempts and whether they applied. |
 | `axond.config.generation` | gauge | — | `0` at boot, `+1` per applied reload. |
 | `axond.budget.capacity_denials` | counter | — | In-memory admissions denied because the ledger bound was exhausted. |
+| `axond.budget.namespace_denials` | counter | — | Admissions denied by `namespace_limit_microdollars` rather than by the subject's own cap. Both answer `429`. |
 | `axond.budget.retained_subjects` | gauge | — | In-memory ledgers retained after capacity-pressure pruning; watch against `max_subjects`. |
 | `axond.rate_limit.denials` | counter | — | Inbound concurrency admissions rejected. |
 | `axond.rate_limit.capacity_denials` | counter | — | In-memory admissions rejected because the bounded subject map is full. |
@@ -89,6 +90,7 @@ metric and a usage row can never disagree.
 | Rejected reloads | `axond.config.reloads{outcome="rejected"}` > 0 | Someone edited the config into an invalid state; the old one is still serving. |
 | Budget capacity exhausted | `axond.budget.capacity_denials` > 0 | The replica is refusing unseen subjects; investigate subject churn and the in-memory bound. |
 | Budget ledger pressure | `axond.budget.retained_subjects` near configured `max_subjects` | Leading indicator that the bound is approaching; watch it before capacity denials occur. |
+| Namespace budget exhausted | `axond.budget.namespace_denials` > 0 | The whole namespace is out of budget, so *every* subject in it is being denied — not one noisy caller. Raise `namespace_limit_microdollars` or investigate what is spending. |
 | TTFT regression | `axond.request.time_to_first_token` p95 | Provider degradation shows here before total latency moves. |
 
 ## Usage records
@@ -113,7 +115,7 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | `404` | `unknown_model` | The alias is not configured. | Add a `[[model]]`, or fix the caller. `/v1/models` lists the aliases the caller can invoke. |
 | `400` | `unsupported_wire` | The alias's target (or one of its failover targets) does not speak this route's wire — e.g. an OpenAI-only alias on `/v1/messages`. Raised **before** anything is reserved or dispatched. | Fix the alias's targets; no route translates between wires. See the [compatibility contract](./compatibility.md). |
 | `400` | `invalid_request`, `context_window_exceeded`, `bad_request` | The provider (or the gateway) rejected the request shape. | Caller-side fix; retrying will not help. |
-| `429` | `budget_exceeded` | The `(namespace, subject)` cap is spent — settled spend plus live holds leaves no room. | Raise `limit_microdollars` or wait. This is the tenant's own cap, not a provider rate limit. |
+| `429` | `budget_exceeded` | The `(namespace, subject)` cap is spent — settled spend plus live holds leaves no room. With `namespace_limit_microdollars` set, the same code and body also cover the namespace-wide cap being spent; `axond.budget.namespace_denials` is what tells them apart. | Raise `limit_microdollars` (or `namespace_limit_microdollars`) or wait. This is the tenant's own cap, not a provider rate limit. |
 | `503` | `budget_unavailable` | The budget store could not be reached and `on_unavailable = "deny"` (the default). | Fix Redis/Postgres. **Distinguish this from `429`:** `429` is the tenant over budget, `503` is *your* dependency down. |
 | `503` | `rate_limit_unavailable` | The Redis rate-limit store could not be reached and `on_unavailable = "deny"` (the default). | Fix Redis or deliberately choose `on_unavailable = "allow"`. |
 | `503` | `all_provider_circuits_open` | Every target for the alias has a tripped circuit. | The upstreams are down or the thresholds are too tight; check `axond.upstream.circuit_state`. |

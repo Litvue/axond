@@ -37,7 +37,7 @@ use crate::config::{BudgetBackend, BudgetConfig, StoreUnavailable};
 use crate::telemetry::metrics;
 
 pub use postgres::PostgresBudget;
-pub use redis::RedisBudget;
+pub use redis::{MigrationReport, RedisBudget};
 
 /// The dimension a budget is scoped to. Neutral vocabulary, like usage records.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -532,8 +532,27 @@ impl BudgetError {
 #[derive(Debug, Clone, Copy)]
 pub struct SharedSettings {
     pub limit_microdollars: u64,
+    /// The optional namespace-wide cap. `Some` turns every reserve and settle
+    /// into a composite `(subject, namespace)` operation on the same logical
+    /// reservation; `None` leaves the subject-only behavior untouched.
+    pub namespace_limit_microdollars: Option<u64>,
     pub reservation_ttl: Duration,
     pub unavailable: UnavailablePolicy,
+}
+
+impl SharedSettings {
+    pub fn enforces_namespace_cap(&self) -> bool {
+        self.namespace_limit_microdollars.is_some()
+    }
+}
+
+/// Which cap a composite reserve ran out of. Both answer the caller with the
+/// same `429 budget_exceeded`; they differ only in what an operator should do,
+/// so the scope is logged and counted rather than exposed on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExceededScope {
+    Subject,
+    Namespace,
 }
 
 /// Build the configured backend. Connecting here means a misconfigured budget
@@ -546,10 +565,13 @@ pub async fn build(
 ) -> Result<Box<dyn BudgetStore>, BudgetError> {
     let settings = SharedSettings {
         limit_microdollars: config.limit_microdollars,
+        namespace_limit_microdollars: config.namespace_limit_microdollars,
         reservation_ttl: Duration::from_secs(config.reservation_ttl_seconds),
         unavailable: config.on_unavailable.into(),
     };
     match config.backend {
+        // `validate_budget` already refuses a namespace cap on these two, so
+        // reaching them here means no namespace cap was asked for.
         BudgetBackend::None => Ok(Box::new(NoBudget)),
         BudgetBackend::InMemory => Ok(Box::new(InMemoryBudget::with_settings_and_policy(
             config.limit_microdollars,
@@ -580,6 +602,27 @@ pub async fn build(
             ))
         }
     }
+}
+
+/// Move Redis budget state into the layout the namespace cap needs, carrying
+/// accumulated spend forward. Run with every replica stopped; the gateway
+/// refuses to boot with a namespace cap until this has been done, and refuses to
+/// boot without one afterwards, so neither direction silently resets a ledger.
+pub async fn migrate_redis(
+    config: &BudgetConfig,
+    env: &HashMap<String, String>,
+) -> Result<MigrationReport, BudgetError> {
+    if config.backend != BudgetBackend::Redis {
+        return Err(BudgetError::invalid(
+            "redis",
+            format!(
+                "the Redis budget migration needs `[budget] backend = \"redis\"`, not `{}`",
+                config.backend.as_str()
+            ),
+        ));
+    }
+    let url = dsn(config, "redis", env)?;
+    redis::migrate_v1_to_v2(url, &config.key_prefix()).await
 }
 
 /// The connection string, resolved from the environment. Like every other

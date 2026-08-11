@@ -141,6 +141,53 @@ was least observable.
 here: they change the admission decision from one key to a set of keys, which
 changes the atomic unit both backends are built around. Follow-up, not beta.
 
+### Amendment: an optional namespace-wide cap (2026-08-11)
+
+The subject-only scope above left a hole that
+[ADR 0022](./0022-opt-in-gateway-token-minting.md) had to accept as a caveat: a
+cap per `(namespace, subject)` bounds nothing when the caller can choose a fresh
+subject, so a namespace's spend authority was unbounded. `BudgetConfig`
+therefore gains an optional `namespace_limit_microdollars`, an additional cap on
+what a whole namespace spends.
+
+**It is exactly the two-key admission decision this ADR deferred, and only
+where it can be made exact.** Omitting it preserves the previous behavior
+unchanged; setting it is accepted only on `redis` and `postgres`, and rejected at
+boot on `none` and `in-memory`, which would enforce one cap per replica — a cap
+that is per-replica and *called* namespace-wide is worse than no cap, because it
+reads as a guarantee. Zero is rejected for the same reason it is on the subject
+cap.
+
+**Composite, or nothing.** A request is admitted only if the estimate fits both
+caps, and the two scopes are one logical reservation with one id: recorded in
+both and settled out of both by the same script (Redis) or the same transaction
+(Postgres). `on_unavailable` applies to the composite operation — `deny` answers
+`503`, `allow` serves with nothing held anywhere — so the gateway never enforces
+one scope while silently ignoring the other. A denial by either cap keeps the
+existing `429 budget_exceeded` contract; only a new counter,
+`axond.budget.namespace_denials`, distinguishes them, because "which of your caps"
+is an operator question, not a caller one.
+
+**Redis needs a new key layout, so it needs a migration.** A script spanning both
+scopes needs all four keys in one hash slot, and the v1 tag is
+`{namespace|subject}` — which puts each subject in a different slot. The v2
+layout tags every key with `{namespace}` alone. The layouts share no keys, so
+enabling the cap without moving state would read zero spend everywhere. Hence
+`axond budget migrate-redis`, a layout marker, and boot checks in both
+directions: with the cap set the gateway refuses to boot un-migrated or while any
+v1 key still exists (that is, while a v1 binary is still writing), and without the
+cap it refuses to boot against migrated state. Mixed binaries are the failure this
+fences — they would each enforce a share of the traffic. A counter is never
+lowered by the migration, so a re-run cannot reset a ledger.
+
+**Postgres gets an additive file, not an edit.** The shipped DDL is an interface,
+so the namespace spend table, the `(namespace, expires_at)` index the
+namespace-wide reservation cleanup needs, and the backfill from existing subject
+rows ship as [`budget_v2.sql`](../../ops/postgres/budget_v2.sql). Both
+transactions lock the namespace row first and the subject row second, so a reserve
+and a settlement on one namespace cannot deadlock. A namespace with spend but no
+backfilled row fails boot rather than starting from zero.
+
 **Dependency:** `redis` 1.4.1 (MIT), pinned exactly, with
 `default-features = false` and only `tokio-comp`, `tokio-rustls-comp`,
 `connection-manager`, and `script` — no sync client, no cluster or pubsub code,
@@ -177,3 +224,15 @@ by the same rule as the usage table — a change to the row shape is a new file.
   `AXOND_TEST_REQUIRE_SERVICES=1` to make missing services fail.
 - Per-model and hierarchical caps, and a budget-state admin/reset surface, remain
   open.
+- A namespace cap is a hot spot by construction: every subject in the namespace
+  contends on one spend row (Postgres) or one counter, and every reserve scans
+  that namespace's whole live-reservation set. That is the cost of exactness, and
+  it is why the cap is opt-in rather than always on.
+- "Exact" continues to mean settled spend plus live reservations under this ADR's
+  estimate and TTL semantics — not provider billing. A namespace cap inherits the
+  estimate conservatism above, now across every subject at once.
+- Enabling the cap on Redis is a stop-the-fleet migration, which is a real
+  operational cost. The alternative — dual-writing both layouts, or reading v1
+  keys behind the v2 scripts — would have kept the exactness guarantee only while
+  no replica lagged, so the migration is fenced at boot instead of made
+  "seamless".

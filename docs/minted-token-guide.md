@@ -52,16 +52,25 @@ Tier 0 path does not maintain an issuance registry.
 Because `sub` is caller-chosen, a trusted minting key can rotate subjects and
 give each new `(namespace, subject)` a fresh budget ledger and per-subject
 `max_in_flight_per_subject` allowance. `BudgetConfig::limit_microdollars` is
-the cap per `(namespace, subject)`; there is no namespace-wide cap, so a
-`can_mint` key has unbounded namespace spend authority by construction while
-minting is enabled. `max_request_microdollars` limits one request rather than
-cumulative spend. Treat `can_mint` as operator-level trust, never hand it to a
-downstream service, and keep minting namespaces separate from namespaces where
-per-subject controls are the spend boundary. This is the blocker for
-recommending minting; file the follow-up issue for a namespace-level budget
-cap. Request throttling would only slow subject accumulation because minted
-tokens outlive the request that created them and would not bound total spend.
-Keep `max_ttl` short.
+the cap per `(namespace, subject)`, so on its own it does not bound what a
+`can_mint` key can spend: it can always move to a subject that has not spent
+anything. `max_request_microdollars` limits one request rather than cumulative
+spend.
+
+**Bound the namespace, not just the subject.** Set
+`[budget] namespace_limit_microdollars` on a `redis` or `postgres` budget in
+every namespace where minting is enabled ([configuration](./configuration.md)).
+It caps everything the namespace spends across all its subjects, so rotating
+subjects no longer creates spend authority, and it is enforced exactly across
+replicas. Without it, a `can_mint` key still has unbounded namespace spend
+authority by construction. `in-memory` is not sufficient here: it would enforce
+one cap per replica.
+
+Even with the namespace cap, treat `can_mint` as operator-level trust, never hand
+it to a downstream service, and keep the subject cap set as well so one subject
+cannot consume the whole namespace. Request throttling would only slow subject
+accumulation, because minted tokens outlive the request that created them, and
+would not bound total spend. Keep `max_ttl` short.
 
 ```bash
 curl -s https://gateway.example/v1/tokens -H "Authorization: Bearer $GW_INBOUND_PLATFORM_KEY" -H 'content-type: application/json' -d '{"sub":"agent-7","ttl_seconds":300,"scope":["chat"],"aliases":["gpt-4o"],"max_request_microdollars":500}'
@@ -266,7 +275,7 @@ The verifier requires these claims:
 | `aud` | Deployment audience; must match `[gateway_token].audience`. |
 | `jti` | Non-empty token identifier; required even in Tier 0. |
 | `ns` | Existing namespace permitted by the selected verifier. |
-| `sub` | Non-empty caller subject used for budgets and usage attribution. |
+| `sub` | Non-empty caller subject used for budgets and usage attribution. Caller-chosen, so the namespace cap is the spend boundary. |
 
 `nbf` is optional and, when present, is checked with the verifier's fixed
 five-second clock-skew allowance. Unknown claims are otherwise ignored by the

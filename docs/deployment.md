@@ -396,6 +396,7 @@ config-owned; only callers and keys may become store-owned.
 | 1 | A spend cap across replicas | `[budget] backend = "redis"` | Redis availability couples budgeted admission to Redis; `deny` fails closed. |
 | 2 | Durable usage rows | `[[usage_sink]] kind = "postgres"` | A Postgres role, the [`usage_v2.sql`](../ops/postgres/usage_v2.sql) table, ordered additive migrations, and backup/restore ownership. |
 | 2 | A spend cap across replicas | `[budget] backend = "postgres"` | Postgres availability and the [`budget_v1.sql`](../ops/postgres/budget_v1.sql) tables. |
+| 1 or 2 | A cap on a whole namespace, not just each subject | `[budget] namespace_limit_microdollars` on a `redis` or `postgres` budget | A one-time migration with the fleet stopped (below), and contention on one key or row per namespace. |
 
 For upgrades, apply each additive `usage_v1_<sequence>_<name>.sql` migration in
 filename order before deploying a gateway that writes its new column. Otherwise
@@ -405,3 +406,47 @@ the dropped-records metric, until the migrations are applied.
 A `[budget]` backend of `in-memory` enforces the cap **per replica**, so a fleet
 of N replicas admits up to N caps. Use a shared backend for a real fleet-wide
 cap.
+
+### Enabling a namespace-wide cap
+
+`namespace_limit_microdollars` caps everything a namespace spends across all its
+subjects, which is what bounds a namespace whose holder can mint fresh subjects
+(see the [minted-token guide](./minted-token-guide.md)). Only `redis` and
+`postgres` can enforce it exactly across replicas, so the other backends reject
+it at boot. Turning it on is a **migration**, not a config flip, because the
+accumulated spend has to be carried into the new shape:
+
+**Redis.** Stop every replica, then run the migration and start the fleet with
+the cap set:
+
+```bash
+axond budget migrate-redis --config /etc/axond/axond.toml
+```
+
+Do not run old and new binaries at the same time. A version without namespace-cap
+support writes the previous key layout, so the two would each enforce a share of
+the traffic. The gateway fences this rather than trusting the runbook: with the
+cap set it refuses to boot until the migration marker exists and refuses to boot
+while any old-layout key remains; once migrated, it refuses to boot *without* the
+cap, because the old keys no longer hold the spend. The migration never lowers a
+counter, so re-running it (or resuming an interrupted run) cannot reset a ledger.
+In-flight reservations are not carried over, which is the other reason to stop
+traffic first.
+
+**Postgres.** Apply [`budget_v2.sql`](../ops/postgres/budget_v2.sql) on top of
+`budget_v1.sql` — it is additive, and its backfill seeds each namespace total
+from the subject rows already present:
+
+```bash
+psql "$AXOND_BUDGET_POSTGRES_DSN" -f ops/postgres/budget_v2.sql
+```
+
+It is safe on a live v1 database and idempotent, so it can be applied before the
+rollout; `create_table = true` applies it at boot instead. The gateway refuses to
+start if a namespace has spend but no backfilled row, so the cap cannot silently
+begin from zero.
+
+Both backends then concentrate a namespace's traffic on one hot spot — one spend
+row in Postgres, one counter and reservation hash in Redis — and every reserve
+scans that namespace's live reservations. Size for that when a single namespace
+carries the bulk of the fleet's requests.

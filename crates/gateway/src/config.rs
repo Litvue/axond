@@ -458,6 +458,12 @@ pub struct BudgetConfig {
     /// backend but `none`.
     #[serde(default)]
     pub limit_microdollars: u64,
+    /// An additional exact cap, in micro-dollars, on everything a *namespace*
+    /// spends — every subject in it combined. Omitted by default, which keeps
+    /// per-subject-only enforcement. Only the shared backends can enforce it
+    /// exactly, so `none` and `in-memory` reject it at boot (ADR 0010).
+    #[serde(default)]
+    pub namespace_limit_microdollars: Option<u64>,
     /// What to do when the store cannot be reached. Fail-closed by default: an
     /// unenforceable cap denies rather than silently admitting.
     #[serde(default)]
@@ -536,6 +542,7 @@ impl Default for BudgetConfig {
         Self {
             backend: BudgetBackend::None,
             limit_microdollars: 0,
+            namespace_limit_microdollars: None,
             on_unavailable: StoreUnavailable::Deny,
             dsn_env: None,
             table: None,
@@ -1431,6 +1438,21 @@ impl Config {
     fn validate_budget(&self) -> Result<(), ConfigError> {
         let budget = &self.budget;
         let backend = budget.backend.as_str();
+        // Checked before the `none` short-circuit: a namespace cap on a backend
+        // that cannot enforce it exactly is a boot failure, not a no-op.
+        match budget.namespace_limit_microdollars {
+            Some(_) if !budget.backend.is_shared() => {
+                return Err(ConfigError::Invalid(format!(
+                    "budget `{backend}`: namespace_limit_microdollars is supported only by `redis` and `postgres`, which enforce it exactly across replicas"
+                )));
+            }
+            Some(0) => {
+                return Err(ConfigError::Invalid(format!(
+                    "budget `{backend}`: namespace_limit_microdollars must be at least 1"
+                )));
+            }
+            _ => {}
+        }
         if budget.backend == BudgetBackend::None {
             return Ok(());
         }
@@ -2150,6 +2172,56 @@ on_unavailable = "allow"
         assert_eq!(cfg.budget.backend, BudgetBackend::Redis);
         assert_eq!(cfg.budget.on_unavailable, StoreUnavailable::Allow);
         assert_eq!(cfg.budget.key_prefix(), "axond:budget");
+    }
+
+    #[test]
+    fn a_shared_backend_reads_the_optional_namespace_cap() {
+        let cfg = Config::from_toml_str(&format!(
+            r#"{VALID}
+[budget]
+backend = "redis"
+limit_microdollars = 10000
+namespace_limit_microdollars = 100000
+dsn_env = "AXOND_BUDGET_REDIS_URL"
+"#
+        ))
+        .expect("valid config");
+        assert_eq!(cfg.budget.namespace_limit_microdollars, Some(100_000));
+    }
+
+    /// Omitting it must keep the previous per-subject-only behavior exactly.
+    #[test]
+    fn omitting_the_namespace_cap_leaves_subject_only_enforcement() {
+        let cfg = Config::from_toml_str(&format!(
+            "{VALID}\n[budget]\nbackend = \"redis\"\nlimit_microdollars = 1\ndsn_env = \"R\"\n"
+        ))
+        .expect("valid config");
+        assert_eq!(cfg.budget.namespace_limit_microdollars, None);
+    }
+
+    /// Only the shared backends can enforce a namespace cap *exactly*, so the
+    /// others reject it rather than pretending to honour it per replica.
+    #[test]
+    fn a_namespace_cap_needs_a_backend_that_can_enforce_it_exactly() {
+        for budget in [
+            "[budget]\nnamespace_limit_microdollars = 100",
+            "[budget]\nbackend = \"none\"\nnamespace_limit_microdollars = 100",
+            "[budget]\nbackend = \"in-memory\"\nlimit_microdollars = 1\nnamespace_limit_microdollars = 100",
+        ] {
+            let error = Config::from_toml_str(&format!("{VALID}\n{budget}\n"))
+                .err()
+                .unwrap_or_else(|| panic!("`{budget}` must be rejected"));
+            assert!(
+                format!("{error}").contains("namespace_limit_microdollars is supported only by"),
+                "{error}"
+            );
+        }
+        // Zero would deny every request in the namespace.
+        let error = Config::from_toml_str(&format!(
+            "{VALID}\n[budget]\nbackend = \"redis\"\nlimit_microdollars = 1\ndsn_env = \"R\"\nnamespace_limit_microdollars = 0\n"
+        ))
+        .expect_err("zero must be rejected");
+        assert!(format!("{error}").contains("must be at least 1"), "{error}");
     }
 
     /// A budget whose fields do not add up is a boot failure, not a surprise at
