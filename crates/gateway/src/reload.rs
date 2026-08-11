@@ -211,6 +211,8 @@ pub struct ReloadSummary {
     pub gateway_minting_fingerprint: Option<String>,
     /// Minting is configured, but no static key is authorized to use it.
     pub gateway_minting_without_authorized_key: bool,
+    /// Static keys declaring `can_mint` while minting is disabled.
+    pub gateway_minting_inert_keys: Vec<String>,
     /// `[server] bind` differs from what the process bound at startup.
     pub bind_changed: bool,
     /// `[[usage_sink]]` differs from the connected sinks.
@@ -398,6 +400,16 @@ impl ReloadSummary {
             gateway_minting_fingerprint: after.gateway_minting_fingerprint.clone(),
             gateway_minting_without_authorized_key: after_config.gateway_minting.is_some()
                 && !after_config.gateway_key.iter().any(|key| key.can_mint),
+            gateway_minting_inert_keys: if after_config.gateway_minting.is_none() {
+                after_config
+                    .gateway_key
+                    .iter()
+                    .filter(|key| key.can_mint)
+                    .filter_map(|key| key.source_label().map(str::to_owned))
+                    .collect()
+            } else {
+                Vec::new()
+            },
             bind_changed: boot.bind != after_config.server.bind,
             usage_sinks_changed: boot.usage_sink != after_config.usage_sink,
             budget_changed: boot.budget != after_config.budget,
@@ -479,6 +491,17 @@ impl ReloadSummary {
         if self.gateway_minting_without_authorized_key {
             tracing::warn!(
                 "`[gateway_minting]` is configured, but no gateway key has `can_mint = true`; `/v1/tokens` rejects every caller"
+            );
+        }
+        if !self.gateway_minting_inert_keys.is_empty() {
+            tracing::warn!(
+                keys = ?self.gateway_minting_inert_keys,
+                "`can_mint = true` has no effect because `[gateway_minting]` is absent"
+            );
+        }
+        if self.revocation_changed {
+            tracing::warn!(
+                "`[revocation]` changed, but the revocation store is already serving; restart to apply it"
             );
         }
     }
@@ -1047,6 +1070,27 @@ scope = ["chat", "models"]
         let removed = ReloadSummary::between(&boot, &enabled, &disabled);
         assert_eq!(removed.gateway_minting.removed, vec!["enabled".to_owned()]);
         assert!(removed.gateway_minting.changed.is_empty());
+
+        let inert = ConfigSnapshot::build(
+            Config::from_toml_str(
+                &WITH_GATEWAY_MINTING.replace(
+                    "[gateway_minting]\nkid = \"reload-kid\"\nenv = \"SIGNING_KEY\"\nmax_ttl = \"10m\"\n",
+                    "",
+                ),
+            )
+            .unwrap(),
+            &minting_env(),
+            2,
+        )
+        .unwrap();
+        let inert_summary = ReloadSummary::between(&boot, &enabled, &inert);
+        assert_eq!(
+            inert_summary.gateway_minting_inert_keys,
+            vec![
+                "AXOND_INBOUND_KEY".to_owned(),
+                "AXOND_SECOND_KEY".to_owned()
+            ]
+        );
 
         let no_authorized_key = ConfigSnapshot::build(
             Config::from_toml_str(

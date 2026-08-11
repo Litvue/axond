@@ -1872,7 +1872,6 @@ max_request_microdollars = 1000
     }
 
     #[tokio::test]
-<<<<<<< HEAD
     async fn no_scope_ceiling_inherits_ordinary_capabilities() {
         let state = minting_state_without_scope();
         let (status, body) = mint_request(state.clone(), json!({"sub": "agent"})).await;
@@ -1896,69 +1895,8 @@ max_request_microdollars = 1000
                 "sub": "agent",
                 "scope": ["credentials:all"],
             }),
-||||||| parent of 2af6b3b (fix(gateway): enforce inherited minting scope authority)
-    async fn minting_key_cannot_escalate_operator_capability() {
-        let state = minting_state_with_scope_audience_epochs(
-            "scope = [\"credentials\", \"credentials:all\"]",
-            "test-audience",
-            "",
-        );
-        let (status, body) = mint_request(
-            state,
-            json!({
-                "sub": "agent",
-                "scope": ["credentials:all"],
-            }),
-=======
-    async fn omitted_scope_cannot_inherit_operator_capability() {
-        let mut cfg = Config::from_toml_str(
-            r#"
-[[namespace]]
-id = "platform"
-default = true
-
-[[gateway_key]]
-env = "MINT_KEY"
-namespace = "platform"
-can_mint = true
-
-[gateway_token]
-audience = "test-audience"
-
-[[gateway_verifier]]
-kid = "mint-kid"
-alg = "HS256"
-env = "JWT_SECRET"
-namespaces = ["platform"]
-max_ttl = "15m"
-
-[gateway_minting]
-kid = "mint-kid"
-env = "JWT_SECRET"
-scope = ["credentials"]
-aliases = ["gpt-*"]
-max_request_microdollars = 1000
-"#,
->>>>>>> 2af6b3b (fix(gateway): enforce inherited minting scope authority)
         )
-        .expect("valid minting config");
-        cfg.gateway_minting.as_mut().expect("minting config").scope =
-            Some(vec!["credentials:all".to_owned()]);
-        let env = HashMap::from([
-            ("MINT_KEY".to_owned(), "mint-key".to_owned()),
-            (
-                "JWT_SECRET".to_owned(),
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-            ),
-        ]);
-        let state = AppState::new(
-            cfg,
-            &env,
-            UsageFanout::new(vec![Box::new(StdoutSink)]),
-            Box::new(NoBudget),
-        )
-        .expect("state");
-        let (status, body) = mint_request(state, json!({"sub": "agent"})).await;
+        .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"]["type"], "mint_claims_not_narrowing");
     }
