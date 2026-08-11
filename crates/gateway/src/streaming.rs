@@ -684,9 +684,9 @@ impl Accounting {
         const CHARS_PER_TOKEN: usize = 4;
         if self.carried_output_tokens == 0
             && (self.usage.input_tokens > 0
-            || self.usage.output_tokens > 0
-            || self.usage.cache_read_tokens > 0
-            || self.usage.cache_write_tokens > 0)
+                || self.usage.output_tokens > 0
+                || self.usage.cache_read_tokens > 0
+                || self.usage.cache_write_tokens > 0)
         {
             return self.usage;
         }
@@ -709,7 +709,7 @@ impl Accounting {
                 self.usage.output_tokens
             } else {
                 self.relayed_chars.div_ceil(CHARS_PER_TOKEN) as u64
-        };
+            };
         usage
     }
 

@@ -330,21 +330,16 @@ pub struct UsageSinkConfig {
     pub kind: UsageSinkKind,
     /// `postgres`: name of the env var holding the connection string. The DSN is
     /// a secret, so it is referenced rather than inlined, like every credential.
-    #[serde(default)]
     pub dsn_env: Option<String>,
     /// `postgres`: destination table. Defaults to `axond_usage`, matching the
     /// shipped DDL.
-    #[serde(default)]
     pub table: Option<String>,
     /// `postgres`: apply the shipped DDL at boot. Off by default — most
     /// deployments give the gateway's role no DDL rights.
-    #[serde(default)]
     pub create_table: bool,
     /// Records buffered before the fan-out starts dropping (`postgres`).
-    #[serde(default = "default_buffer_capacity")]
     pub buffer_capacity: usize,
     /// Rows per write (`postgres`).
-    #[serde(skip)]
     pub max_batch: usize,
     #[doc(hidden)]
     pub max_batch_explicit: bool,
