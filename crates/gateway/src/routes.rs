@@ -1570,6 +1570,8 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use http_body_util::BodyExt;
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
     use serde::Serialize;
     use std::collections::HashMap;
     use std::future::pending;
@@ -1578,6 +1580,7 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::oneshot;
     use tower::util::ServiceExt;
+    use tracing_subscriber::layer::SubscriberExt;
 
     /// The inbound key every test config declares, and the secret the caller
     /// presents for it. Inbound auth is always enforced (ADR 0013).
@@ -2713,6 +2716,127 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(records[0].signer_kid, None);
         // The pool made one target attempt (credential rotation is inner).
         assert_eq!(records[0].attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn buffered_pool_dispatch_emits_parented_lease_spans() {
+        let base_url = rate_limiting_upstream("sk-rate-limited").await;
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "{base_url}"
+
+{GATEWAY_KEY}
+
+[credential_pool]
+failure_threshold = 1
+cooldown_seconds = 60
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K_PARKED"
+id = "parked"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K_RATE"
+id = "rate-limited"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K_SERVED"
+id = "served"
+
+[[model]]
+name = "gpt-4o"
+targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+"#
+        ))
+        .unwrap();
+        let state = AppState::new(
+            cfg,
+            &env_with([
+                ("K_PARKED", "sk-parked"),
+                ("K_RATE", "sk-rate-limited"),
+                ("K_SERVED", "sk-served"),
+            ]),
+            UsageFanout::new(vec![Box::new(StdoutSink)]),
+            Box::new(NoBudget),
+        )
+        .unwrap();
+        let snapshot = state.config();
+        let parked = snapshot
+            .credentials
+            .plan(&snapshot.config, "platform", "openai")
+            .unwrap()
+            .attempts
+            .into_iter()
+            .find(|lease| lease.id == "parked")
+            .unwrap();
+        snapshot.credentials.record_failure(&parked);
+        snapshot.credentials.record_failure(&parked);
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("axond-test")));
+        let body = serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []})).unwrap();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let response = tokio::spawn(async move {
+            let _default = tracing::dispatcher::set_default(&dispatch);
+            router(state)
+                .oneshot(
+                    authorized("/v1/chat/completions")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        let attempt = spans
+            .iter()
+            .find(|span| span.name == "axond.upstream.attempt")
+            .unwrap();
+        let leases: Vec<_> = spans
+            .iter()
+            .filter(|span| span.name == "axond.credential.lease")
+            .collect();
+        assert_eq!(leases.len(), 3);
+        let attribute = |span: &opentelemetry_sdk::trace::SpanData, key: &str| {
+            span.attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.to_string())
+        };
+        for (id, status) in [
+            ("parked", "parked"),
+            ("rate-limited", "rate_limited"),
+            ("served", "served"),
+        ] {
+            let lease = leases
+                .iter()
+                .find(|span| attribute(span, "axond.credential.id").as_deref() == Some(id))
+                .unwrap();
+            assert_eq!(lease.parent_span_id, attempt.span_context.span_id());
+            assert_eq!(attribute(lease, "axond.status").as_deref(), Some(status));
+        }
     }
 
     /// A stand-in provider whose health is flipped at test time, counting the
