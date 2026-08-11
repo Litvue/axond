@@ -50,6 +50,12 @@ const DEFAULT_TABLE: &str = "axond_budget";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// What a cap-aware replica tells the database about itself, on every connection.
+/// The v2 fence trigger rejects spend and reservation writes from sessions that
+/// have not said this, which is what stops a replica configured without the cap
+/// from charging a subject while leaving the namespace total behind.
+const NAMESPACE_CAP_DECLARATION: &str = "SET axond.budget_namespace_cap = 'on'";
+
 #[derive(Debug, Clone)]
 pub struct PostgresBudgetSettings {
     /// Base table name. The reservation table is `<table>_reservation`.
@@ -95,6 +101,8 @@ impl PostgresBudget {
         }
         if store.settings.enforces_namespace_cap() {
             store.require_namespace_schema(&client).await?;
+        } else {
+            store.require_no_namespace_fence(&client).await?;
         }
         *store.client.lock().await = Some(client);
         Ok(store)
@@ -105,6 +113,14 @@ impl PostgresBudget {
     /// schema and its name may not be qualified.
     fn schema_ddl(&self, ddl: &str) -> String {
         let index_prefix = self.table.rsplit('.').next().unwrap_or(&self.table);
+        // `batch_execute` already runs a multi-statement query as one implicit
+        // transaction, so the file's own transaction control is redundant here
+        // (and nested `BEGIN` only earns a warning).
+        let ddl: String = ddl
+            .lines()
+            .filter(|line| !matches!(line.trim(), "BEGIN;" | "COMMIT;"))
+            .map(|line| format!("{line}\n"))
+            .collect();
         // Longest names first, into placeholders, so a substitution cannot chew
         // into a suffix that has not been replaced yet.
         ddl.replace(&format!("{DEFAULT_TABLE}_reservation_"), "\u{1}")
@@ -168,6 +184,21 @@ impl PostgresBudget {
                 ),
             ));
         }
+        // The backfill and the fence are installed together, so a missing fence
+        // means the applied file predates it — and without it a replica without
+        // the cap could still write here, leaving this namespace total short.
+        if !self.fence_installed(client).await? {
+            return Err(BudgetError::invalid(
+                BACKEND,
+                format!(
+                    "`{table}` has no `{}` trigger, so nothing stops a replica configured without \
+                     `namespace_limit_microdollars` from recording spend that never reaches the \
+                     namespace total. Re-apply `ops/postgres/budget_v2.sql` (with the fleet \
+                     stopped), which installs it.",
+                    self.fence_name()
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -178,7 +209,54 @@ impl PostgresBudget {
                 tracing::warn!(error = %e, "postgres budget connection closed");
             }
         });
+        if self.settings.enforces_namespace_cap() {
+            // Every connection, not just the first: the fence is per session, and
+            // a reconnect after a failure gets a fresh one.
+            client.batch_execute(NAMESPACE_CAP_DECLARATION).await?;
+        }
         Ok(client)
+    }
+
+    /// The name of the v2 fence trigger, which is also its function's name.
+    fn fence_name(&self) -> String {
+        let prefix = self.table.rsplit('.').next().unwrap_or(&self.table);
+        format!("{prefix}_namespace_fence")
+    }
+
+    async fn fence_installed(&self, client: &Client) -> Result<bool, tokio_postgres::Error> {
+        let count: i64 = client
+            .query_one(
+                "SELECT count(*)::bigint FROM pg_trigger
+                 WHERE tgname = $1 AND NOT tgisinternal",
+                &[&self.fence_name()],
+            )
+            .await?
+            .get(0);
+        Ok(count > 0)
+    }
+
+    /// The mirror image of the fence: a replica configured *without* the cap must
+    /// not serve from a database that enforces one. The fence would reject its
+    /// writes anyway; refusing at boot turns a stream of failed settlements into
+    /// one legible error, and refuses before any traffic is admitted.
+    async fn require_no_namespace_fence(&self, client: &Client) -> Result<(), BudgetError> {
+        if self.fence_installed(client).await? {
+            return Err(BudgetError::invalid(
+                BACKEND,
+                format!(
+                    "`{}` enforces a namespace spend cap (the `{}` trigger from \
+                     `ops/postgres/budget_v2.sql` is installed), so \
+                     `namespace_limit_microdollars` must be set here too: without it this replica \
+                     would charge subjects without ever charging the namespace, and the cap would \
+                     under-count permanently. Set the same namespace limit as the rest of the \
+                     fleet, or drop the fence triggers to go back to per-subject-only \
+                     enforcement.",
+                    self.table,
+                    self.fence_name()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Runs one operation on the store's single connection, holding the lock for
@@ -470,6 +548,10 @@ fn bigint(value: u64) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::Barrier;
+
     use super::super::UnavailablePolicy;
     use super::super::tests::key;
     use super::*;
@@ -755,23 +837,130 @@ mod tests {
         .await
         .expect("connect");
 
-        let mut admitted = 0;
-        for index in 0..40 {
-            let store = if index % 2 == 0 {
-                &replica_a
-            } else {
-                &replica_b
-            };
-            let k = BudgetKey {
+        // Every task waits on the barrier, so the admissions genuinely overlap
+        // instead of taking turns: whatever serializes them has to be the
+        // namespace row lock, not the test's own sequencing.
+        let replica_a = Arc::new(replica_a);
+        let replica_b = Arc::new(replica_b);
+        let contenders = 40;
+        let start = Arc::new(Barrier::new(contenders));
+        let mut tasks = Vec::with_capacity(contenders);
+        for index in 0..contenders {
+            // Distinct subjects, so only the namespace cap can deny any of them.
+            let key = BudgetKey {
                 namespace: "acme".into(),
                 subject: format!("subject-{index}"),
             };
-            if let Admission::Allowed(held) = store.reserve(&k, 100).await {
+            let store = if index % 2 == 0 {
+                Arc::clone(&replica_a)
+            } else {
+                Arc::clone(&replica_b)
+            };
+            let start = Arc::clone(&start);
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                match store.reserve(&key, 100).await {
+                    Admission::Allowed(held) => {
+                        store.settle(&key, &held, 100).await;
+                        true
+                    }
+                    Admission::Denied(_) => false,
+                }
+            }));
+        }
+
+        let mut admitted = 0;
+        for task in tasks {
+            if task.await.expect("no task panicked") {
                 admitted += 1;
-                store.settle(&k, &held, 100).await;
             }
         }
+        // The cap divided by the estimate, exactly: not one request more, even
+        // though forty raced for it across two replicas.
         assert_eq!(admitted, 10);
+    }
+
+    /// The fence, from the direction that matters: a replica configured without
+    /// the namespace cap must not be able to record spend in a database that
+    /// enforces one, or the namespace total would drift down forever.
+    #[tokio::test]
+    async fn a_replica_without_the_namespace_cap_cannot_write_to_a_fenced_database() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let table = "axond_budget_ns_fence_test";
+        let capped = namespace_store(&dsn, table, namespace_settings(1_000, 1_000)).await;
+
+        // Boot direction one: the old configuration refuses to start.
+        let refused = PostgresBudget::connect(
+            &dsn,
+            PostgresBudgetSettings {
+                table: table.to_owned(),
+                create_table: false,
+                shared: settings(1_000),
+            },
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a cap-less replica must not boot against a fenced database"));
+        assert!(
+            format!("{refused}").contains("namespace_limit_microdollars"),
+            "{refused}"
+        );
+
+        // Spend from the cap-aware replica, so the fence has an existing row to
+        // defend as well as an insert to refuse.
+        let key = BudgetKey {
+            namespace: "acme".into(),
+            subject: "honest".into(),
+        };
+        let Admission::Allowed(held) = capped.reserve(&key, 600).await else {
+            panic!("the declared replica writes as before");
+        };
+        capped.settle(&key, &held, 600).await;
+
+        // And the database enforces it itself, for a binary that never had a boot
+        // check to run: a session that has not declared namespace-cap support
+        // cannot write spend or take a hold.
+        let (bare, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(connection);
+        for statement in [
+            format!(
+                "INSERT INTO {table} (namespace, subject, spent_microdollars)
+                 VALUES ('acme', 'sneaky', 500)"
+            ),
+            format!(
+                "UPDATE {table} SET spent_microdollars = spent_microdollars + 500
+                 WHERE namespace = 'acme'"
+            ),
+            format!(
+                "INSERT INTO {table}_reservation
+                     (id, namespace, subject, amount_microdollars, expires_at)
+                 VALUES ('x', 'acme', 'sneaky', 500, now() + interval '1 minute')"
+            ),
+        ] {
+            let rejected = bare
+                .execute(&statement, &[])
+                .await
+                .expect_err("the fence must reject an undeclared writer");
+            let raised = rejected
+                .as_db_error()
+                .map(|error| error.message().to_owned())
+                .unwrap_or_default();
+            assert!(
+                raised.contains("namespace spend cap"),
+                "the fence must be what refused it: {rejected} ({raised})"
+            );
+        }
+
+        // The namespace total is exactly what the declared replica charged.
+        assert_eq!(
+            capped.reserve(&key, 401).await,
+            Admission::Denied(Denial::Exceeded),
+            "the namespace has 600 of its 1000 spent, and nothing slipped past"
+        );
     }
 
     #[tokio::test]

@@ -421,8 +421,13 @@ cluster-safe key layout tagged by namespace rather than by
 $ axond budget migrate-redis --config axond.toml
 ```
 
-It carries accumulated spend forward (never lowering a counter, so a re-run is
-safe), sums namespace totals from it, and stamps a layout marker. A gateway with
+It carries accumulated spend forward — claimed out of each v1 counter and added
+to the v2 ones at most once, so an interrupted run loses nothing, a re-run adds
+nothing twice, and spend a stray v1 replica wrote *after* the first run is added
+rather than dropped — sums namespace totals from it, and stamps a layout marker.
+A legacy key whose `{namespace|subject}` tag matches no configured namespace, or
+more than one, stops the migration before anything is moved, deleted, or stamped
+rather than guessing where the namespace ends. A gateway with
 the cap set refuses to boot until that marker exists, refuses to boot while any
 v1 key remains — that is, while a version without namespace-cap support is still
 writing — and, once migrated, refuses to boot *without* the cap, since the v1
@@ -434,9 +439,15 @@ not carried over, so migrate with traffic stopped.
 `budget_v1.sql`: a namespace spend table, an index for namespace-wide
 reservation cleanup, and a backfill that seeds each namespace's total from the
 subject rows already there. Custom `table` names are substituted as usual
-(`<table>_namespace`), and `create_table = true` applies both files. The gateway
-refuses to boot if a namespace with spend has no backfilled row, so the cap
-cannot start from zero.
+(`<table>_namespace`), and `create_table = true` applies both files. Apply it with
+the fleet stopped and drained: the backfill's sum would otherwise miss a
+settlement committing behind it, leaving a namespace total permanently short (the
+file takes an `EXCLUSIVE` lock so such a settlement blocks rather than being
+lost). It also installs a fence trigger, so a replica configured *without* the
+namespace cap can neither boot against that database nor write to it — its spend
+would never reach the namespace total. The gateway refuses to boot if the fence is
+missing, or if a namespace with spend has no backfilled row, so the cap cannot
+start from zero or be bypassed by an old configuration.
 
 ## `[rate_limit]` — opt-in inbound concurrency enforcement
 

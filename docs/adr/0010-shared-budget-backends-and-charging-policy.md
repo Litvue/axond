@@ -177,8 +177,17 @@ enabling the cap without moving state would read zero spend everywhere. Hence
 directions: with the cap set the gateway refuses to boot un-migrated or while any
 v1 key still exists (that is, while a v1 binary is still writing), and without the
 cap it refuses to boot against migrated state. Mixed binaries are the failure this
-fences — they would each enforce a share of the traffic. A counter is never
-lowered by the migration, so a re-run cannot reset a ledger.
+fences — they would each enforce a share of the traffic.
+
+The carry is additive and at-most-once, not `max(v1, v2)`: spend is claimed out of
+a v1 counter and applied to the v2 ones under an idempotency token, so an
+interrupted run finishes, a repeat run charges nothing twice, and spend a stray v1
+replica wrote after the first run is *added* instead of being discarded as
+"already smaller". Attribution is resolved against the configured namespace ids
+rather than by splitting the tag at the first `|`, because neither half was ever
+escaped; zero or several candidate namespaces abort the run before anything moves,
+since silently charging `team|west`'s spend to `team` is worse than a failed
+migration.
 
 **Postgres gets an additive file, not an edit.** The shipped DDL is an interface,
 so the namespace spend table, the `(namespace, expires_at)` index the
@@ -187,6 +196,21 @@ rows ship as [`budget_v2.sql`](../../ops/postgres/budget_v2.sql). Both
 transactions lock the namespace row first and the subject row second, so a reserve
 and a settlement on one namespace cannot deadlock. A namespace with spend but no
 backfilled row fails boot rather than starting from zero.
+
+**Postgres fences the mixed fleet in the database.** A replica configured without
+the cap would charge the subject row and leave the namespace total untouched,
+which no later check can repair or even detect — the row is present and merely too
+small — so the cap would be bypassed for good. A runbook line is not enough for
+something described as exact, and neither is a boot check, which a replica started
+before the migration never runs. `budget_v2.sql` therefore installs a trigger on
+the spend and reservation tables that rejects writes from any session that has not
+declared namespace-cap support (`SET axond.budget_namespace_cap = 'on'`, which a
+cap-aware gateway sends on every connection). Old configurations fail loudly and
+immediately; cap-less boots are additionally refused with the fence named, and the
+backfill itself runs in one transaction under an `EXCLUSIVE` table lock so it
+cannot miss a settlement racing behind its sum. The cost is that reverting to
+per-subject-only enforcement is a deliberate `DROP TRIGGER`, which is the right
+price for a cap that claims to be exact.
 
 **Dependency:** `redis` 1.4.1 (MIT), pinned exactly, with
 `default-features = false` and only `tokio-comp`, `tokio-rustls-comp`,

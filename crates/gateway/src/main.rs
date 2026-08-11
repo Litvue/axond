@@ -227,7 +227,14 @@ fn migrate_redis_budget(args: &clap::ArgMatches) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to load config from `{config_path}`: {e}"))?;
     let env: HashMap<String, String> = std::env::vars().collect();
     let runtime = tokio::runtime::Runtime::new()?;
-    let report = runtime.block_on(budget::migrate_redis(&config.budget, &env))?;
+    // The v1 keys are attributed against the configured namespaces, so this must
+    // run with the config that wrote them.
+    let namespaces: Vec<String> = config
+        .namespace
+        .iter()
+        .map(|namespace| namespace.id.clone())
+        .collect();
+    let report = runtime.block_on(budget::migrate_redis(&config.budget, &namespaces, &env))?;
     eprintln!(
         "migrated {} subject ledger(s) into {} namespace total(s), carrying {} micro-dollars; \
          dropped {} stale reservation hash(es)",

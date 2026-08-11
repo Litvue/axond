@@ -608,8 +608,14 @@ pub async fn build(
 /// accumulated spend forward. Run with every replica stopped; the gateway
 /// refuses to boot with a namespace cap until this has been done, and refuses to
 /// boot without one afterwards, so neither direction silently resets a ledger.
+///
+/// `namespaces` is the configured namespace id list: the v1 keys carry an
+/// unescaped `{namespace|subject}` tag, so they are attributed by resolving that
+/// tag against real namespace ids rather than by splitting it at a delimiter
+/// that may appear in either half.
 pub async fn migrate_redis(
     config: &BudgetConfig,
+    namespaces: &[String],
     env: &HashMap<String, String>,
 ) -> Result<MigrationReport, BudgetError> {
     if config.backend != BudgetBackend::Redis {
@@ -622,7 +628,7 @@ pub async fn migrate_redis(
         ));
     }
     let url = dsn(config, "redis", env)?;
-    redis::migrate_v1_to_v2(url, &config.key_prefix()).await
+    redis::migrate_v1_to_v2(url, &config.key_prefix(), namespaces).await
 }
 
 /// The connection string, resolved from the environment. Like every other

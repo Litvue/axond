@@ -39,7 +39,7 @@
 //! contends on one spend counter, and every reserve scans that namespace's whole
 //! reservation hash. That is the cost of exactness (see ADR 0010).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -163,16 +163,45 @@ end
 return 1
 "#;
 
-/// Carry one v1 counter into its v2 counterpart without ever lowering it, so a
-/// re-run (or a resumed migration) cannot reset accumulated spend.
-const CARRY_SPEND: &str = r#"
-local carried = tonumber(ARGV[1])
-local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-if carried > current then
-  redis.call('SET', KEYS[1], carried)
-  return carried - current
+/// Step one of carrying a v1 counter forward: move the whole counter into a
+/// `pending` slot next to it, atomically, and stamp the batch with a sequence
+/// number. The v1 spend is gone the instant it is claimed, so nothing can read
+/// it twice; it is not yet *added* anywhere, so nothing is lost if this is where
+/// the migration dies — a re-run finds the same `pending` and finishes it.
+///
+/// All three keys carry the v1 `{namespace|subject}` tag, so they share one slot.
+/// Returns `seq:amount`, or `false` when there is nothing to claim.
+const DRAIN_V1: &str = r#"
+local pending = redis.call('GET', KEYS[2])
+if pending then
+  return pending
 end
-return 0
+local spent = redis.call('GET', KEYS[1])
+if not spent then
+  return false
+end
+local seq = redis.call('INCR', KEYS[3])
+redis.call('DEL', KEYS[1])
+local claim = seq .. ':' .. spent
+redis.call('SET', KEYS[2], claim)
+return claim
+"#;
+
+/// Step two: **add** a claimed batch to the v2 subject counter, at most once.
+/// The claim token is recorded in a hash beside the counter, in the same
+/// `{namespace}` slot, so the add and the record of having added it are one
+/// atomic operation. A repeated (or resumed) apply is a no-op, and a *new* batch
+/// from the same v1 key carries a new sequence number, so genuine post-migration
+/// spend is added rather than mistaken for a replay.
+const APPLY_CLAIM: &str = r#"
+local amount = tonumber(ARGV[2])
+if redis.call('HSETNX', KEYS[2], ARGV[1], amount) == 0 then
+  return 0
+end
+if amount > 0 then
+  redis.call('INCRBY', KEYS[1], amount)
+end
+return amount
 "#;
 
 pub struct RedisBudget {
@@ -395,8 +424,10 @@ pub struct MigrationReport {
     pub reservation_hashes: usize,
     /// Namespace totals written from the v2 subject ledgers.
     pub namespaces: usize,
-    /// Micro-dollars carried into subject ledgers that did not already hold
-    /// them. Zero on a re-run, which is what makes the migration idempotent.
+    /// Micro-dollars added to v2 subject ledgers by this run. Zero on a re-run
+    /// that finds nothing new, which is what makes the migration idempotent; a
+    /// non-zero value on a re-run is spend a stray v1 writer recorded after the
+    /// first migration, now recovered.
     pub carried_microdollars: u64,
 }
 
@@ -405,41 +436,70 @@ pub struct MigrationReport {
 ///
 /// Run it with every replica stopped: it deletes the v1 keys it has copied, and
 /// a v1 binary still serving traffic would recreate them (which the boot check
-/// then refuses). It is idempotent and resumable — a counter is never lowered,
-/// and namespace totals are recomputed from the subject ledgers, which is their
-/// invariant: every settlement charges a subject and its namespace the same
-/// amount.
-pub async fn migrate_v1_to_v2(url: &str, key_prefix: &str) -> Result<MigrationReport, BudgetError> {
+/// then refuses).
+///
+/// It is idempotent, resumable, and **additive**: spend is claimed out of a v1
+/// counter atomically and then added to its v2 counterpart at most once, keyed by
+/// the claim token, so an interrupted run loses nothing and a re-run double-counts
+/// nothing. That is also what makes the recovery the boot fence prescribes exact:
+/// spend a stray v1 replica wrote *after* an earlier migration is a new claim, so
+/// re-running adds it rather than discarding it. Namespace totals are then
+/// recomputed from the subject ledgers, which is their invariant — every
+/// settlement charges a subject and its namespace the same amount.
+///
+/// `namespaces` is the configured `[[namespace]]` id list, which is what the
+/// unescaped v1 tags are attributed against. Every v1 key is resolved before any
+/// of them is written or deleted, so a key that belongs to no configured
+/// namespace — or to more than one, and so cannot be split unambiguously — fails
+/// the migration with the state untouched and the layout unmarked.
+pub async fn migrate_v1_to_v2(
+    url: &str,
+    key_prefix: &str,
+    namespaces: &[String],
+) -> Result<MigrationReport, BudgetError> {
     let client = ::redis::Client::open(url)
         .map_err(|e| BudgetError::invalid(BACKEND, format!("unusable URL: {e}")))?;
     let mut connection = ConnectionManager::new(client).await?;
-    let carry = Script::new(CARRY_SPEND);
+    let drain = Script::new(DRAIN_V1);
+    let apply = Script::new(APPLY_CLAIM);
     let mut report = MigrationReport::default();
 
-    for legacy in scan(&mut connection, &legacy_patterns(key_prefix)[0]).await? {
-        let Some(key) = parse_legacy_scope(key_prefix, &legacy) else {
-            tracing::warn!(
-                "skipping a v1 budget key whose `{{namespace|subject}}` tag could not be read"
-            );
-            continue;
-        };
-        let spent: Option<i64> = connection.get(&legacy).await?;
-        let spent = spent.unwrap_or_default().max(0) as u64;
-        let carried: i64 = carry
-            .prepare_invoke()
-            .key(v2_keys(key_prefix, &key).subject_spent)
-            .arg(spent)
-            .invoke_async(&mut connection)
-            .await?;
-        let _: i64 = connection.del(&legacy).await?;
-        report.subjects += 1;
-        report.carried_microdollars = report
-            .carried_microdollars
-            .saturating_add(carried.max(0) as u64);
+    // Attribute every v1 key before touching any of them: a key that cannot be
+    // resolved to exactly one configured namespace fails the whole migration,
+    // with nothing deleted and the layout marker unset, so the operator fixes
+    // the configuration and re-runs rather than discovering half-moved state.
+    let spend_keys = scan(&mut connection, &legacy_patterns(key_prefix)[0]).await?;
+    let reservation_keys = scan(&mut connection, &legacy_patterns(key_prefix)[1]).await?;
+    // A claim an earlier run took but did not finish applying. Its `:spent` key
+    // is already gone, so only this pattern finds it.
+    let claimed_keys = scan(&mut connection, &format!("{key_prefix}:{{*}}{PENDING}")).await?;
+    let mut scopes = Vec::with_capacity(spend_keys.len() + claimed_keys.len());
+    for legacy in &spend_keys {
+        scopes.push(resolve_legacy_scope(
+            key_prefix, legacy, ":spent", namespaces,
+        )?);
+    }
+    for claimed in &claimed_keys {
+        scopes.push(resolve_legacy_scope(
+            key_prefix, claimed, PENDING, namespaces,
+        )?);
+    }
+    for legacy in &reservation_keys {
+        resolve_legacy_scope(key_prefix, legacy, ":reservations", namespaces)?;
     }
 
-    for legacy in scan(&mut connection, &legacy_patterns(key_prefix)[1]).await? {
-        let _: i64 = connection.del(&legacy).await?;
+    let mut seen = HashSet::new();
+    for key in scopes {
+        if !seen.insert((key.namespace.clone(), key.subject.clone())) {
+            continue;
+        }
+        let carried = carry_forward(&mut connection, &drain, &apply, key_prefix, &key).await?;
+        report.subjects += 1;
+        report.carried_microdollars = report.carried_microdollars.saturating_add(carried);
+    }
+
+    for legacy in &reservation_keys {
+        let _: i64 = connection.del(legacy).await?;
         report.reservation_hashes += 1;
     }
 
@@ -465,32 +525,126 @@ pub async fn migrate_v1_to_v2(url: &str, key_prefix: &str) -> Result<MigrationRe
     Ok(report)
 }
 
-/// The `(namespace, subject)` a v1 key belongs to, read back out of its hash
-/// tag. The namespace ends at the first `|`, matching how the tag was built.
-fn parse_legacy_scope(key_prefix: &str, key: &str) -> Option<BudgetKey> {
-    let tag = hash_tag(key)?;
-    let (namespace, subject) = tag.split_once('|')?;
-    if !key.starts_with(key_prefix) || namespace.is_empty() {
-        return None;
+/// Suffixes of the two bookkeeping keys a carry uses, both tagged like the v1
+/// key they belong to so a script may span them. `PENDING` holds a claim until
+/// it has been added to v2; `SEQ` makes every claim from the same v1 key
+/// distinct, so a later claim is never mistaken for a replay of an earlier one.
+/// Neither matches [`legacy_patterns`], so neither is read as v1 state.
+const PENDING: &str = ":migration_pending";
+const SEQ: &str = ":migration_seq";
+
+/// Claim whatever a v1 subject counter holds and add it to its v2 counterpart,
+/// repeating until the v1 side is empty. Each claim is atomic on the v1 side and
+/// applied at most once on the v2 side, so this is safe to interrupt and safe to
+/// re-run: an interrupted claim is finished by the next run, and an applied claim
+/// is skipped. Returns the micro-dollars actually added.
+async fn carry_forward(
+    connection: &mut ConnectionManager,
+    drain: &Script,
+    apply: &Script,
+    key_prefix: &str,
+    key: &BudgetKey,
+) -> Result<u64, BudgetError> {
+    let scope = format!("{key_prefix}:{{{}|{}}}", key.namespace, key.subject);
+    let pending = format!("{scope}{PENDING}");
+    let v2 = v2_keys(key_prefix, key);
+    let applied = format!(
+        "{}:migration:applied",
+        namespace_scope(key_prefix, &key.namespace)
+    );
+    let mut carried: u64 = 0;
+    loop {
+        let claim: Option<String> = drain
+            .prepare_invoke()
+            .key(format!("{scope}:spent"))
+            .key(&pending)
+            .key(format!("{scope}{SEQ}"))
+            .invoke_async(connection)
+            .await?;
+        let Some(claim) = claim else {
+            return Ok(carried);
+        };
+        let (sequence, amount) = claim.split_once(':').ok_or_else(|| {
+            BudgetError::invalid(
+                BACKEND,
+                format!("the migration claim in `{pending}` is malformed: `{claim}`"),
+            )
+        })?;
+        let amount: i64 = amount.parse().unwrap_or_default();
+        let added: i64 = apply
+            .prepare_invoke()
+            .key(&v2.subject_spent)
+            .key(&applied)
+            // Unique per subject *and* per claim, so re-applying is a no-op but
+            // a fresh claim is additive.
+            .arg(format!("{}#{sequence}", escaped(&key.subject)))
+            .arg(amount.max(0))
+            .invoke_async(connection)
+            .await?;
+        let _: i64 = connection.del(&pending).await?;
+        carried = carried.saturating_add(added.max(0) as u64);
     }
-    if subject.contains('|') {
-        // The v1 tag is not escaped, so a `|` in either identifier makes the
-        // split ambiguous. The first `|` is the documented reading; say so,
-        // because the alternative reading would move spend to another namespace.
-        tracing::warn!(
-            namespace = %namespace,
-            "a v1 budget key's tag contains more than one `|`; reading everything after the first \
-             as the subject"
-        );
+}
+
+/// The `(namespace, subject)` a v1 key belongs to.
+///
+/// The v1 tag is `{namespace|subject}` with neither half escaped, so the string
+/// alone does not say where the namespace ends: `{team|west|sub}` reads as
+/// namespace `team` *or* `team|west`, and guessing would move a tenant's spend
+/// to a namespace that is not theirs. So the tag is resolved against the
+/// configured namespace ids instead of split, and anything that does not match
+/// exactly one of them is an error — the migration refuses rather than guesses.
+fn resolve_legacy_scope(
+    key_prefix: &str,
+    key: &str,
+    suffix: &str,
+    namespaces: &[String],
+) -> Result<BudgetKey, BudgetError> {
+    let ambiguous = |detail: &str| {
+        BudgetError::invalid(
+            BACKEND,
+            format!(
+                "the v1 budget key `{key}` cannot be attributed: {detail}. The v1 \
+                 `{{namespace|subject}}` tag is unescaped, so it is resolved against the \
+                 configured `[[namespace]]` ids rather than split; nothing has been migrated or \
+                 deleted. Configure the namespace this key belongs to (or delete the key if the \
+                 namespace is gone) and re-run the migration."
+            ),
+        )
+    };
+    let opening = format!("{key_prefix}:{{");
+    let closing = format!("}}{suffix}");
+    let tag = key
+        .strip_prefix(&opening)
+        .and_then(|rest| rest.strip_suffix(&closing))
+        .ok_or_else(|| ambiguous("it is not a `<prefix>:{namespace|subject}` key"))?;
+
+    let mut matched = namespaces
+        .iter()
+        .filter_map(|namespace| {
+            tag.strip_prefix(namespace.as_str())
+                .and_then(|rest| rest.strip_prefix('|'))
+                .map(|subject| BudgetKey {
+                    namespace: namespace.clone(),
+                    subject: subject.to_owned(),
+                })
+        })
+        .collect::<Vec<_>>();
+    match matched.len() {
+        1 => Ok(matched.remove(0)),
+        0 => Err(ambiguous(
+            "no configured namespace id is a prefix of its tag",
+        )),
+        found => Err(ambiguous(&format!(
+            "{found} configured namespace ids are prefixes of its tag, so the split between \
+             namespace and subject is ambiguous"
+        ))),
     }
-    Some(BudgetKey {
-        namespace: namespace.to_owned(),
-        subject: subject.to_owned(),
-    })
 }
 
 /// The contents of a key's `{...}` hash tag: the first `{` and the first `}`
-/// after it, which is the slot Redis itself hashes.
+/// after it, which is the slot Redis itself hashes. v2 keys escape braces out
+/// of the identifiers inside the tag, so this reads a whole v2 namespace.
 fn hash_tag(key: &str) -> Option<&str> {
     let start = key.find('{')? + 1;
     let end = key[start..].find('}')? + start;
@@ -578,6 +732,10 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::Barrier;
+
     use super::super::UnavailablePolicy;
     use super::super::tests::key;
     use super::*;
@@ -600,6 +758,11 @@ mod tests {
 
     fn prefix() -> String {
         format!("axond:test:{}", Reservation::next_id())
+    }
+
+    /// The configured namespaces the migration attributes v1 keys against.
+    fn namespaces() -> Vec<String> {
+        vec!["acme".to_owned()]
     }
 
     fn tag(key: &str) -> &str {
@@ -674,13 +837,46 @@ mod tests {
         assert!(keys.subject_spent.starts_with("axond:budget:v2:{"));
     }
 
+    /// A v1 key is attributed by resolving its tag against the configured
+    /// namespaces, so a delimiter or a brace inside either identifier does not
+    /// move spend to a namespace that does not own it.
     #[test]
-    fn a_legacy_key_maps_back_to_its_namespace_and_subject() {
-        let parsed = parse_legacy_scope("axond:budget", "axond:budget:{acme|sub|ject}:spent")
-            .expect("a v1 key carries its scope in its tag");
+    fn a_legacy_key_is_attributed_to_a_configured_namespace() {
+        let resolve = |key: &str, namespaces: &[&str]| {
+            let namespaces: Vec<String> = namespaces.iter().map(|n| (*n).to_owned()).collect();
+            resolve_legacy_scope("axond:budget", key, ":spent", &namespaces)
+        };
+
+        // A `|` in the subject is not a namespace boundary.
+        let parsed = resolve("axond:budget:{acme|sub|ject}:spent", &["acme"]).expect("resolved");
         assert_eq!(parsed.namespace, "acme");
         assert_eq!(parsed.subject, "sub|ject");
-        assert!(parse_legacy_scope("axond:budget", "axond:budget:layout").is_none());
+
+        // A `|` in the *namespace* would have been split off by a first-`|`
+        // reading, moving `team|west`'s spend into a namespace called `team`.
+        let parsed =
+            resolve("axond:budget:{team|west|sub}:spent", &["team|west"]).expect("resolved");
+        assert_eq!(parsed.namespace, "team|west");
+        assert_eq!(parsed.subject, "sub");
+
+        // Braces in either identifier are part of the tag, not a new tag.
+        let parsed = resolve("axond:budget:{ac}me|sub{ject}:spent", &["ac}me"]).expect("resolved");
+        assert_eq!(parsed.namespace, "ac}me");
+        assert_eq!(parsed.subject, "sub{ject");
+
+        // Both `team` and `team|west` could own it: refuse, do not guess.
+        let ambiguous = resolve("axond:budget:{team|west|sub}:spent", &["team", "team|west"])
+            .expect_err("two candidate namespaces are ambiguous");
+        assert!(format!("{ambiguous}").contains("ambiguous"), "{ambiguous}");
+
+        // No configured namespace owns it: refuse.
+        for (key, namespaces) in [
+            ("axond:budget:{gone|sub}:spent", &["acme"][..]),
+            ("axond:budget:layout", &["acme"][..]),
+            ("axond:budget:{acme}:spent", &["acme"][..]),
+        ] {
+            resolve(key, namespaces).expect_err(key);
+        }
     }
 
     #[test]
@@ -802,7 +998,9 @@ mod tests {
         subject_limit: u64,
         namespace_limit: u64,
     ) -> RedisBudget {
-        migrate_v1_to_v2(url, prefix).await.expect("migrate");
+        migrate_v1_to_v2(url, prefix, &namespaces())
+            .await
+            .expect("migrate");
         RedisBudget::connect(
             url,
             prefix.to_owned(),
@@ -963,7 +1161,9 @@ mod tests {
             return;
         };
         let prefix = prefix();
-        migrate_v1_to_v2(&url, &prefix).await.expect("migrate");
+        migrate_v1_to_v2(&url, &prefix, &namespaces())
+            .await
+            .expect("migrate");
         // A long TTL, so the denial below cannot race the clock; expiry is then
         // forced by rewriting the hold's deadline rather than by sleeping.
         let mut expiring = namespace_settings(1_000, 1_000);
@@ -1023,23 +1223,47 @@ mod tests {
                 .await
                 .expect("connect");
 
-        let mut admitted = 0;
-        for index in 0..40 {
-            let store: &RedisBudget = if index % 2 == 0 {
-                &replica_a
-            } else {
-                &replica_b
-            };
-            let k = BudgetKey {
+        // A barrier, so all forty admissions are in flight at once rather than
+        // taking turns: the only thing that may serialize them is the script
+        // Redis runs atomically.
+        let replica_a = Arc::new(replica_a);
+        let replica_b = Arc::new(replica_b);
+        let contenders = 40;
+        let start = Arc::new(Barrier::new(contenders));
+        let mut tasks = Vec::with_capacity(contenders);
+        for index in 0..contenders {
+            // A distinct subject each, well under the subject cap, so only the
+            // namespace cap can deny anyone.
+            let key = BudgetKey {
                 namespace: "acme".into(),
                 subject: format!("subject-{index}"),
             };
-            if let Admission::Allowed(held) = store.reserve(&k, 100).await {
+            let store = if index % 2 == 0 {
+                Arc::clone(&replica_a)
+            } else {
+                Arc::clone(&replica_b)
+            };
+            let start = Arc::clone(&start);
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                match store.reserve(&key, 100).await {
+                    Admission::Allowed(held) => {
+                        store.settle(&key, &held, 100).await;
+                        true
+                    }
+                    Admission::Denied(_) => false,
+                }
+            }));
+        }
+
+        let mut admitted = 0;
+        for task in tasks {
+            if task.await.expect("no task panicked") {
                 admitted += 1;
-                store.settle(&k, &held, 100).await;
             }
         }
-        // Exactly the cap, across both replicas and ten distinct subjects.
+        // The cap divided by the estimate, exactly: forty concurrent requests
+        // across two replicas and ten of them fit.
         assert_eq!(admitted, 10);
     }
 
@@ -1066,12 +1290,16 @@ mod tests {
             v1.settle(&k, &held, 400).await;
         }
 
-        let report = migrate_v1_to_v2(&url, &prefix).await.expect("migrate");
+        let report = migrate_v1_to_v2(&url, &prefix, &namespaces())
+            .await
+            .expect("migrate");
         assert_eq!(report.subjects, 2);
         assert_eq!(report.namespaces, 1);
         assert_eq!(report.carried_microdollars, 800);
         // Idempotent: a second run carries nothing and keeps the totals.
-        let again = migrate_v1_to_v2(&url, &prefix).await.expect("re-migrate");
+        let again = migrate_v1_to_v2(&url, &prefix, &namespaces())
+            .await
+            .expect("re-migrate");
         assert_eq!(again.carried_microdollars, 0);
         assert_eq!(again.subjects, 0);
 
@@ -1106,6 +1334,216 @@ mod tests {
         );
     }
 
+    /// Spend a stray v1 replica records *after* a migration must be recovered,
+    /// not discarded: the carry adds it to what v2 already holds.
+    #[tokio::test]
+    async fn a_v1_write_after_the_migration_is_added_not_dropped() {
+        let Some(url) = crate::test_services::redis_url() else {
+            return;
+        };
+        let prefix = prefix();
+        let k = BudgetKey {
+            namespace: "acme".into(),
+            subject: "first".into(),
+        };
+        let v1 = RedisBudget::connect(&url, prefix.clone(), settings(10_000))
+            .await
+            .expect("connect");
+        let Admission::Allowed(held) = v1.reserve(&k, 400).await else {
+            panic!("admitted");
+        };
+        v1.settle(&k, &held, 400).await;
+        let first = migrate_v1_to_v2(&url, &prefix, &namespaces())
+            .await
+            .expect("migrate");
+        assert_eq!(first.carried_microdollars, 400);
+
+        // A replica that did not get the memo settles another 150 under v1.
+        let Admission::Allowed(held) = v1.reserve(&k, 150).await else {
+            panic!("admitted");
+        };
+        v1.settle(&k, &held, 150).await;
+
+        let recovery = migrate_v1_to_v2(&url, &prefix, &namespaces())
+            .await
+            .expect("re-migrate");
+        assert_eq!(
+            recovery.carried_microdollars, 150,
+            "the stray write is added to the 400 already carried"
+        );
+        assert_eq!(spent(&url, &prefix, &k).await, 550);
+        assert_eq!(namespace_spent(&url, &prefix, "acme").await, 550);
+
+        // And running it again adds nothing.
+        let again = migrate_v1_to_v2(&url, &prefix, &namespaces())
+            .await
+            .expect("re-migrate");
+        assert_eq!(again.carried_microdollars, 0);
+        assert_eq!(spent(&url, &prefix, &k).await, 550);
+    }
+
+    /// A carry is claimed on the v1 side and applied on the v2 side, and either
+    /// step can be the last thing that happens before the process dies. Neither
+    /// interruption may lose or duplicate spend.
+    #[tokio::test]
+    async fn an_interrupted_carry_is_finished_exactly_once() {
+        let Some(url) = crate::test_services::redis_url() else {
+            return;
+        };
+        let prefix = prefix();
+        let k = BudgetKey {
+            namespace: "acme".into(),
+            subject: "first".into(),
+        };
+        let client = ::redis::Client::open(url.as_str()).expect("client");
+        let mut connection = ConnectionManager::new(client).await.expect("connect");
+        let scope = format!("{prefix}:{{acme|first}}");
+        let drain = Script::new(DRAIN_V1);
+        let apply = Script::new(APPLY_CLAIM);
+
+        // Died after claiming, before applying: the v1 counter is already gone,
+        // so only the claim can account for the spend.
+        let _: () = connection
+            .set(format!("{scope}:spent"), 300)
+            .await
+            .expect("v1 spend");
+        let claim: Option<String> = drain
+            .prepare_invoke()
+            .key(format!("{scope}:spent"))
+            .key(format!("{scope}{PENDING}"))
+            .key(format!("{scope}{SEQ}"))
+            .invoke_async(&mut connection)
+            .await
+            .expect("claim");
+        assert_eq!(claim.as_deref(), Some("1:300"));
+        let v1_gone: Option<i64> = connection
+            .get(format!("{scope}:spent"))
+            .await
+            .expect("read");
+        assert_eq!(v1_gone, None, "a claimed counter is drained atomically");
+
+        let resumed = migrate_v1_to_v2(&url, &prefix, &namespaces())
+            .await
+            .expect("resume");
+        assert_eq!(
+            resumed.carried_microdollars, 300,
+            "the orphaned claim is finished, not lost"
+        );
+        assert_eq!(spent(&url, &prefix, &k).await, 300);
+
+        // Died after applying, before clearing the claim: replaying it must not
+        // charge twice, because the claim token was recorded with the increment.
+        let claim = "2:75";
+        let _: () = connection
+            .set(format!("{scope}{PENDING}"), claim)
+            .await
+            .expect("orphan claim");
+        let _: () = connection
+            .set(format!("{scope}{SEQ}"), 2)
+            .await
+            .expect("sequence");
+        for expected in [75, 0] {
+            let added: i64 = apply
+                .prepare_invoke()
+                .key(v2_keys(&prefix, &k).subject_spent)
+                .key(format!(
+                    "{}:migration:applied",
+                    namespace_scope(&prefix, "acme")
+                ))
+                .arg("first#2")
+                .arg(75)
+                .invoke_async(&mut connection)
+                .await
+                .expect("apply");
+            assert_eq!(added, expected, "a claim is applied at most once");
+        }
+        let recovered = migrate_v1_to_v2(&url, &prefix, &namespaces())
+            .await
+            .expect("resume");
+        assert_eq!(
+            recovered.carried_microdollars, 0,
+            "the already-applied claim is not charged again"
+        );
+        assert_eq!(spent(&url, &prefix, &k).await, 375);
+        assert_eq!(namespace_spent(&url, &prefix, "acme").await, 375);
+    }
+
+    async fn read(url: &str, key: String) -> u64 {
+        let client = ::redis::Client::open(url).expect("client");
+        let mut connection = ConnectionManager::new(client).await.expect("connect");
+        let value: Option<i64> = connection.get(key).await.expect("read");
+        value.unwrap_or_default().max(0) as u64
+    }
+
+    async fn spent(url: &str, prefix: &str, key: &BudgetKey) -> u64 {
+        read(url, v2_keys(prefix, key).subject_spent).await
+    }
+
+    async fn namespace_spent(url: &str, prefix: &str, namespace: &str) -> u64 {
+        read(
+            url,
+            format!("{}:namespace:spent", namespace_scope(prefix, namespace)),
+        )
+        .await
+    }
+
+    /// A v1 key the configured namespaces cannot account for stops the whole
+    /// migration: guessing its owner would move one tenant's spend to another,
+    /// and a half-applied migration would be worse than none.
+    #[tokio::test]
+    async fn an_unattributable_v1_key_aborts_the_migration_intact() {
+        let Some(url) = crate::test_services::redis_url() else {
+            return;
+        };
+        let prefix = prefix();
+        let v1 = RedisBudget::connect(&url, prefix.clone(), settings(1_000))
+            .await
+            .expect("connect");
+        let k = BudgetKey {
+            namespace: "acme".into(),
+            subject: "first".into(),
+        };
+        let Admission::Allowed(held) = v1.reserve(&k, 400).await else {
+            panic!("the v1 cap admits it");
+        };
+        v1.settle(&k, &held, 400).await;
+
+        let client = ::redis::Client::open(url.as_str()).expect("client");
+        let mut connection = ConnectionManager::new(client).await.expect("connect");
+        let orphan = format!("{prefix}:{{retired|sub}}:spent");
+        let _: () = connection.set(&orphan, 25).await.expect("orphan write");
+
+        // `retired` is not configured, and `team` alone cannot claim
+        // `team|west`'s keys either: both are refusals, not guesses.
+        for namespaces in [namespaces(), vec!["acme".to_owned(), "team".to_owned()]] {
+            let err = migrate_v1_to_v2(&url, &prefix, &namespaces)
+                .await
+                .expect_err("an unattributable key must abort the migration");
+            assert!(format!("{err}").contains(&orphan), "{err}");
+        }
+
+        // Nothing was moved, deleted, or stamped, so the operator can fix the
+        // configuration and re-run.
+        let v1_spend: Option<i64> = connection
+            .get(format!("{prefix}:{{acme|first}}:spent"))
+            .await
+            .expect("read");
+        assert_eq!(v1_spend, Some(400), "the v1 ledger is untouched");
+        let orphan_spend: Option<i64> = connection.get(&orphan).await.expect("read");
+        assert_eq!(orphan_spend, Some(25));
+        let marker: Option<String> = connection
+            .get(layout_key(&prefix))
+            .await
+            .expect("read marker");
+        assert_eq!(marker, None, "an aborted migration marks nothing");
+
+        // With the namespace configured, the same state migrates cleanly.
+        let report = migrate_v1_to_v2(&url, &prefix, &["acme".to_owned(), "retired".to_owned()])
+            .await
+            .expect("migrate");
+        assert_eq!(report.carried_microdollars, 425);
+    }
+
     #[tokio::test]
     async fn the_namespace_cap_refuses_to_boot_against_unmigrated_state() {
         let Some(url) = crate::test_services::redis_url() else {
@@ -1129,7 +1567,9 @@ mod tests {
             return;
         };
         let prefix = prefix();
-        migrate_v1_to_v2(&url, &prefix).await.expect("migrate");
+        migrate_v1_to_v2(&url, &prefix, &namespaces())
+            .await
+            .expect("migrate");
         let v1 = RedisBudget::connect(&url, prefix.clone(), settings(1_000))
             .await
             .err()

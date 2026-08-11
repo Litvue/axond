@@ -396,7 +396,7 @@ config-owned; only callers and keys may become store-owned.
 | 1 | A spend cap across replicas | `[budget] backend = "redis"` | Redis availability couples budgeted admission to Redis; `deny` fails closed. |
 | 2 | Durable usage rows | `[[usage_sink]] kind = "postgres"` | A Postgres role, the [`usage_v2.sql`](../ops/postgres/usage_v2.sql) table, ordered additive migrations, and backup/restore ownership. |
 | 2 | A spend cap across replicas | `[budget] backend = "postgres"` | Postgres availability and the [`budget_v1.sql`](../ops/postgres/budget_v1.sql) tables. |
-| 1 or 2 | A cap on a whole namespace, not just each subject | `[budget] namespace_limit_microdollars` on a `redis` or `postgres` budget | A one-time migration with the fleet stopped (below), and contention on one key or row per namespace. |
+| 1 or 2 | A cap on a whole namespace, not just each subject | `[budget] namespace_limit_microdollars` on a `redis` or `postgres` budget | A one-time migration with the fleet stopped for either backend (below), and contention on one key or row per namespace. |
 
 For upgrades, apply each additive `usage_v1_<sequence>_<name>.sql` migration in
 filename order before deploying a gateway that writes its new column. Otherwise
@@ -428,23 +428,56 @@ support writes the previous key layout, so the two would each enforce a share of
 the traffic. The gateway fences this rather than trusting the runbook: with the
 cap set it refuses to boot until the migration marker exists and refuses to boot
 while any old-layout key remains; once migrated, it refuses to boot *without* the
-cap, because the old keys no longer hold the spend. The migration never lowers a
-counter, so re-running it (or resuming an interrupted run) cannot reset a ledger.
+cap, because the old keys no longer hold the spend.
+
+Re-running the migration is safe, and is the repair for a replica that slipped
+through: spend is claimed out of an old counter atomically and added to the new
+one at most once, so an interrupted run loses nothing, a repeat run adds nothing
+twice, and spend a stray old replica recorded *after* the first run is carried
+over rather than discarded. The report line names the amount, so a non-zero carry
+on a re-run is the signal that something was still writing the old layout.
+
+The migration attributes old keys by resolving their `{namespace|subject}` tag
+against the namespaces in your config. Neither half of that tag was escaped, so
+`{team|west|abc}` could mean namespace `team` or `team|west`; rather than guess,
+the migration stops with the offending key named, having moved and deleted
+nothing. That happens when a namespace has been removed from the config while its
+spend is still in Redis (add it back, or delete the key), or when one namespace id
+is a prefix of another such that both could own the key (rename, or migrate under
+a separate `key_prefix`).
+
 In-flight reservations are not carried over, which is the other reason to stop
 traffic first.
 
-**Postgres.** Apply [`budget_v2.sql`](../ops/postgres/budget_v2.sql) on top of
-`budget_v1.sql` — it is additive, and its backfill seeds each namespace total
-from the subject rows already present:
+**Postgres.** Stop and drain the fleet here too, then apply
+[`budget_v2.sql`](../ops/postgres/budget_v2.sql) on top of `budget_v1.sql` — it is
+additive, and its backfill seeds each namespace total from the subject rows
+already present:
 
 ```bash
 psql "$AXOND_BUDGET_POSTGRES_DSN" -f ops/postgres/budget_v2.sql
 ```
 
-It is safe on a live v1 database and idempotent, so it can be applied before the
-rollout; `create_table = true` applies it at boot instead. The gateway refuses to
-start if a namespace has spend but no backfilled row, so the cap cannot silently
-begin from zero.
+It is not a live migration. The backfill sums the subject rows, so a settlement
+that commits after that sum would be counted against its subject and never
+against its namespace, leaving a total that is permanently short — and no boot
+check can detect that, because the row exists and merely holds too small a
+number. The file therefore runs as one transaction holding an `EXCLUSIVE` lock on
+the spend table, which blocks a v1 settlement rather than losing it; stopping the
+fleet is what keeps that lock from being an outage. Re-running it is idempotent,
+and `create_table = true` applies the same statements at boot.
+
+Mixed configurations are fenced by the database, not by this runbook. The file
+installs a trigger that rejects spend and reservation writes from any session that
+has not declared namespace-cap support, which a cap-aware gateway does once per
+connection. A replica still configured without `namespace_limit_microdollars` —
+including a binary too old to have a boot check — therefore cannot charge a
+subject while leaving the namespace total behind; its writes fail loudly instead.
+Such a replica also refuses to boot, naming the fence, and a cap-enabled replica
+refuses to boot if the fence is missing or a namespace has spend but no backfilled
+row, so the cap can neither begin from zero nor be quietly bypassed. To return to
+per-subject-only enforcement, stop the fleet and drop the two
+`<table>_namespace_fence` triggers.
 
 Both backends then concentrate a namespace's traffic on one hot spot — one spend
 row in Postgres, one counter and reservation hash in Redis — and every reserve
