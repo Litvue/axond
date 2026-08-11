@@ -438,15 +438,17 @@ over rather than discarded. The report line names the amount, so a non-zero carr
 on a re-run is the signal that something was still writing the old layout.
 
 An interrupted run is fenced rather than papered over, in both of the ways it can
-stop. Spend taken off an old counter but not yet added to the new one sits in a
-`:migration_pending` claim, and *neither* configuration boots while one is
-outstanding. A run that carried some subjects and then failed on a later one
-leaves nothing in the keyspace to show it — a carried subject has no old key and no
-claim — so the migration marks `<key_prefix>:layout` as `v2-migrating` before it
-moves anything and only writes `v2` once every subject is across; neither
-configuration serves a `v2-migrating` prefix either, since the ledger is then split
-between the layouts. Re-running the migration resumes where it stopped and clears
-both states; that is all it takes.
+stop. The migration marks `<key_prefix>:layout` as `v2-migrating` before it moves
+anything and writes `v2` only once every subject is across, so a run that carried
+some subjects and then failed on a later one is visible even though it leaves
+nothing else behind — a carried subject has no old key — and no configuration will
+serve a `v2-migrating` prefix, since the ledger is then split between the layouts.
+Spend taken off an old counter but not yet added to the new one sits in a
+`:migration_pending` claim, which the cap-enabled boot check refuses as well. A
+gateway *without* the cap reads the marker and nothing else, so enabling this
+feature costs an un-migrated deployment one `GET` at boot and no keyspace scan.
+Re-running the migration resumes where it stopped and clears both states; that is
+all it takes.
 
 The migration attributes old keys by resolving their `{namespace|subject}` tag
 against the namespaces in your config. Neither half of that tag was escaped, so

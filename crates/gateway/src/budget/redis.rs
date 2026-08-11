@@ -396,9 +396,11 @@ async fn require_unmigrated_layout(
         // fresh budget. Only finishing the migration resolves it.
         return Err(unfinished_migration(key_prefix));
     }
-    // And with the marker unset — a pre-migration deployment — a claim can still
-    // be outstanding from a run that died before stamping anything.
-    require_no_pending_claims(connection, key_prefix).await
+    // An unmarked prefix has never been touched by a migration, and so cannot hold
+    // an outstanding claim either: the marker is stamped before the first key
+    // moves. That keeps this path — the one every deployment without the cap takes
+    // — a single `GET`, with no scan of the keyspace.
+    Ok(())
 }
 
 fn unfinished_migration(key_prefix: &str) -> BudgetError {
@@ -1669,20 +1671,16 @@ mod tests {
             "the error must point at the migration: {refused}"
         );
 
-        // And so must the cap-less one with the marker gone — a *first* migration
-        // interrupted the same way leaves the same orphaned spend, which the old
-        // layout would simply not see.
-        let _: i64 = connection
-            .del(layout_key(&prefix))
-            .await
-            .expect("unmark the layout");
+        // The cap-less configuration is refused by the marker alone, which is why
+        // its boot needs no scan: a claim only exists on a prefix a migration has
+        // already stamped.
         let refused = RedisBudget::connect(&url, prefix.clone(), settings(1_000))
             .await
             .err()
-            .expect("an outstanding claim must fail at boot for the old layout too");
+            .expect("migrated state must fail at boot without the cap");
         assert!(
-            format!("{refused}").contains("migrate-redis"),
-            "the error must point at the migration: {refused}"
+            format!("{refused}").contains("must stay set"),
+            "the marker is what refuses the old layout: {refused}"
         );
 
         // Finishing the migration is what clears it, and the claim is added to
