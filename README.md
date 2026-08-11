@@ -264,8 +264,9 @@ name and prints only the token. Ed25519 base64 whitespace is trimmed on both
 sides because mounted secrets may preserve the generated file's trailing
 newline; HS256 secrets are opaque bytes and are not trimmed. `scope` is enforced
 as a narrowing route capability and can be emitted with repeatable `--scope`
-flags, including `credentials`. The operator-only `credentials:all` cannot be
-minted and never grants a token the all-namespaces credential view. The
+flags, including `credentials`. The operator-only `credentials:all` is never
+granted to a token: `POST /v1/tokens` refuses to issue it, and a claim signed
+offline still does not reach the all-namespaces credential view. The
 `aliases` claim is enforced at dispatch and in the
 `/v1/models` view,
 and is emitted by `axond mint --alias`. `max_request_microdollars` is enforced

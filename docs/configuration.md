@@ -206,7 +206,7 @@ such key is enabled, the route remains present but rejects every caller.
 | `kid` | string | — | Existing verifier key identifier used for the minted token. |
 | `env` / `file` | string | — | Exactly one signing-material source; resolved at boot and reload. |
 | `max_ttl` | duration | verifier `max_ttl` | Issuance ceiling, never above the matching verifier's ceiling and at most 24h. When omitted, it tracks the verifier's `max_ttl`; raising that verifier ceiling also raises the issuance ceiling. |
-| `scope` | array of string | — | Optional capability ceiling. When configured, omitted requests inherit it; when absent, omitted scope uses the ordinary capability posture. The operator-only `credentials:all` is rejected here and can never be minted. |
+| `scope` | array of string | — | Optional capability ceiling. When configured, omitted requests inherit it; when absent, omitted scope uses the ordinary capability posture. The operator-only `credentials:all` is rejected here and is never issued by `POST /v1/tokens`. |
 | `aliases` | array of string | — | Optional alias-pattern ceiling. When configured, omitted requests inherit it; when absent, `*` is permitted, but alias dispatch still narrows it to aliases the namespace can already reach. |
 | `max_request_microdollars` | u64 | — | Optional per-request ceiling. Omitted requests inherit it. |
 
