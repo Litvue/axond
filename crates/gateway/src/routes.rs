@@ -4242,6 +4242,16 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         failover: &str,
         captured: CapturingSink,
     ) -> AppState {
+        two_target_state_with_budget(url_a, url_b, failover, captured, Box::new(NoBudget))
+    }
+
+    fn two_target_state_with_budget(
+        url_a: &str,
+        url_b: &str,
+        failover: &str,
+        captured: CapturingSink,
+        budget: Box<dyn crate::budget::BudgetStore>,
+    ) -> AppState {
         let cfg = Config::from_toml_str(&format!(
             r#"
 [[namespace]]
@@ -4285,7 +4295,7 @@ targets = [
         .unwrap();
         let env = env_with([("KA", "ka"), ("KB", "kb")]);
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(captured)];
-        AppState::new(cfg, &env, UsageFanout::new(sinks), Box::new(NoBudget)).unwrap()
+        AppState::new(cfg, &env, UsageFanout::new(sinks), budget).unwrap()
     }
 
     fn chat_request() -> Request<Body> {
@@ -4300,6 +4310,18 @@ targets = [
         if let Some(id) = previous_response_id {
             body["previous_response_id"] = json!(id);
         }
+        authorized("/v1/responses")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn streaming_responses_request(previous_response_id: &str) -> Request<Body> {
+        let body = json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "stream": true,
+            "previous_response_id": previous_response_id
+        });
         authorized("/v1/responses")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
@@ -4908,6 +4930,59 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         );
         let records = captured.0.lock().unwrap();
         assert_eq!(records.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pinned_streaming_responses_skipped_target_releases_its_budget_hold() {
+        let (url_a, hits_a) = controllable_upstream(
+            Arc::new(AtomicBool::new(false)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let (url_b, hits_b) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let captured = CapturingSink::default();
+        let budget = Arc::new(crate::budget::InMemoryBudget::new(1_000_000));
+        let state = two_target_state_with_budget(
+            &url_a,
+            &url_b,
+            "[failover]\nmax_attempts = 3\nfailure_threshold = 1",
+            captured,
+            Box::new(SharedBudget(budget.clone())),
+        );
+
+        let first = router(state.clone())
+            .oneshot(responses_request(None))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+
+        let pinned = router(state)
+            .oneshot(streaming_responses_request("resp-from-a"))
+            .await
+            .unwrap();
+        assert_eq!(pinned.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = pinned.into_body().collect().await.unwrap();
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+
+        let key = BudgetKey {
+            namespace: "platform".to_owned(),
+            subject: "AXOND_INBOUND_KEY".to_owned(),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if budget.outstanding(&key) == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "pinned continuation leaked its budget reservation"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     #[tokio::test]
