@@ -295,11 +295,24 @@ process environment. Nothing in the config file is ever a secret value.
 | `GET /healthz` | none | `ok` once the process is serving. |
 | `GET /readyz` | none | `ready` once the process is serving. |
 | `GET /v1/models` | gateway key | The alias catalogue (names only), scoped to the caller's namespace — only aliases whose targets the caller holds a credential for. |
+| `GET /v1/credentials` | gateway key | Replica-local credential labels and circuit state for the caller's namespace; `?namespaces=all` additionally requires `credentials:all`. |
 
 Minted callers may additionally carry repeatable `--scope` capabilities
-(`chat`, `messages`, `embeddings`, or `models`). Scope only narrows the derived
-namespace authority; denial is `403 token_scope_insufficient`. Static keys and
-scope-less tokens are unaffected. `/v1/responses` remains a typed `501`.
+(`chat`, `messages`, `embeddings`, `models`, `credentials`, or
+`credentials:all`). Scope only narrows the derived namespace authority;
+scope-less principals retain their own-namespace credential view. A scoped
+token needs `credentials` for the route, while `?namespaces=all` additionally
+requires the explicit `credentials:all` scope and otherwise returns
+`403 token_scope_insufficient`. `/v1/responses` remains a typed `501`.
+`credentials:all` is operator-only and must be minted only into operator
+tokens: it is a pure capability check and is not constrained by the token's
+verifier `namespaces = [...]` allowlist.
+
+Credential status is Tier 0, in-memory, and per replica: `observed: "replica"`
+is not a fleet-wide health view. Presence is represented by an entry (boot
+resolves configured credentials or fails), and credential ids are attribution
+labels, never secrets. The default env-derived `credential_id` is omitted for
+platform entries shown through tenant fallback; explicit ids remain visible.
 
 Both probes report process liveness. `/readyz` does **not** currently probe the
 usage sink, the budget store, or any provider — it answers `ready` whenever the
