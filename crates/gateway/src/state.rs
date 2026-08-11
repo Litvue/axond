@@ -189,7 +189,6 @@ impl ConfigSnapshot {
                     alias_scope: None,
                     max_request_microdollars: None,
                     jti: None,
-                    exp: None,
                 },
             });
             gateway_key_fingerprints

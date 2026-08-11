@@ -4,7 +4,7 @@ use std::{future::Future, pin::Pin};
 use async_trait::async_trait;
 use tokio_postgres::{Client, Config};
 
-use super::{RevocationError, RevocationStore, unavailable};
+use super::{RevocationError, RevocationStore, unavailable, validate_expiry};
 use crate::config::StoreUnavailable;
 use crate::usage::validate_table_name;
 
@@ -55,7 +55,11 @@ impl PostgresRevocation {
     }
 
     fn schema_ddl(&self) -> String {
-        SCHEMA_DDL.replace("axond_revocation", &self.table)
+        let index_prefix = self.table.rsplit('.').next().unwrap_or(&self.table);
+        SCHEMA_DDL
+            .replace("axond_revocation_expires_at_idx", "\u{1}")
+            .replace("axond_revocation", &self.table)
+            .replace('\u{1}', &format!("{index_prefix}_expires_at_idx"))
     }
 
     async fn connect_client(&self) -> Result<Client, tokio_postgres::Error> {
@@ -135,6 +139,7 @@ impl RevocationStore for PostgresRevocation {
     }
 
     async fn revoke(&self, jti: &str, expires_at: SystemTime) -> Result<(), RevocationError> {
+        validate_expiry(expires_at)?;
         let table = self.table.clone();
         let jti = jti.to_owned();
         match self.run(|client: &mut Client| Box::pin(async move {
@@ -157,7 +162,7 @@ impl RevocationStore for PostgresRevocation {
             Ok(())
         })).await {
             Ok(()) => Ok(()),
-            Err(error) => unavailable(self.on_unavailable, "postgres", error).map(|_| ()),
+            Err(error) => Err(error),
         }
     }
 }
@@ -166,6 +171,21 @@ impl RevocationStore for PostgresRevocation {
 mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
+
+    #[test]
+    fn schema_ddl_keeps_index_name_unqualified_for_schema_tables() {
+        let store = PostgresRevocation {
+            table: "tenant.axond_revocation".to_owned(),
+            config: "host=localhost".parse().expect("dsn"),
+            timeout: Duration::from_millis(1),
+            on_unavailable: StoreUnavailable::Deny,
+            client: tokio::sync::Mutex::new(None),
+        };
+        let ddl = store.schema_ddl();
+        assert!(ddl.contains("tenant.axond_revocation"));
+        assert!(ddl.contains("axond_revocation_expires_at_idx"));
+        assert!(!ddl.contains("tenant.axond_revocation_expires_at_idx"));
+    }
 
     #[tokio::test]
     async fn two_connections_share_revocations_and_expiry_is_honored() {
@@ -204,10 +224,16 @@ mod tests {
             .await
             .expect("revoke");
         assert!(second.is_revoked("replica-jti").await.expect("read"));
-        first
-            .revoke("expired-jti", UNIX_EPOCH)
+        let client = first.client.lock().await;
+        client
+            .as_ref()
+            .expect("client")
+            .execute(
+                &format!("INSERT INTO {table} (jti, expires_at) VALUES ($1, $2)"),
+                &[&"expired-jti", &UNIX_EPOCH],
+            )
             .await
-            .expect("expired write");
+            .expect("expired row");
         assert!(
             !second
                 .is_revoked("expired-jti")

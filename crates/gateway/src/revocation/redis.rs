@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 
-use super::{RevocationError, RevocationStore, expiry_ms, unavailable};
+use super::{RevocationError, RevocationStore, expiry_ms, unavailable, validate_expiry};
 use crate::config::StoreUnavailable;
 
 pub struct RedisRevocation {
@@ -68,22 +68,7 @@ impl RevocationStore for RedisRevocation {
     }
 
     async fn revoke(&self, jti: &str, expires_at: SystemTime) -> Result<(), RevocationError> {
-        if expires_at <= SystemTime::now() {
-            let result = tokio::time::timeout(self.timeout, async {
-                redis::cmd("DEL")
-                    .arg(self.key(jti))
-                    .query_async::<i64>(&mut self.connection.clone())
-                    .await
-            })
-            .await;
-            return match result {
-                Ok(Ok(_)) => Ok(()),
-                Ok(Err(error)) => unavailable(self.on_unavailable, "redis", error).map(|_| ()),
-                Err(_) => {
-                    unavailable(self.on_unavailable, "redis", "operation timed out").map(|_| ())
-                }
-            };
-        }
+        validate_expiry(expires_at)?;
         let result = tokio::time::timeout(self.timeout, async {
             redis::cmd("SET")
                 .arg(self.key(jti))
@@ -96,8 +81,14 @@ impl RevocationStore for RedisRevocation {
         .await;
         match result {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => unavailable(self.on_unavailable, "redis", error).map(|_| ()),
-            Err(_) => unavailable(self.on_unavailable, "redis", "operation timed out").map(|_| ()),
+            Ok(Err(error)) => Err(RevocationError::Unavailable {
+                backend: "redis",
+                message: error.to_string(),
+            }),
+            Err(_) => Err(RevocationError::Unavailable {
+                backend: "redis",
+                message: "operation timed out".to_owned(),
+            }),
         }
     }
 }
@@ -105,7 +96,6 @@ impl RevocationStore for RedisRevocation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::UNIX_EPOCH;
 
     #[tokio::test]
     async fn two_connections_share_revocations_and_expiry_is_set() {
@@ -146,15 +136,5 @@ mod tests {
             .await
             .expect("ttl");
         assert!(ttl > 0);
-        first
-            .revoke("expired-jti", UNIX_EPOCH)
-            .await
-            .expect("expired write");
-        assert!(
-            !second
-                .is_revoked("expired-jti")
-                .await
-                .expect("expired read")
-        );
     }
 }

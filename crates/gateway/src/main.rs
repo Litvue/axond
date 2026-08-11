@@ -58,14 +58,30 @@ fn cli() -> Command {
         .subcommand(
             Command::new("revoke")
                 .about("Add a minted-token JTI to the revocation denylist")
-                .arg(Arg::new("jti").long("jti").required(true))
-                .arg(Arg::new("ttl").long("ttl").conflicts_with("expires-at"))
+                .arg(
+                    Arg::new("jti")
+                        .long("jti")
+                        .required(true)
+                        .help("Token JTI to deny"),
+                )
+                .arg(
+                    Arg::new("ttl")
+                        .long("ttl")
+                        .conflicts_with("expires-at")
+                        .help("How long the JTI should remain revoked"),
+                )
                 .arg(
                     Arg::new("expires-at")
                         .long("expires-at")
-                        .conflicts_with("ttl"),
+                        .conflicts_with("ttl")
+                        .help("Absolute expiry as Unix seconds or RFC3339 UTC"),
                 )
-                .arg(Arg::new("config").long("config").value_name("PATH")),
+                .arg(
+                    Arg::new("config")
+                        .long("config")
+                        .value_name("PATH")
+                        .help("Config file path"),
+                ),
         )
         .subcommand(
             Command::new("mint")

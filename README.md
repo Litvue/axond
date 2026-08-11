@@ -67,10 +67,9 @@ Tier 0.
 
 Tier 1 ships `[budget] backend = "redis"`, `[rate_limit] backend = "redis"`,
 and `[revocation] backend = "redis"`
-for exact shared admission. Precise per-token revocation remains a future
-declaration. Minted claims require `jti`, but today's
-revocation ladder is short TTLs, killing a `kid`, rotation, and `axond revoke`
-for precise single-token denial. An OTLP usage
+for exact shared admission and precise single-token denial. Minted claims
+require `jti`; the revocation ladder also includes short TTLs, killing a
+`kid`, rotation, and `axond revoke`. An OTLP usage
 sink is Tier 0 state (no datastore, nothing to migrate), but not hermetic: it
 adds a collector dependency at boot, so it is excluded from the hermetic Tier
 0 CI lane.

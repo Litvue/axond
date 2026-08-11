@@ -294,9 +294,6 @@ pub fn keygen(args: &ArgMatches) -> Result<()> {
 
 pub fn revoke(args: &ArgMatches) -> Result<()> {
     let jti = required(args, "jti")?;
-    if jti.is_empty() {
-        bail!("--jti must not be empty");
-    }
     let config_path = args
         .get_one::<String>("config")
         .cloned()
@@ -305,20 +302,45 @@ pub fn revoke(args: &ArgMatches) -> Result<()> {
     let config = Config::load(&config_path)
         .map_err(|error| anyhow::anyhow!("failed to load config from `{config_path}`: {error}"))?;
     let env = std::env::vars().collect();
-    let expires_at = match (
-        args.get_one::<String>("ttl"),
-        args.get_one::<String>("expires-at"),
-    ) {
-        (Some(_), Some(_)) => unreachable!("clap enforces conflicts"),
+    let expires_at = resolve_revocation_expiry(
+        jti,
+        args.get_one::<String>("ttl").map(String::as_str),
+        args.get_one::<String>("expires-at").map(String::as_str),
+        &config,
+    )?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let store = crate::revocation::build(&config.revocation, &config.budget, &env).await?;
+        store.revoke(jti, expires_at).await?;
+        eprintln!("revoked jti `{jti}`");
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+pub(crate) fn resolve_revocation_expiry(
+    jti: &str,
+    ttl: Option<&str>,
+    expires_at: Option<&str>,
+    config: &Config,
+) -> Result<SystemTime> {
+    if jti.is_empty() {
+        bail!("--jti must not be empty");
+    }
+    if config.revocation.backend == crate::config::RevocationBackend::None {
+        bail!("no denylist is configured; set [revocation].backend to redis or postgres");
+    }
+    match (ttl, expires_at) {
+        (Some(_), Some(_)) => bail!("--ttl and --expires-at are mutually exclusive"),
         (Some(ttl), None) => SystemTime::now()
             .checked_add(parse_duration(ttl)?)
-            .ok_or_else(|| anyhow::anyhow!("--ttl is too large"))?,
+            .ok_or_else(|| anyhow::anyhow!("--ttl is too large")),
         (None, Some(value)) => {
             let seconds = value
                 .parse::<u64>()
                 .or_else(|_| crate::config::parse_gateway_rfc3339_utc(value))
                 .map_err(|_| anyhow::anyhow!("--expires-at must be unix seconds or RFC3339 UTC"))?;
-            UNIX_EPOCH + Duration::from_secs(seconds)
+            Ok(UNIX_EPOCH + Duration::from_secs(seconds))
         }
         (None, None) => {
             let max_ttl = config
@@ -333,20 +355,9 @@ pub fn revoke(args: &ArgMatches) -> Result<()> {
                 })?;
             SystemTime::now()
                 .checked_add(max_ttl + Duration::from_secs(5))
-                .ok_or_else(|| anyhow::anyhow!("configured verifier lifetime is too large"))?
+                .ok_or_else(|| anyhow::anyhow!("configured verifier lifetime is too large"))
         }
-    };
-    if config.revocation.backend == crate::config::RevocationBackend::None {
-        bail!("no denylist is configured; set [revocation].backend to redis or postgres");
     }
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
-        let store = crate::revocation::build(&config.revocation, &config.budget, &env).await?;
-        store.revoke(jti, expires_at).await?;
-        eprintln!("revoked jti `{jti}`");
-        Ok::<(), anyhow::Error>(())
-    })?;
-    Ok(())
 }
 
 fn validate_keygen_identifier(flag: &str, value: &str, allow_punctuation: bool) -> Result<()> {
@@ -1085,6 +1096,83 @@ max_ttl = "{max_ttl}"
 
     fn keygen_args(max_ttl: &str) -> clap::ArgMatches {
         keygen_args_with("test-kid", "PUBLIC", "acme", max_ttl)
+    }
+
+    fn revoke_args(values: &[&str]) -> clap::ArgMatches {
+        let mut argv = vec!["axond", "revoke"];
+        argv.extend(values);
+        crate::cli()
+            .try_get_matches_from(argv)
+            .unwrap()
+            .remove_subcommand()
+            .expect("revoke subcommand")
+            .1
+    }
+
+    fn configured_revocation() -> Config {
+        let mut config = verifier_config("test-kid", "HS256", "SECRET", "15m");
+        config.revocation.backend = crate::config::RevocationBackend::Redis;
+        config.revocation.dsn_env = Some("REDIS_URL".to_owned());
+        config
+    }
+
+    #[test]
+    fn revoke_resolves_ttl_unix_and_rfc3339_expiries() {
+        let config = configured_revocation();
+        let before = SystemTime::now();
+        let ttl = revoke_args(&["--jti", "jti-1", "--ttl", "2m"]);
+        let expiry = resolve_revocation_expiry(
+            "jti-1",
+            ttl.get_one::<String>("ttl").map(String::as_str),
+            None,
+            &config,
+        )
+        .unwrap();
+        assert!(expiry >= before + Duration::from_secs(119));
+
+        let unix = resolve_revocation_expiry("jti-1", None, Some("2000000000"), &config).unwrap();
+        assert_eq!(unix, UNIX_EPOCH + Duration::from_secs(2_000_000_000));
+        let rfc3339 =
+            resolve_revocation_expiry("jti-1", None, Some("2033-05-18T03:33:20Z"), &config)
+                .unwrap();
+        assert_eq!(rfc3339, unix);
+    }
+
+    #[test]
+    fn revoke_defaults_beyond_the_largest_verifier_and_requires_expiry_without_one() {
+        let config = configured_revocation();
+        let before = SystemTime::now();
+        let expiry = resolve_revocation_expiry("jti-1", None, None, &config).unwrap();
+        assert!(expiry >= before + Duration::from_secs(905));
+
+        let mut no_verifier = config;
+        no_verifier.gateway_verifier.clear();
+        let error = resolve_revocation_expiry("jti-1", None, None, &no_verifier)
+            .expect_err("explicit expiry required");
+        assert!(error.to_string().contains("--ttl or --expires-at"));
+    }
+
+    #[test]
+    fn revoke_rejects_an_unconfigured_denylist() {
+        let config = verifier_config("test-kid", "HS256", "SECRET", "15m");
+        let error = resolve_revocation_expiry("jti-1", Some("1m"), None, &config)
+            .expect_err("none backend must fail");
+        assert!(error.to_string().contains("no denylist is configured"));
+    }
+
+    #[test]
+    fn revoke_cli_rejects_mutually_exclusive_expiry_flags() {
+        let error = crate::cli().try_get_matches_from([
+            "axond",
+            "revoke",
+            "--jti",
+            "jti-1",
+            "--ttl",
+            "1m",
+            "--expires-at",
+            "2000000000",
+        ]);
+        assert!(error.is_err());
     }
 
     fn keygen_args_with(kid: &str, env: &str, namespace: &str, max_ttl: &str) -> clap::ArgMatches {

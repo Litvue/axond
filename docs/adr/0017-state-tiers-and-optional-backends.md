@@ -221,7 +221,12 @@ stores one key per revoked token, shaped as
 `<key_prefix>:{<jti>}` with `key_prefix = "axond:revocation"` by default. The
 value is irrelevant; the key is written with an absolute expiry matching the
 entry's `expires_at`, and membership is one `EXISTS` round trip. Postgres uses
-the versioned `axond_revocation` table with the same expiry semantics.
+the versioned `axond_revocation` table with the same expiry semantics. An entry
+must expire no earlier than the token's own `exp`: operators supplying an
+explicit expiry are responsible for choosing that bound, while the default
+used by `axond revoke` is the current time plus the largest configured
+verifier `max_ttl` and the clock-skew allowance, which bounds the remaining
+life of any token that signer could have minted.
 
 The request-path check is bounded and fail-closed by default, returning
 `503 revocation_unavailable`; `on_unavailable = "allow"` is an explicit

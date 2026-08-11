@@ -74,6 +74,15 @@ pub(crate) fn expiry_ms(expires_at: SystemTime) -> u64 {
         .as_millis() as u64
 }
 
+pub(crate) fn validate_expiry(expires_at: SystemTime) -> Result<(), RevocationError> {
+    if expires_at <= SystemTime::now() {
+        return Err(RevocationError::Invalid(
+            "revocation expiry must be in the future".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn build(
     config: &RevocationConfig,
     budget: &crate::config::BudgetConfig,
@@ -106,7 +115,7 @@ pub async fn build(
             Ok(Box::new(
                 RedisRevocation::connect(
                     url,
-                    config.key_prefix.as_deref().unwrap_or("axond:revocation"),
+                    &config.key_prefix(),
                     Duration::from_millis(config.timeout_ms),
                     Duration::from_millis(config.connect_timeout_ms),
                     config.on_unavailable,

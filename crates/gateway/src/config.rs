@@ -656,9 +656,18 @@ impl RateLimitConfig {
     }
 }
 
+impl RevocationConfig {
+    pub fn key_prefix(&self) -> String {
+        self.key_prefix
+            .clone()
+            .unwrap_or_else(|| DEFAULT_REVOCATION_KEY_PREFIX.to_owned())
+    }
+}
+
 const DEFAULT_BUDGET_TABLE: &str = "axond_budget";
 const DEFAULT_BUDGET_KEY_PREFIX: &str = "axond:budget";
 const DEFAULT_RATE_LIMIT_KEY_PREFIX: &str = "axond:rate_limit";
+const DEFAULT_REVOCATION_KEY_PREFIX: &str = "axond:revocation";
 
 fn default_reservation_ttl_seconds() -> u64 {
     300
@@ -1590,6 +1599,7 @@ audience = "test"
         assert_eq!(cfg.default_namespace(), "platform");
         assert!(cfg.model("gpt-4o").is_some());
         assert_eq!(cfg.revocation.backend, RevocationBackend::None);
+        assert_eq!(cfg.revocation.key_prefix(), "axond:revocation");
         assert_eq!(cfg.revocation.timeout_ms, 250);
         assert_eq!(cfg.revocation.connect_timeout_ms, 5_000);
     }

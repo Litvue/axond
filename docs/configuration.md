@@ -38,6 +38,7 @@ egress: upstream provider calls still use the network at Tier 0.
 | `[budget] backend = "redis"`, `[rate_limit] backend = "redis"`, or `[revocation] backend = "redis"` | Tier 1: exact shared admission and precise token revocation through Redis. |
 | `[rate_limit] backend = "none"` or `"in-memory"` | Tier 0; in-memory state is per replica and approximate. |
 | `[budget] backend = "postgres"` | Tier 2: shared caps. |
+| `[revocation] backend = "postgres"` | Tier 2: durable precise token revocation. |
 | `/healthz`, `/readyz` | Tier 0. |
 
 Namespaces, providers, aliases, prices, and provider credentials are
