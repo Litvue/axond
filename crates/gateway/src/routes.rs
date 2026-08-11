@@ -321,7 +321,7 @@ async fn mint_tokens(
             "exp": minted.exp,
             "expires_in": expires_in,
             "namespace": caller.namespace,
-        "sub": subject,
+            "sub": subject,
         })),
     ))
 }
