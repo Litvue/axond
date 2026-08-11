@@ -216,13 +216,6 @@ async fn mint_tokens(
             {
                 return Err(GatewayError::MintClaimsNotNarrowing);
             }
-            if minting.scope.is_none()
-                && parsed
-                    .iter()
-                    .any(|capability| capability.is_operator_only())
-            {
-                return Err(GatewayError::MintClaimsNotNarrowing);
-            }
             Some(parsed)
         }
         None => Some(
@@ -238,6 +231,13 @@ async fn mint_tokens(
                 }),
         ),
     };
+    if scope.as_ref().is_some_and(|capabilities| {
+        capabilities
+            .iter()
+            .any(|capability| !caller_can_mint_capability(&caller, &snapshot, *capability))
+    }) {
+        return Err(GatewayError::MintClaimsNotNarrowing);
+    }
     let aliases = match request.aliases {
         Some(values) => {
             let requested = AliasScope::parse(values.iter().map(String::as_str))
@@ -307,6 +307,19 @@ async fn mint_tokens(
         "sub": subject,
         })),
     ))
+}
+
+fn caller_can_mint_capability(
+    caller: &InboundKey,
+    snapshot: &ConfigSnapshot,
+    capability: Capability,
+) -> bool {
+    caller
+        .scope
+        .as_ref()
+        .map_or(!capability.is_operator_only(), |scope| {
+            scope.contains(&capability) && namespace_allows(snapshot, &caller.namespace, capability)
+        })
 }
 
 async fn healthz() -> &'static str {
@@ -1879,26 +1892,51 @@ max_request_microdollars = 1000
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let (status, body) = mint_request(
+            minting_state_with_scope_audience_epochs(
+                "scope = [\"credentials\", \"credentials:all\"]",
+                "test-audience",
+                "",
+            ),
+            json!({"sub": "agent", "scope": ["credentials:all"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["type"], "mint_claims_not_narrowing");
     }
 
     #[tokio::test]
-    async fn explicit_operator_scope_ceiling_allows_credentials_view() {
-        let state = minting_state_with_scope_audience_epochs(
-            "scope = [\"credentials\", \"credentials:all\"]",
-            "test-audience",
-            "",
-        );
-        let (status, body) = mint_request(
-            state.clone(),
-            json!({"sub": "agent", "scope": ["credentials", "credentials:all"]}),
-        )
-        .await;
+    async fn no_scope_ceiling_inherits_ordinary_capabilities() {
+        let state = minting_state_without_scope();
+        let (status, body) = mint_request(state.clone(), json!({"sub": "agent"})).await;
         assert_eq!(status, StatusCode::OK);
         let token = body["token"].as_str().unwrap();
-        let response = scoped_route_request(state, "/v1/credentials?namespaces=all", token).await;
-        let status = response.status();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(status, StatusCode::OK, "response body: {body:?}");
+        let response = router(state)
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn inherited_operator_scope_is_rejected_when_minting_key_lacks_it() {
+        let (status, body) = mint_request(
+            minting_state_with_scope_audience_epochs(
+                "scope = [\"credentials\", \"credentials:all\"]",
+                "test-audience",
+                "",
+            ),
+            json!({"sub": "agent"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["type"], "mint_claims_not_narrowing");
     }
 
     #[tokio::test]
