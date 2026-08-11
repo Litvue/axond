@@ -331,6 +331,9 @@ whenever a column was added; it is now bounded by `buffer_capacity` instead, so
 the cap no longer shifts under a schema change. A config setting `max_batch`
 above its sink's `buffer_capacity` booted before this release and is now a boot
 error: lower `max_batch`, or raise `buffer_capacity` to match.
+When `max_batch` is omitted, the default of `500` is clamped to
+`buffer_capacity` instead, so a smaller operator-configured buffer remains a
+valid upgrade path and runs with the smaller effective batch size.
 
 `kind = "otlp"` emits usage as OTel log records on the exporter telemetry
 already installed, so it needs `OTEL_EXPORTER_OTLP_ENDPOINT`; the SDK's batch

@@ -325,7 +325,7 @@ fn default_target_cooldown_seconds() -> u64 {
 /// One usage destination. `kind` decides which of the remaining fields apply;
 /// they are validated as a set at boot, so a Postgres sink without a DSN (or a
 /// batch size the wire protocol cannot carry) refuses to start.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageSinkConfig {
     pub kind: UsageSinkKind,
     /// `postgres`: name of the env var holding the connection string. The DSN is
@@ -344,11 +344,48 @@ pub struct UsageSinkConfig {
     #[serde(default = "default_buffer_capacity")]
     pub buffer_capacity: usize,
     /// Rows per write (`postgres`).
-    #[serde(default = "default_max_batch")]
+    #[serde(skip)]
     pub max_batch: usize,
+    #[doc(hidden)]
+    pub max_batch_explicit: bool,
     /// How long a partial batch waits before it is written anyway (`postgres`).
-    #[serde(default = "default_flush_interval_ms")]
     pub flush_interval_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageSinkConfigWire {
+    kind: UsageSinkKind,
+    #[serde(default)]
+    dsn_env: Option<String>,
+    #[serde(default)]
+    table: Option<String>,
+    #[serde(default)]
+    create_table: bool,
+    #[serde(default = "default_buffer_capacity")]
+    buffer_capacity: usize,
+    #[serde(default)]
+    max_batch: Option<usize>,
+    #[serde(default = "default_flush_interval_ms")]
+    flush_interval_ms: u64,
+}
+
+impl<'de> Deserialize<'de> for UsageSinkConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = UsageSinkConfigWire::deserialize(deserializer)?;
+        Ok(Self {
+            kind: wire.kind,
+            dsn_env: wire.dsn_env,
+            table: wire.table,
+            create_table: wire.create_table,
+            buffer_capacity: wire.buffer_capacity,
+            max_batch: wire.max_batch.unwrap_or_else(default_max_batch),
+            max_batch_explicit: wire.max_batch.is_some(),
+            flush_interval_ms: wire.flush_interval_ms,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -378,6 +415,7 @@ impl Default for UsageSinkConfig {
             create_table: false,
             buffer_capacity: default_buffer_capacity(),
             max_batch: default_max_batch(),
+            max_batch_explicit: false,
             flush_interval_ms: default_flush_interval_ms(),
         }
     }
@@ -393,7 +431,7 @@ impl UsageSinkConfig {
     pub fn batch_settings(&self) -> BatchSettings {
         BatchSettings {
             capacity: self.buffer_capacity,
-            max_batch: self.max_batch,
+            max_batch: self.max_batch.min(self.buffer_capacity),
             flush_interval: Duration::from_millis(self.flush_interval_ms),
         }
     }
@@ -1550,7 +1588,7 @@ impl Config {
                     "usage_sink `{kind}`: max_batch must be at least 1"
                 )));
             }
-            if sink.max_batch > sink.buffer_capacity {
+            if sink.max_batch_explicit && sink.max_batch > sink.buffer_capacity {
                 return Err(ConfigError::Invalid(format!(
                     "usage_sink `{kind}`: max_batch ({}) must not exceed buffer_capacity ({})",
                     sink.max_batch, sink.buffer_capacity
@@ -2510,6 +2548,25 @@ max_batch = 100
                 .to_string()
                 .contains("max_batch (100) must not exceed buffer_capacity (99)")
         );
+    }
+
+    #[test]
+    fn clamps_default_batch_to_a_small_buffer() {
+        let toml = format!(
+            r#"
+{VALID}
+
+[[usage_sink]]
+kind = "postgres"
+dsn_env = "DSN"
+buffer_capacity = 100
+"#
+        );
+        let cfg = Config::from_toml_str(&toml).expect("default batch should be clamped");
+        let sink = &cfg.usage_sink[0];
+        assert!(!sink.max_batch_explicit);
+        assert_eq!(sink.max_batch, default_max_batch());
+        assert_eq!(sink.batch_settings().max_batch, 100);
     }
 
     #[test]
