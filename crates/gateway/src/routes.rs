@@ -26,7 +26,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Extension, Request, State};
 use axum::http::{HeaderMap, HeaderValue};
@@ -176,6 +176,22 @@ async fn mint_tokens(
     let Json(request) = body.map_err(|error| GatewayError::BadRequest(error.to_string()))?;
     if request.sub.trim().is_empty() {
         return Err(GatewayError::BadRequest("`sub` must not be empty".into()));
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| GatewayError::MintingBlockedByEpoch {
+            namespace: caller.namespace.clone(),
+            subject: request.sub.clone(),
+        })?
+        .as_secs();
+    if snapshot
+        .gateway_token_epoch(&caller.namespace, &request.sub)
+        .is_some_and(|min_iat| min_iat > now)
+    {
+        return Err(GatewayError::MintingBlockedByEpoch {
+            namespace: caller.namespace.clone(),
+            subject: request.sub.clone(),
+        });
     }
     let ttl = Duration::from_secs(request.ttl_seconds.unwrap_or(minting.max_ttl.as_secs()));
     if ttl.is_zero() || ttl > minting.max_ttl {
@@ -1623,7 +1639,11 @@ targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdol
     }
 
     fn minting_state() -> AppState {
-        let cfg = Config::from_toml_str(
+        minting_state_with_epochs("")
+    }
+
+    fn minting_state_with_epochs(epochs: &str) -> AppState {
+        let cfg = Config::from_toml_str(&format!(
             r#"
 [[namespace]]
 id = "platform"
@@ -1650,8 +1670,10 @@ env = "JWT_SECRET"
 scope = ["chat", "models"]
 aliases = ["gpt-*"]
 max_request_microdollars = 1000
+{epochs}
 "#,
-        )
+            epochs = epochs
+        ))
         .unwrap();
         let env = HashMap::from([
             ("MINT_KEY".to_owned(), "mint-key".to_owned()),
@@ -1699,6 +1721,32 @@ max_request_microdollars = 1000
             response.headers().get(axum::http::header::CACHE_CONTROL),
             Some(&HeaderValue::from_static("no-store"))
         );
+    }
+
+    #[tokio::test]
+    async fn future_token_epochs_block_minting_but_past_epochs_do_not() {
+        let future = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        for epoch in [
+            format!("[[gateway_token_epoch]]\nnamespace = \"platform\"\nmin_iat = {future}"),
+            format!(
+                "[[gateway_token_epoch]]\nnamespace = \"platform\"\nsubject = \"agent\"\nmin_iat = {future}"
+            ),
+        ] {
+            let (status, body) =
+                mint_request(minting_state_with_epochs(&epoch), json!({"sub": "agent"})).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(body["error"]["type"], "minting_blocked_by_epoch");
+        }
+
+        let past = future - 7200;
+        let epoch = format!("[[gateway_token_epoch]]\nnamespace = \"platform\"\nmin_iat = {past}");
+        let (status, _) =
+            mint_request(minting_state_with_epochs(&epoch), json!({"sub": "agent"})).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[test]

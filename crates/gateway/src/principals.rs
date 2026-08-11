@@ -212,7 +212,7 @@ struct ResolvedVerifier {
 }
 
 #[derive(Default)]
-struct NamespaceEpoch {
+pub(crate) struct NamespaceEpoch {
     namespace_min_iat: Option<u64>,
     subjects: HashMap<String, u64>,
 }
@@ -222,6 +222,33 @@ pub struct TokenVerifier {
     namespaces: HashSet<String>,
     verifiers: Vec<ResolvedVerifier>,
     epochs: HashMap<String, NamespaceEpoch>,
+}
+
+pub(crate) fn configured_token_epochs(config: &Config) -> HashMap<String, NamespaceEpoch> {
+    let mut epochs: HashMap<String, NamespaceEpoch> = HashMap::new();
+    for epoch in &config.gateway_token_epoch {
+        let namespace = epochs.entry(epoch.namespace.clone()).or_default();
+        if let Some(subject) = &epoch.subject {
+            namespace.subjects.insert(subject.clone(), epoch.min_iat);
+        } else {
+            namespace.namespace_min_iat = Some(epoch.min_iat);
+        }
+    }
+    epochs
+}
+
+pub(crate) fn resolve_token_epoch(
+    epochs: &HashMap<String, NamespaceEpoch>,
+    namespace: &str,
+    subject: &str,
+) -> Option<u64> {
+    epochs.get(namespace).and_then(|epoch| {
+        epoch
+            .subjects
+            .get(subject)
+            .copied()
+            .or(epoch.namespace_min_iat)
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,15 +311,7 @@ impl TokenVerifier {
             .iter()
             .map(|namespace| namespace.id.clone())
             .collect();
-        let mut epochs: HashMap<String, NamespaceEpoch> = HashMap::new();
-        for epoch in &config.gateway_token_epoch {
-            let namespace = epochs.entry(epoch.namespace.clone()).or_default();
-            if let Some(subject) = &epoch.subject {
-                namespace.subjects.insert(subject.clone(), epoch.min_iat);
-            } else {
-                namespace.namespace_min_iat = Some(epoch.min_iat);
-            }
-        }
+        let epochs = configured_token_epochs(config);
         let mut verifiers = Vec::with_capacity(config.gateway_verifier.len());
         for verifier in &config.gateway_verifier {
             let source =
@@ -579,13 +598,7 @@ impl PrincipalStore for TokenVerifier {
                 claim: "sub".to_owned(),
             }),
         )?;
-        let epoch = self.epochs.get(namespace.as_str()).and_then(|namespace| {
-            namespace
-                .subjects
-                .get(subject.as_str())
-                .copied()
-                .or(namespace.namespace_min_iat)
-        });
+        let epoch = resolve_token_epoch(&self.epochs, &namespace, &subject);
         if epoch.is_some_and(|min_iat| iat < min_iat) {
             return Err(PrincipalStoreError::Unauthorized(
                 TokenVerificationError::IssuedBeforeEpoch { namespace, subject },
