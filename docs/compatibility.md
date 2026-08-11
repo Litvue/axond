@@ -23,9 +23,12 @@ Scoped minted callers receive a typed `403 token_scope_insufficient` when their
 scope does not include a route capability or the namespace cannot serve it.
 Static gateway keys and scope-less tokens retain their existing route behavior,
 including the own-namespace `/v1/credentials` view. The all-namespaces
-credential view requires the explicit `credentials:all` scope; a scoped token
-also needs `credentials` for the route. The all-namespaces view additionally
-requires the caller's namespace to be the configured default/platform namespace.
+credential view (`?namespaces=all`) follows direct operator authority: a
+scope-less static `[[gateway_key]]` in the configured default namespace is
+admitted, while a static key in a tenant namespace and every minted token —
+including one carrying a `credentials:all` claim — receive
+`403 token_scope_insufficient`. A scoped token also needs `credentials` for the
+route. `credentials:all` remains unmintable through `POST /v1/tokens`.
 
 Responses is forwarded natively with only `model` rewritten; streaming is
 byte-faithful and requests carrying a non-empty `previous_response_id` consider

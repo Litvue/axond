@@ -283,7 +283,14 @@ and pass any ceiling. It is enforced at admission time and emitted by
 
 ADR 0016 describes three narrowing claims. `scope` is enforced by route
 capability and can be emitted with repeatable `--scope` flags:
-`chat`, `messages`, `embeddings`, `responses`, and `models`. The `aliases` claim is enforced
+`chat`, `messages`, `embeddings`, `responses`, `models`, and `credentials`.
+A minted token cannot reach the all-namespaces credential view
+(`GET /v1/credentials?namespaces=all`) at all: that view follows direct
+operator authority, so use a scope-less static `[[gateway_key]]` in the default
+namespace for it. Signing a `credentials:all` claim yourself does not help: the
+gateway denies it with `403 token_scope_insufficient`, and `POST /v1/tokens`
+refuses to mint it ([ADR 0021](./adr/0021-credential-status-endpoint.md)).
+The `aliases` claim is enforced
 both before dispatch and in the caller's `/v1/models` view, and is emitted by
 `axond mint --alias`. It is a repeatable, case-sensitive pattern restriction.
 

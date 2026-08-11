@@ -76,10 +76,27 @@ impl std::fmt::Display for Capability {
     }
 }
 
+/// How a principal's authority was established, which decides whether it is the
+/// operator's own authority or authority an operator delegated to a subject.
+///
+/// Claims cannot answer this: a minted token can present any capability its
+/// signer allowed, so provenance has to be recorded where the principal is
+/// resolved rather than inferred from its scope later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrincipalAuthority {
+    /// A configured `[[gateway_key]]` secret, presented directly by an operator
+    /// or a tenant that holds it. Its authority is the operator's own.
+    StaticKey,
+    /// A verified `axt1.` token. Its authority is delegated and bounded by what
+    /// minting and the verifier allow.
+    MintedToken,
+}
+
 #[derive(Clone)]
 pub struct InboundKey {
     pub namespace: String,
     pub subject: String,
+    pub authority: PrincipalAuthority,
     pub signer_kid: Option<String>,
     pub scope: Option<HashSet<Capability>>,
     pub alias_scope: Option<AliasScope>,
@@ -632,6 +649,7 @@ impl PrincipalStore for TokenVerifier {
         Ok(Some(InboundKey {
             namespace,
             subject,
+            authority: PrincipalAuthority::MintedToken,
             signer_kid: Some(verifier.kid.clone()),
             scope: claims.scope.map(RawScope::capabilities),
             alias_scope,
@@ -855,6 +873,7 @@ mod tests {
             caller: InboundKey {
                 namespace: "platform".to_owned(),
                 subject: "AXOND_KEY".to_owned(),
+                authority: PrincipalAuthority::StaticKey,
                 signer_kid: None,
                 scope: None,
                 alias_scope: None,

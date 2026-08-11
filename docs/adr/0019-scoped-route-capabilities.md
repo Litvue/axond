@@ -27,11 +27,12 @@ The route capability set is fixed and maps directly to the provider routes:
 | `models` | `GET /v1/models` |
 | `credentials` | `GET /v1/credentials` |
 
-`credentials:all` is an additional explicit operator scope for the
-all-namespaces credential status view; it never grants the route by itself.
-Scope-less principals retain the route's own-namespace view, while this
-explicit capability is required for `?namespaces=all`.
-The endpoint's replica-local state and operator-scope boundary are specified
+`credentials:all` names the all-namespaces credential status view, but no scope
+grants it: the view follows direct operator authority — a scope-less static
+gateway key in the default namespace — and is denied to every minted token,
+including one that presents the capability. Scope-less principals retain the
+route's own-namespace view.
+The endpoint's replica-local state and operator-authority boundary are specified
 in [ADR 0021](./0021-credential-status-endpoint.md).
 
 Namespace authority is derived from the existing route and credential graph.

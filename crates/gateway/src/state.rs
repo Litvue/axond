@@ -28,9 +28,9 @@ use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind};
 use crate::credentials::{CredentialError, Credentials};
 use crate::key_material::{self, KeyMaterialError};
 use crate::principals::{
-    Capability, ConfigPrincipals, GatewayKeyEntry, NamespaceEpoch, Presented, PrincipalShapeError,
-    PrincipalStoreChain, TokenVerifier, TokenVerifierBuildError, configured_token_epochs,
-    resolve_token_epoch,
+    Capability, ConfigPrincipals, GatewayKeyEntry, NamespaceEpoch, Presented, PrincipalAuthority,
+    PrincipalShapeError, PrincipalStoreChain, TokenVerifier, TokenVerifierBuildError,
+    configured_token_epochs, resolve_token_epoch,
 };
 #[cfg(test)]
 use crate::rate_limit::NoLimit;
@@ -227,6 +227,7 @@ impl ConfigSnapshot {
                 caller: InboundKey {
                     namespace: k.namespace.clone(),
                     subject: label.to_owned(),
+                    authority: PrincipalAuthority::StaticKey,
                     signer_kid: None,
                     scope: None,
                     alias_scope: None,
