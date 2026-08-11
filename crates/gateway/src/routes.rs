@@ -316,7 +316,7 @@ async fn mint_tokens(
             "exp": minted.exp,
             "expires_in": expires_in,
             "namespace": caller.namespace,
-        "sub": subject,
+            "sub": subject,
         })),
     ))
 }
@@ -333,6 +333,7 @@ fn caller_can_mint_capability(
             scope.contains(&capability) && namespace_allows(snapshot, &caller.namespace, capability)
         })
 }
+
 async fn healthz() -> &'static str {
     "ok"
 }
