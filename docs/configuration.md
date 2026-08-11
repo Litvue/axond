@@ -35,9 +35,10 @@ egress: upstream provider calls still use the network at Tier 0.
 | `[[usage_sink]] kind = "otlp"` | Tier 0 state, but not hermetic: a collector is a boot-time dependency, so this is outside the hermetic Tier 0 CI lane. |
 | `[[usage_sink]] kind = "postgres"` | Tier 2: durable usage rows. |
 | `[budget] backend = "none"` or `"in-memory"` | Tier 0; in-memory state is per replica and approximate. |
-| `[budget] backend = "redis"` or `[rate_limit] backend = "redis"` | Tier 1: exact shared admission through Redis. |
+| `[budget] backend = "redis"`, `[rate_limit] backend = "redis"`, or `[revocation] backend = "redis"` | Tier 1: exact shared admission and precise token revocation through Redis. |
 | `[rate_limit] backend = "none"` or `"in-memory"` | Tier 0; in-memory state is per replica and approximate. |
 | `[budget] backend = "postgres"` | Tier 2: shared caps. |
+| `[revocation] backend = "postgres"` | Tier 2: durable precise token revocation. |
 | `/healthz`, `/readyz` | Tier 0. |
 
 Namespaces, providers, aliases, prices, and provider credentials are
@@ -77,7 +78,7 @@ The tenancy boundary: which credential pool a caller's requests draw from.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `name` | string | — | The name callers send (`gpt-4o`). Also what `/v1/models` lists, for callers whose namespace holds a credential for one of its targets. |
+| `name` | string | — | The name callers send (`gpt-4o`). Also what `/v1/models` lists, for callers whose namespace holds a credential for one of its targets. Credential labels are separately exposed by the scoped, replica-local `/v1/credentials` status view. |
 | `targets` | array of target | — | Concrete destinations, tried **in order** on a retryable failure. All targets must use one provider wire family: OpenAI (`openai` or `openai-compatible`) or Anthropic. An empty list is rejected. |
 
 Each target:
@@ -110,6 +111,15 @@ Several entries for the same pair form that pair's **pool**
 | `env` | string | — | *Name* of the environment variable holding the key. Empty is rejected; unset or empty **at boot** is a fatal error naming the variable. |
 | `id` | string | the `env` name | Non-secret attribution label; lands on usage records as `credential_id`. Duplicates within one pool are rejected. |
 | `weight` | integer | `1` | Share of pool traffic under the `weighted` strategy. `0` is rejected — remove the entry instead. |
+
+The label is caller-visible in the owning namespace and in the operator's
+`?namespaces=all` view. A fallback tenant sees the platform credential and its
+state, but the default `env`-derived label is omitted; an explicitly configured
+`id` remains visible. This keeps operator environment naming private while
+making deliberate credential labels actionable.
+
+In the JSON response, `credential_id` is therefore optional: it is omitted for
+fallback platform entries without an explicit `id`.
 
 ## `[credential_pool]` — Tier 0, in-memory per replica
 
@@ -264,7 +274,7 @@ or via an atomic rename is therefore reload-reachable without a process
 restart. `[[namespace]]` changes are reloadable and appear in the reported
 namespace delta, but the namespace count used for in-memory budget retention
 floors is captured at boot and does not resize until restart. `[server] bind`,
-`[[usage_sink]]`, `[budget]`, and `[rate_limit]`
+`[[usage_sink]]`, `[budget]`, `[rate_limit]`, and `[revocation]`
 changes warn and are ignored until restart; this includes
 `limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
 
@@ -354,6 +364,23 @@ the map retains only active callers.
 
 Redis connects and PINGs at boot. A Redis limiter's lease is released when its
 permit drops; if the process or Redis is unavailable, the TTL reclaims it.
+
+## `[revocation]` — opt-in precise minted-token revocation
+
+Omit this section for Tier 0: no denylist is consulted. Redis is Tier 1 and
+Postgres is the durable alternative. Expired rows and keys are harmless
+leftovers and are not removed on the request path.
+
+| Key | Type | Default | Applies to | Meaning |
+| --- | --- | --- | --- | --- |
+| `backend` | `none` \| `redis` \| `postgres` | `none` | all | Selects the denylist backend. |
+| `dsn_env` | string | — | `redis`, `postgres` | Env-var name for the connection string; omitted Redis references reuse a Redis budget's `dsn_env`. |
+| `key_prefix` | string | `axond:revocation` | `redis` | Prefix for `<prefix>:{<jti>}` keys. |
+| `table` | string | `axond_revocation` | `postgres` | Revocation table, validated as an identifier. |
+| `create_table` | bool | `false` | `postgres` | Apply the shipped versioned DDL at boot. |
+| `on_unavailable` | `deny` \| `allow` | `deny` | shared | For outages after boot, fail closed with `503 revocation_unavailable`, or explicitly admit and warn. The backend connects and PINGs/`SELECT`s before the listener binds, so an unreachable store aborts startup for either value. |
+| `timeout_ms` | integer | `250` | shared | Bounded operation timeout; must be nonzero. |
+| `connect_timeout_ms` | integer | `5000` | shared | Bounded connection/PING timeout; must be nonzero. |
 
 ## Telemetry
 

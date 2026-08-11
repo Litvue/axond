@@ -1,0 +1,87 @@
+# Docker Compose stateful quickstart configuration.
+#
+# This duplicates axond.quickstart.toml because TOML has no include. Keep the
+# catalogue and routing sections in sync; only the trailing budget,
+# rate_limit, and usage_sink sections differ. The shared backends are:
+# - Tier 1: Redis-backed budget and inbound rate limiting. Redis is now part of
+#   admission and the default `deny` policy fails closed when it is unavailable.
+# - Tier 2: Postgres durable usage rows. `create_table = true` applies the
+#   committed usage schema and additive migrations at boot.
+
+[server]
+bind = "0.0.0.0:8080"
+
+[[namespace]]
+id = "platform"
+default = true
+
+[[namespace]]
+id = "acme"
+allow_platform_fallback = false
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[provider]]
+id = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "GW_PLATFORM_OPENAI_API_KEY"
+
+[[credential]]
+namespace = "platform"
+provider = "anthropic"
+env = "GW_PLATFORM_ANTHROPIC_API_KEY"
+
+[[credential]]
+namespace = "acme"
+provider = "openai"
+env = "GW_ACME_OPENAI_API_KEY"
+
+[[gateway_key]]
+env = "GW_INBOUND_PLATFORM_KEY"
+namespace = "platform"
+
+[[gateway_key]]
+env = "GW_INBOUND_ACME_KEY"
+namespace = "acme"
+
+[[model]]
+name = "gpt-4o"
+targets = [
+  { provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2_500_000, output_microdollars_per_million = 10_000_000 } },
+]
+
+[[model]]
+name = "claude-sonnet"
+targets = [
+  { provider = "anthropic", model = "claude-3-7-sonnet-latest", price = { input_microdollars_per_million = 3_000_000, output_microdollars_per_million = 15_000_000 } },
+]
+
+[[model]]
+name = "text-embedding-3-small"
+targets = [
+  { provider = "openai", model = "text-embedding-3-small", price = { input_microdollars_per_million = 20_000, output_microdollars_per_million = 0 } },
+]
+
+[budget]
+backend = "redis"
+limit_microdollars = 10_000_000
+dsn_env = "AXOND_BUDGET_REDIS_URL"
+on_unavailable = "deny"
+
+[rate_limit]
+backend = "redis"
+dsn_env = "AXOND_RATE_LIMIT_REDIS_URL"
+on_unavailable = "deny"
+
+[[usage_sink]]
+kind = "postgres"
+dsn_env = "AXOND_USAGE_POSTGRES_DSN"
+create_table = true

@@ -8,6 +8,107 @@ balancer; there is no leader, no local state, and nothing to migrate.
 For what each config key means, see the [configuration reference](./configuration.md).
 For what to watch once it is running, see the [observability runbook](./observability.md).
 
+## 5-minute quickstart
+
+This path builds the local distroless image from the Dockerfile rather than
+pulling a registry image. The first build compiles the static musl release and
+can take several minutes; later starts reuse the cached image.
+
+The example inbound keys are public values for local use only. Replace them
+before exposing the gateway beyond your own machine.
+
+```bash
+git clone https://github.com/Litvue/axond.git
+cd axond
+cp ops/compose/env.example .env
+docker compose up -d --build
+curl http://localhost:8080/healthz
+curl -H 'Authorization: Bearer quickstart-platform-key' \
+  http://localhost:8080/v1/models
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -w '\nHTTP %{http_code}\n' \
+  -H 'Authorization: Bearer quickstart-platform-key' \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Say hello in one word."}]}'
+docker compose down -v
+```
+
+The health probe returns `ok`, and the authenticated catalogue lists the
+aliases available to the platform namespace:
+
+```text
+ok
+{"data":[{"id":"gpt-4o","object":"model","owned_by":"axond"},{"id":"claude-sonnet","object":"model","owned_by":"axond"},{"id":"text-embedding-3-small","object":"model","owned_by":"axond"}],"object":"list"}
+```
+
+With the committed placeholder key, the chat request returns HTTP `502` and
+an example of the following typed provider error:
+
+```text
+{"error":{"message":"invalid provider request: Incorrect API key provided: placehol**********-key. You can find your API key at https://platform.openai.com/account/api-keys.","type":"invalid_request"}}
+HTTP 502
+```
+
+A real key in `GW_PLATFORM_OPENAI_API_KEY` returns the provider's normal HTTP
+`200` chat-completion response.
+
+The exact provider message varies with network and provider responses; an
+air-gapped run returns a typed `upstream_transport` error instead. Keep `.env`
+until after `docker compose down -v`, because required-variable interpolation
+runs before every Compose command. To run `just quickstart-smoke`, tear down
+the quickstart first because the smoke uses the same host port. If port 8080
+is occupied by another local stack, use
+`AXOND_QUICKSTART_SMOKE_PORT=18080 just quickstart-smoke`.
+
+To try the stateful variant, select the Tier 1 Redis budget/rate-limit backends
+and the Tier 2 Postgres durable usage sink:
+
+```bash
+export AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml
+docker compose \
+  -f docker-compose.yml -f docker-compose.stateful.yml \
+  --profile stateful up -d --build
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -w '\nHTTP %{http_code}\n' \
+  -H 'Authorization: Bearer quickstart-platform-key' \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Say hello in one word."}]}'
+```
+
+The stateful configuration creates the Postgres usage table at boot. Redis and
+Postgres are required dependencies in this path; admission fails closed when
+Redis is unavailable, and usage rows are durable in Postgres.
+
+After the chat request, the usage sink batches rows. Poll for the durable Tier
+2 usage row with:
+
+```bash
+for attempt in $(seq 1 12); do
+  count="$(docker compose -f docker-compose.yml -f docker-compose.stateful.yml \
+    --profile stateful exec -T postgres psql -U postgres -d axond -Atc \
+    "select count(*) from axond_usage;")"
+  if [ "$count" = 1 ]; then
+    printf '%s\n' "$count"
+    break
+  fi
+  sleep 1
+done
+test "$count" = 1
+```
+
+Observed output after the placeholder chat request:
+
+```text
+1
+```
+
+Keep `.env` in place for this query and for teardown. When finished:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.stateful.yml \
+  --profile stateful down -v
+```
+
 ## What you need before you start
 
 - A config file. Copy [`axond.example.toml`](../axond.example.toml) and edit it.
@@ -194,11 +295,25 @@ process environment. Nothing in the config file is ever a secret value.
 | `GET /healthz` | none | `ok` once the process is serving. |
 | `GET /readyz` | none | `ready` once the process is serving. |
 | `GET /v1/models` | gateway key | The alias catalogue (names only), scoped to the caller's namespace — only aliases whose targets the caller holds a credential for. |
+| `GET /v1/credentials` | gateway key | Replica-local credential labels and circuit state for the caller's namespace; `?namespaces=all` additionally requires `credentials:all`. |
 
 Minted callers may additionally carry repeatable `--scope` capabilities
-(`chat`, `messages`, `embeddings`, or `models`). Scope only narrows the derived
-namespace authority; denial is `403 token_scope_insufficient`. Static keys and
-scope-less tokens are unaffected. `/v1/responses` remains a typed `501`.
+(`chat`, `messages`, `embeddings`, `models`, `credentials`, or
+`credentials:all`). Scope only narrows the derived namespace authority;
+scope-less principals retain their own-namespace credential view. A scoped
+token needs `credentials` for the route, while `?namespaces=all` additionally
+requires the explicit `credentials:all` scope and otherwise returns
+`403 token_scope_insufficient`. `/v1/responses` remains a typed `501`.
+`credentials:all` is operator-only and must be minted only into operator
+tokens. The all-namespaces view also requires the caller's namespace to be the
+configured default/platform namespace; the verifier `namespaces = [...]`
+allowlist is defense in depth ([ADR 0021](./adr/0021-credential-status-endpoint.md)).
+
+Credential status is Tier 0, in-memory, and per replica: `observed: "replica"`
+is not a fleet-wide health view. Presence is represented by an entry (boot
+resolves configured credentials or fails), and credential ids are attribution
+labels, never secrets. The default env-derived `credential_id` is omitted for
+platform entries shown through tenant fallback; explicit ids remain visible.
 
 Both probes report process liveness. `/readyz` does **not** currently probe the
 usage sink, the budget store, or any provider — it answers `ready` whenever the

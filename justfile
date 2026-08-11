@@ -62,3 +62,7 @@ docker:
 # Build the image and prove it boots and serves /healthz.
 docker-smoke:
     ops/docker-smoke.sh "$(docker build -q .)"
+
+# Run the five-minute Docker Compose quickstart against placeholder providers.
+quickstart-smoke:
+    ops/compose-smoke.sh

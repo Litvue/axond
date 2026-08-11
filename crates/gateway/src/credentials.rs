@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use secrecy::SecretString;
+use serde::Serialize;
 
 use crate::config::{Config, SelectionStrategy};
 
@@ -83,6 +84,36 @@ pub enum CredentialError {
 pub enum CredentialState {
     Healthy,
     Parked,
+    Probe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialStatusView<'a> {
+    Namespace(&'a str),
+    All,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CredentialStatus {
+    pub namespace: String,
+    pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
+    pub source: &'static str,
+    pub state: CredentialState,
+}
+
+impl Serialize for CredentialState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::Healthy => "healthy",
+            Self::Parked => "parked",
+            Self::Probe => "probe",
+        })
+    }
 }
 
 /// What one request may do with a credential.
@@ -96,6 +127,7 @@ enum Eligibility {
 
 struct PoolEntry {
     id: String,
+    status_id: Option<String>,
     secret: SecretString,
     weight: u32,
     health_key: String,
@@ -205,23 +237,18 @@ impl CredentialHealth {
         }
     }
 
-    fn snapshot_at(&self, now: Instant) -> Vec<(String, CredentialState)> {
-        self.lock()
-            .iter()
-            .map(|(key, circuit)| {
-                let parked = circuit.parked_at.is_some_and(|parked_at| {
-                    now.saturating_duration_since(parked_at) < self.cooldown
-                });
-                (
-                    key.clone(),
-                    if parked {
-                        CredentialState::Parked
-                    } else {
-                        CredentialState::Healthy
-                    },
-                )
-            })
-            .collect()
+    fn state_at(&self, key: &str, now: Instant) -> CredentialState {
+        let circuits = self.lock();
+        let Some(circuit) = circuits.get(key) else {
+            return CredentialState::Healthy;
+        };
+        match circuit.parked_at {
+            None => CredentialState::Healthy,
+            Some(parked_at) if now.saturating_duration_since(parked_at) < self.cooldown => {
+                CredentialState::Parked
+            }
+            Some(_) => CredentialState::Probe,
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Circuit>> {
@@ -262,6 +289,7 @@ impl Credentials {
                 .or_default()
                 .push(PoolEntry {
                     id: c.label().to_string(),
+                    status_id: c.id.clone(),
                     secret: SecretString::from(secret.clone()),
                     weight: c.weight,
                     health_key: health_key(&c.namespace, &c.provider, c.label()),
@@ -409,10 +437,95 @@ impl Credentials {
                 .contains_key(&(self.platform_ns.clone(), provider.to_string()))
     }
 
-    /// Labels + circuit state per credential, for the status endpoint and logs.
-    #[allow(dead_code)] // backs the credential-status endpoint (follow-up)
-    pub fn health_snapshot(&self) -> Vec<(String, CredentialState)> {
-        self.health.snapshot_at(Instant::now())
+    /// Return configured credentials visible to a namespace or to an operator.
+    ///
+    /// Presence is represented by the entry itself: boot either resolved the
+    /// configured credential or failed. `observed` is therefore a replica-local
+    /// Tier 0 view, and this read never advances rotation or consumes a probe.
+    pub fn status(&self, config: &Config, view: CredentialStatusView<'_>) -> Vec<CredentialStatus> {
+        self.status_at(config, view, Instant::now())
+    }
+
+    fn status_at(
+        &self,
+        config: &Config,
+        view: CredentialStatusView<'_>,
+        now: Instant,
+    ) -> Vec<CredentialStatus> {
+        let mut statuses = Vec::new();
+        let mut add_pool =
+            |owner: &str, provider: &str, pool: &Pool, source: &'static str, hide_default_id| {
+                for entry in &pool.entries {
+                    statuses.push(CredentialStatus {
+                        namespace: owner.to_owned(),
+                        provider: provider.to_owned(),
+                        credential_id: if hide_default_id {
+                            entry.status_id.clone()
+                        } else {
+                            Some(entry.id.clone())
+                        },
+                        source,
+                        state: self.health.state_at(&entry.health_key, now),
+                    });
+                }
+            };
+        match view {
+            CredentialStatusView::All => {
+                for ((namespace, provider), pool) in &self.pools {
+                    add_pool(
+                        namespace,
+                        provider,
+                        pool,
+                        if namespace == &self.platform_ns {
+                            "platform"
+                        } else {
+                            "byok"
+                        },
+                        false,
+                    );
+                }
+            }
+            CredentialStatusView::Namespace(namespace) => {
+                let allow_platform_fallback = namespace != self.platform_ns
+                    && config
+                        .namespace(namespace)
+                        .is_some_and(|n| n.allow_platform_fallback);
+                for ((owner, provider), pool) in &self.pools {
+                    if owner == namespace {
+                        add_pool(
+                            owner,
+                            provider,
+                            pool,
+                            if owner == &self.platform_ns {
+                                "platform"
+                            } else {
+                                "byok"
+                            },
+                            false,
+                        );
+                    }
+                }
+                if allow_platform_fallback {
+                    for ((owner, provider), pool) in &self.pools {
+                        if owner == &self.platform_ns
+                            && !self
+                                .pools
+                                .contains_key(&(namespace.to_owned(), provider.clone()))
+                        {
+                            add_pool(owner, provider, pool, "platform", true);
+                        }
+                    }
+                }
+            }
+        }
+        statuses.sort_by(|a, b| {
+            (&a.namespace, &a.provider, &a.credential_id).cmp(&(
+                &b.namespace,
+                &b.provider,
+                &b.credential_id,
+            ))
+        });
+        statuses
     }
 }
 
@@ -479,6 +592,44 @@ id = "openai-b"
 
     fn two_key_credentials(cfg: &Config) -> Credentials {
         Credentials::from_env(cfg, &env(&[("K1", "sk-a"), ("K2", "sk-b")])).expect("credentials")
+    }
+
+    #[test]
+    fn fallback_status_hides_default_platform_label_but_keeps_explicit_id() {
+        let cfg = config(
+            r#"
+[[namespace]]
+id = "tenant"
+allow_platform_fallback = true
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K1"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K2"
+id = "public-platform"
+"#,
+        );
+        let creds = Credentials::from_env(&cfg, &env(&[("K1", "sk-a"), ("K2", "sk-b")]))
+            .expect("credentials");
+        let statuses = creds.status(&cfg, CredentialStatusView::Namespace("tenant"));
+        let body = serde_json::to_value(statuses).expect("status JSON");
+        let entries = body.as_array().expect("status list");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["namespace"], "platform");
+        assert_eq!(entries[0]["source"], "platform");
+        assert_eq!(entries[0]["state"], "healthy");
+        assert!(
+            !entries[0]
+                .as_object()
+                .unwrap()
+                .contains_key("credential_id")
+        );
+        assert_eq!(entries[1]["credential_id"], "public-platform");
     }
 
     #[test]
@@ -646,9 +797,45 @@ weight = 1
         creds.record_success(probed);
         assert!(
             creds
-                .health_snapshot()
+                .status_at(&cfg, CredentialStatusView::All, Instant::now())
                 .iter()
-                .all(|(_, state)| { *state == CredentialState::Healthy })
+                .all(|status| status.state == CredentialState::Healthy)
+        );
+    }
+
+    #[test]
+    fn status_reports_probe_and_is_pure() {
+        let cfg = config(TWO_PLATFORM_KEYS);
+        let creds = two_key_credentials(&cfg);
+        let now = Instant::now();
+        let plan = creds
+            .plan_at(&cfg, "platform", "openai", now)
+            .expect("plan");
+        let head = &plan.attempts[0];
+        creds.health.record_failure_at(&head.health_key, now);
+        creds.health.record_failure_at(&head.health_key, now);
+
+        let after_cooldown = now + Duration::from_secs(31);
+        let statuses = creds.status_at(&cfg, CredentialStatusView::All, after_cooldown);
+        assert_eq!(
+            statuses
+                .iter()
+                .find(|status| status.credential_id.as_deref() == Some(head.id.as_str()))
+                .expect("head status")
+                .state,
+            CredentialState::Probe
+        );
+        for _ in 0..5 {
+            let _ = creds.status_at(&cfg, CredentialStatusView::All, after_cooldown);
+        }
+        assert_eq!(
+            creds
+                .plan_at(&cfg, "platform", "openai", after_cooldown)
+                .expect("plan")
+                .attempts[0]
+                .id,
+            head.id,
+            "status reads must not consume the half-open probe"
         );
     }
 

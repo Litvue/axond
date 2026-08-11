@@ -33,6 +33,8 @@ pub enum GatewayError {
     BudgetUnavailable,
     #[error("rate-limit store is unavailable")]
     RateLimitUnavailable,
+    #[error("revocation store is unavailable")]
+    RevocationUnavailable,
     #[error("inbound concurrency limit exceeded")]
     RateLimitExceeded { retry_after_seconds: Option<u64> },
     #[error("unauthorized")]
@@ -74,6 +76,7 @@ impl GatewayError {
             // dependency failure rather than an over-cap caller (ADR 0010).
             Self::BudgetUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::RateLimitUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::RevocationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::RateLimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::TokenUnauthorized(_) => StatusCode::UNAUTHORIZED,
@@ -105,6 +108,7 @@ impl GatewayError {
             Self::RequestCostCeilingExceeded { .. } => "request_cost_ceiling_exceeded",
             Self::BudgetUnavailable => "budget_unavailable",
             Self::RateLimitUnavailable => "rate_limit_unavailable",
+            Self::RevocationUnavailable => "revocation_unavailable",
             Self::RateLimitExceeded { .. } => "rate_limited",
             Self::Unauthorized => "unauthorized",
             Self::TokenUnauthorized(error) | Self::TokenForbidden(error) => error.code(),

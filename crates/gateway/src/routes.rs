@@ -28,7 +28,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Extension, Request, State};
+use axum::extract::{Extension, RawQuery, Request, State};
 use axum::http::HeaderMap;
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -46,7 +46,9 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target};
-use crate::credentials::{CredentialLease, CredentialPlan, CredentialSource};
+use crate::credentials::{
+    CredentialLease, CredentialPlan, CredentialSource, CredentialStatusView,
+};
 use crate::error::GatewayError;
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
 use crate::rate_limit::{RateLimitKey, RateLimitPermit};
@@ -91,7 +93,7 @@ struct RouteSpec {
 
 /// The single route table: its posture is the source of truth for registration
 /// and for the sweep test that keeps the unauthenticated set closed.
-fn route_specs() -> [RouteSpec; 7] {
+fn route_specs() -> [RouteSpec; 8] {
     [
         RouteSpec {
             path: "/healthz",
@@ -110,6 +112,12 @@ fn route_specs() -> [RouteSpec; 7] {
             auth: AuthPosture::Authenticated,
             capability: Some(Capability::Models),
             router: || get(list_models),
+        },
+        RouteSpec {
+            path: "/v1/credentials",
+            auth: AuthPosture::Authenticated,
+            capability: Some(Capability::Credentials),
+            router: || get(list_credentials),
         },
         RouteSpec {
             path: "/v1/chat/completions",
@@ -146,6 +154,102 @@ async fn healthz() -> &'static str {
 /// credential present) is a follow-up — kept honest rather than always-200.
 async fn readyz() -> &'static str {
     "ready"
+}
+
+/// Replica-local Tier 0 credential status. Presence is expressed by each
+/// configured entry (boot resolves it or boot fails), never by an always-true
+/// field. Credential ids are attribution labels only; secrets remain write-only.
+async fn list_credentials(
+    Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
+    Extension(caller): Extension<InboundKey>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<Value>, GatewayError> {
+    let namespaces = parse_credential_query(raw_query.as_deref())?;
+    let view = match namespaces.as_deref() {
+        None => CredentialStatusView::Namespace(&caller.namespace),
+        Some("all") => {
+            if caller.namespace != snapshot.config.default_namespace()
+                || !caller
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.contains(&Capability::CredentialsAll))
+            {
+                return Err(GatewayError::ScopeInsufficient(Capability::CredentialsAll));
+            }
+            CredentialStatusView::All
+        }
+        Some(_) => {
+            return Err(GatewayError::BadRequest(
+                "invalid `namespaces` value".into(),
+            ));
+        }
+    };
+    Ok(Json(json!({
+        "object": "list",
+        "observed": "replica",
+        "data": snapshot.credentials.status(&snapshot.config, view),
+    })))
+}
+
+fn parse_credential_query(raw_query: Option<&str>) -> Result<Option<String>, GatewayError> {
+    let mut namespaces = None;
+    for pair in raw_query.unwrap_or_default().split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = decode_query_component(raw_key)?;
+        let value = decode_query_component(raw_value)?;
+        if key == "namespaces" {
+            if namespaces.is_some() {
+                return Err(GatewayError::BadRequest(
+                    "duplicate query parameter `namespaces`".into(),
+                ));
+            }
+            namespaces = Some(value);
+        }
+    }
+    Ok(namespaces)
+}
+
+fn decode_query_component(value: &str) -> Result<String, GatewayError> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => decoded.push(b' '),
+            b'%' if index + 2 < bytes.len() => {
+                let high = hex_digit(bytes[index + 1]);
+                let low = hex_digit(bytes[index + 2]);
+                let (Some(high), Some(low)) = (high, low) else {
+                    return Err(GatewayError::BadRequest(
+                        "invalid query string encoding".into(),
+                    ));
+                };
+                decoded.push((high << 4) | low);
+                index += 2;
+            }
+            b'%' => {
+                return Err(GatewayError::BadRequest(
+                    "invalid query string encoding".into(),
+                ));
+            }
+            byte => decoded.push(byte),
+        }
+        index += 1;
+    }
+    String::from_utf8(decoded)
+        .map_err(|_| GatewayError::BadRequest("invalid query string encoding".into()))
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// The model catalog, gated behind a gateway key and scoped to the caller's
@@ -240,6 +344,26 @@ async fn authenticate_middleware(
 ) -> Result<Response, GatewayError> {
     let snapshot = state.config();
     let caller = authenticate(&snapshot, &headers).await?;
+    if let Some(jti) = &caller.jti {
+        match state.0.revocation.is_revoked(jti).await {
+            Ok(true) => {
+                crate::telemetry::metrics::record_revocation_denial();
+                return Err(GatewayError::TokenUnauthorized(
+                    TokenVerificationError::Revoked,
+                ));
+            }
+            Ok(false) => {}
+            Err(crate::revocation::RevocationError::Unavailable { .. }) => {
+                crate::telemetry::metrics::record_revocation_unavailable_denial();
+                return Err(GatewayError::RevocationUnavailable);
+            }
+            Err(error) => {
+                warn!(error = %error, "revocation store check failed");
+                crate::telemetry::metrics::record_revocation_unavailable_denial();
+                return Err(GatewayError::RevocationUnavailable);
+            }
+        }
+    }
     if let Some(capability) = capability
         && let Some(scope) = caller.scope.as_ref()
         && (!scope.contains(&capability)
@@ -265,6 +389,7 @@ fn namespace_allows(snapshot: &ConfigSnapshot, namespace: &str, capability: Capa
         Capability::Messages => Some(Route::NativeMessages),
         Capability::Embeddings => Some(Route::Embeddings),
         Capability::Models => None,
+        Capability::Credentials | Capability::CredentialsAll => None,
     };
     let Some(route) = route else {
         return true;
@@ -1585,7 +1710,7 @@ mod tests {
     use std::future::pending;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
     use tokio::sync::oneshot;
     use tower::util::ServiceExt;
     use tracing_subscriber::layer::SubscriberExt;
@@ -1685,6 +1810,12 @@ targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdol
     }
 
     async fn scoped_route_state() -> AppState {
+        scoped_route_state_with_revocation(Box::new(crate::revocation::NoDenylist)).await
+    }
+
+    async fn scoped_route_state_with_revocation(
+        revocation: Box<dyn crate::revocation::RevocationStore>,
+    ) -> AppState {
         let (chat_url, _) =
             controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
         let (messages_url, _) = native_upstream(
@@ -1780,11 +1911,13 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             ),
         ]);
-        AppState::new(
+        AppState::new_with_rate_limiter(
             config,
             &env,
             UsageFanout::new(vec![Box::new(StdoutSink)]),
             Box::new(NoBudget),
+            Box::new(NoLimit),
+            revocation,
         )
         .expect("scope test state")
     }
@@ -1794,6 +1927,14 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
     }
 
     fn scoped_token_for(audience: &'static str, scope: Option<Vec<&'static str>>) -> String {
+        scoped_token_for_namespace(audience, "platform", scope)
+    }
+
+    fn scoped_token_for_namespace(
+        audience: &'static str,
+        namespace: &'static str,
+        scope: Option<Vec<&'static str>>,
+    ) -> String {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -1803,7 +1944,7 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
             iat: now,
             jti: "scope-test-jti",
             aud: audience,
-            ns: "platform",
+            ns: namespace,
             sub: "scope-caller",
             scope,
             max_request_microdollars: None,
@@ -1821,6 +1962,75 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
         )
     }
 
+    async fn response_error_type(response: Response) -> Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).expect("typed error JSON")
+    }
+
+    #[tokio::test]
+    async fn denylisted_minted_token_returns_token_revoked() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = scoped_route_state_with_revocation(Box::new(FakeRevocation {
+            mode: FakeRevocationMode::Revoked,
+            calls: Arc::clone(&calls),
+        }))
+        .await;
+        let response = scoped_route_request(state, "/v1/models", &scoped_token(None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response_error_type(response).await["error"]["type"],
+            "token_revoked"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn unavailable_revocation_store_returns_revocation_unavailable() {
+        let state = scoped_route_state_with_revocation(Box::new(FakeRevocation {
+            mode: FakeRevocationMode::Unavailable,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }))
+        .await;
+        let response = scoped_route_request(state, "/v1/models", &scoped_token(None)).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_error_type(response).await["error"]["type"],
+            "revocation_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn revocation_store_allow_admits_the_minted_token() {
+        let state = scoped_route_state_with_revocation(Box::new(FakeRevocation {
+            mode: FakeRevocationMode::Allow,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }))
+        .await;
+        let response = scoped_route_request(state, "/v1/models", &scoped_token(None)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tier_zero_and_static_key_requests_do_not_consult_revocation() {
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/models",
+            &scoped_token(None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = scoped_route_state_with_revocation(Box::new(FakeRevocation {
+            mode: FakeRevocationMode::Revoked,
+            calls: Arc::clone(&calls),
+        }))
+        .await;
+        let response = scoped_route_request(state, "/v1/models", "static-key").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
     async fn assert_scope_denial(response: Response, capability: &str) {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -1836,8 +2046,9 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
     }
 
     async fn scoped_route_request(state: AppState, path: &str, token: &str) -> Response {
-        let (method, body) = match path {
+        let (method, body) = match path.split('?').next().unwrap_or(path) {
             "/v1/models" => (Method::GET, Vec::new()),
+            "/v1/credentials" => (Method::GET, Vec::new()),
             "/v1/chat/completions" => (
                 Method::POST,
                 serde_json::to_vec(&json!({
@@ -1898,6 +2109,249 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
                 .status(),
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn credentials_status_requires_its_scope_and_supports_operator_view() {
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/credentials",
+            &scoped_token(Some(vec!["chat"])),
+        )
+        .await;
+        assert_scope_denial(response, "credentials").await;
+
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/credentials",
+            &scoped_token(Some(vec!["credentials"])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["observed"], "replica");
+        assert_eq!(body["data"][0]["state"], "healthy");
+        assert_eq!(body["data"][0]["source"], "platform");
+
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/credentials?namespaces=all",
+            &scoped_token(Some(vec!["credentials"])),
+        )
+        .await;
+        assert_scope_denial(response, "credentials:all").await;
+
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/credentials?namespaces=all",
+            &scoped_token(Some(vec!["credentials", "credentials:all"])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/credentials?namespaces=tenant",
+            &scoped_token(Some(vec!["credentials"])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn credentials_status_scope_less_static_keys_keep_tenant_view() {
+        let response =
+            scoped_route_request(scoped_route_state().await, "/v1/credentials", "static-key").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["data"][0]["namespace"], "platform");
+
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/credentials?namespaces=all",
+            "static-key",
+        )
+        .await;
+        assert_scope_denial(response, "credentials:all").await;
+    }
+
+    #[tokio::test]
+    async fn credentials_status_tenant_operator_scope_cannot_view_all_namespaces() {
+        let token = scoped_token_for_namespace(
+            "scope-tests",
+            "acme",
+            Some(vec!["credentials", "credentials:all"]),
+        );
+        let response =
+            scoped_route_request(isolated_tenant_state(), "/v1/credentials", &token).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = scoped_route_request(
+            isolated_tenant_state(),
+            "/v1/credentials?namespaces=all",
+            &token,
+        )
+        .await;
+        assert_scope_denial(response, "credentials:all").await;
+
+        let platform_token = scoped_token(Some(vec!["credentials", "credentials:all"]));
+        let response = scoped_route_request(
+            isolated_tenant_state(),
+            "/v1/credentials?namespaces=all",
+            &platform_token,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let namespaces: Vec<_> = body["data"]
+            .as_array()
+            .expect("credential list")
+            .iter()
+            .filter_map(|entry| entry["namespace"].as_str())
+            .collect();
+        assert_eq!(namespaces, ["acme", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn credentials_status_never_serializes_secret_material() {
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/credentials?namespaces=all",
+            &scoped_token(Some(vec!["credentials", "credentials:all"])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let serialized = String::from_utf8(body.to_vec()).expect("json body");
+        for secret in [
+            "chat-key",
+            "messages-key",
+            "embeddings-key",
+            "static-key",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "credential status leaked secret material: {secret}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn credentials_status_rejects_duplicate_and_empty_namespaces_query_values() {
+        for path in [
+            "/v1/credentials?namespaces=all&namespaces=beta",
+            "/v1/credentials?namespaces=",
+        ] {
+            let response = scoped_route_request(
+                scoped_route_state().await,
+                path,
+                &scoped_token(Some(vec!["credentials"])),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body["error"]["type"], "bad_request");
+            let message = body["error"]["message"].as_str().expect("error message");
+            if path.contains("all&namespaces") {
+                assert!(message.contains("duplicate"));
+            } else {
+                assert!(message.contains("invalid `namespaces` value"));
+            }
+        }
+    }
+
+    fn isolated_tenant_state() -> AppState {
+        let config = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[namespace]]
+id = "acme"
+
+[[namespace]]
+id = "beta"
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[credential]]
+namespace = "acme"
+provider = "openai"
+env = "ACME_SECRET"
+id = "acme-label"
+
+[[credential]]
+namespace = "beta"
+provider = "openai"
+env = "BETA_SECRET"
+id = "beta-label"
+
+[[gateway_key]]
+env = "STATIC_KEY"
+namespace = "acme"
+
+[gateway_token]
+audience = "scope-tests"
+
+[[gateway_verifier]]
+kid = "scope-test-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform", "acme", "beta"]
+max_ttl = "15m"
+"#,
+        )
+        .expect("isolated tenant config");
+        let env = HashMap::from([
+            ("ACME_SECRET".to_owned(), "acme-secret".to_owned()),
+            ("BETA_SECRET".to_owned(), "beta-secret".to_owned()),
+            ("STATIC_KEY".to_owned(), "static-secret".to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
+        AppState::new(
+            config,
+            &env,
+            UsageFanout::new(vec![Box::new(StdoutSink)]),
+            Box::new(NoBudget),
+        )
+        .expect("isolated tenant state")
+    }
+
+    #[tokio::test]
+    async fn credentials_status_isolated_between_tenant_namespaces() {
+        let response = scoped_route_request(
+            isolated_tenant_state(),
+            "/v1/credentials",
+            &scoped_token_for_namespace("scope-tests", "acme", Some(vec!["credentials"])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .expect("status list")
+            .iter()
+            .map(|entry| entry["credential_id"].as_str().expect("credential id"))
+            .collect();
+        assert_eq!(ids, ["acme-label"]);
     }
 
     #[tokio::test]
@@ -2396,6 +2850,7 @@ min_iat = {}
             scope: None,
             alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
             max_request_microdollars: None,
+            jti: None,
         };
         let response = list_models(Extension(snapshot), Extension(caller))
             .await
@@ -2523,6 +2978,7 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
                     scope: None,
                     alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
                     max_request_microdollars: None,
+                    jti: None,
                 },
             )
             .await
@@ -3011,6 +3467,46 @@ targets = [
         }
     }
 
+    struct FakeRevocation {
+        mode: FakeRevocationMode,
+        calls: Arc<AtomicUsize>,
+    }
+
+    enum FakeRevocationMode {
+        Revoked,
+        Unavailable,
+        Allow,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::revocation::RevocationStore for FakeRevocation {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn is_revoked(&self, _jti: &str) -> Result<bool, crate::revocation::RevocationError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            match self.mode {
+                FakeRevocationMode::Revoked => Ok(true),
+                FakeRevocationMode::Unavailable => {
+                    Err(crate::revocation::RevocationError::Unavailable {
+                        backend: "fake",
+                        message: "test outage".to_owned(),
+                    })
+                }
+                FakeRevocationMode::Allow => Ok(false),
+            }
+        }
+
+        async fn revoke(
+            &self,
+            _jti: &str,
+            _expires_at: SystemTime,
+        ) -> Result<(), crate::revocation::RevocationError> {
+            Ok(())
+        }
+    }
+
     struct RejectingBudget;
 
     #[async_trait::async_trait]
@@ -3079,8 +3575,15 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         .unwrap();
         let env = env_with([("K1", "sk-test")]);
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
-        AppState::new_with_rate_limiter(cfg, &env, UsageFanout::new(sinks), budget, rate_limiter)
-            .unwrap()
+        AppState::new_with_rate_limiter(
+            cfg,
+            &env,
+            UsageFanout::new(sinks),
+            budget,
+            rate_limiter,
+            Box::new(crate::revocation::NoDenylist),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -3158,6 +3661,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             scope: None,
             alias_scope: None,
             max_request_microdollars: Some(1),
+            jti: None,
         };
         let body = json!({"model": "gpt-4o", "messages": []});
 
@@ -3195,6 +3699,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             scope: None,
             alias_scope: None,
             max_request_microdollars: Some(10_000),
+            jti: None,
         };
         let body = json!({"model": "gpt-4o", "messages": []});
 

@@ -52,6 +52,63 @@ no upstream: `401 unauthorized`, `404 unknown_model`, `501 not_implemented`
 (`POST /v1/responses`), `400 unsupported_wire` (send an OpenAI-kind alias to `/v1/messages`
 or an Anthropic-kind alias to `/v1/chat/completions`).
 
+### Black-box testing `/v1/credentials`
+
+Observed behaviour worth reusing (all reproducible offline, no provider keys):
+
+- Scope matrix: scope-less principals (static `[[gateway_key]]` **and** a minted token
+  with no `scope` claim) get `200` on the own-namespace view and `403
+  token_scope_insufficient` naming `credentials:all` on `?namespaces=all`. A scoped token
+  needs `credentials` for the route; `credentials:all` alone is denied with `credentials`.
+- `?namespaces=` is the caller's *own* namespace only when omitted entirely. Any other
+  value — including `""`, `ALL`, a real other namespace, or `all,platform` — is typed
+  `400 bad_request`. Unknown params (`?foo=bar`) are ignored.
+- A repeated `namespaces` param is deliberately rejected with a typed `400 bad_request`
+  (for example, `?namespaces=all&namespaces=beta`); it never exposes a query deserializer
+  error or bypasses the gateway's typed-error envelope.
+- `credentials:all` is an operator-only capability: a token minted for a tenant
+  namespace that carries it is denied the all-namespaces view because that view also
+  requires the configured default/platform namespace. Operators must mint it only into
+  operator tokens; the verifier's `namespaces = [...]` allowlist is defense in depth.
+- A namespace with no credentials and fallback off answers `200 {"data":[]}` — an empty
+  list, not an error.
+- The list is sorted by `(namespace, provider, credential_id)`, with omitted ids sorting
+  as empty values. When diffing repeated bodies, compare the *ordering* separately from
+  the `state` values: an interleaved dispatch legitimately flips `probe` → `parked`,
+  which makes a naive whole-body `md5sum` diff look like an ordering bug.
+- A fallback tenant sees the platform credential's presence and state, but its default
+  env-derived `credential_id` is omitted. Set explicit `id`s when a test needs a stable
+  non-secret label; explicit ids remain visible.
+
+### Driving `parked` / `probe` on a live process
+
+`is_credential_exhausted` only counts upstream **429**s — a connection-refused `base_url`
+never parks a credential. Serve a local fake upstream that returns `429` *only for one
+credential's key value* (check the `authorization` / `x-api-key` header) and `200`
+otherwise; that parks exactly one entry of a multi-credential pool and proves per-credential
+independence. With `[credential_pool] failure_threshold = 2, cooldown_seconds = 5`:
+
+1. Send ~4 `POST /v1/chat/completions`; each returns `200` (the healthy credential serves)
+   while the 429 credential accumulates failures — with round-robin, only about half the
+   requests touch it, so count the fake upstream's 429 log lines rather than the requests.
+2. Status then reports that credential `parked`; a request during the cooldown produces no
+   new upstream hit for it (it is skipped, not retried).
+3. After the cooldown it reports `probe`, and polling `/v1/credentials` repeatedly leaves it
+   `probe` and generates zero upstream traffic (the read is pure). The next real request
+   consumes the probe (one new 429 line) and the state re-arms to `parked`.
+
+A fake upstream log line per request (`{"key_tail": ..., "status": ...}`) is the cheapest
+evidence for all of this; `key_tail` keeps the secret out of the log.
+
+### Making a "no secret material" assertion non-vacuous
+
+Give every `[[credential]]` / `[[gateway_key]]` env var a distinctive marker value
+(`SEKRETAAA-…`, `GWKEY…`), tee every response body to one file, and grep the file for each
+marker plus the bare prefixes. Set explicit credential `id`s in the test config when
+checking labels: without explicit ids, fallback entries omit the env-derived
+`credential_id`, which weakens a naive leak grep. Never use the env-var name as the
+secret marker.
+
 ## Exercising the upstream/transport path with no provider
 
 Point a provider's `base_url` at an unreachable address, e.g. `http://127.0.0.1:1/v1`, then
@@ -216,3 +273,48 @@ exercises the temp-file cleanup trap, temporarily make `tests/compat/fake_upstre
 ## Devin Secrets Needed
 
 None. All of the above runs offline with placeholder values.
+
+## Testing the Docker Compose quickstart
+
+The repo ships a Compose quickstart (`docker-compose.yml`, `docker-compose.stateful.yml`
+overlay, `ops/compose/*.toml`, `ops/compose/env.example`, `ops/compose-smoke.sh`,
+`just quickstart-smoke`) documented in `docs/deployment.md#5-minute-quickstart`.
+
+```bash
+cp ops/compose/env.example .env      # compose uses `${VAR:?set it in .env}` — no .env, no boot
+docker compose up -d --build         # warm image cache: ~45s; cold musl build: minutes
+curl http://localhost:8080/healthz   # -> ok
+docker compose down -v               # keep .env until after this command
+just quickstart-smoke                # tear down first; own project name, needs host 8080 free
+```
+
+- Every compose command (including `docker compose down`) needs `.env` to exist, because
+  the required-variable interpolation runs first. Deleting `.env` before teardown leaves
+  containers running with a confusing "required variable ... is missing a value" error.
+- `just quickstart-smoke` publishes on host port 8080 by default
+  (`AXOND_QUICKSTART_SMOKE_PORT=18080` overrides). If a quickstart stack is already up,
+  tear it down first or use the override.
+- The stateful path needs both files plus the config override, and the same flags on every
+  follow-up command:
+
+```bash
+export AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml
+docker compose -f docker-compose.yml -f docker-compose.stateful.yml --profile stateful up -d
+```
+
+- Proving Redis is really in admission (not silently ignored): `docker compose ... stop redis`,
+  then POST `/v1/chat/completions` → `503` `rate_limit_unavailable` (or `budget_unavailable`).
+  `/v1/models` still answers `200`, so only the dispatch path is gated. After
+  `start redis`, expect ~10-15s of transient `503`s before requests flow again — do not
+  read the first failure after a restart as a bug.
+- Redis holds no keys for a request that never spends (cost 0), so `redis-cli KEYS '*'`
+  being empty is not evidence Redis is unwired; use the fail-closed probe above instead.
+- Postgres usage rows are batched: `select count(*) from axond_usage` immediately after a
+  request returns `0` and flips to `1` a few seconds later. Always poll before asserting,
+  as shown in the deployment guide.
+- With the committed placeholder provider key and network egress, dispatch returns `502`
+  `invalid_request` carrying OpenAI's "Incorrect API key provided: placehol**********-key"
+  text. That body depends on reaching api.openai.com; air-gapped runs get
+  `upstream_transport` instead, so assert "typed error" rather than that exact string.
+- Boot/config failures stay visible: the service sets no restart policy, so a bad config
+  leaves an `Exited (1)` container and the error is the last line of `docker compose logs`.

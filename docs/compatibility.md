@@ -15,12 +15,17 @@ breaking them is a deliberate, documented act — not that they are frozen.
 | `POST /v1/messages` | **supported** | Anthropic Messages, native | yes |
 | `POST /v1/embeddings` | **supported** | OpenAI embeddings | n/a |
 | `GET /v1/models` | **supported** | the alias catalogue, gated + namespace-scoped | n/a |
+| `GET /v1/credentials` | **supported** | replica-local credential labels and circuit state, scoped | n/a |
 | `GET /healthz`, `GET /readyz` | **supported** | liveness / readiness text | n/a |
 | `POST /v1/responses` | **deferred** — typed `501 not_implemented` | OpenAI Responses | — |
 
 Scoped minted callers receive a typed `403 token_scope_insufficient` when their
 scope does not include a route capability or the namespace cannot serve it.
-Static gateway keys and scope-less tokens retain their existing route behavior.
+Static gateway keys and scope-less tokens retain their existing route behavior,
+including the own-namespace `/v1/credentials` view. The all-namespaces
+credential view requires the explicit `credentials:all` scope; a scoped token
+also needs `credentials` for the route. The all-namespaces view additionally
+requires the caller's namespace to be the configured default/platform namespace.
 
 Deferred routes are still routes: they answer with a typed error naming their
 own deferral, so a `501` can never be confused with a wrong `base_url`.

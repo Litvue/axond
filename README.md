@@ -62,13 +62,14 @@ Tier 0.
 | Tier | What it buys | What it costs |
 | --- | --- | --- |
 | **0 — config-only** | Namespaces, providers, aliases, prices, credentials, pools, failover, reload, gateway keys, minted-token verification and issuance epochs, stdout usage, local budgets, and health probes. | No datastore. In-memory health and budgets are per replica; the default is no budget. This is the hermetic [`ops/tier0-gate.sh`](./ops/tier0-gate.sh) CI posture proved on every PR by [ADR 0018](./docs/adr/0018-tier-0-hermetic-boot-gate.md). |
-| **1 — Redis** | Exact shared budgets and inbound in-flight rate limiting. | Redis availability is part of selected admission paths; `on_unavailable = "deny"` (the default) returns `503` (`budget_unavailable` or `rate_limit_unavailable`). |
+| **1 — Redis** | Exact shared budgets, inbound in-flight rate limiting, and precise minted-token revocation. | Redis availability is part of selected admission paths; `on_unavailable = "deny"` (the default) returns `503` (`budget_unavailable`, `rate_limit_unavailable`, or `revocation_unavailable`). |
 | **2 — Postgres** | Durable usage rows and shared Postgres-backed budgets; a future store-owned caller/key lifecycle. | A Postgres role, ordered migrations, backup/restore ownership, and boot-time DSN resolution. |
 
-Tier 1 ships `[budget] backend = "redis"` and `[rate_limit] backend = "redis"`
-for exact shared admission. Precise per-token revocation remains a future
-declaration. Minted claims require `jti`, but today's
-revocation ladder is short TTLs, killing a `kid`, and rotation. An OTLP usage
+Tier 1 ships `[budget] backend = "redis"`, `[rate_limit] backend = "redis"`,
+and `[revocation] backend = "redis"`
+for exact shared admission and precise single-token denial. Minted claims
+require `jti`; the revocation ladder also includes short TTLs, killing a
+`kid`, rotation, and `axond revoke`. An OTLP usage
 sink is Tier 0 state (no datastore, nothing to migrate), but not hermetic: it
 adds a collector dependency at boot, so it is excluded from the hermetic Tier
 0 CI lane.
@@ -83,6 +84,31 @@ verifier intersects token claims with config-owned namespace authority (ADR
 and [ADR 0018](./docs/adr/0018-tier-0-hermetic-boot-gate.md).
 
 ## Quick start
+
+For a five-minute Docker Compose deployment (including a stateful Redis and
+Postgres variant), see the [deployment guide](./docs/deployment.md#5-minute-quickstart).
+
+```bash
+cp ops/compose/env.example .env
+docker compose up -d --build
+curl http://localhost:8080/healthz
+```
+
+The first Compose build compiles the static musl release and can take several
+minutes. To call the authenticated catalogue:
+
+```bash
+curl -H "Authorization: Bearer quickstart-platform-key" \
+  http://localhost:8080/v1/models
+docker compose down -v
+```
+
+Keep `.env` until after teardown: Compose validates required variables before
+running `down`. To run the smoke helper, tear down this stack first; it uses
+the same host port. If another local stack owns port 8080, use
+`AXOND_QUICKSTART_SMOKE_PORT=18080 just quickstart-smoke`.
+
+For a source-based configuration path, use the full annotated reference:
 
 ```bash
 cp axond.example.toml axond.toml      # edit providers/models/namespaces
@@ -238,7 +264,9 @@ name and prints only the token. Ed25519 base64 whitespace is trimmed on both
 sides because mounted secrets may preserve the generated file's trailing
 newline; HS256 secrets are opaque bytes and are not trimmed. `scope` is enforced
 as a narrowing route capability and can be emitted with repeatable `--scope`
-flags. The `aliases` claim is enforced at dispatch and in the `/v1/models` view,
+flags, including `credentials` and the explicit operator-only
+`credentials:all`. The `aliases` claim is enforced at dispatch and in the
+`/v1/models` view,
 and is emitted by `axond mint --alias`. `max_request_microdollars` is enforced
 at admission time against the pre-dispatch estimate and can be emitted by
 `axond mint`. An explicit `--audience` must still match the configured
@@ -250,10 +278,20 @@ verification is Tier 0 and adds no runtime datastore dependency. See the
 same-`kid` key-material reload trap) and the honest Tier 1 revocation boundary.
 
 Every route that dispatches to a provider (`/v1/chat/completions`, `/v1/messages`,
-`/v1/embeddings`) authenticates, and so does `/v1/models` — it answers only for a
-configured gateway key and lists the aliases scoped to the caller's namespace (an
+`/v1/embeddings`) authenticates, and so do `/v1/models` and `/v1/credentials` —
+they answer only for a configured gateway key and list data scoped to the caller's
+namespace (an
 alias whose targets the caller holds no credential for is not disclosed). Only the
 liveness probes `/healthz` and `/readyz` answer without a credential.
+
+`GET /v1/credentials` reports replica-local, Tier 0 credential labels and
+healthy/parked/probe state. Its default view follows the caller's namespace and
+platform fallback; scope-less principals retain this own-namespace view.
+`?namespaces=all` requires the explicit `credentials:all` scope, while a
+scoped token also needs `credentials` for the route, and the caller must be in
+the configured default/platform namespace. It never returns secret material.
+For fallback platform entries, the default env-derived
+`credential_id` is omitted; an explicitly configured id remains visible.
 
 See [ADR 0013](./docs/adr/0013-inbound-auth-fails-closed.md).
 
