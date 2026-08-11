@@ -339,7 +339,12 @@ impl ReloadSummary {
                             &m.max_request_microdollars,
                         )
                     }))
-                .then(|| "enabled".to_owned()),
+                .then(|| "enabled".to_owned())
+                .into_iter()
+                .chain(
+                    (before.gateway_minting_fingerprint != after.gateway_minting_fingerprint)
+                        .then(|| "gateway_minting".to_owned()),
+                ),
             ),
             gateway_token_epochs: Delta::between(
                 before_config
@@ -527,7 +532,8 @@ fn gateway_key_definition_changes(before: &Config, after: &Config) -> Vec<String
         .filter_map(|label| {
             let before = before[label];
             let after = after.get(label)?;
-            (before.namespace != after.namespace).then(|| (*label).to_owned())
+            (before.namespace != after.namespace || before.can_mint != after.can_mint)
+                .then(|| (*label).to_owned())
         })
         .collect::<Vec<_>>();
     changed.sort();
@@ -739,6 +745,47 @@ namespaces = ["platform", "acme"]
 max_ttl = "15m"
 "#;
 
+    const WITH_GATEWAY_MINTING: &str = r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "PLATFORM_OPENAI_KEY"
+
+[[gateway_key]]
+env = "AXOND_INBOUND_KEY"
+namespace = "platform"
+can_mint = true
+
+[[gateway_key]]
+env = "AXOND_SECOND_KEY"
+namespace = "platform"
+can_mint = true
+
+[gateway_token]
+audience = "reload-test"
+
+[[gateway_verifier]]
+kid = "reload-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+
+[gateway_minting]
+kid = "reload-kid"
+env = "SIGNING_KEY"
+max_ttl = "10m"
+"#;
+
     fn state_from(file: &ConfigFile) -> AppState {
         let config = Config::load(file.path()).expect("valid boot config");
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
@@ -764,6 +811,16 @@ max_ttl = "15m"
         ]
         .into_iter()
         .collect()
+    }
+
+    fn minting_env() -> HashMap<String, String> {
+        let mut env = inbound_env();
+        env.insert("AXOND_SECOND_KEY".to_string(), "second-secret".to_string());
+        env.insert(
+            "SIGNING_KEY".to_string(),
+            "signing-secret-012345678901234567890".to_string(),
+        );
+        env
     }
 
     fn tenant_env() -> HashMap<String, String> {
@@ -861,6 +918,55 @@ max_ttl = "15m"
             .expect("no-op candidate is valid");
         assert!(summary.gateway_token_epochs.is_empty());
         assert!(summary.is_empty());
+    }
+
+    #[test]
+    fn reload_summary_reports_can_mint_toggles() {
+        let before_config = Config::from_toml_str(WITH_GATEWAY_MINTING).unwrap();
+        let after_config = Config::from_toml_str(&WITH_GATEWAY_MINTING.replacen(
+            "can_mint = true",
+            "can_mint = false",
+            1,
+        ))
+        .unwrap();
+        let before = ConfigSnapshot::build(before_config, &minting_env(), 0).unwrap();
+        let after = ConfigSnapshot::build(after_config, &minting_env(), 1).unwrap();
+        let boot = Boot {
+            bind: before.config.server.bind,
+            usage_sink: before.config.usage_sink.clone(),
+            budget: before.config.budget.clone(),
+            rate_limit: before.config.rate_limit.clone(),
+        };
+        let summary = ReloadSummary::between(&boot, &before, &after);
+        assert_eq!(
+            summary.gateway_keys.changed,
+            vec!["AXOND_INBOUND_KEY".to_owned()]
+        );
+        assert!(!summary.is_empty());
+    }
+
+    #[test]
+    fn reload_summary_reports_minting_material_rotation() {
+        let config = Config::from_toml_str(WITH_GATEWAY_MINTING).unwrap();
+        let before = ConfigSnapshot::build(config.clone(), &minting_env(), 0).unwrap();
+        let mut rotated_env = minting_env();
+        rotated_env.insert(
+            "SIGNING_KEY".to_string(),
+            "rotated-signing-secret-012345678901234567".to_string(),
+        );
+        let after = ConfigSnapshot::build(config, &rotated_env, 1).unwrap();
+        let boot = Boot {
+            bind: before.config.server.bind,
+            usage_sink: before.config.usage_sink.clone(),
+            budget: before.config.budget.clone(),
+            rate_limit: before.config.rate_limit.clone(),
+        };
+        let summary = ReloadSummary::between(&boot, &before, &after);
+        assert_eq!(
+            summary.gateway_minting.changed,
+            vec!["gateway_minting".to_owned()]
+        );
+        assert!(!summary.is_empty());
     }
 
     /// An issuance epoch is part of the immutable candidate snapshot: SIGHUP
