@@ -2,7 +2,7 @@
 //!
 //! The schema is the expensive part of this sink — it lands in an adopter's own
 //! database and is read by their billing queries — so it is treated as an API:
-//! it lives in [`crates/gateway/sql/usage_v2.sql`](../../sql/usage_v2.sql),
+//! it lives in [`ops/postgres/usage_v2.sql`](../../../../ops/postgres/usage_v2.sql),
 //! every row carries `schema_version`, and a change to the row shape is a new
 //! versioned file rather than an edit (ADR 0009).
 //!
@@ -25,6 +25,9 @@ use super::{ObservedRecord, SinkFailure, UsageRecord, UsageSink, UsageSinkError}
 /// The DDL for the current schema version, shared with operators who apply it
 /// themselves. The table and the serialized record are one schema with one
 /// version — [`UsageRecord::SCHEMA_VERSION`] — not two that can drift.
+// Embedded from the package-local copy of `ops/postgres/usage_v2.sql`, because
+// `ops/` is outside this crate and so outside the published package.
+// `tests/shipped_ddl.rs` fails if the two copies differ by a byte.
 const SCHEMA_DDL: &str = include_str!("../../sql/usage_v2.sql");
 
 /// Additive migrations for the current schema version. These are applied after

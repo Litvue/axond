@@ -17,7 +17,7 @@ a different blast radius when it changes:
   boot (ADR 0002's fail-at-boot principle, working exactly as intended), which
   means a routine upgrade takes the fleet down.
 * **The usage row shape.** `UsageRecord::SCHEMA_VERSION = 1` and
-  `crates/gateway/sql/usage_v1.sql` land in the operator's *own* Postgres, feeding
+  `ops/postgres/usage_v1.sql` land in the operator's *own* Postgres, feeding
   their invoices and dashboards. ADR 0009 already committed to versioning it and
   to never editing shipped DDL in place, but the rule lives in that ADR and in
   `docs/usage-schema.md`, scoped to usage alone.

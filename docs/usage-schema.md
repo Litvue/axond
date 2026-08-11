@@ -7,7 +7,7 @@ meaning, and how they are allowed to change. The design rationale is
 [ADR 0009](./adr/0009-durable-usage-sinks.md).
 
 **Current version: `2`** (`UsageRecord::SCHEMA_VERSION`, DDL in
-[`crates/gateway/sql/usage_v2.sql`](../crates/gateway/sql/usage_v2.sql)).
+[`ops/postgres/usage_v2.sql`](../ops/postgres/usage_v2.sql)).
 
 ## Fields
 
@@ -56,7 +56,7 @@ omitted when absent), and the OTLP sink emits it as an OTel log record with
   dropped-record path.
 - Removing or renaming a column, making one `NOT NULL`, or changing a unit or a
   vocabulary (e.g. a new `status` value is fine; redefining an existing one is
-  not) **is** a bump: a new `crates/gateway/sql/usage_v<N>.sql` plus a bump of
+  not) **is** a bump: a new `ops/postgres/usage_v<N>.sql` plus a bump of
   `UsageRecord::SCHEMA_VERSION`. Shipped DDL files are never edited in place.
 - Version 2 changes the meaning of `input_tokens` from the inclusive provider
   prompt total to the non-cached prompt remainder, so it is a version bump even

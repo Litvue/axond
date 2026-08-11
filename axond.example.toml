@@ -315,7 +315,7 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # dsn_env = "AXOND_USAGE_POSTGRES_DSN"
 # # Destination table; `schema.table` is allowed. Defaults to `axond_usage`.
 # table = "axond_usage"
-# # Apply crates/gateway/sql/usage_v1.sql and every additive
+# # Apply ops/postgres/usage_v1.sql and every additive
 # # usage_v1_<sequence>_<name>.sql migration in filename order at boot. Off by
 # # default — most deployments give the gateway's role no DDL rights and
 # # sequence migrations themselves.
@@ -392,7 +392,7 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 
 # The Postgres backend reuses the client the usage sink already brings, for
 # deployments that would rather not run Redis. Apply
-# crates/gateway/sql/budget_v1.sql first, or let the gateway do it with
+# ops/postgres/budget_v1.sql first, or let the gateway do it with
 # `create_table = true`.
 
 # [budget]

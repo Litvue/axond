@@ -330,7 +330,7 @@ versioned interface — see [`docs/usage-schema.md`](./usage-schema.md).
 `kind = "stdout"` is Tier 0. `kind = "otlp"` is Tier 0 state (no datastore,
 nothing to migrate), but not hermetic: it adds a collector dependency at boot
 and is excluded from the hermetic Tier 0 CI lane. `kind = "postgres"` is Tier 2
-and requires the Postgres role, `crates/gateway/sql/usage_v2.sql`, ordered additive
+and requires the Postgres role, `ops/postgres/usage_v2.sql`, ordered additive
 migrations, and backup/restore ownership.
 
 | Key | Type | Default | Applies to | Meaning |

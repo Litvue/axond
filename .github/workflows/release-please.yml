@@ -10,7 +10,10 @@ name: Release
 # A `workflow_dispatch` with an existing release tag re-runs the artifact lanes
 # for a release that already exists (repair path); it never creates a tag or
 # release. Because the crates.io lane skips versions already on the registry,
-# that same dispatch resumes a release whose publish only partly succeeded.
+# that same dispatch resumes a release whose publish only partly succeeded — for
+# any tag whose tree contains that lane. Tags cut before it (v0.3.0 and earlier)
+# check out a commit without the job, so the first crates.io publish is the next
+# release tag; RELEASE.md, "The first publish is the next tag".
 
 on:
   push:

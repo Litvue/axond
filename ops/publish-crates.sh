@@ -131,6 +131,31 @@ PY
   echo "versions: all workspace packages and internal dependency requirements are at $version"
 }
 
+# The shipped DDL is an operator interface and lives in `ops/postgres/`, which is
+# outside `crates/gateway/` and therefore outside the published package. The
+# gateway embeds package-local copies under `crates/gateway/sql/`. Publishing a
+# copy that has drifted from the operator-facing file would ship a gateway that
+# builds a different table than the runbook does, so refuse — and refuse before
+# the first upload, since a published version cannot be replaced.
+# `crates/gateway/tests/shipped_ddl.rs` is the same gate in the test suite.
+require_ddl_copies_match() {
+  local operator_dir=ops/postgres packaged_dir=crates/gateway/sql name
+  local -a names=()
+  for name in "$operator_dir"/*.sql "$packaged_dir"/*.sql; do
+    [[ -e "$name" ]] || fail "no shipped DDL found in $operator_dir and $packaged_dir"
+    names+=("$(basename "$name")")
+  done
+  while read -r name; do
+    [[ -f "$operator_dir/$name" ]] ||
+      fail "$packaged_dir/$name has no $operator_dir/$name; operators applying the schema by hand would never see it"
+    [[ -f "$packaged_dir/$name" ]] ||
+      fail "$operator_dir/$name has no packaged copy at $packaged_dir/$name; the published axond package cannot embed it"
+    cmp --silent "$operator_dir/$name" "$packaged_dir/$name" ||
+      fail "$operator_dir/$name and $packaged_dir/$name differ; copy the operator-facing file over the packaged one"
+  done < <(printf '%s\n' "${names[@]}" | sort -u)
+  echo "shipped DDL: every ops/postgres file has a byte-identical packaged copy"
+}
+
 # 200 = this exact version is already published (immutable, so skip it).
 # 404 = absent. Anything else is an unknown registry state: refuse rather than
 # guess, because guessing "absent" risks a duplicate upload attempt mid-release.
@@ -154,6 +179,7 @@ if [[ "$mode" == publish && -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
 fi
 
 require_aligned_versions
+require_ddl_copies_match
 
 if [[ "$mode" == dry-run ]]; then
   echo

@@ -38,7 +38,7 @@ a wrong DSN, an unreachable database, or a missing table refuses to start rather
 than discarding records at request time.
 
 **The schema is versioned, documented, and shipped as DDL.** Every row carries
-`schema_version`; the DDL lives in [`crates/gateway/sql/usage_v1.sql`](../../crates/gateway/sql/usage_v1.sql)
+`schema_version`; the DDL lives in [`ops/postgres/usage_v1.sql`](../../ops/postgres/usage_v1.sql)
 and is documented in [`docs/usage-schema.md`](../usage-schema.md). The rules:
 
 - An **additive, nullable** column is not a version bump. `reasoning_tokens`,

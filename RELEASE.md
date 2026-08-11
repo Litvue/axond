@@ -42,7 +42,7 @@ executed locally.
 | Image | Wired **and exercised** | `docker build` + `ops/docker-smoke.sh` run locally against the built image: `healthz: ok`, `/v1/models` (probed with the platform gateway key) returns the example catalogue, `axond image smoke passed`. In the release job the same smoke runs against the *published* image **before** it is signed. |
 | Signing | Wired | Keyless cosign over the digest, verified in-job against `SIGNER_IDENTITY`, which is anchored to this workflow file at `refs/heads/main` or `refs/tags/v<semver>` only. `gh attestation verify` then checks SLSA provenance. A broken chain fails the release rather than shipping quietly. |
 | Supply chain | Wired | `deny.toml` fails on any advisory, yanked crate, unlisted license, or non-crates.io source, with no ignores; `dependency-audit.yml` re-runs it on a schedule. Gate 5 below is green. |
-| crates.io | Wired **and dry-run** | `release-crates` runs last, gated on the tagged commit's `CI Success` and on every artifact lane, and publishes `gateway-core` → `gateway-transport` → `axond` through `ops/publish-crates.sh`. `cargo package --locked` and `cargo publish --dry-run --locked` pass in that order locally and in the `crates.io packaging` CI lane. The upload itself is untested until a token exists — see [Publishing to crates.io](#publishing-to-cratesio). |
+| crates.io | Wired **and dry-run** | `release-crates` runs last, gated on the tagged commit's `CI Success` and on every artifact lane, and publishes `gateway-core` → `gateway-transport` → `axond` through `ops/publish-crates.sh`. `cargo package --locked` and `cargo publish --dry-run --locked` pass in that order locally and in the `crates.io packaging` CI lane. The upload itself is untested until a token exists, and the first workflow-driven publish is the next release tag — `v0.3.0` predates the lane. See [Publishing to crates.io](#publishing-to-cratesio). |
 
 No configuration error was found that warranted a fix. Two observations, both
 maintainer calls rather than defects, are in the decisions section.
@@ -116,6 +116,16 @@ alongside `[workspace.package].version` (`release-please-config.json`
 `ops/publish-crates.sh` refuses to publish if any package version or internal
 requirement disagrees with the release version.
 
+**The shipped DDL is duplicated on purpose.** `ops/postgres/*.sql` stays the
+operator contract — every doc, ADR, and runbook `psql -f` points there, and a
+shipped file is never edited in place. Because `ops/` is outside
+`crates/gateway/`, the packaged crate carries byte-identical copies under
+`crates/gateway/sql/`, which is what the binary `include_str!`s. Change the
+operator-facing file, then copy it across; `crates/gateway/tests/shipped_ddl.rs`
+and `ops/publish-crates.sh` both fail on any drift or on a file that exists in
+only one of the two directories, so a new `budget_v2.sql` is covered without
+touching either gate.
+
 **Names.** `gateway-core`, `gateway-transport`, and `axond` were all unclaimed on
 crates.io on 2026-08-11 (`curl -s https://crates.io/api/v1/crates/<name>` →
 `does not exist` for each). Registry names are first-come, so re-check
@@ -136,6 +146,35 @@ reserve them, deliberately.
 It is the last lane on purpose: binaries and images can be rebuilt or replaced,
 while a crates.io version is immutable — it can only be yanked, never replaced
 or deleted.
+
+### The first publish is the next tag
+
+The already-released tags, `v0.3.0` included, predate this lane: their trees
+contain no `ops/publish-crates.sh` and no `release-crates` job, and the
+`workflow_dispatch` repair path checks the tag out before running it. So
+**dispatching `v0.3.0` cannot publish these crates** — the job it would need does
+not exist at that commit, and the packaging fixes this release depends on are not
+in that tree either.
+
+The bootstrap is therefore the *next* release tag cut after this lands: merge the
+release PR, and the crates lane runs for the first time on that tag, after the
+same CI and artifact gates as every later release. That is deliberate — there is
+no "publish from main" shortcut, because a registry version that does not
+correspond to a tag cannot be reproduced or re-verified afterwards.
+
+If a release has to be bootstrapped before then, do it by hand from a clean
+checkout of the tag, with the same script the workflow uses and the release
+owner's own token:
+
+```bash
+git clone --depth 1 --branch <tag> https://github.com/Litvue/axond && cd axond
+CARGO_REGISTRY_TOKEN=… ops/publish-crates.sh "${tag#v}"
+```
+
+The script's refusals are the gate in that case: misaligned versions, drifted
+DDL copies, a missing token, or an unreadable registry all stop it before an
+upload. Note that this only works for a tag whose tree contains the script — in
+practice, this release or later.
 
 ### Token ownership and rotation
 
@@ -158,9 +197,9 @@ To rotate:
    the three crates; endpoint scope: publish only).
 2. Update the `CARGO_REGISTRY_TOKEN` secret in the `crates-io` environment.
 3. Revoke the old token on crates.io.
-4. Confirm the next release publishes, or re-dispatch the release workflow for
-   the current tag — the publish lane is idempotent, so a re-run with the new
-   token is safe even if nothing is left to upload.
+4. Confirm the next release publishes, or re-dispatch the release workflow for a
+   tag that contains the crates lane — the publish is idempotent, so a re-run
+   with the new token is safe even if nothing is left to upload.
 
 The token never appears in a workflow run's logs: it is passed only as the
 `CARGO_REGISTRY_TOKEN` environment variable of the publish step, and no step
@@ -174,7 +213,8 @@ A publish that dies between packages leaves the release half-shipped — say
 undone, so recovery is *resumption*, not repair:
 
 1. Re-dispatch **Release** (`workflow_dispatch`) from the release tag, passing
-   that tag as `release_tag`. Dispatching from any other ref is rejected.
+   that tag as `release_tag`. Dispatching from any other ref is rejected, and
+   the tag must be one whose tree contains this lane (see above).
 2. `ops/publish-crates.sh` asks crates.io for each `name@version` first and
    skips what is already there, so the run uploads exactly the packages that are
    missing and reports the rest as `already present`.
@@ -214,6 +254,7 @@ None of these blocks the release; all are stated so adopters are not surprised.
 - `/v1/responses` and cross-provider translation remain typed deferrals.
 - The crates.io upload path is wired, gated, and dry-run, but **no version has
   been published yet**: it needs `CARGO_REGISTRY_TOKEN` in the `crates-io`
-  environment. Until that secret exists the `release-crates` job fails loudly
-  with that reason instead of silently skipping, so a release cannot appear to
-  have published when it did not.
+  environment, and the first workflow-driven publish is the next release tag
+  cut after this lane lands — `v0.3.0` predates it. Until that secret exists the
+  `release-crates` job fails loudly with that reason instead of silently
+  skipping, so a release cannot appear to have published when it did not.

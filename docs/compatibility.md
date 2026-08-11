@@ -91,7 +91,7 @@ Practically: the config that boots on `0.x.y` boots on `0.x.(y+1)`.
 ### The usage schema
 
 `UsageRecord::SCHEMA_VERSION = 2`, with the row shape in
-[`crates/gateway/sql/usage_v2.sql`](../crates/gateway/sql/usage_v2.sql) and the field-level
+[`ops/postgres/usage_v2.sql`](../ops/postgres/usage_v2.sql) and the field-level
 contract in [`docs/usage-schema.md`](./usage-schema.md). It lands in *your*
 tables, so it is treated as an API and is versioned independently of the
 gateway's own version:
@@ -103,12 +103,12 @@ gateway's own version:
   `input_tokens`.
 - Removing or renaming a column, making one `NOT NULL`, changing a unit, or
   redefining an existing vocabulary value **is** a bump: a new
-  `crates/gateway/sql/usage_v<N>.sql` alongside the old one, and a bump of
+  `ops/postgres/usage_v<N>.sql` alongside the old one, and a bump of
   `SCHEMA_VERSION`. Shipped DDL is never edited in place.
 - One table may hold rows from several gateway versions. Read `schema_version`;
   do not assume a deploy timeline.
 
-The budget schema ([`crates/gateway/sql/budget_v1.sql`](../crates/gateway/sql/budget_v1.sql))
+The budget schema ([`ops/postgres/budget_v1.sql`](../ops/postgres/budget_v1.sql))
 follows the same rule, but it is gateway-internal state rather than a reporting
 interface — read it at your own risk.
 
