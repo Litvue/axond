@@ -1346,22 +1346,7 @@ impl Config {
                 ConfigError::Invalid(format!("gateway_minting aliases: {error}"))
             })?;
         }
-        if minting.scope.is_none() {
-            return Err(ConfigError::Invalid(
-                "gateway_minting must declare an explicit scope ceiling".into(),
-            ));
-        }
-        let minting_keys = self
-            .gateway_key
-            .iter()
-            .filter(|key| key.can_mint)
-            .collect::<Vec<_>>();
-        if minting_keys.is_empty() {
-            return Err(ConfigError::Invalid(
-                "gateway_minting requires at least one gateway_key with `can_mint = true`".into(),
-            ));
-        }
-        for key in minting_keys {
+        for key in self.gateway_key.iter().filter(|key| key.can_mint) {
             if !namespaces.contains_key(key.namespace.as_str()) {
                 continue;
             }
@@ -1964,6 +1949,33 @@ can_mint = true
         )
         .expect_err("can_mint must require minting config");
         assert!(error.to_string().contains("gateway_minting"), "{error}");
+    }
+
+    #[test]
+    fn gateway_minting_without_authorized_key_is_valid() {
+        let config = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "INBOUND"
+namespace = "platform"
+can_mint = false
+[gateway_token]
+audience = "test"
+[[gateway_verifier]]
+kid = "test"
+alg = "HS256"
+env = "JWT"
+namespaces = ["platform"]
+max_ttl = "15m"
+[gateway_minting]
+kid = "test"
+env = "SIGN"
+"#,
+        );
+        assert!(config.is_ok(), "{config:?}");
     }
 
     #[test]

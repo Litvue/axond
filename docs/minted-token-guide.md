@@ -66,9 +66,10 @@ curl -s https://gateway.example/v1/tokens -H "Authorization: Bearer $GW_INBOUND_
 
 Enabling this puts the **private signing** key in the published config
 snapshot on every replica that has minting enabled. A compromised minting
-replica becomes a forgery capability for every namespace its verifier permits,
-and loses Ed25519's verification-only-replica benefit. The verifier retains
-only public key material; that is not the concern here. Keep offline
+replica becomes a forgery capability for every namespace its verifier permits.
+EdDSA otherwise allows verification-only replicas to hold only public key
+material; HS256 never had that property because every verifier already holds
+the forging secret. Keep offline
 `axond mint` as the default; if HTTP minting is necessary, run it on dedicated
 replicas that do not serve dispatch traffic, and reference the private signing
 key only in that deployment's config. Keep `max_ttl` short.
@@ -239,9 +240,9 @@ TOKEN="$(
 ```
 
 HS256 is symmetric: `GW_SIGN_LOCAL` and `GW_VERIFY_LOCAL_MINTER` must contain
-the same secret bytes. Every verifier holding those bytes can forge tokens,
-which is why Ed25519 is preferred when verification-only replicas must not be
-able to mint. As with any verifier, `GW_VERIFY_LOCAL_MINTER` must be present in
+the same secret bytes. Every verifier holding those bytes can forge tokens;
+prefer EdDSA for `[gateway_minting]` when verification-only replicas must not
+be able to mint. As with any verifier, `GW_VERIFY_LOCAL_MINTER` must be present in
 the gateway's environment before it starts; the export above only equips the
 minting shell.
 
@@ -399,11 +400,11 @@ coarsest to most targeted:
    and subject, so the gateway does not mint tokens it would immediately
    reject with `token_issued_before_epoch`.
 
-To revoke in-gateway issuance entirely, remove `[gateway_minting]` and the
-`can_mint` flags in the same edit. Removing only the last `can_mint` key is
-rejected by validation, so the previous still-minting configuration continues
-serving. Removing `[gateway_minting]` takes effect on reload and is the fast
-path for shutting issuance off.
+To revoke in-gateway issuance entirely, remove `[gateway_minting]`; that takes
+effect on reload and is the fast path for shutting issuance off. Alternatively,
+setting every gateway key's `can_mint` to `false` leaves the section in place
+but makes the endpoint reject every caller with `mint_not_authorized`. Reload
+logs a warning when minting is configured without an authorized key.
 
 4. **`jti` denylist (#68).** A future opt-in denylist can reject one token by
    its mandatory `jti`.

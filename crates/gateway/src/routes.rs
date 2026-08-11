@@ -26,7 +26,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Extension, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderValue};
@@ -285,6 +285,10 @@ async fn mint_tokens(
         iat,
     )
     .map_err(|error| GatewayError::BadRequest(error.to_string()))?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let expires_in = minted.exp.saturating_sub(now);
     let mut headers = HeaderMap::new();
     headers.insert(
         axum::http::header::CACHE_CONTROL,
@@ -295,7 +299,7 @@ async fn mint_tokens(
         Json(json!({
             "token": minted.token,
             "exp": minted.exp,
-            "expires_in": ttl.as_secs(),
+            "expires_in": expires_in,
             "namespace": caller.namespace,
         "sub": subject,
         })),
@@ -1956,6 +1960,13 @@ max_request_microdollars = 1000
         let (status, body) = mint_request(state.clone(), json!({"sub": "near"})).await;
         assert_eq!(status, StatusCode::OK);
         let token = body["token"].as_str().expect("minted token");
+        let exp = body["exp"].as_u64().expect("expiry");
+        let expires_in = body["expires_in"].as_u64().expect("remaining lifetime");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(expires_in, exp.saturating_sub(now));
         assert!(
             state
                 .config()
