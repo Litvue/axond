@@ -373,6 +373,9 @@ coarsest to most targeted:
    namespace-wide epoch affects every subject in that namespace; to spare one
    subject, add a per-subject entry with an earlier `min_iat`, which overrides
    the namespace-wide entry for that subject.
+   A future epoch also blocks in-gateway issuance for the affected namespace
+   and subject, so the gateway does not mint tokens it would immediately
+   reject with `token_issued_before_epoch`.
 
 To revoke in-gateway issuance entirely, remove `[gateway_minting]` and the
 `can_mint` flags in the same edit. Removing only the last `can_mint` key is

@@ -63,6 +63,10 @@ pub enum GatewayError {
     MintNotAuthorized,
     #[error("requested claims are not narrower than the minting ceiling")]
     MintClaimsNotNarrowing,
+    #[error(
+        "minting is blocked by the token epoch for namespace `{namespace}` and subject `{subject}`"
+    )]
+    MintingBlockedByEpoch { namespace: String, subject: String },
     /// A native route reached with an alias whose target cannot speak that wire
     /// shape (an OpenAI-only alias on `/v1/messages`, say). The caller asked for
     /// something the configuration cannot serve, so it is a request error rather
@@ -95,7 +99,9 @@ impl GatewayError {
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::MintingDisabled => StatusCode::NOT_FOUND,
-            Self::MintNotAuthorized | Self::MintClaimsNotNarrowing => StatusCode::FORBIDDEN,
+            Self::MintNotAuthorized
+            | Self::MintClaimsNotNarrowing
+            | Self::MintingBlockedByEpoch { .. } => StatusCode::FORBIDDEN,
             Self::UnsupportedWire { .. } => StatusCode::BAD_REQUEST,
             Self::Provider(e) => match e {
                 ProviderError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
@@ -129,6 +135,7 @@ impl GatewayError {
             Self::MintingDisabled => "minting_disabled",
             Self::MintNotAuthorized => "mint_not_authorized",
             Self::MintClaimsNotNarrowing => "mint_claims_not_narrowing",
+            Self::MintingBlockedByEpoch { .. } => "minting_blocked_by_epoch",
             Self::UnsupportedWire { .. } => "unsupported_wire",
             Self::Provider(e) => e.code(),
             Self::Transport(TransportError::Provider(e)) => e.code(),

@@ -28,8 +28,9 @@ use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind};
 use crate::credentials::{CredentialError, Credentials};
 use crate::key_material::{self, KeyMaterialError};
 use crate::principals::{
-    Capability, ConfigPrincipals, GatewayKeyEntry, Presented, PrincipalShapeError,
-    PrincipalStoreChain, TokenVerifier, TokenVerifierBuildError,
+    Capability, ConfigPrincipals, GatewayKeyEntry, NamespaceEpoch, Presented, PrincipalShapeError,
+    PrincipalStoreChain, TokenVerifier, TokenVerifierBuildError, configured_token_epochs,
+    resolve_token_epoch,
 };
 #[cfg(test)]
 use crate::rate_limit::NoLimit;
@@ -71,6 +72,7 @@ pub struct ConfigSnapshot {
     pub gateway_verifier_fingerprints: HashMap<String, String>,
     pub gateway_minting_fingerprint: Option<String>,
     pub gateway_minting: Option<ResolvedMinting>,
+    gateway_token_epochs: HashMap<String, NamespaceEpoch>,
 }
 
 pub struct ResolvedMinting {
@@ -163,6 +165,7 @@ impl ConfigSnapshot {
         env: &HashMap<String, String>,
         generation: u64,
     ) -> Result<Self, SnapshotError> {
+        let gateway_token_epochs = configured_token_epochs(&config);
         let credentials = Credentials::from_env(&config, env)?;
         let target_circuits = CircuitBreaker::new(
             config.failover.failure_threshold,
@@ -356,6 +359,7 @@ impl ConfigSnapshot {
             gateway_verifier_fingerprints,
             gateway_minting_fingerprint,
             gateway_minting,
+            gateway_token_epochs,
         })
     }
 
@@ -378,6 +382,10 @@ impl ConfigSnapshot {
 
     pub fn token_verifier_count(&self) -> usize {
         self.config.gateway_verifier.len()
+    }
+
+    pub(crate) fn gateway_token_epoch(&self, namespace: &str, subject: &str) -> Option<u64> {
+        resolve_token_epoch(&self.gateway_token_epochs, namespace, subject)
     }
 }
 
