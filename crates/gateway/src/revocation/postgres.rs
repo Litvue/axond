@@ -142,28 +142,22 @@ impl RevocationStore for PostgresRevocation {
         validate_expiry(expires_at)?;
         let table = self.table.clone();
         let jti = jti.to_owned();
-        match self.run(|client: &mut Client| Box::pin(async move {
-            let values: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
-                vec![Box::new(jti), Box::new(expires_at)];
-            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = values
-                .iter()
-                .map(|value| value.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-                .collect();
-            client
-                .execute(
-                    &format!(
-                        "INSERT INTO {} (jti, expires_at) VALUES ($1::text, $2)
-                         ON CONFLICT (jti) DO UPDATE SET expires_at = GREATEST({}.expires_at, EXCLUDED.expires_at)",
-                        table, table
-                    ),
-                    &params,
-                )
-                .await?;
-            Ok(())
-        })).await {
-            Ok(()) => Ok(()),
-            Err(error) => Err(error),
-        }
+        self.run(|client: &mut Client| {
+            Box::pin(async move {
+                client
+                    .execute(
+                        &format!(
+                            "INSERT INTO {table} (jti, expires_at) VALUES ($1::text, $2) \
+                             ON CONFLICT (jti) DO UPDATE \
+                             SET expires_at = GREATEST({table}.expires_at, EXCLUDED.expires_at)"
+                        ),
+                        &[&jti, &expires_at],
+                    )
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
     }
 }
 
