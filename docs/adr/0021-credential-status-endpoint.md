@@ -63,5 +63,9 @@ secrets or other tenants' credentials. Operators use a default-namespace static
 key — the breakglass key they already keep — for the all-namespaces view, and
 cannot delegate that view to any token. The `credentials:all` capability
 remains parseable and names the denial, but no principal is granted the view by
-carrying it. Replicas may disagree about transient circuit state, which is
+carrying it. The default namespace is consequently operator territory: a
+deployment that hands its default-namespace static key to an application widens
+that application's visibility to every namespace's labels and circuit state, so
+applications belong in their own namespace or on minted tokens.
+Replicas may disagree about transient circuit state, which is
 intentional and visible in the response.

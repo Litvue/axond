@@ -56,20 +56,22 @@ or an Anthropic-kind alias to `/v1/chat/completions`).
 
 Observed behaviour worth reusing (all reproducible offline, no provider keys):
 
-- Scope matrix: scope-less principals (static `[[gateway_key]]` **and** a minted token
-  with no `scope` claim) get `200` on the own-namespace view and `403
-  token_scope_insufficient` naming `credentials:all` on `?namespaces=all`. A scoped token
-  needs `credentials` for the route; `credentials:all` alone is denied with `credentials`.
+- Authority matrix: scope-less principals (static `[[gateway_key]]` **and** a minted token
+  with no `scope` claim) get `200` on the own-namespace view. On `?namespaces=all` only a
+  scope-less static key in the configured *default* namespace gets `200`; a static key in
+  a tenant namespace and every minted token get `403 token_scope_insufficient` naming
+  `credentials:all`. A scoped token needs `credentials` for the route;
+  `credentials:all` alone is denied with `credentials`.
 - `?namespaces=` is the caller's *own* namespace only when omitted entirely. Any other
   value — including `""`, `ALL`, a real other namespace, or `all,platform` — is typed
   `400 bad_request`. Unknown params (`?foo=bar`) are ignored.
 - A repeated `namespaces` param is deliberately rejected with a typed `400 bad_request`
   (for example, `?namespaces=all&namespaces=beta`); it never exposes a query deserializer
   error or bypasses the gateway's typed-error envelope.
-- `credentials:all` is an operator-only capability: a token minted for a tenant
-  namespace that carries it is denied the all-namespaces view because that view also
-  requires the configured default/platform namespace. Operators must mint it only into
-  operator tokens; the verifier's `namespaces = [...]` allowlist is defense in depth.
+- `credentials:all` in a token is inert: the all-namespaces view follows *authority*, not
+  the claim, so a token carrying it is denied even in the default namespace. `axond mint
+  --scope credentials:all` still signs the claim, which makes it a useful negative test.
+  `POST /v1/tokens` refuses to issue it, and an omitted minting scope does not inherit it.
 - A namespace with no credentials and fallback off answers `200 {"data":[]}` — an empty
   list, not an error.
 - The list is sorted by `(namespace, provider, credential_id)`, with omitted ids sorting

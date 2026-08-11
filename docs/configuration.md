@@ -195,6 +195,12 @@ even with a `credentials:all` claim
 default-namespace key is therefore what makes the fleet-wide credential view
 reachable at all.
 
+Treat the default namespace as the operator's own namespace and its keys as
+breakglass: a static key placed there is an operator credential, so anyone
+holding it can enumerate every namespace's credential labels and circuit state.
+Serve applications from their own `[[namespace]]` with their own key, or from
+minted tokens, rather than handing out the default-namespace key.
+
 ## `[gateway_minting]` — in-gateway token issuance (optional, Tier 0)
 
 This section is absent by default; its presence registers `POST /v1/tokens`.
