@@ -9,6 +9,34 @@ use super::{RevocationError, RevocationStore, expiry_ms, unavailable, validate_e
 use crate::config::StoreUnavailable;
 use crate::redis_support::{RedisConnection, RedisRecovery, operation_liveness_timeout};
 
+struct RevocationInvokeGuard {
+    generation: u64,
+    recovery: Arc<RedisRecovery>,
+    completed: bool,
+}
+
+impl RevocationInvokeGuard {
+    fn new(generation: u64, recovery: Arc<RedisRecovery>) -> Self {
+        Self {
+            generation,
+            recovery,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for RevocationInvokeGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.recovery.mark_suspect(self.generation);
+        }
+    }
+}
+
 pub struct RedisRevocation {
     connection: Arc<ArcSwap<RedisConnection>>,
     recovery: Arc<RedisRecovery>,
@@ -108,6 +136,7 @@ impl RevocationStore for RedisRevocation {
         // shared recovery retires that generation if it fires.
         let task = tokio::spawn(async move {
             let mut connection = connection;
+            let mut invoke_guard = RevocationInvokeGuard::new(generation, task_recovery);
             let result = tokio::time::timeout(liveness_timeout, async move {
                 redis::cmd("EXISTS")
                     .arg(key)
@@ -115,8 +144,8 @@ impl RevocationStore for RedisRevocation {
                     .await
             })
             .await;
-            if result.is_err() {
-                task_recovery.mark_suspect(generation);
+            if result.is_ok() {
+                invoke_guard.complete();
             }
             drop(invoke_permit);
             result
@@ -183,6 +212,7 @@ impl RevocationStore for RedisRevocation {
         };
         let task = tokio::spawn(async move {
             let mut connection = connection;
+            let mut invoke_guard = RevocationInvokeGuard::new(generation, task_recovery);
             let result = tokio::time::timeout(liveness_timeout, async move {
                 redis::cmd("SET")
                     .arg(key)
@@ -193,8 +223,8 @@ impl RevocationStore for RedisRevocation {
                     .await
             })
             .await;
-            if result.is_err() {
-                task_recovery.mark_suspect(generation);
+            if result.is_ok() {
+                invoke_guard.complete();
             }
             drop(invoke_permit);
             result
@@ -564,6 +594,34 @@ mod tests {
         assert!(
             error.to_string().contains("alignment test error"),
             "backend error was lost: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_lookup_task_retires_its_generation() {
+        let stub = RevocationTimeoutStub::start().await;
+        let store = RedisRevocation::connect(
+            &stub.url(),
+            "axond:test:revocation-panic",
+            Duration::from_millis(25),
+            Duration::from_secs(1),
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect");
+        let generation = store.connection.load_full().generation;
+        let recovery = store.recovery.clone();
+        let task = tokio::spawn(async move {
+            let _guard = RevocationInvokeGuard::new(generation, recovery);
+            panic!("alignment test panic");
+        });
+        assert!(task.await.is_err(), "lookup task unexpectedly succeeded");
+        assert_eq!(
+            store
+                .recovery
+                .suspect_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            generation
         );
     }
 

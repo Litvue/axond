@@ -10,16 +10,10 @@ use tokio::sync::{Notify, Semaphore};
 const REPLACEMENT_COOLDOWN: Duration = Duration::from_millis(250);
 const OPERATION_LIVENESS_MULTIPLIER: u32 = 4;
 const OPERATION_LIVENESS_FLOOR: Duration = Duration::from_millis(500);
-// The old 256-invoke cap with the 250 ms admission timeout allowed
-// 256 / 0.25 = 1,024 admissions per second before shedding. Owned invokes now
-// live for up to 1 second at that default, so 1,024 preserves that headroom:
-// 1,024 / 1 = 1,024 outstanding invokes per second. At a 2-second admission
-// timeout the liveness budget is 8 seconds, so this fixed ceiling intentionally
-// sheds at 1,024 / 8 = 128 admissions per second rather than allowing 8,192
-// stalled tasks. The cap is therefore a safety ceiling, not a configurable
-// throughput promise; configurability can be considered once production
-// concurrency data justifies it. Saturation refuses only the current request
-// and is not evidence that the socket failed.
+// Each RedisRecovery owns this cap per store. On the revocation path it bounds
+// stalled owned lookups and writes to 1,024 pending operations before only the
+// current request is shed. It is a safety ceiling, not a throughput promise,
+// and saturation is not evidence that the socket failed.
 pub(crate) const INVOKE_CONCURRENCY: usize = 1024;
 
 pub(crate) fn operation_liveness_timeout(admission_timeout: Duration) -> Duration {
