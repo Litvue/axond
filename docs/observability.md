@@ -118,10 +118,13 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | `502` | `upstream_transport`, `provider_dependency_failed`, `model_unavailable`, `invalid_stream` | The upstream failed after the failover walk was exhausted. | Check the provider's status and the attempt spans; `attempts` on the usage record says how hard the gateway tried. |
 | `501` | `not_implemented` | `/v1/responses`, deferred past beta. | Use `/v1/chat/completions`. |
 
-Mid-stream failures are different by construction: streaming can fail over only
-**before the first byte**. Once the relay has emitted anything, a failure is a
-terminal SSE `error` event on an already-`200` response, and the usage record
-settles as `partial` or `upstream_error`.
+Mid-stream failures are different by construction. Native passthrough streams
+and OpenAI-normalized streams that have already queued downstream bytes remain
+terminal: the relay emits an SSE `error` event on the already-`200` response,
+and the usage record settles as `partial` or `upstream_error`. An
+OpenAI-normalized stream may instead rotate to the next pooled credential when
+an explicit upstream rate-limit event arrives before anything is queued
+downstream; the rotated attempt and lease spans remain under the request trace.
 
 ### Boot failures
 

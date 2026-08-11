@@ -28,8 +28,10 @@ use gateway_core::{
     ModelPrice, ModelUsage, ProviderStreamDecoder, ProviderStreamEvent, SseDecoder,
 };
 use gateway_transport::{ByteStream, TransportError};
+use opentelemetry::Context;
 use serde_json::{Value, json};
 use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::budget::{BudgetKey, Reservation};
 use crate::credentials::{CredentialLease, CredentialSource};
@@ -84,7 +86,6 @@ pub struct RotationHandle {
     record_failure: Arc<dyn Fn(&CredentialLease) + Send + Sync>,
     record_success: Arc<dyn Fn(&CredentialLease) + Send + Sync>,
     next_attempt: u32,
-    parent: Option<tracing::Span>,
 }
 
 fn is_stream_rate_limited(err: &TransportError) -> bool {
@@ -117,13 +118,7 @@ impl RotationHandle {
             record_failure: Arc::new(record_failure),
             record_success: Arc::new(record_success),
             next_attempt,
-            parent: None,
         }
-    }
-
-    pub fn with_parent(mut self, parent: tracing::Span) -> Self {
-        self.parent = Some(parent);
-        self
     }
 
     async fn open_next(
@@ -133,11 +128,7 @@ impl RotationHandle {
             let attempt = self.next_attempt;
             self.next_attempt += 1;
             let open = (self.opener)(lease.clone(), attempt, lease_index);
-            let result = match &self.parent {
-                Some(parent) => open.instrument(parent.clone()).await,
-                None => open.await,
-            };
-            match result {
+            match open.await {
                 Ok(opened) => {
                     (self.record_success)(&lease);
                     return Ok(Some((lease, opened)));
@@ -161,12 +152,13 @@ impl RotationHandle {
 /// passthrough stream share one attempt-span and one failover walk. A
 /// non-success upstream status is reported before any bytes flow, so a failed
 /// open never yields a partially-consumed stream.
-pub async fn open_stream<F>(
+pub async fn open_stream_with_parent<F>(
     ctx: &StreamContext,
     attempt: u32,
     lease_id: &str,
     lease_index: usize,
     open: F,
+    parent: Option<Context>,
 ) -> Result<ByteStream, TransportError>
 where
     F: Future<Output = Result<ByteStream, TransportError>>,
@@ -181,6 +173,9 @@ where
         &ctx.target_model,
         UsageRecord::credential_source_str(ctx.source),
     );
+    if let Some(parent) = parent {
+        let _ = attempt_span.set_parent(parent);
+    }
     let opened =
         open_stream_with_attempt_span(ctx, &attempt_span, lease_id, lease_index, open).await;
     telemetry::finish_upstream_attempt(
@@ -206,11 +201,13 @@ pub async fn open_stream_with_attempt_span<F>(
 where
     F: Future<Output = Result<ByteStream, TransportError>>,
 {
-    let lease_span = telemetry::credential_lease_span(
-        lease_id,
-        UsageRecord::credential_source_str(ctx.source),
-        lease_index,
-    );
+    let lease_span = attempt_span.in_scope(|| {
+        telemetry::credential_lease_span(
+            lease_id,
+            UsageRecord::credential_source_str(ctx.source),
+            lease_index,
+        )
+    });
     let opened = async { open.instrument(lease_span.clone()).await }
         .instrument(attempt_span.clone())
         .await;
@@ -240,7 +237,6 @@ pub fn relay_opened(
     framing: Framing,
     rotation: Option<RotationHandle>,
 ) -> Response {
-    let request_span = tracing::Span::current();
     let relay = Relay {
         bytes,
         carry: Vec::new(),
@@ -250,7 +246,7 @@ pub fn relay_opened(
         phase: Phase::Streaming,
         framing,
         accounting: Accounting::new(state, ctx, started),
-        rotation: rotation.map(|rotation| rotation.with_parent(request_span)),
+        rotation,
         queued_downstream: false,
     };
 
@@ -1701,25 +1697,45 @@ targets = [
             .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("axond-test")));
         let dispatch = tracing::Dispatch::new(subscriber);
         let _default = tracing::dispatcher::set_default(&dispatch);
-        let attempt = telemetry::upstream_attempt_span(0, "openai", "gpt-4o", "platform");
-        let result =
-            open_stream_with_attempt_span(&context(), &attempt, "rate-limited", 0, async {
+        let server = tracing::info_span!("http.server.request");
+        let parent_context = server.context();
+        let result = open_stream_with_parent(
+            &context(),
+            0,
+            "rate-limited",
+            0,
+            async {
                 Err(TransportError::Provider(ProviderError::from_upstream(
                     "test",
                     429,
                     "rate limited",
                 )))
-            })
-            .await;
+            },
+            Some(parent_context),
+        )
+        .await;
         assert!(result.is_err());
-        drop(attempt);
+        drop(server);
         provider.force_flush().unwrap();
-        let lease = exporter
-            .get_finished_spans()
-            .unwrap()
-            .into_iter()
+        let spans = exporter.get_finished_spans().unwrap();
+        let server = spans
+            .iter()
+            .find(|span| span.name == "http.server.request")
+            .expect("server span");
+        let attempt = spans
+            .iter()
+            .find(|span| span.name == "axond.upstream.attempt")
+            .expect("attempt span");
+        assert_eq!(attempt.parent_span_id, server.span_context.span_id());
+        assert_eq!(
+            attempt.span_context.trace_id(),
+            server.span_context.trace_id()
+        );
+        let lease = spans
+            .iter()
             .find(|span| span.name == "axond.credential.lease")
             .expect("lease span");
+        assert_eq!(lease.parent_span_id, attempt.span_context.span_id());
         let status = lease
             .attributes
             .iter()

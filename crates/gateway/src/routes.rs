@@ -42,6 +42,7 @@ use gateway_core::{
 use gateway_transport::{AuthScheme, NativeCall, TransportError, Upstream};
 use serde_json::{Value, json};
 use tracing::{Instrument, debug, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target};
@@ -837,6 +838,7 @@ async fn open_stream_lease(
     attempt: u32,
     lease_index: usize,
     attempt_span: Option<&tracing::Span>,
+    parent: Option<opentelemetry::Context>,
 ) -> Result<
     (
         Box<dyn ProviderStreamDecoder>,
@@ -881,7 +883,7 @@ async fn open_stream_lease(
                     .await?
                 }
                 None => {
-                    streaming::open_stream(
+                    streaming::open_stream_with_parent(
                         ctx,
                         attempt,
                         &lease.id,
@@ -892,6 +894,7 @@ async fn open_stream_lease(
                             Surface::ChatCompletions,
                             request,
                         ),
+                        parent,
                     )
                     .await?
                 }
@@ -911,12 +914,13 @@ async fn open_stream_lease(
                     .await?
                 }
                 None => {
-                    streaming::open_stream(
+                    streaming::open_stream_with_parent(
                         ctx,
                         attempt,
                         &lease.id,
                         lease_index,
                         state.0.dispatcher.send_stream(&upstream, &call),
+                        parent,
                     )
                     .await?
                 }
@@ -1021,6 +1025,7 @@ async fn stream_with_failover(
                 target_attempt,
                 plan.parked.len() + lease_index,
                 Some(&attempt_span),
+                None,
             )
             .await;
             ctx.attempts = target_attempt + 1;
@@ -1055,6 +1060,7 @@ async fn stream_with_failover(
                     let reservation_for_open = hold.reservation.clone();
                     let estimate_for_open = hold.estimated_input_tokens;
                     let source_for_open = plan.source;
+                    let parent_context_for_open = tracing::Span::current().context();
                     let opener =
                         move |next_lease: CredentialLease, attempt: u32, lease_index: usize| {
                             let state = state_for_open.clone();
@@ -1066,6 +1072,7 @@ async fn stream_with_failover(
                             let alias = alias_for_open.clone();
                             let budget_key = hold_key_for_open.clone();
                             let reservation = reservation_for_open.clone();
+                            let parent_context = parent_context_for_open.clone();
                             Box::pin(async move {
                                 let ctx = StreamContext {
                                     namespace: caller.namespace,
@@ -1095,6 +1102,7 @@ async fn stream_with_failover(
                                     attempt,
                                     lease_index,
                                     None,
+                                    Some(parent_context),
                                 )
                                 .await
                                 .map(|(decoder, bytes)| streaming::OpenedStream { decoder, bytes })
