@@ -19,6 +19,7 @@ mod mint;
 mod principals;
 mod rate_limit;
 mod reload;
+mod revocation;
 mod routes;
 mod state;
 mod streaming;
@@ -34,6 +35,7 @@ use budget::BudgetStore;
 use clap::{Arg, ArgAction, Command};
 use config::Config;
 use rate_limit::RateLimiter;
+use revocation::RevocationStore;
 use state::AppState;
 use usage::UsageFanout;
 
@@ -42,6 +44,7 @@ fn main() -> anyhow::Result<()> {
     match matches.subcommand() {
         Some(("mint", args)) => mint::run(args),
         Some(("keygen", args)) => mint::keygen(args),
+        Some(("revoke", args)) => mint::revoke(args),
         None => serve(),
         _ => unreachable!("clap validates subcommands"),
     }
@@ -52,6 +55,34 @@ fn cli() -> Command {
         .about("A stateless, self-hosted AI gateway")
         .subcommand_required(false)
         .arg_required_else_help(false)
+        .subcommand(
+            Command::new("revoke")
+                .about("Add a minted-token JTI to the revocation denylist")
+                .arg(
+                    Arg::new("jti")
+                        .long("jti")
+                        .required(true)
+                        .help("Token JTI to deny"),
+                )
+                .arg(
+                    Arg::new("ttl")
+                        .long("ttl")
+                        .conflicts_with("expires-at")
+                        .help("How long the JTI should remain revoked"),
+                )
+                .arg(
+                    Arg::new("expires-at")
+                        .long("expires-at")
+                        .conflicts_with("ttl")
+                        .help("Absolute expiry as Unix seconds or RFC3339 UTC"),
+                )
+                .arg(
+                    Arg::new("config")
+                        .long("config")
+                        .value_name("PATH")
+                        .help("Config file path"),
+                ),
+        )
         .subcommand(
             Command::new("mint")
                 .about("Mint an offline inbound identity token")
@@ -191,11 +222,19 @@ async fn serve() -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("rate-limit configuration failed: {e}"))?;
     tracing::info!(backend = rate_limiter.name(), "inbound rate limiting");
+    let revocation: Box<dyn RevocationStore> =
+        revocation::build(&config.revocation, &config.budget, &env)
+            .await
+            .map_err(|e| anyhow::anyhow!("revocation configuration failed: {e}"))?;
+    if revocation.name() != "none" {
+        tracing::info!(backend = revocation.name(), "token revocation");
+    }
 
     let bind = config.server.bind;
     let watching = config.reload.watch;
-    let state = AppState::new_with_rate_limiter(config, &env, usage, budget, rate_limiter)
-        .map_err(|e| anyhow::anyhow!("config resolution failed: {e}"))?;
+    let state =
+        AppState::new_with_rate_limiter(config, &env, usage, budget, rate_limiter, revocation)
+            .map_err(|e| anyhow::anyhow!("config resolution failed: {e}"))?;
     tracing::info!(
         gateway_keys = state.config().inbound_key_count(),
         gateway_verifiers = state.config().token_verifier_count(),

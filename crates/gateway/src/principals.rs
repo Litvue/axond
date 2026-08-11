@@ -60,6 +60,7 @@ pub struct InboundKey {
     pub alias_scope: Option<AliasScope>,
     pub max_request_microdollars: Option<u64>,
     pub can_mint: bool,
+    pub jti: Option<String>,
 }
 
 pub(crate) struct GatewayKeyEntry {
@@ -135,6 +136,8 @@ pub enum TokenVerificationError {
         "token for namespace `{namespace}` and subject `{subject}` was issued before its revocation epoch"
     )]
     IssuedBeforeEpoch { namespace: String, subject: String },
+    #[error("token has been revoked")]
+    Revoked,
 }
 
 impl TokenVerificationError {
@@ -154,6 +157,7 @@ impl TokenVerificationError {
             Self::AliasNotPermitted { .. } => "token_alias_not_permitted",
             Self::InvalidAliasClaim => "token_alias_claim_invalid",
             Self::IssuedBeforeEpoch { .. } => "token_issued_before_epoch",
+            Self::Revoked => "token_revoked",
         }
     }
 }
@@ -596,6 +600,7 @@ impl PrincipalStore for TokenVerifier {
             max_request_microdollars: claims.max_request_microdollars,
             // Token claims can never confer the ability to mint another token.
             can_mint: false,
+            jti: claims.jti,
         }))
     }
 }
@@ -817,6 +822,7 @@ mod tests {
                 alias_scope: None,
                 max_request_microdollars: None,
                 can_mint: false,
+                jti: None,
             },
         }]))
     }

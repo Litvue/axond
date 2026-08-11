@@ -12,10 +12,11 @@
 //!
 //! Not everything a config file describes can be replaced in a live process.
 //! The listening socket is already bound, the usage sinks already own
-//! connections and flush tasks, and the budget store and rate limiter already
-//! own their state, so changes to `[server] bind`, `[[usage_sink]]`, `[budget]`
-//! (including `limit_microdollars`), and `[rate_limit]` are reported and
-//! ignored until the next restart.
+//! connections and flush tasks, and the budget store, rate limiter, and
+//! revocation store already own their state, so changes to `[server] bind`,
+//! `[[usage_sink]]`, `[budget]` (including `limit_microdollars`),
+//! `[rate_limit]`, and `[revocation]` are reported and ignored until the next
+//! restart.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -23,7 +24,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::config::{BudgetConfig, Config, ConfigError, RateLimitConfig, Reload, UsageSinkConfig};
+use crate::config::{
+    BudgetConfig, Config, ConfigError, RateLimitConfig, Reload, RevocationConfig, UsageSinkConfig,
+};
 use crate::state::{AppState, ConfigSnapshot, SnapshotError};
 use crate::telemetry;
 
@@ -48,6 +51,7 @@ struct Boot {
     usage_sink: Vec<UsageSinkConfig>,
     budget: BudgetConfig,
     rate_limit: RateLimitConfig,
+    revocation: RevocationConfig,
 }
 
 /// Owns the config path and the state whose snapshot it replaces.
@@ -72,6 +76,7 @@ impl Reloader {
                 usage_sink: booted.config.usage_sink.clone(),
                 budget: booted.config.budget.clone(),
                 rate_limit: booted.config.rate_limit.clone(),
+                revocation: booted.config.revocation.clone(),
             },
             path,
             state,
@@ -212,6 +217,8 @@ pub struct ReloadSummary {
     pub budget_changed: bool,
     /// `[rate_limit]` differs from the booted limiter configuration.
     pub rate_limit_changed: bool,
+    /// `[revocation]` differs from the booted revocation store configuration.
+    pub revocation_changed: bool,
 }
 
 /// The added and removed identifiers of one config collection.
@@ -387,6 +394,7 @@ impl ReloadSummary {
             usage_sinks_changed: boot.usage_sink != after_config.usage_sink,
             budget_changed: boot.budget != after_config.budget,
             rate_limit_changed: boot.rate_limit != after_config.rate_limit,
+            revocation_changed: boot.revocation != after_config.revocation,
         }
     }
 
@@ -421,6 +429,7 @@ impl ReloadSummary {
             gateway_minting_fingerprint = ?self.gateway_minting_fingerprint,
             budget_changed = self.budget_changed,
             rate_limit_changed = self.rate_limit_changed,
+            revocation_changed = self.revocation_changed,
             changed = !self.is_empty(),
             "config reloaded"
         );
@@ -452,6 +461,11 @@ impl ReloadSummary {
         if self.gateway_minting_route_removed() {
             tracing::warn!(
                 "`[gateway_minting]` was removed; issuance is disabled immediately and `/v1/tokens` returns typed 404"
+            );
+        }
+        if self.revocation_changed {
+            tracing::warn!(
+                "`[revocation]` changed, but the revocation store is already serving; restart to apply it"
             );
         }
     }
@@ -947,6 +961,7 @@ max_ttl = "10m"
             usage_sink: before.config.usage_sink.clone(),
             budget: before.config.budget.clone(),
             rate_limit: before.config.rate_limit.clone(),
+            revocation: before.config.revocation.clone(),
         };
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(
@@ -975,6 +990,7 @@ max_ttl = "10m"
             usage_sink: before.config.usage_sink.clone(),
             budget: before.config.budget.clone(),
             rate_limit: before.config.rate_limit.clone(),
+            revocation: before.config.revocation.clone(),
         };
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(
@@ -1010,6 +1026,7 @@ max_ttl = "10m"
             usage_sink: disabled.config.usage_sink.clone(),
             budget: disabled.config.budget.clone(),
             rate_limit: disabled.config.rate_limit.clone(),
+            revocation: disabled.config.revocation.clone(),
         };
 
         let added = ReloadSummary::between(&boot, &disabled, &enabled);
@@ -1332,6 +1349,40 @@ default = true
         assert_eq!(listed_aliases(&state).await, vec!["gpt-4o".to_string()]);
     }
 
+    #[tokio::test]
+    async fn a_cross_wire_alias_is_rejected_and_the_previous_config_keeps_serving() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state.clone());
+        let before = state.config();
+
+        file.rewrite(
+            &format!(
+                r#"{PLATFORM_ONLY}
+[[provider]]
+id = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+
+[[model]]
+name = "mixed"
+targets = [
+    {{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }},
+    {{ provider = "anthropic", model = "claude", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }},
+]
+"#
+            ),
+        );
+        let err = reloader
+            .reload_with_env(TRIGGER_WATCH, &inbound_env())
+            .expect_err("cross-wire candidate must be rejected");
+        let message = err.to_string();
+        assert!(message.contains("mixed"), "{message}");
+        assert!(message.contains("no route can serve"), "{message}");
+        assert!(Arc::ptr_eq(&before, &state.config()));
+        assert_eq!(state.config().generation, 0);
+    }
+
     /// Reload runs the same fail-closed validation boot does, so a candidate
     /// whose gateway key cannot be resolved never replaces a config that can be
     /// authenticated against (ADR 0013).
@@ -1499,6 +1550,32 @@ default = true
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
             .expect("rate limit removal is valid");
         assert!(!summary.rate_limit_changed);
+    }
+
+    #[tokio::test]
+    async fn revocation_changes_are_reported_as_restart_required() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+
+        file.rewrite(&format!(
+            "{PLATFORM_ONLY}\n[revocation]\nbackend = \"redis\"\ndsn_env = \"REDIS_URL\"\n"
+        ));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &{
+                let mut env = inbound_env();
+                env.insert("REDIS_URL".to_owned(), "redis://127.0.0.1:6399".to_owned());
+                env
+            })
+            .expect("revocation candidate is valid");
+        assert!(summary.revocation_changed);
+        assert!(summary.is_empty());
+
+        file.rewrite(PLATFORM_ONLY);
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("revocation removal is valid");
+        assert!(!summary.revocation_changed);
     }
 
     /// Both triggers share one view of what has been acted on, so the watcher

@@ -71,17 +71,30 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+      # Resolve the release branch while the release PR output is available.
+      # The output is empty when release-please has just merged the PR, so keep
+      # JSON parsing in this guarded shell step rather than an expression.
+      - name: Resolve release branch
+        id: release-branch
+        if: ${{ steps.release.outputs.pr }}
+        env:
+          RELEASE_PR: ${{ steps.release.outputs.pr }}
+        run: |
+          set -euo pipefail
+          release_branch="$(jq -r '.headBranchName' <<<"$RELEASE_PR")"
+          [[ -n "$release_branch" && "$release_branch" != "null" ]]
+          echo "name=$release_branch" >> "$GITHUB_OUTPUT"
       # Keep Cargo.lock in step with the version bump release-please writes into
       # Cargo.toml, so `cargo build --locked` stays green.
       # actions/checkout persists this token by default, so the later git push
       # uses the same token without a separate credential argument.
       - uses: actions/checkout@v7
-        if: ${{ steps.release.outputs.pr }}
+        if: ${{ steps.release-branch.outputs.name }}
         with:
-          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          ref: ${{ steps.release-branch.outputs.name }}
           token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
       - name: Install the sync toolchain
-        if: ${{ steps.release.outputs.pr }}
+        if: ${{ steps.release-branch.outputs.name }}
         run: rustup toolchain install stable --profile minimal
       # The job concurrency group serializes lockfile sync for main, but a
       # dispatch or a manual push to the release branch can still move it under
@@ -90,9 +103,9 @@ jobs:
       # avoided: the goal is to include release-please's regenerated content,
       # not overwrite it.
       - name: Sync Cargo.lock onto the release branch
-        if: ${{ steps.release.outputs.pr }}
+        if: ${{ steps.release-branch.outputs.name }}
         env:
-          RELEASE_BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          RELEASE_BRANCH: ${{ steps.release-branch.outputs.name }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"

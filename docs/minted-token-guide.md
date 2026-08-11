@@ -270,6 +270,24 @@ The claim is omitted when no `--alias` is supplied. Its exact glob syntax,
 including fail-closed empty-array and invalid-pattern behavior, is documented
 under `[[gateway_verifier]]` in [configuration.md](./configuration.md).
 
+## 4.5. Precise single-token revocation
+
+With an optional denylist configured, revoke a token by its `jti` without
+placing token or key material on the command line:
+
+```bash
+axond revoke --jti TOKEN_JTI --ttl 15m --config axond.toml
+```
+
+`axond revoke` also accepts `--expires-at` as Unix seconds or RFC3339 UTC.
+Without either flag it uses the largest configured verifier lifetime plus the
+clock-skew allowance. This command is the complete operator surface; a full
+administrative/control-plane API is out of scope.
+
+Choose an explicit `--ttl` or `--expires-at` at or beyond the token's `exp`;
+the no-flag default is recommended because a shorter entry silently stops
+revoking the token when it expires.
+
 ## 5. Rotation runbook
 
 File-backed verifier material is re-read when a candidate snapshot is built, so

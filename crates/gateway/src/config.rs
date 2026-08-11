@@ -73,6 +73,9 @@ pub struct Config {
     /// Inbound per-caller concurrency enforcement. Defaults to no limit.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Precise minted-token revocation. Defaults to no denylist.
+    #[serde(default)]
+    pub revocation: RevocationConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,6 +123,30 @@ pub enum ProviderKind {
     Openai,
     Anthropic,
     OpenaiCompatible,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderWire {
+    Openai,
+    Anthropic,
+}
+
+impl std::fmt::Display for ProviderWire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Openai => f.write_str("OpenAI"),
+            Self::Anthropic => f.write_str("Anthropic"),
+        }
+    }
+}
+
+impl ProviderKind {
+    pub const fn wire(self) -> ProviderWire {
+        match self {
+            Self::Openai | Self::OpenaiCompatible => ProviderWire::Openai,
+            Self::Anthropic => ProviderWire::Anthropic,
+        }
+    }
 }
 
 /// A caller-facing model name (alias) → an ordered list of concrete targets.
@@ -541,6 +568,68 @@ pub struct RateLimitConfig {
     pub connect_timeout_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RevocationConfig {
+    #[serde(default)]
+    pub backend: RevocationBackend,
+    #[serde(default)]
+    pub dsn_env: Option<String>,
+    #[serde(default)]
+    pub key_prefix: Option<String>,
+    #[serde(default)]
+    pub table: Option<String>,
+    #[serde(default)]
+    pub create_table: bool,
+    #[serde(default)]
+    pub on_unavailable: StoreUnavailable,
+    #[serde(default = "default_revocation_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_revocation_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RevocationBackend {
+    #[default]
+    None,
+    Redis,
+    Postgres,
+}
+
+impl RevocationBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Redis => "redis",
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
+impl Default for RevocationConfig {
+    fn default() -> Self {
+        Self {
+            backend: RevocationBackend::None,
+            dsn_env: None,
+            key_prefix: None,
+            table: None,
+            create_table: false,
+            on_unavailable: StoreUnavailable::Deny,
+            timeout_ms: default_revocation_timeout_ms(),
+            connect_timeout_ms: default_revocation_connect_timeout_ms(),
+        }
+    }
+}
+
+fn default_revocation_timeout_ms() -> u64 {
+    250
+}
+
+fn default_revocation_connect_timeout_ms() -> u64 {
+    5_000
+}
+
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
@@ -595,9 +684,18 @@ impl RateLimitConfig {
     }
 }
 
+impl RevocationConfig {
+    pub fn key_prefix(&self) -> String {
+        self.key_prefix
+            .clone()
+            .unwrap_or_else(|| DEFAULT_REVOCATION_KEY_PREFIX.to_owned())
+    }
+}
+
 const DEFAULT_BUDGET_TABLE: &str = "axond_budget";
 const DEFAULT_BUDGET_KEY_PREFIX: &str = "axond:budget";
 const DEFAULT_RATE_LIMIT_KEY_PREFIX: &str = "axond:rate_limit";
+const DEFAULT_REVOCATION_KEY_PREFIX: &str = "axond:revocation";
 
 fn default_reservation_ttl_seconds() -> u64 {
     300
@@ -820,7 +918,7 @@ where
     }
 }
 
-fn parse_gateway_rfc3339_utc(value: &str) -> Result<u64, String> {
+pub(crate) fn parse_gateway_rfc3339_utc(value: &str) -> Result<u64, String> {
     let value = value.trim();
     let value = value
         .strip_suffix('Z')
@@ -948,6 +1046,20 @@ impl Config {
                     )));
                 }
             }
+            let first = &model.targets[0];
+            let first_provider = providers[first.provider.as_str()];
+            let first_wire = first_provider.kind.wire();
+            for target in model.targets.iter().skip(1) {
+                let provider = providers[target.provider.as_str()];
+                let wire = provider.kind.wire();
+                if wire != first_wire {
+                    return Err(ConfigError::Invalid(format!(
+                        "model `{}` has incompatible failover targets: provider `{}` uses {} wire, \
+                         but provider `{}` uses {} wire; no route can serve such an alias",
+                        model.name, first.provider, first_wire, provider.id, wire
+                    )));
+                }
+            }
         }
         if self.credential_pool.failure_threshold == 0 {
             return Err(ConfigError::Invalid(
@@ -1030,6 +1142,7 @@ impl Config {
         self.validate_usage_sinks()?;
         self.validate_budget()?;
         self.validate_rate_limit()?;
+        self.validate_revocation()?;
         Ok(())
     }
 
@@ -1356,6 +1469,49 @@ impl Config {
         Ok(())
     }
 
+    fn validate_revocation(&self) -> Result<(), ConfigError> {
+        let revocation = &self.revocation;
+        if revocation.backend == RevocationBackend::None {
+            return Ok(());
+        }
+        if revocation.timeout_ms == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "revocation `{}`: timeout_ms must be at least 1",
+                revocation.backend.as_str()
+            )));
+        }
+        if revocation.connect_timeout_ms == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "revocation `{}`: connect_timeout_ms must be at least 1",
+                revocation.backend.as_str()
+            )));
+        }
+        let has_revocation_dsn = revocation
+            .dsn_env
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty());
+        let has_budget_fallback = revocation.backend == RevocationBackend::Redis
+            && self.budget.backend == BudgetBackend::Redis
+            && self
+                .budget
+                .dsn_env
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty());
+        if !has_revocation_dsn && !has_budget_fallback {
+            return Err(ConfigError::Invalid(format!(
+                "revocation `{}`: `dsn_env` must name the env var holding the connection string (or use the Redis budget `dsn_env` fallback)",
+                revocation.backend.as_str()
+            )));
+        }
+        if revocation.backend == RevocationBackend::Postgres {
+            validate_table_name(revocation.table.as_deref().unwrap_or("axond_revocation"))
+                .map_err(|message| {
+                    ConfigError::Invalid(format!("revocation `postgres`: {message}"))
+                })?;
+        }
+        Ok(())
+    }
+
     /// A sink's fields only make sense together, so they are checked as a set:
     /// a Postgres sink needs a DSN reference and a table name that is safe to
     /// interpolate, and its batch has to fit one statement's parameter budget.
@@ -1617,6 +1773,28 @@ audience = "test"
         let cfg = Config::from_toml_str(VALID).expect("valid config");
         assert_eq!(cfg.default_namespace(), "platform");
         assert!(cfg.model("gpt-4o").is_some());
+        assert_eq!(cfg.revocation.backend, RevocationBackend::None);
+        assert_eq!(cfg.revocation.key_prefix(), "axond:revocation");
+        assert_eq!(cfg.revocation.timeout_ms, 250);
+        assert_eq!(cfg.revocation.connect_timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn revocation_reuses_redis_budget_dsn_and_rejects_zero_timeouts() {
+        let config = format!(
+            "{VALID}\n[budget]\nbackend = \"redis\"\ndsn_env = \"REDIS_URL\"\nlimit_microdollars = 1\n[revocation]\nbackend = \"redis\"\n"
+        );
+        let cfg = Config::from_toml_str(&config).expect("budget DSN fallback");
+        assert_eq!(cfg.revocation.backend, RevocationBackend::Redis);
+
+        for section in [
+            "[revocation]\nbackend = \"redis\"\ntimeout_ms = 0\ndsn_env = \"R\"",
+            "[revocation]\nbackend = \"postgres\"\nconnect_timeout_ms = 0\ndsn_env = \"P\"",
+        ] {
+            let error = Config::from_toml_str(&format!("{VALID}\n{section}"))
+                .expect_err("zero timeout must fail");
+            assert!(error.to_string().contains("timeout_ms"), "{error}");
+        }
     }
 
     /// Epochs accept both the compact unix representation and an explicit UTC
@@ -1939,6 +2117,103 @@ targets = [{ provider = "ghost", model = "gpt-4o", price = { input_microdollars_
 "#;
         let err = Config::from_toml_str(toml).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid(_)), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_alias_with_targets_from_incompatible_wires() {
+        let toml = r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[provider]]
+id = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+
+[[model]]
+name = "mixed"
+targets = [
+    { provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } },
+    { provider = "anthropic", model = "claude", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } },
+]
+"#;
+        let err = Config::from_toml_str(toml).expect_err("cross-wire failover must fail");
+        let message = err.to_string();
+        assert!(message.contains("mixed"), "{message}");
+        assert!(message.contains("openai"), "{message}");
+        assert!(message.contains("anthropic"), "{message}");
+        assert!(message.contains("OpenAI"), "{message}");
+        assert!(message.contains("Anthropic"), "{message}");
+        assert!(message.contains("no route can serve"), "{message}");
+    }
+
+    #[test]
+    fn accepts_openai_family_failover_targets() {
+        let toml = r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[provider]]
+id = "compatible"
+kind = "openai-compatible"
+base_url = "https://example.test/v1"
+
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "platform"
+
+[[model]]
+name = "mixed-openai"
+targets = [
+    { provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } },
+    { provider = "compatible", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } },
+]
+"#;
+        Config::from_toml_str(toml).expect("OpenAI-family targets are compatible");
+    }
+
+    #[test]
+    fn accepts_aliases_each_confined_to_one_wire_family() {
+        let toml = r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[provider]]
+id = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "platform"
+
+[[model]]
+name = "openai-alias"
+targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
+
+[[model]]
+name = "anthropic-alias"
+targets = [{ provider = "anthropic", model = "claude", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
+"#;
+        Config::from_toml_str(toml).expect("single-wire aliases are compatible");
     }
 
     #[test]

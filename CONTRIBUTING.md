@@ -10,6 +10,7 @@ Requires the toolchain pinned in [`rust-toolchain.toml`](./rust-toolchain.toml).
 ```bash
 just check      # fmt --check, clippy -D warnings, tests — the CI gates
 just run        # run against ./axond.toml
+just compat     # run the Python SDK compatibility lane
 ```
 
 Or without `just`:
@@ -32,6 +33,14 @@ AXOND_TEST_REDIS_URL=redis://127.0.0.1:6399 \
 AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:55432/postgres \
 AXOND_TEST_REQUIRE_SERVICES=1 cargo test -p axond --all-features --locked
 ```
+
+The SDK compatibility lane uses the hash-pinned lockfile at
+[`tests/compat/requirements.txt`](./tests/compat/requirements.txt). Refresh it
+with `just compat-lock`; the recipe resolves from
+[`requirements.in`](./tests/compat/requirements.in) while excluding releases
+published less than seven days ago. The refresh requires
+[`uv`](https://docs.astral.sh/uv/getting-started/installation/) on `PATH`.
+Review the generated diff, then run `just compat`.
 
 ## Conventions
 

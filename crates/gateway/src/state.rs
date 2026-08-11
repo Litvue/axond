@@ -34,6 +34,7 @@ use crate::principals::{
 #[cfg(test)]
 use crate::rate_limit::NoLimit;
 use crate::rate_limit::RateLimiter;
+use crate::revocation::RevocationStore;
 use crate::usage::UsageFanout;
 
 pub use crate::principals::InboundKey;
@@ -46,6 +47,7 @@ pub struct Inner {
     pub usage: UsageFanout,
     pub budget: Box<dyn BudgetStore>,
     pub rate_limiter: Box<dyn RateLimiter>,
+    pub revocation: Box<dyn RevocationStore>,
     config: ArcSwap<ConfigSnapshot>,
 }
 
@@ -227,6 +229,7 @@ impl ConfigSnapshot {
                     alias_scope: None,
                     max_request_microdollars: None,
                     can_mint: k.can_mint,
+                    jti: None,
                 },
             });
             gateway_key_fingerprints
@@ -387,7 +390,14 @@ impl AppState {
         usage: UsageFanout,
         budget: Box<dyn BudgetStore>,
     ) -> Result<Self, SnapshotError> {
-        Self::new_with_rate_limiter(config, env, usage, budget, Box::new(NoLimit))
+        Self::new_with_rate_limiter(
+            config,
+            env,
+            usage,
+            budget,
+            Box::new(NoLimit),
+            Box::new(crate::revocation::NoDenylist),
+        )
     }
 
     pub fn new_with_rate_limiter(
@@ -396,6 +406,7 @@ impl AppState {
         usage: UsageFanout,
         budget: Box<dyn BudgetStore>,
         rate_limiter: Box<dyn RateLimiter>,
+        revocation: Box<dyn RevocationStore>,
     ) -> Result<Self, SnapshotError> {
         let snapshot = ConfigSnapshot::build(config, env, 0)?;
         Ok(AppState(Arc::new(Inner {
@@ -403,6 +414,7 @@ impl AppState {
             usage,
             budget,
             rate_limiter,
+            revocation,
             config: ArcSwap::from_pointee(snapshot),
         })))
     }
