@@ -41,6 +41,17 @@ pub struct CredentialLease {
     health_key: String,
 }
 
+#[cfg(test)]
+impl CredentialLease {
+    pub(crate) fn test(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            secret: SecretString::new(id.to_owned().into_boxed_str()),
+            health_key: id.to_owned(),
+        }
+    }
+}
+
 /// The ordered attempts for one request against one `(namespace, provider)`.
 pub struct CredentialPlan {
     pub source: CredentialSource,
@@ -601,6 +612,13 @@ weight = 1
                 .expect("plan");
             let ids: Vec<&str> = plan.attempts.iter().map(|a| a.id.as_str()).collect();
             assert_eq!(ids, ["openai-b"], "parked credential must be skipped");
+            assert_eq!(
+                plan.parked
+                    .iter()
+                    .map(|entry| entry.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["openai-a"],
+            );
         }
 
         let after_cooldown = now + Duration::from_secs(31);
@@ -609,6 +627,7 @@ weight = 1
             .expect("plan");
         let ids: Vec<&str> = plan.attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids[0], "openai-a", "the probe leads the plan");
+        assert!(plan.parked.is_empty());
 
         let next = creds
             .plan_at(&cfg, "platform", "openai", after_cooldown)

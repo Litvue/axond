@@ -148,7 +148,10 @@ fn server_span<B>(request: &Request<B>, method: &str, route: &str) -> Span {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::telemetry::{ATTEMPT_OK, finish_upstream_attempt, upstream_attempt_span};
+    use crate::telemetry::{
+        ATTEMPT_OK, LEASE_PARKED, LEASE_RATE_LIMITED, LEASE_SERVED, credential_lease_span,
+        finish_credential_lease, finish_upstream_attempt, upstream_attempt_span,
+    };
     use axum::Router;
     use axum::body::Body;
     use axum::routing::post;
@@ -167,7 +170,17 @@ mod tests {
     async fn dispatch() -> &'static str {
         let attempt = upstream_attempt_span(0, "openai", "gpt-4o", "platform");
         let _entered = attempt.enter();
+        let parked = credential_lease_span("parked", "platform", 0);
+        finish_credential_lease(&parked, LEASE_PARKED);
+        let rate_limited = credential_lease_span("a", "platform", 1);
+        finish_credential_lease(&rate_limited, LEASE_RATE_LIMITED);
         finish_upstream_attempt(&attempt, ATTEMPT_OK, 12, Some(12));
+        drop(_entered);
+        let rotated = upstream_attempt_span(1, "openai", "gpt-4o", "platform");
+        let _entered = rotated.enter();
+        let served = credential_lease_span("b", "platform", 2);
+        finish_credential_lease(&served, LEASE_SERVED);
+        finish_upstream_attempt(&rotated, ATTEMPT_OK, 12, Some(12));
         "ok"
     }
 
@@ -212,11 +225,27 @@ mod tests {
             .iter()
             .find(|span| span.name == "axond.upstream.attempt")
             .expect("an attempt span");
+        let attempts: Vec<_> = spans
+            .iter()
+            .filter(|span| span.name == "axond.upstream.attempt")
+            .collect();
+        let leases: Vec<_> = spans
+            .iter()
+            .filter(|span| span.name == "axond.credential.lease")
+            .collect();
 
         assert_eq!(server.span_context.trace_id().to_string(), INBOUND_TRACE);
         assert_eq!(server.parent_span_id.to_string(), INBOUND_SPAN);
         assert_eq!(attempt.parent_span_id, server.span_context.span_id());
         assert_eq!(attempt.span_context.trace_id().to_string(), INBOUND_TRACE);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(leases.len(), 3);
+        for lease in &leases {
+            assert!(attempts.iter().any(|parent| {
+                lease.parent_span_id == parent.span_context.span_id()
+                    && lease.span_context.trace_id() == parent.span_context.trace_id()
+            }));
+        }
 
         let attribute = |span: &opentelemetry_sdk::trace::SpanData, key: &str| {
             span.attributes
@@ -237,5 +266,12 @@ mod tests {
             attribute(attempt, "axond.target.provider").as_deref(),
             Some("openai")
         );
+        for (id, status) in [("parked", "parked"), ("a", "rate_limited"), ("b", "served")] {
+            let lease = leases
+                .iter()
+                .find(|span| attribute(span, "axond.credential.id").as_deref() == Some(id))
+                .expect("credential lease");
+            assert_eq!(attribute(lease, "axond.status").as_deref(), Some(status));
+        }
     }
 }

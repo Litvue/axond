@@ -948,7 +948,7 @@ async fn stream_with_failover(
 
     let mut walk = FailoverWalk::new(caller, model.targets.len());
     let mut last_ctx: Option<(StreamContext, Instant)> = None;
-    for (index, target) in model.targets.iter().enumerate() {
+    'targets: for (index, target) in model.targets.iter().enumerate() {
         if walk.attempts >= max_attempts || Instant::now() >= deadline {
             break;
         }
@@ -1043,7 +1043,7 @@ async fn stream_with_failover(
                     );
                     let remaining = plan.attempts[lease_index + 1..].to_vec();
                     let state_for_open = state.clone();
-                    let snapshot_for_open = snapshot.clone();
+                    let provider_for_open = Arc::new(provider.clone());
                     let target_for_open = target.clone();
                     let wire_for_open = wire.clone();
                     let body_for_open = body.clone();
@@ -1056,7 +1056,7 @@ async fn stream_with_failover(
                     let opener =
                         move |next_lease: CredentialLease, attempt: u32, lease_index: usize| {
                             let state = state_for_open.clone();
-                            let snapshot = snapshot_for_open.clone();
+                            let provider = provider_for_open.clone();
                             let target = target_for_open.clone();
                             let wire = wire_for_open.clone();
                             let body = body_for_open.clone();
@@ -1085,10 +1085,7 @@ async fn stream_with_failover(
                                 open_stream_lease(
                                     &state,
                                     &ctx,
-                                    snapshot
-                                        .config
-                                        .provider(&target.provider)
-                                        .expect("provider snapshot"),
+                                    provider.as_ref(),
                                     &target,
                                     &body,
                                     &wire,
@@ -1138,7 +1135,14 @@ async fn stream_with_failover(
                     last_ctx = Some((ctx, started));
                     walk.last_error = Some(err);
                     if decision == FailoverDecision::Return {
-                        break;
+                        telemetry::finish_upstream_attempt(
+                            &attempt_span,
+                            telemetry::ATTEMPT_ERROR,
+                            attempt_started.elapsed().as_millis() as u64,
+                            None,
+                        );
+                        walk.attempts += 1;
+                        break 'targets;
                     }
                 }
             }
