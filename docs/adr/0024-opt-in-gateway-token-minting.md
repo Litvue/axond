@@ -39,7 +39,9 @@ Every request is narrowed against ceilings owned by `[gateway_minting]`:
 exceed the configured authority. An omitted field inherits its configured
 ceiling; when `scope` has no configured ceiling, an omitted scope uses the
 ordinary capability posture and operator-only capabilities must be explicitly
-granted. Omission must never widen a token into an unrestricted one. The
+granted. Every effective capability, including inherited capabilities, must
+also be held by the minting key itself. Omission must never widen a token into
+an unrestricted one. The
 namespace is derived from the authorized static caller and cannot be supplied
 by the request.
 

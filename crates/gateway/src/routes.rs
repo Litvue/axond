@@ -216,13 +216,6 @@ async fn mint_tokens(
             {
                 return Err(GatewayError::MintClaimsNotNarrowing);
             }
-            if minting.scope.is_none()
-                && parsed
-                    .iter()
-                    .any(|capability| capability.is_operator_only())
-            {
-                return Err(GatewayError::MintClaimsNotNarrowing);
-            }
             Some(parsed)
         }
         None => Some(
@@ -238,6 +231,13 @@ async fn mint_tokens(
                 }),
         ),
     };
+    if scope.as_ref().is_some_and(|capabilities| {
+        capabilities
+            .iter()
+            .any(|capability| !caller_can_mint_capability(&caller, &snapshot, *capability))
+    }) {
+        return Err(GatewayError::MintClaimsNotNarrowing);
+    }
     let aliases = match request.aliases {
         Some(values) => {
             let requested = AliasScope::parse(values.iter().map(String::as_str))
@@ -307,6 +307,19 @@ async fn mint_tokens(
         "sub": subject,
         })),
     ))
+}
+
+fn caller_can_mint_capability(
+    caller: &InboundKey,
+    snapshot: &ConfigSnapshot,
+    capability: Capability,
+) -> bool {
+    caller
+        .scope
+        .as_ref()
+        .map_or(!capability.is_operator_only(), |scope| {
+            scope.contains(&capability) && namespace_allows(snapshot, &caller.namespace, capability)
+        })
 }
 
 async fn healthz() -> &'static str {
