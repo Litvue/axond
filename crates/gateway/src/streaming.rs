@@ -521,12 +521,12 @@ impl Relay {
             return Ok(false);
         };
         rotation.record_serving_failure();
-        self.accounting.fold_attempt();
         self.bytes = futures::stream::empty().boxed();
         self.carry.clear();
         self.sse = Some(SseDecoder::default());
         self.decoder = match rotation.open_next().await {
             Ok(Some((lease, opened))) => {
+                self.accounting.fold_attempt();
                 self.accounting.ctx.credential_id = lease.id.clone();
                 self.bytes = opened.bytes;
                 self.sse = Some(SseDecoder::default());
@@ -1713,6 +1713,48 @@ targets = [
         assert_eq!(ledger.settlements().len(), 1);
         assert_eq!(failures.load(Ordering::SeqCst), 1);
         assert_eq!(*failed_ids.lock().expect("failed ids"), ["a"]);
+    }
+
+    #[tokio::test]
+    async fn failed_rotation_preserves_reported_prompt_usage() {
+        let ledger = Arc::new(Ledger::default());
+        let rotation = RotationHandle::new(
+            Vec::new(),
+            test_lease("a"),
+            1,
+            |_lease: CredentialLease, _attempt: u32, _index: usize| {
+                Box::pin(async {
+                    Err(TransportError::Provider(ProviderError::from_upstream(
+                        "test",
+                        429,
+                        "rate limited",
+                    )))
+                }) as futures::future::BoxFuture<'static, _>
+            },
+            |_| {},
+            |_| {},
+        );
+        let response = relay_opened(
+            state_for("http://127.0.0.1:1", ledger.clone()),
+            context(),
+            Box::new(UsagePreludeDecoder::default()),
+            futures::stream::iter(vec![Ok(Bytes::from_static(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\n\ndata: {\"error\":{\"type\":\"rate_limit_exceeded\"}}\n\n",
+            ))])
+            .boxed(),
+            Instant::now(),
+            Framing::OpenAiSse,
+            Some(rotation),
+        );
+        let mut body = response.into_body().into_data_stream();
+        while let Some(chunk) = body.next().await {
+            let _ = chunk.expect("chunk");
+        }
+
+        let record = settled(&ledger).await;
+        assert_eq!(record["status"], "upstream_error");
+        assert_eq!(record["input_tokens"], 7);
+        assert_eq!(record["output_tokens"], 2);
     }
 
     #[tokio::test]
