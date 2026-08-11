@@ -47,9 +47,7 @@ use tracing::{Instrument, debug, warn};
 
 use crate::aliases::AliasScope;
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
-use crate::config::{
-    Model, Provider, ProviderKind, ProviderWire, Target, gateway_token_min_iat,
-};
+use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target, gateway_token_min_iat};
 use crate::credentials::{CredentialPlan, CredentialSource, CredentialStatusView};
 use crate::error::GatewayError;
 use crate::mint::{MintRequest, mint_issued_at, mint_token_at};
