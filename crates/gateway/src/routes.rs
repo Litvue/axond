@@ -222,10 +222,10 @@ async fn mint_tokens(
                     Capability::Credentials,
                     Capability::CredentialsAll,
                 ]
-                    .into_iter()
-                    .filter(|capability| !capability.is_operator_only())
-                    .map(Capability::name)
-                    .collect()
+                .into_iter()
+                .filter(|capability| !capability.is_operator_only())
+                .map(Capability::name)
+                .collect()
             })
     });
     let parsed = values
@@ -1900,8 +1900,7 @@ max_request_microdollars = 1000
                 .as_ref()
                 .map_or(true, |scope| !scope.contains(&Capability::CredentialsAll))
         );
-        let response =
-            scoped_route_request(state, "/v1/credentials?namespaces=all", token).await;
+        let response = scoped_route_request(state, "/v1/credentials?namespaces=all", token).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
