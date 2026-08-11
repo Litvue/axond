@@ -296,7 +296,7 @@ assume that subjects belong to the static config key list.
   configured namespaces, so signer ownership and rotation remain operational
   responsibilities.
 - The in-gateway `POST /v1/tokens` decision is recorded in
-  [ADR 0022](0022-opt-in-gateway-token-minting.md).
+  [ADR 0024](0024-opt-in-gateway-token-minting.md).
 - OIDC/JWKS federation, cumulative token budgets, and precise revocation remain
   open implementation decisions. The gateway does not
   gain a runtime control plane from this ADR.
