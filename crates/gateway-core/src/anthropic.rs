@@ -6,7 +6,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     Capabilities, ModelUsage, ProviderAdapter, ProviderError, ProviderRequest, ProviderResponse,
-    ProviderStreamDecoder, ProviderStreamEvent, SseEvent, Surface,
+    ProviderStreamDecoder, ProviderStreamEvent, SseEvent, Surface, is_rate_limit_payload,
 };
 
 const DEFAULT_MAX_TOKENS: u64 = 4096;
@@ -467,6 +467,14 @@ impl ProviderStreamDecoder for NativeMessagesDecoder {
             .event
             .clone()
             .or_else(|| data.get("type").and_then(Value::as_str).map(str::to_owned));
+        if is_rate_limit_payload(&data) {
+            return Err(ProviderError::RateLimitedStream(
+                data.pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Anthropic stream rate limited")
+                    .to_owned(),
+            ));
+        }
         match kind.as_deref() {
             Some("message_start") => merge_anthropic_usage(
                 &mut self.usage,

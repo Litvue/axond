@@ -1104,39 +1104,44 @@ async fn stream_with_failover(
             continue;
         }
         let target_attempt = walk.attempts;
-        let attempt_started = Instant::now();
-        let attempt_span = telemetry::upstream_attempt_span(
-            target_attempt,
-            &target.provider,
-            &target.model,
-            UsageRecord::credential_source_str(plan.source),
-        );
-        for (index, skipped) in plan.parked.iter().enumerate() {
-            let span = attempt_span.in_scope(|| {
-                telemetry::credential_lease_span(
-                    &skipped.id,
-                    UsageRecord::credential_source_str(plan.source),
-                    index,
-                )
-            });
-            telemetry::finish_credential_lease(&span, telemetry::LEASE_PARKED);
-        }
+        let mut attempt_started: Option<Instant> = None;
+        let mut attempt_span: Option<tracing::Span> = None;
         for (lease_index, lease) in plan.attempts.iter().enumerate() {
             if Instant::now() >= deadline {
                 if lease_index > 0 {
+                    let started = attempt_started.expect("attempt start");
+                    let span = attempt_span.as_ref().expect("attempt span");
                     telemetry::finish_upstream_attempt(
-                        &attempt_span,
+                        span,
                         telemetry::ATTEMPT_ERROR,
-                        attempt_started.elapsed().as_millis() as u64,
+                        started.elapsed().as_millis() as u64,
                         None,
                     );
                     walk.attempts += 1;
-                } else {
-                    // No open was issued, so this target has no attempt span.
-                    drop(attempt_span);
                 }
                 break 'targets;
             }
+            if attempt_span.is_none() {
+                let span = telemetry::upstream_attempt_span(
+                    target_attempt,
+                    &target.provider,
+                    &target.model,
+                    UsageRecord::credential_source_str(plan.source),
+                );
+                for (index, skipped) in plan.parked.iter().enumerate() {
+                    let lease_span = span.in_scope(|| {
+                        telemetry::credential_lease_span(
+                            &skipped.id,
+                            UsageRecord::credential_source_str(plan.source),
+                            index,
+                        )
+                    });
+                    telemetry::finish_credential_lease(&lease_span, telemetry::LEASE_PARKED);
+                }
+                attempt_started = Some(Instant::now());
+                attempt_span = Some(span);
+            }
+            let span = attempt_span.as_ref().expect("attempt span");
             let mut ctx = StreamContext {
                 namespace: caller.namespace.clone(),
                 subject: caller.subject.clone(),
@@ -1164,16 +1169,19 @@ async fn stream_with_failover(
                 wire,
                 lease,
                 plan.parked.len() + lease_index,
-                StreamLeaseParent::Attempt(&attempt_span),
+                StreamLeaseParent::Attempt(span),
             )
             .await;
             ctx.attempts = target_attempt + 1;
             match opened {
                 Ok((decoder, bytes)) => {
                     telemetry::finish_upstream_attempt(
-                        &attempt_span,
+                        span,
                         telemetry::ATTEMPT_OK,
-                        attempt_started.elapsed().as_millis() as u64,
+                        attempt_started
+                            .expect("attempt start")
+                            .elapsed()
+                            .as_millis() as u64,
                         None,
                     );
                     ctx.rate_limit_permit = hold.permit.take();
@@ -1198,7 +1206,8 @@ async fn stream_with_failover(
                     let reservation_for_open = hold.reservation.clone();
                     let estimate_for_open = hold.estimated_input_tokens;
                     let source_for_open = plan.source;
-                    let parent_context_for_open = attempt_span.context();
+                    let parent_context_for_open =
+                        attempt_span.as_ref().expect("attempt span").context();
                     let opener =
                         move |next_lease: CredentialLease, _attempt: u32, lease_index: usize| {
                             let state = state_for_open.clone();
@@ -1283,9 +1292,12 @@ async fn stream_with_failover(
                     walk.last_error = Some(err);
                     if decision == FailoverDecision::Return {
                         telemetry::finish_upstream_attempt(
-                            &attempt_span,
+                            span,
                             telemetry::ATTEMPT_ERROR,
-                            attempt_started.elapsed().as_millis() as u64,
+                            attempt_started
+                                .expect("attempt start")
+                                .elapsed()
+                                .as_millis() as u64,
                             None,
                         );
                         walk.attempts += 1;
@@ -1295,10 +1307,14 @@ async fn stream_with_failover(
                 }
             }
         }
+        let span = attempt_span.as_ref().expect("attempt span");
         telemetry::finish_upstream_attempt(
-            &attempt_span,
+            span,
             telemetry::ATTEMPT_ERROR,
-            attempt_started.elapsed().as_millis() as u64,
+            attempt_started
+                .expect("attempt start")
+                .elapsed()
+                .as_millis() as u64,
             None,
         );
         walk.attempts += 1;

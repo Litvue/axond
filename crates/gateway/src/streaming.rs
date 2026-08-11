@@ -787,7 +787,9 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::routing::post;
     use futures::StreamExt;
-    use gateway_core::{OpenAiCompatibleAdapter, ProviderAdapter, ProviderError, Surface};
+    use gateway_core::{
+        NativeMessagesDecoder, OpenAiCompatibleAdapter, ProviderAdapter, ProviderError, Surface,
+    };
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
     use serde_json::json;
@@ -1934,6 +1936,7 @@ targets = [
     async fn native_rate_limit_is_terminal_without_rotation() {
         let ledger = Arc::new(Ledger::default());
         let calls = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(AtomicUsize::new(0));
         let calls_for_open = calls.clone();
         let opener = move |_lease: CredentialLease, _attempt: u32, _index: usize| {
             let calls = calls_for_open.clone();
@@ -1945,9 +1948,7 @@ targets = [
         let response = relay_opened(
             state_for("http://127.0.0.1:1", ledger),
             context(),
-            OpenAiCompatibleAdapter::openai()
-                .stream_decoder(Surface::ChatCompletions)
-                .expect("decoder"),
+            Box::new(NativeMessagesDecoder::new()),
             futures::stream::iter(vec![Ok(Bytes::from_static(
                 b"data: {\"error\":{\"type\":\"rate_limit_exceeded\"}}\n\n",
             ))])
@@ -1959,7 +1960,12 @@ targets = [
                 test_lease("a"),
                 1,
                 opener,
-                |_| {},
+                {
+                    let failures = failures.clone();
+                    move |_| {
+                        failures.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
                 |_| {},
             )),
         );
@@ -1968,6 +1974,7 @@ targets = [
             let _ = chunk.expect("chunk");
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
