@@ -136,6 +136,10 @@ allowing.
   which means a mid-stream failure is reported as an Anthropic-shaped `error`
   event; the upstream has usually sent its own already, and an SDK stops at the
   first one.
+- Native passthrough never rotates mid-relay: its first upstream byte is already
+  on the caller's wire. Credential rotation is limited to HTTP open-time errors;
+  only OpenAI-normalized framing can retry an explicit rate-limit event before
+  content has been emitted.
 - Usage on a native route is only as good as what the provider reports. A stream
   that dies before `message_delta` settles the partial charge from the prompt
   estimate (ADR 0010), exactly as the OpenAI-shaped path does.

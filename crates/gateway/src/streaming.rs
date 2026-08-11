@@ -15,6 +15,7 @@
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
@@ -22,15 +23,18 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use gateway_core::{
     ModelPrice, ModelUsage, ProviderStreamDecoder, ProviderStreamEvent, SseDecoder,
 };
 use gateway_transport::{ByteStream, TransportError};
+use opentelemetry::Context;
 use serde_json::{Value, json};
 use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::budget::{BudgetKey, Reservation};
-use crate::credentials::CredentialSource;
+use crate::credentials::{CredentialLease, CredentialSource};
 use crate::rate_limit::RateLimitPermit;
 use crate::routes::next_request_id;
 use crate::state::AppState;
@@ -65,52 +69,189 @@ pub struct StreamContext {
     pub attempts: u32,
 }
 
-/// Attempt to open one target's upstream stream, wrapped in its per-attempt
-/// child span. Returns the undecoded byte stream on success, or the transport
-/// error so the failover loop can decide whether to advance to the next target
-/// — failover is only possible here, *before* the first byte is relayed.
-///
-/// The open itself is supplied by the caller so an adapter-encoded and a native
-/// passthrough stream share one attempt-span and one failover walk. A
-/// non-success upstream status is reported before any bytes flow, so a failed
-/// open never yields a partially-consumed stream.
-pub async fn open_stream<F>(
+pub struct OpenedStream {
+    pub bytes: ByteStream,
+    pub decoder: Box<dyn ProviderStreamDecoder>,
+}
+
+type RotationOpener = Arc<
+    dyn Fn(CredentialLease, u32, usize) -> BoxFuture<'static, Result<OpenedStream, TransportError>>
+        + Send
+        + Sync,
+>;
+
+pub struct RotationHandle {
+    remaining: VecDeque<(CredentialLease, usize)>,
+    serving: CredentialLease,
+    opener: RotationOpener,
+    deadline: Option<Instant>,
+    record_failure: Arc<dyn Fn(&CredentialLease) + Send + Sync>,
+    record_success: Arc<dyn Fn(&CredentialLease) + Send + Sync>,
+}
+
+fn is_stream_rate_limited(err: &TransportError) -> bool {
+    matches!(err, TransportError::Provider(error) if error.is_credential_rate_limited())
+}
+
+impl RotationHandle {
+    #[cfg(test)]
+    pub fn new(
+        leases: Vec<CredentialLease>,
+        serving: CredentialLease,
+        first_lease_index: usize,
+        opener: impl Fn(
+            CredentialLease,
+            u32,
+            usize,
+        ) -> BoxFuture<'static, Result<OpenedStream, TransportError>>
+        + Send
+        + Sync
+        + 'static,
+        record_failure: impl Fn(&CredentialLease) + Send + Sync + 'static,
+        record_success: impl Fn(&CredentialLease) + Send + Sync + 'static,
+    ) -> Self {
+        Self::new_with_deadline(
+            leases,
+            serving,
+            first_lease_index,
+            opener,
+            None,
+            record_failure,
+            record_success,
+        )
+    }
+
+    pub fn new_with_deadline(
+        leases: Vec<CredentialLease>,
+        serving: CredentialLease,
+        first_lease_index: usize,
+        opener: impl Fn(
+            CredentialLease,
+            u32,
+            usize,
+        ) -> BoxFuture<'static, Result<OpenedStream, TransportError>>
+        + Send
+        + Sync
+        + 'static,
+        deadline: Option<Instant>,
+        record_failure: impl Fn(&CredentialLease) + Send + Sync + 'static,
+        record_success: impl Fn(&CredentialLease) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            remaining: leases
+                .into_iter()
+                .enumerate()
+                .map(|(offset, lease)| (lease, first_lease_index + offset))
+                .collect(),
+            serving,
+            opener: Arc::new(opener),
+            deadline,
+            record_failure: Arc::new(record_failure),
+            record_success: Arc::new(record_success),
+        }
+    }
+
+    fn record_serving_failure(&self) {
+        (self.record_failure)(&self.serving);
+    }
+
+    fn record_serving_success(&self) {
+        (self.record_success)(&self.serving);
+    }
+
+    async fn open_next(
+        &mut self,
+    ) -> Result<Option<(CredentialLease, OpenedStream)>, TransportError> {
+        while let Some((lease, lease_index)) = self.remaining.pop_front() {
+            if self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return Ok(None);
+            }
+            let open = (self.opener)(lease.clone(), 0, lease_index);
+            match open.await {
+                Ok(opened) => {
+                    self.serving = lease.clone();
+                    return Ok(Some((lease, opened)));
+                }
+                Err(err) if is_stream_rate_limited(&err) => {
+                    (self.record_failure)(&lease);
+                }
+                // A non-rate-limit reopen error ends this credential walk,
+                // matching stream-open dispatch before target failover.
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(None)
+    }
+}
+
+pub async fn open_stream_with_attempt_span<F>(
     ctx: &StreamContext,
-    attempt: u32,
+    attempt_span: &tracing::Span,
+    lease_id: &str,
+    lease_index: usize,
     open: F,
 ) -> Result<ByteStream, TransportError>
 where
     F: Future<Output = Result<ByteStream, TransportError>>,
 {
-    // The attempt span covers opening the stream, which is where a failed
-    // stream fails; the relayed body outlives it, so its TTFT is reported
-    // through the metrics at settlement instead.
-    let started = Instant::now();
-    let attempt_span = telemetry::upstream_attempt_span(
-        attempt,
-        &ctx.target_provider,
-        &ctx.target_model,
-        UsageRecord::credential_source_str(ctx.source),
-    );
-    let opened = open.instrument(attempt_span.clone()).await;
-    telemetry::finish_upstream_attempt(
-        &attempt_span,
-        if opened.is_ok() {
-            telemetry::ATTEMPT_OK
-        } else {
-            telemetry::ATTEMPT_ERROR
+    let lease_span = attempt_span.in_scope(|| {
+        telemetry::credential_lease_span(
+            lease_id,
+            UsageRecord::credential_source_str(ctx.source),
+            lease_index,
+        )
+    });
+    let opened = async { open.instrument(lease_span.clone()).await }
+        .instrument(attempt_span.clone())
+        .await;
+    telemetry::finish_credential_lease(
+        &lease_span,
+        match &opened {
+            Ok(_) => telemetry::LEASE_SERVED,
+            Err(err) if is_stream_rate_limited(err) => telemetry::LEASE_RATE_LIMITED,
+            Err(_) => telemetry::LEASE_ERROR,
         },
-        started.elapsed().as_millis() as u64,
-        None,
+    );
+    opened
+}
+
+pub async fn open_stream_with_lease_parent<F>(
+    ctx: &StreamContext,
+    lease_id: &str,
+    lease_index: usize,
+    open: F,
+    parent: Context,
+) -> Result<ByteStream, TransportError>
+where
+    F: Future<Output = Result<ByteStream, TransportError>>,
+{
+    let lease_span = telemetry::credential_lease_span(
+        lease_id,
+        UsageRecord::credential_source_str(ctx.source),
+        lease_index,
+    );
+    let _ = lease_span.set_parent(parent);
+    let opened = open.instrument(lease_span.clone()).await;
+    telemetry::finish_credential_lease(
+        &lease_span,
+        match &opened {
+            Ok(_) => telemetry::LEASE_SERVED,
+            Err(err) if is_stream_rate_limited(err) => telemetry::LEASE_RATE_LIMITED,
+            Err(_) => telemetry::LEASE_ERROR,
+        },
     );
     opened
 }
 
 /// Build the client-facing SSE response from an already-opened upstream stream.
 ///
-/// The caller has committed to this target (the first byte is about to flow),
-/// so there is no more failover: an upstream that fails mid-stream is surfaced
-/// as a terminal `error` event in the caller's framing.
+/// Native bytes are committed as they arrive and never rotate mid-relay.
+/// OpenAI-normalized streams may use the supplied handle only while no content
+/// has been emitted, because a second independent completion cannot safely
+/// resume a partially delivered wire.
 pub fn relay_opened(
     state: AppState,
     ctx: StreamContext,
@@ -118,6 +259,7 @@ pub fn relay_opened(
     bytes: ByteStream,
     started: Instant,
     framing: Framing,
+    rotation: Option<RotationHandle>,
 ) -> Response {
     let relay = Relay {
         bytes,
@@ -128,6 +270,8 @@ pub fn relay_opened(
         phase: Phase::Streaming,
         framing,
         accounting: Accounting::new(state, ctx, started),
+        rotation,
+        queued_downstream: false,
     };
 
     let body = Body::from_stream(futures::stream::unfold(relay, |mut relay| async move {
@@ -208,6 +352,8 @@ struct Relay {
     phase: Phase,
     framing: Framing,
     accounting: Accounting,
+    rotation: Option<RotationHandle>,
+    queued_downstream: bool,
 }
 
 impl Relay {
@@ -227,6 +373,9 @@ impl Relay {
                 }
                 Phase::Finished => {
                     self.pending.extend(self.framing.done());
+                    if let Some(rotation) = self.rotation.as_ref() {
+                        rotation.record_serving_success();
+                    }
                     self.accounting.settle(Status::Ok);
                     self.phase = Phase::Ended;
                 }
@@ -241,6 +390,7 @@ impl Relay {
                 // A native stream is byte-faithful: the provider's own bytes go
                 // out as they arrive, and the decode below only observes usage.
                 if !self.framing.reemits() {
+                    self.queued_downstream = true;
                     self.pending.push_back(chunk.clone());
                 }
                 let text = self.decode_utf8(&chunk);
@@ -253,6 +403,39 @@ impl Relay {
                         for event in events {
                             match self.decoder.decode(event) {
                                 Ok(decoded) => self.emit(decoded),
+                                Err(err)
+                                    if err.is_credential_rate_limited()
+                                        && self.framing == Framing::OpenAiSse
+                                        && matches!(self.phase, Phase::Streaming)
+                                        && !self.queued_downstream =>
+                                {
+                                    match self.rotate().await {
+                                        Ok(true) => return,
+                                        Ok(false) => {
+                                            self.phase = Phase::Failed(err.to_string());
+                                            return;
+                                        }
+                                        Err(open_err) => {
+                                            self.phase = Phase::Failed(open_err.to_string());
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(err)
+                                    if err.is_credential_rate_limited()
+                                        && !matches!(self.phase, Phase::Streaming) =>
+                                {
+                                    // A post-Done rate limit follows a successful
+                                    // relay; do not penalize the serving credential.
+                                    return;
+                                }
+                                Err(err) if err.is_credential_rate_limited() => {
+                                    if let Some(rotation) = self.rotation.as_ref() {
+                                        rotation.record_serving_failure();
+                                    }
+                                    self.phase = Phase::Failed(err.to_string());
+                                    return;
+                                }
                                 Err(err) => {
                                     self.phase = Phase::Failed(err.to_string());
                                     return;
@@ -328,7 +511,9 @@ impl Relay {
                     self.accounting.mark_first_token();
                     self.accounting.count_relayed(&data);
                     if self.framing.reemits() {
-                        self.pending.push_back(data_event(event.as_deref(), &data));
+                        let rendered = data_event(event.as_deref(), &data);
+                        self.queued_downstream = true;
+                        self.pending.push_back(rendered);
                     }
                 }
                 ProviderStreamEvent::Done(usage) => {
@@ -337,6 +522,29 @@ impl Relay {
                 }
             }
         }
+    }
+
+    async fn rotate(&mut self) -> Result<bool, TransportError> {
+        let Some(rotation) = self.rotation.as_mut() else {
+            return Ok(false);
+        };
+        rotation.record_serving_failure();
+        self.bytes = futures::stream::empty().boxed();
+        self.carry.clear();
+        self.sse = Some(SseDecoder::default());
+        self.decoder = match rotation.open_next().await {
+            Ok(Some((lease, opened))) => {
+                self.accounting.fold_attempt();
+                self.accounting.ctx.credential_id = lease.id.clone();
+                self.bytes = opened.bytes;
+                self.sse = Some(SseDecoder::default());
+                self.phase = Phase::Streaming;
+                opened.decoder
+            }
+            Ok(None) => return Ok(false),
+            Err(err) => return Err(err),
+        };
+        Ok(true)
     }
 }
 
@@ -423,6 +631,7 @@ struct Accounting {
     /// Characters of generated text relayed to the client, which is the only
     /// measure of output a stream has before the provider's usage arrives.
     relayed_chars: usize,
+    carried_output_tokens: u64,
     /// Time to the first relayed token, which for a stream is the number a
     /// caller actually feels.
     ttft_ms: Option<u64>,
@@ -437,6 +646,7 @@ impl Accounting {
             started,
             usage: ModelUsage::default(),
             relayed_chars: 0,
+            carried_output_tokens: 0,
             ttft_ms: None,
             settled: false,
         }
@@ -451,23 +661,53 @@ impl Accounting {
         self.relayed_chars = self.relayed_chars.saturating_add(relayed_text_len(data));
     }
 
+    fn fold_attempt(&mut self) {
+        const CHARS_PER_TOKEN: usize = 4;
+        // Today the production decoders report usage only in terminal events,
+        // so a permitted pre-content rotation carries no provider usage. Keep
+        // this fallback for decoders that learn usage before rotation.
+        let output = if self.usage.output_tokens > 0 {
+            self.usage.output_tokens
+        } else {
+            self.relayed_chars.div_ceil(CHARS_PER_TOKEN) as u64
+        };
+        self.carried_output_tokens = self.carried_output_tokens.saturating_add(output);
+        self.usage = ModelUsage::default();
+        self.relayed_chars = 0;
+    }
+
     /// The usage the request is charged for. The provider's own numbers win
     /// whenever they arrived; otherwise — a cancelled or broken stream — the
     /// charge is derived from what was measurably relayed, and a stream that
     /// produced nothing is charged nothing.
     fn chargeable_usage(&self) -> ModelUsage {
         const CHARS_PER_TOKEN: usize = 4;
-        if self.usage.input_tokens > 0 || self.usage.output_tokens > 0 {
+        if self.carried_output_tokens == 0
+            && (self.usage.input_tokens > 0 || self.usage.output_tokens > 0)
+        {
             return self.usage;
         }
-        if self.relayed_chars == 0 {
+        let has_output = self.carried_output_tokens > 0
+            || self.usage.output_tokens > 0
+            || self.relayed_chars > 0;
+        if !has_output && self.usage.input_tokens == 0 {
             return ModelUsage::default();
         }
-        ModelUsage {
-            input_tokens: self.ctx.estimated_input_tokens,
-            output_tokens: self.relayed_chars.div_ceil(CHARS_PER_TOKEN) as u64,
-            ..ModelUsage::default()
-        }
+        let mut usage = self.usage;
+        usage.input_tokens = if self.usage.input_tokens > 0 {
+            self.usage.input_tokens
+        } else if has_output {
+            self.ctx.estimated_input_tokens
+        } else {
+            0
+        };
+        usage.output_tokens = self.carried_output_tokens
+            + if self.usage.output_tokens > 0 {
+                self.usage.output_tokens
+            } else {
+                self.relayed_chars.div_ceil(CHARS_PER_TOKEN) as u64
+            };
+        usage
     }
 
     fn settle(&mut self, status: Status) {
@@ -535,16 +775,26 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Duration;
 
     use async_trait::async_trait;
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{HeaderMap, Request, StatusCode};
+    use axum::response::IntoResponse;
     use axum::routing::post;
     use futures::StreamExt;
+    use gateway_core::{
+        NativeMessagesDecoder, OpenAiCompatibleAdapter, ProviderAdapter, ProviderError, Surface,
+    };
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
     use serde_json::json;
     use tower::util::ServiceExt;
+    use tracing_subscriber::layer::SubscriberExt;
 
     use crate::budget::{Admission, BudgetStore, Denial};
     use crate::config::Config;
@@ -648,6 +898,91 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         format!("http://{addr}")
+    }
+
+    async fn pooled_upstream() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            post(|headers: HeaderMap| async move {
+                if headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    == Some("Bearer a")
+                {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        axum::Json(json!({"error": {"type": "rate_limit_exceeded"}})),
+                    )
+                        .into_response()
+                } else {
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from(OPENAI_STREAM),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn pooled_config(base_url: &str) -> Config {
+        Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "{base_url}"
+
+{GATEWAY_KEY}
+
+[credential_pool]
+failure_threshold = 1
+cooldown_seconds = 60
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "GW_TEST_KEY_A"
+id = "a"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "GW_TEST_KEY_B"
+id = "b"
+
+[[model]]
+name = "gpt-4o"
+targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 2000000 }} }}]
+"#
+        ))
+        .expect("config")
+    }
+
+    fn pooled_state(base_url: &str, ledger: Arc<Ledger>) -> AppState {
+        AppState::new(
+            pooled_config(base_url),
+            &HashMap::from([
+                ("GW_TEST_KEY_A".to_owned(), "a".to_owned()),
+                ("GW_TEST_KEY_B".to_owned(), "b".to_owned()),
+                ("GW_TEST_INBOUND_KEY".to_owned(), CALLER_SECRET.to_owned()),
+            ]),
+            UsageFanout::new(vec![Box::new(LedgerSink(ledger.clone()))]),
+            Box::new(LedgerBudget(ledger)),
+        )
+        .expect("state")
     }
 
     fn state_for(base_url: &str, ledger: Arc<Ledger>) -> AppState {
@@ -965,6 +1300,50 @@ targets = [{{ provider = "anthropic", model = "claude-sonnet-4-5", price = {{ in
     }
 
     #[tokio::test]
+    async fn reported_zero_output_wins_without_rotation() {
+        let ledger = Arc::new(Ledger::default());
+        let base_url = upstream_serving(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"relayed text\"}}]}\n\n\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":0}}\n\n\
+data: [DONE]\n\n",
+        )
+        .await;
+        let resp = router(state_for(&base_url, ledger.clone()))
+            .oneshot(stream_request())
+            .await
+            .expect("response");
+        let mut body = resp.into_body().into_data_stream();
+        while let Some(chunk) = body.next().await {
+            chunk.expect("chunk");
+        }
+        let record = settled(&ledger).await;
+        assert_eq!(record["input_tokens"], 5);
+        assert_eq!(record["output_tokens"], 0);
+    }
+
+    #[test]
+    fn fold_attempt_carries_reported_output_and_chargeable_usage_keeps_prompt_once() {
+        let mut accounting = Accounting::new(
+            state_for("http://127.0.0.1:1", Arc::new(Ledger::default())),
+            context(),
+            Instant::now(),
+        );
+        accounting.usage = ModelUsage {
+            input_tokens: 7,
+            output_tokens: 2,
+            ..ModelUsage::default()
+        };
+        accounting.fold_attempt();
+        assert_eq!(accounting.carried_output_tokens, 2);
+        assert_eq!(accounting.usage, ModelUsage::default());
+
+        accounting.usage.input_tokens = 5;
+        accounting.usage.output_tokens = 1;
+        assert_eq!(accounting.chargeable_usage().input_tokens, 5);
+        assert_eq!(accounting.chargeable_usage().output_tokens, 3);
+    }
+
+    #[tokio::test]
     async fn multibyte_characters_survive_a_chunk_boundary() {
         let mut relay = Relay {
             bytes: Box::pin(futures::stream::empty()),
@@ -983,6 +1362,8 @@ targets = [{{ provider = "anthropic", model = "claude-sonnet-4-5", price = {{ in
                 context(),
                 Instant::now(),
             ),
+            rotation: None,
+            queued_downstream: false,
         };
         let text = "héllo — 日本語";
         let bytes = text.as_bytes();
@@ -1222,5 +1603,412 @@ targets = [
         assert_eq!(record["target_provider"], "pb");
         assert_eq!(record["target_model"], "m-b");
         assert_eq!(record["attempts"], 2);
+    }
+
+    #[tokio::test]
+    async fn stream_open_rotates_a_rate_limited_credential() {
+        let ledger = Arc::new(Ledger::default());
+        let base_url = pooled_upstream().await;
+        let state = pooled_state(&base_url, ledger.clone());
+        let resp = router(state.clone())
+            .oneshot(stream_request())
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body().into_data_stream();
+        let mut relayed = String::new();
+        while let Some(chunk) = body.next().await {
+            relayed.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+        }
+        assert!(relayed.contains("\"content\":\"hel\""));
+        let record = settled(&ledger).await;
+        assert_eq!(record["credential_id"], "b");
+    }
+
+    #[tokio::test]
+    async fn non_retryable_stream_open_does_not_try_the_next_target() {
+        let ledger = Arc::new(Ledger::default());
+        let url_a = failing_to_open_upstream(StatusCode::BAD_REQUEST).await;
+        let url_b = upstream_serving(OPENAI_STREAM).await;
+        let state = two_target_stream_state(&url_a, &url_b, ledger.clone());
+        let resp = router(state)
+            .oneshot(stream_request())
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let record = settled(&ledger).await;
+        assert_eq!(record["target_provider"], "pa");
+        assert_eq!(record["attempts"], 1);
+    }
+
+    fn test_opened_stream(body: &'static str) -> OpenedStream {
+        OpenedStream {
+            bytes: futures::stream::iter(vec![Ok(Bytes::from_static(body.as_bytes()))]).boxed(),
+            decoder: OpenAiCompatibleAdapter::openai()
+                .stream_decoder(Surface::ChatCompletions)
+                .expect("decoder"),
+        }
+    }
+
+    fn test_lease(id: &str) -> CredentialLease {
+        CredentialLease::test(id)
+    }
+
+    #[tokio::test]
+    async fn pre_content_rate_limit_rotates_and_carries_usage_once() {
+        let ledger = Arc::new(Ledger::default());
+        let failures = Arc::new(AtomicUsize::new(0));
+        let failed_ids = Arc::new(Mutex::new(Vec::new()));
+        let state = state_for("http://127.0.0.1:1", ledger.clone());
+        let opener = |_lease: CredentialLease, _attempt: u32, _index: usize| {
+            Box::pin(async {
+                Ok(test_opened_stream(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\ndata: [DONE]\n\n",
+                ))
+            }) as futures::future::BoxFuture<'static, _>
+        };
+        let failures_for_callback = failures.clone();
+        let failed_ids_for_callback = failed_ids.clone();
+        let rotation = RotationHandle::new(
+            vec![test_lease("b")],
+            test_lease("a"),
+            1,
+            opener,
+            move |lease| {
+                failures_for_callback.fetch_add(1, Ordering::SeqCst);
+                failed_ids_for_callback
+                    .lock()
+                    .expect("failed ids")
+                    .push(lease.id.clone());
+            },
+            |_| {},
+        );
+        let response = relay_opened(
+            state,
+            context(),
+            OpenAiCompatibleAdapter::openai()
+                .stream_decoder(Surface::ChatCompletions)
+                .expect("decoder"),
+            futures::stream::iter(vec![Ok(Bytes::from_static(
+                b"data: {\"error\":{\"type\":\"rate_limit_exceeded\"}}\n\n",
+            ))])
+            .boxed(),
+            Instant::now(),
+            Framing::OpenAiSse,
+            Some(rotation),
+        );
+        let mut body = response.into_body().into_data_stream();
+        let mut output = String::new();
+        while let Some(chunk) = body.next().await {
+            output.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+        }
+        assert!(output.contains("\"content\":\"b\""));
+        assert_eq!(output.matches("data: [DONE]").count(), 1);
+        assert!(!output.contains("rate_limit_exceeded"));
+        let record = settled(&ledger).await;
+        assert_eq!(record["input_tokens"], 8);
+        assert_eq!(record["output_tokens"], 1);
+        assert_eq!(ledger.settlements().len(), 1);
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+        assert_eq!(*failed_ids.lock().expect("failed ids"), ["a"]);
+    }
+
+    #[tokio::test]
+    async fn rotation_skips_rate_limited_reopens_before_serving() {
+        let ledger = Arc::new(Ledger::default());
+        let opens = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let opens_for_opener = opens.clone();
+        let opener = move |_lease: CredentialLease, _attempt: u32, _index: usize| {
+            let opens = opens_for_opener.clone();
+            Box::pin(async move {
+                if opens.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err(gateway_transport::TransportError::Provider(
+                        ProviderError::from_upstream("test", 429, "rate limited"),
+                    ))
+                } else {
+                    Ok(test_opened_stream(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\ndata: [DONE]\n\n",
+                    ))
+                }
+            }) as futures::future::BoxFuture<'static, _>
+        };
+        let failures_for_callback = failures.clone();
+        let response = relay_opened(
+            state_for("http://127.0.0.1:1", ledger.clone()),
+            context(),
+            OpenAiCompatibleAdapter::openai()
+                .stream_decoder(Surface::ChatCompletions)
+                .expect("decoder"),
+            futures::stream::iter(vec![Ok(Bytes::from_static(
+                b"data: {\"error\":{\"type\":\"rate_limit_exceeded\"}}\n\n",
+            ))])
+            .boxed(),
+            Instant::now(),
+            Framing::OpenAiSse,
+            Some(RotationHandle::new(
+                vec![test_lease("b"), test_lease("c"), test_lease("d")],
+                test_lease("a"),
+                1,
+                opener,
+                move |_| {
+                    failures_for_callback.fetch_add(1, Ordering::SeqCst);
+                },
+                |_| {},
+            )),
+        );
+        let mut body = response.into_body().into_data_stream();
+        let mut output = String::new();
+        while let Some(chunk) = body.next().await {
+            output.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+        }
+        assert!(output.contains("\"content\":\"c\""));
+        assert_eq!(opens.load(Ordering::SeqCst), 3);
+        assert_eq!(failures.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_after_done_does_not_reopen_the_stream() {
+        let ledger = Arc::new(Ledger::default());
+        let ledger_for_relay = ledger.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let calls_for_open = calls.clone();
+        let opener = move |_lease: CredentialLease, _attempt: u32, _index: usize| {
+            let calls = calls_for_open.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(test_opened_stream(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"replacement\"}}]}\n\ndata: [DONE]\n\n",
+                ))
+            }) as futures::future::BoxFuture<'static, _>
+        };
+        let response = relay_opened(
+            state_for("http://127.0.0.1:1", ledger_for_relay),
+            context(),
+            OpenAiCompatibleAdapter::openai()
+                .stream_decoder(Surface::ChatCompletions)
+                .expect("decoder"),
+            futures::stream::iter(vec![Ok(Bytes::from_static(
+                b"data: [DONE]\n\ndata: {\"error\":{\"type\":\"rate_limit_exceeded\"}}\n\n",
+            ))])
+            .boxed(),
+            Instant::now(),
+            Framing::OpenAiSse,
+            Some(RotationHandle::new(
+                vec![test_lease("b")],
+                test_lease("a"),
+                1,
+                opener,
+                {
+                    let failures = failures.clone();
+                    move |_| {
+                        failures.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+                |_| {},
+            )),
+        );
+        let mut body = response.into_body().into_data_stream();
+        let mut output = String::new();
+        while let Some(chunk) = body.next().await {
+            output.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!output.contains("event: error"));
+        assert!(output.ends_with("data: [DONE]\n\n"));
+        assert_eq!(settled(&ledger).await["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn stream_open_429_closes_lease_as_rate_limited() {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("axond-test")));
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _default = tracing::dispatcher::set_default(&dispatch);
+        let server = tracing::info_span!("http.server.request");
+        let parent_context = server.context();
+        let attempt = telemetry::upstream_attempt_span(0, "test", "model", "platform");
+        let _ = attempt.set_parent(parent_context);
+        let entered = attempt.enter();
+        let result =
+            open_stream_with_attempt_span(&context(), &attempt, "rate-limited", 0, async {
+                Err(TransportError::Provider(ProviderError::from_upstream(
+                    "test",
+                    429,
+                    "rate limited",
+                )))
+            })
+            .await;
+        drop(entered);
+        assert!(result.is_err());
+        telemetry::finish_upstream_attempt(&attempt, telemetry::ATTEMPT_ERROR, 0, None);
+        drop(attempt);
+        drop(server);
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        let server = spans
+            .iter()
+            .find(|span| span.name == "http.server.request")
+            .expect("server span");
+        let attempt = spans
+            .iter()
+            .find(|span| span.name == "axond.upstream.attempt")
+            .expect("attempt span");
+        assert_eq!(attempt.parent_span_id, server.span_context.span_id());
+        assert_eq!(
+            attempt.span_context.trace_id(),
+            server.span_context.trace_id()
+        );
+        let lease = spans
+            .iter()
+            .find(|span| span.name == "axond.credential.lease")
+            .expect("lease span");
+        assert_eq!(lease.parent_span_id, attempt.span_context.span_id());
+        let status = lease
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == "axond.status")
+            .map(|kv| kv.value.to_string());
+        assert_eq!(status.as_deref(), Some("rate_limited"));
+    }
+
+    #[tokio::test]
+    async fn post_content_rate_limit_is_terminal_without_rotation() {
+        let ledger = Arc::new(Ledger::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let calls_for_open = calls.clone();
+        let opener = move |_lease: CredentialLease, _attempt: u32, _index: usize| {
+            let calls = calls_for_open.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(test_opened_stream(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\ndata: [DONE]\n\n",
+                ))
+            }) as futures::future::BoxFuture<'static, _>
+        };
+        let response = relay_opened(
+            state_for("http://127.0.0.1:1", ledger.clone()),
+            context(),
+            OpenAiCompatibleAdapter::openai()
+                .stream_decoder(Surface::ChatCompletions)
+                .expect("decoder"),
+            futures::stream::iter(vec![Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: {\"error\":{\"type\":\"rate_limit_exceeded\"}}\n\n",
+            ))])
+            .boxed(),
+            Instant::now(),
+            Framing::OpenAiSse,
+            Some(RotationHandle::new(
+                vec![test_lease("b")],
+                test_lease("a"),
+                1,
+                opener,
+                {
+                    let failures = failures.clone();
+                    move |_| {
+                        failures.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+                |_| {},
+            )),
+        );
+        let mut body = response.into_body().into_data_stream();
+        let mut output = String::new();
+        while let Some(chunk) = body.next().await {
+            output.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+        }
+        assert!(output.contains("\"content\":\"a\""));
+        assert!(output.contains("OpenAI stream rate limited"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn native_rate_limit_is_terminal_without_rotation() {
+        let ledger = Arc::new(Ledger::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let calls_for_open = calls.clone();
+        let opener = move |_lease: CredentialLease, _attempt: u32, _index: usize| {
+            let calls = calls_for_open.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(test_opened_stream("data: [DONE]\n\n"))
+            }) as futures::future::BoxFuture<'static, _>
+        };
+        let response = relay_opened(
+            state_for("http://127.0.0.1:1", ledger),
+            context(),
+            Box::new(NativeMessagesDecoder::new()),
+            futures::stream::iter(vec![Ok(Bytes::from_static(
+                b"data: {\"error\":{\"type\":\"rate_limit_exceeded\"}}\n\n",
+            ))])
+            .boxed(),
+            Instant::now(),
+            Framing::Native,
+            Some(RotationHandle::new(
+                vec![test_lease("b")],
+                test_lease("a"),
+                1,
+                opener,
+                {
+                    let failures = failures.clone();
+                    move |_| {
+                        failures.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+                |_| {},
+            )),
+        );
+        let mut body = response.into_body().into_data_stream();
+        while let Some(chunk) = body.next().await {
+            let _ = chunk.expect("chunk");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rotation_stops_before_opening_after_deadline() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_open = calls.clone();
+        let opener = move |_lease: CredentialLease, _attempt: u32, _index: usize| {
+            let calls = calls_for_open.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(TransportError::Provider(ProviderError::from_upstream(
+                    "test",
+                    429,
+                    "rate limited",
+                )))
+            }) as futures::future::BoxFuture<'static, _>
+        };
+        let mut rotation = RotationHandle::new_with_deadline(
+            vec![test_lease("b"), test_lease("c")],
+            test_lease("a"),
+            1,
+            opener,
+            Some(Instant::now() - Duration::from_millis(1)),
+            |_| {},
+            |_| {},
+        );
+
+        assert!(
+            rotation
+                .open_next()
+                .await
+                .expect("rotation result")
+                .is_none()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

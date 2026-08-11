@@ -26,12 +26,15 @@ Logs are always JSON on stdout, filtered by `RUST_LOG` (default
 
 One `http.server.request` span per request, with one `axond.upstream.attempt`
 child per upstream call — so an ordered-failover walk reads as N attempt spans
-under one server span, the last carrying the status the caller saw.
+under one server span, the last carrying the status the caller saw. Each
+attempt contains one `axond.credential.lease` child for every attempted or
+parked credential.
 
 | Span | Key attributes |
 | --- | --- |
 | `http.server.request` | `http.request.method`, `http.route`, `http.response.status_code`, `axond.request_id`, `axond.namespace`, `axond.subject`, `gen_ai.request.model`, `axond.target.*`, `axond.credential_source`, `axond.status`, `axond.retry_count`, `gen_ai.usage.*`, `axond.cost_microdollars`, `axond.latency_ms`, `axond.ttft_ms` |
 | `axond.upstream.attempt` | `axond.attempt` (zero-based), `axond.target.provider`, `axond.target.model`, `axond.credential_source`, `axond.status`, `axond.latency_ms`, `axond.ttft_ms` |
+| `axond.credential.lease` | `axond.credential.id`, `axond.credential_source`, `axond.credential.index`, `axond.status` (`served`, `rate_limited`, `error`, `parked`) |
 | `axond.config.reload` | `axond.reload.trigger`, `axond.reload.outcome`, `axond.config.generation` |
 
 An inbound `traceparent` is **joined**, not replaced, and the context is
@@ -115,10 +118,21 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | `502` | `upstream_transport`, `provider_dependency_failed`, `model_unavailable`, `invalid_stream` | The upstream failed after the failover walk was exhausted. | Check the provider's status and the attempt spans; `attempts` on the usage record says how hard the gateway tried. |
 | `501` | `not_implemented` | `/v1/responses`, deferred past beta. | Use `/v1/chat/completions`. |
 
-Mid-stream failures are different by construction: streaming can fail over only
-**before the first byte**. Once the relay has emitted anything, a failure is a
-terminal SSE `error` event on an already-`200` response, and the usage record
-settles as `partial` or `upstream_error`.
+Mid-stream failures are different by construction. Native passthrough streams
+and OpenAI-normalized streams that have already queued downstream bytes remain
+terminal: the relay emits an SSE `error` event on the already-`200` response,
+and the usage record settles as `partial` or `upstream_error`. An
+OpenAI-normalized stream may instead rotate to the next pooled credential when
+an explicit upstream rate-limit event arrives before anything is queued
+downstream; the additional lease span remains under the original upstream
+attempt and request trace. Rotation does not create another upstream attempt
+span: there is one attempt span per target attempt, while `attempts` and
+`axond.retry_count` remain target-scoped. The target-open attempt can be
+`ok` while a later lease child is `rate_limited`.
+Rotation uses the same `failover.overall_timeout_ms` deadline as target
+failover. A long time-to-first-token stream can therefore remain terminal
+instead of rotating once that deadline expires; the attempt span is closed
+with the target's terminal status and no later lease span is emitted.
 
 ### Boot failures
 

@@ -35,16 +35,35 @@ pub enum CredentialSource {
 
 /// One credential handed to a single upstream attempt. The `id` is a label, so
 /// it can be logged and attributed; the secret never is.
+#[derive(Clone)]
 pub struct CredentialLease {
     pub id: String,
     pub secret: SecretString,
     health_key: String,
 }
 
+#[cfg(test)]
+impl CredentialLease {
+    pub(crate) fn test(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            secret: SecretString::new(id.to_owned().into_boxed_str()),
+            health_key: id.to_owned(),
+        }
+    }
+}
+
 /// The ordered attempts for one request against one `(namespace, provider)`.
 pub struct CredentialPlan {
     pub source: CredentialSource,
     pub attempts: Vec<CredentialLease>,
+    pub parked: Vec<CredentialSkip>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialSkip {
+    pub id: String,
+    pub reason: &'static str,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -349,18 +368,33 @@ impl Credentials {
         // Every credential is parked and none is due a probe. Health is
         // advisory, so the request still gets the rotation's first choice rather
         // than being failed on stale bookkeeping.
-        if attempts.is_empty() {
+        let forced = if attempts.is_empty() {
             attempts = parked
                 .first()
                 .map(|entry| vec![lease(entry)])
                 .into_iter()
                 .flatten()
                 .collect();
-        }
+            attempts.first().map(|lease| lease.id.clone())
+        } else {
+            None
+        };
         if attempts.is_empty() {
             return None;
         }
-        Some(CredentialPlan { source, attempts })
+        let parked = parked
+            .into_iter()
+            .filter(|entry| forced.as_deref() != Some(entry.id.as_str()))
+            .map(|entry| CredentialSkip {
+                id: entry.id.clone(),
+                reason: "parked",
+            })
+            .collect();
+        Some(CredentialPlan {
+            source,
+            attempts,
+            parked,
+        })
     }
 
     /// A credential served a request: clear its failure history.
@@ -729,6 +763,13 @@ weight = 1
                 .expect("plan");
             let ids: Vec<&str> = plan.attempts.iter().map(|a| a.id.as_str()).collect();
             assert_eq!(ids, ["openai-b"], "parked credential must be skipped");
+            assert_eq!(
+                plan.parked
+                    .iter()
+                    .map(|entry| entry.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["openai-a"],
+            );
         }
 
         let after_cooldown = now + Duration::from_secs(31);
@@ -737,6 +778,7 @@ weight = 1
             .expect("plan");
         let ids: Vec<&str> = plan.attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids[0], "openai-a", "the probe leads the plan");
+        assert!(plan.parked.is_empty());
 
         let next = creds
             .plan_at(&cfg, "platform", "openai", after_cooldown)

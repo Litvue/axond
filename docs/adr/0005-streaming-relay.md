@@ -70,10 +70,14 @@ struct that commits the cost and writes the record; the cancellation arm is its
 `Drop`. Because settlement outlives the request, it is spawned detached.
 
 **A mid-stream upstream failure is an event, not a dropped connection.** Once
-headers are sent the status code is spent, so an upstream error or an
-undecodable frame is relayed as `event: error` with a typed payload, followed by
-`[DONE]`, and recorded as `upstream_error`. A failure *before* any byte is
-relayed still becomes an ordinary typed error response.
+content has been emitted, an upstream error or an undecodable frame is relayed
+as `event: error` with a typed payload, followed by `[DONE]`, and recorded as
+`upstream_error`. OpenAI-normalized framing may rotate to a remaining credential
+when an explicit rate-limit event arrives before any content is emitted; native
+byte-faithful framing never does. HTTP open-time failures rotate on both wires.
+Because the relay stops reading after a post-content rate-limit frame, any usage
+chunk that would have followed it is not observed and billing falls back to the
+relayed-character estimate.
 
 **Partial spend is charged, best-effort, through the existing
 `BudgetStore::commit`.** A cancelled stream commits the usage accrued at the
@@ -97,6 +101,6 @@ there.
 - Under-charging is possible on cancelled streams against providers that report
   usage only at the end. This is the conservative direction, and it narrows once
   durable budgets land.
-- Failover and native routes are unaffected: the relay is a self-contained
-  module the route calls after target resolution, so wiring a second attempt or
-  a second surface into it later is additive.
+- A rotated stream keeps one reservation, one usage record, and one settlement:
+  prompt input is charged once and output from an abandoned attempt is carried
+  into the final record.

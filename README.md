@@ -328,7 +328,10 @@ weight = 1
 
 A credential that answers `429` (rate limit / exhausted quota) is skipped and the
 request retries the **same** target with the next credential in the pool —
-credential rotation, not target failover. Repeated 429s park that credential
+credential rotation, not target failover. This applies to stream opens too.
+OpenAI-normalized streams may rotate on an explicit rate-limit event before any
+content is emitted; native streams do not rotate after relay bytes begin.
+Repeated 429s park that credential
 alone; the target stays available to every other key. The credential that served
 a request is attributed on its usage record as `credential_id`. Pools never cross
 a namespace boundary: a BYOK namespace uses its own pool, or the whole platform
@@ -347,8 +350,9 @@ failures trip it, a tripped target is skipped for a cooldown, then re-offered as
 single half-open probe that closes on success. A pool-wide `429` is
 credential-scoped and never trips the target's breaker. The walk is bounded by
 both `failover.max_attempts` and `failover.overall_timeout_ms` so failover cannot
-amplify latency without limit. Streaming can fail over only while opening the
-upstream; once the relay emits its first byte a mid-stream failure is a terminal
+amplify latency without limit. Streaming rotates credentials at open on both
+wires, and only retries an OpenAI-normalized mid-relay rate limit before content;
+once content is emitted, or on native passthrough, the failure is a terminal
 `error` event. The serving target and total attempt count land on the usage
 record and on the per-attempt spans. See
 [ADR 0008](./docs/adr/0008-target-failover-and-circuit-scope.md).

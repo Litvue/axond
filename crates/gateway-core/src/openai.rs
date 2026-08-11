@@ -135,6 +135,14 @@ impl ProviderStreamDecoder for OpenAiStreamDecoder {
         }
         let data: Value = serde_json::from_str(&event.data)
             .map_err(|error| ProviderError::InvalidStream(error.to_string()))?;
+        if crate::is_rate_limit_payload(&data) {
+            let message = data
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("OpenAI stream rate limited")
+                .to_owned();
+            return Err(ProviderError::RateLimitedStream(message));
+        }
         let usage = match self.surface {
             Surface::ChatCompletions => data.get("usage"),
             Surface::Responses => data
@@ -340,6 +348,50 @@ mod tests {
                 cache_read_tokens: 4,
                 cache_write_tokens: 0,
             })]
+        );
+    }
+
+    #[test]
+    fn informational_rate_limits_updated_event_is_not_a_stream_error() {
+        let mut decoder = OpenAiCompatibleAdapter::openai()
+            .stream_decoder(Surface::Responses)
+            .unwrap();
+        let events = decoder
+            .decode(SseEvent {
+                event: None,
+                data: json!({
+                    "type": "rate_limits.updated",
+                    "rate_limits": { "requests": 10 }
+                })
+                .to_string(),
+            })
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [ProviderStreamEvent::Data { .. }]
+        ));
+    }
+
+    #[test]
+    fn rate_limit_stream_error_uses_provider_message() {
+        let mut decoder = OpenAiCompatibleAdapter::openai()
+            .stream_decoder(Surface::ChatCompletions)
+            .unwrap();
+        let error = decoder
+            .decode(SseEvent {
+                event: None,
+                data: json!({
+                    "error": {
+                        "type": "rate_limit_exceeded",
+                        "message": "slow down"
+                    }
+                })
+                .to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ProviderError::RateLimitedStream("slow down".to_owned())
         );
     }
 }

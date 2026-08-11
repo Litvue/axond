@@ -32,6 +32,10 @@ pub fn trace_id() -> Option<String> {
 pub const ATTEMPT_OK: &str = "ok";
 /// Status recorded on a failed upstream attempt.
 pub const ATTEMPT_ERROR: &str = "error";
+pub const LEASE_SERVED: &str = "served";
+pub const LEASE_RATE_LIMITED: &str = "rate_limited";
+pub const LEASE_ERROR: &str = "error";
+pub const LEASE_PARKED: &str = "parked";
 
 /// A child span covering one dispatch to one target. `attempt` is zero-based so
 /// the retry count is the highest attempt index observed.
@@ -69,6 +73,25 @@ pub fn finish_upstream_attempt(
     if let Some(ttft_ms) = ttft_ms {
         span.record("axond.ttft_ms", ttft_ms);
     }
+}
+
+pub fn credential_lease_span(
+    credential_id: &str,
+    credential_source: &'static str,
+    index: usize,
+) -> Span {
+    tracing::info_span!(
+        target: "axond.upstream",
+        "axond.credential.lease",
+        axond.credential.id = credential_id,
+        axond.credential_source = credential_source,
+        axond.credential.index = index,
+        axond.status = Empty,
+    )
+}
+
+pub fn finish_credential_lease(span: &Span, status: &'static str) {
+    span.record("axond.status", status);
 }
 
 /// Outcome recorded on an applied config reload.
