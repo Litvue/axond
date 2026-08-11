@@ -30,11 +30,11 @@ The endpoint uses the same authentication middleware as every other
 non-liveness route. The body accepts `sub`, optional `ttl_seconds`, `scope`,
 `aliases`, and `max_request_microdollars`; it rejects unknown fields. Omitted
 scope, aliases, and microdollar limits inherit their configured ceilings. With
-no configured scope ceiling, the ordinary capability posture is inherited and
-operator-only capabilities such as `credentials:all` must be explicitly
-granted. Requested values must narrow their ceilings and TTL must be between
-one second and the effective maximum. Minted tokens are never authorized to
-mint another token.
+no configured scope ceiling, the ordinary capability posture is inherited.
+Every effective capability must also be held by the minting key itself.
+Requested values must narrow their ceilings and TTL must be between one second
+and the effective maximum. Minted tokens are never authorized to mint another
+token.
 
 `POST /v1/tokens` is intentionally outside the request rate limiter and usage
 fanout: issuance is unthrottled and unrecorded in the gateway by design. The

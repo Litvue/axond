@@ -185,8 +185,8 @@ table. The usage record's `subject` is the env var's *name*
 ## `[gateway_minting]` — in-gateway token issuance (optional, Tier 0)
 
 This section is absent by default; its presence registers `POST /v1/tokens`.
-It requires a static `[[gateway_key]]` with `can_mint = true` and places a
-signing key in the gateway.
+It may be paired with a static `[[gateway_key]]` with `can_mint = true`; if no
+such key is enabled, the route remains present but rejects every caller.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
