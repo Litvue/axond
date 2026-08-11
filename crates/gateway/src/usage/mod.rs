@@ -93,7 +93,12 @@ pub struct UsageRecord {
     /// never the secret. Makes per-key spend and error rates attributable.
     pub credential_id: String,
     pub status: Status,
+    /// Non-cached prompt tokens billed at the regular input rate.
     pub input_tokens: u64,
+    /// Cached prompt tokens billed at the cache-read rate.
+    pub cache_read_tokens: u64,
+    /// Prompt tokens written to the provider's cache.
+    pub cache_write_tokens: u64,
     pub output_tokens: u64,
     pub cost_microdollars: u64,
     pub catalog_version: u64,
@@ -104,7 +109,7 @@ pub struct UsageRecord {
 }
 
 impl UsageRecord {
-    pub const SCHEMA_VERSION: u32 = 1;
+    pub const SCHEMA_VERSION: u32 = 2;
 
     pub fn credential_source_str(source: CredentialSource) -> &'static str {
         match source {
@@ -306,6 +311,8 @@ mod tests {
             credential_id: "openai-primary".to_string(),
             status: Status::Ok,
             input_tokens: 120,
+            cache_read_tokens: 12,
+            cache_write_tokens: 0,
             output_tokens: 34,
             cost_microdollars: 640,
             catalog_version: 0,

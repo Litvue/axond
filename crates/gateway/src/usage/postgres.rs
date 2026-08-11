@@ -2,7 +2,7 @@
 //!
 //! The schema is the expensive part of this sink — it lands in an adopter's own
 //! database and is read by their billing queries — so it is treated as an API:
-//! it lives in [`ops/postgres/usage_v1.sql`](../../../../ops/postgres/usage_v1.sql),
+//! it lives in [`ops/postgres/usage_v2.sql`](../../../../ops/postgres/usage_v2.sql),
 //! every row carries `schema_version`, and a change to the row shape is a new
 //! versioned file rather than an edit (ADR 0009).
 //!
@@ -25,7 +25,7 @@ use super::{ObservedRecord, SinkFailure, UsageRecord, UsageSink, UsageSinkError}
 /// The DDL for the current schema version, shared with operators who apply it
 /// themselves. The table and the serialized record are one schema with one
 /// version — [`UsageRecord::SCHEMA_VERSION`] — not two that can drift.
-const SCHEMA_DDL: &str = include_str!("../../../../ops/postgres/usage_v1.sql");
+const SCHEMA_DDL: &str = include_str!("../../../../ops/postgres/usage_v2.sql");
 
 /// Additive migrations for the current schema version. These are applied after
 /// the base DDL for fresh tables; existing installations apply them before
@@ -40,10 +40,9 @@ const DEFAULT_TABLE: &str = "axond_usage";
 /// the two do not rewrite each other. Not valid SQL, and never left in the DDL.
 const INDEX_PREFIX_PLACEHOLDER: &str = "\u{1}index_prefix\u{1}";
 
-/// Columns written per row, in parameter order. `reasoning_tokens`,
-/// `cache_read_tokens`, and `cache_write_tokens` exist in the table but are not
-/// written: the canonical record does not carry them yet.
-const COLUMNS: [&str; 20] = [
+/// Columns written per row, in parameter order. `reasoning_tokens` remains
+/// reserved for a future schema version; the cache counters are canonical.
+const COLUMNS: [&str; 22] = [
     "schema_version",
     "request_id",
     "trace_id",
@@ -57,6 +56,8 @@ const COLUMNS: [&str; 20] = [
     "credential_id",
     "status",
     "input_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
     "output_tokens",
     "cost_microdollars",
     "catalog_version",
@@ -276,6 +277,8 @@ fn row(observed: &ObservedRecord) -> Vec<Box<dyn ToSql + Sync + Send>> {
         Box::new(record.credential_id.clone()),
         Box::new(record.status.as_str().to_owned()),
         Box::new(bigint(record.input_tokens)),
+        Box::new(bigint(record.cache_read_tokens)),
+        Box::new(bigint(record.cache_write_tokens)),
         Box::new(bigint(record.output_tokens)),
         Box::new(bigint(record.cost_microdollars)),
         Box::new(bigint(record.catalog_version)),
@@ -332,8 +335,8 @@ mod tests {
                 "column `{column}` is written but not declared in the base or additive DDL"
             );
         }
-        assert_eq!(UsageRecord::SCHEMA_VERSION, 1);
-        assert!(SCHEMA_DDL.contains("version 1"));
+        assert_eq!(UsageRecord::SCHEMA_VERSION, 2);
+        assert!(SCHEMA_DDL.contains("version 2"));
     }
 
     #[test]

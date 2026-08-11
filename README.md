@@ -368,7 +368,7 @@ touches no datastore. Durable destinations are opt-in:
 [[usage_sink]]
 kind = "postgres"
 dsn_env = "AXOND_USAGE_POSTGRES_DSN"   # the DSN is a secret: referenced, never inlined
-create_table = true                   # or apply usage_v1.sql and additive migrations yourself
+create_table = true                   # or apply usage_v2.sql and additive migrations yourself
 
 [[usage_sink]]
 kind = "otlp"                         # usage as OTel log records, on the existing exporter

@@ -53,6 +53,9 @@ and is documented in [`docs/usage-schema.md`](../usage-schema.md). The rules:
   column, a widened `NOT NULL`, a changed unit or vocabulary — is a new
   `usage_v<N>.sql` and a bump of `UsageRecord::SCHEMA_VERSION`. The old file is
   not edited, because it describes rows that already exist.
+- Version 2 applies this rule to the usage counters: `input_tokens` is now the
+  non-cached prompt remainder, while the reserved cache counters are populated
+  so readers can reconstruct the provider total.
 - One table may hold rows of several versions. That is the point of the column:
   readers branch on it instead of guessing from a deploy timeline.
 

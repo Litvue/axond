@@ -6,8 +6,8 @@ This document is the reader-facing contract for that record: the columns, their
 meaning, and how they are allowed to change. The design rationale is
 [ADR 0009](./adr/0009-durable-usage-sinks.md).
 
-**Current version: `1`** (`UsageRecord::SCHEMA_VERSION`, DDL in
-[`ops/postgres/usage_v1.sql`](../ops/postgres/usage_v1.sql)).
+**Current version: `2`** (`UsageRecord::SCHEMA_VERSION`, DDL in
+[`ops/postgres/usage_v2.sql`](../ops/postgres/usage_v2.sql)).
 
 ## Fields
 
@@ -26,11 +26,11 @@ meaning, and how they are allowed to change. The design rationale is
 | `credential_source` | `text` | `platform` or `byok`. |
 | `credential_id` | `text` | Non-secret label of the credential in the pool that served the request. |
 | `status` | `text` | `ok`, `upstream_error`, `client_cancelled`, `partial`, or `rejected`. |
-| `input_tokens` | `bigint` | Prompt tokens billed upstream. |
+| `input_tokens` | `bigint` | Non-cached prompt tokens billed at the regular input rate. Add `cache_read_tokens` to recover the provider's full prompt total. |
 | `output_tokens` | `bigint` | Completion tokens billed upstream. |
 | `reasoning_tokens` | `bigint` | Reserved; NULL today. |
-| `cache_read_tokens` | `bigint` | Reserved; NULL today. |
-| `cache_write_tokens` | `bigint` | Reserved; NULL today. |
+| `cache_read_tokens` | `bigint` | Prompt tokens read from the provider cache, disjoint from `input_tokens`. |
+| `cache_write_tokens` | `bigint` | Prompt tokens written to the provider cache. |
 | `cost_microdollars` | `bigint` | Cost in micro-dollars, priced from the target's catalog entry. |
 | `catalog_version` | `bigint` | Version of the pricing catalog the cost was computed against. |
 | `latency_ms` | `bigint` | End-to-end gateway latency. |
@@ -38,9 +38,9 @@ meaning, and how they are allowed to change. The design rationale is
 | `started_at` | `timestamptz` | `recorded_at - latency_ms`. |
 | `recorded_at` | `timestamptz` | When the gateway settled the request. Excludes the sink's own batching delay. |
 
-The stdout and OTLP sinks carry the same fields, minus `id` and the reserved
-token columns: stdout emits the record as JSON (`snake_case`, `trace_id` omitted
-when absent), and the OTLP sink emits it as an OTel log record with
+The stdout and OTLP sinks carry the same fields, minus `id` and
+`reasoning_tokens`: stdout emits the record as JSON (`snake_case`, `trace_id`
+omitted when absent), and the OTLP sink emits it as an OTel log record with
 `event_name = axond.usage` and `axond.*` / `gen_ai.*` attributes.
 
 ## Versioning policy
@@ -58,6 +58,9 @@ when absent), and the OTLP sink emits it as an OTel log record with
   vocabulary (e.g. a new `status` value is fine; redefining an existing one is
   not) **is** a bump: a new `ops/postgres/usage_v<N>.sql` plus a bump of
   `UsageRecord::SCHEMA_VERSION`. Shipped DDL files are never edited in place.
+- Version 2 changes the meaning of `input_tokens` from the inclusive provider
+  prompt total to the non-cached prompt remainder, so it is a version bump even
+  though the cache columns were reserved in version 1.
 - One table may hold rows written by several gateway versions. Read
   `schema_version` rather than assuming a deploy timeline.
 

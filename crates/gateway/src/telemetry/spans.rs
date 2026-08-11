@@ -142,6 +142,8 @@ pub fn record_request(record: &UsageRecord, ttft_ms: Option<u64>, attempts: u32)
     span.record("axond.status", record.status.as_str());
     span.record("axond.retry_count", attempts.saturating_sub(1));
     span.record("gen_ai.usage.input_tokens", record.input_tokens);
+    span.record("gen_ai.usage.cache_read_tokens", record.cache_read_tokens);
+    span.record("gen_ai.usage.cache_write_tokens", record.cache_write_tokens);
     span.record("gen_ai.usage.output_tokens", record.output_tokens);
     span.record("axond.cost_microdollars", record.cost_microdollars);
     span.record("axond.latency_ms", record.latency_ms);

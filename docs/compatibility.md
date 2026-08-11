@@ -68,6 +68,14 @@ provider account and no network
 
 ## Stability promises
 
+### Telemetry
+
+The `axond.tokens.input` metric now reports only the non-cached prompt
+remainder. Cache-read and cache-write tokens are reported separately as
+`axond.tokens.cache_read` and `axond.tokens.cache_write`; operators should
+account for all three counters when comparing prompt volume across the schema
+version 2 transition.
+
 ### The config surface
 
 [`docs/configuration.md`](./configuration.md) is the reference; the file it
@@ -85,14 +93,17 @@ Practically: the config that boots on `0.x.y` boots on `0.x.(y+1)`.
 
 ### The usage schema
 
-`UsageRecord::SCHEMA_VERSION = 1`, with the row shape in
-[`ops/postgres/usage_v1.sql`](../ops/postgres/usage_v1.sql) and the field-level
+`UsageRecord::SCHEMA_VERSION = 2`, with the row shape in
+[`ops/postgres/usage_v2.sql`](../ops/postgres/usage_v2.sql) and the field-level
 contract in [`docs/usage-schema.md`](./usage-schema.md). It lands in *your*
 tables, so it is treated as an API and is versioned independently of the
 gateway's own version:
 
 - Adding a nullable column, populating a reserved one, or adding a `status`
   value is **not** a bump.
+- Populating a reserved column while changing the meaning of an existing field
+  is still a bump; version 2 separates cached prompt tokens from
+  `input_tokens`.
 - Removing or renaming a column, making one `NOT NULL`, changing a unit, or
   redefining an existing vocabulary value **is** a bump: a new
   `ops/postgres/usage_v<N>.sql` alongside the old one, and a bump of

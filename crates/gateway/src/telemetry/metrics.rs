@@ -27,6 +27,8 @@ struct Instruments {
     request_duration: Histogram<f64>,
     ttft: Histogram<f64>,
     input_tokens: Counter<u64>,
+    cache_read_tokens: Counter<u64>,
+    cache_write_tokens: Counter<u64>,
     output_tokens: Counter<u64>,
     cost: Counter<u64>,
     upstream_errors: Counter<u64>,
@@ -80,7 +82,15 @@ impl Instruments {
                 .build(),
             input_tokens: meter
                 .u64_counter("axond.tokens.input")
-                .with_description("Prompt tokens billed upstream.")
+                .with_description("Non-cached prompt tokens billed at the regular input rate.")
+                .build(),
+            cache_read_tokens: meter
+                .u64_counter("axond.tokens.cache_read")
+                .with_description("Prompt tokens read from the provider cache.")
+                .build(),
+            cache_write_tokens: meter
+                .u64_counter("axond.tokens.cache_write")
+                .with_description("Prompt tokens written to the provider cache.")
                 .build(),
             output_tokens: meter
                 .u64_counter("axond.tokens.output")
@@ -193,6 +203,12 @@ pub(super) fn record_request(record: &UsageRecord, ttft_ms: Option<u64>) {
     instruments
         .input_tokens
         .add(record.input_tokens, &attributes);
+    instruments
+        .cache_read_tokens
+        .add(record.cache_read_tokens, &attributes);
+    instruments
+        .cache_write_tokens
+        .add(record.cache_write_tokens, &attributes);
     instruments
         .output_tokens
         .add(record.output_tokens, &attributes);

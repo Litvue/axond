@@ -86,12 +86,17 @@ pub trait ProviderAdapter: Send + Sync {
 
 pub(crate) fn chat_usage(value: &Value) -> ModelUsage {
     let usage = value.get("usage").unwrap_or(value);
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let openai_cache_read_tokens = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+        .and_then(Value::as_u64);
     ModelUsage {
-        input_tokens: usage
-            .get("prompt_tokens")
-            .or_else(|| usage.get("input_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
+        input_tokens: input_tokens.saturating_sub(openai_cache_read_tokens.unwrap_or_default()),
         output_tokens: usage
             .get("completion_tokens")
             .or_else(|| usage.get("output_tokens"))
@@ -102,15 +107,52 @@ pub(crate) fn chat_usage(value: &Value) -> ModelUsage {
             .or_else(|| usage.pointer("/output_tokens_details/reasoning_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or_default(),
-        cache_read_tokens: usage
-            .pointer("/prompt_tokens_details/cached_tokens")
-            .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
-            .or_else(|| usage.get("cache_read_input_tokens"))
-            .and_then(Value::as_u64)
+        cache_read_tokens: openai_cache_read_tokens
+            .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
             .unwrap_or_default(),
         cache_write_tokens: usage
             .get("cache_creation_input_tokens")
             .and_then(Value::as_u64)
             .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn openai_cached_input_tokens_are_normalized_to_disjoint_usage() {
+        assert_eq!(
+            chat_usage(&json!({
+                "prompt_tokens": 19,
+                "completion_tokens": 7,
+                "prompt_tokens_details": { "cached_tokens": 3 }
+            })),
+            ModelUsage {
+                input_tokens: 16,
+                output_tokens: 7,
+                cache_read_tokens: 3,
+                ..ModelUsage::default()
+            }
+        );
+    }
+
+    #[test]
+    fn anthropic_cache_read_tokens_are_already_disjoint() {
+        assert_eq!(
+            chat_usage(&json!({
+                "input_tokens": 19,
+                "output_tokens": 7,
+                "cache_read_input_tokens": 3
+            })),
+            ModelUsage {
+                input_tokens: 19,
+                output_tokens: 7,
+                cache_read_tokens: 3,
+                ..ModelUsage::default()
+            }
+        );
     }
 }
