@@ -7,6 +7,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header, errors::ErrorKind as JwtErrorKind,
 };
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -202,6 +203,7 @@ struct ResolvedVerifier {
     namespaces: HashSet<String>,
     max_ttl: Duration,
     key: DecodingKey,
+    material: SecretString,
     fingerprint: String,
 }
 
@@ -384,6 +386,7 @@ impl TokenVerifier {
                 namespaces: verifier.namespaces.iter().cloned().collect(),
                 max_ttl: verifier.max_ttl,
                 key,
+                material: SecretString::from(value.clone()),
                 fingerprint: key_material::fingerprint(&verifier.kid, &value),
             });
         }
@@ -400,6 +403,38 @@ impl TokenVerifier {
             .iter()
             .map(|verifier| (verifier.kid.clone(), verifier.fingerprint.clone()))
             .collect()
+    }
+
+    pub(crate) fn signing_material_matches(
+        &self,
+        kid: &str,
+        algorithm: GatewayVerifierAlgorithm,
+        signing_material: &str,
+    ) -> bool {
+        let Some(verifier) = self.verifiers.iter().find(|verifier| verifier.kid == kid) else {
+            return false;
+        };
+        match algorithm {
+            GatewayVerifierAlgorithm::Hs256 => {
+                verifier.algorithm == Algorithm::HS256
+                    && constant_time_eq(
+                        verifier.material.expose_secret().as_bytes(),
+                        signing_material.as_bytes(),
+                    )
+            }
+            GatewayVerifierAlgorithm::EdDsa => {
+                let Ok(private) = BASE64.decode(signing_material.trim()) else {
+                    return false;
+                };
+                let Ok(key_pair) = Ed25519KeyPair::from_pkcs8(&private) else {
+                    return false;
+                };
+                verifier.algorithm == Algorithm::EdDSA
+                    && BASE64
+                        .decode(verifier.material.expose_secret().trim())
+                        .is_ok_and(|public| public == key_pair.public_key().as_ref())
+            }
+        }
     }
 }
 

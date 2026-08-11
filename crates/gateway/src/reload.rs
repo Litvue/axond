@@ -342,7 +342,9 @@ impl ReloadSummary {
                 .then(|| "enabled".to_owned())
                 .into_iter()
                 .chain(
-                    (before.gateway_minting_fingerprint != after.gateway_minting_fingerprint)
+                    (before_config.gateway_minting.is_some()
+                        && after_config.gateway_minting.is_some()
+                        && before.gateway_minting_fingerprint != after.gateway_minting_fingerprint)
                         .then(|| "gateway_minting".to_owned()),
                 ),
             ),
@@ -818,7 +820,7 @@ max_ttl = "10m"
         env.insert("AXOND_SECOND_KEY".to_string(), "second-secret".to_string());
         env.insert(
             "SIGNING_KEY".to_string(),
-            "signing-secret-012345678901234567890".to_string(),
+            "jwt-test-secret-0123456789012345".to_string(),
         );
         env
     }
@@ -954,6 +956,10 @@ max_ttl = "10m"
             "SIGNING_KEY".to_string(),
             "rotated-signing-secret-012345678901234567".to_string(),
         );
+        rotated_env.insert(
+            "JWT_SECRET".to_string(),
+            "rotated-signing-secret-012345678901234567".to_string(),
+        );
         let after = ConfigSnapshot::build(config, &rotated_env, 1).unwrap();
         let boot = Boot {
             bind: before.config.server.bind,
@@ -967,6 +973,39 @@ max_ttl = "10m"
             vec!["gateway_minting".to_owned()]
         );
         assert!(!summary.is_empty());
+    }
+
+    #[test]
+    fn reload_summary_separates_minting_add_remove_from_changes() {
+        let disabled_config = WITH_GATEWAY_MINTING
+            .replace("[gateway_minting]\nkid = \"reload-kid\"\nenv = \"SIGNING_KEY\"\nmax_ttl = \"10m\"\n", "")
+            .replace("can_mint = true", "can_mint = false");
+        let disabled = ConfigSnapshot::build(
+            Config::from_toml_str(&disabled_config).unwrap(),
+            &minting_env(),
+            0,
+        )
+        .unwrap();
+        let enabled = ConfigSnapshot::build(
+            Config::from_toml_str(WITH_GATEWAY_MINTING).unwrap(),
+            &minting_env(),
+            1,
+        )
+        .unwrap();
+        let boot = Boot {
+            bind: disabled.config.server.bind,
+            usage_sink: disabled.config.usage_sink.clone(),
+            budget: disabled.config.budget.clone(),
+            rate_limit: disabled.config.rate_limit.clone(),
+        };
+
+        let added = ReloadSummary::between(&boot, &disabled, &enabled);
+        assert_eq!(added.gateway_minting.added, vec!["enabled".to_owned()]);
+        assert!(added.gateway_minting.changed.is_empty());
+
+        let removed = ReloadSummary::between(&boot, &enabled, &disabled);
+        assert_eq!(removed.gateway_minting.removed, vec!["enabled".to_owned()]);
+        assert!(removed.gateway_minting.changed.is_empty());
     }
 
     /// An issuance epoch is part of the immutable candidate snapshot: SIGHUP
