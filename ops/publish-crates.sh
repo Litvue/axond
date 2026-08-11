@@ -156,6 +156,86 @@ require_ddl_copies_match() {
   echo "shipped DDL: every ops/postgres file has a byte-identical packaged copy"
 }
 
+# release-please bumps the manifest strings through `extra-files` JSONPaths, and
+# its TOML updater *warns* rather than fails when a path matches nothing: an
+# unregistered or mistyped path silently leaves a version behind, and the first
+# symptom would be an incoherent release at the tag. So assert here that every
+# version string this release depends on is both reachable by a configured path
+# and already at $version — and that no internal `path` + `version` dependency
+# is missing an entry, which is the way a fourth publishable crate would
+# reintroduce the silent no-op.
+require_release_config_bumps_every_version() {
+  python3 - "$version" <<'PY' || fail "release-please-config.json does not cover every version string (see above)"
+import json
+import re
+import sys
+import tomllib
+
+release_version = sys.argv[1]
+manifest = tomllib.loads(open("Cargo.toml", "rb").read().decode("utf-8"))
+config = json.load(open("release-please-config.json", encoding="utf-8"))
+
+
+def segments(jsonpath):
+    """The member names of a plain `$.a.b` / `$['a']['b']` JSONPath.
+
+    release-please resolves these with jsonpath-plus, which accepts a hyphenated
+    key in dot notation as well as in brackets. Only the plain forms are used
+    here, so anything with a wildcard or filter is reported rather than guessed
+    at.
+    """
+    if not re.fullmatch(r"\$(\.[A-Za-z0-9_-]+|\['[^']+'\])+", jsonpath):
+        return None
+    matches = re.findall(r"\.([A-Za-z0-9_-]+)|\['([^']+)'\]", jsonpath)
+    return [dotted or bracketed for dotted, bracketed in matches]
+
+
+def resolve(names):
+    node = manifest
+    for name in names:
+        if not isinstance(node, dict) or name not in node:
+            return None
+        node = node[name]
+    return node
+
+
+problems = []
+covered = set()
+for entry in config["packages"]["."]["extra-files"]:
+    if entry.get("type") != "toml" or entry.get("path") != "Cargo.toml":
+        continue
+    jsonpath = entry["jsonpath"]
+    names = segments(jsonpath)
+    if names is None:
+        problems.append(f"{jsonpath} is not a plain member path; this gate cannot verify it")
+        continue
+    found = resolve(names)
+    if found is None:
+        problems.append(f"{jsonpath} matches nothing in Cargo.toml; release-please would only warn and leave the version unbumped")
+        continue
+    if found != release_version:
+        problems.append(f"{jsonpath} is '{found}', not {release_version}")
+    covered.add(tuple(names))
+
+if ("workspace", "package", "version") not in covered:
+    problems.append("$.workspace.package.version has no extra-files entry; the workspace version would not be bumped")
+
+for name, dependency in manifest["workspace"]["dependencies"].items():
+    if not isinstance(dependency, dict) or "path" not in dependency or "version" not in dependency:
+        continue
+    if ("workspace", "dependencies", name, "version") not in covered:
+        problems.append(
+            f"[workspace.dependencies] {name} pins a version but no extra-files entry bumps it; "
+            f"add $.workspace.dependencies.{name}.version to release-please-config.json"
+        )
+
+for problem in problems:
+    print(f"  {problem}", file=sys.stderr)
+raise SystemExit(1 if problems else 0)
+PY
+  echo "release config: every version string is bumped by an extra-files path and is at $version"
+}
+
 # 200 = this exact version is already published (immutable, so skip it).
 # 404 = absent. Anything else is an unknown registry state: refuse rather than
 # guess, because guessing "absent" risks a duplicate upload attempt mid-release.
@@ -179,6 +259,7 @@ if [[ "$mode" == publish && -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
 fi
 
 require_aligned_versions
+require_release_config_bumps_every_version
 require_ddl_copies_match
 
 if [[ "$mode" == dry-run ]]; then

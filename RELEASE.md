@@ -19,7 +19,7 @@ translation stay deferred, deliberately and in writing
 | # | Criterion | Status | Evidence |
 | --- | --- | --- | --- |
 | 1 | Streaming, failover, native `/v1/messages`, OTel, a durable usage sink, and a shared budget backend are implemented and covered by tests | **Met** | Streaming [ADR 0005](./docs/adr/0005-streaming-relay.md) (`crates/gateway/src/streaming.rs`); failover [ADR 0008](./docs/adr/0008-target-failover-and-circuit-scope.md); native routes [ADR 0012](./docs/adr/0012-native-provider-routes.md); telemetry [ADR 0007](./docs/adr/0007-telemetry-model.md); usage sinks [ADR 0009](./docs/adr/0009-durable-usage-sinks.md) (Postgres + OTLP); budgets [ADR 0010](./docs/adr/0010-shared-budget-backends-and-charging-policy.md) (Redis + Postgres, fail-closed). Whole workspace green under gate 3 below. |
-| 2 | The supported-provider/compatibility contract and the usage schema are documented and versioned | **Met** | [`docs/compatibility.md`](./docs/compatibility.md) (routes, provider kinds, deferrals, `0.x` promise); [`docs/usage-schema.md`](./docs/usage-schema.md) + `UsageRecord::SCHEMA_VERSION = 1` + [`crates/gateway/sql/usage_v1.sql`](./crates/gateway/sql/usage_v1.sql); policy of record in [ADR 0015](./docs/adr/0015-zero-dot-x-compatibility-policy.md). |
+| 2 | The supported-provider/compatibility contract and the usage schema are documented and versioned | **Met** | [`docs/compatibility.md`](./docs/compatibility.md) (routes, provider kinds, deferrals, `0.x` promise); [`docs/usage-schema.md`](./docs/usage-schema.md) + `UsageRecord::SCHEMA_VERSION = 1` + [`ops/postgres/usage_v1.sql`](./ops/postgres/usage_v1.sql); policy of record in [ADR 0015](./docs/adr/0015-zero-dot-x-compatibility-policy.md). |
 | 3 | Security review complete with no known secret-exposure paths | **Met** | [`docs/security-review-2026-08-05.md`](./docs/security-review-2026-08-05.md). One finding (transport errors echoed the upstream URL's query/userinfo) found **and fixed** in the same PR, with a regression test. Two residual items recorded as accepted risk with follow-ups; neither is a known exposure. |
 | 4 | Deployment guide + config reference + runbook published | **Met** | [`docs/deployment.md`](./docs/deployment.md), [`docs/configuration.md`](./docs/configuration.md), [`docs/observability.md`](./docs/observability.md) — each cross-checked against `config.rs`, `routes.rs`, and the telemetry module rather than the roadmap. |
 | 5 | Compatibility, record/replay, and SSE soak suites pass in CI | **Met** | [ADR 0014](./docs/adr/0014-compatibility-and-soak-harness.md); `crates/gateway/tests/{compat,replay,soak}.rs` and `tests/compat/` (vendor SDKs pinned to `openai==2.50.0`, `anthropic==0.120.0`). Both lanes are required by the `CI-Success` aggregate in `.github/workflows/ci.yml`. |
@@ -96,6 +96,11 @@ Then append the result and the date to this file.
 
 ## Publishing to crates.io
 
+The decision of record is
+[ADR 0025](./docs/adr/0025-crates-io-publication.md), which supersedes
+[ADR 0004](./docs/adr/0004-ci-and-release-pipeline.md)'s wildcard rule and
+extends its artifact list. This section is the runbook.
+
 The workspace is published as **one release at one version**, in dependency
 order:
 
@@ -115,6 +120,17 @@ alongside `[workspace.package].version` (`release-please-config.json`
 `extra-files`), so a bump cannot leave the registry requirements behind.
 `ops/publish-crates.sh` refuses to publish if any package version or internal
 requirement disagrees with the release version.
+
+Those `extra-files` paths are load-bearing and fail quietly: release-please
+resolves them with jsonpath-plus and its TOML updater only *warns*
+(`No entries modified in …`) when a path matches nothing, so a mistyped path — or
+a fourth publishable crate nobody registered — would leave a version behind and
+break the release at the tag. Hyphenated keys do resolve in dot notation
+(verified against the `release-please` version the pinned `@v5` action installs,
+by running its own `GenericToml` updater over this `Cargo.toml`), and
+`ops/publish-crates.sh` asserts on every run that each configured path resolves
+to the release version and that every internal `path` + `version` dependency has
+an entry.
 
 **The shipped DDL is duplicated on purpose.** `ops/postgres/*.sql` stays the
 operator contract — every doc, ADR, and runbook `psql -f` points there, and a
