@@ -128,7 +128,7 @@ jobs:
       # Hermetic: the SDKs are pointed at a local fake upstream serving the
       # committed fixtures, so this lane makes no provider call and needs no key.
       - name: Install the pinned provider SDKs
-        run: pip install -r tests/compat/requirements.txt
+        run: pip install --require-hashes -r tests/compat/requirements.txt
       - name: Drive axond with the vendors' own SDKs
         run: pytest tests/compat -q
         env:

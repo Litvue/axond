@@ -30,8 +30,12 @@ deny:
 compat:
     cargo build -p axond --locked
     python3 -m venv target/compat-venv
-    target/compat-venv/bin/pip install --quiet --require-virtualenv -r tests/compat/requirements.txt
+    target/compat-venv/bin/pip install --quiet --require-virtualenv --require-hashes -r tests/compat/requirements.txt
     AXOND_BIN="$(pwd)/target/debug/axond" target/compat-venv/bin/python -m pytest tests/compat -q
+
+# Refresh the hash-pinned provider-SDK lockfile, excluding releases newer than a week.
+compat-lock:
+    uv pip compile --generate-hashes --universal --python-version 3.12 --exclude-newer "$(date -u -d '7 days ago' '+%Y-%m-%dT%H:%M:%SZ')" -o tests/compat/requirements.txt tests/compat/requirements.in
 
 # The heavy SSE soak: hundreds of concurrent streams with cancels and drops.
 # The short subset runs in `just test`; this is the long one.

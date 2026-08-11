@@ -101,9 +101,11 @@ nightly cannot rot into something nobody runs.
 - A wire-fidelity or accounting regression fails deterministically, offline,
   with no provider account, no secret, and no network in any lane.
 - Editing a fixture moves an asserted expectation and reads like one in review.
-- The `sdk-compat` lane adds a Python runtime and two pinned SDK versions to
-  CI. Pinned exactly, and bumped deliberately: when a new SDK release breaks,
-  the bump commit is the report. Nothing enters the Rust dependency graph, so
+- The `sdk-compat` lane adds a Python runtime and a hash-pinned lockfile to CI.
+  Refresh `tests/compat/requirements.txt` from its direct pins with
+  `just compat-lock`; the refresh excludes releases published less than seven
+  days ago. Bumps are deliberate: when a new SDK release breaks, the bump
+  commit is the report. Nothing enters the Rust dependency graph, so
   `deny.toml` is untouched.
 - A provider changing its wire is still invisible until a fixture is
   re-captured against the live API — this harness proves the gateway is
