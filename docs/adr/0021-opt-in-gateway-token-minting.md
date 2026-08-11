@@ -47,6 +47,14 @@ or issuance log, consistent with ADR 0016. Short `max_ttl` values and
 Rate-limit permits and budget reservations are intentionally not acquired by
 `POST /v1/tokens`; this is a known accepted gap and a follow-up decision,
 rather than a reason to introduce state into the mint path.
+Because the minted `sub` is caller-chosen and budgets and inbound rate limits
+are keyed by `(namespace, subject)`, a minting key can rotate subjects to get
+fresh budget ledgers and per-subject concurrency allowances. Per-subject
+budgets are therefore not a namespace-wide spend ceiling, and
+`max_request_microdollars` limits one request rather than cumulative spend.
+Operators should isolate minting namespaces from namespaces that rely on those
+per-subject controls, treat `can_mint` as trusted for the whole namespace, and
+keep `max_ttl` short.
 
 The gateway resolves and validates both sides of the signing relationship at
 boot and reload. Signing material must be well formed and must match the
@@ -84,3 +92,6 @@ and this decision does not raise the state tier of an existing deployment.
   section and the flags disables issuance on reload.
 - Precise per-token revocation, issuance accounting, rate limiting, and
   budget reservation remain follow-up work outside this stateless endpoint.
+- Per-subject budget and concurrency controls are not a namespace-wide
+  ceiling when callers can choose fresh subjects; namespace isolation and
+  short-lived tokens are the accepted operational mitigation.
