@@ -315,7 +315,8 @@ impl TokenVerifier {
             .as_ref()
             .ok_or(TokenVerifierBuildError::MissingAudience)?
             .audience
-            .clone();
+            .trim()
+            .to_owned();
         let namespaces = config
             .namespace
             .iter()

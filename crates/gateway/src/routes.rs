@@ -1915,11 +1915,7 @@ max_request_microdollars = 1000
 
     #[tokio::test]
     async fn minting_key_cannot_escalate_operator_capability() {
-        let state = minting_state_with_scope_audience_epochs(
-            "scope = [\"credentials\", \"credentials:all\"]",
-            "test-audience",
-            "",
-        );
+        let state = minting_state_without_scope();
         let (status, body) = mint_request(
             state,
             json!({
