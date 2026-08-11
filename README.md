@@ -194,7 +194,7 @@ whose targets — including its failover targets — speak that route's wire: an
 OpenAI-only alias on `/v1/messages`, or an Anthropic-native one on
 `/v1/chat/completions`, is a `400 unsupported_wire` before anything is reserved or
 dispatched. `/v1/responses` is served as a native OpenAI Responses passthrough.
-See [ADR 0022](./docs/adr/0022-openai-responses-passthrough.md).
+See [ADR 0023](./docs/adr/0023-openai-responses-passthrough.md).
 
 ## Configuration
 
@@ -479,7 +479,7 @@ runtime-neutral.
 - [x] Usage sinks: Postgres (batched, versioned schema) + OTLP; Tinybird / ClickHouse post-beta
 - [x] Budget backends (Tier 1 / Tier 2): shared Redis / Postgres, held reservations, partial charging (see [ADR 0010](./docs/adr/0010-shared-budget-backends-and-charging-policy.md))
 - [x] Exact cross-replica inbound in-flight rate limiting via Redis leases (Tier 1)
-- [x] Native Anthropic `/v1/messages` + OpenAI `/v1/embeddings` and `/v1/responses` passthrough (see [ADR 0012](./docs/adr/0012-native-provider-routes.md) and [ADR 0022](./docs/adr/0022-openai-responses-passthrough.md))
+- [x] Native Anthropic `/v1/messages` + OpenAI `/v1/embeddings` and `/v1/responses` passthrough (see [ADR 0012](./docs/adr/0012-native-provider-routes.md) and [ADR 0023](./docs/adr/0023-openai-responses-passthrough.md))
 - [x] Multiple credentials per provider (pooling, weighted, skip-on-429)
 - [x] Config hot-reload (SIGHUP / watched files) for zero-restart BYOK onboarding (see [ADR 0011](./docs/adr/0011-config-hot-reload.md))
 - [x] Provider-SDK compatibility + record/replay + SSE soak tests (see [ADR 0014](./docs/adr/0014-compatibility-and-soak-harness.md))
