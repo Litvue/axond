@@ -1,4 +1,4 @@
-# 22. Provider cache usage normalization
+# 24. Provider cache usage normalization
 
 Date: 2026-08-11
 
