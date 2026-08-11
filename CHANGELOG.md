@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.1](https://github.com/Litvue/axond/compare/v0.3.0...v0.3.1) (2026-08-11)
+
+
+### Features
+
+* **budget:** exact namespace-level spend cap for Redis and Postgres ([#133](https://github.com/Litvue/axond/issues/133)) ([13b139f](https://github.com/Litvue/axond/commit/13b139f13e21070547cb8e6e7333f9d06f3c1960))
+* **release:** publish gateway-core, gateway-transport, and axond to crates.io ([#132](https://github.com/Litvue/axond/issues/132)) ([ab6f0e6](https://github.com/Litvue/axond/commit/ab6f0e6bb9cddf34092017c2ee8b1d7e4e9700ac))
+
+
+### Bug Fixes
+
+* **auth:** let the operator's own key read every namespace's credentials ([#131](https://github.com/Litvue/axond/issues/131)) ([a0e1a8d](https://github.com/Litvue/axond/commit/a0e1a8d400ac342f6897fd409c0230e7965629a3))
+
 ## [0.3.0](https://github.com/Litvue/axond/compare/v0.2.2...v0.3.0) (2026-08-11)
 
 
