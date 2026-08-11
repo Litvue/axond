@@ -180,11 +180,29 @@ jobs:
                 exit 1
                 ;;
             esac
+            if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+              for required_path in Dockerfile ops/docker-smoke.sh; do
+                if ! gh api "/repos/${GITHUB_REPOSITORY}/contents/${required_path}?ref=${tag_name}" >/dev/null 2>&1; then
+                  echo "$tag_name does not contain required repair path $required_path" >&2
+                  exit 1
+                fi
+              done
+            fi
             release_created=true
-            if gh api "/repos/${GITHUB_REPOSITORY}/contents/ops/publish-crates.sh?ref=${tag_name}" >/dev/null 2>&1; then
+            crates_probe="$RUNNER_TEMP/crates-publish-probe"
+            if gh api --include "/repos/${GITHUB_REPOSITORY}/contents/ops/publish-crates.sh?ref=${tag_name}" >"$crates_probe" 2>&1; then
               crates_publishable=true
+              echo "$tag_name contains ops/publish-crates.sh; crates lane enabled"
             else
-              crates_publishable=false
+              crates_status="$(sed -n '1s/^HTTP\/[^ ]* \([0-9][0-9][0-9]\).*/\1/p' "$crates_probe")"
+              if [[ "$crates_status" == 404 ]]; then
+                crates_publishable=false
+                echo "$tag_name predates ops/publish-crates.sh; crates lane skipped"
+              else
+                cat "$crates_probe" >&2
+                echo "could not determine whether $tag_name contains ops/publish-crates.sh" >&2
+                exit 1
+              fi
             fi
           else
             tag_name="$AUTO_TAG_NAME"

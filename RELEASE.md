@@ -174,9 +174,11 @@ that older tree either.
 
 When a workflow fix lands after a release tag, dispatch **Release** from `main`
 with the existing tag as `release_tag`. The workflow definition comes from the
-reviewed `main` commit, while binaries, the image, and any crates publish are
-built from the immutable tag. The run records this distinction explicitly; use
-the tag-ref dispatch whenever the tag already contains the desired workflow.
+reviewed `main` commit, while binaries and the image are built from the
+immutable tag. The repair preflight requires the tag's `Dockerfile` and
+`ops/docker-smoke.sh`; crates publishing is enabled only when the tag also
+contains `ops/publish-crates.sh`. The run records this distinction explicitly;
+use the tag-ref dispatch whenever the tag already contains the desired workflow.
 
 The bootstrap is therefore the *next* release tag cut after this lands: merge the
 release PR, and the crates lane runs for the first time on that tag, after the
