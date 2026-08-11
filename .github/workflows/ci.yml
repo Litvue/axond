@@ -127,13 +127,17 @@ jobs:
         run: cargo build -p axond --locked
       - name: Check compatibility lock inputs
         run: |
+          set -euo pipefail
           # Keep every direct input pin present in the generated lockfile.
-          while IFS= read -r pin; do
-            grep -Fq -- "$pin" tests/compat/requirements.txt || {
+          mapfile -t pins < <(grep -E '^[A-Za-z0-9_.-]+==' tests/compat/requirements.in || true)
+          ((${#pins[@]} > 0)) || { echo "no direct pins found" >&2; exit 1; }
+          for pin in "${pins[@]}"; do
+            escaped_pin="$(printf '%s' "$pin" | sed 's/[.[\*^$()+?{|\\]/\\&/g')"
+            grep -Eq "^${escaped_pin}([[:space:];\\]|$)" tests/compat/requirements.txt || {
               echo "missing direct pin in lockfile: $pin" >&2
               exit 1
             }
-          done < <(grep -E '^[A-Za-z0-9_.-]+==' tests/compat/requirements.in)
+          done
       # Hermetic: the SDKs are pointed at a local fake upstream serving the
       # committed fixtures, so this lane makes no provider call and needs no key.
       - name: Install the pinned provider SDKs
