@@ -69,6 +69,9 @@ pub struct Config {
     /// Inbound per-caller concurrency enforcement. Defaults to no limit.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Precise minted-token revocation. Defaults to no denylist.
+    #[serde(default)]
+    pub revocation: RevocationConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -537,6 +540,68 @@ pub struct RateLimitConfig {
     pub connect_timeout_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RevocationConfig {
+    #[serde(default)]
+    pub backend: RevocationBackend,
+    #[serde(default)]
+    pub dsn_env: Option<String>,
+    #[serde(default)]
+    pub key_prefix: Option<String>,
+    #[serde(default)]
+    pub table: Option<String>,
+    #[serde(default)]
+    pub create_table: bool,
+    #[serde(default)]
+    pub on_unavailable: StoreUnavailable,
+    #[serde(default = "default_revocation_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_revocation_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RevocationBackend {
+    #[default]
+    None,
+    Redis,
+    Postgres,
+}
+
+impl RevocationBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Redis => "redis",
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
+impl Default for RevocationConfig {
+    fn default() -> Self {
+        Self {
+            backend: RevocationBackend::None,
+            dsn_env: None,
+            key_prefix: None,
+            table: None,
+            create_table: false,
+            on_unavailable: StoreUnavailable::Deny,
+            timeout_ms: default_revocation_timeout_ms(),
+            connect_timeout_ms: default_revocation_connect_timeout_ms(),
+        }
+    }
+}
+
+fn default_revocation_timeout_ms() -> u64 {
+    250
+}
+
+fn default_revocation_connect_timeout_ms() -> u64 {
+    5_000
+}
+
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
@@ -769,7 +834,7 @@ where
     }
 }
 
-fn parse_gateway_rfc3339_utc(value: &str) -> Result<u64, String> {
+pub(crate) fn parse_gateway_rfc3339_utc(value: &str) -> Result<u64, String> {
     let value = value.trim();
     let value = value
         .strip_suffix('Z')
@@ -978,6 +1043,7 @@ impl Config {
         self.validate_usage_sinks()?;
         self.validate_budget()?;
         self.validate_rate_limit()?;
+        self.validate_revocation()?;
         Ok(())
     }
 
@@ -1215,6 +1281,49 @@ impl Config {
                         .into(),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    fn validate_revocation(&self) -> Result<(), ConfigError> {
+        let revocation = &self.revocation;
+        if revocation.backend == RevocationBackend::None {
+            return Ok(());
+        }
+        if revocation.timeout_ms == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "revocation `{}`: timeout_ms must be at least 1",
+                revocation.backend.as_str()
+            )));
+        }
+        if revocation.connect_timeout_ms == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "revocation `{}`: connect_timeout_ms must be at least 1",
+                revocation.backend.as_str()
+            )));
+        }
+        let has_revocation_dsn = revocation
+            .dsn_env
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty());
+        let has_budget_fallback = revocation.backend == RevocationBackend::Redis
+            && self.budget.backend == BudgetBackend::Redis
+            && self
+                .budget
+                .dsn_env
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty());
+        if !has_revocation_dsn && !has_budget_fallback {
+            return Err(ConfigError::Invalid(format!(
+                "revocation `{}`: `dsn_env` must name the env var holding the connection string (or use the Redis budget `dsn_env` fallback)",
+                revocation.backend.as_str()
+            )));
+        }
+        if revocation.backend == RevocationBackend::Postgres {
+            validate_table_name(revocation.table.as_deref().unwrap_or("axond_revocation"))
+                .map_err(|message| {
+                    ConfigError::Invalid(format!("revocation `postgres`: {message}"))
+                })?;
         }
         Ok(())
     }
@@ -1480,6 +1589,27 @@ audience = "test"
         let cfg = Config::from_toml_str(VALID).expect("valid config");
         assert_eq!(cfg.default_namespace(), "platform");
         assert!(cfg.model("gpt-4o").is_some());
+        assert_eq!(cfg.revocation.backend, RevocationBackend::None);
+        assert_eq!(cfg.revocation.timeout_ms, 250);
+        assert_eq!(cfg.revocation.connect_timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn revocation_reuses_redis_budget_dsn_and_rejects_zero_timeouts() {
+        let config = format!(
+            "{VALID}\n[budget]\nbackend = \"redis\"\ndsn_env = \"REDIS_URL\"\nlimit_microdollars = 1\n[revocation]\nbackend = \"redis\"\n"
+        );
+        let cfg = Config::from_toml_str(&config).expect("budget DSN fallback");
+        assert_eq!(cfg.revocation.backend, RevocationBackend::Redis);
+
+        for section in [
+            "[revocation]\nbackend = \"redis\"\ntimeout_ms = 0\ndsn_env = \"R\"",
+            "[revocation]\nbackend = \"postgres\"\nconnect_timeout_ms = 0\ndsn_env = \"P\"",
+        ] {
+            let error = Config::from_toml_str(&format!("{VALID}\n{section}"))
+                .expect_err("zero timeout must fail");
+            assert!(error.to_string().contains("timeout_ms"), "{error}");
+        }
     }
 
     /// Epochs accept both the compact unix representation and an explicit UTC

@@ -62,13 +62,15 @@ Tier 0.
 | Tier | What it buys | What it costs |
 | --- | --- | --- |
 | **0 — config-only** | Namespaces, providers, aliases, prices, credentials, pools, failover, reload, gateway keys, minted-token verification and issuance epochs, stdout usage, local budgets, and health probes. | No datastore. In-memory health and budgets are per replica; the default is no budget. This is the hermetic [`ops/tier0-gate.sh`](./ops/tier0-gate.sh) CI posture proved on every PR by [ADR 0018](./docs/adr/0018-tier-0-hermetic-boot-gate.md). |
-| **1 — Redis** | Exact shared budgets and inbound in-flight rate limiting. | Redis availability is part of selected admission paths; `on_unavailable = "deny"` (the default) returns `503` (`budget_unavailable` or `rate_limit_unavailable`). |
+| **1 — Redis** | Exact shared budgets, inbound in-flight rate limiting, and precise minted-token revocation. | Redis availability is part of selected admission paths; `on_unavailable = "deny"` (the default) returns `503` (`budget_unavailable`, `rate_limit_unavailable`, or `revocation_unavailable`). |
 | **2 — Postgres** | Durable usage rows and shared Postgres-backed budgets; a future store-owned caller/key lifecycle. | A Postgres role, ordered migrations, backup/restore ownership, and boot-time DSN resolution. |
 
-Tier 1 ships `[budget] backend = "redis"` and `[rate_limit] backend = "redis"`
+Tier 1 ships `[budget] backend = "redis"`, `[rate_limit] backend = "redis"`,
+and `[revocation] backend = "redis"`
 for exact shared admission. Precise per-token revocation remains a future
 declaration. Minted claims require `jti`, but today's
-revocation ladder is short TTLs, killing a `kid`, and rotation. An OTLP usage
+revocation ladder is short TTLs, killing a `kid`, rotation, and `axond revoke`
+for precise single-token denial. An OTLP usage
 sink is Tier 0 state (no datastore, nothing to migrate), but not hermetic: it
 adds a collector dependency at boot, so it is excluded from the hermetic Tier
 0 CI lane.

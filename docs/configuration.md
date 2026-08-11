@@ -35,7 +35,7 @@ egress: upstream provider calls still use the network at Tier 0.
 | `[[usage_sink]] kind = "otlp"` | Tier 0 state, but not hermetic: a collector is a boot-time dependency, so this is outside the hermetic Tier 0 CI lane. |
 | `[[usage_sink]] kind = "postgres"` | Tier 2: durable usage rows. |
 | `[budget] backend = "none"` or `"in-memory"` | Tier 0; in-memory state is per replica and approximate. |
-| `[budget] backend = "redis"` or `[rate_limit] backend = "redis"` | Tier 1: exact shared admission through Redis. |
+| `[budget] backend = "redis"`, `[rate_limit] backend = "redis"`, or `[revocation] backend = "redis"` | Tier 1: exact shared admission and precise token revocation through Redis. |
 | `[rate_limit] backend = "none"` or `"in-memory"` | Tier 0; in-memory state is per replica and approximate. |
 | `[budget] backend = "postgres"` | Tier 2: shared caps. |
 | `/healthz`, `/readyz` | Tier 0. |
@@ -347,6 +347,23 @@ the map retains only active callers.
 
 Redis connects and PINGs at boot. A Redis limiter's lease is released when its
 permit drops; if the process or Redis is unavailable, the TTL reclaims it.
+
+## `[revocation]` — opt-in precise minted-token revocation
+
+Omit this section for Tier 0: no denylist is consulted. Redis is Tier 1 and
+Postgres is the durable alternative. Expired rows and keys are harmless
+leftovers and are not removed on the request path.
+
+| Key | Type | Default | Applies to | Meaning |
+| --- | --- | --- | --- | --- |
+| `backend` | `none` \| `redis` \| `postgres` | `none` | all | Selects the denylist backend. |
+| `dsn_env` | string | — | `redis`, `postgres` | Env-var name for the connection string; omitted Redis references reuse a Redis budget's `dsn_env`. |
+| `key_prefix` | string | `axond:revocation` | `redis` | Prefix for `<prefix>:{<jti>}` keys. |
+| `table` | string | `axond_revocation` | `postgres` | Revocation table, validated as an identifier. |
+| `create_table` | bool | `false` | `postgres` | Apply the shipped versioned DDL at boot. |
+| `on_unavailable` | `deny` \| `allow` | `deny` | shared | Fail closed with `503 revocation_unavailable`, or explicitly admit and warn. |
+| `timeout_ms` | integer | `250` | shared | Bounded operation timeout; must be nonzero. |
+| `connect_timeout_ms` | integer | `5000` | shared | Bounded connection/PING timeout; must be nonzero. |
 
 ## Telemetry
 

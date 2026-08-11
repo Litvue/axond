@@ -137,7 +137,6 @@ Per-model and hierarchical budget caps remain the existing opt-in
   `Retry-After`, because an upstream request has no honest deadline. Redis
   (#65) will slot behind the same trait without changing key semantics,
   placement, error shape, or the `NoLimit` default.
-- The Redis schema and algorithm parameters for `jti` revocation remain open.
 - A future self-serve identity product must define its administrative auth
   separately; this ADR does not create a runtime control plane.
 - The tier labels should be included in future feature ADRs and deployment
@@ -214,3 +213,19 @@ happens to match.
 The limiter refuses new admissions while a bounded replacement is in flight.
 Results from a retired generation are unknown, so the existing unavailable
 policy applies rather than trusting an admission or denial.
+
+## Amendment (2026-08-11)
+
+Issue #68 settles precise `jti` revocation as a Tier 1 optional backend. Redis
+stores one key per revoked token, shaped as
+`<key_prefix>:{<jti>}` with `key_prefix = "axond:revocation"` by default. The
+value is irrelevant; the key is written with an absolute expiry matching the
+entry's `expires_at`, and membership is one `EXISTS` round trip. Postgres uses
+the versioned `axond_revocation` table with the same expiry semantics.
+
+The request-path check is bounded and fail-closed by default, returning
+`503 revocation_unavailable`; `on_unavailable = "allow"` is an explicit
+fail-open exception. No cache is used: caching could delay a revocation, while
+the check is one round trip against an already-optional store. The complete
+operator surface is `axond revoke`; a full administrative or control-plane API
+is explicitly out of scope.

@@ -238,6 +238,26 @@ async fn authenticate_middleware(
 ) -> Result<Response, GatewayError> {
     let snapshot = state.config();
     let caller = authenticate(&snapshot, &headers).await?;
+    if let (Some(jti), Some(_exp)) = (&caller.jti, caller.exp) {
+        match state.0.revocation.is_revoked(jti).await {
+            Ok(true) => {
+                crate::telemetry::metrics::record_revocation_denial();
+                return Err(GatewayError::TokenUnauthorized(
+                    TokenVerificationError::Revoked,
+                ));
+            }
+            Ok(false) => {}
+            Err(crate::revocation::RevocationError::Unavailable { .. }) => {
+                crate::telemetry::metrics::record_revocation_unavailable_denial();
+                return Err(GatewayError::RevocationUnavailable);
+            }
+            Err(error) => {
+                warn!(error = %error, "revocation store check failed");
+                crate::telemetry::metrics::record_revocation_unavailable_denial();
+                return Err(GatewayError::RevocationUnavailable);
+            }
+        }
+    }
     if let Some(capability) = capability
         && let Some(scope) = caller.scope.as_ref()
         && (!scope.contains(&capability)
@@ -2190,6 +2210,8 @@ min_iat = {}
             scope: None,
             alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
             max_request_microdollars: None,
+            jti: None,
+            exp: None,
         };
         let response = list_models(Extension(snapshot), Extension(caller))
             .await
@@ -2317,6 +2339,8 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
                     scope: None,
                     alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
                     max_request_microdollars: None,
+                    jti: None,
+                    exp: None,
                 },
             )
             .await
@@ -2752,8 +2776,15 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         .unwrap();
         let env = env_with([("K1", "sk-test")]);
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
-        AppState::new_with_rate_limiter(cfg, &env, UsageFanout::new(sinks), budget, rate_limiter)
-            .unwrap()
+        AppState::new_with_rate_limiter(
+            cfg,
+            &env,
+            UsageFanout::new(sinks),
+            budget,
+            rate_limiter,
+            Box::new(crate::revocation::NoDenylist),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -2831,6 +2862,8 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             scope: None,
             alias_scope: None,
             max_request_microdollars: Some(1),
+            jti: None,
+            exp: None,
         };
         let body = json!({"model": "gpt-4o", "messages": []});
 
@@ -2868,6 +2901,8 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             scope: None,
             alias_scope: None,
             max_request_microdollars: Some(10_000),
+            jti: None,
+            exp: None,
         };
         let body = json!({"model": "gpt-4o", "messages": []});
 

@@ -58,6 +58,8 @@ pub struct InboundKey {
     pub scope: Option<HashSet<Capability>>,
     pub alias_scope: Option<AliasScope>,
     pub max_request_microdollars: Option<u64>,
+    pub jti: Option<String>,
+    pub exp: Option<SystemTime>,
 }
 
 pub(crate) struct GatewayKeyEntry {
@@ -133,6 +135,8 @@ pub enum TokenVerificationError {
         "token for namespace `{namespace}` and subject `{subject}` was issued before its revocation epoch"
     )]
     IssuedBeforeEpoch { namespace: String, subject: String },
+    #[error("token has been revoked")]
+    Revoked,
 }
 
 impl TokenVerificationError {
@@ -152,6 +156,7 @@ impl TokenVerificationError {
             Self::AliasNotPermitted { .. } => "token_alias_not_permitted",
             Self::InvalidAliasClaim => "token_alias_claim_invalid",
             Self::IssuedBeforeEpoch { .. } => "token_issued_before_epoch",
+            Self::Revoked => "token_revoked",
         }
     }
 }
@@ -558,6 +563,8 @@ impl PrincipalStore for TokenVerifier {
             scope: claims.scope.map(RawScope::capabilities),
             alias_scope,
             max_request_microdollars: claims.max_request_microdollars,
+            jti: claims.jti,
+            exp: Some(UNIX_EPOCH + Duration::from_secs(exp)),
         }))
     }
 }
@@ -778,6 +785,8 @@ mod tests {
                 scope: None,
                 alias_scope: None,
                 max_request_microdollars: None,
+                jti: None,
+                exp: None,
             },
         }]))
     }

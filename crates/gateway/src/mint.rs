@@ -292,6 +292,63 @@ pub fn keygen(args: &ArgMatches) -> Result<()> {
     Ok(())
 }
 
+pub fn revoke(args: &ArgMatches) -> Result<()> {
+    let jti = required(args, "jti")?;
+    if jti.is_empty() {
+        bail!("--jti must not be empty");
+    }
+    let config_path = args
+        .get_one::<String>("config")
+        .cloned()
+        .or_else(|| std::env::var("AXOND_CONFIG").ok())
+        .unwrap_or_else(|| "axond.toml".to_owned());
+    let config = Config::load(&config_path)
+        .map_err(|error| anyhow::anyhow!("failed to load config from `{config_path}`: {error}"))?;
+    let env = std::env::vars().collect();
+    let expires_at = match (
+        args.get_one::<String>("ttl"),
+        args.get_one::<String>("expires-at"),
+    ) {
+        (Some(_), Some(_)) => unreachable!("clap enforces conflicts"),
+        (Some(ttl), None) => SystemTime::now()
+            .checked_add(parse_duration(ttl)?)
+            .ok_or_else(|| anyhow::anyhow!("--ttl is too large"))?,
+        (None, Some(value)) => {
+            let seconds = value
+                .parse::<u64>()
+                .or_else(|_| crate::config::parse_gateway_rfc3339_utc(value))
+                .map_err(|_| anyhow::anyhow!("--expires-at must be unix seconds or RFC3339 UTC"))?;
+            UNIX_EPOCH + Duration::from_secs(seconds)
+        }
+        (None, None) => {
+            let max_ttl = config
+                .gateway_verifier
+                .iter()
+                .map(|verifier| verifier.max_ttl)
+                .max()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--ttl or --expires-at is required when no gateway verifier is configured"
+                    )
+                })?;
+            SystemTime::now()
+                .checked_add(max_ttl + Duration::from_secs(5))
+                .ok_or_else(|| anyhow::anyhow!("configured verifier lifetime is too large"))?
+        }
+    };
+    if config.revocation.backend == crate::config::RevocationBackend::None {
+        bail!("no denylist is configured; set [revocation].backend to redis or postgres");
+    }
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let store = crate::revocation::build(&config.revocation, &config.budget, &env).await?;
+        store.revoke(jti, expires_at).await?;
+        eprintln!("revoked jti `{jti}`");
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
 fn validate_keygen_identifier(flag: &str, value: &str, allow_punctuation: bool) -> Result<()> {
     let valid = !value.is_empty()
         && value.chars().all(|character| {

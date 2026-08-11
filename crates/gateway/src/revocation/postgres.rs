@@ -1,0 +1,218 @@
+use std::time::{Duration, SystemTime};
+use std::{future::Future, pin::Pin};
+
+use async_trait::async_trait;
+use tokio_postgres::{Client, Config};
+
+use super::{RevocationError, RevocationStore, unavailable};
+use crate::config::StoreUnavailable;
+use crate::usage::validate_table_name;
+
+const SCHEMA_DDL: &str = include_str!("../../../../ops/postgres/revocation_v1.sql");
+
+pub struct PostgresRevocation {
+    table: String,
+    config: Config,
+    timeout: Duration,
+    on_unavailable: StoreUnavailable,
+    client: tokio::sync::Mutex<Option<Client>>,
+}
+
+impl PostgresRevocation {
+    pub async fn connect(
+        dsn: &str,
+        table: &str,
+        create_table: bool,
+        timeout: Duration,
+        connect_timeout: Duration,
+        on_unavailable: StoreUnavailable,
+    ) -> Result<Self, RevocationError> {
+        validate_table_name(table).map_err(RevocationError::Invalid)?;
+        let mut config: Config = dsn
+            .parse()
+            .map_err(|e| RevocationError::Invalid(format!("unparsable DSN: {e}")))?;
+        config.connect_timeout(connect_timeout);
+        config.application_name(crate::telemetry::SERVICE_NAME);
+        let store = Self {
+            table: table.to_owned(),
+            config,
+            timeout,
+            on_unavailable,
+            client: tokio::sync::Mutex::new(None),
+        };
+        let client = tokio::time::timeout(connect_timeout, store.connect_client())
+            .await
+            .map_err(|_| RevocationError::Invalid("Postgres connection timed out".to_owned()))?
+            .map_err(|e| RevocationError::Invalid(format!("Postgres connection failed: {e}")))?;
+        if create_table {
+            client
+                .batch_execute(&store.schema_ddl())
+                .await
+                .map_err(|e| RevocationError::Invalid(format!("create table failed: {e}")))?;
+        }
+        *store.client.lock().await = Some(client);
+        Ok(store)
+    }
+
+    fn schema_ddl(&self) -> String {
+        SCHEMA_DDL.replace("axond_revocation", &self.table)
+    }
+
+    async fn connect_client(&self) -> Result<Client, tokio_postgres::Error> {
+        let (client, connection) = self.config.connect(crate::usage::tls_connector()).await?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::warn!(%error, "postgres revocation connection closed");
+            }
+        });
+        Ok(client)
+    }
+
+    async fn run<T>(
+        &self,
+        operation: impl for<'a> FnOnce(
+            &'a mut Client,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<T, tokio_postgres::Error>> + Send + 'a>,
+        >,
+    ) -> Result<T, RevocationError> {
+        let mut guard = self.client.lock().await;
+        if guard.as_ref().is_none_or(Client::is_closed) {
+            *guard =
+                Some(
+                    self.connect_client()
+                        .await
+                        .map_err(|e| RevocationError::Unavailable {
+                            backend: "postgres",
+                            message: e.to_string(),
+                        })?,
+                );
+        }
+        let result =
+            tokio::time::timeout(self.timeout, operation(guard.as_mut().expect("connected")))
+                .await
+                .map_err(|_| RevocationError::Unavailable {
+                    backend: "postgres",
+                    message: "operation timed out".to_owned(),
+                })?
+                .map_err(|e| RevocationError::Unavailable {
+                    backend: "postgres",
+                    message: e.to_string(),
+                });
+        if result.is_err() {
+            *guard = None;
+        }
+        result
+    }
+}
+
+#[async_trait]
+impl RevocationStore for PostgresRevocation {
+    fn name(&self) -> &'static str {
+        "postgres"
+    }
+
+    async fn is_revoked(&self, jti: &str) -> Result<bool, RevocationError> {
+        let table = self.table.clone();
+        let jti = jti.to_owned();
+        match self
+            .run(|client: &mut Client| {
+                Box::pin(async move {
+                    let row = client
+                        .query_opt(
+                            &format!("SELECT 1 FROM {table} WHERE jti = $1 AND expires_at > now()"),
+                            &[&jti],
+                        )
+                        .await?;
+                    Ok(row.is_some())
+                })
+            })
+            .await
+        {
+            Ok(value) => Ok(value),
+            Err(error) => unavailable(self.on_unavailable, "postgres", error),
+        }
+    }
+
+    async fn revoke(&self, jti: &str, expires_at: SystemTime) -> Result<(), RevocationError> {
+        let table = self.table.clone();
+        let jti = jti.to_owned();
+        match self.run(|client: &mut Client| Box::pin(async move {
+            let values: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+                vec![Box::new(jti), Box::new(expires_at)];
+            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = values
+                .iter()
+                .map(|value| value.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO {} (jti, expires_at) VALUES ($1::text, $2)
+                         ON CONFLICT (jti) DO UPDATE SET expires_at = GREATEST({}.expires_at, EXCLUDED.expires_at)",
+                        table, table
+                    ),
+                    &params,
+                )
+                .await?;
+            Ok(())
+        })).await {
+            Ok(()) => Ok(()),
+            Err(error) => unavailable(self.on_unavailable, "postgres", error).map(|_| ()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+
+    #[tokio::test]
+    async fn two_connections_share_revocations_and_expiry_is_honored() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let table = format!(
+            "axond_revocation_test_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let first = PostgresRevocation::connect(
+            &dsn,
+            &table,
+            true,
+            Duration::from_millis(500),
+            Duration::from_secs(5),
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect");
+        let second = PostgresRevocation::connect(
+            &dsn,
+            &table,
+            false,
+            Duration::from_millis(500),
+            Duration::from_secs(5),
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect");
+        first
+            .revoke("replica-jti", SystemTime::now() + Duration::from_secs(30))
+            .await
+            .expect("revoke");
+        assert!(second.is_revoked("replica-jti").await.expect("read"));
+        first
+            .revoke("expired-jti", UNIX_EPOCH)
+            .await
+            .expect("expired write");
+        assert!(
+            !second
+                .is_revoked("expired-jti")
+                .await
+                .expect("expired read")
+        );
+    }
+}
