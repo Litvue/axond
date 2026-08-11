@@ -37,7 +37,7 @@ executed locally.
 | Stage | Verified | How |
 | --- | --- | --- |
 | Version + changelog | Wired | `release-please-config.json`: `release-type: simple`, `bump-minor-pre-major`, `bump-patch-for-minor-pre-major`, Cargo workspace version in `extra-files`, `CHANGELOG.md` sections per Conventional Commit type. A GitHub App token (falling back to `GITHUB_TOKEN`) makes the release PR trigger CI; the lockfile is re-synced onto the release PR so `--locked` stays green. |
-| Release fan-out | Wired | `release-metadata` resolves the automatic path and the `workflow_dispatch` repair path, and rejects a dispatch whose ref is not the requested tag. |
+| Release fan-out | Wired | `release-metadata` resolves the automatic path and the `workflow_dispatch` repair path. A normal repair dispatch runs from the release tag; when the workflow itself was fixed after the tag, dispatching from `main` is supported while all artifact lanes still check out the requested tag. |
 | Binaries | Wired | Four targets — `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc` — each built at the pinned toolchain from the tagged commit, packaged with a SHA-256 sidecar, an SPDX SBOM, and provenance + SBOM attestations. |
 | Image | Wired **and exercised** | `docker build` + `ops/docker-smoke.sh` run locally against the built image: `healthz: ok`, `/v1/models` (probed with the platform gateway key) returns the example catalogue, `axond image smoke passed`. In the release job the same smoke runs against the *published* image **before** it is signed. |
 | Signing | Wired | Keyless cosign over the digest, verified in-job against `SIGNER_IDENTITY`, which is anchored to this workflow file at `refs/heads/main` or `refs/tags/v<semver>` only. `gh attestation verify` then checks SLSA provenance. A broken chain fails the release rather than shipping quietly. |
@@ -166,11 +166,17 @@ or deleted.
 ### The first publish is the next tag
 
 The already-released tags, `v0.3.0` included, predate this lane: their trees
-contain no `ops/publish-crates.sh` and no `release-crates` job, and the
-`workflow_dispatch` repair path checks the tag out before running it. So
-**dispatching `v0.3.0` cannot publish these crates** — the job it would need does
-not exist at that commit, and the packaging fixes this release depends on are not
-in that tree either.
+contain no `ops/publish-crates.sh` and no `release-crates` job, so
+**dispatching `v0.3.0` cannot publish these crates**. The repair workflow detects
+that absence and skips the crates lane while still allowing the binary and image
+artifacts to be rebuilt. The packaging fixes this release depends on are not in
+that older tree either.
+
+When a workflow fix lands after a release tag, dispatch **Release** from `main`
+with the existing tag as `release_tag`. The workflow definition comes from the
+reviewed `main` commit, while binaries, the image, and any crates publish are
+built from the immutable tag. The run records this distinction explicitly; use
+the tag-ref dispatch whenever the tag already contains the desired workflow.
 
 The bootstrap is therefore the *next* release tag cut after this lands: merge the
 release PR, and the crates lane runs for the first time on that tag, after the
@@ -229,8 +235,9 @@ A publish that dies between packages leaves the release half-shipped — say
 undone, so recovery is *resumption*, not repair:
 
 1. Re-dispatch **Release** (`workflow_dispatch`) from the release tag, passing
-   that tag as `release_tag`. Dispatching from any other ref is rejected, and
-   the tag must be one whose tree contains this lane (see above).
+   that tag as `release_tag`. If the tag predates a workflow fix, dispatch from
+   `main` instead; the artifact lanes still check out the tag, and the crates
+   lane runs only when that tag contains `ops/publish-crates.sh`.
 2. `ops/publish-crates.sh` asks crates.io for each `name@version` first and
    skips what is already there, so the run uploads exactly the packages that are
    missing and reports the rest as `already present`.

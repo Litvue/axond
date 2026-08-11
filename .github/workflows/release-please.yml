@@ -145,6 +145,7 @@ jobs:
       version: ${{ steps.release.outputs.version }}
       commit_sha: ${{ steps.release.outputs.commit_sha }}
       short_sha: ${{ steps.release.outputs.short_sha }}
+      crates_publishable: ${{ steps.release.outputs.crates_publishable }}
     steps:
       - name: Resolve automatic or requested release
         id: release
@@ -180,11 +181,17 @@ jobs:
                 ;;
             esac
             release_created=true
+            if gh api "/repos/${GITHUB_REPOSITORY}/contents/ops/publish-crates.sh?ref=${tag_name}" >/dev/null 2>&1; then
+              crates_publishable=true
+            else
+              crates_publishable=false
+            fi
           else
             tag_name="$AUTO_TAG_NAME"
             version="$AUTO_VERSION"
             release_created="${AUTO_RELEASE_CREATED:-false}"
             commit_sha="$GITHUB_SHA"
+            crates_publishable=true
           fi
           short_sha="${commit_sha:0:7}"
           {
@@ -193,6 +200,7 @@ jobs:
             echo "version=$version"
             echo "commit_sha=$commit_sha"
             echo "short_sha=$short_sha"
+            echo "crates_publishable=$crates_publishable"
           } >> "$GITHUB_OUTPUT"
 
   release-binaries:
@@ -436,6 +444,7 @@ jobs:
       !cancelled() &&
       needs['release-metadata'].result == 'success' &&
       needs['release-success'].result == 'success' &&
+      needs['release-metadata'].outputs.crates_publishable == 'true' &&
       needs['release-metadata'].outputs.release_created == 'true'
     # Serialize per tag so a re-dispatch cannot race the original run into a
     # duplicate upload; never cancel, because a cancelled publish is the one
