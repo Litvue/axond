@@ -323,7 +323,7 @@ migrations, and backup/restore ownership.
 | `table` | string | `axond_usage` | `postgres` | Destination table; `schema.table` allowed. Validated as an identifier, so it cannot carry SQL. |
 | `create_table` | bool | `false` | `postgres` | Apply the shipped DDL at boot. Off because most deployments give the gateway's role no DDL rights. |
 | `buffer_capacity` | integer | `10000` | `postgres` | Records buffered before the fan-out drops. Must be ≥ 1. |
-| `max_batch` | integer | `500` | `postgres` | Rows per statement. Must be between 1 and the statement parameter budget. |
+| `max_batch` | integer | `500` | `postgres` | Records accumulated before a flush. Must be ≥ 1 and no greater than `buffer_capacity`; the sink splits large batches across statements as needed. |
 | `flush_interval_ms` | integer | `1000` | `postgres` | How long a partial batch waits. Must be ≥ 1. |
 
 `kind = "otlp"` emits usage as OTel log records on the exporter telemetry

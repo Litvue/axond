@@ -108,7 +108,7 @@ async fn flush_loop(
     settings: BatchSettings,
     dropped: Arc<AtomicU64>,
 ) {
-    let mut batch: Vec<ObservedRecord> = Vec::with_capacity(settings.max_batch);
+    let mut batch: Vec<ObservedRecord> = Vec::with_capacity(settings.max_batch.min(1024));
     loop {
         let Some(first) = rx.recv().await else {
             return;

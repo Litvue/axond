@@ -1550,6 +1550,12 @@ impl Config {
                     "usage_sink `{kind}`: max_batch must be at least 1"
                 )));
             }
+            if sink.max_batch > sink.buffer_capacity {
+                return Err(ConfigError::Invalid(format!(
+                    "usage_sink `{kind}`: max_batch ({}) must not exceed buffer_capacity ({})",
+                    sink.max_batch, sink.buffer_capacity
+                )));
+            }
             if sink.flush_interval_ms == 0 {
                 return Err(ConfigError::Invalid(format!(
                     "usage_sink `{kind}`: flush_interval_ms must be at least 1"
@@ -2486,6 +2492,27 @@ dsn_env = "DSN"
     }
 
     #[test]
+    fn rejects_a_batch_larger_than_its_buffer() {
+        let toml = format!(
+            r#"
+{VALID}
+
+[[usage_sink]]
+kind = "postgres"
+dsn_env = "DSN"
+buffer_capacity = 99
+max_batch = 100
+"#
+        );
+        let error = Config::from_toml_str(&toml).expect_err("batch must fit its buffer");
+        assert!(
+            error
+                .to_string()
+                .contains("max_batch (100) must not exceed buffer_capacity (99)")
+        );
+    }
+
+    #[test]
     fn accepts_a_batch_larger_than_one_statement() {
         let toml = format!(
             r#"
@@ -2494,6 +2521,7 @@ dsn_env = "DSN"
 [[usage_sink]]
 kind = "postgres"
 dsn_env = "DSN"
+buffer_capacity = 100000
 max_batch = 100000
 "#
         );
