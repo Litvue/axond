@@ -326,6 +326,12 @@ migrations, and backup/restore ownership.
 | `max_batch` | integer | `500` | `postgres` | Records accumulated before a flush. Must be ≥ 1 and no greater than `buffer_capacity`; the sink splits large batches across statements as needed. |
 | `flush_interval_ms` | integer | `1000` | `postgres` | How long a partial batch waits. Must be ≥ 1. |
 
+`max_batch` was previously capped by the INSERT parameter budget, which moved
+whenever a column was added; it is now bounded by `buffer_capacity` instead, so
+the cap no longer shifts under a schema change. A config setting `max_batch`
+above its sink's `buffer_capacity` booted before this release and is now a boot
+error: lower `max_batch`, or raise `buffer_capacity` to match.
+
 `kind = "otlp"` emits usage as OTel log records on the exporter telemetry
 already installed, so it needs `OTEL_EXPORTER_OTLP_ENDPOINT`; the SDK's batch
 processor does its buffering and the batching keys above do not apply.
