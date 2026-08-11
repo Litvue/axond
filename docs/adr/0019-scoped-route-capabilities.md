@@ -23,6 +23,7 @@ The route capability set is fixed and maps directly to the provider routes:
 | `chat` | `POST /v1/chat/completions` |
 | `messages` | `POST /v1/messages` |
 | `embeddings` | `POST /v1/embeddings` |
+| `responses` | `POST /v1/responses` |
 | `models` | `GET /v1/models` |
 | `credentials` | `GET /v1/credentials` |
 
@@ -46,8 +47,7 @@ authority. A missing scope therefore preserves Phase 1 behavior, including for
 static gateway keys, while an empty scope narrows authority to nothing. A
 `null` claim is an absent claim, not an empty scope. Unknown scope values are
 ignored and intersect away rather than failing token verification.
-`/v1/responses` has no capability and remains the typed `501 not_implemented`
-route for scoped callers.
+Scoped callers need the `responses` capability for `/v1/responses`.
 
 The auth middleware enforces the capability before handler extractors run.
 Scope denial is a typed `403` with code `token_scope_insufficient`; its message

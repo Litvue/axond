@@ -31,6 +31,7 @@ pub mod target {
     pub const CHAT: &str = "fixture-chat";
     /// Buffered OpenAI embeddings from the committed fixture.
     pub const EMBEDDINGS: &str = "fixture-embeddings";
+    pub const RESPONSES: &str = "fixture-responses";
     /// Buffered/streamed Anthropic Messages from the committed fixtures.
     pub const MESSAGES: &str = "fixture-messages";
     /// A long-lived stream of many small events, for soak.
@@ -72,6 +73,8 @@ impl Fixtures {
             "openai/chat_completion.json",
             "openai/chat_completion.sse",
             "openai/embeddings.json",
+            "openai/responses.json",
+            "openai/responses.sse",
             "anthropic/message_thinking_tool_use.json",
             "anthropic/message_thinking_tool_use.sse",
         ];
@@ -160,6 +163,7 @@ impl FakeUpstream {
             .route("/chat/completions", post(handle))
             .route("/messages", post(handle))
             .route("/embeddings", post(handle))
+            .route("/responses", post(handle))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
@@ -224,6 +228,7 @@ async fn handle(
         });
 
     let anthropic = path == "/messages";
+    let responses = path == "/responses";
     match model.as_str() {
         target::FAIL => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -237,6 +242,8 @@ async fn handle(
         _ if streamed => {
             let name = if anthropic {
                 "anthropic/message_thinking_tool_use.sse"
+            } else if responses {
+                "openai/responses.sse"
             } else {
                 "openai/chat_completion.sse"
             };
@@ -250,6 +257,7 @@ async fn handle(
             let name = match (anthropic, path.as_str()) {
                 (true, _) => "anthropic/message_thinking_tool_use.json",
                 (_, "/embeddings") => "openai/embeddings.json",
+                (_, "/responses") => "openai/responses.json",
                 _ => "openai/chat_completion.json",
             };
             (

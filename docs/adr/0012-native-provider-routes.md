@@ -8,8 +8,9 @@ Accepted
 
 ## Context
 
-The gateway serves `/v1/chat/completions` and, until now, answered `/v1/messages`,
-`/v1/embeddings`, and `/v1/responses` with a typed `501`. That left the Anthropic
+The gateway serves `/v1/chat/completions`, `/v1/messages`, `/v1/embeddings`, and
+now `/v1/responses` as native provider routes. Before ADR 0023, Responses
+answered with a typed `501`. That left the Anthropic
 half of the market reachable only by sending an OpenAI-shaped request to an
 Anthropic target and letting the adapter translate it — the arrangement the
 passthrough-first turn (delta A1) was a reaction to.
@@ -107,16 +108,11 @@ real means routing an OpenAI-shaped chat request to a provider's *own* endpoint
 and translating both directions, which is a decision of its own rather than a
 silent fallback.
 
-**`/v1/responses` is deferred past beta.** It is the one route where passthrough
-is not the whole job: the Responses API is *stateful* (server-side conversation
-storage via `store`/`previous_response_id`), and an honest implementation has to
-decide what a stateless gateway does with a response id it did not mint and cannot
-resolve if the alias fails over to a different provider — a routing-affinity
-question, not a wire question, and squarely against ADR 0002's stateless default.
-It is also served today: the OpenAI SDK's chat surface goes through
-`/v1/chat/completions`, so nothing is unreachable. The route keeps its typed `501`
-with a message naming both the deferral and the alternative, because a missing
-route is indistinguishable from a misconfigured `base_url`.
+**Superseded for `/v1/responses` by [ADR 0023](./0023-openai-responses-passthrough.md).**
+Responses is now served natively on the shared path. Its provider-side
+statefulness is handled by considering only the alias's first configured target
+and first configured credential for requests with `previous_response_id`, while
+keeping the gateway stateless.
 
 **No new dependencies**, so `deny.toml` is untouched and no licence needed
 allowing.
@@ -143,5 +139,6 @@ allowing.
 - Usage on a native route is only as good as what the provider reports. A stream
   that dies before `message_delta` settles the partial charge from the prompt
   estimate (ADR 0010), exactly as the OpenAI-shaped path does.
-- `/v1/responses` stays a `501` for beta. When it lands it will need its own ADR
-  for the statefulness question, not just a route.
+- `/v1/responses` is now served by the shared native passthrough path. Its
+  statefulness, target pinning, and Responses-specific stream framing are
+  defined by ADR 0023.

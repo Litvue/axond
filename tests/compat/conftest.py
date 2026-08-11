@@ -17,7 +17,7 @@ import pytest
 import urllib.error
 import urllib.request
 
-from fake_upstream import CHAT, EMBEDDINGS, FakeUpstream, MESSAGES
+from fake_upstream import CHAT, EMBEDDINGS, FakeUpstream, MESSAGES, RESPONSES
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GATEWAY_KEY = "test-inbound-key"
@@ -51,6 +51,7 @@ def _config(bind: str, upstream: str) -> str:
             ("chat-golden", "fake-openai", CHAT),
             ("messages-golden", "fake-anthropic", MESSAGES),
             ("embeddings-golden", "fake-openai", EMBEDDINGS),
+            ("responses-golden", "fake-openai", RESPONSES),
         ]
     )
     return f"""

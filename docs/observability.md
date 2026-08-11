@@ -119,7 +119,6 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | `503` | `all_provider_circuits_open` | Every target for the alias has a tripped circuit. | The upstreams are down or the thresholds are too tight; check `axond.upstream.circuit_state`. |
 | `502` | `no_credential` | The namespace has no credential for the resolved provider and no platform fallback. | Add a `[[credential]]`, or set `allow_platform_fallback` deliberately. |
 | `502` | `upstream_transport`, `provider_dependency_failed`, `model_unavailable`, `invalid_stream` | The upstream failed after the failover walk was exhausted. | Check the provider's status and the attempt spans; `attempts` on the usage record says how hard the gateway tried. |
-| `501` | `not_implemented` | `/v1/responses`, deferred past beta. | Use `/v1/chat/completions`. |
 
 Mid-stream failures are different by construction. Native passthrough streams
 and OpenAI-normalized streams that have already queued downstream bytes remain

@@ -12,8 +12,17 @@ use serde_json::json;
 use support::gateway::{INPUT_PRICE, OUTPUT_PRICE, alias};
 use support::{GATEWAY_KEY, boot, client};
 
-fn cost(input_tokens: u64, output_tokens: u64) -> u64 {
-    input_tokens * INPUT_PRICE / 1_000_000 + output_tokens * OUTPUT_PRICE / 1_000_000
+fn cost(
+    input_tokens: u64,
+    output_tokens: u64,
+    reasoning_tokens: u64,
+    cache_read_tokens: u64,
+) -> u64 {
+    let billed_output_tokens = output_tokens.saturating_sub(reasoning_tokens);
+    input_tokens * INPUT_PRICE / 1_000_000
+        + billed_output_tokens * OUTPUT_PRICE / 1_000_000
+        + reasoning_tokens * OUTPUT_PRICE / 1_000_000
+        + cache_read_tokens * INPUT_PRICE / 1_000_000
 }
 
 #[tokio::test]
@@ -22,14 +31,26 @@ async fn replayed_fixtures_settle_the_usage_the_wire_reports() {
     let client = client();
 
     let cases = [
-        ("/v1/chat/completions", alias::CHAT, false, 19u64, 7u64),
-        ("/v1/chat/completions", alias::CHAT, true, 19, 7),
-        ("/v1/messages", alias::MESSAGES, false, 41, 63),
-        ("/v1/messages", alias::MESSAGES, true, 41, 63),
-        ("/v1/embeddings", alias::EMBEDDINGS, false, 8, 0),
+        (
+            "/v1/chat/completions",
+            alias::CHAT,
+            false,
+            19u64,
+            7u64,
+            0,
+            0,
+        ),
+        ("/v1/chat/completions", alias::CHAT, true, 19, 7, 0, 0),
+        ("/v1/messages", alias::MESSAGES, false, 41, 63, 0, 0),
+        ("/v1/messages", alias::MESSAGES, true, 41, 63, 0, 0),
+        ("/v1/embeddings", alias::EMBEDDINGS, false, 8, 0, 0, 0),
+        ("/v1/responses", alias::RESPONSES, false, 16, 7, 2, 3),
+        ("/v1/responses", alias::RESPONSES, true, 16, 7, 2, 3),
     ];
 
-    for (index, (path, model, streamed, input, output)) in cases.into_iter().enumerate() {
+    for (index, (path, model, streamed, input, output, reasoning, cache_read)) in
+        cases.into_iter().enumerate()
+    {
         let mut body = json!({ "model": model, "max_tokens": 1024, "input": "hello",
                                "messages": [{ "role": "user", "content": "hello" }] });
         if streamed {
@@ -57,7 +78,7 @@ async fn replayed_fixtures_settle_the_usage_the_wire_reports() {
         assert_eq!(record["output_tokens"], json!(output), "{label}");
         assert_eq!(
             record["cost_microdollars"],
-            json!(cost(input, output)),
+            json!(cost(input, output, reasoning, cache_read)),
             "{label}"
         );
         assert_eq!(record["attempts"], json!(1), "{label}");

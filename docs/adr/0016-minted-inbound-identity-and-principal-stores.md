@@ -45,7 +45,7 @@ The claim set is:
 | `aud` | Deployment audience, preventing cross-environment replay. |
 | `kid` | Verification-key identifier in the JWS header, supporting overlap during rotation. |
 | `jti` | Mandatory at every tier, including Tier 0 where no denylist is configured. |
-| `scope` | Optional route capabilities: `chat`, `messages`, `embeddings`, and `models`. |
+| `scope` | Optional route capabilities: `chat`, `messages`, `embeddings`, `responses`, and `models`. |
 | `aliases` | Optional alias allowlist/globs, intersected with the namespace catalogue. |
 | `max_request_microdollars` | Optional per-request ceiling, checked against the existing estimate. |
 

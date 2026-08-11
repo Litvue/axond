@@ -52,6 +52,10 @@ pub fn embeddings_usage(response: &Value) -> ModelUsage {
     }
 }
 
+pub fn responses_usage(response: &Value) -> ModelUsage {
+    response.get("usage").map(chat_usage).unwrap_or_default()
+}
+
 impl ProviderAdapter for OpenAiCompatibleAdapter {
     fn name(&self) -> &'static str {
         match self.flavor {
@@ -101,7 +105,7 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
     ) -> Result<ProviderResponse, ProviderError> {
         let usage = match surface {
             Surface::ChatCompletions => chat_usage(&response),
-            Surface::Responses => response.get("usage").map(chat_usage).unwrap_or_default(),
+            Surface::Responses => responses_usage(&response),
         };
         Ok(ProviderResponse {
             body: response,
@@ -216,6 +220,26 @@ mod tests {
             ModelUsage {
                 input_tokens: 8,
                 ..ModelUsage::default()
+            }
+        );
+    }
+
+    #[test]
+    fn responses_usage_reads_the_responses_usage_block() {
+        assert_eq!(
+            responses_usage(&json!({
+                "usage": {
+                    "input_tokens": 20,
+                    "output_tokens": 8,
+                    "output_tokens_details": { "reasoning_tokens": 6 }
+                }
+            })),
+            ModelUsage {
+                input_tokens: 20,
+                output_tokens: 8,
+                reasoning_tokens: 6,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
             }
         );
     }

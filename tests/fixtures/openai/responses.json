@@ -1,0 +1,32 @@
+{
+  "id": "resp_fixture_0001",
+  "object": "response",
+  "created_at": 1750000000,
+  "status": "completed",
+  "model": "gpt-4o-responses",
+  "output": [
+    {
+      "id": "msg_fixture_0001",
+      "type": "message",
+      "status": "completed",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "The capital of France is Paris.",
+          "annotations": []
+        }
+      ]
+    }
+  ],
+  "opaque_future_field": {
+    "signed_reasoning_item": "preserve-me"
+  },
+  "usage": {
+    "input_tokens": 19,
+    "output_tokens": 7,
+    "total_tokens": 26,
+    "input_tokens_details": { "cached_tokens": 3 },
+    "output_tokens_details": { "reasoning_tokens": 2 }
+  }
+}

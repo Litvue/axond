@@ -8,7 +8,7 @@ import pytest
 from openai import OpenAI
 
 from conftest import GATEWAY_KEY, UPSTREAM_OPENAI_KEY
-from fake_upstream import CHAT, fixture
+from fake_upstream import CHAT, fixture, RESPONSES
 
 
 @pytest.fixture
@@ -55,11 +55,36 @@ def test_embeddings(client):
     assert response.usage.prompt_tokens == expected["usage"]["prompt_tokens"]
 
 
+def test_buffered_responses(client, upstream):
+    response = client.responses.create(
+        model="responses-golden",
+        input="What is the capital of France?",
+    )
+    expected = json.loads(fixture("openai/responses.json"))
+    assert response.id == expected["id"]
+    assert response.output[0].content[0].text == expected["output"][0]["content"][0]["text"]
+    assert response.usage.input_tokens == expected["usage"]["input_tokens"]
+    sent = upstream.requests[-1]
+    assert sent["model"] == RESPONSES
+    assert sent["authorization"] == f"Bearer {UPSTREAM_OPENAI_KEY}"
+
+
+def test_streamed_responses(client):
+    stream = client.responses.create(
+        model="responses-golden",
+        input="What is the capital of France?",
+        stream=True,
+    )
+    text = "".join(event.delta for event in stream if getattr(event, "delta", None))
+    assert text == "The capital of France is Paris."
+
+
 def test_models_are_listed(client):
     assert {model.id for model in client.models.list()} >= {
         "chat-golden",
         "messages-golden",
         "embeddings-golden",
+        "responses-golden",
     }
 
 

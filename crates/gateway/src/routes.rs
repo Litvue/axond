@@ -14,8 +14,7 @@
 //! only `model` rewritten, so signed thinking and tool-use blocks survive intact
 //! (verbatim bytes when streamed, re-serialized values when buffered); only how
 //! usage is read back differs per route. `/v1/responses`
-//! is deferred past beta and answers with a typed `501` rather than being a
-//! missing route (delta B3).
+//! is a native OpenAI Responses passthrough.
 //!
 //! An alias's `targets` are tried in configured order (ADR 0008). The failover
 //! walk is the *outer* loop around credential-pool dispatch: each target has an
@@ -144,7 +143,7 @@ fn route_specs(minting_enabled: bool) -> Vec<RouteSpec> {
         RouteSpec {
             path: "/v1/responses",
             auth: AuthPosture::Authenticated,
-            capability: None,
+            capability: Some(Capability::Responses),
             router: || post(responses),
         },
     ];
@@ -235,7 +234,8 @@ async fn mint_tokens(
                 .map(|values| values.iter().copied().collect())
                 .unwrap_or_else(|| {
                     Capability::ALL
-                        .into_iter()
+                        .iter()
+                        .copied()
                         .filter(|capability| !capability.is_operator_only())
                         .collect()
                 }),
@@ -525,7 +525,7 @@ async fn authenticate(
 /// Authenticate once per request, before handler extractors, and carry the
 /// resolved snapshot and caller into the handler. A reload landing mid-request
 /// therefore cannot change what this request resolved; failures return `401`
-/// before any typed handler error, including `/v1/responses`'s `501`.
+/// before any typed handler error.
 async fn authenticate_middleware(
     State((state, capability)): State<(AppState, Option<Capability>)>,
     headers: HeaderMap,
@@ -578,6 +578,7 @@ fn namespace_allows(snapshot: &ConfigSnapshot, namespace: &str, capability: Capa
         Capability::Chat => Some(Route::ChatCompletions),
         Capability::Messages => Some(Route::NativeMessages),
         Capability::Embeddings => Some(Route::Embeddings),
+        Capability::Responses => Some(Route::Responses),
         Capability::Models => None,
         Capability::Credentials | Capability::CredentialsAll => None,
     };
@@ -614,6 +615,8 @@ enum Route {
     NativeMessages,
     /// OpenAI-shaped embeddings, forwarded verbatim to an OpenAI-family target.
     Embeddings,
+    /// OpenAI Responses, forwarded verbatim to an OpenAI-family target.
+    Responses,
 }
 
 impl Route {
@@ -623,6 +626,7 @@ impl Route {
             Self::ChatCompletions => "/v1/chat/completions",
             Self::NativeMessages => "/v1/messages",
             Self::Embeddings => "/v1/embeddings",
+            Self::Responses => "/v1/responses",
         }
     }
 
@@ -632,6 +636,7 @@ impl Route {
             Self::ChatCompletions => "/chat/completions",
             Self::NativeMessages => "/messages",
             Self::Embeddings => "/embeddings",
+            Self::Responses => "/responses",
         }
     }
 
@@ -644,7 +649,7 @@ impl Route {
 
     fn wire(self) -> ProviderWire {
         match self {
-            Self::ChatCompletions | Self::Embeddings => ProviderWire::Openai,
+            Self::ChatCompletions | Self::Embeddings | Self::Responses => ProviderWire::Openai,
             Self::NativeMessages => ProviderWire::Anthropic,
         }
     }
@@ -653,10 +658,27 @@ impl Route {
         self != Self::Embeddings
     }
 
+    /// A stored Responses id only resolves on the provider that stored it;
+    /// failing over would turn a continuity error into a confusing upstream
+    /// 404, so stateful continuations consider only the first configured
+    /// target. Null and empty values are ordinary non-continuation requests.
+    fn is_pinned(self, body: &Value) -> bool {
+        self == Self::Responses
+            && body
+                .get("previous_response_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+    }
+
+    fn max_attempts(self, body: &Value, configured: u32) -> u32 {
+        if self.is_pinned(body) { 1 } else { configured }
+    }
+
     fn framing(self) -> Framing {
         match self {
             Self::ChatCompletions => Framing::OpenAiSse,
             Self::NativeMessages | Self::Embeddings => Framing::Native,
+            Self::Responses => Framing::Responses,
         }
     }
 
@@ -665,6 +687,7 @@ impl Route {
     fn native_usage(self, response: &Value) -> ModelUsage {
         match self {
             Self::NativeMessages => gateway_core::native_message_usage(response),
+            Self::Responses => gateway_core::responses_usage(response),
             // Chat never takes this path (its adapter reports usage), so the
             // OpenAI-shaped prompt-only reader is the honest default.
             Self::ChatCompletions | Self::Embeddings => gateway_core::embeddings_usage(response),
@@ -800,15 +823,14 @@ async fn embeddings(
     serve(state, headers, body, Route::Embeddings, snapshot, caller).await
 }
 
-/// Deferred past beta (ADR 0012): the OpenAI Responses API is a stateful
-/// surface, and serving it honestly needs more than passthrough. Its route
-/// layer authenticates callers before this handler returns the typed `501`,
-/// because a missing route is indistinguishable from a misconfigured `base_url`.
-async fn responses() -> Result<Json<Value>, GatewayError> {
-    Err(GatewayError::NotImplemented(
-        "the OpenAI Responses API (`/v1/responses`), deferred past beta by ADR 0012 \
-         in favour of `/v1/chat/completions`,",
-    ))
+async fn responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
+    Extension(caller): Extension<InboundKey>,
+    Json(body): Json<Value>,
+) -> Result<Response, GatewayError> {
+    serve(state, headers, body, Route::Responses, snapshot, caller).await
 }
 
 /// The one request path every route shares: use the authenticated request
@@ -1035,25 +1057,52 @@ async fn dispatch_with_failover(
     let cfg = &snapshot.config;
     let policy = FailoverPolicy;
     let deadline = Instant::now() + Duration::from_millis(cfg.failover.overall_timeout_ms);
-    let max_attempts = cfg.failover.max_attempts;
+    let max_attempts = wire.route.max_attempts(body, cfg.failover.max_attempts);
+    let pinned = wire.route.is_pinned(body);
 
     let mut walk = FailoverWalk::new(caller, model.targets.len());
     for (index, target) in model.targets.iter().enumerate() {
+        if pinned && index > 0 {
+            break;
+        }
         if walk.attempts >= max_attempts || Instant::now() >= deadline {
             break;
         }
         let Some(provider) = cfg.provider(&target.provider) else {
+            if pinned {
+                return Err(GatewayError::ContinuationAffinityUnavailable {
+                    provider: target.provider.clone(),
+                    model: target.model.clone(),
+                });
+            }
             continue;
         };
         let circuit_key = target_key(target);
         if let CircuitDecision::Skip = snapshot.target_circuits.allow(&circuit_key) {
+            if pinned {
+                return Err(GatewayError::ContinuationAffinityUnavailable {
+                    provider: target.provider.clone(),
+                    model: target.model.clone(),
+                });
+            }
             walk.skipped_open.push(circuit_key);
             continue;
         }
-        let Some(plan) = snapshot
-            .credentials
-            .plan(cfg, &caller.namespace, &provider.id)
-        else {
+        let Some(plan) = (if pinned {
+            snapshot
+                .credentials
+                .plan_pinned(cfg, &caller.namespace, &provider.id)
+        } else {
+            snapshot
+                .credentials
+                .plan(cfg, &caller.namespace, &provider.id)
+        }) else {
+            if pinned {
+                return Err(GatewayError::ContinuationAffinityUnavailable {
+                    provider: target.provider.clone(),
+                    model: target.model.clone(),
+                });
+            }
             walk.note_missing_credential(&provider.id);
             continue;
         };
@@ -1173,6 +1222,9 @@ async fn open_stream_lease(
         Route::ChatCompletions => adapter
             .stream_decoder(Surface::ChatCompletions)
             .map_err(TransportError::Provider)?,
+        Route::Responses => adapter
+            .stream_decoder(Surface::Responses)
+            .map_err(TransportError::Provider)?,
         _ => Box::new(NativeMessagesDecoder::new()) as Box<dyn ProviderStreamDecoder>,
     };
     let upstream = Upstream {
@@ -1269,29 +1321,58 @@ async fn stream_with_failover(
         wire,
         mut hold,
     } = request;
+    let reservation_guard =
+        BudgetReservation::new(state.clone(), hold.key.clone(), hold.reservation.clone());
     let cfg = &snapshot.config;
     let policy = FailoverPolicy;
     let deadline = Instant::now() + Duration::from_millis(cfg.failover.overall_timeout_ms);
-    let max_attempts = cfg.failover.max_attempts;
+    let max_attempts = wire.route.max_attempts(&body, cfg.failover.max_attempts);
+    let pinned = wire.route.is_pinned(&body);
 
     let mut walk = FailoverWalk::new(caller, model.targets.len());
     let mut last_ctx: Option<(StreamContext, Instant)> = None;
     'targets: for (index, target) in model.targets.iter().enumerate() {
+        if pinned && index > 0 {
+            break;
+        }
         if walk.attempts >= max_attempts || Instant::now() >= deadline {
             break;
         }
         let Some(provider) = cfg.provider(&target.provider) else {
+            if pinned {
+                return Err(GatewayError::ContinuationAffinityUnavailable {
+                    provider: target.provider.clone(),
+                    model: target.model.clone(),
+                });
+            }
             continue;
         };
         let circuit_key = target_key(target);
         if let CircuitDecision::Skip = snapshot.target_circuits.allow(&circuit_key) {
+            if pinned {
+                return Err(GatewayError::ContinuationAffinityUnavailable {
+                    provider: target.provider.clone(),
+                    model: target.model.clone(),
+                });
+            }
             walk.skipped_open.push(circuit_key);
             continue;
         }
-        let Some(plan) = snapshot
-            .credentials
-            .plan(cfg, &caller.namespace, &provider.id)
-        else {
+        let Some(plan) = (if pinned {
+            snapshot
+                .credentials
+                .plan_pinned(cfg, &caller.namespace, &provider.id)
+        } else {
+            snapshot
+                .credentials
+                .plan(cfg, &caller.namespace, &provider.id)
+        }) else {
+            if pinned {
+                return Err(GatewayError::ContinuationAffinityUnavailable {
+                    provider: target.provider.clone(),
+                    model: target.model.clone(),
+                });
+            }
             walk.note_missing_credential(&provider.id);
             continue;
         };
@@ -1371,6 +1452,7 @@ async fn stream_with_failover(
             ctx.attempts = target_attempt + 1;
             match opened {
                 Ok((decoder, bytes)) => {
+                    reservation_guard.disarm();
                     telemetry::finish_upstream_attempt(
                         span,
                         telemetry::ATTEMPT_OK,
@@ -1518,15 +1600,16 @@ async fn stream_with_failover(
 
     if let Some(err) = walk.last_error.take() {
         if let Some((mut ctx, started)) = last_ctx {
+            reservation_guard.disarm();
             ctx.attempts = walk.attempts;
             ctx.rate_limit_permit = hold.permit.take();
             streaming::settle_upstream_error(state.clone(), ctx, started);
         } else {
-            state.0.budget.release(&hold.key, &hold.reservation).await;
+            reservation_guard.release().await;
         }
         return Err(err.into());
     }
-    state.0.budget.release(&hold.key, &hold.reservation).await;
+    reservation_guard.release().await;
     Err(walk.into_error())
 }
 
@@ -1591,6 +1674,10 @@ impl BudgetReservation {
             .take()
             .expect("budget reservation guard must be armed");
         self.state.0.budget.release(&self.key, &reservation).await;
+    }
+
+    fn disarm(mut self) {
+        self.reservation.take();
     }
 }
 
@@ -1850,6 +1937,7 @@ fn estimate_usage(body: &Value) -> Usage {
     let output_tokens = body
         .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
+        .or_else(|| body.get("max_output_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
     Usage {
@@ -1972,6 +2060,10 @@ namespace = "platform"
     }
 
     fn test_state() -> AppState {
+        test_state_with_base_url("https://api.openai.com/v1")
+    }
+
+    fn test_state_with_base_url(base_url: &str) -> AppState {
         let cfg = Config::from_toml_str(&format!(
             r#"
 [[namespace]]
@@ -1981,7 +2073,7 @@ default = true
 [[provider]]
 id = "openai"
 kind = "openai"
-base_url = "https://api.openai.com/v1"
+base_url = "{base_url}"
 
 [[credential]]
 namespace = "platform"
@@ -2088,10 +2180,21 @@ max_request_microdollars = 1000
     }
 
     async fn mint_request(state: AppState, body: Value) -> (StatusCode, Value) {
+        mint_request_with_credential(state, "mint-key", body).await
+    }
+
+    async fn mint_request_with_credential(
+        state: AppState,
+        credential: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
         let response = router(state)
             .oneshot(
                 Request::post("/v1/tokens")
-                    .header(axum::http::header::AUTHORIZATION, "Bearer mint-key")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {credential}"),
+                    )
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
@@ -2153,6 +2256,42 @@ max_request_microdollars = 1000
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn default_scope_minted_token_reaches_responses() {
+        let state = scoped_route_state().await;
+        let mut config = state.config().config.clone();
+        config.gateway_key[0].can_mint = true;
+        config.gateway_minting = Some(crate::config::GatewayMinting {
+            kid: "scope-test-kid".to_owned(),
+            env: Some("JWT_SECRET".to_owned()),
+            file: None,
+            max_ttl: None,
+            scope: None,
+            aliases: None,
+            max_request_microdollars: None,
+        });
+        let env = HashMap::from([
+            ("CHAT_KEY".to_owned(), "chat-key".to_owned()),
+            ("MESSAGES_KEY".to_owned(), "messages-key".to_owned()),
+            ("EMBEDDINGS_KEY".to_owned(), "embeddings-key".to_owned()),
+            ("RESPONSES_KEY".to_owned(), "responses-key".to_owned()),
+            ("STATIC_KEY".to_owned(), "static-key".to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
+        state.publish(ConfigSnapshot::build(config, &env, 0).expect("minting snapshot"));
+
+        let (status, body) =
+            mint_request_with_credential(state.clone(), "static-key", json!({"sub": "agent"}))
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = body["token"].as_str().expect("minted token");
+        let response = scoped_route_request(state, "/v1/responses", token).await;
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -2254,6 +2393,11 @@ max_request_microdollars = 1000
             "platform",
             Capability::Embeddings
         ));
+        assert!(namespace_allows(
+            &snapshot,
+            "platform",
+            Capability::Responses
+        ));
         assert!(!namespace_allows(
             &snapshot,
             "platform",
@@ -2289,6 +2433,15 @@ max_request_microdollars = 1000
             .into_response(),
         )
         .await;
+        let (responses_url, _) = native_upstream(
+            "/responses",
+            Json(json!({
+                "id": "resp-1",
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            }))
+            .into_response(),
+        )
+        .await;
         let config = Config::from_toml_str(&format!(
             r#"
 [[namespace]]
@@ -2310,6 +2463,11 @@ id = "embeddings"
 kind = "openai"
 base_url = "{embeddings_url}"
 
+[[provider]]
+id = "responses"
+kind = "openai"
+base_url = "{responses_url}"
+
 [[credential]]
 namespace = "platform"
 provider = "chat"
@@ -2324,6 +2482,11 @@ env = "MESSAGES_KEY"
 namespace = "platform"
 provider = "embeddings"
 env = "EMBEDDINGS_KEY"
+
+[[credential]]
+namespace = "platform"
+provider = "responses"
+env = "RESPONSES_KEY"
 
 [[gateway_key]]
 env = "STATIC_KEY"
@@ -2350,6 +2513,10 @@ targets = [{{ provider = "messages", model = "messages-model", price = {{ input_
 [[model]]
 name = "embeddings-model"
 targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+
+[[model]]
+name = "responses-model"
+targets = [{{ provider = "responses", model = "responses-model", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
 "#
         ))
         .expect("scope test config");
@@ -2357,6 +2524,7 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
             ("CHAT_KEY".to_owned(), "chat-key".to_owned()),
             ("MESSAGES_KEY".to_owned(), "messages-key".to_owned()),
             ("EMBEDDINGS_KEY".to_owned(), "embeddings-key".to_owned()),
+            ("RESPONSES_KEY".to_owned(), "responses-key".to_owned()),
             ("STATIC_KEY".to_owned(), "static-key".to_owned()),
             (
                 "JWT_SECRET".to_owned(),
@@ -2523,6 +2691,14 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
                 serde_json::to_vec(&json!({
                     "model": "embeddings-model",
                     "input": ["hello"]
+                }))
+                .unwrap(),
+            ),
+            "/v1/responses" => (
+                Method::POST,
+                serde_json::to_vec(&json!({
+                    "model": "responses-model",
+                    "input": "hello"
                 }))
                 .unwrap(),
             ),
@@ -2884,6 +3060,7 @@ max_ttl = "15m"
             "/v1/chat/completions",
             "/v1/messages",
             "/v1/embeddings",
+            "/v1/responses",
         ] {
             assert_eq!(
                 scoped_route_request(scoped_route_state().await, path, &scoped_token(None))
@@ -2925,7 +3102,7 @@ max_ttl = "15m"
     }
 
     #[tokio::test]
-    async fn scoped_token_on_responses_keeps_the_typed_501() {
+    async fn scoped_token_requires_the_responses_capability() {
         let response = router(test_state())
             .oneshot(
                 Request::post("/v1/responses")
@@ -2941,10 +3118,7 @@ max_ttl = "15m"
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"]["type"], "not_implemented");
+        assert_scope_denial(response, "responses").await;
     }
 
     /// Inbound auth is enforced for every configured key set: the wrong
@@ -3178,7 +3352,7 @@ max_ttl = "15m"
     }
 
     #[tokio::test]
-    async fn the_responses_route_rejects_anonymous_callers_before_deferring() {
+    async fn the_responses_route_rejects_anonymous_callers_before_dispatching() {
         let resp = router(test_state())
             .oneshot(
                 Request::post("/v1/responses")
@@ -3612,20 +3786,25 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
         }
     }
 
-    /// Deferred past beta, but the route still answers for itself: a caller
-    /// cannot tell a missing route from a misconfigured `base_url`.
     #[tokio::test]
-    async fn the_responses_route_is_a_typed_501_that_names_its_deferral() {
-        let resp = router(test_state())
-            .oneshot(authorized("/v1/responses").body(Body::from("{}")).unwrap())
+    async fn the_responses_route_dispatches_through_the_shared_path() {
+        let (base_url, _) = controllable_upstream(
+            Arc::new(AtomicBool::new(false)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let resp = router(test_state_with_base_url(&base_url))
+            .oneshot(
+                authorized("/v1/responses")
+                    .body(Body::from(r#"{"model":"gpt-4o","input":"hello"}"#))
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["error"]["type"], "not_implemented");
-        let message = json["error"]["message"].as_str().unwrap();
-        assert!(message.contains("/v1/chat/completions"), "{message}");
+        assert_eq!(json["error"]["type"], "provider_dependency_failed");
     }
 
     /// An alias whose targets cannot speak the route's wire is the caller's
@@ -3742,6 +3921,83 @@ targets = [{{ provider = "anthropic", model = "claude-sonnet-4-5", price = {{ in
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://{addr}")
+    }
+
+    async fn credential_probe_upstream(reject_first: bool) -> (String, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let app_seen = seen.clone();
+        let app = Router::new().route(
+            "/responses",
+            post(move |headers: HeaderMap| {
+                let seen = app_seen.clone();
+                async move {
+                    let authorization = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned();
+                    seen.lock().unwrap().push(authorization.clone());
+                    if reject_first && authorization == "Bearer sk-a" {
+                        (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            Json(json!({ "error": { "message": "rate limit exceeded" } })),
+                        )
+                            .into_response()
+                    } else {
+                        Json(json!({
+                            "id": "resp-1",
+                            "object": "response",
+                            "usage": {
+                                "input_tokens": 10,
+                                "output_tokens": 5
+                            }
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn two_credential_responses_state(base_url: &str, captured: CapturingSink) -> AppState {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "{base_url}"
+
+{GATEWAY_KEY}
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K1"
+id = "openai-a"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K2"
+id = "openai-b"
+
+[[model]]
+name = "gpt-4o"
+targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 1000000 }} }}]
+"#
+        ))
+        .unwrap();
+        let env = env_with([("K1", "sk-a"), ("K2", "sk-b")]);
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(captured)];
+        AppState::new(cfg, &env, UsageFanout::new(sinks), Box::new(NoBudget)).unwrap()
     }
 
     #[tokio::test]
@@ -3927,39 +4183,51 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
     /// A stand-in provider whose health is flipped at test time, counting the
     /// requests that actually reached it. Serves `200` while `healthy`, and the
     /// given status otherwise.
+    #[derive(Clone)]
+    struct ControllableState {
+        healthy: Arc<AtomicBool>,
+        hits: Arc<AtomicUsize>,
+        unhealthy_status: StatusCode,
+    }
+
+    async fn controllable_handler(State(state): State<ControllableState>) -> Response {
+        state.hits.fetch_add(1, Ordering::SeqCst);
+        if state.healthy.load(Ordering::SeqCst) {
+            Json(json!({
+                "id": "resp-1",
+                "object": "response",
+                "choices": [],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5
+                }
+            }))
+            .into_response()
+        } else {
+            (
+                state.unhealthy_status,
+                Json(json!({ "error": { "message": "upstream is unwell" } })),
+            )
+                .into_response()
+        }
+    }
+
     async fn controllable_upstream(
         healthy: Arc<AtomicBool>,
         unhealthy_status: StatusCode,
     ) -> (String, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
-        let counter = hits.clone();
-        let app = Router::new().route(
-            "/chat/completions",
-            post(move || {
-                let healthy = healthy.clone();
-                let counter = counter.clone();
-                async move {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    if healthy.load(Ordering::SeqCst) {
-                        (
-                            StatusCode::OK,
-                            Json(json!({
-                                "id": "chatcmpl-1",
-                                "choices": [],
-                                "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
-                            })),
-                        )
-                            .into_response()
-                    } else {
-                        (
-                            unhealthy_status,
-                            Json(json!({ "error": { "message": "upstream is unwell" } })),
-                        )
-                            .into_response()
-                    }
-                }
-            }),
-        );
+        let state = ControllableState {
+            healthy,
+            hits: hits.clone(),
+            unhealthy_status,
+        };
+        let app = Router::new()
+            .route("/chat/completions", post(controllable_handler))
+            .route("/responses", post(controllable_handler))
+            .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -3973,6 +4241,16 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         url_b: &str,
         failover: &str,
         captured: CapturingSink,
+    ) -> AppState {
+        two_target_state_with_budget(url_a, url_b, failover, captured, Box::new(NoBudget))
+    }
+
+    fn two_target_state_with_budget(
+        url_a: &str,
+        url_b: &str,
+        failover: &str,
+        captured: CapturingSink,
+        budget: Box<dyn crate::budget::BudgetStore>,
     ) -> AppState {
         let cfg = Config::from_toml_str(&format!(
             r#"
@@ -4017,13 +4295,46 @@ targets = [
         .unwrap();
         let env = env_with([("KA", "ka"), ("KB", "kb")]);
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(captured)];
-        AppState::new(cfg, &env, UsageFanout::new(sinks), Box::new(NoBudget)).unwrap()
+        AppState::new(cfg, &env, UsageFanout::new(sinks), budget).unwrap()
     }
 
     fn chat_request() -> Request<Body> {
         let body = serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []})).unwrap();
         authorized("/v1/chat/completions")
             .body(Body::from(body))
+            .unwrap()
+    }
+
+    fn responses_request(previous_response_id: Option<&str>) -> Request<Body> {
+        let mut body = json!({"model": "gpt-4o", "input": "hello"});
+        if let Some(id) = previous_response_id {
+            body["previous_response_id"] = json!(id);
+        }
+        authorized("/v1/responses")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn streaming_responses_request(previous_response_id: &str) -> Request<Body> {
+        let body = json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "stream": true,
+            "previous_response_id": previous_response_id
+        });
+        authorized("/v1/responses")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn responses_request_with_null_previous_id() -> Request<Body> {
+        let body = json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "previous_response_id": null
+        });
+        authorized("/v1/responses")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
     }
 
@@ -4536,6 +4847,190 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(records[0].target_model, "m-b");
         assert_eq!(records[0].credential_id, "cred-b");
         assert_eq!(records[0].attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn a_responses_previous_id_pins_the_first_target_without_failover() {
+        let (url_a, hits_a) = controllable_upstream(
+            Arc::new(AtomicBool::new(false)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let (url_b, hits_b) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let captured = CapturingSink::default();
+        let state = two_target_state(&url_a, &url_b, "", captured.clone());
+
+        let pinned = router(state.clone())
+            .oneshot(responses_request(Some("resp-from-a")))
+            .await
+            .unwrap();
+        assert_eq!(pinned.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
+
+        let unpinned = router(state)
+            .oneshot(responses_request_with_null_previous_id())
+            .await
+            .unwrap();
+        assert_eq!(unpinned.status(), StatusCode::OK);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 2);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+
+        let records = captured.0.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].status.as_str(), "upstream_error");
+        assert_eq!(records[0].attempts, 1);
+        assert_eq!(records[0].target_provider, "pa");
+        assert_eq!(records[1].status.as_str(), "ok");
+        assert_eq!(records[1].attempts, 2);
+        assert_eq!(records[1].target_provider, "pb");
+    }
+
+    #[tokio::test]
+    async fn a_pinned_responses_request_does_not_use_a_skipped_first_target() {
+        let (url_a, hits_a) = controllable_upstream(
+            Arc::new(AtomicBool::new(false)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let (url_b, hits_b) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let captured = CapturingSink::default();
+        let state = two_target_state(
+            &url_a,
+            &url_b,
+            "[failover]\nmax_attempts = 3\nfailure_threshold = 1",
+            captured.clone(),
+        );
+
+        let first = router(state.clone())
+            .oneshot(responses_request(None))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+
+        let pinned = router(state)
+            .oneshot(responses_request(Some("resp-from-a")))
+            .await
+            .unwrap();
+        assert_eq!(pinned.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+        let body = pinned.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "continuation_affinity_unavailable");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("continuation affinity")
+        );
+        let records = captured.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pinned_streaming_responses_skipped_target_releases_its_budget_hold() {
+        let (url_a, hits_a) = controllable_upstream(
+            Arc::new(AtomicBool::new(false)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let (url_b, hits_b) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let captured = CapturingSink::default();
+        let budget = Arc::new(crate::budget::InMemoryBudget::new(1_000_000));
+        let state = two_target_state_with_budget(
+            &url_a,
+            &url_b,
+            "[failover]\nmax_attempts = 3\nfailure_threshold = 1",
+            captured,
+            Box::new(SharedBudget(budget.clone())),
+        );
+
+        let first = router(state.clone())
+            .oneshot(responses_request(None))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+
+        let pinned = router(state)
+            .oneshot(streaming_responses_request("resp-from-a"))
+            .await
+            .unwrap();
+        assert_eq!(pinned.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = pinned.into_body().collect().await.unwrap();
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+
+        let key = BudgetKey {
+            namespace: "platform".to_owned(),
+            subject: "AXOND_INBOUND_KEY".to_owned(),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if budget.outstanding(&key) == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "pinned continuation leaked its budget reservation"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_responses_reuse_the_first_credential_while_unpinned_requests_rotate() {
+        let (base_url, seen) = credential_probe_upstream(false).await;
+        let captured = CapturingSink::default();
+        let state = two_credential_responses_state(&base_url, captured);
+
+        for _ in 0..2 {
+            assert_eq!(
+                router(state.clone())
+                    .oneshot(responses_request(Some("resp-from-a")))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                router(state.clone())
+                    .oneshot(responses_request(None))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        }
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["Bearer sk-a", "Bearer sk-a", "Bearer sk-a", "Bearer sk-b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_responses_rate_limit_does_not_rotate_credentials() {
+        let (base_url, seen) = credential_probe_upstream(true).await;
+        let captured = CapturingSink::default();
+        let state = two_credential_responses_state(&base_url, captured);
+
+        let response = router(state)
+            .oneshot(responses_request(Some("resp-from-a")))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(*seen.lock().unwrap(), ["Bearer sk-a"]);
     }
 
     #[tokio::test]

@@ -16,31 +16,36 @@ use crate::aliases::AliasScope;
 use crate::config::{Config, GatewayVerifierAlgorithm};
 use crate::key_material::{self, KeyMaterialError};
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub enum Capability {
+macro_rules! define_capabilities {
+    ($($capability:ident),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+        pub enum Capability {
+            $($capability),+
+        }
+
+        impl Capability {
+            pub(crate) const ALL: &'static [Self] = &[$(Self::$capability),+];
+        }
+    };
+}
+
+define_capabilities!(
     Chat,
     Messages,
     Embeddings,
+    Responses,
     Models,
     Credentials,
     CredentialsAll,
-}
+);
 
 impl Capability {
-    pub(crate) const ALL: [Self; 6] = [
-        Self::Chat,
-        Self::Messages,
-        Self::Embeddings,
-        Self::Models,
-        Self::Credentials,
-        Self::CredentialsAll,
-    ];
-
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "chat" => Some(Self::Chat),
             "messages" => Some(Self::Messages),
             "embeddings" => Some(Self::Embeddings),
+            "responses" => Some(Self::Responses),
             "models" => Some(Self::Models),
             "credentials" => Some(Self::Credentials),
             "credentials:all" => Some(Self::CredentialsAll),
@@ -53,6 +58,7 @@ impl Capability {
             Self::Chat => "chat",
             Self::Messages => "messages",
             Self::Embeddings => "embeddings",
+            Self::Responses => "responses",
             Self::Models => "models",
             Self::Credentials => "credentials",
             Self::CredentialsAll => "credentials:all",
