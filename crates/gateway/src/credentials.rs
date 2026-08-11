@@ -334,6 +334,7 @@ impl Credentials {
         Some(CredentialPlan {
             source,
             attempts: vec![lease(entry)],
+            parked: Vec::new(),
         })
     }
 
