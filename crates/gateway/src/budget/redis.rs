@@ -613,6 +613,9 @@ fn resolve_legacy_scope(
         .and_then(|rest| rest.strip_suffix(&closing))
         .ok_or_else(|| ambiguous("it is not a `<prefix>:{namespace|subject}` key"))?;
 
+    // By resolved key, not by candidate: a config may legitimately declare the
+    // same namespace id twice (see `Config::distinct_namespace_count`), and two
+    // candidates that agree on the split are not an ambiguity.
     let mut matched = namespaces
         .iter()
         .filter_map(|namespace| {
@@ -624,6 +627,8 @@ fn resolve_legacy_scope(
                 })
         })
         .collect::<Vec<_>>();
+    matched.sort_by(|a, b| (&a.namespace, &a.subject).cmp(&(&b.namespace, &b.subject)));
+    matched.dedup();
     match matched.len() {
         1 => Ok(matched.remove(0)),
         0 => Err(ambiguous(
@@ -865,6 +870,13 @@ mod tests {
         let ambiguous = resolve("axond:budget:{team|west|sub}:spent", &["team", "team|west"])
             .expect_err("two candidate namespaces are ambiguous");
         assert!(format!("{ambiguous}").contains("ambiguous"), "{ambiguous}");
+
+        // The same id declared twice is legal in a config and is not an
+        // ambiguity: both candidates agree on where the namespace ends.
+        let parsed = resolve("axond:budget:{acme|sub}:spent", &["acme", "acme"])
+            .expect("a duplicate namespace id resolves to the one key it describes");
+        assert_eq!(parsed.namespace, "acme");
+        assert_eq!(parsed.subject, "sub");
 
         // No configured namespace owns it: refuse.
         for (key, namespaces) in [

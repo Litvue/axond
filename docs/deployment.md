@@ -484,10 +484,19 @@ connection. A replica still configured without `namespace_limit_microdollars` �
 including a binary too old to have a boot check — therefore cannot charge a
 subject while leaving the namespace total behind; its writes fail loudly instead.
 Such a replica also refuses to boot, naming the fence, and a cap-enabled replica
-refuses to boot if the fence is missing or a namespace has spend but no backfilled
-row, so the cap can neither begin from zero nor be quietly bypassed. To return to
-per-subject-only enforcement, stop the fleet and drop the two
-`<table>_namespace_fence` triggers.
+refuses to boot if the fence is missing from either table or a namespace has spend
+but no backfilled row, so the cap can neither begin from zero nor be quietly
+bypassed. To return to per-subject-only enforcement, stop the fleet and drop the
+two `<table>_namespace_fence` triggers.
+
+The declaration the fence looks for is a session setting, sent once per
+connection, so **point the budget DSN at Postgres directly or at a pooler in
+session mode**. A pooler in *transaction* mode may run the declaration on one
+backend and the writes on another, in which case boot succeeds and then every
+reserve and settlement is rejected by the fence. `create_table = true` also
+re-applies the DDL on boot, but skips the v2 file once the schema is installed and
+backfilled, so a restart does not re-take the `EXCLUSIVE` lock or re-run the
+aggregate against a live fleet.
 
 Both backends then concentrate a namespace's traffic on one hot spot — one spend
 row in Postgres, one counter and reservation hash in Redis — and every reserve

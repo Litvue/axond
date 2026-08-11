@@ -229,10 +229,14 @@ fn migrate_redis_budget(args: &clap::ArgMatches) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     // The v1 keys are attributed against the configured namespaces, so this must
     // run with the config that wrote them.
+    // Distinct: an id may legitimately appear twice, and the same id offered
+    // twice as a candidate owner of a key is not an ambiguity.
     let namespaces: Vec<String> = config
         .namespace
         .iter()
         .map(|namespace| namespace.id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect();
     let report = runtime.block_on(budget::migrate_redis(&config.budget, &namespaces, &env))?;
     eprintln!(

@@ -124,7 +124,15 @@ impl PostgresBudget {
         let client = store.connect_client().await?;
         if settings.create_table {
             client.batch_execute(&store.schema_ddl(SCHEMA_DDL)).await?;
-            if store.settings.enforces_namespace_cap() {
+            // The v2 file is a migration, not idempotent boot DDL: it takes an
+            // `EXCLUSIVE` lock on the spend table and ends with a whole-table
+            // aggregate, all in one batch. Re-running it on every restart would
+            // block every other replica's reserves and settlements for the
+            // duration of that aggregate, so it runs only when the schema it
+            // installs is not already there.
+            if store.settings.enforces_namespace_cap()
+                && !store.namespace_schema_ready(&client).await
+            {
                 client
                     .batch_execute(&store.schema_ddl(SCHEMA_DDL_V2))
                     .await?;
@@ -250,7 +258,9 @@ impl PostgresBudget {
         });
         if self.settings.enforces_namespace_cap() {
             // Every connection, not just the first: the fence is per session, and
-            // a reconnect after a failure gets a fresh one.
+            // a reconnect after a failure gets a fresh one. Being per session, it
+            // also assumes the DSN reaches a backend directly (or through a pooler
+            // in session mode); see `docs/deployment.md`.
             client.batch_execute(NAMESPACE_CAP_DECLARATION).await?;
         }
         Ok(client)
@@ -262,6 +272,15 @@ impl PostgresBudget {
     fn fence_name(&self) -> String {
         let prefix = self.table.rsplit('.').next().unwrap_or(&self.table);
         format!("{prefix}_namespace_fence")
+    }
+
+    /// Whether everything the v2 file installs is already in place *and* in force:
+    /// the namespace table, the fence on both relations, and a namespace total for
+    /// every namespace with spend. That is exactly what the cap-enabled boot check
+    /// demands, so anything it would reject reads as not ready and the file is
+    /// applied; anything it would accept needs no lock and no backfill.
+    async fn namespace_schema_ready(&self, client: &Client) -> bool {
+        self.require_namespace_schema(client).await.is_ok()
     }
 
     /// Whether the fence is on the spend table and on the reservation table,
@@ -1019,6 +1038,84 @@ mod tests {
             Admission::Denied(Denial::Exceeded),
             "the namespace has 600 of its 1000 spent, and nothing slipped past"
         );
+    }
+
+    /// `create_table = true` re-applies the shipped DDL on every boot, but the v2
+    /// file is a migration: an `EXCLUSIVE` lock plus a whole-table aggregate. A
+    /// restart must not take that lock again, or it would stall every other
+    /// replica's reserves and settlements for as long as the aggregate runs.
+    #[tokio::test]
+    async fn a_restart_does_not_re_lock_the_spend_table_to_reapply_the_v2_ddl() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let table = "axond_budget_ns_relock_test";
+        let store = namespace_store(&dsn, table, namespace_settings(1_000, 1_000)).await;
+        drop(store);
+
+        // Another replica is mid-settlement, holding `ROW EXCLUSIVE` on the spend
+        // table — which conflicts with the `EXCLUSIVE` the v2 file takes.
+        let (mut busy, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(connection);
+        busy.batch_execute(NAMESPACE_CAP_DECLARATION)
+            .await
+            .expect("declare");
+        let holding = busy.transaction().await.expect("begin");
+        holding
+            .execute(
+                &format!(
+                    "INSERT INTO {table} (namespace, subject, spent_microdollars)
+                     VALUES ('acme', 'busy', 10)"
+                ),
+                &[],
+            )
+            .await
+            .expect("write as the fleet does");
+
+        let booted = tokio::time::timeout(
+            Duration::from_secs(10),
+            PostgresBudget::connect(
+                &dsn,
+                PostgresBudgetSettings {
+                    table: table.to_owned(),
+                    create_table: true,
+                    shared: namespace_settings(1_000, 1_000),
+                },
+            ),
+        )
+        .await
+        .expect("booting must not queue behind an in-flight settlement");
+        booted.expect("connect");
+        holding.rollback().await.expect("rollback");
+
+        // But a schema that is *not* already installed is still applied, so the
+        // skip cannot leave a replica serving without the fence.
+        let (admin, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(connection);
+        admin
+            .batch_execute(&format!(
+                "DROP TRIGGER {table}_namespace_fence ON {table}_reservation"
+            ))
+            .await
+            .expect("drop the reservation fence");
+        namespace_store(&dsn, table, namespace_settings(1_000, 1_000)).await;
+        let restored: bool = admin
+            .query_one(
+                "SELECT count(*) = 1 FROM pg_trigger
+                 WHERE tgname = $1 AND tgrelid = to_regclass($2) AND NOT tgisinternal",
+                &[
+                    &format!("{table}_namespace_fence"),
+                    &format!("{table}_reservation"),
+                ],
+            )
+            .await
+            .expect("query")
+            .get(0);
+        assert!(restored, "an incomplete v2 schema is still applied at boot");
     }
 
     /// A trigger name is unique per table, never globally, and the fence has to
