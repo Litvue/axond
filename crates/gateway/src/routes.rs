@@ -2317,6 +2317,7 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
             &scoped_token(Some(vec!["credentials"])),
         )
         .await;
+        assert_eq!(response.status(), StatusCode::OK);
         let body: Value =
             serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
