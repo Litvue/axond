@@ -43,7 +43,7 @@ const BACKEND: &str = "postgres";
 const SCHEMA_DDL: &str = include_str!("../../sql/budget_v1.sql");
 
 /// The additive DDL the namespace cap needs, applied on top of the v1 schema.
-const SCHEMA_DDL_V2: &str = include_str!("../../../../ops/postgres/budget_v2.sql");
+const SCHEMA_DDL_V2: &str = include_str!("../../sql/budget_v2.sql");
 
 /// The table name the shipped DDL uses; substituted when another is configured.
 const DEFAULT_TABLE: &str = "axond_budget";

@@ -394,6 +394,15 @@ measured spend afterwards, so concurrent requests cannot collectively overshoot.
 A cancelled or failed request is charged what it actually consumed — not the
 estimate, and not always zero.
 
+Settlement happens **exactly once** per admitted request — on completion,
+upstream failure, client cancellation, or a dropped handler — and charges and
+releases in one atomic operation, so a request can never be charged without its
+hold being freed or vice versa. It is never retried: a settlement the store
+rejects leaves the hold to lapse at `reservation_ttl_seconds`, which the next
+reserve reclaims. That TTL is therefore the upper bound on how long a failed
+settlement can hold budget out of circulation, which is why it should exceed the
+longest expected request rather than be set generously.
+
 ### The namespace cap
 
 With `namespace_limit_microdollars` set, a request is admitted only if it fits

@@ -39,7 +39,7 @@
 //! contends on one spend counter, and every reserve scans that namespace's whole
 //! reservation hash. That is the cost of exactness (see ADR 0010).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -187,19 +187,24 @@ redis.call('SET', KEYS[2], claim)
 return claim
 "#;
 
-/// Step two: **add** a claimed batch to the v2 subject counter, at most once.
-/// The claim token is recorded in a hash beside the counter, in the same
-/// `{namespace}` slot, so the add and the record of having added it are one
-/// atomic operation. A repeated (or resumed) apply is a no-op, and a *new* batch
-/// from the same v1 key carries a new sequence number, so genuine post-migration
-/// spend is added rather than mistaken for a replay.
+/// Step two: **add** a claimed batch to the v2 counters, at most once. The
+/// subject total, the namespace total, and the record of having applied the claim
+/// all carry the same `{namespace}` tag, so one script covers them in one slot
+/// and the two totals cannot drift apart.
+///
+/// The namespace total is incremented by the claimed delta, never recomputed from
+/// the subject counters: a sum-then-write would clobber a settlement that a live
+/// v2 replica committed in between. A repeated (or resumed) apply is a no-op, and
+/// a *new* batch from the same v1 key carries a new sequence number, so genuine
+/// post-migration spend is added rather than mistaken for a replay.
 const APPLY_CLAIM: &str = r#"
 local amount = tonumber(ARGV[2])
-if redis.call('HSETNX', KEYS[2], ARGV[1], amount) == 0 then
+if redis.call('HSETNX', KEYS[3], ARGV[1], amount) == 0 then
   return 0
 end
 if amount > 0 then
   redis.call('INCRBY', KEYS[1], amount)
+  redis.call('INCRBY', KEYS[2], amount)
 end
 return amount
 "#;
@@ -488,11 +493,16 @@ pub async fn migrate_v1_to_v2(
         resolve_legacy_scope(key_prefix, legacy, ":reservations", namespaces)?;
     }
 
+    // Each carry adds its subject's spend to that subject's counter *and* to its
+    // namespace's, in one script, so the namespace total is built up additively
+    // and is never recomputed from a sum that a live settlement could outrun.
     let mut seen = HashSet::new();
+    let mut touched = HashSet::new();
     for key in scopes {
         if !seen.insert((key.namespace.clone(), key.subject.clone())) {
             continue;
         }
+        touched.insert(key.namespace.clone());
         let carried = carry_forward(&mut connection, &drain, &apply, key_prefix, &key).await?;
         report.subjects += 1;
         report.carried_microdollars = report.carried_microdollars.saturating_add(carried);
@@ -502,24 +512,7 @@ pub async fn migrate_v1_to_v2(
         let _: i64 = connection.del(legacy).await?;
         report.reservation_hashes += 1;
     }
-
-    // A namespace total is the sum of its subject ledgers, so it can always be
-    // rebuilt from them — which is also how a partially applied migration heals.
-    let mut totals: HashMap<String, u64> = HashMap::new();
-    let subject_pattern = format!("{key_prefix}:v2:{{*}}:subject:*:spent");
-    for subject_key in scan(&mut connection, &subject_pattern).await? {
-        let Some(namespace) = hash_tag(&subject_key) else {
-            continue;
-        };
-        let spent: Option<i64> = connection.get(&subject_key).await?;
-        *totals.entry(namespace.to_owned()).or_default() += spent.unwrap_or_default().max(0) as u64;
-    }
-    for (namespace, total) in &totals {
-        // The namespace id is already escaped inside the tag it was read from.
-        let key = format!("{key_prefix}:v2:{{{namespace}}}:namespace:spent");
-        let _: () = connection.set(key, *total).await?;
-        report.namespaces += 1;
-    }
+    report.namespaces = touched.len();
 
     let _: () = connection.set(layout_key(key_prefix), LAYOUT_V2).await?;
     Ok(report)
@@ -574,6 +567,7 @@ async fn carry_forward(
         let added: i64 = apply
             .prepare_invoke()
             .key(&v2.subject_spent)
+            .key(&v2.namespace_spent)
             .key(&applied)
             // Unique per subject *and* per claim, so re-applying is a no-op but
             // a fresh claim is additive.
@@ -644,7 +638,10 @@ fn resolve_legacy_scope(
 
 /// The contents of a key's `{...}` hash tag: the first `{` and the first `}`
 /// after it, which is the slot Redis itself hashes. v2 keys escape braces out
-/// of the identifiers inside the tag, so this reads a whole v2 namespace.
+/// of the identifiers inside the tag, so this reads a whole v2 namespace. Only
+/// the tests need it: the code builds tags rather than parsing them, deliberately
+/// (parsing one is what made the old migration attribute keys by guesswork).
+#[cfg(test)]
 fn hash_tag(key: &str) -> Option<&str> {
     let start = key.find('{')? + 1;
     let end = key[start..].find('}')? + start;
@@ -1382,6 +1379,73 @@ mod tests {
         assert_eq!(spent(&url, &prefix, &k).await, 550);
     }
 
+    /// The recovery runs against a live v2 fleet, so it must add its delta to the
+    /// namespace total rather than recompute that total: a sum taken before a
+    /// concurrent settlement and written after it would erase the settlement.
+    #[tokio::test]
+    async fn recovering_a_stray_v1_write_keeps_the_v2_spend_beside_it() {
+        let Some(url) = crate::test_services::redis_url() else {
+            return;
+        };
+        let prefix = prefix();
+        let carried_subject = BudgetKey {
+            namespace: "acme".into(),
+            subject: "first".into(),
+        };
+        let v2_only_subject = BudgetKey {
+            namespace: "acme".into(),
+            subject: "second".into(),
+        };
+
+        // Migrate a namespace that has spend, so the layout is v2 and the
+        // namespace total is non-zero to begin with.
+        let v1 = RedisBudget::connect(&url, prefix.clone(), settings(10_000))
+            .await
+            .expect("connect");
+        let Admission::Allowed(held) = v1.reserve(&carried_subject, 400).await else {
+            panic!("admitted");
+        };
+        v1.settle(&carried_subject, &held, 400).await;
+        migrate_v1_to_v2(&url, &prefix, &namespaces())
+            .await
+            .expect("migrate");
+
+        // A cap-enabled replica spends under v2 on a different subject, and a
+        // stray v1 replica settles under the old layout on the first one.
+        let v2 = RedisBudget::connect(&url, prefix.clone(), namespace_settings(10_000, 10_000))
+            .await
+            .expect("connect");
+        let Admission::Allowed(held) = v2.reserve(&v2_only_subject, 250).await else {
+            panic!("admitted");
+        };
+        v2.settle(&v2_only_subject, &held, 250).await;
+        let _: () = ::redis::Client::open(url.as_str())
+            .expect("client")
+            .get_multiplexed_async_connection()
+            .await
+            .expect("connect")
+            .set(format!("{prefix}:{{acme|first}}:spent"), 150)
+            .await
+            .expect("stray v1 spend");
+
+        let recovery = migrate_v1_to_v2(&url, &prefix, &namespaces())
+            .await
+            .expect("re-migrate");
+        assert_eq!(recovery.carried_microdollars, 150);
+        assert_eq!(spent(&url, &prefix, &carried_subject).await, 550);
+        assert_eq!(
+            spent(&url, &prefix, &v2_only_subject).await,
+            250,
+            "the v2-only subject is untouched by the carry"
+        );
+        assert_eq!(
+            namespace_spent(&url, &prefix, "acme").await,
+            800,
+            "400 carried, 250 settled under v2, 150 recovered: the recovery added \
+             its delta instead of overwriting the total"
+        );
+    }
+
     /// A carry is claimed on the v1 side and applied on the v2 side, and either
     /// step can be the last thing that happens before the process dies. Neither
     /// interruption may lose or duplicate spend.
@@ -1446,6 +1510,7 @@ mod tests {
             let added: i64 = apply
                 .prepare_invoke()
                 .key(v2_keys(&prefix, &k).subject_spent)
+                .key(v2_keys(&prefix, &k).namespace_spent)
                 .key(format!(
                     "{}:migration:applied",
                     namespace_scope(&prefix, "acme")

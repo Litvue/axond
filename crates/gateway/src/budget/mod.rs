@@ -114,7 +114,17 @@ pub trait BudgetStore: Send + Sync {
     /// requests already in flight count against the cap.
     async fn reserve(&self, key: &BudgetKey, estimated_microdollars: u64) -> Admission;
     /// Release the reservation and record the measured spend, in micro-dollars.
-    /// Called exactly once per admitted request, whatever its outcome.
+    ///
+    /// **Exactly once per admitted request**, whatever its outcome — completion,
+    /// upstream failure, client cancellation, or a dropped handler. The route
+    /// guarantees it: the guard holding the reservation is disarmed before the
+    /// call, so a settlement and its drop-path fallback cannot both run, and no
+    /// caller retries a settlement. So an implementation must charge and release
+    /// in one atomic step (neither alone is recoverable afterwards), and it must
+    /// not assume a second chance: a settlement that fails at the store leaves the
+    /// hold to expire with its TTL, which the reserve path reclaims. That is the
+    /// bound on how long a failed settlement can hold a budget, and it is why the
+    /// TTL should exceed the longest expected request rather than be generous.
     async fn settle(&self, key: &BudgetKey, reservation: &Reservation, actual_microdollars: u64);
     /// Drop a reservation that consumed nothing. Settling zero is the same
     /// operation, and every backend implements it that way.
