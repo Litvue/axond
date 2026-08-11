@@ -416,12 +416,16 @@ subjects, which is what bounds a namespace whose holder can mint fresh subjects
 it at boot. Turning it on is a **migration**, not a config flip, because the
 accumulated spend has to be carried into the new shape:
 
-**Redis.** Stop every replica, then run the migration and start the fleet with
-the cap set:
+**Redis.** Set `namespace_limit_microdollars` in the config first, stop every
+replica, then run the migration and start the fleet on that same config:
 
 ```bash
 axond budget migrate-redis --config /etc/axond/axond.toml
 ```
+
+The command reads the config it is given and refuses to run if the cap is not set
+there, since only a gateway configured with one can serve the layout it produces —
+migrating first and configuring second would leave the fleet unable to start.
 
 Do not run old and new binaries at the same time. A version without namespace-cap
 support writes the previous key layout, so the two would each enforce a share of

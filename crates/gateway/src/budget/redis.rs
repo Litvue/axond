@@ -425,19 +425,18 @@ async fn require_no_pending_claims(
     connection: &mut ConnectionManager,
     key_prefix: &str,
 ) -> Result<(), BudgetError> {
-    let pending = scan(connection, &format!("{key_prefix}:{{*}}{PENDING}")).await?;
-    if pending.is_empty() {
+    let pending = tally(connection, &format!("{key_prefix}:{{*}}{PENDING}")).await?;
+    let Some(example) = pending.example else {
         return Ok(());
-    }
+    };
     Err(BudgetError::invalid(
         BACKEND,
         format!(
             "{} interrupted migration claim(s) are outstanding under `{key_prefix}` (for example \
-             `{}`): a `axond budget migrate-redis` run was cut short after taking spend off the v1 \
-             key and before adding it to the v2 counters, so that spend is in neither. Re-run \
-             `axond budget migrate-redis`, which finishes them exactly once.",
-            pending.len(),
-            pending[0]
+             `{example}`): a `axond budget migrate-redis` run was cut short after taking spend off \
+             the v1 key and before adding it to the v2 counters, so that spend is in neither. \
+             Re-run `axond budget migrate-redis`, which finishes them exactly once.",
+            pending.count
         ),
     ))
 }
@@ -448,9 +447,31 @@ async fn count_legacy_keys(
 ) -> Result<usize, BudgetError> {
     let mut total = 0;
     for pattern in legacy_patterns(key_prefix) {
-        total += scan(connection, &pattern).await?.len();
+        total += tally(connection, &pattern).await?.count;
     }
     Ok(total)
+}
+
+/// How many keys match a pattern, and one of them to name in an error.
+struct Tally {
+    count: usize,
+    example: Option<String>,
+}
+
+/// [`Tally`] for a pattern, without holding the matches: a boot check wants a
+/// count and something to point at, and the keyspace it walks may not be only
+/// ours.
+async fn tally(connection: &mut ConnectionManager, pattern: &str) -> Result<Tally, BudgetError> {
+    let mut tally = Tally {
+        count: 0,
+        example: None,
+    };
+    scan(connection, pattern, |key| {
+        tally.count += 1;
+        tally.example.get_or_insert(key);
+    })
+    .await?;
+    Ok(tally)
 }
 
 /// Every key matching a pattern. `SCAN` rather than `KEYS`, so a big keyspace
@@ -458,9 +479,9 @@ async fn count_legacy_keys(
 async fn scan(
     connection: &mut ConnectionManager,
     pattern: &str,
-) -> Result<Vec<String>, BudgetError> {
+    mut each: impl FnMut(String),
+) -> Result<(), BudgetError> {
     let mut cursor = 0u64;
-    let mut found = Vec::new();
     loop {
         let (next, keys): (u64, Vec<String>) = ::redis::cmd("SCAN")
             .arg(cursor)
@@ -470,12 +491,25 @@ async fn scan(
             .arg(500)
             .query_async(connection)
             .await?;
-        found.extend(keys);
+        for key in keys {
+            each(key);
+        }
         cursor = next;
         if cursor == 0 {
-            return Ok(found);
+            return Ok(());
         }
     }
+}
+
+/// The keys matching a pattern, collected. Only the migration uses this: it runs
+/// with the fleet stopped and needs the keys themselves.
+async fn scanned(
+    connection: &mut ConnectionManager,
+    pattern: &str,
+) -> Result<Vec<String>, BudgetError> {
+    let mut found = Vec::new();
+    scan(connection, pattern, |key| found.push(key)).await?;
+    Ok(found)
 }
 
 /// What a migration carried over, for the operator who ran it.
@@ -532,11 +566,11 @@ pub async fn migrate_v1_to_v2(
     // resolved to exactly one configured namespace fails the whole migration,
     // with nothing deleted and the layout marker unset, so the operator fixes
     // the configuration and re-runs rather than discovering half-moved state.
-    let spend_keys = scan(&mut connection, &legacy_patterns(key_prefix)[0]).await?;
-    let reservation_keys = scan(&mut connection, &legacy_patterns(key_prefix)[1]).await?;
+    let spend_keys = scanned(&mut connection, &legacy_patterns(key_prefix)[0]).await?;
+    let reservation_keys = scanned(&mut connection, &legacy_patterns(key_prefix)[1]).await?;
     // A claim an earlier run took but did not finish applying. Its `:spent` key
     // is already gone, so only this pattern finds it.
-    let claimed_keys = scan(&mut connection, &format!("{key_prefix}:{{*}}{PENDING}")).await?;
+    let claimed_keys = scanned(&mut connection, &format!("{key_prefix}:{{*}}{PENDING}")).await?;
     let mut scopes = Vec::with_capacity(spend_keys.len() + claimed_keys.len());
     for legacy in &spend_keys {
         scopes.push(resolve_legacy_scope(
@@ -583,6 +617,30 @@ pub async fn migrate_v1_to_v2(
         report.reservation_hashes += 1;
     }
     report.namespaces = touched.len();
+
+    // Every claim has been applied and every v1 counter drained, so the two
+    // bookkeeping structures have nothing left to protect and are dropped rather
+    // than left in Redis for the lifetime of the deployment.
+    //
+    // The order matters, and it is the record of applied tokens first: a token is
+    // `<subject>#<sequence>`, so deleting a subject's sequence resets the tokens a
+    // later stray v1 write would produce, and a *surviving* record of the old ones
+    // would then read that write as a replay and drop its spend. Cleared in this
+    // order, an interruption anywhere leaves either both or only the record gone,
+    // and neither can mistake new spend for old.
+    for namespace in &touched {
+        let _: i64 = connection
+            .del(format!(
+                "{}:migration:applied",
+                namespace_scope(key_prefix, namespace)
+            ))
+            .await?;
+    }
+    for key in &seen {
+        let _: i64 = connection
+            .del(format!("{key_prefix}:{{{}|{}}}{SEQ}", key.0, key.1))
+            .await?;
+    }
 
     let _: () = connection.set(layout_key(key_prefix), LAYOUT_V2).await?;
     Ok(report)
@@ -1526,6 +1584,53 @@ mod tests {
             "400 carried, 250 settled under v2, 150 recovered: the recovery added \
              its delta instead of overwriting the total"
         );
+    }
+
+    /// The sequence keys and the record of applied claims exist to make an
+    /// interrupted carry resumable exactly once; once the run is over they are dead
+    /// state, and nothing else would ever reclaim them.
+    #[tokio::test]
+    async fn a_finished_migration_leaves_no_bookkeeping_behind() {
+        let Some(url) = crate::test_services::redis_url() else {
+            return;
+        };
+        let prefix = prefix();
+        let k = BudgetKey {
+            namespace: "acme".into(),
+            subject: "first".into(),
+        };
+        let client = ::redis::Client::open(url.as_str()).expect("client");
+        let mut connection = ConnectionManager::new(client).await.expect("connect");
+        let _: () = connection
+            .set(format!("{prefix}:{{acme|first}}:spent"), 250)
+            .await
+            .expect("v1 spend");
+
+        migrate_v1_to_v2(&url, &prefix, &namespaces())
+            .await
+            .expect("migrate");
+        assert_eq!(spent(&url, &prefix, &k).await, 250);
+        for key in [
+            format!("{prefix}:{{acme|first}}{SEQ}"),
+            format!("{}:migration:applied", namespace_scope(&prefix, "acme")),
+        ] {
+            let left: bool = connection.exists(&key).await.expect("read");
+            assert!(!left, "`{key}` outlived the migration");
+        }
+
+        // And a stray v1 write afterwards is still carried exactly once, which is
+        // what the deleted state was protecting: its claim token is fresh because
+        // the record of the old ones went with the run that made them.
+        let _: () = connection
+            .set(format!("{prefix}:{{acme|first}}:spent"), 100)
+            .await
+            .expect("stray v1 spend");
+        let recovery = migrate_v1_to_v2(&url, &prefix, &namespaces())
+            .await
+            .expect("recover");
+        assert_eq!(recovery.carried_microdollars, 100);
+        assert_eq!(spent(&url, &prefix, &k).await, 350);
+        assert_eq!(namespace_spent(&url, &prefix, "acme").await, 350);
     }
 
     /// A carried subject leaves no v1 key and no claim behind, so a run that fails

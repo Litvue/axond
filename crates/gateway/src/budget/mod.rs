@@ -637,6 +637,19 @@ pub async fn migrate_redis(
             ),
         ));
     }
+    // The migration is one-way, and only a gateway with the cap set can serve what
+    // it produces. Run against a config that has none, it would take the fleet
+    // down: every replica would refuse to boot on a layout its configuration
+    // cannot read, and the documented way back is a spend reset. So the command
+    // requires the configuration it is a migration *to*.
+    if config.namespace_limit_microdollars.is_none() {
+        return Err(BudgetError::invalid(
+            "redis",
+            "the Redis budget migration moves this `key_prefix` to the v2 layout, which only a \
+             gateway with `namespace_limit_microdollars` set can serve. Set it under `[budget]` \
+             first, then migrate, then start the fleet on that same configuration.",
+        ));
+    }
     let url = dsn(config, "redis", env)?;
     redis::migrate_v1_to_v2(url, &config.key_prefix(), namespaces).await
 }
@@ -771,6 +784,27 @@ mod tests {
             .err()
             .expect("a missing dsn must fail at boot");
         assert!(matches!(err, BudgetError::Invalid { .. }), "{err:?}");
+    }
+
+    /// The migration is one-way and only the cap-enabled configuration can serve
+    /// what it produces, so running it from a config without the cap would leave
+    /// the whole fleet unable to boot. It refuses before touching Redis.
+    #[tokio::test]
+    async fn the_redis_migration_needs_the_cap_it_migrates_to() {
+        let config = BudgetConfig {
+            backend: BudgetBackend::Redis,
+            limit_microdollars: 1_000,
+            dsn_env: Some("AXOND_TEST_MISSING_BUDGET_URL".to_owned()),
+            ..BudgetConfig::default()
+        };
+        let err = migrate_redis(&config, &[], &HashMap::new())
+            .await
+            .err()
+            .expect("migrating without the cap must fail");
+        assert!(
+            format!("{err}").contains("namespace_limit_microdollars"),
+            "the error must name the missing setting: {err}"
+        );
     }
 
     #[tokio::test]
