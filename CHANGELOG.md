@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.2.0](https://github.com/Litvue/axond/compare/v0.1.6...v0.2.0) (2026-08-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* **adr:** Configurations with cross-family failover aliases that previously booted are now rejected. Operators must split each alias into one alias per wire family before upgrading.
+
+### Features
+
+* **gateway:** validate alias wire families ([0ccdb02](https://github.com/Litvue/axond/commit/0ccdb023cb30f8a8695102b98e0e0670c1607f87))
+
+
+### Bug Fixes
+
+* **ci:** guard empty release PR output ([f963612](https://github.com/Litvue/axond/commit/f963612bf53f6f526e3e4883f62dfea03f83e6ba))
+* **ci:** keep the release job alive when there is no release PR ([99e25a4](https://github.com/Litvue/axond/commit/99e25a40e32bef72c440a9fa4a58624fc20418c9))
+
+
+### Documentation
+
+* **adr:** document alias wire migration ([445cd1f](https://github.com/Litvue/axond/commit/445cd1f6bcb9c87853c65049fc9d58c388f29cba))
+* **adr:** number ADR 0020 title ([22f4ffd](https://github.com/Litvue/axond/commit/22f4ffd71530224b1922a637abe275dfa53e3d97))
+
+
+### Tests
+
+* harden compatibility lock refresh ([3875b95](https://github.com/Litvue/axond/commit/3875b95b64cb41cbebc9d84136662e62aad59514))
+* hash-pin Python SDK compatibility lane ([9014ee5](https://github.com/Litvue/axond/commit/9014ee514d38f8346aa593deb55de4add2d03d22))
+* hash-pin the provider-SDK compatibility lane ([e714068](https://github.com/Litvue/axond/commit/e714068e908ed86e134e380e376ded7031f6e134))
+
+
+### Continuous Integration
+
+* harden compatibility lock guard ([018e78f](https://github.com/Litvue/axond/commit/018e78f34d5e02c5ad39cee214763b35db8a54de))
+
 ## [0.1.6](https://github.com/Litvue/axond/compare/v0.1.5...v0.1.6) (2026-08-10)
 
 
