@@ -9,11 +9,10 @@ name: Release
 #
 # A `workflow_dispatch` with an existing release tag re-runs the artifact lanes
 # for a release that already exists (repair path); it never creates a tag or
-# release. Because the crates.io lane skips versions already on the registry,
-# that same dispatch resumes a release whose publish only partly succeeded — for
-# any tag whose tree contains that lane. Tags cut before it (v0.3.0 and earlier)
-# check out a commit without the job, so the first crates.io publish is the next
-# release tag; RELEASE.md, "The first publish is the next tag".
+# release. Dispatch from the tag for a normal repair, or from `main` when the
+# workflow definition itself was fixed after the tag was cut. Because the
+# crates.io lane skips versions already on the registry, the same dispatch
+# resumes a release whose publish only partly succeeded.
 
 on:
   push:
@@ -146,6 +145,7 @@ jobs:
       version: ${{ steps.release.outputs.version }}
       commit_sha: ${{ steps.release.outputs.commit_sha }}
       short_sha: ${{ steps.release.outputs.short_sha }}
+      crates_publishable: ${{ steps.release.outputs.crates_publishable }}
     steps:
       - name: Resolve automatic or requested release
         id: release
@@ -165,16 +165,60 @@ jobs:
             commit_sha="$(
               gh api "/repos/${GITHUB_REPOSITORY}/commits/${tag_name}" --jq .sha
             )"
-            if [[ "$commit_sha" != "$GITHUB_SHA" ]]; then
-              echo "dispatch the workflow from ref $tag_name, not $GITHUB_REF" >&2
-              exit 1
+            case "$GITHUB_REF" in
+              "refs/tags/$tag_name")
+                if [[ "$commit_sha" != "$GITHUB_SHA" ]]; then
+                  echo "tag ref $GITHUB_REF does not point at $tag_name" >&2
+                  exit 1
+                fi
+                ;;
+              refs/heads/main)
+                echo "using the main workflow definition to repair $tag_name"
+                ;;
+              *)
+                echo "dispatch the workflow from $tag_name or main, not $GITHUB_REF" >&2
+                exit 1
+                ;;
+            esac
+            if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+              for required_path in Dockerfile ops/docker-smoke.sh; do
+                required_probe="$RUNNER_TEMP/repair-${required_path//\//-}"
+                if gh api --include "/repos/${GITHUB_REPOSITORY}/contents/${required_path}?ref=${tag_name}" >"$required_probe" 2>&1; then
+                  echo "$tag_name contains required repair path $required_path"
+                else
+                  required_status="$(sed -n '1s/^HTTP\/[^ ]* \([0-9][0-9][0-9]\).*/\1/p' "$required_probe")"
+                  if [[ "$required_status" == 404 ]]; then
+                    echo "$tag_name does not contain required repair path $required_path" >&2
+                  else
+                    cat "$required_probe" >&2
+                    echo "could not determine whether $tag_name contains $required_path" >&2
+                  fi
+                  exit 1
+                fi
+              done
             fi
             release_created=true
+            crates_probe="$RUNNER_TEMP/crates-publish-probe"
+            if gh api --include "/repos/${GITHUB_REPOSITORY}/contents/ops/publish-crates.sh?ref=${tag_name}" >"$crates_probe" 2>&1; then
+              crates_publishable=true
+              echo "$tag_name contains ops/publish-crates.sh; crates lane enabled"
+            else
+              crates_status="$(sed -n '1s/^HTTP\/[^ ]* \([0-9][0-9][0-9]\).*/\1/p' "$crates_probe")"
+              if [[ "$crates_status" == 404 ]]; then
+                crates_publishable=false
+                echo "$tag_name predates ops/publish-crates.sh; crates lane skipped"
+              else
+                cat "$crates_probe" >&2
+                echo "could not determine whether $tag_name contains ops/publish-crates.sh" >&2
+                exit 1
+              fi
+            fi
           else
             tag_name="$AUTO_TAG_NAME"
             version="$AUTO_VERSION"
             release_created="${AUTO_RELEASE_CREATED:-false}"
             commit_sha="$GITHUB_SHA"
+            crates_publishable=true
           fi
           short_sha="${commit_sha:0:7}"
           {
@@ -183,6 +227,7 @@ jobs:
             echo "version=$version"
             echo "commit_sha=$commit_sha"
             echo "short_sha=$short_sha"
+            echo "crates_publishable=$crates_publishable"
           } >> "$GITHUB_OUTPUT"
 
   release-binaries:
@@ -426,6 +471,7 @@ jobs:
       !cancelled() &&
       needs['release-metadata'].result == 'success' &&
       needs['release-success'].result == 'success' &&
+      needs['release-metadata'].outputs.crates_publishable == 'true' &&
       needs['release-metadata'].outputs.release_created == 'true'
     # Serialize per tag so a re-dispatch cannot race the original run into a
     # duplicate upload; never cancel, because a cancelled publish is the one
