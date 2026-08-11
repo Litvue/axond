@@ -813,6 +813,7 @@ max_ttl = "15m"
 kid = "reload-kid"
 env = "SIGNING_KEY"
 max_ttl = "10m"
+scope = ["chat", "models"]
 "#;
 
     fn state_from(file: &ConfigFile) -> AppState {

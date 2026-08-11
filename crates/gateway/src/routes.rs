@@ -207,29 +207,22 @@ async fn mint_tokens(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let requested = parsed.iter().copied().collect::<HashSet<_>>();
             if let Some(ceiling) = &minting.scope
-                && !parsed
+                && !requested.is_subset(ceiling)
+            {
+                return Err(GatewayError::MintClaimsNotNarrowing);
+            }
+            if minting.scope.is_none()
+                && parsed
                     .iter()
-                    .copied()
-                    .collect::<HashSet<_>>()
-                    .is_subset(ceiling)
+                    .any(|capability| capability.is_operator_only())
             {
                 return Err(GatewayError::MintClaimsNotNarrowing);
             }
             Some(parsed)
         }
-        None => Some(
-            minting
-                .scope
-                .as_ref()
-                .map(|values| values.iter().copied().collect())
-                .unwrap_or_else(|| {
-                    Capability::ALL
-                        .into_iter()
-                        .filter(|capability| !capability.is_operator_only())
-                        .collect()
-                }),
-        ),
+        None => Some(minting.scope.as_ref().unwrap().iter().copied().collect()),
     };
     if scope.as_ref().is_some_and(|capabilities| {
         capabilities
@@ -1778,10 +1771,6 @@ targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdol
         minting_state_with_scope_audience_epochs("scope = [\"chat\", \"models\"]", audience, epochs)
     }
 
-    fn minting_state_without_scope() -> AppState {
-        minting_state_with_scope_audience_epochs("", "test-audience", "")
-    }
-
     fn minting_state_with_scope_audience_epochs(
         scope: &str,
         audience: &str,
@@ -1878,6 +1867,23 @@ max_request_microdollars = 1000
         let response =
             scoped_route_request(state, "/v1/credentials?namespaces=all", token).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    async fn minting_key_cannot_escalate_operator_capability() {
+        let state = minting_state_with_scope_audience_epochs(
+            "scope = [\"credentials\", \"credentials:all\"]",
+            "test-audience",
+            "",
+        );
+        let (status, body) = mint_request(
+            state,
+            json!({
+                "sub": "agent",
+                "scope": ["credentials:all"],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["type"], "mint_claims_not_narrowing");
+    }
     }
 
     #[tokio::test]
