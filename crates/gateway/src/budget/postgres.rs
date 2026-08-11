@@ -779,11 +779,12 @@ mod tests {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
         };
+        let table = "axond_budget_ns_expiry_test";
+        // A long TTL, so the denial below cannot race the clock; expiry is then
+        // forced by backdating the row rather than by sleeping.
         let mut expiring = namespace_settings(1_000, 1_000);
-        // Long enough that the denial below cannot race the expiry it is
-        // asserting has *not* happened yet, on a loaded CI runner.
-        expiring.reservation_ttl = Duration::from_secs(2);
-        let store = namespace_store(&dsn, "axond_budget_ns_expiry_test", expiring).await;
+        expiring.reservation_ttl = Duration::from_secs(600);
+        let store = namespace_store(&dsn, table, expiring).await;
         let died = BudgetKey {
             namespace: "acme".into(),
             subject: "died".into(),
@@ -801,7 +802,24 @@ mod tests {
             store.reserve(&alive, 900).await,
             Admission::Denied(Denial::Exceeded)
         );
-        tokio::time::sleep(Duration::from_millis(2_200)).await;
+
+        // The replica holding it died: its hold is now in the past.
+        {
+            let guard = store.client.lock().await;
+            let client = guard.as_ref().expect("connected");
+            let backdated = client
+                .execute(
+                    &format!(
+                        "UPDATE {table}_reservation SET expires_at = now() - interval '1 second' \
+                         WHERE namespace = $1 AND subject = $2"
+                    ),
+                    &[&died.namespace, &died.subject],
+                )
+                .await
+                .expect("backdate the hold");
+            assert_eq!(backdated, 1, "exactly one hold is outstanding");
+        }
+
         // The dead replica's hold is reclaimed for the namespace, not just for
         // the subject that made it.
         assert!(matches!(

@@ -964,11 +964,11 @@ mod tests {
         };
         let prefix = prefix();
         migrate_v1_to_v2(&url, &prefix).await.expect("migrate");
+        // A long TTL, so the denial below cannot race the clock; expiry is then
+        // forced by rewriting the hold's deadline rather than by sleeping.
         let mut expiring = namespace_settings(1_000, 1_000);
-        // Long enough that the denial below cannot race the expiry it is
-        // asserting has *not* happened yet, on a loaded CI runner.
-        expiring.reservation_ttl = Duration::from_secs(2);
-        let store = RedisBudget::connect(&url, prefix, expiring)
+        expiring.reservation_ttl = Duration::from_secs(600);
+        let store = RedisBudget::connect(&url, prefix.clone(), expiring)
             .await
             .expect("connect");
         let first = BudgetKey {
@@ -980,15 +980,30 @@ mod tests {
             subject: "alive".into(),
         };
 
-        assert!(matches!(
-            store.reserve(&first, 900).await,
-            Admission::Allowed(_)
-        ));
+        let Admission::Allowed(held) = store.reserve(&first, 900).await else {
+            panic!("the first reservation must be admitted");
+        };
         assert_eq!(
             store.reserve(&second, 900).await,
             Admission::Denied(Denial::Exceeded)
         );
-        tokio::time::sleep(Duration::from_millis(2_200)).await;
+
+        // The replica holding it died: its hold is now in the past, in both
+        // scopes it was recorded in.
+        {
+            let keys = v2_keys(&prefix, &first);
+            let client = ::redis::Client::open(url.as_str()).expect("client");
+            let mut connection = ConnectionManager::new(client).await.expect("connect");
+            let stale = format!("900:{}", now_ms() - 1);
+            for key in [&keys.subject_reservations, &keys.namespace_reservations] {
+                let rewritten: i64 = connection
+                    .hset(key, &held.id, &stale)
+                    .await
+                    .expect("backdate the hold");
+                assert_eq!(rewritten, 0, "the hold is rewritten, not added");
+            }
+        }
+
         assert!(matches!(
             store.reserve(&second, 900).await,
             Admission::Allowed(_)
