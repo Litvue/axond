@@ -281,6 +281,10 @@ Every route that dispatches to a provider (`/v1/chat/completions`, `/v1/messages
 `/v1/embeddings`) authenticates, and so do `/v1/models` and `/v1/credentials` —
 they answer only for a configured gateway key and list data scoped to the caller's
 namespace (an
+`POST /v1/tokens` is
+an opt-in authenticated route and is absent by default; see the minted-token guide.
+The models route answers only for a
+configured gateway key and lists the aliases scoped to the caller's namespace (an
 alias whose targets the caller holds no credential for is not disclosed). Only the
 liveness probes `/healthz` and `/readyz` answer without a credential.
 
