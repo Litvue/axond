@@ -124,7 +124,8 @@ terminal: the relay emits an SSE `error` event on the already-`200` response,
 and the usage record settles as `partial` or `upstream_error`. An
 OpenAI-normalized stream may instead rotate to the next pooled credential when
 an explicit upstream rate-limit event arrives before anything is queued
-downstream; the rotated attempt and lease spans remain under the request trace.
+ downstream; the additional lease span remains under the original upstream
+ attempt and request trace.
 
 ### Boot failures
 

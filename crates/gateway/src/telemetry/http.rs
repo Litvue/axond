@@ -174,13 +174,9 @@ mod tests {
         finish_credential_lease(&parked, LEASE_PARKED);
         let rate_limited = credential_lease_span("a", "platform", 1);
         finish_credential_lease(&rate_limited, LEASE_RATE_LIMITED);
-        finish_upstream_attempt(&attempt, ATTEMPT_OK, 12, Some(12));
-        drop(_entered);
-        let rotated = upstream_attempt_span(1, "openai", "gpt-4o", "platform");
-        let _entered = rotated.enter();
         let served = credential_lease_span("b", "platform", 2);
         finish_credential_lease(&served, LEASE_SERVED);
-        finish_upstream_attempt(&rotated, ATTEMPT_OK, 12, Some(12));
+        finish_upstream_attempt(&attempt, ATTEMPT_OK, 12, Some(12));
         "ok"
     }
 
@@ -238,7 +234,7 @@ mod tests {
         assert_eq!(server.parent_span_id.to_string(), INBOUND_SPAN);
         assert_eq!(attempt.parent_span_id, server.span_context.span_id());
         assert_eq!(attempt.span_context.trace_id().to_string(), INBOUND_TRACE);
-        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts.len(), 1);
         assert_eq!(leases.len(), 3);
         for lease in &leases {
             assert!(attempts.iter().any(|parent| {

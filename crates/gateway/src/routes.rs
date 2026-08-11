@@ -962,6 +962,7 @@ async fn open_stream_lease(
     lease_index: usize,
     attempt_span: Option<&tracing::Span>,
     parent: Option<opentelemetry::Context>,
+    lease_parent: Option<opentelemetry::Context>,
 ) -> Result<
     (
         Box<dyn ProviderStreamDecoder>,
@@ -1006,20 +1007,32 @@ async fn open_stream_lease(
                     .await?
                 }
                 None => {
-                    streaming::open_stream_with_parent(
-                        ctx,
-                        attempt,
-                        &lease.id,
-                        lease_index,
-                        state.0.dispatcher.dispatch_stream(
-                            adapter.as_ref(),
-                            &upstream,
-                            Surface::ChatCompletions,
-                            request,
-                        ),
-                        parent,
-                    )
-                    .await?
+                    let open = state.0.dispatcher.dispatch_stream(
+                        adapter.as_ref(),
+                        &upstream,
+                        Surface::ChatCompletions,
+                        request,
+                    );
+                    if let Some(parent) = lease_parent {
+                        streaming::open_stream_with_lease_parent(
+                            ctx,
+                            &lease.id,
+                            lease_index,
+                            open,
+                            parent,
+                        )
+                        .await?
+                    } else {
+                        streaming::open_stream_with_parent(
+                            ctx,
+                            attempt,
+                            &lease.id,
+                            lease_index,
+                            open,
+                            parent,
+                        )
+                        .await?
+                    }
                 }
             }
         }
@@ -1037,15 +1050,27 @@ async fn open_stream_lease(
                     .await?
                 }
                 None => {
-                    streaming::open_stream_with_parent(
-                        ctx,
-                        attempt,
-                        &lease.id,
-                        lease_index,
-                        state.0.dispatcher.send_stream(&upstream, &call),
-                        parent,
-                    )
-                    .await?
+                    let open = state.0.dispatcher.send_stream(&upstream, &call);
+                    if let Some(parent) = lease_parent {
+                        streaming::open_stream_with_lease_parent(
+                            ctx,
+                            &lease.id,
+                            lease_index,
+                            open,
+                            parent,
+                        )
+                        .await?
+                    } else {
+                        streaming::open_stream_with_parent(
+                            ctx,
+                            attempt,
+                            &lease.id,
+                            lease_index,
+                            open,
+                            parent,
+                        )
+                        .await?
+                    }
                 }
             }
         }
@@ -1149,6 +1174,7 @@ async fn stream_with_failover(
                 plan.parked.len() + lease_index,
                 Some(&attempt_span),
                 None,
+                None,
             )
             .await;
             ctx.attempts = target_attempt + 1;
@@ -1182,7 +1208,7 @@ async fn stream_with_failover(
                     let reservation_for_open = hold.reservation.clone();
                     let estimate_for_open = hold.estimated_input_tokens;
                     let source_for_open = plan.source;
-                    let parent_context_for_open = tracing::Span::current().context();
+                    let parent_context_for_open = attempt_span.context();
                     let opener =
                         move |next_lease: CredentialLease, attempt: u32, lease_index: usize| {
                             let state = state_for_open.clone();
@@ -1224,6 +1250,7 @@ async fn stream_with_failover(
                                     attempt,
                                     lease_index,
                                     None,
+                                    None,
                                     Some(parent_context),
                                 )
                                 .await
@@ -1235,7 +1262,6 @@ async fn stream_with_failover(
                         remaining,
                         lease.clone(),
                         plan.parked.len() + lease_index + 1,
-                        target_attempt + 1,
                         opener,
                         move |lease| snapshot_for_health.credentials.record_failure(lease),
                         {

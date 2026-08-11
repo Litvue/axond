@@ -86,7 +86,6 @@ pub struct RotationHandle {
     opener: RotationOpener,
     record_failure: Arc<dyn Fn(&CredentialLease) + Send + Sync>,
     record_success: Arc<dyn Fn(&CredentialLease) + Send + Sync>,
-    next_attempt: u32,
 }
 
 fn is_stream_rate_limited(err: &TransportError) -> bool {
@@ -98,7 +97,6 @@ impl RotationHandle {
         leases: Vec<CredentialLease>,
         serving: CredentialLease,
         first_lease_index: usize,
-        next_attempt: u32,
         opener: impl Fn(
             CredentialLease,
             u32,
@@ -120,7 +118,6 @@ impl RotationHandle {
             opener: Arc::new(opener),
             record_failure: Arc::new(record_failure),
             record_success: Arc::new(record_success),
-            next_attempt,
         }
     }
 
@@ -136,9 +133,7 @@ impl RotationHandle {
         &mut self,
     ) -> Result<Option<(CredentialLease, OpenedStream)>, TransportError> {
         while let Some((lease, lease_index)) = self.remaining.pop_front() {
-            let attempt = self.next_attempt;
-            self.next_attempt += 1;
-            let open = (self.opener)(lease.clone(), attempt, lease_index);
+            let open = (self.opener)(lease.clone(), 0, lease_index);
             match open.await {
                 Ok(opened) => {
                     self.serving = lease.clone();
@@ -222,6 +217,34 @@ where
     let opened = async { open.instrument(lease_span.clone()).await }
         .instrument(attempt_span.clone())
         .await;
+    telemetry::finish_credential_lease(
+        &lease_span,
+        match &opened {
+            Ok(_) => telemetry::LEASE_SERVED,
+            Err(err) if is_stream_rate_limited(err) => telemetry::LEASE_RATE_LIMITED,
+            Err(_) => telemetry::LEASE_ERROR,
+        },
+    );
+    opened
+}
+
+pub async fn open_stream_with_lease_parent<F>(
+    ctx: &StreamContext,
+    lease_id: &str,
+    lease_index: usize,
+    open: F,
+    parent: Context,
+) -> Result<ByteStream, TransportError>
+where
+    F: Future<Output = Result<ByteStream, TransportError>>,
+{
+    let lease_span = telemetry::credential_lease_span(
+        lease_id,
+        UsageRecord::credential_source_str(ctx.source),
+        lease_index,
+    );
+    let _ = lease_span.set_parent(parent);
+    let opened = open.instrument(lease_span.clone()).await;
     telemetry::finish_credential_lease(
         &lease_span,
         match &opened {
@@ -1666,7 +1689,6 @@ targets = [
             vec![test_lease("b")],
             test_lease("a"),
             1,
-            1,
             opener,
             move |lease| {
                 failures_for_callback.fetch_add(1, Ordering::SeqCst);
@@ -1742,7 +1764,6 @@ targets = [
                 vec![test_lease("b"), test_lease("c"), test_lease("d")],
                 test_lease("a"),
                 1,
-                1,
                 opener,
                 move |_| {
                     failures_for_callback.fetch_add(1, Ordering::SeqCst);
@@ -1790,7 +1811,6 @@ targets = [
             Some(RotationHandle::new(
                 vec![test_lease("b")],
                 test_lease("a"),
-                1,
                 1,
                 opener,
                 |_| {},
@@ -1895,7 +1915,6 @@ targets = [
                 vec![test_lease("b")],
                 test_lease("a"),
                 1,
-                1,
                 opener,
                 |_| {},
                 |_| {},
@@ -1938,7 +1957,6 @@ targets = [
             Some(RotationHandle::new(
                 vec![test_lease("b")],
                 test_lease("a"),
-                1,
                 1,
                 opener,
                 |_| {},

@@ -153,9 +153,10 @@ pub fn is_rate_limit_payload(value: &serde_json::Value) -> bool {
         value
             .pointer("/error/type")
             .and_then(serde_json::Value::as_str),
-        value
-            .pointer("/error/code")
-            .and_then(serde_json::Value::as_str),
+        value.pointer("/error/code").and_then(|code| {
+            code.as_str()
+                .or_else(|| (code.as_u64() == Some(429)).then_some("429"))
+        }),
         value.pointer("/type").and_then(serde_json::Value::as_str),
         value.pointer("/code").and_then(serde_json::Value::as_str),
     ]
@@ -218,6 +219,7 @@ mod tests {
         for body in [
             r#"{"type":"error","error":{"type":"rate_limit_error"}}"#,
             r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+            r#"{"error":{"code":429}}"#,
             r#"{"error":{"status":429}}"#,
         ] {
             let value: serde_json::Value = serde_json::from_str(body).unwrap();
