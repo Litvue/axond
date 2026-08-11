@@ -27,6 +27,7 @@ cleanup() {
 trap cleanup EXIT
 
 GW_PLATFORM_OPENAI_API_KEY=placeholder-openai-key \
+AXOND_QUICKSTART_CONFIG=./ops/compose/axond.quickstart.toml \
   "${compose[@]}" up -d --build
 healthy=false
 for attempt in $(seq 1 60); do
