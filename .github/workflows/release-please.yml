@@ -9,11 +9,10 @@ name: Release
 #
 # A `workflow_dispatch` with an existing release tag re-runs the artifact lanes
 # for a release that already exists (repair path); it never creates a tag or
-# release. Because the crates.io lane skips versions already on the registry,
-# that same dispatch resumes a release whose publish only partly succeeded — for
-# any tag whose tree contains that lane. Tags cut before it (v0.3.0 and earlier)
-# check out a commit without the job, so the first crates.io publish is the next
-# release tag; RELEASE.md, "The first publish is the next tag".
+# release. Dispatch from the tag for a normal repair, or from `main` when the
+# workflow definition itself was fixed after the tag was cut. Because the
+# crates.io lane skips versions already on the registry, the same dispatch
+# resumes a release whose publish only partly succeeded.
 
 on:
   push:
@@ -165,10 +164,21 @@ jobs:
             commit_sha="$(
               gh api "/repos/${GITHUB_REPOSITORY}/commits/${tag_name}" --jq .sha
             )"
-            if [[ "$commit_sha" != "$GITHUB_SHA" ]]; then
-              echo "dispatch the workflow from ref $tag_name, not $GITHUB_REF" >&2
-              exit 1
-            fi
+            case "$GITHUB_REF" in
+              "refs/tags/$tag_name")
+                if [[ "$commit_sha" != "$GITHUB_SHA" ]]; then
+                  echo "tag ref $GITHUB_REF does not point at $tag_name" >&2
+                  exit 1
+                fi
+                ;;
+              refs/heads/main)
+                echo "using the main workflow definition to repair $tag_name"
+                ;;
+              *)
+                echo "dispatch the workflow from $tag_name or main, not $GITHUB_REF" >&2
+                exit 1
+                ;;
+            esac
             release_created=true
           else
             tag_name="$AUTO_TAG_NAME"
