@@ -1,0 +1,40 @@
+services:
+  axond:
+    build: .
+    image: ${AXOND_IMAGE:-axond:quickstart}
+    ports:
+      - "8080:8080"
+    environment:
+      AXOND_CONFIG: /etc/axond/axond.toml
+      GW_PLATFORM_OPENAI_API_KEY: ${GW_PLATFORM_OPENAI_API_KEY:?set it in .env}
+      GW_PLATFORM_ANTHROPIC_API_KEY: ${GW_PLATFORM_ANTHROPIC_API_KEY:?set it in .env}
+      GW_ACME_OPENAI_API_KEY: ${GW_ACME_OPENAI_API_KEY:?set it in .env}
+      GW_INBOUND_PLATFORM_KEY: ${GW_INBOUND_PLATFORM_KEY:?set it in .env}
+      GW_INBOUND_ACME_KEY: ${GW_INBOUND_ACME_KEY:?set it in .env}
+      AXOND_BUDGET_REDIS_URL: ${AXOND_BUDGET_REDIS_URL:-redis://redis:6379}
+      AXOND_RATE_LIMIT_REDIS_URL: ${AXOND_RATE_LIMIT_REDIS_URL:-redis://redis:6379}
+      AXOND_USAGE_POSTGRES_DSN: ${AXOND_USAGE_POSTGRES_DSN:-postgres://postgres:axond-quickstart@postgres:5432/axond}
+    volumes:
+      - ${AXOND_QUICKSTART_CONFIG:-./ops/compose/axond.quickstart.toml}:/etc/axond/axond.toml:ro
+    # Do not hide a fail-closed boot/configuration error behind an auto-restart loop.
+
+  redis:
+    image: redis:7.4.2-alpine
+    profiles: ["stateful"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  postgres:
+    image: postgres:17.6-alpine
+    profiles: ["stateful"]
+    environment:
+      POSTGRES_DB: axond
+      POSTGRES_PASSWORD: axond-quickstart
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d axond"]
+      interval: 2s
+      timeout: 3s
+      retries: 15

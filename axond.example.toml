@@ -4,6 +4,9 @@
 # environment variable (`env = "..."`) and read at startup — never inlined.
 # Copy to `axond.toml` (gitignored) and set the referenced env vars.
 #
+# For a runnable local deployment with Docker Compose, see
+# `ops/compose/axond.quickstart.toml` and `docs/deployment.md`.
+#
 # Telemetry is environment-only, so it looks the same here as in every other
 # OTel service: unset means JSON logs on stdout and nothing exported; set
 # OTEL_EXPORTER_OTLP_ENDPOINT (OTLP/HTTP, e.g. http://collector:4318) to turn on

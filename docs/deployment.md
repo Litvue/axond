@@ -8,6 +8,64 @@ balancer; there is no leader, no local state, and nothing to migrate.
 For what each config key means, see the [configuration reference](./configuration.md).
 For what to watch once it is running, see the [observability runbook](./observability.md).
 
+## 5-minute quickstart
+
+This path builds the local distroless image from the Dockerfile rather than
+pulling a registry image. The first build compiles the static musl release and
+can take several minutes; later starts reuse the cached image.
+
+```bash
+git clone https://github.com/Litvue/axond.git
+cd axond
+cp ops/compose/env.example .env
+docker compose up -d --build
+curl http://localhost:8080/healthz
+curl -H 'Authorization: Bearer quickstart-platform-key' \
+  http://localhost:8080/v1/models
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H 'Authorization: Bearer quickstart-platform-key' \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Say hello in one word."}]}'
+```
+
+The health probe returns `ok`, and the authenticated catalogue lists the
+aliases available to the platform namespace:
+
+```text
+ok
+{"data":[{"id":"gpt-4o","object":"model","owned_by":"axond"},{"id":"claude-sonnet","object":"model","owned_by":"axond"},{"id":"text-embedding-3-small","object":"model","owned_by":"axond"}],"object":"list"}
+```
+
+With a real OpenAI key in `GW_PLATFORM_OPENAI_API_KEY`, the final request
+returns the provider's normal successful chat-completion JSON. With the
+committed placeholder value,
+the request reaches OpenAI and returns this observed typed provider error
+instead; do not treat that response as a successful completion:
+
+```text
+{"error":{"message":"invalid provider request: Incorrect API key provided: placehol**********-key. You can find your API key at https://platform.openai.com/account/api-keys.","type":"invalid_request"}}
+```
+
+The HTTP status for that placeholder response is `502`. A real provider key
+returns the provider's successful completion response and an HTTP `200`; the
+successful response body depends on the model and prompt and is intentionally
+not fabricated here.
+
+To try the stateful variant, select the Tier 1 Redis budget/rate-limit backends
+and the Tier 2 Postgres durable usage sink:
+
+```bash
+AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml docker compose \
+  -f docker-compose.yml -f docker-compose.stateful.yml \
+  --profile stateful up -d --build
+docker compose -f docker-compose.yml -f docker-compose.stateful.yml \
+  --profile stateful down -v
+```
+
+The stateful configuration creates the Postgres usage table at boot. Redis and
+Postgres are required dependencies in this path; admission fails closed when
+Redis is unavailable, and usage rows are durable in Postgres.
+
 ## What you need before you start
 
 - A config file. Copy [`axond.example.toml`](../axond.example.toml) and edit it.

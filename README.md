@@ -84,6 +84,25 @@ and [ADR 0018](./docs/adr/0018-tier-0-hermetic-boot-gate.md).
 
 ## Quick start
 
+For a five-minute Docker Compose deployment (including a stateful Redis and
+Postgres variant), see the [deployment guide](./docs/deployment.md#5-minute-quickstart).
+
+```bash
+cp ops/compose/env.example .env
+docker compose up -d --build
+curl http://localhost:8080/healthz
+```
+
+The first Compose build compiles the static musl release and can take several
+minutes. To call the authenticated catalogue, use the key from `.env`:
+
+```bash
+curl -H "Authorization: Bearer $GW_INBOUND_PLATFORM_KEY" \
+  http://localhost:8080/v1/models
+```
+
+For the source-based configuration path:
+
 ```bash
 cp axond.example.toml axond.toml      # edit providers/models/namespaces
 

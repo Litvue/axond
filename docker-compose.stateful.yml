@@ -1,0 +1,10 @@
+# Compose overlay for the stateful profile. The base file keeps the default
+# Tier 0 invocation independent of profile-only services; this overlay adds
+# readiness gating when `--profile stateful` is selected.
+services:
+  axond:
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
