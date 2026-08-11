@@ -644,6 +644,11 @@ impl Accounting {
     /// produced nothing is charged nothing.
     fn chargeable_usage(&self) -> ModelUsage {
         const CHARS_PER_TOKEN: usize = 4;
+        if self.carried_output_tokens == 0
+            && (self.usage.input_tokens > 0 || self.usage.output_tokens > 0)
+        {
+            return self.usage;
+        }
         let has_output = self.carried_output_tokens > 0
             || self.usage.output_tokens > 0
             || self.relayed_chars > 0;
@@ -1255,6 +1260,28 @@ targets = [{{ provider = "anthropic", model = "claude-sonnet-4-5", price = {{ in
 
         let record = settled(&ledger).await;
         assert_eq!(record["status"], "upstream_error");
+    }
+
+    #[tokio::test]
+    async fn reported_zero_output_wins_without_rotation() {
+        let ledger = Arc::new(Ledger::default());
+        let base_url = upstream_serving(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"relayed text\"}}]}\n\n\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":0}}\n\n\
+data: [DONE]\n\n",
+        )
+        .await;
+        let resp = router(state_for(&base_url, ledger.clone()))
+            .oneshot(stream_request())
+            .await
+            .expect("response");
+        let mut body = resp.into_body().into_data_stream();
+        while let Some(chunk) = body.next().await {
+            chunk.expect("chunk");
+        }
+        let record = settled(&ledger).await;
+        assert_eq!(record["input_tokens"], 5);
+        assert_eq!(record["output_tokens"], 0);
     }
 
     #[tokio::test]
