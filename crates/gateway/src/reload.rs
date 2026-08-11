@@ -1125,6 +1125,40 @@ default = true
         assert_eq!(listed_aliases(&state).await, vec!["gpt-4o".to_string()]);
     }
 
+    #[tokio::test]
+    async fn a_cross_wire_alias_is_rejected_and_the_previous_config_keeps_serving() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state.clone());
+        let before = state.config();
+
+        file.rewrite(
+            &format!(
+                r#"{PLATFORM_ONLY}
+[[provider]]
+id = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+
+[[model]]
+name = "mixed"
+targets = [
+    {{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }},
+    {{ provider = "anthropic", model = "claude", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }},
+]
+"#
+            ),
+        );
+        let err = reloader
+            .reload_with_env(TRIGGER_WATCH, &inbound_env())
+            .expect_err("cross-wire candidate must be rejected");
+        let message = err.to_string();
+        assert!(message.contains("mixed"), "{message}");
+        assert!(message.contains("no route can serve"), "{message}");
+        assert!(Arc::ptr_eq(&before, &state.config()));
+        assert_eq!(state.config().generation, 0);
+    }
+
     /// Reload runs the same fail-closed validation boot does, so a candidate
     /// whose gateway key cannot be resolved never replaces a config that can be
     /// authenticated against (ADR 0013).
