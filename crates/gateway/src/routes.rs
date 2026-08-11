@@ -238,6 +238,26 @@ async fn authenticate_middleware(
 ) -> Result<Response, GatewayError> {
     let snapshot = state.config();
     let caller = authenticate(&snapshot, &headers).await?;
+    if let Some(jti) = &caller.jti {
+        match state.0.revocation.is_revoked(jti).await {
+            Ok(true) => {
+                crate::telemetry::metrics::record_revocation_denial();
+                return Err(GatewayError::TokenUnauthorized(
+                    TokenVerificationError::Revoked,
+                ));
+            }
+            Ok(false) => {}
+            Err(crate::revocation::RevocationError::Unavailable { .. }) => {
+                crate::telemetry::metrics::record_revocation_unavailable_denial();
+                return Err(GatewayError::RevocationUnavailable);
+            }
+            Err(error) => {
+                warn!(error = %error, "revocation store check failed");
+                crate::telemetry::metrics::record_revocation_unavailable_denial();
+                return Err(GatewayError::RevocationUnavailable);
+            }
+        }
+    }
     if let Some(capability) = capability
         && let Some(scope) = caller.scope.as_ref()
         && (!scope.contains(&capability)
@@ -1382,7 +1402,7 @@ mod tests {
     use std::future::pending;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
     use tokio::sync::oneshot;
     use tower::util::ServiceExt;
 
@@ -1481,6 +1501,12 @@ targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdol
     }
 
     async fn scoped_route_state() -> AppState {
+        scoped_route_state_with_revocation(Box::new(crate::revocation::NoDenylist)).await
+    }
+
+    async fn scoped_route_state_with_revocation(
+        revocation: Box<dyn crate::revocation::RevocationStore>,
+    ) -> AppState {
         let (chat_url, _) =
             controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
         let (messages_url, _) = native_upstream(
@@ -1576,11 +1602,13 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             ),
         ]);
-        AppState::new(
+        AppState::new_with_rate_limiter(
             config,
             &env,
             UsageFanout::new(vec![Box::new(StdoutSink)]),
             Box::new(NoBudget),
+            Box::new(NoLimit),
+            revocation,
         )
         .expect("scope test state")
     }
@@ -1615,6 +1643,75 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
             )
             .expect("scope test token")
         )
+    }
+
+    async fn response_error_type(response: Response) -> Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).expect("typed error JSON")
+    }
+
+    #[tokio::test]
+    async fn denylisted_minted_token_returns_token_revoked() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = scoped_route_state_with_revocation(Box::new(FakeRevocation {
+            mode: FakeRevocationMode::Revoked,
+            calls: Arc::clone(&calls),
+        }))
+        .await;
+        let response = scoped_route_request(state, "/v1/models", &scoped_token(None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response_error_type(response).await["error"]["type"],
+            "token_revoked"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn unavailable_revocation_store_returns_revocation_unavailable() {
+        let state = scoped_route_state_with_revocation(Box::new(FakeRevocation {
+            mode: FakeRevocationMode::Unavailable,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }))
+        .await;
+        let response = scoped_route_request(state, "/v1/models", &scoped_token(None)).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_error_type(response).await["error"]["type"],
+            "revocation_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn revocation_store_allow_admits_the_minted_token() {
+        let state = scoped_route_state_with_revocation(Box::new(FakeRevocation {
+            mode: FakeRevocationMode::Allow,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }))
+        .await;
+        let response = scoped_route_request(state, "/v1/models", &scoped_token(None)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tier_zero_and_static_key_requests_do_not_consult_revocation() {
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/models",
+            &scoped_token(None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = scoped_route_state_with_revocation(Box::new(FakeRevocation {
+            mode: FakeRevocationMode::Revoked,
+            calls: Arc::clone(&calls),
+        }))
+        .await;
+        let response = scoped_route_request(state, "/v1/models", "static-key").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     async fn assert_scope_denial(response: Response, capability: &str) {
@@ -2192,6 +2289,7 @@ min_iat = {}
             scope: None,
             alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
             max_request_microdollars: None,
+            jti: None,
         };
         let response = list_models(Extension(snapshot), Extension(caller))
             .await
@@ -2319,6 +2417,7 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
                     scope: None,
                     alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
                     max_request_microdollars: None,
+                    jti: None,
                 },
             )
             .await
@@ -2686,6 +2785,46 @@ targets = [
         }
     }
 
+    struct FakeRevocation {
+        mode: FakeRevocationMode,
+        calls: Arc<AtomicUsize>,
+    }
+
+    enum FakeRevocationMode {
+        Revoked,
+        Unavailable,
+        Allow,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::revocation::RevocationStore for FakeRevocation {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn is_revoked(&self, _jti: &str) -> Result<bool, crate::revocation::RevocationError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            match self.mode {
+                FakeRevocationMode::Revoked => Ok(true),
+                FakeRevocationMode::Unavailable => {
+                    Err(crate::revocation::RevocationError::Unavailable {
+                        backend: "fake",
+                        message: "test outage".to_owned(),
+                    })
+                }
+                FakeRevocationMode::Allow => Ok(false),
+            }
+        }
+
+        async fn revoke(
+            &self,
+            _jti: &str,
+            _expires_at: SystemTime,
+        ) -> Result<(), crate::revocation::RevocationError> {
+            Ok(())
+        }
+    }
+
     struct RejectingBudget;
 
     #[async_trait::async_trait]
@@ -2754,8 +2893,15 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         .unwrap();
         let env = env_with([("K1", "sk-test")]);
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
-        AppState::new_with_rate_limiter(cfg, &env, UsageFanout::new(sinks), budget, rate_limiter)
-            .unwrap()
+        AppState::new_with_rate_limiter(
+            cfg,
+            &env,
+            UsageFanout::new(sinks),
+            budget,
+            rate_limiter,
+            Box::new(crate::revocation::NoDenylist),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -2833,6 +2979,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             scope: None,
             alias_scope: None,
             max_request_microdollars: Some(1),
+            jti: None,
         };
         let body = json!({"model": "gpt-4o", "messages": []});
 
@@ -2870,6 +3017,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             scope: None,
             alias_scope: None,
             max_request_microdollars: Some(10_000),
+            jti: None,
         };
         let body = json!({"model": "gpt-4o", "messages": []});
 

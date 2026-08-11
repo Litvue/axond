@@ -12,10 +12,11 @@
 //!
 //! Not everything a config file describes can be replaced in a live process.
 //! The listening socket is already bound, the usage sinks already own
-//! connections and flush tasks, and the budget store and rate limiter already
-//! own their state, so changes to `[server] bind`, `[[usage_sink]]`, `[budget]`
-//! (including `limit_microdollars`), and `[rate_limit]` are reported and
-//! ignored until the next restart.
+//! connections and flush tasks, and the budget store, rate limiter, and
+//! revocation store already own their state, so changes to `[server] bind`,
+//! `[[usage_sink]]`, `[budget]` (including `limit_microdollars`),
+//! `[rate_limit]`, and `[revocation]` are reported and ignored until the next
+//! restart.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -23,7 +24,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::config::{BudgetConfig, Config, ConfigError, RateLimitConfig, Reload, UsageSinkConfig};
+use crate::config::{
+    BudgetConfig, Config, ConfigError, RateLimitConfig, Reload, RevocationConfig, UsageSinkConfig,
+};
 use crate::state::{AppState, ConfigSnapshot, SnapshotError};
 use crate::telemetry;
 
@@ -48,6 +51,7 @@ struct Boot {
     usage_sink: Vec<UsageSinkConfig>,
     budget: BudgetConfig,
     rate_limit: RateLimitConfig,
+    revocation: RevocationConfig,
 }
 
 /// Owns the config path and the state whose snapshot it replaces.
@@ -72,6 +76,7 @@ impl Reloader {
                 usage_sink: booted.config.usage_sink.clone(),
                 budget: booted.config.budget.clone(),
                 rate_limit: booted.config.rate_limit.clone(),
+                revocation: booted.config.revocation.clone(),
             },
             path,
             state,
@@ -210,6 +215,8 @@ pub struct ReloadSummary {
     pub budget_changed: bool,
     /// `[rate_limit]` differs from the booted limiter configuration.
     pub rate_limit_changed: bool,
+    /// `[revocation]` differs from the booted revocation store configuration.
+    pub revocation_changed: bool,
 }
 
 /// The added and removed identifiers of one config collection.
@@ -335,6 +342,7 @@ impl ReloadSummary {
             usage_sinks_changed: boot.usage_sink != after_config.usage_sink,
             budget_changed: boot.budget != after_config.budget,
             rate_limit_changed: boot.rate_limit != after_config.rate_limit,
+            revocation_changed: boot.revocation != after_config.revocation,
         }
     }
 
@@ -366,6 +374,7 @@ impl ReloadSummary {
             gateway_verifier_fingerprints = ?self.gateway_verifier_fingerprints,
             budget_changed = self.budget_changed,
             rate_limit_changed = self.rate_limit_changed,
+            revocation_changed = self.revocation_changed,
             changed = !self.is_empty(),
             "config reloaded"
         );
@@ -387,6 +396,11 @@ impl ReloadSummary {
         if self.rate_limit_changed {
             tracing::warn!(
                 "`[rate_limit]` changed, but the limiter is already serving; restart to apply it"
+            );
+        }
+        if self.revocation_changed {
+            tracing::warn!(
+                "`[revocation]` changed, but the revocation store is already serving; restart to apply it"
             );
         }
     }
@@ -1326,6 +1340,32 @@ targets = [
             .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
             .expect("rate limit removal is valid");
         assert!(!summary.rate_limit_changed);
+    }
+
+    #[tokio::test]
+    async fn revocation_changes_are_reported_as_restart_required() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state);
+
+        file.rewrite(&format!(
+            "{PLATFORM_ONLY}\n[revocation]\nbackend = \"redis\"\ndsn_env = \"REDIS_URL\"\n"
+        ));
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &{
+                let mut env = inbound_env();
+                env.insert("REDIS_URL".to_owned(), "redis://127.0.0.1:6399".to_owned());
+                env
+            })
+            .expect("revocation candidate is valid");
+        assert!(summary.revocation_changed);
+        assert!(summary.is_empty());
+
+        file.rewrite(PLATFORM_ONLY);
+        let summary = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect("revocation removal is valid");
+        assert!(!summary.revocation_changed);
     }
 
     /// Both triggers share one view of what has been acted on, so the watcher

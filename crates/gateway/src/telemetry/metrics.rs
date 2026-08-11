@@ -40,6 +40,8 @@ struct Instruments {
     rate_limit_denials: Counter<u64>,
     rate_limit_capacity_denials: Counter<u64>,
     rate_limit_unavailable_denials: Counter<u64>,
+    revocation_denials: Counter<u64>,
+    revocation_unavailable_denials: Counter<u64>,
 }
 
 static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
@@ -140,6 +142,14 @@ impl Instruments {
             rate_limit_unavailable_denials: meter
                 .u64_counter("axond.rate_limit.unavailable_denials")
                 .with_description("Rate-limit admissions denied because the store was unavailable.")
+                .build(),
+            revocation_denials: meter
+                .u64_counter("axond.revocation.denials")
+                .with_description("Minted tokens denied because their JTI was revoked.")
+                .build(),
+            revocation_unavailable_denials: meter
+                .u64_counter("axond.revocation.unavailable_denials")
+                .with_description("Tokens denied because the revocation store was unavailable.")
                 .build(),
         }
     }
@@ -273,6 +283,20 @@ pub fn record_rate_limit_unavailable_denial() {
         return;
     };
     instruments.rate_limit_unavailable_denials.add(1, &[]);
+}
+
+pub fn record_revocation_denial() {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.revocation_denials.add(1, &[]);
+}
+
+pub fn record_revocation_unavailable_denial() {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.revocation_unavailable_denials.add(1, &[]);
 }
 
 /// Publish a target's circuit state. Ordered failover (which owns the breaker)

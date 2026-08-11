@@ -418,3 +418,13 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # on_unavailable = "deny" # deny (default) | allow
 # lease_ttl_seconds = 300
 # timeout_ms = 250
+# connect_timeout_ms = 5000
+
+# Precise single-token revocation is opt-in (Tier 1 Redis or Tier 2 Postgres).
+# [revocation]
+# backend = "redis" # none (default) | redis | postgres
+# dsn_env = "AXOND_REDIS_URL" # optional: reuse [budget].dsn_env
+# key_prefix = "axond:revocation"
+# on_unavailable = "deny" # deny (default) | allow
+# timeout_ms = 250
+# connect_timeout_ms = 5000
