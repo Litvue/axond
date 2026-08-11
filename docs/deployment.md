@@ -449,6 +449,16 @@ a separate `key_prefix`).
 In-flight reservations are not carried over, which is the other reason to stop
 traffic first.
 
+Turning the cap back off is deliberately not a config flip either, and there is
+no un-migrate command: the old keys are gone, so a cap-less binary would read
+zero spend for every subject and hand each one a fresh budget — which is why it
+refuses to boot against migrated state. Dropping the cap therefore means
+accepting a spend reset, which you do explicitly: stop the fleet and either
+delete `<key_prefix>:v2:*` together with `<key_prefix>:layout`, or move the
+deployment to a new `key_prefix`. Note that the layout marker is per
+`key_prefix`, so two deployments sharing one Redis and one prefix cannot disagree
+about the cap; give them separate prefixes if they need to.
+
 **Postgres.** Stop and drain the fleet here too, then apply
 [`budget_v2.sql`](../ops/postgres/budget_v2.sql) on top of `budget_v1.sql` — it is
 additive, and its backfill seeds each namespace total from the subject rows
