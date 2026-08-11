@@ -298,12 +298,13 @@ process environment. Nothing in the config file is ever a secret value.
 | `GET /v1/credentials` | gateway key | Replica-local credential labels and circuit state for the caller's namespace; `?namespaces=all` additionally requires `credentials:all`. |
 
 Minted callers may additionally carry repeatable `--scope` capabilities
-(`chat`, `messages`, `embeddings`, `models`, `credentials`, or
+(`chat`, `messages`, `embeddings`, `responses`, `models`, `credentials`, or
 `credentials:all`). Scope only narrows the derived namespace authority;
 scope-less principals retain their own-namespace credential view. A scoped
 token needs `credentials` for the route, while `?namespaces=all` additionally
 requires the explicit `credentials:all` scope and otherwise returns
-`403 token_scope_insufficient`. `/v1/responses` remains a typed `501`.
+`403 token_scope_insufficient`. `/v1/responses` requires the `responses`
+capability for scoped callers.
 `credentials:all` is operator-only and must be minted only into operator
 tokens. The all-namespaces view also requires the caller's namespace to be the
 configured default/platform namespace; the verifier `namespaces = [...]`

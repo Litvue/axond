@@ -1,0 +1,15 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_fixture_0001","object":"response","status":"in_progress","model":"gpt-4o-responses","opaque_future_field":{"keep":true}}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"The capital"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":" of France"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":" is Paris."}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_fixture_0001","status":"completed","usage":{"input_tokens":19,"output_tokens":7,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}}}
+

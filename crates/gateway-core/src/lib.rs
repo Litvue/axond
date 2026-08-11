@@ -26,6 +26,7 @@ pub use guardrail::{
 };
 pub use openai::{
     OpenAiCompatibleAdapter, OpenAiFlavor, embeddings_usage, normalize_foundry_endpoint,
+    responses_usage,
 };
 pub use provider::{
     Capabilities, ModelUsage, ProviderAdapter, ProviderRequest, ProviderResponse,

@@ -317,6 +317,26 @@ impl Credentials {
         self.plan_at(config, namespace, provider, Instant::now())
     }
 
+    /// Plan only the first configured credential for a stateful continuation.
+    /// Provider-stored response ids are scoped to the credential's project or
+    /// organization, so rotating to another key would break continuity. This
+    /// intentionally bypasses credential health so a parked or cooling-down
+    /// first key surfaces its provider error instead of silently switching to
+    /// a key that cannot see the stored response.
+    pub fn plan_pinned(
+        &self,
+        config: &Config,
+        namespace: &str,
+        provider: &str,
+    ) -> Option<CredentialPlan> {
+        let (pool, source) = self.resolve_pool(config, namespace, provider)?;
+        let entry = pool.entries.first()?;
+        Some(CredentialPlan {
+            source,
+            attempts: vec![lease(entry)],
+        })
+    }
+
     fn plan_at(
         &self,
         config: &Config,
@@ -324,31 +344,7 @@ impl Credentials {
         provider: &str,
         now: Instant,
     ) -> Option<CredentialPlan> {
-        let own = self
-            .pools
-            .get(&(namespace.to_string(), provider.to_string()));
-        let (pool, source) = match own {
-            Some(pool) => {
-                let source = if namespace == self.platform_ns {
-                    CredentialSource::Platform
-                } else {
-                    CredentialSource::Byok
-                };
-                (pool, source)
-            }
-            None => {
-                let allow_fallback = config
-                    .namespace(namespace)
-                    .is_some_and(|n| n.allow_platform_fallback);
-                if !allow_fallback || namespace == self.platform_ns {
-                    return None;
-                }
-                let pool = self
-                    .pools
-                    .get(&(self.platform_ns.clone(), provider.to_string()))?;
-                (pool, CredentialSource::Platform)
-            }
-        };
+        let (pool, source) = self.resolve_pool(config, namespace, provider)?;
 
         let order = pool.order(self.strategy);
         let entries = order.iter().map(|&i| &pool.entries[i]);
@@ -395,6 +391,39 @@ impl Credentials {
             attempts,
             parked,
         })
+    }
+
+    fn resolve_pool<'a>(
+        &'a self,
+        config: &Config,
+        namespace: &str,
+        provider: &str,
+    ) -> Option<(&'a Pool, CredentialSource)> {
+        let own = self
+            .pools
+            .get(&(namespace.to_string(), provider.to_string()));
+        match own {
+            Some(pool) => {
+                let source = if namespace == self.platform_ns {
+                    CredentialSource::Platform
+                } else {
+                    CredentialSource::Byok
+                };
+                Some((pool, source))
+            }
+            None => {
+                let allow_fallback = config
+                    .namespace(namespace)
+                    .is_some_and(|n| n.allow_platform_fallback);
+                if !allow_fallback || namespace == self.platform_ns {
+                    return None;
+                }
+                let pool = self
+                    .pools
+                    .get(&(self.platform_ns.clone(), provider.to_string()))?;
+                Some((pool, CredentialSource::Platform))
+            }
+        }
     }
 
     /// A credential served a request: clear its failure history.

@@ -116,6 +116,57 @@ async fn buffered_embeddings_round_trip() {
 }
 
 #[tokio::test]
+async fn buffered_responses_round_trip_and_rewrite_only_model() {
+    let (upstream_server, gateway) = boot().await;
+    let response = client()
+        .post(gateway.url("/v1/responses"))
+        .bearer_auth(GATEWAY_KEY)
+        .json(&json!({
+            "model": alias::RESPONSES,
+            "input": "What is the capital of France?",
+            "store": true,
+            "opaque_future_field": { "keep": true }
+        }))
+        .send()
+        .await
+        .expect("the gateway answers");
+
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.expect("a JSON body");
+    let fixture: Value =
+        serde_json::from_slice(&upstream::fixture("openai/responses.json")).expect("fixture");
+    assert_eq!(body, fixture);
+    let recorded = upstream_server.state.last_request();
+    assert_eq!(recorded.path, "/responses");
+    assert_eq!(recorded.model, target::RESPONSES);
+    assert_eq!(recorded.body["store"], json!(true));
+    assert_eq!(
+        recorded.body["opaque_future_field"],
+        json!({ "keep": true })
+    );
+    assert_eq!(
+        recorded.authorization.as_deref(),
+        Some(format!("Bearer {OPENAI_KEY}").as_str())
+    );
+}
+
+#[tokio::test]
+async fn streamed_responses_are_byte_faithful() {
+    let (_upstream, gateway) = boot().await;
+    let body = stream_text(
+        gateway.url("/v1/responses"),
+        json!({
+            "model": alias::RESPONSES,
+            "stream": true,
+            "input": "What is the capital of France?"
+        }),
+    )
+    .await;
+    let fixture = upstream::fixture("openai/responses.sse");
+    assert_eq!(body.as_bytes(), fixture.as_ref());
+}
+
+#[tokio::test]
 async fn streamed_chat_completions_relays_openai_framing() {
     let (_upstream, gateway) = boot().await;
     let body = stream_text(

@@ -16,16 +16,19 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
 CHAT = "fixture-chat"
 EMBEDDINGS = "fixture-embeddings"
+RESPONSES = "fixture-responses"
 MESSAGES = "fixture-messages"
 
 _BUFFERED = {
     ("/chat/completions", False): "openai/chat_completion.json",
     ("/embeddings", False): "openai/embeddings.json",
+    ("/responses", False): "openai/responses.json",
     ("/messages", False): "anthropic/message_thinking_tool_use.json",
 }
 _STREAMED = {
     "/chat/completions": "openai/chat_completion.sse",
     "/messages": "anthropic/message_thinking_tool_use.sse",
+    "/responses": "openai/responses.sse",
 }
 
 

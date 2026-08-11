@@ -17,7 +17,7 @@ breaking them is a deliberate, documented act — not that they are frozen.
 | `GET /v1/models` | **supported** | the alias catalogue, gated + namespace-scoped | n/a |
 | `GET /v1/credentials` | **supported** | replica-local credential labels and circuit state, scoped | n/a |
 | `GET /healthz`, `GET /readyz` | **supported** | liveness / readiness text | n/a |
-| `POST /v1/responses` | **deferred** — typed `501 not_implemented` | OpenAI Responses | — |
+| `POST /v1/responses` | **supported** | OpenAI Responses, native passthrough | yes |
 
 Scoped minted callers receive a typed `403 token_scope_insufficient` when their
 scope does not include a route capability or the namespace cannot serve it.
@@ -27,8 +27,10 @@ credential view requires the explicit `credentials:all` scope; a scoped token
 also needs `credentials` for the route. The all-namespaces view additionally
 requires the caller's namespace to be the configured default/platform namespace.
 
-Deferred routes are still routes: they answer with a typed error naming their
-own deferral, so a `501` can never be confused with a wrong `base_url`.
+Responses is forwarded natively with only `model` rewritten; streaming is
+byte-faithful and requests carrying a non-empty `previous_response_id` consider
+only their alias's first configured target and first configured credential; they
+do not fail over or rotate credentials.
 
 ## Providers
 
@@ -140,6 +142,6 @@ version 2 transition.
   `backend = "in-memory"` budgets are per replica by design. Their exact
   thresholds and recovery timing may be tuned in any release.
 - **Pricing catalogue values.** Prices come from your config, not from us.
-- **Deferred features arriving on a date.** `/v1/responses`, cross-provider
-  translation, and further usage sinks (Tinybird, ClickHouse) are post-beta with
-  no committed schedule.
+- **Deferred features arriving on a date.** Cross-provider translation and
+  further usage sinks (Tinybird, ClickHouse) remain post-beta with no committed
+  schedule.

@@ -37,6 +37,8 @@ pub enum GatewayError {
     BudgetUnavailable,
     #[error("rate-limit store is unavailable")]
     RateLimitUnavailable,
+    #[error("continuation affinity unavailable for Responses target `{provider}/{model}`")]
+    ContinuationAffinityUnavailable { provider: String, model: String },
     #[error("revocation store is unavailable")]
     RevocationUnavailable,
     #[error("inbound concurrency limit exceeded")]
@@ -49,8 +51,6 @@ pub enum GatewayError {
     TokenForbidden(#[source] TokenVerificationError),
     #[error("token scope does not authorize `{0}`")]
     ScopeInsufficient(Capability),
-    #[error("{0} is not implemented yet")]
-    NotImplemented(&'static str),
     #[error(transparent)]
     Provider(#[from] ProviderError),
     #[error(transparent)]
@@ -90,13 +90,13 @@ impl GatewayError {
             // dependency failure rather than an over-cap caller (ADR 0010).
             Self::BudgetUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::RateLimitUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ContinuationAffinityUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::RevocationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::RateLimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::TokenUnauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::TokenForbidden(_) => StatusCode::FORBIDDEN,
             Self::ScopeInsufficient(_) => StatusCode::FORBIDDEN,
-            Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::MintingDisabled => StatusCode::NOT_FOUND,
             Self::MintNotAuthorized
@@ -129,12 +129,12 @@ impl GatewayError {
             Self::RequestCostCeilingExceeded { .. } => "request_cost_ceiling_exceeded",
             Self::BudgetUnavailable => "budget_unavailable",
             Self::RateLimitUnavailable => "rate_limit_unavailable",
+            Self::ContinuationAffinityUnavailable { .. } => "continuation_affinity_unavailable",
             Self::RevocationUnavailable => "revocation_unavailable",
             Self::RateLimitExceeded { .. } => "rate_limited",
             Self::Unauthorized => "unauthorized",
             Self::TokenUnauthorized(error) | Self::TokenForbidden(error) => error.code(),
             Self::ScopeInsufficient(_) => "token_scope_insufficient",
-            Self::NotImplemented(_) => "not_implemented",
             Self::BadRequest(_) => "bad_request",
             Self::MintingDisabled => "minting_disabled",
             Self::MintNotAuthorized => "mint_not_authorized",

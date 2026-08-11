@@ -33,6 +33,7 @@ pub mod alias {
     pub const MESSAGES_SLOW: &str = "messages-slow";
     pub const MESSAGES_DROP: &str = "messages-drop";
     pub const EMBEDDINGS: &str = "embeddings-golden";
+    pub const RESPONSES: &str = "responses-golden";
 }
 
 /// Micro-dollars per million tokens every test target is priced at, so an
@@ -246,7 +247,7 @@ namespace = "platform"
 max_attempts = 1
 overall_timeout_ms = 30000
 
-{chat}{chat_slow}{chat_drop}{chat_fail}{messages}{messages_slow}{messages_drop}{embeddings}"#,
+{chat}{chat_slow}{chat_drop}{chat_fail}{messages}{messages_slow}{messages_drop}{embeddings}{responses}"#,
         chat = model(alias::CHAT, "fake-openai", target::CHAT),
         chat_slow = model(alias::CHAT_SLOW, "fake-openai", target::SLOW_STREAM),
         chat_drop = model(alias::CHAT_DROP, "fake-openai", target::DROP_STREAM),
@@ -255,5 +256,6 @@ overall_timeout_ms = 30000
         messages_slow = model(alias::MESSAGES_SLOW, "fake-anthropic", target::SLOW_STREAM),
         messages_drop = model(alias::MESSAGES_DROP, "fake-anthropic", target::DROP_STREAM),
         embeddings = model(alias::EMBEDDINGS, "fake-openai", target::EMBEDDINGS),
+        responses = model(alias::RESPONSES, "fake-openai", target::RESPONSES),
     )
 }

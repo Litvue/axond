@@ -304,11 +304,13 @@ pub fn settle_upstream_error(state: AppState, ctx: StreamContext, started: Insta
 /// `[DONE]` sentinel an OpenAI SDK waits for. A native route relays the
 /// provider's own bytes verbatim — the decoder runs only to observe usage — and
 /// closes on the provider's own terminal event, because an SDK reading its
-/// native wire would choke on a foreign sentinel.
+/// native wire would choke on a foreign sentinel. Responses is byte-faithful
+/// like Native, but uses a Responses-shaped terminal error.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Framing {
     OpenAiSse,
     Native,
+    Responses,
 }
 
 impl Framing {
@@ -320,6 +322,7 @@ impl Framing {
         match self {
             Self::OpenAiSse => Some(done_event()),
             Self::Native => None,
+            Self::Responses => None,
         }
     }
 
@@ -330,6 +333,7 @@ impl Framing {
         match self {
             Self::OpenAiSse => error_event(message),
             Self::Native => native_error_event(message),
+            Self::Responses => responses_error_event(message),
         }
     }
 }
@@ -549,7 +553,8 @@ impl Relay {
 }
 
 /// Generated text in one relayed chunk, across the shapes the adapters emit:
-/// OpenAI chat deltas, and Anthropic's content-block deltas. Anything else
+/// OpenAI chat deltas, Anthropic's content-block deltas, and OpenAI Responses
+/// top-level string deltas. Anything else
 /// contributes nothing rather than guessing, so an unmeasurable stream is
 /// charged its prompt only.
 fn relayed_text_len(data: &Value) -> usize {
@@ -570,6 +575,10 @@ fn relayed_text_len(data: &Value) -> usize {
             .and_then(Value::as_str)
             .map_or(0, text_chars);
     }
+    chars += data
+        .get("delta")
+        .and_then(Value::as_str)
+        .map_or(0, text_chars);
     chars
 }
 
@@ -607,6 +616,18 @@ fn native_error_event(message: &str) -> Bytes {
     let payload = json!({
         "type": "error",
         "error": { "type": "upstream_stream_error", "message": message }
+    });
+    Bytes::from(format!(
+        "event: error\ndata: {}\n\n",
+        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned())
+    ))
+}
+
+fn responses_error_event(message: &str) -> Bytes {
+    let payload = json!({
+        "type": "error",
+        "code": "upstream_stream_error",
+        "message": message,
     });
     Bytes::from(format!(
         "event: error\ndata: {}\n\n",
@@ -1129,6 +1150,22 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         accounting.settle(Status::Ok);
         let record = settled(&ledger).await;
         assert_eq!(record["signer_kid"], "test-kid");
+    }
+
+    #[test]
+    fn responses_deltas_contribute_to_partial_output_charge() {
+        let first = json!({
+            "type": "response.output_text.delta",
+            "delta": "The capital"
+        });
+        let second = json!({
+            "type": "response.output_text.delta",
+            "delta": " is Paris."
+        });
+        assert_eq!(
+            relayed_text_len(&first) + relayed_text_len(&second),
+            "The capital is Paris.".chars().count()
+        );
     }
 
     const OPENAI_STREAM: &str = concat!(
