@@ -24,8 +24,10 @@ scope-less tokens retain their own-namespace view; granting all namespaces to
 them would let any tenant enumerate every namespace. A scoped token
 additionally needs `credentials` for the route at all.
 `credentials:all` is an operator-only capability: because it has no namespace
-restriction, operators must mint it only into operator tokens, never tenant
-tokens. The verifier's `namespaces` allowlist does not narrow this capability.
+restriction, the all-namespaces view additionally requires that the caller's
+namespace is the configured default/platform namespace. Operators must mint it
+only into operator tokens, never tenant tokens; the verifier's `namespaces`
+allowlist is defense in depth rather than the boundary.
 Unknown query values are typed `400 bad_request`.
 
 The response declares `observed: "replica"` and reports `healthy`, `parked`, or

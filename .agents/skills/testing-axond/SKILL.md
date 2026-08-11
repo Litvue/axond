@@ -66,10 +66,10 @@ Observed behaviour worth reusing (all reproducible offline, no provider keys):
 - A repeated `namespaces` param is deliberately rejected with a typed `400 bad_request`
   (for example, `?namespaces=all&namespaces=beta`); it never exposes a query deserializer
   error or bypasses the gateway's typed-error envelope.
-- `credentials:all` is a pure capability check, not an operator-namespace check: a token
-  minted for a *tenant* namespace that carries `credentials:all` sees every namespace.
-  Operators must mint it only into operator tokens; the verifier's `namespaces = [...]`
-  allowlist does not constrain this capability.
+- `credentials:all` is an operator-only capability: a token minted for a tenant
+  namespace that carries it is denied the all-namespaces view because that view also
+  requires the configured default/platform namespace. Operators must mint it only into
+  operator tokens; the verifier's `namespaces = [...]` allowlist is defense in depth.
 - A namespace with no credentials and fallback off answers `200 {"data":[]}` — an empty
   list, not an error.
 - The list is sorted by `(namespace, provider, credential_id)`, with omitted ids sorting

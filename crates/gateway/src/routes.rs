@@ -164,10 +164,11 @@ async fn list_credentials(
     let view = match namespaces.as_deref() {
         None => CredentialStatusView::Namespace(&caller.namespace),
         Some("all") => {
-            if !caller
-                .scope
-                .as_ref()
-                .is_some_and(|scope| scope.contains(&Capability::CredentialsAll))
+            if caller.namespace != snapshot.config.default_namespace()
+                || !caller
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.contains(&Capability::CredentialsAll))
             {
                 return Err(GatewayError::ScopeInsufficient(Capability::CredentialsAll));
             }
@@ -1973,6 +1974,45 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
     }
 
     #[tokio::test]
+    async fn credentials_status_tenant_operator_scope_cannot_view_all_namespaces() {
+        let token = scoped_token_for_namespace(
+            "scope-tests",
+            "acme",
+            Some(vec!["credentials", "credentials:all"]),
+        );
+        let response =
+            scoped_route_request(isolated_tenant_state(), "/v1/credentials", &token).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = scoped_route_request(
+            isolated_tenant_state(),
+            "/v1/credentials?namespaces=all",
+            &token,
+        )
+        .await;
+        assert_scope_denial(response, "credentials:all").await;
+
+        let platform_token = scoped_token(Some(vec!["credentials", "credentials:all"]));
+        let response = scoped_route_request(
+            isolated_tenant_state(),
+            "/v1/credentials?namespaces=all",
+            &platform_token,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let namespaces: Vec<_> = body["data"]
+            .as_array()
+            .expect("credential list")
+            .iter()
+            .filter_map(|entry| entry["namespace"].as_str())
+            .collect();
+        assert_eq!(namespaces, ["acme", "beta"]);
+    }
+
+    #[tokio::test]
     async fn credentials_status_never_serializes_secret_material() {
         let response = scoped_route_request(
             scoped_route_state().await,
@@ -2064,7 +2104,7 @@ audience = "scope-tests"
 kid = "scope-test-kid"
 alg = "HS256"
 env = "JWT_SECRET"
-namespaces = ["acme", "beta"]
+namespaces = ["platform", "acme", "beta"]
 max_ttl = "15m"
 "#,
         )

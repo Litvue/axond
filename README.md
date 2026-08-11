@@ -288,8 +288,9 @@ liveness probes `/healthz` and `/readyz` answer without a credential.
 healthy/parked/probe state. Its default view follows the caller's namespace and
 platform fallback; scope-less principals retain this own-namespace view.
 `?namespaces=all` requires the explicit `credentials:all` scope, while a
-scoped token also needs `credentials` for the route. It never returns secret
-material. For fallback platform entries, the default env-derived
+scoped token also needs `credentials` for the route, and the caller must be in
+the configured default/platform namespace. It never returns secret material.
+For fallback platform entries, the default env-derived
 `credential_id` is omitted; an explicitly configured id remains visible.
 
 See [ADR 0013](./docs/adr/0013-inbound-auth-fails-closed.md).

@@ -24,7 +24,8 @@ scope does not include a route capability or the namespace cannot serve it.
 Static gateway keys and scope-less tokens retain their existing route behavior,
 including the own-namespace `/v1/credentials` view. The all-namespaces
 credential view requires the explicit `credentials:all` scope; a scoped token
-also needs `credentials` for the route.
+also needs `credentials` for the route. The all-namespaces view additionally
+requires the caller's namespace to be the configured default/platform namespace.
 
 Deferred routes are still routes: they answer with a typed error naming their
 own deferral, so a `501` can never be confused with a wrong `base_url`.

@@ -305,8 +305,9 @@ token needs `credentials` for the route, while `?namespaces=all` additionally
 requires the explicit `credentials:all` scope and otherwise returns
 `403 token_scope_insufficient`. `/v1/responses` remains a typed `501`.
 `credentials:all` is operator-only and must be minted only into operator
-tokens: it is a pure capability check and is not constrained by the token's
-verifier `namespaces = [...]` allowlist.
+tokens. The all-namespaces view also requires the caller's namespace to be the
+configured default/platform namespace; the verifier `namespaces = [...]`
+allowlist is defense in depth ([ADR 0021](./adr/0021-credential-status-endpoint.md)).
 
 Credential status is Tier 0, in-memory, and per replica: `observed: "replica"`
 is not a fleet-wide health view. Presence is represented by an entry (boot
