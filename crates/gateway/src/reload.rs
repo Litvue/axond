@@ -264,6 +264,14 @@ impl std::fmt::Display for Delta {
 }
 
 impl ReloadSummary {
+    fn gateway_minting_route_added(&self) -> bool {
+        !self.gateway_minting.added.is_empty()
+    }
+
+    fn gateway_minting_route_removed(&self) -> bool {
+        !self.gateway_minting.removed.is_empty()
+    }
+
     fn between(boot: &Boot, before: &ConfigSnapshot, after: &ConfigSnapshot) -> Self {
         let before_config = &before.config;
         let after_config = &after.config;
@@ -450,13 +458,14 @@ impl ReloadSummary {
                 "`[revocation]` changed, but the revocation store is already serving; restart to apply it"
             );
         }
-        if self.gateway_minting.added.len()
-            + self.gateway_minting.removed.len()
-            + self.gateway_minting.changed.len()
-            > 0
-        {
+        if self.gateway_minting_route_added() {
             tracing::warn!(
-                "`[gateway_minting]` route registration is boot-time; enabling it requires a restart, while removal takes effect immediately"
+                "`[gateway_minting]` was enabled, but `/v1/tokens` route registration is boot-time; restart to expose it"
+            );
+        }
+        if self.gateway_minting_route_removed() {
+            tracing::warn!(
+                "`[gateway_minting]` was removed; issuance is disabled immediately and `/v1/tokens` returns typed 404"
             );
         }
     }
@@ -987,6 +996,10 @@ max_ttl = "10m"
             vec!["gateway_minting".to_owned()]
         );
         assert!(!summary.is_empty());
+        assert!(summary.gateway_minting.added.is_empty());
+        assert!(summary.gateway_minting.removed.is_empty());
+        assert!(!summary.gateway_minting_route_added());
+        assert!(!summary.gateway_minting_route_removed());
     }
 
     #[test]
