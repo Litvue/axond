@@ -1111,6 +1111,7 @@ async fn stream_with_failover(
                     let snapshot_for_health = snapshot.clone();
                     let rotation = streaming::RotationHandle::new(
                         remaining,
+                        lease.clone(),
                         plan.parked.len() + lease_index + 1,
                         target_attempt + 1,
                         opener,
