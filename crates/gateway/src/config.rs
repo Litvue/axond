@@ -1340,6 +1340,13 @@ impl Config {
                     )));
                 }
             }
+            if let Some(capability) = scope.iter().find_map(|value| {
+                Capability::parse(value).filter(|capability| capability.is_operator_only())
+            }) {
+                return Err(ConfigError::Invalid(format!(
+                    "gateway_minting scope capability `{capability}` is not held by any can_mint gateway key"
+                )));
+            }
         }
         if let Some(aliases) = &minting.aliases {
             AliasScope::parse(aliases.iter().map(String::as_str)).map_err(|error| {
@@ -1887,6 +1894,25 @@ audience = "test"
                 "kid = \"test\"\nenv = \"SIGN\"\naliases = [\"gpt-*-bad\"]",
                 "invalid alias pattern",
             ),
+<<<<<<< HEAD
+||||||| parent of 2af6b3b (fix(gateway): enforce inherited minting scope authority)
+            (
+                "missing scope ceiling",
+                "kid = \"test\"\nenv = \"SIGN\"",
+                "explicit scope ceiling",
+            ),
+=======
+            (
+                "missing scope ceiling",
+                "kid = \"test\"\nenv = \"SIGN\"",
+                "explicit scope ceiling",
+            ),
+            (
+                "unheld scope capability",
+                "kid = \"test\"\nenv = \"SIGN\"\nscope = [\"credentials:all\"]",
+                "not held",
+            ),
+>>>>>>> 2af6b3b (fix(gateway): enforce inherited minting scope authority)
         ];
         for (name, minting, expected) in cases {
             let minting = if minting.contains("scope =") {
