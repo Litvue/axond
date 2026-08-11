@@ -21,6 +21,8 @@ pub enum Capability {
     Messages,
     Embeddings,
     Models,
+    Credentials,
+    CredentialsAll,
 }
 
 impl Capability {
@@ -30,6 +32,8 @@ impl Capability {
             "messages" => Some(Self::Messages),
             "embeddings" => Some(Self::Embeddings),
             "models" => Some(Self::Models),
+            "credentials" => Some(Self::Credentials),
+            "credentials:all" => Some(Self::CredentialsAll),
             _ => None,
         }
     }
@@ -40,6 +44,8 @@ impl Capability {
             Self::Messages => "messages",
             Self::Embeddings => "embeddings",
             Self::Models => "models",
+            Self::Credentials => "credentials",
+            Self::CredentialsAll => "credentials:all",
         }
     }
 }
