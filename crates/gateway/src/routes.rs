@@ -1321,6 +1321,8 @@ async fn stream_with_failover(
         wire,
         mut hold,
     } = request;
+    let reservation_guard =
+        BudgetReservation::new(state.clone(), hold.key.clone(), hold.reservation.clone());
     let cfg = &snapshot.config;
     let policy = FailoverPolicy;
     let deadline = Instant::now() + Duration::from_millis(cfg.failover.overall_timeout_ms);
@@ -1450,6 +1452,7 @@ async fn stream_with_failover(
             ctx.attempts = target_attempt + 1;
             match opened {
                 Ok((decoder, bytes)) => {
+                    reservation_guard.disarm();
                     telemetry::finish_upstream_attempt(
                         span,
                         telemetry::ATTEMPT_OK,
@@ -1597,15 +1600,16 @@ async fn stream_with_failover(
 
     if let Some(err) = walk.last_error.take() {
         if let Some((mut ctx, started)) = last_ctx {
+            reservation_guard.disarm();
             ctx.attempts = walk.attempts;
             ctx.rate_limit_permit = hold.permit.take();
             streaming::settle_upstream_error(state.clone(), ctx, started);
         } else {
-            state.0.budget.release(&hold.key, &hold.reservation).await;
+            reservation_guard.release().await;
         }
         return Err(err.into());
     }
-    state.0.budget.release(&hold.key, &hold.reservation).await;
+    reservation_guard.release().await;
     Err(walk.into_error())
 }
 
@@ -1670,6 +1674,10 @@ impl BudgetReservation {
             .take()
             .expect("budget reservation guard must be armed");
         self.state.0.budget.release(&self.key, &reservation).await;
+    }
+
+    fn disarm(mut self) {
+        self.reservation.take();
     }
 }
 
