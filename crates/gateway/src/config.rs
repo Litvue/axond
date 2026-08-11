@@ -1860,6 +1860,103 @@ audience = "test"
     }
 
     #[test]
+    fn gateway_minting_validation_rejects_invalid_definitions() {
+        let cases = [
+            (
+                "unknown kid",
+                "kid = \"missing\"\nenv = \"SIGN\"",
+                "unknown gateway_verifier",
+            ),
+            (
+                "unauthorized namespace",
+                "kid = \"test\"\nenv = \"SIGN\"",
+                "not permitted",
+            ),
+            (
+                "missing source",
+                "kid = \"test\"",
+                "exactly one non-empty source",
+            ),
+            (
+                "both sources",
+                "kid = \"test\"\nenv = \"SIGN\"\nfile = \"/run/sign\"",
+                "exactly one non-empty source",
+            ),
+            (
+                "ttl above verifier",
+                "kid = \"test\"\nenv = \"SIGN\"\nmax_ttl = \"16m\"",
+                "exceeds verifier",
+            ),
+            (
+                "bad capability",
+                "kid = \"test\"\nenv = \"SIGN\"\nscope = [\"not-a-capability\"]",
+                "unknown capability",
+            ),
+            (
+                "bad alias",
+                "kid = \"test\"\nenv = \"SIGN\"\naliases = [\"gpt-*-bad\"]",
+                "invalid alias pattern",
+            ),
+        ];
+        for (name, minting, expected) in cases {
+            let extra_namespace = if name == "unauthorized namespace" {
+                "\n[[namespace]]\nid = \"other\"\n"
+            } else {
+                ""
+            };
+            let verifier_namespaces = if name == "unauthorized namespace" {
+                "[\"other\"]"
+            } else {
+                "[\"platform\"]"
+            };
+            let toml = format!(
+                r#"
+[[namespace]]
+id = "platform"
+default = true
+{extra_namespace}
+[[gateway_key]]
+env = "INBOUND"
+namespace = "platform"
+can_mint = true
+
+[gateway_token]
+audience = "test"
+
+[[gateway_verifier]]
+kid = "test"
+alg = "HS256"
+env = "JWT"
+namespaces = {verifier_namespaces}
+max_ttl = "15m"
+
+[gateway_minting]
+{minting}
+"#
+            );
+            let error = Config::from_toml_str(&toml).expect_err(name);
+            assert!(error.to_string().contains(expected), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn can_mint_without_gateway_minting_is_rejected() {
+        let error = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "INBOUND"
+namespace = "platform"
+can_mint = true
+"#,
+        )
+        .expect_err("can_mint must require minting config");
+        assert!(error.to_string().contains("gateway_minting"), "{error}");
+    }
+
+    #[test]
     fn no_budget_section_means_no_cap_and_no_datastore() {
         let cfg = Config::from_toml_str(VALID).expect("valid config");
         assert_eq!(cfg.budget.backend, BudgetBackend::None);

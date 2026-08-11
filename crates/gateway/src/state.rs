@@ -11,7 +11,7 @@
 //! credential, and its circuit against one consistent config, even if a reload
 //! lands mid-flight.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,13 +22,14 @@ use gateway_core::{
 use gateway_transport::HttpDispatcher;
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::aliases::AliasScope;
 use crate::budget::BudgetStore;
 use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind};
 use crate::credentials::{CredentialError, Credentials};
 use crate::key_material::{self, KeyMaterialError};
 use crate::principals::{
-    ConfigPrincipals, GatewayKeyEntry, Presented, PrincipalShapeError, PrincipalStoreChain,
-    TokenVerifier, TokenVerifierBuildError,
+    Capability, ConfigPrincipals, GatewayKeyEntry, Presented, PrincipalShapeError,
+    PrincipalStoreChain, TokenVerifier, TokenVerifierBuildError,
 };
 #[cfg(test)]
 use crate::rate_limit::NoLimit;
@@ -78,8 +79,8 @@ pub struct ResolvedMinting {
     pub key_material: SecretString,
     pub audience: String,
     pub max_ttl: Duration,
-    pub scope: Option<std::collections::HashSet<crate::principals::Capability>>,
-    pub aliases: Option<crate::aliases::AliasScope>,
+    pub scope: Option<HashSet<Capability>>,
+    pub aliases: Option<AliasScope>,
     pub max_request_microdollars: Option<u64>,
 }
 
@@ -123,8 +124,30 @@ pub enum SnapshotError {
         "no inbound gateway key resolved: inbound authentication fails closed and there is no keyless mode"
     )]
     NoInboundKeys,
-    #[error("gateway_minting signing key is invalid: {0}")]
-    MintingKey(String),
+    #[error("gateway_minting signing key `{reference}` is invalid: {error}")]
+    MintingKey { reference: String, error: String },
+    #[error("gateway_minting references unknown verifier kid `{kid}`")]
+    MintingVerifierNotFound { kid: String },
+    #[error("gateway_minting must declare exactly one non-empty source")]
+    InvalidMintingSource,
+    #[error("gateway_minting references env var `{env}`, which is unset or empty")]
+    MissingMintingKey { env: String },
+    #[error("gateway_minting file `{path}` failed ({kind}): {error}")]
+    MintingKeyFile {
+        path: String,
+        kind: std::io::ErrorKind,
+        error: String,
+    },
+    #[error("gateway_minting file `{path}` is empty")]
+    EmptyMintingKeyFile { path: String },
+    #[error("gateway_minting file `{path}` is not valid UTF-8")]
+    InvalidMintingKeyFileUtf8 { path: String },
+    #[error("gateway_minting requires a non-empty gateway token audience")]
+    MissingMintingAudience,
+    #[error("gateway_minting aliases are invalid: {error}")]
+    InvalidMintingAliases { error: String },
+    #[error("gateway_minting scope contains invalid capability `{value}`")]
+    InvalidMintingCapability { value: String },
 }
 
 impl ConfigSnapshot {
@@ -226,77 +249,83 @@ impl ConfigSnapshot {
             .map(|verifier| Box::new(verifier) as Box<dyn crate::principals::PrincipalStore>)
             .collect();
         let principals = PrincipalStoreChain::new(stores, config_principals)?;
-        let gateway_minting = config
-            .gateway_minting
-            .as_ref()
-            .map(|minting| {
-                let verifier = config
-                    .gateway_verifier
-                    .iter()
-                    .find(|verifier| verifier.kid == minting.kid)
-                    .expect("validated minting verifier");
-                let source = minting.source().expect("validated minting source");
-                let material = key_material::resolve(source, env).map_err(|error| match error {
-                    KeyMaterialError::MissingEnv { name } => SnapshotError::MissingGatewayKey {
-                        namespace: "gateway_minting".into(),
-                        env: name,
-                    },
-                    KeyMaterialError::FileRead { path, kind, error } => {
-                        SnapshotError::GatewayKeyFile {
-                            namespace: "gateway_minting".into(),
-                            path,
-                            kind,
-                            error,
-                        }
-                    }
-                    KeyMaterialError::EmptyFile { path } => SnapshotError::EmptyGatewayKeyFile {
-                        namespace: "gateway_minting".into(),
-                        path,
-                    },
-                    KeyMaterialError::InvalidUtf8 { path } => {
-                        SnapshotError::InvalidGatewayKeyFileUtf8 {
-                            namespace: "gateway_minting".into(),
-                            path,
-                        }
-                    }
-                })?;
-                crate::mint::validate_signing_material(
-                    match verifier.alg {
-                        GatewayVerifierAlgorithm::EdDsa => crate::mint::MintAlgorithm::EdDsa,
-                        GatewayVerifierAlgorithm::Hs256 => crate::mint::MintAlgorithm::Hs256,
-                    },
-                    &material,
-                    &minting.kid,
-                )
-                .map_err(|error| SnapshotError::MintingKey(error.to_string()))?;
-                Ok::<ResolvedMinting, SnapshotError>(ResolvedMinting {
+        let gateway_minting = if let Some(minting) = config.gateway_minting.as_ref() {
+            let verifier = config
+                .gateway_verifier
+                .iter()
+                .find(|verifier| verifier.kid == minting.kid)
+                .ok_or_else(|| SnapshotError::MintingVerifierNotFound {
                     kid: minting.kid.clone(),
-                    algorithm: match verifier.alg {
-                        GatewayVerifierAlgorithm::EdDsa => crate::mint::MintAlgorithm::EdDsa,
-                        GatewayVerifierAlgorithm::Hs256 => crate::mint::MintAlgorithm::Hs256,
-                    },
-                    key_material: SecretString::from(material),
-                    audience: config
-                        .gateway_token
-                        .as_ref()
-                        .expect("validated audience")
-                        .audience
-                        .clone(),
-                    max_ttl: minting.max_ttl.unwrap_or(verifier.max_ttl),
-                    scope: minting.scope.as_ref().map(|values| {
-                        values
-                            .iter()
-                            .filter_map(|value| crate::principals::Capability::parse(value))
-                            .collect()
-                    }),
-                    aliases: minting.aliases.as_ref().map(|values| {
-                        crate::aliases::AliasScope::parse(values.iter().map(String::as_str))
-                            .expect("validated aliases")
-                    }),
-                    max_request_microdollars: minting.max_request_microdollars,
+                })?;
+            let source = minting
+                .source()
+                .ok_or(SnapshotError::InvalidMintingSource)?;
+            let material = key_material::resolve(source, env).map_err(|error| match error {
+                KeyMaterialError::MissingEnv { name } => {
+                    SnapshotError::MissingMintingKey { env: name }
+                }
+                KeyMaterialError::FileRead { path, kind, error } => {
+                    SnapshotError::MintingKeyFile { path, kind, error }
+                }
+                KeyMaterialError::EmptyFile { path } => SnapshotError::EmptyMintingKeyFile { path },
+                KeyMaterialError::InvalidUtf8 { path } => {
+                    SnapshotError::InvalidMintingKeyFileUtf8 { path }
+                }
+            })?;
+            let algorithm = match verifier.alg {
+                GatewayVerifierAlgorithm::EdDsa => crate::mint::MintAlgorithm::EdDsa,
+                GatewayVerifierAlgorithm::Hs256 => crate::mint::MintAlgorithm::Hs256,
+            };
+            crate::mint::validate_signing_material(algorithm, &material, &minting.kid).map_err(
+                |error| SnapshotError::MintingKey {
+                    reference: minting.source_label().unwrap_or(&minting.kid).to_owned(),
+                    error: error.to_string(),
+                },
+            )?;
+            let audience = config
+                .gateway_token
+                .as_ref()
+                .map(|token| token.audience.trim())
+                .filter(|audience| !audience.is_empty())
+                .ok_or(SnapshotError::MissingMintingAudience)?
+                .to_owned();
+            let scope = minting
+                .scope
+                .as_ref()
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|value| {
+                            Capability::parse(value).ok_or_else(|| {
+                                SnapshotError::InvalidMintingCapability {
+                                    value: value.clone(),
+                                }
+                            })
+                        })
+                        .collect::<Result<HashSet<_>, _>>()
                 })
+                .transpose()?;
+            let aliases = minting
+                .aliases
+                .as_ref()
+                .map(|values| AliasScope::parse(values.iter().map(String::as_str)))
+                .transpose()
+                .map_err(|error| SnapshotError::InvalidMintingAliases {
+                    error: error.to_string(),
+                })?;
+            Some(ResolvedMinting {
+                kid: minting.kid.clone(),
+                algorithm,
+                key_material: SecretString::from(material),
+                audience,
+                max_ttl: minting.max_ttl.unwrap_or(verifier.max_ttl),
+                scope,
+                aliases,
+                max_request_microdollars: minting.max_request_microdollars,
             })
-            .transpose()?;
+        } else {
+            None
+        };
         let gateway_minting_fingerprint = config
             .gateway_minting
             .as_ref()
@@ -409,6 +438,9 @@ pub fn adapter_for(kind: ProviderKind) -> Box<dyn ProviderAdapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use ring::rand::SystemRandom;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn temp_file(contents: &[u8]) -> String {
@@ -509,6 +541,95 @@ max_ttl = "15m"
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn minting_signing_material_fails_closed_without_disclosing_material() {
+        let config = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "platform"
+can_mint = true
+
+[gateway_token]
+audience = "test"
+
+[[gateway_verifier]]
+kid = "test"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+
+[gateway_minting]
+kid = "test"
+env = "SIGNING_SECRET"
+"#,
+        )
+        .unwrap();
+        let env = HashMap::from([
+            ("AXOND_KEY".to_owned(), "static-secret".to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+            ("SIGNING_SECRET".to_owned(), "too-short".to_owned()),
+        ]);
+        let Err(error) = ConfigSnapshot::build(config, &env, 0) else {
+            panic!("short HS256 signing material must fail");
+        };
+        let message = error.to_string();
+        assert!(message.contains("SIGNING_SECRET"));
+        assert!(!message.contains("too-short"));
+
+        let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap();
+        let config = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "platform"
+can_mint = true
+
+[gateway_token]
+audience = "test"
+
+[[gateway_verifier]]
+kid = "test"
+alg = "EdDSA"
+env = "VERIFYING_KEY"
+namespaces = ["platform"]
+max_ttl = "15m"
+
+[gateway_minting]
+kid = "test"
+env = "SIGNING_KEY"
+"#,
+        )
+        .unwrap();
+        let env = HashMap::from([
+            ("AXOND_KEY".to_owned(), "static-secret".to_owned()),
+            (
+                "VERIFYING_KEY".to_owned(),
+                STANDARD.encode(pair.public_key().as_ref()),
+            ),
+            ("SIGNING_KEY".to_owned(), "not-base64".to_owned()),
+        ]);
+        let Err(error) = ConfigSnapshot::build(config, &env, 0) else {
+            panic!("invalid Ed25519 signing material must fail");
+        };
+        let message = error.to_string();
+        assert!(message.contains("SIGNING_KEY"));
+        assert!(!message.contains("not-base64"));
     }
 
     #[tokio::test]
