@@ -51,3 +51,9 @@ the state tier of any existing deployment.
 - Route choice stays a request concern for valid aliases.
 - Operators still receive a typed request-time error when a valid alias is sent
   to an incompatible route.
+
+### Upgrading
+
+An existing cross-family alias currently reaches request time and returns
+`400 unsupported_wire`; after this change it refuses to boot. Split it into
+one alias per wire family before upgrading.
