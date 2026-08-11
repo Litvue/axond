@@ -71,7 +71,8 @@ const COLUMNS: [&str; 22] = [
 /// bind at most 65535 values.
 const MAX_BIND_PARAMETERS: usize = u16::MAX as usize;
 
-/// Rows one INSERT can carry. Batches larger than this are split.
+/// Rows one INSERT can carry. Configured batches larger than this are split
+/// into sequential statements by `record_batch`.
 pub const MAX_ROWS_PER_STATEMENT: usize = MAX_BIND_PARAMETERS / COLUMNS.len();
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

@@ -21,7 +21,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::aliases::AliasScope;
 use crate::principals::Capability;
-use crate::usage::{BatchSettings, MAX_ROWS_PER_STATEMENT, validate_table_name};
+use crate::usage::{BatchSettings, validate_table_name};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -1536,7 +1536,7 @@ impl Config {
 
     /// A sink's fields only make sense together, so they are checked as a set:
     /// a Postgres sink needs a DSN reference and a table name that is safe to
-    /// interpolate, and its batch has to fit one statement's parameter budget.
+    /// interpolate.
     fn validate_usage_sinks(&self) -> Result<(), ConfigError> {
         for sink in &self.usage_sink {
             let kind = sink.kind.as_str();
@@ -1545,9 +1545,9 @@ impl Config {
                     "usage_sink `{kind}`: buffer_capacity must be at least 1"
                 )));
             }
-            if sink.max_batch == 0 || sink.max_batch > MAX_ROWS_PER_STATEMENT {
+            if sink.max_batch == 0 {
                 return Err(ConfigError::Invalid(format!(
-                    "usage_sink `{kind}`: max_batch must be between 1 and {MAX_ROWS_PER_STATEMENT}"
+                    "usage_sink `{kind}`: max_batch must be at least 1"
                 )));
             }
             if sink.flush_interval_ms == 0 {
@@ -2466,8 +2466,8 @@ table = "usage\"; drop table users --"
     }
 
     #[test]
-    fn rejects_batch_sizes_the_wire_protocol_cannot_carry() {
-        for bad in ["max_batch = 0", "max_batch = 100000", "buffer_capacity = 0"] {
+    fn rejects_zero_batch_size_or_buffer_capacity() {
+        for bad in ["max_batch = 0", "buffer_capacity = 0"] {
             let toml = format!(
                 r#"
 {VALID}
@@ -2483,6 +2483,21 @@ dsn_env = "DSN"
                 "accepted `{bad}`"
             );
         }
+    }
+
+    #[test]
+    fn accepts_a_batch_larger_than_one_statement() {
+        let toml = format!(
+            r#"
+{VALID}
+
+[[usage_sink]]
+kind = "postgres"
+dsn_env = "DSN"
+max_batch = 100000
+"#
+        );
+        assert!(Config::from_toml_str(&toml).is_ok());
     }
 
     #[test]

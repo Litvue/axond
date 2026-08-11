@@ -68,14 +68,6 @@ provider account and no network
 
 ## Stability promises
 
-### Telemetry
-
-The `axond.tokens.input` metric now reports only the non-cached prompt
-remainder. Cache-read and cache-write tokens are reported separately as
-`axond.tokens.cache_read` and `axond.tokens.cache_write`; operators should
-account for all three counters when comparing prompt volume across the schema
-version 2 transition.
-
 ### The config surface
 
 [`docs/configuration.md`](./configuration.md) is the reference; the file it
@@ -133,7 +125,12 @@ interface — read it at your own risk.
 
 Metric and span names, and the `axond.*` attribute keys, are stable within `0.x`
 in the same additive sense. They are an operational interface — dashboards break
-loudly — so a rename is a minor bump and a changelog entry.
+loudly — so a rename or meaning change is a minor bump and a changelog entry.
+The `axond.tokens.input` metric now reports only the non-cached prompt
+remainder. Cache-read and cache-write tokens are reported separately as
+`axond.tokens.cache_read` and `axond.tokens.cache_write`; operators should
+account for all three counters when comparing prompt volume across the schema
+version 2 transition.
 
 ### What is explicitly *not* promised at beta
 

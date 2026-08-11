@@ -20,7 +20,11 @@ known. `ModelUsage::input_tokens` is the non-cached prompt remainder and
 `cache_read_tokens` is disjoint from it for every provider. This lets
 `cost_microdollars` apply one additive rule without double-counting cached
 OpenAI input, while usage sinks and telemetry retain the cache counters needed
-to reconstruct the provider total.
+to reconstruct the provider total. The parser infers the convention from the
+provider-specific key shape; an upstream that mixes conventions, such as an
+inclusive `prompt_tokens` with Anthropic-style `cache_read_input_tokens`, is
+indistinguishable from the payload alone. Onboarding such a provider requires
+an explicit per-provider mapping rather than a heuristic.
 
 `reasoning_tokens` remains normalized at pricing time rather than being
 persisted in the usage record: the record excludes cached tokens from
