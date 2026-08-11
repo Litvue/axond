@@ -136,7 +136,12 @@ impl ProviderStreamDecoder for OpenAiStreamDecoder {
         let data: Value = serde_json::from_str(&event.data)
             .map_err(|error| ProviderError::InvalidStream(error.to_string()))?;
         if crate::is_rate_limit_payload(&data) {
-            return Err(ProviderError::RateLimitedStream(event.data));
+            let message = data
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("OpenAI stream rate limited")
+                .to_owned();
+            return Err(ProviderError::RateLimitedStream(message));
         }
         let usage = match self.surface {
             Surface::ChatCompletions => data.get("usage"),
@@ -365,5 +370,28 @@ mod tests {
             events.as_slice(),
             [ProviderStreamEvent::Data { .. }]
         ));
+    }
+
+    #[test]
+    fn rate_limit_stream_error_uses_provider_message() {
+        let mut decoder = OpenAiCompatibleAdapter::openai()
+            .stream_decoder(Surface::ChatCompletions)
+            .unwrap();
+        let error = decoder
+            .decode(SseEvent {
+                event: None,
+                data: json!({
+                    "error": {
+                        "type": "rate_limit_exceeded",
+                        "message": "slow down"
+                    }
+                })
+                .to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ProviderError::RateLimitedStream("slow down".to_owned())
+        );
     }
 }

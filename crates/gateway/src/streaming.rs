@@ -82,6 +82,7 @@ type RotationOpener = Arc<
 
 pub struct RotationHandle {
     remaining: VecDeque<(CredentialLease, usize)>,
+    serving: CredentialLease,
     opener: RotationOpener,
     record_failure: Arc<dyn Fn(&CredentialLease) + Send + Sync>,
     record_success: Arc<dyn Fn(&CredentialLease) + Send + Sync>,
@@ -95,6 +96,7 @@ fn is_stream_rate_limited(err: &TransportError) -> bool {
 impl RotationHandle {
     pub fn new(
         leases: Vec<CredentialLease>,
+        serving: CredentialLease,
         first_lease_index: usize,
         next_attempt: u32,
         opener: impl Fn(
@@ -114,11 +116,16 @@ impl RotationHandle {
                 .enumerate()
                 .map(|(offset, lease)| (lease, first_lease_index + offset))
                 .collect(),
+            serving,
             opener: Arc::new(opener),
             record_failure: Arc::new(record_failure),
             record_success: Arc::new(record_success),
             next_attempt,
         }
+    }
+
+    fn record_serving_failure(&self) {
+        (self.record_failure)(&self.serving);
     }
 
     async fn open_next(
@@ -131,6 +138,7 @@ impl RotationHandle {
             match open.await {
                 Ok(opened) => {
                     (self.record_success)(&lease);
+                    self.serving = lease.clone();
                     return Ok(Some((lease, opened)));
                 }
                 Err(err) if is_stream_rate_limited(&err) => {
@@ -485,6 +493,7 @@ impl Relay {
         let Some(rotation) = self.rotation.as_mut() else {
             return Ok(false);
         };
+        rotation.record_serving_failure();
         self.accounting.fold_attempt();
         self.bytes = futures::stream::empty().boxed();
         self.carry.clear();
@@ -1598,6 +1607,8 @@ targets = [
     #[tokio::test]
     async fn pre_content_rate_limit_rotates_and_carries_usage_once() {
         let ledger = Arc::new(Ledger::default());
+        let failures = Arc::new(AtomicUsize::new(0));
+        let failed_ids = Arc::new(Mutex::new(Vec::new()));
         let state = state_for("http://127.0.0.1:1", ledger.clone());
         let opener = |_lease: CredentialLease, _attempt: u32, _index: usize| {
             Box::pin(async {
@@ -1606,7 +1617,23 @@ targets = [
                 ))
             }) as futures::future::BoxFuture<'static, _>
         };
-        let rotation = RotationHandle::new(vec![test_lease("b")], 1, 1, opener, |_| {}, |_| {});
+        let failures_for_callback = failures.clone();
+        let failed_ids_for_callback = failed_ids.clone();
+        let rotation = RotationHandle::new(
+            vec![test_lease("b")],
+            test_lease("a"),
+            1,
+            1,
+            opener,
+            move |lease| {
+                failures_for_callback.fetch_add(1, Ordering::SeqCst);
+                failed_ids_for_callback
+                    .lock()
+                    .expect("failed ids")
+                    .push(lease.id.clone());
+            },
+            |_| {},
+        );
         let response = relay_opened(
             state,
             context(),
@@ -1631,6 +1658,8 @@ targets = [
         assert_eq!(record["input_tokens"], 8);
         assert_eq!(record["output_tokens"], 3);
         assert_eq!(ledger.settlements().len(), 1);
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+        assert_eq!(*failed_ids.lock().expect("failed ids"), ["a"]);
     }
 
     #[tokio::test]
@@ -1668,6 +1697,7 @@ targets = [
             Framing::OpenAiSse,
             Some(RotationHandle::new(
                 vec![test_lease("b"), test_lease("c"), test_lease("d")],
+                test_lease("a"),
                 1,
                 1,
                 opener,
@@ -1684,7 +1714,7 @@ targets = [
         }
         assert!(output.contains("\"content\":\"c\""));
         assert_eq!(opens.load(Ordering::SeqCst), 3);
-        assert_eq!(failures.load(Ordering::SeqCst), 2);
+        assert_eq!(failures.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -1772,6 +1802,7 @@ targets = [
             Framing::OpenAiSse,
             Some(RotationHandle::new(
                 vec![test_lease("b")],
+                test_lease("a"),
                 1,
                 1,
                 opener,
@@ -1785,7 +1816,7 @@ targets = [
             output.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
         }
         assert!(output.contains("\"content\":\"a\""));
-        assert!(output.contains("rate_limit_exceeded"));
+        assert!(output.contains("OpenAI stream rate limited"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1815,6 +1846,7 @@ targets = [
             Framing::Native,
             Some(RotationHandle::new(
                 vec![test_lease("b")],
+                test_lease("a"),
                 1,
                 1,
                 opener,
