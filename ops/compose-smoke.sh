@@ -68,6 +68,7 @@ cat /tmp/axond-compose-unauth
 echo
 printf 'placeholder chat/completions: '
 chat_status="$(curl --silent --show-error --output /tmp/axond-compose-chat \
+  --connect-timeout 5 --max-time 30 \
   --write-out '%{http_code}' \
   -H "Authorization: Bearer ${GW_INBOUND_PLATFORM_KEY}" \
   -H 'content-type: application/json' \
