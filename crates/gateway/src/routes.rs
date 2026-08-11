@@ -26,7 +26,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use axum::extract::{Extension, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderValue};
@@ -50,7 +50,7 @@ use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target};
 use crate::credentials::{CredentialPlan, CredentialSource, CredentialStatusView};
 use crate::error::GatewayError;
-use crate::mint::{MintRequest, mint_token};
+use crate::mint::{MintRequest, mint_issued_at, mint_token_at};
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
 use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
@@ -184,22 +184,15 @@ async fn mint_tokens(
         return Err(GatewayError::BadRequest("`sub` must not be empty".into()));
     }
     let subject = request.sub.trim().to_owned();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| GatewayError::MintingBlockedByEpoch {
-            namespace: caller.namespace.clone(),
-            subject: subject.clone(),
-        })?
-        .as_secs();
-    if snapshot
-        .gateway_token_epoch(&caller.namespace, &subject)
-        .is_some_and(|min_iat| min_iat > now)
-    {
-        return Err(GatewayError::MintingBlockedByEpoch {
-            namespace: caller.namespace.clone(),
-            subject: subject.clone(),
-        });
-    }
+    let epoch = snapshot.gateway_token_epoch(&caller.namespace, &subject);
+    let iat = epoch
+        .map(|min_iat| {
+            mint_issued_at(Some(min_iat)).map_err(|_| GatewayError::MintEpochNotUsable {
+                kid: minting.kid.clone(),
+                min_iat,
+            })
+        })
+        .transpose()?;
     let ttl = Duration::from_secs(request.ttl_seconds.unwrap_or(minting.max_ttl.as_secs()));
     if ttl.is_zero() || ttl > minting.max_ttl {
         return Err(GatewayError::MintClaimsNotNarrowing);
@@ -283,18 +276,21 @@ async fn mint_tokens(
     {
         return Err(GatewayError::MintClaimsNotNarrowing);
     }
-    let minted = mint_token(MintRequest {
-        kid: &minting.kid,
-        algorithm: minting.algorithm,
-        key_material: minting.key_material.expose_secret(),
-        namespace: &caller.namespace,
-        subject: &subject,
-        audience: &minting.audience,
-        ttl,
-        aliases,
-        max_request_microdollars,
-        scope,
-    })
+    let minted = mint_token_at(
+        MintRequest {
+            kid: &minting.kid,
+            algorithm: minting.algorithm,
+            key_material: minting.key_material.expose_secret(),
+            namespace: &caller.namespace,
+            subject: &subject,
+            audience: &minting.audience,
+            ttl,
+            aliases,
+            max_request_microdollars,
+            scope,
+        },
+        iat,
+    )
     .map_err(|error| GatewayError::BadRequest(error.to_string()))?;
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -1676,7 +1672,7 @@ mod tests {
     use std::future::pending;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::sync::oneshot;
     use tower::util::ServiceExt;
 
@@ -1925,8 +1921,24 @@ max_request_microdollars = 1000
             let (status, body) =
                 mint_request(minting_state_with_epochs(&epoch), json!({"sub": subject})).await;
             assert_eq!(status, StatusCode::FORBIDDEN);
-            assert_eq!(body["error"]["type"], "minting_blocked_by_epoch");
+            assert_eq!(body["error"]["type"], "mint_epoch_not_usable");
         }
+
+        let near = future - 3598;
+        let state = minting_state_with_epochs(&format!(
+            "[[gateway_token_epoch]]\nnamespace = \"platform\"\nsubject = \"near\"\nmin_iat = {near}"
+        ));
+        let (status, body) = mint_request(state.clone(), json!({"sub": "near"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let token = body["token"].as_str().expect("minted token");
+        assert!(
+            state
+                .config()
+                .resolve_principal(&Presented { credential: token })
+                .await
+                .expect("resolve minted token")
+                .is_some()
+        );
 
         let past = future - 7200;
         let epoch = format!("[[gateway_token_epoch]]\nnamespace = \"platform\"\nmin_iat = {past}");

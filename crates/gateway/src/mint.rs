@@ -220,6 +220,27 @@ pub(crate) struct MintedToken {
 }
 
 pub(crate) fn mint_token(request: MintRequest<'_>) -> Result<MintedToken> {
+    mint_token_at(request, None)
+}
+
+pub(crate) fn mint_issued_at(min_iat: Option<u64>) -> Result<u64> {
+    const CLOCK_SKEW_SECONDS: u64 = 5;
+    let now = unix_now()?;
+    match min_iat {
+        Some(min_iat) if min_iat > now.saturating_add(CLOCK_SKEW_SECONDS) => {
+            bail!(
+                "configured token epoch {min_iat} is too far in the future to issue a valid token"
+            );
+        }
+        Some(min_iat) => Ok(now.max(min_iat)),
+        None => Ok(now),
+    }
+}
+
+pub(crate) fn mint_token_at(
+    request: MintRequest<'_>,
+    issued_at: Option<u64>,
+) -> Result<MintedToken> {
     let MintRequest {
         kid,
         algorithm,
@@ -233,10 +254,10 @@ pub(crate) fn mint_token(request: MintRequest<'_>) -> Result<MintedToken> {
         scope,
     } = request;
     let encoding_key = encoding_key(algorithm, key_material, kid)?;
-    let now = unix_now()?;
+    let iat = issued_at.unwrap_or(unix_now()?);
     let claims = MintClaims {
-        exp: now + ttl.as_secs(),
-        iat: now,
+        exp: iat + ttl.as_secs(),
+        iat,
         aud: audience.to_owned(),
         jti: random_jti()?,
         ns: namespace.to_owned(),
