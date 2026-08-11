@@ -431,3 +431,17 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # on_unavailable = "deny" # deny (default) | allow
 # timeout_ms = 250
 # connect_timeout_ms = 5000
+
+# ── In-gateway minting (opt-in; disabled in this example) ────────────────────
+# This puts a SIGNING key in the gateway. A compromised minting replica can
+# forge inbound tokens and loses Ed25519's verification-only replica benefit.
+# Prefer offline `axond mint`; if enabled, use a separately deployed replica set
+# and keep max_ttl short.
+# [gateway_minting]
+# kid = "acme-2026-08"
+# env = "GW_SIGN_ACME_2026_08"
+# max_ttl = "10m"
+# scope = ["chat", "models"]
+# aliases = ["gpt-*"]
+# max_request_microdollars = 1000
+# Add can_mint = true to an explicitly authorized static key.

@@ -7,6 +7,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header, errors::ErrorKind as JwtErrorKind,
 };
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -26,6 +27,15 @@ pub enum Capability {
 }
 
 impl Capability {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Chat,
+        Self::Messages,
+        Self::Embeddings,
+        Self::Models,
+        Self::Credentials,
+        Self::CredentialsAll,
+    ];
+
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "chat" => Some(Self::Chat),
@@ -48,6 +58,10 @@ impl Capability {
             Self::CredentialsAll => "credentials:all",
         }
     }
+
+    pub(crate) const fn is_operator_only(self) -> bool {
+        matches!(self, Self::CredentialsAll)
+    }
 }
 
 impl std::fmt::Display for Capability {
@@ -64,6 +78,7 @@ pub struct InboundKey {
     pub scope: Option<HashSet<Capability>>,
     pub alias_scope: Option<AliasScope>,
     pub max_request_microdollars: Option<u64>,
+    pub can_mint: bool,
     pub jti: Option<String>,
 }
 
@@ -211,11 +226,12 @@ struct ResolvedVerifier {
     namespaces: HashSet<String>,
     max_ttl: Duration,
     key: DecodingKey,
+    material: SecretString,
     fingerprint: String,
 }
 
 #[derive(Default)]
-struct NamespaceEpoch {
+pub(crate) struct NamespaceEpoch {
     namespace_min_iat: Option<u64>,
     subjects: HashMap<String, u64>,
 }
@@ -225,6 +241,33 @@ pub struct TokenVerifier {
     namespaces: HashSet<String>,
     verifiers: Vec<ResolvedVerifier>,
     epochs: HashMap<String, NamespaceEpoch>,
+}
+
+pub(crate) fn configured_token_epochs(config: &Config) -> HashMap<String, NamespaceEpoch> {
+    let mut epochs: HashMap<String, NamespaceEpoch> = HashMap::new();
+    for epoch in &config.gateway_token_epoch {
+        let namespace = epochs.entry(epoch.namespace.clone()).or_default();
+        if let Some(subject) = &epoch.subject {
+            namespace.subjects.insert(subject.clone(), epoch.min_iat);
+        } else {
+            namespace.namespace_min_iat = Some(epoch.min_iat);
+        }
+    }
+    epochs
+}
+
+pub(crate) fn resolve_token_epoch(
+    epochs: &HashMap<String, NamespaceEpoch>,
+    namespace: &str,
+    subject: &str,
+) -> Option<u64> {
+    epochs.get(namespace).and_then(|epoch| {
+        epoch
+            .subjects
+            .get(subject)
+            .copied()
+            .or(epoch.namespace_min_iat)
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -287,15 +330,7 @@ impl TokenVerifier {
             .iter()
             .map(|namespace| namespace.id.clone())
             .collect();
-        let mut epochs: HashMap<String, NamespaceEpoch> = HashMap::new();
-        for epoch in &config.gateway_token_epoch {
-            let namespace = epochs.entry(epoch.namespace.clone()).or_default();
-            if let Some(subject) = &epoch.subject {
-                namespace.subjects.insert(subject.clone(), epoch.min_iat);
-            } else {
-                namespace.namespace_min_iat = Some(epoch.min_iat);
-            }
-        }
+        let epochs = configured_token_epochs(config);
         let mut verifiers = Vec::with_capacity(config.gateway_verifier.len());
         for verifier in &config.gateway_verifier {
             let source =
@@ -393,6 +428,7 @@ impl TokenVerifier {
                 namespaces: verifier.namespaces.iter().cloned().collect(),
                 max_ttl: verifier.max_ttl,
                 key,
+                material: SecretString::from(value.clone()),
                 fingerprint: key_material::fingerprint(&verifier.kid, &value),
             });
         }
@@ -409,6 +445,38 @@ impl TokenVerifier {
             .iter()
             .map(|verifier| (verifier.kid.clone(), verifier.fingerprint.clone()))
             .collect()
+    }
+
+    pub(crate) fn signing_material_matches(
+        &self,
+        kid: &str,
+        algorithm: GatewayVerifierAlgorithm,
+        signing_material: &str,
+    ) -> bool {
+        let Some(verifier) = self.verifiers.iter().find(|verifier| verifier.kid == kid) else {
+            return false;
+        };
+        match algorithm {
+            GatewayVerifierAlgorithm::Hs256 => {
+                verifier.algorithm == Algorithm::HS256
+                    && constant_time_eq(
+                        verifier.material.expose_secret().as_bytes(),
+                        signing_material.as_bytes(),
+                    )
+            }
+            GatewayVerifierAlgorithm::EdDsa => {
+                let Ok(private) = BASE64.decode(signing_material.trim()) else {
+                    return false;
+                };
+                let Ok(key_pair) = Ed25519KeyPair::from_pkcs8(&private) else {
+                    return false;
+                };
+                verifier.algorithm == Algorithm::EdDSA
+                    && BASE64
+                        .decode(verifier.material.expose_secret().trim())
+                        .is_ok_and(|public| public == key_pair.public_key().as_ref())
+            }
+        }
     }
 }
 
@@ -549,13 +617,7 @@ impl PrincipalStore for TokenVerifier {
                 claim: "sub".to_owned(),
             }),
         )?;
-        let epoch = self.epochs.get(namespace.as_str()).and_then(|namespace| {
-            namespace
-                .subjects
-                .get(subject.as_str())
-                .copied()
-                .or(namespace.namespace_min_iat)
-        });
+        let epoch = resolve_token_epoch(&self.epochs, &namespace, &subject);
         if epoch.is_some_and(|min_iat| iat < min_iat) {
             return Err(PrincipalStoreError::Unauthorized(
                 TokenVerificationError::IssuedBeforeEpoch { namespace, subject },
@@ -568,6 +630,8 @@ impl PrincipalStore for TokenVerifier {
             scope: claims.scope.map(RawScope::capabilities),
             alias_scope,
             max_request_microdollars: claims.max_request_microdollars,
+            // Token claims can never confer the ability to mint another token.
+            can_mint: false,
             jti: claims.jti,
         }))
     }
@@ -789,6 +853,7 @@ mod tests {
                 scope: None,
                 alias_scope: None,
                 max_request_microdollars: None,
+                can_mint: false,
                 jti: None,
             },
         }]))

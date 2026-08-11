@@ -39,7 +39,7 @@ struct MintClaims {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum MintAlgorithm {
+pub(crate) enum MintAlgorithm {
     EdDsa,
     Hs256,
 }
@@ -186,7 +186,7 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
 
-    mint_token(MintRequest {
+    Ok(mint_token(MintRequest {
         kid,
         algorithm,
         key_material,
@@ -197,23 +197,50 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
         aliases,
         max_request_microdollars,
         scope,
-    })
+    })?
+    .token)
 }
 
-struct MintRequest<'a> {
-    kid: &'a str,
-    algorithm: MintAlgorithm,
-    key_material: &'a str,
-    namespace: &'a str,
-    subject: &'a str,
-    audience: &'a str,
-    ttl: Duration,
-    aliases: Option<Vec<String>>,
-    max_request_microdollars: Option<u64>,
-    scope: Option<Vec<Capability>>,
+pub(crate) struct MintRequest<'a> {
+    pub(crate) kid: &'a str,
+    pub(crate) algorithm: MintAlgorithm,
+    pub(crate) key_material: &'a str,
+    pub(crate) namespace: &'a str,
+    pub(crate) subject: &'a str,
+    pub(crate) audience: &'a str,
+    pub(crate) ttl: Duration,
+    pub(crate) aliases: Option<Vec<String>>,
+    pub(crate) max_request_microdollars: Option<u64>,
+    pub(crate) scope: Option<Vec<Capability>>,
 }
 
-fn mint_token(request: MintRequest<'_>) -> Result<String> {
+pub(crate) struct MintedToken {
+    pub(crate) token: String,
+    pub(crate) exp: u64,
+}
+
+pub(crate) fn mint_token(request: MintRequest<'_>) -> Result<MintedToken> {
+    mint_token_at(request, None)
+}
+
+pub(crate) fn mint_issued_at(min_iat: Option<u64>) -> Result<u64> {
+    const CLOCK_SKEW_SECONDS: u64 = 5;
+    let now = unix_now()?;
+    match min_iat {
+        Some(min_iat) if min_iat > now.saturating_add(CLOCK_SKEW_SECONDS) => {
+            bail!(
+                "configured token epoch {min_iat} is too far in the future to issue a valid token"
+            );
+        }
+        Some(min_iat) => Ok(now.max(min_iat)),
+        None => Ok(now),
+    }
+}
+
+pub(crate) fn mint_token_at(
+    request: MintRequest<'_>,
+    issued_at: Option<u64>,
+) -> Result<MintedToken> {
     let MintRequest {
         kid,
         algorithm,
@@ -227,10 +254,10 @@ fn mint_token(request: MintRequest<'_>) -> Result<String> {
         scope,
     } = request;
     let encoding_key = encoding_key(algorithm, key_material, kid)?;
-    let now = unix_now()?;
+    let iat = issued_at.unwrap_or(unix_now()?);
     let claims = MintClaims {
-        exp: now + ttl.as_secs(),
-        iat: now,
+        exp: iat + ttl.as_secs(),
+        iat,
         aud: audience.to_owned(),
         jti: random_jti()?,
         ns: namespace.to_owned(),
@@ -241,7 +268,18 @@ fn mint_token(request: MintRequest<'_>) -> Result<String> {
     };
     let mut header = Header::new(algorithm.jwt());
     header.kid = Some(kid.to_owned());
-    Ok(format!("axt1.{}", encode(&header, &claims, &encoding_key)?))
+    Ok(MintedToken {
+        token: format!("axt1.{}", encode(&header, &claims, &encoding_key)?),
+        exp: claims.exp,
+    })
+}
+
+pub(crate) fn validate_signing_material(
+    algorithm: MintAlgorithm,
+    value: &str,
+    kid: &str,
+) -> Result<()> {
+    encoding_key(algorithm, value, kid).map(|_| ())
 }
 
 pub fn keygen(args: &ArgMatches) -> Result<()> {
@@ -586,7 +624,8 @@ max_ttl = "15m"
             max_request_microdollars: None,
             scope: None,
         })
-        .unwrap();
+        .unwrap()
+        .token;
         let principal = verifier
             .resolve(&Presented { credential: &token })
             .await
@@ -618,7 +657,8 @@ max_ttl = "15m"
             max_request_microdollars: None,
             scope: None,
         })
-        .unwrap();
+        .unwrap()
+        .token;
         let principal = verifier
             .resolve(&Presented { credential: &token })
             .await
@@ -694,7 +734,8 @@ max_ttl = "15m"
             max_request_microdollars: None,
             scope: None,
         })
-        .unwrap();
+        .unwrap()
+        .token;
         let principal = verifier
             .resolve(&Presented { credential: &token })
             .await
@@ -738,7 +779,8 @@ max_ttl = "15m"
             max_request_microdollars: None,
             scope: None,
         })
-        .unwrap();
+        .unwrap()
+        .token;
         let principal = verifier
             .resolve(&Presented { credential: &token })
             .await
@@ -1005,7 +1047,8 @@ max_ttl = "15m"
             max_request_microdollars: None,
             scope: None,
         })
-        .unwrap();
+        .unwrap()
+        .token;
         assert!(matches!(
             verifier.resolve(&Presented { credential: &token }).await,
             Err(PrincipalStoreError::Unauthorized(

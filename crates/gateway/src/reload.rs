@@ -203,10 +203,16 @@ pub struct ReloadSummary {
     pub credentials: Delta,
     pub gateway_keys: Delta,
     pub gateway_verifiers: Delta,
+    pub gateway_minting: Delta,
     pub gateway_token_epochs: Delta,
     pub gateway_token_audience: Delta,
     pub gateway_key_fingerprints: HashMap<String, String>,
     pub gateway_verifier_fingerprints: HashMap<String, String>,
+    pub gateway_minting_fingerprint: Option<String>,
+    /// Minting is configured, but no static key is authorized to use it.
+    pub gateway_minting_without_authorized_key: bool,
+    /// Static keys declaring `can_mint` while minting is disabled.
+    pub gateway_minting_inert_keys: Vec<String>,
     /// `[server] bind` differs from what the process bound at startup.
     pub bind_changed: bool,
     /// `[[usage_sink]]` differs from the connected sinks.
@@ -262,6 +268,14 @@ impl std::fmt::Display for Delta {
 }
 
 impl ReloadSummary {
+    fn gateway_minting_route_added(&self) -> bool {
+        !self.gateway_minting.added.is_empty()
+    }
+
+    fn gateway_minting_route_removed(&self) -> bool {
+        !self.gateway_minting.removed.is_empty()
+    }
+
     fn between(boot: &Boot, before: &ConfigSnapshot, after: &ConfigSnapshot) -> Self {
         let before_config = &before.config;
         let after_config = &after.config;
@@ -312,6 +326,51 @@ impl ReloadSummary {
                         &after.gateway_verifier_fingerprints,
                     )),
             ),
+            gateway_minting: Delta::between(
+                before_config
+                    .gateway_minting
+                    .iter()
+                    .map(|_| "enabled".to_owned()),
+                after_config
+                    .gateway_minting
+                    .iter()
+                    .map(|_| "enabled".to_owned()),
+            )
+            .with_changed(
+                (before_config.gateway_minting.is_some()
+                    && after_config.gateway_minting.is_some()
+                    && before_config.gateway_minting.as_ref().map(|m| {
+                        (
+                            &m.kid,
+                            m.source_label(),
+                            &m.max_ttl,
+                            &m.scope,
+                            &m.aliases,
+                            &m.max_request_microdollars,
+                        )
+                    }) != after_config.gateway_minting.as_ref().map(|m| {
+                        (
+                            &m.kid,
+                            m.source_label(),
+                            &m.max_ttl,
+                            &m.scope,
+                            &m.aliases,
+                            &m.max_request_microdollars,
+                        )
+                    })
+                    || (before_config.gateway_minting.is_some()
+                        && after_config.gateway_minting.is_some()
+                        && before.gateway_minting.as_ref().map(|m| m.max_ttl)
+                            != after.gateway_minting.as_ref().map(|m| m.max_ttl)))
+                .then(|| "enabled".to_owned())
+                .into_iter()
+                .chain(
+                    (before_config.gateway_minting.is_some()
+                        && after_config.gateway_minting.is_some()
+                        && before.gateway_minting_fingerprint != after.gateway_minting_fingerprint)
+                        .then(|| "gateway_minting".to_owned()),
+                ),
+            ),
             gateway_token_epochs: Delta::between(
                 before_config
                     .gateway_token_epoch
@@ -338,6 +397,19 @@ impl ReloadSummary {
             ),
             gateway_key_fingerprints: after.gateway_key_fingerprints.clone(),
             gateway_verifier_fingerprints: after.gateway_verifier_fingerprints.clone(),
+            gateway_minting_fingerprint: after.gateway_minting_fingerprint.clone(),
+            gateway_minting_without_authorized_key: after_config.gateway_minting.is_some()
+                && !after_config.gateway_key.iter().any(|key| key.can_mint),
+            gateway_minting_inert_keys: if after_config.gateway_minting.is_none() {
+                after_config
+                    .gateway_key
+                    .iter()
+                    .filter(|key| key.can_mint)
+                    .filter_map(|key| key.source_label().map(str::to_owned))
+                    .collect()
+            } else {
+                Vec::new()
+            },
             bind_changed: boot.bind != after_config.server.bind,
             usage_sinks_changed: boot.usage_sink != after_config.usage_sink,
             budget_changed: boot.budget != after_config.budget,
@@ -354,6 +426,7 @@ impl ReloadSummary {
             && self.credentials.is_empty()
             && self.gateway_keys.is_empty()
             && self.gateway_verifiers.is_empty()
+            && self.gateway_minting.is_empty()
             && self.gateway_token_epochs.is_empty()
             && self.gateway_token_audience.is_empty()
     }
@@ -368,10 +441,12 @@ impl ReloadSummary {
             credentials = %self.credentials,
             gateway_keys = %self.gateway_keys,
             gateway_verifiers = %self.gateway_verifiers,
+            gateway_minting = %self.gateway_minting,
             gateway_token_epochs = %self.gateway_token_epochs,
             gateway_token_audience = %self.gateway_token_audience,
             gateway_key_fingerprints = ?self.gateway_key_fingerprints,
             gateway_verifier_fingerprints = ?self.gateway_verifier_fingerprints,
+            gateway_minting_fingerprint = ?self.gateway_minting_fingerprint,
             budget_changed = self.budget_changed,
             rate_limit_changed = self.rate_limit_changed,
             revocation_changed = self.revocation_changed,
@@ -396,6 +471,27 @@ impl ReloadSummary {
         if self.rate_limit_changed {
             tracing::warn!(
                 "`[rate_limit]` changed, but the limiter is already serving; restart to apply it"
+            );
+        }
+        if self.gateway_minting_route_added() {
+            tracing::warn!(
+                "`[gateway_minting]` was enabled, but `/v1/tokens` route registration is boot-time; restart to expose it"
+            );
+        }
+        if self.gateway_minting_route_removed() {
+            tracing::warn!(
+                "`[gateway_minting]` was removed; issuance is disabled immediately and `/v1/tokens` returns typed 404"
+            );
+        }
+        if self.gateway_minting_without_authorized_key {
+            tracing::warn!(
+                "`[gateway_minting]` is configured, but no gateway key has `can_mint = true`; `/v1/tokens` rejects every caller"
+            );
+        }
+        if !self.gateway_minting_inert_keys.is_empty() {
+            tracing::warn!(
+                keys = ?self.gateway_minting_inert_keys,
+                "`can_mint = true` has no effect because `[gateway_minting]` is absent"
             );
         }
         if self.revocation_changed {
@@ -492,7 +588,8 @@ fn gateway_key_definition_changes(before: &Config, after: &Config) -> Vec<String
         .filter_map(|label| {
             let before = before[label];
             let after = after.get(label)?;
-            (before.namespace != after.namespace).then(|| (*label).to_owned())
+            (before.namespace != after.namespace || before.can_mint != after.can_mint)
+                .then(|| (*label).to_owned())
         })
         .collect::<Vec<_>>();
     changed.sort();
@@ -704,6 +801,48 @@ namespaces = ["platform", "acme"]
 max_ttl = "15m"
 "#;
 
+    const WITH_GATEWAY_MINTING: &str = r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "PLATFORM_OPENAI_KEY"
+
+[[gateway_key]]
+env = "AXOND_INBOUND_KEY"
+namespace = "platform"
+can_mint = true
+
+[[gateway_key]]
+env = "AXOND_SECOND_KEY"
+namespace = "platform"
+can_mint = true
+
+[gateway_token]
+audience = "reload-test"
+
+[[gateway_verifier]]
+kid = "reload-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+
+[gateway_minting]
+kid = "reload-kid"
+env = "SIGNING_KEY"
+max_ttl = "10m"
+scope = ["chat", "models"]
+"#;
+
     fn state_from(file: &ConfigFile) -> AppState {
         let config = Config::load(file.path()).expect("valid boot config");
         let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
@@ -729,6 +868,16 @@ max_ttl = "15m"
         ]
         .into_iter()
         .collect()
+    }
+
+    fn minting_env() -> HashMap<String, String> {
+        let mut env = inbound_env();
+        env.insert("AXOND_SECOND_KEY".to_string(), "second-secret".to_string());
+        env.insert(
+            "SIGNING_KEY".to_string(),
+            "jwt-test-secret-0123456789012345".to_string(),
+        );
+        env
     }
 
     fn tenant_env() -> HashMap<String, String> {
@@ -826,6 +975,159 @@ max_ttl = "15m"
             .expect("no-op candidate is valid");
         assert!(summary.gateway_token_epochs.is_empty());
         assert!(summary.is_empty());
+    }
+
+    #[test]
+    fn reload_summary_reports_can_mint_toggles() {
+        let before_config = Config::from_toml_str(WITH_GATEWAY_MINTING).unwrap();
+        let after_config = Config::from_toml_str(&WITH_GATEWAY_MINTING.replacen(
+            "can_mint = true",
+            "can_mint = false",
+            1,
+        ))
+        .unwrap();
+        let before = ConfigSnapshot::build(before_config, &minting_env(), 0).unwrap();
+        let after = ConfigSnapshot::build(after_config, &minting_env(), 1).unwrap();
+        let boot = Boot {
+            bind: before.config.server.bind,
+            usage_sink: before.config.usage_sink.clone(),
+            budget: before.config.budget.clone(),
+            rate_limit: before.config.rate_limit.clone(),
+            revocation: before.config.revocation.clone(),
+        };
+        let summary = ReloadSummary::between(&boot, &before, &after);
+        assert_eq!(
+            summary.gateway_keys.changed,
+            vec!["AXOND_INBOUND_KEY".to_owned()]
+        );
+        assert!(!summary.is_empty());
+    }
+
+    #[test]
+    fn reload_summary_reports_minting_material_rotation() {
+        let config = Config::from_toml_str(WITH_GATEWAY_MINTING).unwrap();
+        let before = ConfigSnapshot::build(config.clone(), &minting_env(), 0).unwrap();
+        let mut rotated_env = minting_env();
+        rotated_env.insert(
+            "SIGNING_KEY".to_string(),
+            "rotated-signing-secret-012345678901234567".to_string(),
+        );
+        rotated_env.insert(
+            "JWT_SECRET".to_string(),
+            "rotated-signing-secret-012345678901234567".to_string(),
+        );
+        let after = ConfigSnapshot::build(config, &rotated_env, 1).unwrap();
+        let boot = Boot {
+            bind: before.config.server.bind,
+            usage_sink: before.config.usage_sink.clone(),
+            budget: before.config.budget.clone(),
+            rate_limit: before.config.rate_limit.clone(),
+            revocation: before.config.revocation.clone(),
+        };
+        let summary = ReloadSummary::between(&boot, &before, &after);
+        assert_eq!(
+            summary.gateway_minting.changed,
+            vec!["gateway_minting".to_owned()]
+        );
+        assert!(!summary.is_empty());
+        assert!(summary.gateway_minting.added.is_empty());
+        assert!(summary.gateway_minting.removed.is_empty());
+        assert!(!summary.gateway_minting_route_added());
+        assert!(!summary.gateway_minting_route_removed());
+    }
+
+    #[test]
+    fn reload_summary_separates_minting_add_remove_from_changes() {
+        let disabled_config = WITH_GATEWAY_MINTING
+            .replace("[gateway_minting]\nkid = \"reload-kid\"\nenv = \"SIGNING_KEY\"\nmax_ttl = \"10m\"\n", "")
+            .replace("can_mint = true", "can_mint = false");
+        let disabled = ConfigSnapshot::build(
+            Config::from_toml_str(&disabled_config).unwrap(),
+            &minting_env(),
+            0,
+        )
+        .unwrap();
+        let enabled = ConfigSnapshot::build(
+            Config::from_toml_str(WITH_GATEWAY_MINTING).unwrap(),
+            &minting_env(),
+            1,
+        )
+        .unwrap();
+        let boot = Boot {
+            bind: disabled.config.server.bind,
+            usage_sink: disabled.config.usage_sink.clone(),
+            budget: disabled.config.budget.clone(),
+            rate_limit: disabled.config.rate_limit.clone(),
+            revocation: disabled.config.revocation.clone(),
+        };
+
+        let added = ReloadSummary::between(&boot, &disabled, &enabled);
+        assert_eq!(added.gateway_minting.added, vec!["enabled".to_owned()]);
+        assert!(added.gateway_minting.changed.is_empty());
+
+        let removed = ReloadSummary::between(&boot, &enabled, &disabled);
+        assert_eq!(removed.gateway_minting.removed, vec!["enabled".to_owned()]);
+        assert!(removed.gateway_minting.changed.is_empty());
+
+        let inert = ConfigSnapshot::build(
+            Config::from_toml_str(
+                &WITH_GATEWAY_MINTING.replace(
+                    "[gateway_minting]\nkid = \"reload-kid\"\nenv = \"SIGNING_KEY\"\nmax_ttl = \"10m\"\n",
+                    "",
+                ),
+            )
+            .unwrap(),
+            &minting_env(),
+            2,
+        )
+        .unwrap();
+        let inert_summary = ReloadSummary::between(&boot, &enabled, &inert);
+        assert_eq!(
+            inert_summary.gateway_minting_inert_keys,
+            vec![
+                "AXOND_INBOUND_KEY".to_owned(),
+                "AXOND_SECOND_KEY".to_owned()
+            ]
+        );
+
+        let no_authorized_key = ConfigSnapshot::build(
+            Config::from_toml_str(
+                &WITH_GATEWAY_MINTING.replace("can_mint = true", "can_mint = false"),
+            )
+            .unwrap(),
+            &minting_env(),
+            2,
+        )
+        .unwrap();
+        let warning = ReloadSummary::between(&boot, &no_authorized_key, &no_authorized_key);
+        assert!(warning.gateway_minting_without_authorized_key);
+    }
+
+    #[test]
+    fn reload_summary_reports_inherited_minting_ttl_changes() {
+        let before_config = WITH_GATEWAY_MINTING.replace("max_ttl = \"10m\"\n", "");
+        let after_config = before_config.replace("max_ttl = \"15m\"", "max_ttl = \"20m\"");
+        let before = ConfigSnapshot::build(
+            Config::from_toml_str(&before_config).unwrap(),
+            &minting_env(),
+            0,
+        )
+        .unwrap();
+        let after = ConfigSnapshot::build(
+            Config::from_toml_str(&after_config).unwrap(),
+            &minting_env(),
+            1,
+        )
+        .unwrap();
+        let boot = Boot {
+            bind: before.config.server.bind,
+            usage_sink: before.config.usage_sink.clone(),
+            budget: before.config.budget.clone(),
+            rate_limit: before.config.rate_limit.clone(),
+            revocation: before.config.revocation.clone(),
+        };
+        let summary = ReloadSummary::between(&boot, &before, &after);
+        assert_eq!(summary.gateway_minting.changed, vec!["enabled".to_owned()]);
     }
 
     /// An issuance epoch is part of the immutable candidate snapshot: SIGHUP

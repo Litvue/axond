@@ -295,8 +295,10 @@ assume that subjects belong to the static config key list.
   remains capable of granting authority to every token it signs for its
   configured namespaces, so signer ownership and rotation remain operational
   responsibilities.
-- `POST /v1/tokens`, OIDC/JWKS federation, cumulative token budgets, and
-  precise revocation remain open implementation decisions. The gateway does not
+- The in-gateway `POST /v1/tokens` decision is recorded in
+  [ADR 0022](0022-opt-in-gateway-token-minting.md).
+- OIDC/JWKS federation, cumulative token budgets, and precise revocation remain
+  open implementation decisions. The gateway does not
   gain a runtime control plane from this ADR.
 - New cryptographic dependencies must still pass the repository's crates.io,
   license, toolchain, and `cargo-deny` policy.

@@ -5,6 +5,79 @@ same `axond` binary for key generation, offline minting, and gateway
 verification. The gateway does not keep an issuance registry and verification
 does not add Redis, Postgres, or another runtime dependency.
 
+## In-gateway minting (opt-in)
+
+Offline `axond mint` remains the default. To expose `POST /v1/tokens`,
+configure a matching verifier and signing source, then authorize a static
+gateway key:
+
+```toml
+[gateway_minting]
+kid = "acme-2026-08"
+env = "GW_SIGN_ACME_2026_08"
+max_ttl = "10m"
+scope = ["chat", "models"]
+aliases = ["gpt-*"]
+max_request_microdollars = 1000
+
+[[gateway_key]]
+env = "GW_INBOUND_PLATFORM_KEY"
+namespace = "platform"
+can_mint = true
+```
+
+The endpoint uses the same authentication middleware as every other
+non-liveness route. The body accepts `sub`, optional `ttl_seconds`, `scope`,
+`aliases`, and `max_request_microdollars`; it rejects unknown fields. Omitted
+scope and microdollar limits inherit their configured ceilings when those
+ceilings are configured; with no configured scope ceiling, the ordinary
+capability posture is inherited. An omitted alias ceiling permits `*`, while
+dispatch still narrows aliases to those the namespace can already reach.
+Every effective capability must also be held by the minting key itself.
+Operator-only capabilities cannot be configured as a minting ceiling and
+therefore cannot be minted by this endpoint.
+Requested values must narrow their ceilings and TTL must be between one second
+and the effective maximum. Minted tokens are never authorized to mint another
+token.
+
+`POST /v1/tokens` is intentionally outside the request rate limiter and usage
+fanout: issuance is unthrottled and unrecorded in the gateway by design. The
+available controls are a short `max_ttl`, removing the signing `kid` to revoke
+all tokens for that verifier, and `[[gateway_token_epoch]]` `min_iat` to revoke
+tokens issued before a configured time. Epochs are the revocation mechanism for
+minted tokens, so every deployment that enables gateway minting must configure
+the applicable namespace epochs. The token itself is the issuance receipt; this
+Tier 0 path does not maintain an issuance registry.
+
+Because `sub` is caller-chosen, a trusted minting key can rotate subjects and
+give each new `(namespace, subject)` a fresh budget ledger and per-subject
+`max_in_flight_per_subject` allowance. `BudgetConfig::limit_microdollars` is
+the cap per `(namespace, subject)`; there is no namespace-wide cap, so a
+`can_mint` key has unbounded namespace spend authority by construction while
+minting is enabled. `max_request_microdollars` limits one request rather than
+cumulative spend. Treat `can_mint` as operator-level trust, never hand it to a
+downstream service, and keep minting namespaces separate from namespaces where
+per-subject controls are the spend boundary. This is the blocker for
+recommending minting; file the follow-up issue for a namespace-level budget
+cap. Request throttling would only slow subject accumulation because minted
+tokens outlive the request that created them and would not bound total spend.
+Keep `max_ttl` short.
+
+```bash
+curl -s https://gateway.example/v1/tokens -H "Authorization: Bearer $GW_INBOUND_PLATFORM_KEY" -H 'content-type: application/json' -d '{"sub":"agent-7","ttl_seconds":300,"scope":["chat"],"aliases":["gpt-4o"],"max_request_microdollars":500}'
+# {"token":"axt1.…","exp":...,"expires_in":300,"namespace":"platform","sub":"agent-7"}
+```
+
+Enabling this puts the **private signing** key in the published config
+snapshot on every replica that has minting enabled. A compromised minting
+replica becomes a forgery capability for every namespace its verifier permits.
+EdDSA otherwise allows verification-only replicas to hold only public key
+material; HS256 never had that property because every verifier already holds
+the forging secret. Keep offline
+`axond mint` as the default; if HTTP minting is necessary, run it on dedicated
+replicas that do not serve dispatch traffic, and reference the private signing
+key only in that deployment's config. Keep `max_ttl` short.
+
 ## 1. Keep a static breakglass key
 
 Minted verifiers are additive to static gateway keys. At least one
@@ -171,9 +244,9 @@ TOKEN="$(
 ```
 
 HS256 is symmetric: `GW_SIGN_LOCAL` and `GW_VERIFY_LOCAL_MINTER` must contain
-the same secret bytes. Every verifier holding those bytes can forge tokens,
-which is why Ed25519 is preferred when verification-only replicas must not be
-able to mint. As with any verifier, `GW_VERIFY_LOCAL_MINTER` must be present in
+the same secret bytes. Every verifier holding those bytes can forge tokens;
+prefer EdDSA for `[gateway_minting]` when verification-only replicas must not
+be able to mint. As with any verifier, `GW_VERIFY_LOCAL_MINTER` must be present in
 the gateway's environment before it starts; the export above only equips the
 minting shell.
 
@@ -327,14 +400,23 @@ coarsest to most targeted:
    namespace-wide epoch affects every subject in that namespace; to spare one
    subject, add a per-subject entry with an earlier `min_iat`, which overrides
    the namespace-wide entry for that subject.
-4. **`jti` denylist (#68).** A future opt-in denylist can reject one token by
-   its mandatory `jti`.
+   A future epoch also blocks in-gateway issuance for the affected namespace
+   and subject, so the gateway does not mint tokens it would immediately
+   reject with `token_issued_before_epoch`.
 
-The `jti` denylist is not a current Tier 0 configuration feature. Precise
-single-token revocation still requires **Tier 1** shared state, as defined by
-ADR 0017; in this design that means Redis-backed enforcement. Tier 1
-availability and its fail-closed behavior must be treated as part of the
-selected request path.
+To revoke in-gateway issuance entirely, either remove `[gateway_minting]` or
+set every gateway key's `can_mint` to `false`. Removing the section takes effect
+on reload, leaves the boot-registered handler returning typed 404
+`minting_disabled`, and makes any remaining `can_mint = true` flags inert;
+reload logs name those keys. Clearing the final `can_mint` flag leaves the
+section in place but makes the endpoint reject every caller with
+`mint_not_authorized`; reload logs a warning when minting is configured without
+an authorized key.
+
+4. **`jti` denylist (#68).** The optional denylist can reject one token by its
+   mandatory `jti`. It is separate from the stateless mint endpoint and uses
+   the configured shared revocation backend; its availability and fail-closed
+   behavior must be treated as part of the selected request path.
 
 ## 7. Delegation and attribution
 

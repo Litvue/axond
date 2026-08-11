@@ -19,6 +19,8 @@ use std::time::Duration;
 use gateway_core::ModelPrice;
 use serde::{Deserialize, Deserializer};
 
+use crate::aliases::AliasScope;
+use crate::principals::Capability;
 use crate::usage::{BatchSettings, MAX_ROWS_PER_STATEMENT, validate_table_name};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,6 +54,8 @@ pub struct Config {
     /// keys and require a deployment audience when any are configured.
     #[serde(default)]
     pub gateway_verifier: Vec<GatewayVerifier>,
+    #[serde(default)]
+    pub gateway_minting: Option<GatewayMinting>,
     /// Issuance epochs that invalidate older minted tokens without runtime
     /// revocation state.
     #[serde(default)]
@@ -714,6 +718,8 @@ pub struct GatewayKey {
     #[serde(default)]
     pub file: Option<String>,
     pub namespace: String,
+    #[serde(default)]
+    pub can_mint: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -745,7 +751,15 @@ impl GatewayKey {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayToken {
+    #[serde(deserialize_with = "deserialize_gateway_audience")]
     pub audience: String,
+}
+
+fn deserialize_gateway_audience<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(String::deserialize(deserializer)?.trim().to_owned())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -797,6 +811,51 @@ impl GatewayVerifier {
             KeyMaterialSource::Env(value) | KeyMaterialSource::File(value) => value,
         })
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GatewayMinting {
+    pub kid: String,
+    #[serde(default)]
+    pub env: Option<String>,
+    #[serde(default)]
+    pub file: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_gateway_ttl")]
+    pub max_ttl: Option<Duration>,
+    #[serde(default)]
+    pub scope: Option<Vec<String>>,
+    #[serde(default)]
+    pub aliases: Option<Vec<String>>,
+    #[serde(default)]
+    pub max_request_microdollars: Option<u64>,
+}
+
+impl GatewayMinting {
+    pub fn source(&self) -> Option<KeyMaterialSource<'_>> {
+        let env = self.env.as_deref().filter(|value| !value.trim().is_empty());
+        let file = self
+            .file
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+        match (env, file) {
+            (Some(env), None) => Some(KeyMaterialSource::Env(env)),
+            (None, Some(file)) => Some(KeyMaterialSource::File(file)),
+            _ => None,
+        }
+    }
+
+    pub fn source_label(&self) -> Option<&str> {
+        self.source().map(|source| match source {
+            KeyMaterialSource::Env(value) | KeyMaterialSource::File(value) => value,
+        })
+    }
+}
+
+fn deserialize_optional_gateway_ttl<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Some(deserialize_gateway_ttl(deserializer)?))
 }
 
 // Deliberate policy ceiling for configured token lifetimes, not a protocol limit.
@@ -1086,6 +1145,7 @@ impl Config {
         }
         self.validate_gateway_keys(&namespaces)?;
         self.validate_gateway_verifiers(&namespaces)?;
+        self.validate_gateway_minting(&namespaces)?;
         self.validate_gateway_token_epochs(&namespaces)?;
         self.validate_usage_sinks()?;
         self.validate_budget()?;
@@ -1228,6 +1288,105 @@ impl Config {
                         verifier.kid
                     )));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_gateway_minting(
+        &self,
+        namespaces: &HashMap<&str, &Namespace>,
+    ) -> Result<(), ConfigError> {
+        let Some(minting) = &self.gateway_minting else {
+            let inert_keys = self
+                .gateway_key
+                .iter()
+                .filter(|key| key.can_mint)
+                .map(|key| key.source_label().unwrap_or("<unknown>").to_owned())
+                .collect::<Vec<_>>();
+            if !inert_keys.is_empty() {
+                tracing::warn!(
+                    keys = ?inert_keys,
+                    "`can_mint = true` is inert because `[gateway_minting]` is absent"
+                );
+            }
+            return Ok(());
+        };
+        if minting.kid.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "gateway_minting `kid` must not be empty".into(),
+            ));
+        }
+        if minting.source().is_none() {
+            return Err(ConfigError::Invalid(
+                "gateway_minting must declare exactly one non-empty source (`env` or `file`)"
+                    .into(),
+            ));
+        }
+        let verifier = self
+            .gateway_verifier
+            .iter()
+            .find(|verifier| verifier.kid == minting.kid)
+            .ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "gateway_minting references unknown gateway_verifier kid `{}`",
+                    minting.kid
+                ))
+            })?;
+        if minting
+            .max_ttl
+            .is_some_and(|max_ttl| max_ttl > verifier.max_ttl)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "gateway_minting max_ttl exceeds verifier `{}` max_ttl",
+                verifier.kid
+            )));
+        }
+        if minting.max_request_microdollars == Some(0) {
+            return Err(ConfigError::Invalid(
+                "gateway_minting max_request_microdollars must be at least 1".into(),
+            ));
+        }
+        if let Some(scope) = &minting.scope {
+            if scope.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "gateway_minting scope must contain at least one capability".into(),
+                ));
+            }
+            for value in scope {
+                if Capability::parse(value).is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "gateway_minting scope contains unknown capability `{value}`"
+                    )));
+                }
+            }
+            if let Some(capability) = scope.iter().find_map(|value| {
+                Capability::parse(value).filter(|capability| capability.is_operator_only())
+            }) {
+                return Err(ConfigError::Invalid(format!(
+                    "gateway_minting scope capability `{capability}` can never be minted"
+                )));
+            }
+        }
+        if let Some(aliases) = &minting.aliases {
+            if aliases.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "gateway_minting aliases must contain at least one pattern".into(),
+                ));
+            }
+            AliasScope::parse(aliases.iter().map(String::as_str)).map_err(|error| {
+                ConfigError::Invalid(format!("gateway_minting aliases: {error}"))
+            })?;
+        }
+        for key in self.gateway_key.iter().filter(|key| key.can_mint) {
+            if !namespaces.contains_key(key.namespace.as_str()) {
+                continue;
+            }
+            if !verifier.namespaces.iter().any(|ns| ns == &key.namespace) {
+                return Err(ConfigError::Invalid(format!(
+                    "gateway_key namespace `{}` with can_mint is not permitted by verifier `{}`",
+                    key.namespace, verifier.kid
+                )));
             }
         }
         Ok(())
@@ -1598,6 +1757,18 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
     }
 
     #[test]
+    fn canonicalizes_gateway_token_audience_whitespace() {
+        let config = Config::from_toml_str(&format!(
+            "{VALID}\n[gateway_token]\naudience = \"  padded-audience  \"\n"
+        ))
+        .expect("padded audience is valid");
+        assert_eq!(
+            config.gateway_token.expect("gateway token").audience,
+            "padded-audience"
+        );
+    }
+
+    #[test]
     fn rejects_a_verifier_only_config() {
         let toml = r#"
 [[namespace]]
@@ -1720,6 +1891,150 @@ audience = "test"
 
         assert_eq!(cfg.namespace.len(), 3);
         assert_eq!(cfg.distinct_namespace_count(), 2);
+    }
+
+    #[test]
+    fn gateway_minting_validation_rejects_invalid_definitions() {
+        let cases = [
+            (
+                "unknown kid",
+                "kid = \"missing\"\nenv = \"SIGN\"",
+                "unknown gateway_verifier",
+            ),
+            (
+                "unauthorized namespace",
+                "kid = \"test\"\nenv = \"SIGN\"",
+                "not permitted",
+            ),
+            (
+                "missing source",
+                "kid = \"test\"",
+                "exactly one non-empty source",
+            ),
+            (
+                "both sources",
+                "kid = \"test\"\nenv = \"SIGN\"\nfile = \"/run/sign\"",
+                "exactly one non-empty source",
+            ),
+            (
+                "ttl above verifier",
+                "kid = \"test\"\nenv = \"SIGN\"\nmax_ttl = \"16m\"",
+                "exceeds verifier",
+            ),
+            (
+                "bad capability",
+                "kid = \"test\"\nenv = \"SIGN\"\nscope = [\"not-a-capability\"]",
+                "unknown capability",
+            ),
+            (
+                "operator-only capability",
+                "kid = \"test\"\nenv = \"SIGN\"\nscope = [\"credentials:all\"]",
+                "can never be minted",
+            ),
+            (
+                "empty scope",
+                "kid = \"test\"\nenv = \"SIGN\"\nscope = []",
+                "at least one capability",
+            ),
+            (
+                "bad alias",
+                "kid = \"test\"\nenv = \"SIGN\"\naliases = [\"gpt-*-bad\"]",
+                "invalid alias pattern",
+            ),
+            (
+                "empty aliases",
+                "kid = \"test\"\nenv = \"SIGN\"\naliases = []",
+                "at least one pattern",
+            ),
+        ];
+        for (name, minting, expected) in cases {
+            let minting = if minting.contains("scope =") {
+                minting.to_owned()
+            } else {
+                format!("{minting}\nscope = [\"chat\"]")
+            };
+            let extra_namespace = if name == "unauthorized namespace" {
+                "\n[[namespace]]\nid = \"other\"\n"
+            } else {
+                ""
+            };
+            let verifier_namespaces = if name == "unauthorized namespace" {
+                "[\"other\"]"
+            } else {
+                "[\"platform\"]"
+            };
+            let toml = format!(
+                r#"
+[[namespace]]
+id = "platform"
+default = true
+{extra_namespace}
+[[gateway_key]]
+env = "INBOUND"
+namespace = "platform"
+can_mint = true
+
+[gateway_token]
+audience = "test"
+
+[[gateway_verifier]]
+kid = "test"
+alg = "HS256"
+env = "JWT"
+namespaces = {verifier_namespaces}
+max_ttl = "15m"
+
+[gateway_minting]
+{minting}
+"#
+            );
+            let error = Config::from_toml_str(&toml).expect_err(name);
+            assert!(error.to_string().contains(expected), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn can_mint_without_gateway_minting_is_inert() {
+        let config = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "INBOUND"
+namespace = "platform"
+can_mint = true
+"#,
+        )
+        .expect("can_mint is inert without minting config");
+        assert!(config.gateway_minting.is_none());
+    }
+
+    #[test]
+    fn gateway_minting_without_authorized_key_is_valid() {
+        let config = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "INBOUND"
+namespace = "platform"
+can_mint = false
+[gateway_token]
+audience = "test"
+[[gateway_verifier]]
+kid = "test"
+alg = "HS256"
+env = "JWT"
+namespaces = ["platform"]
+max_ttl = "15m"
+[gateway_minting]
+kid = "test"
+env = "SIGN"
+"#,
+        );
+        assert!(config.is_ok(), "{config:?}");
     }
 
     #[test]

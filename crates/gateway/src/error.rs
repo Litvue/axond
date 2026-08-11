@@ -3,6 +3,10 @@
 //! Every route always exists and returns a *typed* error explaining its own
 //! state (delta B3). We never 404 a whole route behind a kill switch, because
 //! a 404 from a proxy is indistinguishable from a wrong `base_url`.
+//!
+//! The narrow exception is an opt-in issuance endpoint: when it is not
+//! configured, it is not registered at all because absence is the security
+//! property there.
 
 use axum::Json;
 use axum::http::{HeaderValue, StatusCode};
@@ -53,6 +57,16 @@ pub enum GatewayError {
     Transport(#[from] TransportError),
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("minting is disabled")]
+    MintingDisabled,
+    #[error("caller is not authorized to mint tokens")]
+    MintNotAuthorized,
+    #[error("requested claims are not narrower than the minting ceiling")]
+    MintClaimsNotNarrowing,
+    #[error(
+        "minting key `{kid}` has an epoch at {min_iat} that cannot produce a currently valid token"
+    )]
+    MintEpochNotUsable { kid: String, min_iat: u64 },
     /// A native route reached with an alias whose target cannot speak that wire
     /// shape (an OpenAI-only alias on `/v1/messages`, say). The caller asked for
     /// something the configuration cannot serve, so it is a request error rather
@@ -84,6 +98,10 @@ impl GatewayError {
             Self::ScopeInsufficient(_) => StatusCode::FORBIDDEN,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::MintingDisabled => StatusCode::NOT_FOUND,
+            Self::MintNotAuthorized
+            | Self::MintClaimsNotNarrowing
+            | Self::MintEpochNotUsable { .. } => StatusCode::FORBIDDEN,
             Self::UnsupportedWire { .. } => StatusCode::BAD_REQUEST,
             Self::Provider(e) => match e {
                 ProviderError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
@@ -114,6 +132,10 @@ impl GatewayError {
             Self::ScopeInsufficient(_) => "token_scope_insufficient",
             Self::NotImplemented(_) => "not_implemented",
             Self::BadRequest(_) => "bad_request",
+            Self::MintingDisabled => "minting_disabled",
+            Self::MintNotAuthorized => "mint_not_authorized",
+            Self::MintClaimsNotNarrowing => "mint_claims_not_narrowing",
+            Self::MintEpochNotUsable { .. } => "mint_epoch_not_usable",
             Self::UnsupportedWire { .. } => "unsupported_wire",
             Self::Provider(e) => e.code(),
             Self::Transport(TransportError::Provider(e)) => e.code(),
