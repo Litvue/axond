@@ -264,8 +264,10 @@ name and prints only the token. Ed25519 base64 whitespace is trimmed on both
 sides because mounted secrets may preserve the generated file's trailing
 newline; HS256 secrets are opaque bytes and are not trimmed. `scope` is enforced
 as a narrowing route capability and can be emitted with repeatable `--scope`
-flags, including `credentials` and the explicit operator-only
-`credentials:all`. The `aliases` claim is enforced at dispatch and in the
+flags, including `credentials`. The operator-only `credentials:all` is never
+granted to a token: `POST /v1/tokens` refuses to issue it, and a claim signed
+offline still does not reach the all-namespaces credential view. The
+`aliases` claim is enforced at dispatch and in the
 `/v1/models` view,
 and is emitted by `axond mint --alias`. `max_request_microdollars` is enforced
 at admission time against the pre-dispatch estimate and can be emitted by
@@ -290,9 +292,11 @@ liveness probes `/healthz` and `/readyz` answer without a credential.
 `GET /v1/credentials` reports replica-local, Tier 0 credential labels and
 healthy/parked/probe state. Its default view follows the caller's namespace and
 platform fallback; scope-less principals retain this own-namespace view.
-`?namespaces=all` requires the explicit `credentials:all` scope, while a
-scoped token also needs `credentials` for the route, and the caller must be in
-the configured default/platform namespace. It never returns secret material.
+`?namespaces=all` is the operator view: it is reachable only with a scope-less
+static `[[gateway_key]]` in the configured default namespace, and is denied to
+tenant static keys and to every minted token, including one carrying
+`credentials:all`. A scoped token also needs `credentials` for the route at all.
+It never returns secret material.
 For fallback platform entries, the default env-derived
 `credential_id` is omitted; an explicitly configured id remains visible.
 

@@ -113,7 +113,8 @@ Several entries for the same pair form that pair's **pool**
 | `weight` | integer | `1` | Share of pool traffic under the `weighted` strategy. `0` is rejected — remove the entry instead. |
 
 The label is caller-visible in the owning namespace and in the operator's
-`?namespaces=all` view. A fallback tenant sees the platform credential and its
+`?namespaces=all` view (see `[[gateway_key]]` below for who reaches it).
+A fallback tenant sees the platform credential and its
 state, but the default `env`-derived label is omitted; an explicitly configured
 `id` remains visible. This keeps operator environment naming private while
 making deliberate credential labels actionable.
@@ -184,6 +185,22 @@ secret — the caller's namespace would be ambiguous. Callers present the token 
 table. The usage record's `subject` is the env var's *name*
 ([ADR 0013](./adr/0013-inbound-auth-fails-closed.md)).
 
+A key's `namespace` also decides its authority over the operator credential
+view: an entry in the default namespace may use
+`GET /v1/credentials?namespaces=all` and see every namespace, because an
+operator placed that secret in the config. An entry in a tenant namespace keeps
+its own-namespace view only, and no minted token can reach the operator view
+even with a `credentials:all` claim
+([ADR 0021](./adr/0021-credential-status-endpoint.md)). Keeping one
+default-namespace key is therefore what makes the fleet-wide credential view
+reachable at all.
+
+Treat the default namespace as the operator's own namespace and its keys as
+breakglass: a static key placed there is an operator credential, so anyone
+holding it can enumerate every namespace's credential labels and circuit state.
+Serve applications from their own `[[namespace]]` with their own key, or from
+minted tokens, rather than handing out the default-namespace key.
+
 ## `[gateway_minting]` — in-gateway token issuance (optional, Tier 0)
 
 This section is absent by default; its presence registers `POST /v1/tokens`.
@@ -195,7 +212,7 @@ such key is enabled, the route remains present but rejects every caller.
 | `kid` | string | — | Existing verifier key identifier used for the minted token. |
 | `env` / `file` | string | — | Exactly one signing-material source; resolved at boot and reload. |
 | `max_ttl` | duration | verifier `max_ttl` | Issuance ceiling, never above the matching verifier's ceiling and at most 24h. When omitted, it tracks the verifier's `max_ttl`; raising that verifier ceiling also raises the issuance ceiling. |
-| `scope` | array of string | — | Optional capability ceiling. When configured, omitted requests inherit it; when absent, omitted scope uses the ordinary capability posture. |
+| `scope` | array of string | — | Optional capability ceiling. When configured, omitted requests inherit it; when absent, omitted scope uses the ordinary capability posture. The operator-only `credentials:all` is rejected here and is never issued by `POST /v1/tokens`. |
 | `aliases` | array of string | — | Optional alias-pattern ceiling. When configured, omitted requests inherit it; when absent, `*` is permitted, but alias dispatch still narrows it to aliases the namespace can already reach. |
 | `max_request_microdollars` | u64 | — | Optional per-request ceiling. Omitted requests inherit it. |
 

@@ -52,7 +52,9 @@ use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target};
 use crate::credentials::{CredentialLease, CredentialPlan, CredentialSource, CredentialStatusView};
 use crate::error::GatewayError;
 use crate::mint::{MintRequest, mint_issued_at, mint_token_at};
-use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
+use crate::principals::{
+    Capability, Presented, PrincipalAuthority, PrincipalStoreError, TokenVerificationError,
+};
 use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::streaming::{self, Framing, StreamContext};
@@ -358,12 +360,7 @@ async fn list_credentials(
     let view = match namespaces.as_deref() {
         None => CredentialStatusView::Namespace(&caller.namespace),
         Some("all") => {
-            if caller.namespace != snapshot.config.default_namespace()
-                || !caller
-                    .scope
-                    .as_ref()
-                    .is_some_and(|scope| scope.contains(&Capability::CredentialsAll))
-            {
+            if !caller_holds_direct_operator_authority(&caller, &snapshot) {
                 return Err(GatewayError::ScopeInsufficient(Capability::CredentialsAll));
             }
             CredentialStatusView::All
@@ -379,6 +376,24 @@ async fn list_credentials(
         "observed": "replica",
         "data": snapshot.credentials.status(&snapshot.config, view),
     })))
+}
+
+/// Whether the caller holds the operator's own authority over the whole
+/// deployment, which is what the all-namespaces credential view exposes.
+///
+/// This is deliberately not `caller_can_mint_capability`: that predicate asks
+/// whether a caller may *delegate* a capability to a subject, while this one
+/// asks whether the caller *is* the operator. Only a configured static gateway
+/// key in the default namespace is, because an operator placed that secret there
+/// itself; a scope narrows a static key rather than widening it, so a scoped one
+/// is not treated as unrestricted. Every minted token carries delegated
+/// authority bounded by minting and its verifier, so no token reaches this view,
+/// including one that presents `credentials:all` from a signer outside
+/// `POST /v1/tokens`.
+fn caller_holds_direct_operator_authority(caller: &InboundKey, snapshot: &ConfigSnapshot) -> bool {
+    caller.authority == PrincipalAuthority::StaticKey
+        && caller.scope.is_none()
+        && caller.namespace == snapshot.config.default_namespace()
 }
 
 fn parse_credential_query(raw_query: Option<&str>) -> Result<Option<String>, GatewayError> {
@@ -2259,6 +2274,32 @@ max_request_microdollars = 1000
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// The two authorities stay separate in both directions: the static key can
+    /// read every namespace itself, yet cannot hand that reach to a subject, and
+    /// an omitted mint scope still cannot inherit it (#116).
+    #[tokio::test]
+    async fn minting_cannot_delegate_the_operator_view_a_static_key_holds_directly() {
+        let state = minting_state_without_scope();
+        let (status, body) = mint_request(
+            state.clone(),
+            json!({"sub": "agent", "scope": ["credentials", "credentials:all"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["type"], "mint_claims_not_narrowing");
+
+        let (status, body) = mint_request(state.clone(), json!({"sub": "agent"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let token = body["token"].as_str().expect("minted token").to_owned();
+        let response =
+            scoped_route_request(state.clone(), "/v1/credentials?namespaces=all", &token).await;
+        assert_scope_denial(response, "credentials:all").await;
+
+        let response =
+            scoped_route_request(state, "/v1/credentials?namespaces=all", "mint-key").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn default_scope_minted_token_reaches_responses() {
         let state = scoped_route_state().await;
@@ -2740,7 +2781,7 @@ targets = [{{ provider = "responses", model = "responses-model", price = {{ inpu
     }
 
     #[tokio::test]
-    async fn credentials_status_requires_its_scope_and_supports_operator_view() {
+    async fn credentials_status_requires_its_scope_and_denies_every_minted_operator_view() {
         let response = scoped_route_request(
             scoped_route_state().await,
             "/v1/credentials",
@@ -2771,13 +2812,16 @@ targets = [{{ provider = "responses", model = "responses-model", price = {{ inpu
         .await;
         assert_scope_denial(response, "credentials:all").await;
 
+        // A minted token cannot buy the operator view with a `credentials:all`
+        // claim: delegation never confers direct operator authority, even from a
+        // signer that emitted the claim outside `POST /v1/tokens`.
         let response = scoped_route_request(
             scoped_route_state().await,
             "/v1/credentials?namespaces=all",
             &scoped_token(Some(vec!["credentials", "credentials:all"])),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_scope_denial(response, "credentials:all").await;
 
         let response = scoped_route_request(
             scoped_route_state().await,
@@ -2789,7 +2833,30 @@ targets = [{{ provider = "responses", model = "responses-model", price = {{ inpu
     }
 
     #[tokio::test]
-    async fn credentials_status_scope_less_static_keys_keep_tenant_view() {
+    async fn credentials_status_scope_less_minted_token_keeps_own_namespace_view_only() {
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/credentials",
+            &scoped_token(None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["data"][0]["namespace"], "platform");
+
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/credentials?namespaces=all",
+            &scoped_token(None),
+        )
+        .await;
+        assert_scope_denial(response, "credentials:all").await;
+    }
+
+    #[tokio::test]
+    async fn credentials_status_default_namespace_static_key_reaches_the_operator_view() {
         let response =
             scoped_route_request(scoped_route_state().await, "/v1/credentials", "static-key").await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -2804,33 +2871,15 @@ targets = [{{ provider = "responses", model = "responses-model", price = {{ inpu
             "static-key",
         )
         .await;
-        assert_scope_denial(response, "credentials:all").await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn credentials_status_tenant_operator_scope_cannot_view_all_namespaces() {
-        let token = scoped_token_for_namespace(
-            "scope-tests",
-            "acme",
-            Some(vec!["credentials", "credentials:all"]),
-        );
-        let response =
-            scoped_route_request(isolated_tenant_state(), "/v1/credentials", &token).await;
-        assert_eq!(response.status(), StatusCode::OK);
-
+    async fn credentials_status_operator_view_follows_authority_not_claims() {
         let response = scoped_route_request(
             isolated_tenant_state(),
             "/v1/credentials?namespaces=all",
-            &token,
-        )
-        .await;
-        assert_scope_denial(response, "credentials:all").await;
-
-        let platform_token = scoped_token(Some(vec!["credentials", "credentials:all"]));
-        let response = scoped_route_request(
-            isolated_tenant_state(),
-            "/v1/credentials?namespaces=all",
-            &platform_token,
+            "platform-secret",
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -2844,6 +2893,40 @@ targets = [{{ provider = "responses", model = "responses-model", price = {{ inpu
             .filter_map(|entry| entry["namespace"].as_str())
             .collect();
         assert_eq!(namespaces, ["acme", "beta"]);
+
+        // A tenant static key holds no authority beyond its own namespace.
+        let response =
+            scoped_route_request(isolated_tenant_state(), "/v1/credentials", "acme-static").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = scoped_route_request(
+            isolated_tenant_state(),
+            "/v1/credentials?namespaces=all",
+            "acme-static",
+        )
+        .await;
+        assert_scope_denial(response, "credentials:all").await;
+
+        // Neither does a token in the default namespace that claims the
+        // operator capability outright.
+        for token in [
+            scoped_token_for_namespace(
+                "scope-tests",
+                "acme",
+                Some(vec!["credentials", "credentials:all"]),
+            ),
+            scoped_token(Some(vec!["credentials", "credentials:all"])),
+        ] {
+            let response =
+                scoped_route_request(isolated_tenant_state(), "/v1/credentials", &token).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = scoped_route_request(
+                isolated_tenant_state(),
+                "/v1/credentials?namespaces=all",
+                &token,
+            )
+            .await;
+            assert_scope_denial(response, "credentials:all").await;
+        }
     }
 
     #[tokio::test]
@@ -2851,7 +2934,7 @@ targets = [{{ provider = "responses", model = "responses-model", price = {{ inpu
         let response = scoped_route_request(
             scoped_route_state().await,
             "/v1/credentials?namespaces=all",
-            &scoped_token(Some(vec!["credentials", "credentials:all"])),
+            "static-key",
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -2931,6 +3014,10 @@ id = "beta-label"
 env = "STATIC_KEY"
 namespace = "acme"
 
+[[gateway_key]]
+env = "PLATFORM_STATIC_KEY"
+namespace = "platform"
+
 [gateway_token]
 audience = "scope-tests"
 
@@ -2946,7 +3033,11 @@ max_ttl = "15m"
         let env = HashMap::from([
             ("ACME_SECRET".to_owned(), "acme-secret".to_owned()),
             ("BETA_SECRET".to_owned(), "beta-secret".to_owned()),
-            ("STATIC_KEY".to_owned(), "static-secret".to_owned()),
+            ("STATIC_KEY".to_owned(), "acme-static".to_owned()),
+            (
+                "PLATFORM_STATIC_KEY".to_owned(),
+                "platform-secret".to_owned(),
+            ),
             (
                 "JWT_SECRET".to_owned(),
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
@@ -3639,6 +3730,7 @@ min_iat = {}
         let caller = InboundKey {
             namespace: "platform".to_owned(),
             subject: "restricted".to_owned(),
+            authority: PrincipalAuthority::MintedToken,
             signer_kid: Some("test-kid".to_owned()),
             scope: None,
             alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
@@ -3768,6 +3860,7 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
                 InboundKey {
                     namespace: "platform".to_owned(),
                     subject: "restricted".to_owned(),
+                    authority: PrincipalAuthority::MintedToken,
                     signer_kid: Some("test-kid".to_owned()),
                     scope: None,
                     alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
@@ -4589,6 +4682,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         let caller = InboundKey {
             namespace: "platform".to_owned(),
             subject: "ceiling-caller".to_owned(),
+            authority: PrincipalAuthority::MintedToken,
             signer_kid: Some("test-kid".to_owned()),
             scope: None,
             alias_scope: None,
@@ -4628,6 +4722,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         let caller = InboundKey {
             namespace: "platform".to_owned(),
             subject: "ceiling-caller".to_owned(),
+            authority: PrincipalAuthority::MintedToken,
             signer_kid: Some("test-kid".to_owned()),
             scope: None,
             alias_scope: None,

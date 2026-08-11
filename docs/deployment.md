@@ -295,20 +295,30 @@ process environment. Nothing in the config file is ever a secret value.
 | `GET /healthz` | none | `ok` once the process is serving. |
 | `GET /readyz` | none | `ready` once the process is serving. |
 | `GET /v1/models` | gateway key | The alias catalogue (names only), scoped to the caller's namespace — only aliases whose targets the caller holds a credential for. |
-| `GET /v1/credentials` | gateway key | Replica-local credential labels and circuit state for the caller's namespace; `?namespaces=all` additionally requires `credentials:all`. |
+| `GET /v1/credentials` | gateway key | Replica-local credential labels and circuit state for the caller's namespace; `?namespaces=all` is the operator view and needs a static key in the default namespace. |
 
 Minted callers may additionally carry repeatable `--scope` capabilities
 (`chat`, `messages`, `embeddings`, `responses`, `models`, `credentials`, or
 `credentials:all`). Scope only narrows the derived namespace authority;
 scope-less principals retain their own-namespace credential view. A scoped
-token needs `credentials` for the route, while `?namespaces=all` additionally
-requires the explicit `credentials:all` scope and otherwise returns
-`403 token_scope_insufficient`. `/v1/responses` requires the `responses`
-capability for scoped callers.
-`credentials:all` is operator-only and must be minted only into operator
-tokens. The all-namespaces view also requires the caller's namespace to be the
-configured default/platform namespace; the verifier `namespaces = [...]`
-allowlist is defense in depth ([ADR 0021](./adr/0021-credential-status-endpoint.md)).
+token needs `credentials` for the route. `/v1/responses` requires the
+`responses` capability for scoped callers.
+
+The all-namespaces credential view is reached with a scope-less static
+`[[gateway_key]]` in the configured default namespace — in practice the
+breakglass key — and not with a token:
+
+```sh
+curl -sS -H "Authorization: Bearer $GW_INBOUND_PLATFORM_KEY" \
+  'http://localhost:8080/v1/credentials?namespaces=all'
+```
+
+A static key in a tenant namespace, and every minted token, gets
+`403 token_scope_insufficient` naming `credentials:all` — including a token
+that carries that claim, which `POST /v1/tokens` refuses to mint anyway. So an
+operator who needs the fleet-wide credential view keeps a default-namespace
+static key rather than trying to mint one
+([ADR 0021](./adr/0021-credential-status-endpoint.md)).
 
 Credential status is Tier 0, in-memory, and per replica: `observed: "replica"`
 is not a fleet-wide health view. Presence is represented by an entry (boot
