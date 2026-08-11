@@ -1369,6 +1369,11 @@ impl Config {
             }
         }
         if let Some(aliases) = &minting.aliases {
+            if aliases.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "gateway_minting aliases must contain at least one pattern".into(),
+                ));
+            }
             AliasScope::parse(aliases.iter().map(String::as_str)).map_err(|error| {
                 ConfigError::Invalid(format!("gateway_minting aliases: {error}"))
             })?;
@@ -1935,6 +1940,11 @@ audience = "test"
                 "bad alias",
                 "kid = \"test\"\nenv = \"SIGN\"\naliases = [\"gpt-*-bad\"]",
                 "invalid alias pattern",
+            ),
+            (
+                "empty aliases",
+                "kid = \"test\"\nenv = \"SIGN\"\naliases = []",
+                "at least one pattern",
             ),
         ];
         for (name, minting, expected) in cases {

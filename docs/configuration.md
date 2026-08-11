@@ -193,17 +193,19 @@ such key is enabled, the route remains present but rejects every caller.
 | `kid` | string | — | Existing verifier key identifier used for the minted token. |
 | `env` / `file` | string | — | Exactly one signing-material source; resolved at boot and reload. |
 | `max_ttl` | duration | verifier `max_ttl` | Issuance ceiling, never above the matching verifier's ceiling and at most 24h. When omitted, it tracks the verifier's `max_ttl`; raising that verifier ceiling also raises the issuance ceiling. |
-| `scope` | array of string | — | Optional capability ceiling. Omitted requests inherit it. |
-| `aliases` | array of string | — | Optional alias-pattern ceiling. When omitted, `*` is permitted, but alias dispatch still narrows it to aliases the namespace can already reach. Omitted requests inherit the configured ceiling. |
+| `scope` | array of string | — | Optional capability ceiling. When configured, omitted requests inherit it; when absent, omitted scope uses the ordinary capability posture. |
+| `aliases` | array of string | — | Optional alias-pattern ceiling. When configured, omitted requests inherit it; when absent, `*` is permitted, but alias dispatch still narrows it to aliases the namespace can already reach. |
 | `max_request_microdollars` | u64 | — | Optional per-request ceiling. Omitted requests inherit it. |
 
 The route is registered only at boot. Enabling minting on reload is reported
 but requires a restart; removing it takes effect immediately and returns a
 typed 404. Key material and ceilings otherwise reload normally. Enabling this
 feature means every replica with minting enabled holds signing material: a
-compromised replica can forge tokens, and it loses Ed25519's verification-only
-benefit. Keep offline `axond mint` as the default, and consider a separately
-deployed minting replica set with short `max_ttl`.
+compromised replica can forge tokens. EdDSA otherwise supports verification-only
+replicas with only public key material; HS256 never had that property because
+every verifier already holds the forging secret. Keep offline `axond mint` as
+the default, prefer EdDSA when verification-only replicas matter, and consider
+a separately deployed minting replica set with short `max_ttl`.
 
 ## `[gateway_token]` — minted-token deployment policy (Tier 0)
 

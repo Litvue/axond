@@ -240,6 +240,12 @@ async fn serve() -> anyhow::Result<()> {
         gateway_verifiers = state.config().token_verifier_count(),
         "inbound auth enforced"
     );
+    if let Some(minting) = state.config().config.gateway_minting.as_ref() {
+        tracing::info!(
+            kid = %minting.kid,
+            "gateway token minting enabled; this replica can sign tokens"
+        );
+    }
     reload::spawn(Arc::new(reload::Reloader::new(config_path, state.clone())));
     let app = routes::router(state).layer(telemetry::TelemetryLayer);
 
