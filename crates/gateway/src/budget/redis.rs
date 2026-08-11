@@ -56,6 +56,12 @@ const BACKEND: &str = "redis";
 
 /// Value of the layout marker once the namespace-scoped layout is in force.
 const LAYOUT_V2: &str = "v2";
+/// Value of the layout marker while a migration is carrying spend across. Stamped
+/// before the first key moves and replaced by [`LAYOUT_V2`] only when every one
+/// has, so a run that dies part-way is visible to both boot directions: the
+/// carried subjects hold their spend in the v2 layout and the rest in v1, and
+/// neither layout alone is the whole ledger.
+const LAYOUT_MIGRATING: &str = "v2-migrating";
 
 /// Admit only if settled spend plus every live hold leaves room for this
 /// estimate, and hold it if so. Expired holds are reclaimed first, which is why
@@ -335,6 +341,9 @@ async fn require_migrated_layout(
     key_prefix: &str,
 ) -> Result<(), BudgetError> {
     let marker: Option<String> = connection.get(layout_key(key_prefix)).await?;
+    if marker.as_deref() == Some(LAYOUT_MIGRATING) {
+        return Err(unfinished_migration(key_prefix));
+    }
     if marker.as_deref() != Some(LAYOUT_V2) {
         return Err(BudgetError::invalid(
             BACKEND,
@@ -381,10 +390,28 @@ async fn require_unmigrated_layout(
             ),
         ));
     }
-    // Also with the marker unset: a first migration that died mid-carry has
-    // already deleted the v1 counter it claimed, so booting the old layout would
-    // serve that subject a budget short of what it has spent.
+    if marker.as_deref() == Some(LAYOUT_MIGRATING) {
+        // A run that carried some subjects and then failed: their v1 counters are
+        // gone, so this configuration would read zero for them and hand each a
+        // fresh budget. Only finishing the migration resolves it.
+        return Err(unfinished_migration(key_prefix));
+    }
+    // And with the marker unset — a pre-migration deployment — a claim can still
+    // be outstanding from a run that died before stamping anything.
     require_no_pending_claims(connection, key_prefix).await
+}
+
+fn unfinished_migration(key_prefix: &str) -> BudgetError {
+    BudgetError::invalid(
+        BACKEND,
+        format!(
+            "`{}` is marked `{LAYOUT_MIGRATING}`: a `axond budget migrate-redis` run did not \
+             finish, so some subjects hold their spend in the v2 layout and the rest in v1 and \
+             neither configuration can enforce a whole ledger. Re-run `axond budget migrate-redis`, \
+             which resumes where it stopped and carries each subject exactly once.",
+            layout_key(key_prefix)
+        ),
+    )
 }
 
 /// Claims a migration took but did not finish applying. The v1 counter they came
@@ -521,6 +548,17 @@ pub async fn migrate_v1_to_v2(
     }
     for legacy in &reservation_keys {
         resolve_legacy_scope(key_prefix, legacy, ":reservations", namespaces)?;
+    }
+
+    // Every key is now attributed, so the first move is about to happen: mark the
+    // layout as mid-migration first. A carried subject leaves no v1 key and no
+    // claim behind, so without this a run that failed on a *later* subject would
+    // be invisible — and the old layout would read zero for everyone already
+    // carried. The marker is what makes a partial run refuse to serve.
+    if !scopes.is_empty() || !reservation_keys.is_empty() {
+        let _: () = connection
+            .set(layout_key(key_prefix), LAYOUT_MIGRATING)
+            .await?;
     }
 
     // Each carry adds its subject's spend to that subject's counter *and* to its
@@ -1486,6 +1524,98 @@ mod tests {
             "400 carried, 250 settled under v2, 150 recovered: the recovery added \
              its delta instead of overwriting the total"
         );
+    }
+
+    /// A carried subject leaves no v1 key and no claim behind, so a run that fails
+    /// on a *later* subject is invisible in the keyspace: the old layout would read
+    /// zero for everyone already carried and hand each a fresh budget. The
+    /// mid-migration marker is what neither configuration will serve past.
+    #[tokio::test]
+    async fn a_migration_that_stopped_part_way_serves_neither_layout() {
+        let Some(url) = crate::test_services::redis_url() else {
+            return;
+        };
+        let prefix = prefix();
+        let carried = BudgetKey {
+            namespace: "acme".into(),
+            subject: "first".into(),
+        };
+        let waiting = BudgetKey {
+            namespace: "acme".into(),
+            subject: "second".into(),
+        };
+        let client = ::redis::Client::open(url.as_str()).expect("client");
+        let mut connection = ConnectionManager::new(client).await.expect("connect");
+
+        // Two v1 subjects; the migration carried the first and then died, which
+        // leaves the marker mid-migration and nothing else to give it away.
+        for (key, spend) in [(&carried, 300), (&waiting, 200)] {
+            let _: () = connection
+                .set(
+                    format!("{prefix}:{{{}|{}}}:spent", key.namespace, key.subject),
+                    spend,
+                )
+                .await
+                .expect("v1 spend");
+        }
+        let _: () = connection
+            .set(layout_key(&prefix), LAYOUT_MIGRATING)
+            .await
+            .expect("mark mid-migration");
+        let scope = format!("{prefix}:{{acme|first}}");
+        let claim: Option<String> = Script::new(DRAIN_V1)
+            .prepare_invoke()
+            .key(format!("{scope}:spent"))
+            .key(format!("{scope}{PENDING}"))
+            .key(format!("{scope}{SEQ}"))
+            .invoke_async(&mut connection)
+            .await
+            .expect("claim");
+        let (sequence, amount) = claim.as_deref().expect("claimed").split_once(':').unwrap();
+        let _: i64 = Script::new(APPLY_CLAIM)
+            .prepare_invoke()
+            .key(v2_keys(&prefix, &carried).subject_spent)
+            .key(v2_keys(&prefix, &carried).namespace_spent)
+            .key(format!(
+                "{}:migration:applied",
+                namespace_scope(&prefix, "acme")
+            ))
+            .arg(format!("first#{sequence}"))
+            .arg(amount.parse::<i64>().unwrap())
+            .invoke_async(&mut connection)
+            .await
+            .expect("apply");
+        let _: i64 = connection
+            .del(format!("{scope}{PENDING}"))
+            .await
+            .expect("finish the carry");
+
+        // Neither configuration may serve: the ledger is split across layouts.
+        for shared in [namespace_settings(1_000, 1_000), settings(1_000)] {
+            let refused = RedisBudget::connect(&url, prefix.clone(), shared)
+                .await
+                .err()
+                .expect("a part-way migration must fail at boot");
+            assert!(
+                format!("{refused}").contains("did not finish"),
+                "the error must name the unfinished migration: {refused}"
+            );
+        }
+
+        // Resuming carries only what is left, and both subjects end up whole.
+        let resumed = migrate_v1_to_v2(&url, &prefix, &namespaces())
+            .await
+            .expect("resume");
+        assert_eq!(
+            resumed.carried_microdollars, 200,
+            "the already-carried subject is not charged again"
+        );
+        assert_eq!(spent(&url, &prefix, &carried).await, 300);
+        assert_eq!(spent(&url, &prefix, &waiting).await, 200);
+        assert_eq!(namespace_spent(&url, &prefix, "acme").await, 500);
+        RedisBudget::connect(&url, prefix.clone(), namespace_settings(1_000, 1_000))
+            .await
+            .expect("a finished migration boots");
     }
 
     /// An interrupted claim holds spend that neither layout accounts for, and the

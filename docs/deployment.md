@@ -437,11 +437,16 @@ twice, and spend a stray old replica recorded *after* the first run is carried
 over rather than discarded. The report line names the amount, so a non-zero carry
 on a re-run is the signal that something was still writing the old layout.
 
-An interrupted run can leave spend parked in a `:migration_pending` claim — taken
-off the old counter, not yet added to the new one — and *neither* configuration
-boots while one is outstanding, whatever the layout marker says, because that
-spend is in neither layout and the cap would be short by it. Re-run the migration
-to finish the claims; that is all it takes.
+An interrupted run is fenced rather than papered over, in both of the ways it can
+stop. Spend taken off an old counter but not yet added to the new one sits in a
+`:migration_pending` claim, and *neither* configuration boots while one is
+outstanding. A run that carried some subjects and then failed on a later one
+leaves nothing in the keyspace to show it — a carried subject has no old key and no
+claim — so the migration marks `<key_prefix>:layout` as `v2-migrating` before it
+moves anything and only writes `v2` once every subject is across; neither
+configuration serves a `v2-migrating` prefix either, since the ledger is then split
+between the layouts. Re-running the migration resumes where it stopped and clears
+both states; that is all it takes.
 
 The migration attributes old keys by resolving their `{namespace|subject}` tag
 against the namespaces in your config. Neither half of that tag was escaped, so

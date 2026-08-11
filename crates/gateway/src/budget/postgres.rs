@@ -136,7 +136,7 @@ impl PostgresBudget {
             // duration of that aggregate, so it runs only when the schema it
             // installs is not already there.
             if store.settings.enforces_namespace_cap()
-                && !store.namespace_schema_ready(&client).await
+                && !store.namespace_schema_ready(&client).await?
             {
                 client
                     .batch_execute(&store.schema_ddl(SCHEMA_DDL_V2))
@@ -205,18 +205,7 @@ impl PostgresBudget {
                     ),
                 )
             })?;
-        let unbackfilled: i64 = client
-            .query_one(
-                &format!(
-                    "SELECT count(*)::bigint FROM (
-                         SELECT namespace FROM {table}
-                         EXCEPT SELECT namespace FROM {namespaces}
-                     ) AS missing"
-                ),
-                &[],
-            )
-            .await?
-            .get(0);
+        let unbackfilled = self.unbackfilled_namespaces(client).await?;
         if unbackfilled > 0 {
             return Err(BudgetError::invalid(
                 BACKEND,
@@ -281,11 +270,46 @@ impl PostgresBudget {
 
     /// Whether everything the v2 file installs is already in place *and* in force:
     /// the namespace table, the fence on both relations, and a namespace total for
-    /// every namespace with spend. That is exactly what the cap-enabled boot check
-    /// demands, so anything it would reject reads as not ready and the file is
-    /// applied; anything it would accept needs no lock and no backfill.
-    async fn namespace_schema_ready(&self, client: &Client) -> bool {
-        self.require_namespace_schema(client).await.is_ok()
+    /// every namespace with spend. Those are the conditions the cap-enabled boot
+    /// check enforces, so anything it would accept needs neither the file's lock
+    /// nor its backfill.
+    ///
+    /// Absence is established positively, never inferred from a failure: a
+    /// statement timeout, a lost connection, or a missing privilege must not read
+    /// as "not installed" and send a restart into re-taking an `EXCLUSIVE` lock on
+    /// a live fleet's spend table. So a missing relation is detected with
+    /// `to_regclass` rather than by a failing query, and any real error propagates
+    /// and fails the boot.
+    async fn namespace_schema_ready(&self, client: &Client) -> Result<bool, tokio_postgres::Error> {
+        let installed: bool = client
+            .query_one(
+                "SELECT to_regclass($1) IS NOT NULL",
+                &[&self.namespace_table()],
+            )
+            .await?
+            .get(0);
+        if !installed || !self.fence_targets(client).await?.complete() {
+            return Ok(false);
+        }
+        Ok(self.unbackfilled_namespaces(client).await? == 0)
+    }
+
+    /// Namespaces with spend but no namespace total, which would read as zero.
+    async fn unbackfilled_namespaces(&self, client: &Client) -> Result<i64, tokio_postgres::Error> {
+        let namespaces = self.namespace_table();
+        let table = &self.table;
+        Ok(client
+            .query_one(
+                &format!(
+                    "SELECT count(*)::bigint FROM (
+                         SELECT namespace FROM {table}
+                         EXCEPT SELECT namespace FROM {namespaces}
+                     ) AS missing"
+                ),
+                &[],
+            )
+            .await?
+            .get(0))
     }
 
     /// Whether the fence is on the spend table and on the reservation table,
