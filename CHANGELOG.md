@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.2.2](https://github.com/Litvue/axond/compare/v0.2.1...v0.2.2) (2026-08-11)
+
+
+### Features
+
+* expose scoped credential status ([e8be1c5](https://github.com/Litvue/axond/commit/e8be1c5acc932e4f5807622fcbf1d0202b6fe1cd))
+* **gateway:** expose a namespace-scoped credential status endpoint ([e062514](https://github.com/Litvue/axond/commit/e06251456902907093fb0fed5181b3839233287c))
+
+
+### Bug Fixes
+
+* bound compose smoke provider request ([af355fe](https://github.com/Litvue/axond/commit/af355fe3c59cf5a567ea25bfa84c33a7bde32ef2))
+* clear compose smoke probe outputs ([e65ece4](https://github.com/Litvue/axond/commit/e65ece4143b17d3ab88091fabf249f28ccc1e0dd))
+* **gateway:** constrain credential operator view ([88cb330](https://github.com/Litvue/axond/commit/88cb330c76bb4c500049139d2e0974bd4fc0ed4b))
+* isolate compose smoke probe files ([6ac28e2](https://github.com/Litvue/axond/commit/6ac28e24a3777d1db21e5098f01f00fca6301f60))
+* report compose smoke curl failures ([0414df2](https://github.com/Litvue/axond/commit/0414df26b56fd2c3972f6c1776cf30cc3cc4a229))
+
+
+### Documentation
+
+* restore credential status ADR and testing guidance ([07ec6ad](https://github.com/Litvue/axond/commit/07ec6ade67ffc42fc8c16dc6e93181f3f46ebe6b))
+
+
+### Continuous Integration
+
+* **ops:** guard the compose quickstart smoke ([cc6f270](https://github.com/Litvue/axond/commit/cc6f270ffd0eb263f5a4c4e6a8c1c806ca430fc1))
+
 ## [0.2.1](https://github.com/Litvue/axond/compare/v0.2.0...v0.2.1) (2026-08-11)
 
 
