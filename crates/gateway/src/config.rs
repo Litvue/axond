@@ -1915,7 +1915,7 @@ audience = "test"
 >>>>>>> 2af6b3b (fix(gateway): enforce inherited minting scope authority)
         ];
         for (name, minting, expected) in cases {
-            let minting = if minting.contains("scope =") {
+            let minting = if name == "missing scope ceiling" || minting.contains("scope =") {
                 minting.to_owned()
             } else {
                 format!("{minting}\nscope = [\"chat\"]")
