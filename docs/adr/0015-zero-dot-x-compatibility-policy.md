@@ -16,8 +16,8 @@ a different blast radius when it changes:
   ConfigMaps. A renamed key does not fail gracefully — the gateway refuses to
   boot (ADR 0002's fail-at-boot principle, working exactly as intended), which
   means a routine upgrade takes the fleet down.
-* **The usage row shape.** `UsageRecord::SCHEMA_VERSION = 2` and
-  `ops/postgres/usage_v2.sql` land in the operator's *own* Postgres, feeding
+* **The usage row shape.** `UsageRecord::SCHEMA_VERSION = 1` and
+  `ops/postgres/usage_v1.sql` land in the operator's *own* Postgres, feeding
   their invoices and dashboards. ADR 0009 already committed to versioning it and
   to never editing shipped DDL in place, but the rule lives in that ADR and in
   `docs/usage-schema.md`, scoped to usage alone.
