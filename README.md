@@ -85,6 +85,31 @@ and [ADR 0018](./docs/adr/0018-tier-0-hermetic-boot-gate.md).
 
 ## Quick start
 
+For a five-minute Docker Compose deployment (including a stateful Redis and
+Postgres variant), see the [deployment guide](./docs/deployment.md#5-minute-quickstart).
+
+```bash
+cp ops/compose/env.example .env
+docker compose up -d --build
+curl http://localhost:8080/healthz
+```
+
+The first Compose build compiles the static musl release and can take several
+minutes. To call the authenticated catalogue:
+
+```bash
+curl -H "Authorization: Bearer quickstart-platform-key" \
+  http://localhost:8080/v1/models
+docker compose down -v
+```
+
+Keep `.env` until after teardown: Compose validates required variables before
+running `down`. To run the smoke helper, tear down this stack first; it uses
+the same host port. If another local stack owns port 8080, use
+`AXOND_QUICKSTART_SMOKE_PORT=18080 just quickstart-smoke`.
+
+For a source-based configuration path, use the full annotated reference:
+
 ```bash
 cp axond.example.toml axond.toml      # edit providers/models/namespaces
 
