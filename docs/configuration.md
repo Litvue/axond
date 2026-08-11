@@ -258,7 +258,7 @@ or via an atomic rename is therefore reload-reachable without a process
 restart. `[[namespace]]` changes are reloadable and appear in the reported
 namespace delta, but the namespace count used for in-memory budget retention
 floors is captured at boot and does not resize until restart. `[server] bind`,
-`[[usage_sink]]`, `[budget]`, and `[rate_limit]`
+`[[usage_sink]]`, `[budget]`, `[rate_limit]`, and `[revocation]`
 changes warn and are ignored until restart; this includes
 `limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
 
