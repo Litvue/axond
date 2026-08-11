@@ -198,7 +198,7 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
         max_request_microdollars,
         scope,
     })?
-    .0)
+    .token)
 }
 
 pub(crate) struct MintRequest<'a> {
@@ -214,7 +214,12 @@ pub(crate) struct MintRequest<'a> {
     pub(crate) scope: Option<Vec<Capability>>,
 }
 
-pub(crate) fn mint_token(request: MintRequest<'_>) -> Result<(String, u64)> {
+pub(crate) struct MintedToken {
+    pub(crate) token: String,
+    pub(crate) exp: u64,
+}
+
+pub(crate) fn mint_token(request: MintRequest<'_>) -> Result<MintedToken> {
     let MintRequest {
         kid,
         algorithm,
@@ -242,10 +247,10 @@ pub(crate) fn mint_token(request: MintRequest<'_>) -> Result<(String, u64)> {
     };
     let mut header = Header::new(algorithm.jwt());
     header.kid = Some(kid.to_owned());
-    Ok((
-        format!("axt1.{}", encode(&header, &claims, &encoding_key)?),
-        claims.exp,
-    ))
+    Ok(MintedToken {
+        token: format!("axt1.{}", encode(&header, &claims, &encoding_key)?),
+        exp: claims.exp,
+    })
 }
 
 pub(crate) fn validate_signing_material(
@@ -526,7 +531,7 @@ max_ttl = "15m"
             scope: None,
         })
         .unwrap()
-        .0;
+        .token;
         let principal = verifier
             .resolve(&Presented { credential: &token })
             .await
@@ -559,7 +564,7 @@ max_ttl = "15m"
             scope: None,
         })
         .unwrap()
-        .0;
+        .token;
         let principal = verifier
             .resolve(&Presented { credential: &token })
             .await
@@ -636,7 +641,7 @@ max_ttl = "15m"
             scope: None,
         })
         .unwrap()
-        .0;
+        .token;
         let principal = verifier
             .resolve(&Presented { credential: &token })
             .await
@@ -681,7 +686,7 @@ max_ttl = "15m"
             scope: None,
         })
         .unwrap()
-        .0;
+        .token;
         let principal = verifier
             .resolve(&Presented { credential: &token })
             .await
@@ -948,7 +953,7 @@ max_ttl = "15m"
             scope: None,
         })
         .unwrap()
-        .0;
+        .token;
         assert!(matches!(
             verifier.resolve(&Presented { credential: &token }).await,
             Err(PrincipalStoreError::Unauthorized(

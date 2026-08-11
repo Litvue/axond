@@ -1,7 +1,12 @@
 //! Typed gateway errors → HTTP responses.
 //!
-//! Routes return typed errors for request-level failures. Optional features may
-//! omit their route entirely when not enabled.
+//! Every route always exists and returns a *typed* error explaining its own
+//! state (delta B3). We never 404 a whole route behind a kill switch, because
+//! a 404 from a proxy is indistinguishable from a wrong `base_url`.
+//!
+//! The narrow exception is an opt-in issuance endpoint: when it is not
+//! configured, it is not registered at all because absence is the security
+//! property there.
 
 use axum::Json;
 use axum::http::{HeaderValue, StatusCode};

@@ -24,6 +24,7 @@
 //! an overall wall-clock budget. Streaming can fail over only while opening the
 //! upstream; once bytes flow, a mid-stream failure is terminal.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,10 +40,12 @@ use gateway_core::{
     Surface, Usage,
 };
 use gateway_transport::{AuthScheme, NativeCall, TransportError, Upstream};
+use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{Instrument, debug, warn};
 
+use crate::aliases::AliasScope;
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, Target};
 use crate::credentials::{CredentialPlan, CredentialSource};
@@ -54,7 +57,6 @@ use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::streaming::{self, Framing, StreamContext};
 use crate::telemetry;
 use crate::usage::{Status, UsageRecord};
-use secrecy::ExposeSecret;
 
 pub fn router(state: AppState) -> Router {
     let minting_enabled = state.config().gateway_minting.is_some();
@@ -193,7 +195,7 @@ async fn mint_tokens(
                 && !parsed
                     .iter()
                     .copied()
-                    .collect::<std::collections::HashSet<_>>()
+                    .collect::<HashSet<_>>()
                     .is_subset(ceiling)
             {
                 return Err(GatewayError::MintClaimsNotNarrowing);
@@ -207,7 +209,7 @@ async fn mint_tokens(
     };
     let aliases = match request.aliases {
         Some(values) => {
-            let requested = crate::aliases::AliasScope::parse(values.iter().map(String::as_str))
+            let requested = AliasScope::parse(values.iter().map(String::as_str))
                 .map_err(|error| GatewayError::BadRequest(error.to_string()))?;
             if let Some(ceiling) = &minting.aliases
                 && !requested.is_subset_of(ceiling)
@@ -243,7 +245,7 @@ async fn mint_tokens(
     {
         return Err(GatewayError::MintClaimsNotNarrowing);
     }
-    let (token, exp) = mint_token(MintRequest {
+    let minted = mint_token(MintRequest {
         kid: &minting.kid,
         algorithm: minting.algorithm,
         key_material: minting.key_material.expose_secret(),
@@ -257,8 +259,8 @@ async fn mint_tokens(
     })
     .map_err(|error| GatewayError::BadRequest(error.to_string()))?;
     Ok(Json(json!({
-        "token": token,
-        "exp": exp,
+        "token": minted.token,
+        "exp": minted.exp,
         "expires_in": ttl.as_secs(),
         "namespace": caller.namespace,
         "sub": request.sub,
@@ -1633,6 +1635,23 @@ max_request_microdollars = 1000
             .expect("minting state")
     }
 
+    async fn mint_request(state: AppState, body: Value) -> (StatusCode, Value) {
+        let response = router(state)
+            .oneshot(
+                Request::post("/v1/tokens")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer mint-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        (status, body)
+    }
+
     #[test]
     fn namespace_authority_follows_reachable_provider_wires() {
         let snapshot = test_state().config();
@@ -2130,6 +2149,108 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn minting_rejects_unauthorized_and_malformed_requests() {
+        let (status, body) = mint_request(minting_state(), json!({"sub": "agent"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["namespace"], "platform");
+
+        let state = minting_state();
+        let mut config = state.config().config.clone();
+        config.gateway_key[0].can_mint = false;
+        let env = HashMap::from([
+            ("MINT_KEY".to_owned(), "mint-key".to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
+        let unauthorized = ConfigSnapshot::build(config, &env, 0).unwrap();
+        state.publish(unauthorized);
+        let (status, body) = mint_request(state, json!({"sub": "agent"})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["type"], "mint_not_authorized");
+
+        for body in [
+            json!({"sub": "agent", "ns": "platform"}),
+            json!({"sub": ""}),
+            json!({"sub": "   "}),
+        ] {
+            let (status, _) = mint_request(minting_state(), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn minting_rejects_every_claim_widening_attempt() {
+        for body in [
+            json!({"sub": "agent", "ttl_seconds": 901}),
+            json!({"sub": "agent", "ttl_seconds": 0}),
+            json!({"sub": "agent", "scope": ["embeddings"]}),
+            json!({"sub": "agent", "aliases": ["*"]}),
+            json!({"sub": "agent", "aliases": ["claude-*"]}),
+            json!({"sub": "agent", "max_request_microdollars": 1001}),
+        ] {
+            let (status, body) = mint_request(minting_state(), body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(body["error"]["type"], "mint_claims_not_narrowing");
+        }
+    }
+
+    #[tokio::test]
+    async fn omitted_minting_claims_inherit_configured_ceilings() {
+        let (status, body) = mint_request(minting_state(), json!({"sub": "agent"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let token = body["token"].as_str().unwrap();
+        let state = minting_state();
+        let principal = state
+            .config()
+            .resolve_principal(&Presented { credential: token })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            principal.scope,
+            Some(HashSet::from([Capability::Chat, Capability::Models]))
+        );
+        assert_eq!(
+            principal.alias_scope,
+            Some(AliasScope::parse(["gpt-*"]).unwrap())
+        );
+        assert_eq!(principal.max_request_microdollars, Some(1000));
+    }
+
+    #[tokio::test]
+    async fn removing_minting_from_a_published_snapshot_is_fail_closed() {
+        let state = minting_state();
+        let app = router(state.clone());
+        let mut config = state.config().config.clone();
+        config.gateway_minting = None;
+        config.gateway_key[0].can_mint = false;
+        let env = HashMap::from([
+            ("MINT_KEY".to_owned(), "mint-key".to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
+        state.publish(ConfigSnapshot::build(config, &env, 1).unwrap());
+        let response = app
+            .oneshot(
+                Request::post("/v1/tokens")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer mint-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"sub":"agent"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "minting_disabled");
     }
 
     #[tokio::test]
