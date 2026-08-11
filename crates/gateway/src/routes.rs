@@ -46,9 +46,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target};
-use crate::credentials::{
-    CredentialLease, CredentialPlan, CredentialSource, CredentialStatusView,
-};
+use crate::credentials::{CredentialLease, CredentialPlan, CredentialSource, CredentialStatusView};
 use crate::error::GatewayError;
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
 use crate::rate_limit::{RateLimitKey, RateLimitPermit};
