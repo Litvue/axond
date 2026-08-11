@@ -184,7 +184,9 @@ table. The usage record's `subject` is the env var's *name*
 
 ## `[gateway_minting]` — in-gateway token issuance (optional, Tier 0)
 
-This section is absent by default; its presence registers `POST /v1/tokens`. It requires a static `[[gateway_key]]` with `can_mint = true` and places a signing key in the gateway.
+This section is absent by default; its presence registers `POST /v1/tokens`.
+It requires a static `[[gateway_key]]` with `can_mint = true` and places a
+signing key in the gateway.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -195,7 +197,13 @@ This section is absent by default; its presence registers `POST /v1/tokens`. It 
 | `aliases` | array of string | — | Optional alias-pattern ceiling. Omitted requests inherit it. |
 | `max_request_microdollars` | u64 | — | Optional per-request ceiling. Omitted requests inherit it. |
 
-The route is registered only at boot. Enabling minting on reload is reported but requires a restart; removing it takes effect immediately and returns a typed 404. Key material and ceilings otherwise reload normally. Enabling this feature means every replica with minting enabled holds signing material: a compromised replica can forge tokens, and it loses Ed25519's verification-only benefit. Keep offline `axond mint` as the default, and consider a separately deployed minting replica set with short `max_ttl`.
+The route is registered only at boot. Enabling minting on reload is reported
+but requires a restart; removing it takes effect immediately and returns a
+typed 404. Key material and ceilings otherwise reload normally. Enabling this
+feature means every replica with minting enabled holds signing material: a
+compromised replica can forge tokens, and it loses Ed25519's verification-only
+benefit. Keep offline `axond mint` as the default, and consider a separately
+deployed minting replica set with short `max_ttl`.
 
 ## `[gateway_token]` — minted-token deployment policy (Tier 0)
 

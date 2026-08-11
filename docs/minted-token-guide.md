@@ -7,7 +7,9 @@ does not add Redis, Postgres, or another runtime dependency.
 
 ## In-gateway minting (opt-in)
 
-Offline `axond mint` remains the default. To expose `POST /v1/tokens`, configure a matching verifier and signing source, then authorize a static gateway key:
+Offline `axond mint` remains the default. To expose `POST /v1/tokens`,
+configure a matching verifier and signing source, then authorize a static
+gateway key:
 
 ```toml
 [gateway_minting]
@@ -24,14 +26,23 @@ namespace = "platform"
 can_mint = true
 ```
 
-The endpoint uses the same authentication middleware as every other non-liveness route. The body accepts `sub`, optional `ttl_seconds`, `scope`, `aliases`, and `max_request_microdollars`; it rejects unknown fields. Omitted scope, aliases, and microdollar limits inherit their configured ceilings, while requested values must narrow them and TTL must be between one second and the effective maximum. Minted tokens are never authorized to mint another token.
+The endpoint uses the same authentication middleware as every other
+non-liveness route. The body accepts `sub`, optional `ttl_seconds`, `scope`,
+`aliases`, and `max_request_microdollars`; it rejects unknown fields. Omitted
+scope, aliases, and microdollar limits inherit their configured ceilings, while
+requested values must narrow them and TTL must be between one second and the
+effective maximum. Minted tokens are never authorized to mint another token.
 
 ```bash
 curl -s https://gateway.example/v1/tokens -H "Authorization: Bearer $GW_INBOUND_PLATFORM_KEY" -H 'content-type: application/json' -d '{"sub":"agent-7","ttl_seconds":300,"scope":["chat"],"aliases":["gpt-4o"],"max_request_microdollars":500}'
 # {"token":"axt1.…","exp":...,"expires_in":300,"namespace":"platform","sub":"agent-7"}
 ```
 
-Enabling this puts a **signing** key in the gateway. A compromised minting replica becomes a forgery capability and loses Ed25519's verification-only-replica benefit. Keep offline `axond mint` as the default; if HTTP minting is necessary, use a separately deployed replica set and keep `max_ttl` short.
+Enabling this puts a **signing** key in the gateway. A compromised minting
+replica becomes a forgery capability and loses Ed25519's
+verification-only-replica benefit. Keep offline `axond mint` as the default; if
+HTTP minting is necessary, use a separately deployed replica set and keep
+`max_ttl` short.
 
 ## 1. Keep a static breakglass key
 
