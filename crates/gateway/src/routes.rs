@@ -1129,6 +1129,9 @@ async fn stream_with_failover(
                     attempt_started.elapsed().as_millis() as u64,
                     None,
                 );
+                if lease_index > 0 {
+                    walk.attempts += 1;
+                }
                 break 'targets;
             }
             let mut ctx = StreamContext {

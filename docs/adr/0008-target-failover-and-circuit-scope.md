@@ -67,6 +67,10 @@ health (`affects_provider_health`) **and** is not credential-scoped:
   target would take capacity away from other keys and other namespaces.
 - `4xx`-class permanent error → no failover, no breaker change.
 
+Credential rotation, whether it happens while opening a stream or after a
+pre-content rate-limit event during relay, remains inside one target attempt.
+It never feeds the target breaker; only target-scoped failures do.
+
 **The walk is bounded twice.** `failover.max_attempts` caps the number of
 upstream target attempts and `failover.overall_timeout_ms` caps the total
 wall-clock spent walking, checked before each attempt. Either bound ends the walk

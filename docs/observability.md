@@ -129,6 +129,10 @@ attempt and request trace. Rotation does not create another upstream attempt
 span: there is one attempt span per target attempt, while `attempts` and
 `axond.retry_count` remain target-scoped. The target-open attempt can be
 `ok` while a later lease child is `rate_limited`.
+Rotation uses the same `failover.overall_timeout_ms` deadline as target
+failover. A long time-to-first-token stream can therefore remain terminal
+instead of rotating once that deadline expires; the attempt span is closed
+with the target's terminal status and no later lease span is emitted.
 
 ### Boot failures
 
