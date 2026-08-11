@@ -3296,7 +3296,6 @@ max_ttl = "15m"
     }
 
     #[tokio::test]
-    async fn the_responses_route_rejects_anonymous_callers_before_deferring() {
     async fn the_responses_route_rejects_anonymous_callers_before_dispatching() {
         let resp = router(test_state())
             .oneshot(
