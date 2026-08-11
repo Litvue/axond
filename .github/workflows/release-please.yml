@@ -150,9 +150,9 @@ jobs:
       - name: Resolve automatic or requested release
         id: release
         env:
-          AUTO_RELEASE_CREATED: ${{ needs.release-please.outputs.release_created }}
-          AUTO_TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
-          AUTO_VERSION: ${{ needs.release-please.outputs.version }}
+          AUTO_RELEASE_CREATED: ${{ needs['release-please'].outputs.release_created }}
+          AUTO_TAG_NAME: ${{ needs['release-please'].outputs.tag_name }}
+          AUTO_VERSION: ${{ needs['release-please'].outputs.version }}
           DISPATCH_TAG_NAME: ${{ inputs.release_tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -188,7 +188,10 @@ jobs:
   release-binaries:
     name: Binary ${{ matrix.target }}
     needs: release-metadata
-    if: needs['release-metadata'].outputs.release_created == 'true'
+    if: >-
+      !cancelled() &&
+      needs['release-metadata'].result == 'success' &&
+      needs['release-metadata'].outputs.release_created == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -288,7 +291,10 @@ jobs:
   release-image:
     name: Signed OCI image
     needs: release-metadata
-    if: needs['release-metadata'].outputs.release_created == 'true'
+    if: >-
+      !cancelled() &&
+      needs['release-metadata'].result == 'success' &&
+      needs['release-metadata'].outputs.release_created == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -392,11 +398,16 @@ jobs:
       - release-metadata
       - release-binaries
       - release-image
-    if: always() && needs['release-metadata'].outputs.release_created == 'true'
+    if: >-
+      always() &&
+      (needs['release-metadata'].result != 'success' ||
+       needs['release-metadata'].outputs.release_created == 'true')
     runs-on: ubuntu-latest
     steps:
       - name: Require every release lane
         run: |
+          test "${{ needs['release-metadata'].result }}" = success
+          test "${{ needs['release-metadata'].outputs.release_created }}" = true
           test "${{ needs['release-binaries'].result }}" = success
           test "${{ needs['release-image'].result }}" = success
 
@@ -411,7 +422,10 @@ jobs:
     needs:
       - release-metadata
       - release-success
-    if: needs['release-metadata'].outputs.release_created == 'true'
+    if: >-
+      !cancelled() &&
+      needs['release-metadata'].result == 'success' &&
+      needs['release-metadata'].outputs.release_created == 'true'
     # Serialize per tag so a re-dispatch cannot race the original run into a
     # duplicate upload; never cancel, because a cancelled publish is the one
     # that may have uploaded without recording it.
