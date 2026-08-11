@@ -225,7 +225,7 @@ jobs:
       - name: Prepare quickstart environment
         run: cp ops/compose/env.example .env
       - name: Run the documented quickstart smoke
-        run: just quickstart-smoke
+        run: bash ops/compose-smoke.sh
 
   CI-Success:
     name: CI Success
