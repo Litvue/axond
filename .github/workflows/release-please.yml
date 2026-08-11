@@ -425,6 +425,7 @@ jobs:
     if: >-
       !cancelled() &&
       needs['release-metadata'].result == 'success' &&
+      needs['release-success'].result == 'success' &&
       needs['release-metadata'].outputs.release_created == 'true'
     # Serialize per tag so a re-dispatch cannot race the original run into a
     # duplicate upload; never cancel, because a cancelled publish is the one
