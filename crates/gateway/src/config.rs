@@ -1909,13 +1909,14 @@ audience = "test"
             (
                 "operator-only capability",
                 "kid = \"test\"\nenv = \"SIGN\"\nscope = [\"credentials:all\"]",
-                "can never be minted",
+                "not held",
             ),
             (
                 "empty scope",
                 "kid = \"test\"\nenv = \"SIGN\"\nscope = []",
                 "at least one capability",
             ),
+            (
                 "bad alias",
                 "kid = \"test\"\nenv = \"SIGN\"\naliases = [\"gpt-*-bad\"]",
                 "invalid alias pattern",
