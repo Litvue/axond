@@ -58,6 +58,7 @@ pub struct InboundKey {
     pub scope: Option<HashSet<Capability>>,
     pub alias_scope: Option<AliasScope>,
     pub max_request_microdollars: Option<u64>,
+    pub can_mint: bool,
 }
 
 pub(crate) struct GatewayKeyEntry {
@@ -558,6 +559,8 @@ impl PrincipalStore for TokenVerifier {
             scope: claims.scope.map(RawScope::capabilities),
             alias_scope,
             max_request_microdollars: claims.max_request_microdollars,
+            // Token claims can never confer the ability to mint another token.
+            can_mint: false,
         }))
     }
 }
@@ -778,6 +781,7 @@ mod tests {
                 scope: None,
                 alias_scope: None,
                 max_request_microdollars: None,
+                can_mint: false,
             },
         }]))
     }

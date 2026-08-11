@@ -39,6 +39,7 @@ use gateway_core::{
     Surface, Usage,
 };
 use gateway_transport::{AuthScheme, NativeCall, TransportError, Upstream};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{Instrument, debug, warn};
 
@@ -46,15 +47,18 @@ use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, Target};
 use crate::credentials::{CredentialPlan, CredentialSource};
 use crate::error::GatewayError;
+use crate::mint::{MintRequest, mint_token};
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
 use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::streaming::{self, Framing, StreamContext};
 use crate::telemetry;
 use crate::usage::{Status, UsageRecord};
+use secrecy::ExposeSecret;
 
 pub fn router(state: AppState) -> Router {
-    route_specs()
+    let minting_enabled = state.config().gateway_minting.is_some();
+    route_specs(minting_enabled)
         .into_iter()
         .fold(Router::new(), |router, spec| {
             let route = (spec.router)();
@@ -89,8 +93,8 @@ struct RouteSpec {
 
 /// The single route table: its posture is the source of truth for registration
 /// and for the sweep test that keeps the unauthenticated set closed.
-fn route_specs() -> [RouteSpec; 7] {
-    [
+fn route_specs(minting_enabled: bool) -> Vec<RouteSpec> {
+    let mut routes = vec![
         RouteSpec {
             path: "/healthz",
             auth: AuthPosture::LivenessProbe,
@@ -133,7 +137,132 @@ fn route_specs() -> [RouteSpec; 7] {
             capability: None,
             router: || post(responses),
         },
-    ]
+    ];
+    if minting_enabled {
+        routes.push(RouteSpec {
+            path: "/v1/tokens",
+            auth: AuthPosture::Authenticated,
+            capability: None,
+            router: || post(mint_tokens),
+        });
+    }
+    routes
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MintTokenRequest {
+    sub: String,
+    ttl_seconds: Option<u64>,
+    scope: Option<Vec<String>>,
+    aliases: Option<Vec<String>>,
+    max_request_microdollars: Option<u64>,
+}
+
+async fn mint_tokens(
+    Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
+    Extension(caller): Extension<InboundKey>,
+    body: Result<Json<MintTokenRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Value>, GatewayError> {
+    let minting = snapshot
+        .gateway_minting
+        .as_ref()
+        .ok_or(GatewayError::MintingDisabled)?;
+    if !caller.can_mint {
+        return Err(GatewayError::MintNotAuthorized);
+    }
+    let Json(request) = body.map_err(|error| GatewayError::BadRequest(error.to_string()))?;
+    if request.sub.trim().is_empty() {
+        return Err(GatewayError::BadRequest("`sub` must not be empty".into()));
+    }
+    let ttl = Duration::from_secs(request.ttl_seconds.unwrap_or(minting.max_ttl.as_secs()));
+    if ttl.is_zero() || ttl > minting.max_ttl {
+        return Err(GatewayError::MintClaimsNotNarrowing);
+    }
+    let scope = match request.scope {
+        Some(values) => {
+            let parsed = values
+                .iter()
+                .map(|value| {
+                    Capability::parse(value).ok_or_else(|| {
+                        GatewayError::BadRequest(format!("unknown scope capability `{value}`"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if let Some(ceiling) = &minting.scope
+                && !parsed
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>()
+                    .is_subset(ceiling)
+            {
+                return Err(GatewayError::MintClaimsNotNarrowing);
+            }
+            Some(parsed)
+        }
+        None => minting
+            .scope
+            .as_ref()
+            .map(|values| values.iter().copied().collect()),
+    };
+    let aliases = match request.aliases {
+        Some(values) => {
+            let requested = crate::aliases::AliasScope::parse(values.iter().map(String::as_str))
+                .map_err(|error| GatewayError::BadRequest(error.to_string()))?;
+            if let Some(ceiling) = &minting.aliases
+                && !requested.is_subset_of(ceiling)
+            {
+                return Err(GatewayError::MintClaimsNotNarrowing);
+            }
+            Some(values)
+        }
+        None => minting
+            .aliases
+            .as_ref()
+            .map(|aliases| aliases.patterns_for_claim()),
+    };
+    let max_request_microdollars = match request.max_request_microdollars {
+        Some(value) if value >= 1 => {
+            if minting
+                .max_request_microdollars
+                .is_some_and(|ceiling| value > ceiling)
+            {
+                return Err(GatewayError::MintClaimsNotNarrowing);
+            }
+            Some(value)
+        }
+        Some(_) => return Err(GatewayError::MintClaimsNotNarrowing),
+        None => minting.max_request_microdollars,
+    };
+    if !snapshot
+        .config
+        .gateway_verifier
+        .iter()
+        .find(|verifier| verifier.kid == minting.kid)
+        .is_some_and(|verifier| verifier.namespaces.iter().any(|ns| ns == &caller.namespace))
+    {
+        return Err(GatewayError::MintClaimsNotNarrowing);
+    }
+    let (token, exp) = mint_token(MintRequest {
+        kid: &minting.kid,
+        algorithm: minting.algorithm,
+        key_material: minting.key_material.expose_secret(),
+        namespace: &caller.namespace,
+        subject: &request.sub,
+        audience: &minting.audience,
+        ttl,
+        aliases,
+        max_request_microdollars,
+        scope,
+    })
+    .map_err(|error| GatewayError::BadRequest(error.to_string()))?;
+    Ok(Json(json!({
+        "token": token,
+        "exp": exp,
+        "expires_in": ttl.as_secs(),
+        "namespace": caller.namespace,
+        "sub": request.sub,
+    })))
 }
 
 async fn healthz() -> &'static str {
@@ -1461,6 +1590,49 @@ targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdol
             .expect("credentials resolve")
     }
 
+    fn minting_state() -> AppState {
+        let cfg = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_key]]
+env = "MINT_KEY"
+namespace = "platform"
+can_mint = true
+
+[gateway_token]
+audience = "test-audience"
+
+[[gateway_verifier]]
+kid = "mint-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+
+[gateway_minting]
+kid = "mint-kid"
+env = "JWT_SECRET"
+scope = ["chat", "models"]
+aliases = ["gpt-*"]
+max_request_microdollars = 1000
+"#,
+        )
+        .unwrap();
+        let env = HashMap::from([
+            ("MINT_KEY".to_owned(), "mint-key".to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        AppState::new(cfg, &env, UsageFanout::new(sinks), Box::new(NoBudget))
+            .expect("minting state")
+    }
+
     #[test]
     fn namespace_authority_follows_reachable_provider_wires() {
         let snapshot = test_state().config();
@@ -1864,14 +2036,14 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
 
     #[tokio::test]
     async fn every_authenticated_route_rejects_a_request_without_a_gateway_key() {
-        let public_paths: Vec<_> = route_specs()
+        let public_paths: Vec<_> = route_specs(false)
             .iter()
             .filter(|spec| spec.auth == AuthPosture::LivenessProbe)
             .map(|spec| spec.path)
             .collect();
         assert_eq!(public_paths, ["/healthz", "/readyz"]);
 
-        for spec in route_specs()
+        for spec in route_specs(true)
             .into_iter()
             .filter(|spec| spec.auth == AuthPosture::Authenticated)
         {
@@ -1883,7 +2055,11 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
                     .header("content-type", "application/json")
                     .body(Body::from("{}"))
                     .unwrap();
-                let response = router(test_state()).oneshot(request).await.unwrap();
+                let response = if spec.path == "/v1/tokens" {
+                    router(minting_state()).oneshot(request).await.unwrap()
+                } else {
+                    router(test_state()).oneshot(request).await.unwrap()
+                };
                 if response.status() != StatusCode::METHOD_NOT_ALLOWED {
                     assert_eq!(
                         response.status(),
@@ -1896,6 +2072,64 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
             }
             assert!(rejected, "{0} must handle GET or POST", spec.path);
         }
+    }
+
+    #[tokio::test]
+    async fn minting_route_is_absent_without_boot_minting_config() {
+        let response = router(test_state())
+            .oneshot(Request::post("/v1/tokens").body(Body::from("{}")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn static_minting_key_mints_but_minted_token_cannot_mint() {
+        let state = minting_state();
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/v1/tokens")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer mint-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sub": "agent-1",
+                            "ttl_seconds": 60,
+                            "scope": ["chat"],
+                            "aliases": ["gpt-4o"],
+                            "max_request_microdollars": 500
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let token = body["token"].as_str().unwrap().to_owned();
+        let principal = state
+            .config()
+            .resolve_principal(&Presented { credential: &token })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(principal.namespace, "platform");
+        assert_eq!(principal.subject, "agent-1");
+        assert!(!principal.can_mint);
+
+        let response = router(state)
+            .oneshot(
+                Request::post("/v1/tokens")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"sub":"agent-2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -2190,6 +2424,7 @@ min_iat = {}
             scope: None,
             alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
             max_request_microdollars: None,
+            can_mint: false,
         };
         let response = list_models(Extension(snapshot), Extension(caller))
             .await
@@ -2317,6 +2552,7 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
                     scope: None,
                     alias_scope: Some(AliasScope::parse(["gpt-4o"]).unwrap()),
                     max_request_microdollars: None,
+                    can_mint: false,
                 },
             )
             .await
@@ -2831,6 +3067,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             scope: None,
             alias_scope: None,
             max_request_microdollars: Some(1),
+            can_mint: false,
         };
         let body = json!({"model": "gpt-4o", "messages": []});
 
@@ -2868,6 +3105,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             scope: None,
             alias_scope: None,
             max_request_microdollars: Some(10_000),
+            can_mint: false,
         };
         let body = json!({"model": "gpt-4o", "messages": []});
 

@@ -198,10 +198,12 @@ pub struct ReloadSummary {
     pub credentials: Delta,
     pub gateway_keys: Delta,
     pub gateway_verifiers: Delta,
+    pub gateway_minting: Delta,
     pub gateway_token_epochs: Delta,
     pub gateway_token_audience: Delta,
     pub gateway_key_fingerprints: HashMap<String, String>,
     pub gateway_verifier_fingerprints: HashMap<String, String>,
+    pub gateway_minting_fingerprint: Option<String>,
     /// `[server] bind` differs from what the process bound at startup.
     pub bind_changed: bool,
     /// `[[usage_sink]]` differs from the connected sinks.
@@ -305,6 +307,40 @@ impl ReloadSummary {
                         &after.gateway_verifier_fingerprints,
                     )),
             ),
+            gateway_minting: Delta::between(
+                before_config
+                    .gateway_minting
+                    .iter()
+                    .map(|_| "enabled".to_owned()),
+                after_config
+                    .gateway_minting
+                    .iter()
+                    .map(|_| "enabled".to_owned()),
+            )
+            .with_changed(
+                (before_config.gateway_minting.is_some()
+                    && after_config.gateway_minting.is_some()
+                    && before_config.gateway_minting.as_ref().map(|m| {
+                        (
+                            &m.kid,
+                            m.source_label(),
+                            &m.max_ttl,
+                            &m.scope,
+                            &m.aliases,
+                            &m.max_request_microdollars,
+                        )
+                    }) != after_config.gateway_minting.as_ref().map(|m| {
+                        (
+                            &m.kid,
+                            m.source_label(),
+                            &m.max_ttl,
+                            &m.scope,
+                            &m.aliases,
+                            &m.max_request_microdollars,
+                        )
+                    }))
+                .then(|| "enabled".to_owned()),
+            ),
             gateway_token_epochs: Delta::between(
                 before_config
                     .gateway_token_epoch
@@ -331,6 +367,7 @@ impl ReloadSummary {
             ),
             gateway_key_fingerprints: after.gateway_key_fingerprints.clone(),
             gateway_verifier_fingerprints: after.gateway_verifier_fingerprints.clone(),
+            gateway_minting_fingerprint: after.gateway_minting_fingerprint.clone(),
             bind_changed: boot.bind != after_config.server.bind,
             usage_sinks_changed: boot.usage_sink != after_config.usage_sink,
             budget_changed: boot.budget != after_config.budget,
@@ -346,6 +383,7 @@ impl ReloadSummary {
             && self.credentials.is_empty()
             && self.gateway_keys.is_empty()
             && self.gateway_verifiers.is_empty()
+            && self.gateway_minting.is_empty()
             && self.gateway_token_epochs.is_empty()
             && self.gateway_token_audience.is_empty()
     }
@@ -360,10 +398,12 @@ impl ReloadSummary {
             credentials = %self.credentials,
             gateway_keys = %self.gateway_keys,
             gateway_verifiers = %self.gateway_verifiers,
+            gateway_minting = %self.gateway_minting,
             gateway_token_epochs = %self.gateway_token_epochs,
             gateway_token_audience = %self.gateway_token_audience,
             gateway_key_fingerprints = ?self.gateway_key_fingerprints,
             gateway_verifier_fingerprints = ?self.gateway_verifier_fingerprints,
+            gateway_minting_fingerprint = ?self.gateway_minting_fingerprint,
             budget_changed = self.budget_changed,
             rate_limit_changed = self.rate_limit_changed,
             changed = !self.is_empty(),
@@ -387,6 +427,15 @@ impl ReloadSummary {
         if self.rate_limit_changed {
             tracing::warn!(
                 "`[rate_limit]` changed, but the limiter is already serving; restart to apply it"
+            );
+        }
+        if self.gateway_minting.added.len()
+            + self.gateway_minting.removed.len()
+            + self.gateway_minting.changed.len()
+            > 0
+        {
+            tracing::warn!(
+                "`[gateway_minting]` route registration is boot-time; enabling it requires a restart, while removal takes effect immediately"
             );
         }
     }

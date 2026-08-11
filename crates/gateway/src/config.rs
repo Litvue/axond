@@ -19,6 +19,8 @@ use std::time::Duration;
 use gateway_core::ModelPrice;
 use serde::{Deserialize, Deserializer};
 
+use crate::aliases::AliasScope;
+use crate::principals::Capability;
 use crate::usage::{BatchSettings, MAX_ROWS_PER_STATEMENT, validate_table_name};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,6 +54,8 @@ pub struct Config {
     /// keys and require a deployment audience when any are configured.
     #[serde(default)]
     pub gateway_verifier: Vec<GatewayVerifier>,
+    #[serde(default)]
+    pub gateway_minting: Option<GatewayMinting>,
     /// Issuance epochs that invalidate older minted tokens without runtime
     /// revocation state.
     #[serde(default)]
@@ -616,6 +620,8 @@ pub struct GatewayKey {
     #[serde(default)]
     pub file: Option<String>,
     pub namespace: String,
+    #[serde(default)]
+    pub can_mint: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -699,6 +705,51 @@ impl GatewayVerifier {
             KeyMaterialSource::Env(value) | KeyMaterialSource::File(value) => value,
         })
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GatewayMinting {
+    pub kid: String,
+    #[serde(default)]
+    pub env: Option<String>,
+    #[serde(default)]
+    pub file: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_gateway_ttl")]
+    pub max_ttl: Option<Duration>,
+    #[serde(default)]
+    pub scope: Option<Vec<String>>,
+    #[serde(default)]
+    pub aliases: Option<Vec<String>>,
+    #[serde(default)]
+    pub max_request_microdollars: Option<u64>,
+}
+
+impl GatewayMinting {
+    pub fn source(&self) -> Option<KeyMaterialSource<'_>> {
+        let env = self.env.as_deref().filter(|value| !value.trim().is_empty());
+        let file = self
+            .file
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+        match (env, file) {
+            (Some(env), None) => Some(KeyMaterialSource::Env(env)),
+            (None, Some(file)) => Some(KeyMaterialSource::File(file)),
+            _ => None,
+        }
+    }
+
+    pub fn source_label(&self) -> Option<&str> {
+        self.source().map(|source| match source {
+            KeyMaterialSource::Env(value) | KeyMaterialSource::File(value) => value,
+        })
+    }
+}
+
+fn deserialize_optional_gateway_ttl<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Some(deserialize_gateway_ttl(deserializer)?))
 }
 
 // Deliberate policy ceiling for configured token lifetimes, not a protocol limit.
@@ -974,6 +1025,7 @@ impl Config {
         }
         self.validate_gateway_keys(&namespaces)?;
         self.validate_gateway_verifiers(&namespaces)?;
+        self.validate_gateway_minting(&namespaces)?;
         self.validate_gateway_token_epochs(&namespaces)?;
         self.validate_usage_sinks()?;
         self.validate_budget()?;
@@ -1115,6 +1167,91 @@ impl Config {
                         verifier.kid
                     )));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_gateway_minting(
+        &self,
+        namespaces: &HashMap<&str, &Namespace>,
+    ) -> Result<(), ConfigError> {
+        let Some(minting) = &self.gateway_minting else {
+            if self.gateway_key.iter().any(|key| key.can_mint) {
+                return Err(ConfigError::Invalid(
+                    "`can_mint = true` requires `[gateway_minting]`".into(),
+                ));
+            }
+            return Ok(());
+        };
+        if minting.kid.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "gateway_minting `kid` must not be empty".into(),
+            ));
+        }
+        if minting.source().is_none() {
+            return Err(ConfigError::Invalid(
+                "gateway_minting must declare exactly one non-empty source (`env` or `file`)"
+                    .into(),
+            ));
+        }
+        let verifier = self
+            .gateway_verifier
+            .iter()
+            .find(|verifier| verifier.kid == minting.kid)
+            .ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "gateway_minting references unknown gateway_verifier kid `{}`",
+                    minting.kid
+                ))
+            })?;
+        if minting
+            .max_ttl
+            .is_some_and(|max_ttl| max_ttl > verifier.max_ttl)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "gateway_minting max_ttl exceeds verifier `{}` max_ttl",
+                verifier.kid
+            )));
+        }
+        if minting.max_request_microdollars == Some(0) {
+            return Err(ConfigError::Invalid(
+                "gateway_minting max_request_microdollars must be at least 1".into(),
+            ));
+        }
+        if let Some(scope) = &minting.scope {
+            for value in scope {
+                if Capability::parse(value).is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "gateway_minting scope contains unknown capability `{value}`"
+                    )));
+                }
+            }
+        }
+        if let Some(aliases) = &minting.aliases {
+            AliasScope::parse(aliases.iter().map(String::as_str)).map_err(|error| {
+                ConfigError::Invalid(format!("gateway_minting aliases: {error}"))
+            })?;
+        }
+        let minting_keys = self
+            .gateway_key
+            .iter()
+            .filter(|key| key.can_mint)
+            .collect::<Vec<_>>();
+        if minting_keys.is_empty() {
+            return Err(ConfigError::Invalid(
+                "gateway_minting requires at least one gateway_key with `can_mint = true`".into(),
+            ));
+        }
+        for key in minting_keys {
+            if !namespaces.contains_key(key.namespace.as_str()) {
+                continue;
+            }
+            if !verifier.namespaces.iter().any(|ns| ns == &key.namespace) {
+                return Err(ConfigError::Invalid(format!(
+                    "gateway_key namespace `{}` with can_mint is not permitted by verifier `{}`",
+                    key.namespace, verifier.kid
+                )));
             }
         }
         Ok(())
