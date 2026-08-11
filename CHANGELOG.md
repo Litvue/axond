@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.3.0](https://github.com/Litvue/axond/compare/v0.2.2...v0.3.0) (2026-08-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* **config:** usage_sink `max_batch` may no longer exceed the sink's `buffer_capacity`. A config that set a larger batch than its buffer booted before this release and is now rejected at boot; lower `max_batch` or raise `buffer_capacity`.
+* **billing:** Usage schema v2 redefines input_tokens as the non-cached prompt remainder. Add cache_read_tokens to recover the previous prompt total; schema_version distinguishes v1 and v2 rows in the same table. Tier 2 operators should apply ops/postgres/usage_v2.sql before writing v2 rows; on an existing v1 table it is a no-op because the cache columns already exist. The axond.tokens.input metric steps down on dashboards without any traffic change and must be read with the separate cache counters.
+
+### Features
+
+* **auth:** opt-in POST /v1/tokens minting endpoint ([af1811e](https://github.com/Litvue/axond/commit/af1811e77764a36bc21bf5203c13ab89620cc90f))
+* **gateway:** rotate pooled credentials for streams and trace each lease ([fca759d](https://github.com/Litvue/axond/commit/fca759d9b2188f450718a0a880e3ee665bb612b2))
+* **routes:** serve POST /v1/responses as a native OpenAI passthrough ([ed98f32](https://github.com/Litvue/axond/commit/ed98f325ce1b49eaa005cd8e94bf352a25d50acb))
+
+
+### Bug Fixes
+
+* **auth:** harden revocation Redis timeouts ([de7492e](https://github.com/Litvue/axond/commit/de7492ec9561a0e6809c7a465681b37c92310a82))
+* **billing:** stop double-charging cached OpenAI prompt tokens ([9b4be6a](https://github.com/Litvue/axond/commit/9b4be6a033a912f8b7602c9d41cb43b0e38ae2ff))
+* preserve Responses continuation affinity ([a473bbd](https://github.com/Litvue/axond/commit/a473bbd46575451f370baa46001928b9c8ab5548))
+* **responses:** include parked credentials in pinned plans ([e15e730](https://github.com/Litvue/axond/commit/e15e730e1a807169dd9fff11c5ecdde96e98052d))
+* **responses:** include responses in default mint scope ([6a8f7a3](https://github.com/Litvue/axond/commit/6a8f7a32f492478211e0f88f94f5f507afb485df))
+* **responses:** release pinned stream holds ([722e9f6](https://github.com/Litvue/axond/commit/722e9f641234ed21abfcfac03b5ba7f31b496cab))
+* **responses:** repair rebase test delimiter ([4369c3e](https://github.com/Litvue/axond/commit/4369c3e8e96451f268ceea436f49ad7c707b5dc8))
+* **usage:** bound configured batch accumulation ([8cd1e76](https://github.com/Litvue/axond/commit/8cd1e76432da3ddf8bfea7020a473146c90212df))
+* **usage:** clamp default batch size ([fcbe030](https://github.com/Litvue/axond/commit/fcbe03010d91b10471773730c4ed145942c2709b))
+* **usage:** finalize rebased batch and stream handling ([8b4eb27](https://github.com/Litvue/axond/commit/8b4eb2746a08061eec70346d525b66418f2ffdd6))
+* **usage:** make postgres batch flushes atomic ([2d324fa](https://github.com/Litvue/axond/commit/2d324face2376331200721c26ad9b2a83605d456))
+* **usage:** split oversized Postgres batches ([ae9e259](https://github.com/Litvue/axond/commit/ae9e259ce404b24bb849722bad9301ecb26f28d9))
+
+
+### Documentation
+
+* **adr:** renumber cache usage normalization ([0c8dafa](https://github.com/Litvue/axond/commit/0c8dafa2481cfb59dd308bb5144f9aeafc223228))
+* **adr:** stop rewriting ADR 0015's context ([6b3c87a](https://github.com/Litvue/axond/commit/6b3c87ad9f4a861c2fe7827ca2c364c481fdc67e))
+* **config:** note the max_batch bound change ([dc01ba0](https://github.com/Litvue/axond/commit/dc01ba0bbb770bdc5f2cb56f0db3a029ed43e990))
+* renumber Responses ADR ([eb00ba4](https://github.com/Litvue/axond/commit/eb00ba4e9a168875fe9ebe1244c405b015372114))
+* renumber Responses ADR to 0023 ([ba79d2c](https://github.com/Litvue/axond/commit/ba79d2c865ae16c57dd4f6bfb1b7dbdfd6f720ec))
+
+
+### Tests
+
+* **gateway:** guard inherited mint scope ([3e029d3](https://github.com/Litvue/axond/commit/3e029d3384ea0f3c7f012b252e4b7359528df087))
+* **gateway:** pin the minted-scope escalation guards ([d89e8aa](https://github.com/Litvue/axond/commit/d89e8aa97c84a89b00b47e435ff4160f143dcb7d))
+* **responses:** pin budget cleanup on affinity failure ([2443076](https://github.com/Litvue/axond/commit/24430766dd63418bc97eb7ba8ae1aedf1960235f))
+* **usage:** reconnect before checking rollback ([64f3707](https://github.com/Litvue/axond/commit/64f3707bc909c741e3462d5f7a865ff5f37ec89f))
+
 ## [0.2.2](https://github.com/Litvue/axond/compare/v0.2.1...v0.2.2) (2026-08-11)
 
 
