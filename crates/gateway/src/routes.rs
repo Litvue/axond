@@ -223,12 +223,27 @@ async fn mint_tokens(
             {
                 return Err(GatewayError::MintClaimsNotNarrowing);
             }
+            if minting.scope.is_none()
+                && parsed
+                    .iter()
+                    .any(|capability| capability.is_operator_only())
+            {
+                return Err(GatewayError::MintClaimsNotNarrowing);
+            }
             Some(parsed)
         }
-        None => minting
-            .scope
-            .as_ref()
-            .map(|values| values.iter().copied().collect()),
+        None => Some(
+            minting
+                .scope
+                .as_ref()
+                .map(|values| values.iter().copied().collect())
+                .unwrap_or_else(|| {
+                    Capability::ALL
+                        .into_iter()
+                        .filter(|capability| !capability.is_operator_only())
+                        .collect()
+                }),
+        ),
     };
     let aliases = match request.aliases {
         Some(values) => {
@@ -1747,6 +1762,22 @@ targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdol
     }
 
     fn minting_state_with_epochs(epochs: &str) -> AppState {
+        minting_state_with_audience_epochs("test-audience", epochs)
+    }
+
+    fn minting_state_with_audience_epochs(audience: &str, epochs: &str) -> AppState {
+        minting_state_with_scope_audience_epochs("scope = [\"chat\", \"models\"]", audience, epochs)
+    }
+
+    fn minting_state_without_scope() -> AppState {
+        minting_state_with_scope_audience_epochs("", "test-audience", "")
+    }
+
+    fn minting_state_with_scope_audience_epochs(
+        scope: &str,
+        audience: &str,
+        epochs: &str,
+    ) -> AppState {
         let cfg = Config::from_toml_str(&format!(
             r#"
 [[namespace]]
@@ -1771,11 +1802,13 @@ max_ttl = "15m"
 [gateway_minting]
 kid = "mint-kid"
 env = "JWT_SECRET"
-scope = ["chat", "models"]
+{scope}
 aliases = ["gpt-*"]
 max_request_microdollars = 1000
 {epochs}
 "#,
+            audience = audience,
+            scope = scope,
             epochs = epochs
         ))
         .unwrap();
@@ -1825,6 +1858,49 @@ max_request_microdollars = 1000
             response.headers().get(axum::http::header::CACHE_CONTROL),
             Some(&HeaderValue::from_static("no-store"))
         );
+    }
+
+    #[tokio::test]
+    async fn no_scope_ceiling_inherits_ordinary_capabilities() {
+        let state = minting_state_without_scope();
+        let (status, body) = mint_request(state.clone(), json!({"sub": "agent"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let token = body["token"].as_str().unwrap();
+        let response =
+            scoped_route_request(state, "/v1/credentials?namespaces=all", token).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn padded_audience_mints_a_token_the_gateway_accepts() {
+        let state = minting_state_with_audience_epochs("  test-audience  ", "");
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/v1/tokens")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer mint-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"sub":"agent"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let token = serde_json::from_slice::<Value>(&body).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let response = router(state)
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

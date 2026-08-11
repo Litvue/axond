@@ -37,7 +37,9 @@ reload silently create a new privileged endpoint.
 Every request is narrowed against ceilings owned by `[gateway_minting]`:
 `ttl_seconds`, `scope`, `aliases`, and `max_request_microdollars` cannot
 exceed the configured authority. An omitted field inherits its configured
-ceiling; omission must never widen a token into an unrestricted one. The
+ceiling; when `scope` has no configured ceiling, an omitted scope uses the
+ordinary capability posture and operator-only capabilities must be explicitly
+granted. Omission must never widen a token into an unrestricted one. The
 namespace is derived from the authorized static caller and cannot be supplied
 by the request.
 

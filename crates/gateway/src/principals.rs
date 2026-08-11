@@ -27,6 +27,15 @@ pub enum Capability {
 }
 
 impl Capability {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Chat,
+        Self::Messages,
+        Self::Embeddings,
+        Self::Models,
+        Self::Credentials,
+        Self::CredentialsAll,
+    ];
+
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "chat" => Some(Self::Chat),
@@ -48,6 +57,10 @@ impl Capability {
             Self::Credentials => "credentials",
             Self::CredentialsAll => "credentials:all",
         }
+    }
+
+    pub(crate) const fn is_operator_only(self) -> bool {
+        matches!(self, Self::CredentialsAll)
     }
 }
 
