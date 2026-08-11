@@ -67,13 +67,18 @@ printf '%s ' "$unauth_status"
 cat /tmp/axond-compose-unauth
 echo
 printf 'placeholder chat/completions: '
-chat_status="$(curl --silent --show-error --output /tmp/axond-compose-chat \
-  --connect-timeout 5 --max-time 30 \
-  --write-out '%{http_code}' \
-  -H "Authorization: Bearer ${GW_INBOUND_PLATFORM_KEY}" \
-  -H 'content-type: application/json' \
-  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}' \
-  "${base_url}/v1/chat/completions")"
+if chat_status="$(curl --silent --show-error --output /tmp/axond-compose-chat \
+    --connect-timeout 5 --max-time 30 \
+    --write-out '%{http_code}' \
+    -H "Authorization: Bearer ${GW_INBOUND_PLATFORM_KEY}" \
+    -H 'content-type: application/json' \
+    -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}' \
+    "${base_url}/v1/chat/completions")"; then
+  :
+else
+  curl_status=$?
+  chat_status="curl_exit_${curl_status}"
+fi
 printf '%s ' "$chat_status"
 cat /tmp/axond-compose-chat
 echo
