@@ -66,6 +66,37 @@ pub struct PostgresBudgetSettings {
     pub shared: SharedSettings,
 }
 
+/// Which of the two relations the v2 fence actually covers. Answered per
+/// relation because a partial fence is neither state's contract: a cap-enabled
+/// replica needs both, and a cap-less one is excluded by either.
+#[derive(Debug, Clone, Copy)]
+struct FenceTargets {
+    spend: bool,
+    reservation: bool,
+}
+
+impl FenceTargets {
+    fn complete(self) -> bool {
+        self.spend && self.reservation
+    }
+
+    fn any(self) -> bool {
+        self.spend || self.reservation
+    }
+
+    /// The named relations still missing the fence, for the boot error.
+    fn unfenced(self, spend: &str, reservation: &str) -> Vec<String> {
+        let mut missing = Vec::new();
+        if !self.spend {
+            missing.push(spend.to_owned());
+        }
+        if !self.reservation {
+            missing.push(reservation.to_owned());
+        }
+        missing
+    }
+}
+
 pub struct PostgresBudget {
     table: String,
     settings: SharedSettings,
@@ -187,14 +218,22 @@ impl PostgresBudget {
         // The backfill and the fence are installed together, so a missing fence
         // means the applied file predates it — and without it a replica without
         // the cap could still write here, leaving this namespace total short.
-        if !self.fence_installed(client).await? {
+        // Both relations are required: an unfenced reservation table lets a
+        // cap-less replica hold budget the namespace never sees, and an unfenced
+        // spend table lets it charge spend the namespace never sees.
+        let fence = self.fence_targets(client).await?;
+        if !fence.complete() {
+            let unfenced = fence
+                .unfenced(&self.table, &self.reservation_table())
+                .join("`, `");
             return Err(BudgetError::invalid(
                 BACKEND,
                 format!(
-                    "`{table}` has no `{}` trigger, so nothing stops a replica configured without \
-                     `namespace_limit_microdollars` from recording spend that never reaches the \
-                     namespace total. Re-apply `ops/postgres/budget_v2.sql` (with the fleet \
-                     stopped), which installs it.",
+                    "`{unfenced}` has no `{}` trigger, so nothing stops a replica configured \
+                     without `namespace_limit_microdollars` from recording spend or holds that \
+                     never reach the namespace total. Re-apply `ops/postgres/budget_v2.sql` (with \
+                     the fleet stopped), which installs it on the spend table and the reservation \
+                     table.",
                     self.fence_name()
                 ),
             ));
@@ -217,30 +256,49 @@ impl PostgresBudget {
         Ok(client)
     }
 
-    /// The name of the v2 fence trigger, which is also its function's name.
+    /// The name of the v2 fence trigger, which is also its function's name. The
+    /// name is per-table by construction, so it is never the whole answer to
+    /// whether a given relation is fenced; see [`Self::fence_targets`].
     fn fence_name(&self) -> String {
         let prefix = self.table.rsplit('.').next().unwrap_or(&self.table);
         format!("{prefix}_namespace_fence")
     }
 
-    async fn fence_installed(&self, client: &Client) -> Result<bool, tokio_postgres::Error> {
-        let count: i64 = client
+    /// Whether the fence is on the spend table and on the reservation table,
+    /// answered per relation.
+    ///
+    /// Trigger names are unique only per table, so counting `pg_trigger` rows by
+    /// name alone would accept a same-named trigger on some unrelated table — in
+    /// another schema, or a custom-`table` deployment's — as proof that *these*
+    /// two relations are fenced. Both are therefore resolved with `to_regclass`,
+    /// exactly as configured (schema qualification included), and matched against
+    /// `tgrelid`. A relation that does not exist resolves to `NULL`, which matches
+    /// nothing and so reads as unfenced.
+    async fn fence_targets(&self, client: &Client) -> Result<FenceTargets, tokio_postgres::Error> {
+        let row = client
             .query_one(
-                "SELECT count(*)::bigint FROM pg_trigger
+                "SELECT
+                     coalesce(bool_or(tgrelid = to_regclass($2)), false) AS spend,
+                     coalesce(bool_or(tgrelid = to_regclass($3)), false) AS reservation
+                 FROM pg_trigger
                  WHERE tgname = $1 AND NOT tgisinternal",
-                &[&self.fence_name()],
+                &[&self.fence_name(), &self.table, &self.reservation_table()],
             )
-            .await?
-            .get(0);
-        Ok(count > 0)
+            .await?;
+        Ok(FenceTargets {
+            spend: row.get("spend"),
+            reservation: row.get("reservation"),
+        })
     }
 
     /// The mirror image of the fence: a replica configured *without* the cap must
     /// not serve from a database that enforces one. The fence would reject its
     /// writes anyway; refusing at boot turns a stream of failed settlements into
     /// one legible error, and refuses before any traffic is admitted.
+    /// A partial fence counts: whichever relation carries it will reject this
+    /// replica's writes, so booting would only defer the failure to traffic.
     async fn require_no_namespace_fence(&self, client: &Client) -> Result<(), BudgetError> {
-        if self.fence_installed(client).await? {
+        if self.fence_targets(client).await?.any() {
             return Err(BudgetError::invalid(
                 BACKEND,
                 format!(
@@ -961,6 +1019,105 @@ mod tests {
             Admission::Denied(Denial::Exceeded),
             "the namespace has 600 of its 1000 spent, and nothing slipped past"
         );
+    }
+
+    /// A trigger name is unique per table, never globally, and the fence has to
+    /// cover *both* relations. So neither half of the fence on its own, nor a
+    /// same-named trigger on an unrelated table, may read as a fenced database.
+    #[tokio::test]
+    async fn a_partial_fence_or_a_same_named_decoy_does_not_count_as_fenced() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let table = "axond_budget_ns_partial_fence_test";
+        let fence = format!("{table}_namespace_fence");
+        let capped = namespace_store(&dsn, table, namespace_settings(1_000, 1_000)).await;
+        let (admin, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(connection);
+
+        // One of the two triggers missing: the reservation table would let a
+        // cap-less replica take holds the namespace never sees.
+        admin
+            .batch_execute(&format!("DROP TRIGGER {fence} ON {table}_reservation"))
+            .await
+            .expect("drop the reservation fence");
+        let refused = PostgresBudget::connect(
+            &dsn,
+            PostgresBudgetSettings {
+                table: table.to_owned(),
+                create_table: false,
+                shared: namespace_settings(1_000, 1_000),
+            },
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a half-fenced database must not accept a cap-enabled replica"));
+        assert!(
+            format!("{refused}").contains(&format!("{table}_reservation")),
+            "the error must name the relation that is missing the fence: {refused}"
+        );
+        // And the other direction still refuses, because the spend table is fenced
+        // and will reject this replica's writes.
+        PostgresBudget::connect(
+            &dsn,
+            PostgresBudgetSettings {
+                table: table.to_owned(),
+                create_table: false,
+                shared: settings(1_000),
+            },
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a partly fenced database still excludes a cap-less replica"));
+        drop(capped);
+
+        // A same-named trigger on an unrelated table proves nothing about these
+        // two relations, so a name-only check would boot an unfenced database.
+        let decoy = "axond_budget_ns_decoy_test";
+        let decoy_fence = format!("{decoy}_namespace_fence");
+        let store = namespace_store(&dsn, decoy, namespace_settings(1_000, 1_000)).await;
+        drop(store);
+        admin
+            .batch_execute(&format!(
+                "DROP TRIGGER {decoy_fence} ON {decoy};
+                 DROP TRIGGER {decoy_fence} ON {decoy}_reservation;
+                 CREATE TABLE IF NOT EXISTS {decoy}_bystander (namespace text);
+                 DROP TRIGGER IF EXISTS {decoy_fence} ON {decoy}_bystander;
+                 CREATE TRIGGER {decoy_fence}
+                     BEFORE INSERT ON {decoy}_bystander
+                     FOR EACH ROW EXECUTE FUNCTION {decoy_fence}()"
+            ))
+            .await
+            .expect("plant the decoy");
+        let refused = PostgresBudget::connect(
+            &dsn,
+            PostgresBudgetSettings {
+                table: decoy.to_owned(),
+                create_table: false,
+                shared: namespace_settings(1_000, 1_000),
+            },
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a decoy trigger elsewhere must not pass for the fence"));
+        assert!(
+            format!("{refused}").contains(decoy),
+            "the error must name the unfenced tables: {refused}"
+        );
+        // With no fence on either of its own relations, the cap-less replica is the
+        // one configuration this database does accept.
+        PostgresBudget::connect(
+            &dsn,
+            PostgresBudgetSettings {
+                table: decoy.to_owned(),
+                create_table: false,
+                shared: settings(1_000),
+            },
+        )
+        .await
+        .expect("an unfenced database accepts a cap-less replica");
     }
 
     #[tokio::test]
