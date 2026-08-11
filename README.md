@@ -264,7 +264,9 @@ name and prints only the token. Ed25519 base64 whitespace is trimmed on both
 sides because mounted secrets may preserve the generated file's trailing
 newline; HS256 secrets are opaque bytes and are not trimmed. `scope` is enforced
 as a narrowing route capability and can be emitted with repeatable `--scope`
-flags. The `aliases` claim is enforced at dispatch and in the `/v1/models` view,
+flags, including `credentials` and the explicit operator-only
+`credentials:all`. The `aliases` claim is enforced at dispatch and in the
+`/v1/models` view,
 and is emitted by `axond mint --alias`. `max_request_microdollars` is enforced
 at admission time against the pre-dispatch estimate and can be emitted by
 `axond mint`. An explicit `--audience` must still match the configured
@@ -276,12 +278,23 @@ verification is Tier 0 and adds no runtime datastore dependency. See the
 same-`kid` key-material reload trap) and the honest Tier 1 revocation boundary.
 
 Every route that dispatches to a provider (`/v1/chat/completions`, `/v1/messages`,
-`/v1/embeddings`) authenticates, and so does `/v1/models`. `POST /v1/tokens` is
-an opt-in authenticated route and is absent by default; see the minted-token guide.
-The models route answers only for a
-configured gateway key and lists the aliases scoped to the caller's namespace (an
-alias whose targets the caller holds no credential for is not disclosed). Only the
+`/v1/embeddings`) authenticates, and so do `/v1/models` and `/v1/credentials` —
+they answer only for a configured gateway key and list data scoped to the caller's
+namespace (an alias whose targets the caller holds no credential for is not
+disclosed). `POST /v1/tokens` is an opt-in authenticated route and is absent by
+default; see the minted-token guide. The models route lists aliases scoped to
+the caller's namespace (an alias whose targets the caller holds no credential
+for is not disclosed). Only the
 liveness probes `/healthz` and `/readyz` answer without a credential.
+
+`GET /v1/credentials` reports replica-local, Tier 0 credential labels and
+healthy/parked/probe state. Its default view follows the caller's namespace and
+platform fallback; scope-less principals retain this own-namespace view.
+`?namespaces=all` requires the explicit `credentials:all` scope, while a
+scoped token also needs `credentials` for the route, and the caller must be in
+the configured default/platform namespace. It never returns secret material.
+For fallback platform entries, the default env-derived
+`credential_id` is omitted; an explicitly configured id remains visible.
 
 See [ADR 0013](./docs/adr/0013-inbound-auth-fails-closed.md).
 

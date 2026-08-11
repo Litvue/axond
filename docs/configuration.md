@@ -78,7 +78,7 @@ The tenancy boundary: which credential pool a caller's requests draw from.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `name` | string | — | The name callers send (`gpt-4o`). Also what `/v1/models` lists, for callers whose namespace holds a credential for one of its targets. |
+| `name` | string | — | The name callers send (`gpt-4o`). Also what `/v1/models` lists, for callers whose namespace holds a credential for one of its targets. Credential labels are separately exposed by the scoped, replica-local `/v1/credentials` status view. |
 | `targets` | array of target | — | Concrete destinations, tried **in order** on a retryable failure. All targets must use one provider wire family: OpenAI (`openai` or `openai-compatible`) or Anthropic. An empty list is rejected. |
 
 Each target:
@@ -111,6 +111,15 @@ Several entries for the same pair form that pair's **pool**
 | `env` | string | — | *Name* of the environment variable holding the key. Empty is rejected; unset or empty **at boot** is a fatal error naming the variable. |
 | `id` | string | the `env` name | Non-secret attribution label; lands on usage records as `credential_id`. Duplicates within one pool are rejected. |
 | `weight` | integer | `1` | Share of pool traffic under the `weighted` strategy. `0` is rejected — remove the entry instead. |
+
+The label is caller-visible in the owning namespace and in the operator's
+`?namespaces=all` view. A fallback tenant sees the platform credential and its
+state, but the default `env`-derived label is omitted; an explicitly configured
+`id` remains visible. This keeps operator environment naming private while
+making deliberate credential labels actionable.
+
+In the JSON response, `credential_id` is therefore optional: it is omitted for
+fallback platform entries without an explicit `id`.
 
 ## `[credential_pool]` — Tier 0, in-memory per replica
 

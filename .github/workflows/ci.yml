@@ -217,6 +217,16 @@ jobs:
       - name: Boot the container and probe /healthz
         run: bash ops/docker-smoke.sh axond-ci-smoke
 
+  quickstart-smoke:
+    name: Compose quickstart smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Prepare quickstart environment
+        run: cp ops/compose/env.example .env
+      - name: Run the documented quickstart smoke
+        run: bash ops/compose-smoke.sh
+
   CI-Success:
     name: CI Success
     if: ${{ always() }}
@@ -231,6 +241,7 @@ jobs:
       - dependency-policy
       - static-binary
       - docker-smoke
+      - quickstart-smoke
     runs-on: ubuntu-latest
     steps:
       - name: Require all lanes
@@ -245,3 +256,4 @@ jobs:
           test "${{ needs.dependency-policy.result }}" = success
           test "${{ needs.static-binary.result }}" = success
           test "${{ needs.docker-smoke.result }}" = success
+          test "${{ needs.quickstart-smoke.result }}" = success

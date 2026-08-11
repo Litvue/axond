@@ -1,4 +1,4 @@
-# 20. Opt-in gateway token minting
+# 22. Opt-in gateway token minting
 
 Date: 2026-08-11
 

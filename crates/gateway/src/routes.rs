@@ -28,7 +28,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Extension, Request, State};
+use axum::extract::{Extension, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderValue};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -48,7 +48,7 @@ use tracing::{Instrument, debug, warn};
 use crate::aliases::AliasScope;
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target};
-use crate::credentials::{CredentialPlan, CredentialSource};
+use crate::credentials::{CredentialPlan, CredentialSource, CredentialStatusView};
 use crate::error::GatewayError;
 use crate::mint::{MintRequest, mint_token};
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
@@ -114,6 +114,12 @@ fn route_specs(minting_enabled: bool) -> Vec<RouteSpec> {
             auth: AuthPosture::Authenticated,
             capability: Some(Capability::Models),
             router: || get(list_models),
+        },
+        RouteSpec {
+            path: "/v1/credentials",
+            auth: AuthPosture::Authenticated,
+            capability: Some(Capability::Credentials),
+            router: || get(list_credentials),
         },
         RouteSpec {
             path: "/v1/chat/completions",
@@ -302,6 +308,102 @@ async fn readyz() -> &'static str {
     "ready"
 }
 
+/// Replica-local Tier 0 credential status. Presence is expressed by each
+/// configured entry (boot resolves it or boot fails), never by an always-true
+/// field. Credential ids are attribution labels only; secrets remain write-only.
+async fn list_credentials(
+    Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
+    Extension(caller): Extension<InboundKey>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<Value>, GatewayError> {
+    let namespaces = parse_credential_query(raw_query.as_deref())?;
+    let view = match namespaces.as_deref() {
+        None => CredentialStatusView::Namespace(&caller.namespace),
+        Some("all") => {
+            if caller.namespace != snapshot.config.default_namespace()
+                || !caller
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.contains(&Capability::CredentialsAll))
+            {
+                return Err(GatewayError::ScopeInsufficient(Capability::CredentialsAll));
+            }
+            CredentialStatusView::All
+        }
+        Some(_) => {
+            return Err(GatewayError::BadRequest(
+                "invalid `namespaces` value".into(),
+            ));
+        }
+    };
+    Ok(Json(json!({
+        "object": "list",
+        "observed": "replica",
+        "data": snapshot.credentials.status(&snapshot.config, view),
+    })))
+}
+
+fn parse_credential_query(raw_query: Option<&str>) -> Result<Option<String>, GatewayError> {
+    let mut namespaces = None;
+    for pair in raw_query.unwrap_or_default().split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = decode_query_component(raw_key)?;
+        let value = decode_query_component(raw_value)?;
+        if key == "namespaces" {
+            if namespaces.is_some() {
+                return Err(GatewayError::BadRequest(
+                    "duplicate query parameter `namespaces`".into(),
+                ));
+            }
+            namespaces = Some(value);
+        }
+    }
+    Ok(namespaces)
+}
+
+fn decode_query_component(value: &str) -> Result<String, GatewayError> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => decoded.push(b' '),
+            b'%' if index + 2 < bytes.len() => {
+                let high = hex_digit(bytes[index + 1]);
+                let low = hex_digit(bytes[index + 2]);
+                let (Some(high), Some(low)) = (high, low) else {
+                    return Err(GatewayError::BadRequest(
+                        "invalid query string encoding".into(),
+                    ));
+                };
+                decoded.push((high << 4) | low);
+                index += 2;
+            }
+            b'%' => {
+                return Err(GatewayError::BadRequest(
+                    "invalid query string encoding".into(),
+                ));
+            }
+            byte => decoded.push(byte),
+        }
+        index += 1;
+    }
+    String::from_utf8(decoded)
+        .map_err(|_| GatewayError::BadRequest("invalid query string encoding".into()))
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// The model catalog, gated behind a gateway key and scoped to the caller's
 /// namespace: a caller sees only the aliases it could actually invoke — those
 /// with at least one target whose provider resolves a credential for the
@@ -439,6 +541,7 @@ fn namespace_allows(snapshot: &ConfigSnapshot, namespace: &str, capability: Capa
         Capability::Messages => Some(Route::NativeMessages),
         Capability::Embeddings => Some(Route::Embeddings),
         Capability::Models => None,
+        Capability::Credentials | Capability::CredentialsAll => None,
     };
     let Some(route) = route else {
         return true;
@@ -1640,10 +1743,14 @@ targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdol
     }
 
     fn minting_state() -> AppState {
-        minting_state_with_epochs("")
+        minting_state_with_audience_epochs("test-audience", "")
     }
 
     fn minting_state_with_epochs(epochs: &str) -> AppState {
+        minting_state_with_audience_epochs("test-audience", epochs)
+    }
+
+    fn minting_state_with_audience_epochs(audience: &str, epochs: &str) -> AppState {
         let cfg = Config::from_toml_str(&format!(
             r#"
 [[namespace]]
@@ -1656,7 +1763,7 @@ namespace = "platform"
 can_mint = true
 
 [gateway_token]
-audience = "test-audience"
+audience = "{audience}"
 
 [[gateway_verifier]]
 kid = "mint-kid"
@@ -1673,6 +1780,7 @@ aliases = ["gpt-*"]
 max_request_microdollars = 1000
 {epochs}
 "#,
+            audience = audience,
             epochs = epochs
         ))
         .unwrap();
@@ -1722,6 +1830,38 @@ max_request_microdollars = 1000
             response.headers().get(axum::http::header::CACHE_CONTROL),
             Some(&HeaderValue::from_static("no-store"))
         );
+    }
+
+    #[tokio::test]
+    async fn padded_audience_mints_a_token_the_gateway_accepts() {
+        let state = minting_state_with_audience_epochs("  test-audience  ", "");
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/v1/tokens")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer mint-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"sub":"agent"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let token = serde_json::from_slice::<Value>(&body).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let response = router(state)
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1892,6 +2032,14 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
     }
 
     fn scoped_token_for(audience: &'static str, scope: Option<Vec<&'static str>>) -> String {
+        scoped_token_for_namespace(audience, "platform", scope)
+    }
+
+    fn scoped_token_for_namespace(
+        audience: &'static str,
+        namespace: &'static str,
+        scope: Option<Vec<&'static str>>,
+    ) -> String {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -1901,7 +2049,7 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
             iat: now,
             jti: "scope-test-jti",
             aud: audience,
-            ns: "platform",
+            ns: namespace,
             sub: "scope-caller",
             scope,
             max_request_microdollars: None,
@@ -2003,8 +2151,9 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
     }
 
     async fn scoped_route_request(state: AppState, path: &str, token: &str) -> Response {
-        let (method, body) = match path {
+        let (method, body) = match path.split('?').next().unwrap_or(path) {
             "/v1/models" => (Method::GET, Vec::new()),
+            "/v1/credentials" => (Method::GET, Vec::new()),
             "/v1/chat/completions" => (
                 Method::POST,
                 serde_json::to_vec(&json!({
@@ -2065,6 +2214,249 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
                 .status(),
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn credentials_status_requires_its_scope_and_supports_operator_view() {
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/credentials",
+            &scoped_token(Some(vec!["chat"])),
+        )
+        .await;
+        assert_scope_denial(response, "credentials").await;
+
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/credentials",
+            &scoped_token(Some(vec!["credentials"])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["observed"], "replica");
+        assert_eq!(body["data"][0]["state"], "healthy");
+        assert_eq!(body["data"][0]["source"], "platform");
+
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/credentials?namespaces=all",
+            &scoped_token(Some(vec!["credentials"])),
+        )
+        .await;
+        assert_scope_denial(response, "credentials:all").await;
+
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/credentials?namespaces=all",
+            &scoped_token(Some(vec!["credentials", "credentials:all"])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/credentials?namespaces=tenant",
+            &scoped_token(Some(vec!["credentials"])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn credentials_status_scope_less_static_keys_keep_tenant_view() {
+        let response =
+            scoped_route_request(scoped_route_state().await, "/v1/credentials", "static-key").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["data"][0]["namespace"], "platform");
+
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/credentials?namespaces=all",
+            "static-key",
+        )
+        .await;
+        assert_scope_denial(response, "credentials:all").await;
+    }
+
+    #[tokio::test]
+    async fn credentials_status_tenant_operator_scope_cannot_view_all_namespaces() {
+        let token = scoped_token_for_namespace(
+            "scope-tests",
+            "acme",
+            Some(vec!["credentials", "credentials:all"]),
+        );
+        let response =
+            scoped_route_request(isolated_tenant_state(), "/v1/credentials", &token).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = scoped_route_request(
+            isolated_tenant_state(),
+            "/v1/credentials?namespaces=all",
+            &token,
+        )
+        .await;
+        assert_scope_denial(response, "credentials:all").await;
+
+        let platform_token = scoped_token(Some(vec!["credentials", "credentials:all"]));
+        let response = scoped_route_request(
+            isolated_tenant_state(),
+            "/v1/credentials?namespaces=all",
+            &platform_token,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let namespaces: Vec<_> = body["data"]
+            .as_array()
+            .expect("credential list")
+            .iter()
+            .filter_map(|entry| entry["namespace"].as_str())
+            .collect();
+        assert_eq!(namespaces, ["acme", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn credentials_status_never_serializes_secret_material() {
+        let response = scoped_route_request(
+            scoped_route_state().await,
+            "/v1/credentials?namespaces=all",
+            &scoped_token(Some(vec!["credentials", "credentials:all"])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let serialized = String::from_utf8(body.to_vec()).expect("json body");
+        for secret in [
+            "chat-key",
+            "messages-key",
+            "embeddings-key",
+            "static-key",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "credential status leaked secret material: {secret}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn credentials_status_rejects_duplicate_and_empty_namespaces_query_values() {
+        for path in [
+            "/v1/credentials?namespaces=all&namespaces=beta",
+            "/v1/credentials?namespaces=",
+        ] {
+            let response = scoped_route_request(
+                scoped_route_state().await,
+                path,
+                &scoped_token(Some(vec!["credentials"])),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body["error"]["type"], "bad_request");
+            let message = body["error"]["message"].as_str().expect("error message");
+            if path.contains("all&namespaces") {
+                assert!(message.contains("duplicate"));
+            } else {
+                assert!(message.contains("invalid `namespaces` value"));
+            }
+        }
+    }
+
+    fn isolated_tenant_state() -> AppState {
+        let config = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[namespace]]
+id = "acme"
+
+[[namespace]]
+id = "beta"
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[credential]]
+namespace = "acme"
+provider = "openai"
+env = "ACME_SECRET"
+id = "acme-label"
+
+[[credential]]
+namespace = "beta"
+provider = "openai"
+env = "BETA_SECRET"
+id = "beta-label"
+
+[[gateway_key]]
+env = "STATIC_KEY"
+namespace = "acme"
+
+[gateway_token]
+audience = "scope-tests"
+
+[[gateway_verifier]]
+kid = "scope-test-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform", "acme", "beta"]
+max_ttl = "15m"
+"#,
+        )
+        .expect("isolated tenant config");
+        let env = HashMap::from([
+            ("ACME_SECRET".to_owned(), "acme-secret".to_owned()),
+            ("BETA_SECRET".to_owned(), "beta-secret".to_owned()),
+            ("STATIC_KEY".to_owned(), "static-secret".to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
+        AppState::new(
+            config,
+            &env,
+            UsageFanout::new(vec![Box::new(StdoutSink)]),
+            Box::new(NoBudget),
+        )
+        .expect("isolated tenant state")
+    }
+
+    #[tokio::test]
+    async fn credentials_status_isolated_between_tenant_namespaces() {
+        let response = scoped_route_request(
+            isolated_tenant_state(),
+            "/v1/credentials",
+            &scoped_token_for_namespace("scope-tests", "acme", Some(vec!["credentials"])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .expect("status list")
+            .iter()
+            .map(|entry| entry["credential_id"].as_str().expect("credential id"))
+            .collect();
+        assert_eq!(ids, ["acme-label"]);
     }
 
     #[tokio::test]

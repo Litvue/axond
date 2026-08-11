@@ -751,7 +751,15 @@ impl GatewayKey {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayToken {
+    #[serde(deserialize_with = "deserialize_gateway_audience")]
     pub audience: String,
+}
+
+fn deserialize_gateway_audience<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(String::deserialize(deserializer)?.trim().to_owned())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1732,6 +1740,18 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
         );
         let err = Config::from_toml_str(&toml).expect_err("verifiers need an audience");
         assert!(err.to_string().contains("gateway_token"), "{err}");
+    }
+
+    #[test]
+    fn canonicalizes_gateway_token_audience_whitespace() {
+        let config = Config::from_toml_str(&format!(
+            "{VALID}\n[gateway_token]\naudience = \"  padded-audience  \"\n"
+        ))
+        .expect("padded audience is valid");
+        assert_eq!(
+            config.gateway_token.expect("gateway token").audience,
+            "padded-audience"
+        );
     }
 
     #[test]
