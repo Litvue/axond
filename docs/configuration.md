@@ -78,7 +78,7 @@ The tenancy boundary: which credential pool a caller's requests draw from.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `name` | string | — | The name callers send (`gpt-4o`). Also what `/v1/models` lists, for callers whose namespace holds a credential for one of its targets. |
-| `targets` | array of target | — | Concrete destinations, tried **in order** on a retryable failure. An empty list is rejected. |
+| `targets` | array of target | — | Concrete destinations, tried **in order** on a retryable failure. All targets must use one provider wire family: OpenAI (`openai` or `openai-compatible`) or Anthropic. An empty list is rejected. |
 
 Each target:
 
@@ -91,6 +91,11 @@ Each target:
 
 Pricing is mandatory because budgets are denominated in currency: an unpriced
 target could not be charged, so it fails to parse.
+
+An alias cannot fail over between OpenAI-shaped and Anthropic targets because no
+single route can serve both wires. Such a cross-family alias is rejected at boot
+and on reload; a request that uses an alias from one family on the wrong route
+still receives the typed `400 unsupported_wire` error.
 
 ## `[[credential]]` — outbound provider keys
 

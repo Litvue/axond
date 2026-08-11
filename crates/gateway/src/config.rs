@@ -118,6 +118,30 @@ pub enum ProviderKind {
     OpenaiCompatible,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderWire {
+    Openai,
+    Anthropic,
+}
+
+impl std::fmt::Display for ProviderWire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Openai => f.write_str("OpenAI"),
+            Self::Anthropic => f.write_str("Anthropic"),
+        }
+    }
+}
+
+impl ProviderKind {
+    pub const fn wire(self) -> ProviderWire {
+        match self {
+            Self::Openai | Self::OpenaiCompatible => ProviderWire::Openai,
+            Self::Anthropic => ProviderWire::Anthropic,
+        }
+    }
+}
+
 /// A caller-facing model name (alias) → an ordered list of concrete targets.
 /// The name is what SDKs already send (`gpt-4o`); callers never need to know
 /// the provider topology (assessment delta A2).
@@ -894,6 +918,20 @@ impl Config {
                     return Err(ConfigError::Invalid(format!(
                         "model `{}` targets undefined provider `{}`",
                         model.name, t.provider
+                    )));
+                }
+            }
+            let first = &model.targets[0];
+            let first_provider = providers[first.provider.as_str()];
+            let first_wire = first_provider.kind.wire();
+            for target in model.targets.iter().skip(1) {
+                let provider = providers[target.provider.as_str()];
+                let wire = provider.kind.wire();
+                if wire != first_wire {
+                    return Err(ConfigError::Invalid(format!(
+                        "model `{}` has incompatible failover targets: provider `{}` uses {} wire, \
+                         but provider `{}` uses {} wire; no route can serve such an alias",
+                        model.name, first.provider, first_wire, provider.id, wire
                     )));
                 }
             }
@@ -1705,6 +1743,103 @@ targets = [{ provider = "ghost", model = "gpt-4o", price = { input_microdollars_
 "#;
         let err = Config::from_toml_str(toml).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid(_)), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_alias_with_targets_from_incompatible_wires() {
+        let toml = r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[provider]]
+id = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+
+[[model]]
+name = "mixed"
+targets = [
+    { provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } },
+    { provider = "anthropic", model = "claude", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } },
+]
+"#;
+        let err = Config::from_toml_str(toml).expect_err("cross-wire failover must fail");
+        let message = err.to_string();
+        assert!(message.contains("mixed"), "{message}");
+        assert!(message.contains("openai"), "{message}");
+        assert!(message.contains("anthropic"), "{message}");
+        assert!(message.contains("OpenAI"), "{message}");
+        assert!(message.contains("Anthropic"), "{message}");
+        assert!(message.contains("no route can serve"), "{message}");
+    }
+
+    #[test]
+    fn accepts_openai_family_failover_targets() {
+        let toml = r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[provider]]
+id = "compatible"
+kind = "openai-compatible"
+base_url = "https://example.test/v1"
+
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "platform"
+
+[[model]]
+name = "mixed-openai"
+targets = [
+    { provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } },
+    { provider = "compatible", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } },
+]
+"#;
+        Config::from_toml_str(toml).expect("OpenAI-family targets are compatible");
+    }
+
+    #[test]
+    fn accepts_aliases_each_confined_to_one_wire_family() {
+        let toml = r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[provider]]
+id = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "platform"
+
+[[model]]
+name = "openai-alias"
+targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
+
+[[model]]
+name = "anthropic-alias"
+targets = [{ provider = "anthropic", model = "claude", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
+"#;
+        Config::from_toml_str(toml).expect("single-wire aliases are compatible");
     }
 
     #[test]
