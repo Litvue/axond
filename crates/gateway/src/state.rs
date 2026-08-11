@@ -23,7 +23,7 @@ use gateway_transport::HttpDispatcher;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::budget::BudgetStore;
-use crate::config::{Config, ProviderKind};
+use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind};
 use crate::credentials::{CredentialError, Credentials};
 use crate::key_material::{self, KeyMaterialError};
 use crate::principals::{
@@ -68,6 +68,19 @@ pub struct ConfigSnapshot {
     pub generation: u64,
     pub gateway_key_fingerprints: HashMap<String, String>,
     pub gateway_verifier_fingerprints: HashMap<String, String>,
+    pub gateway_minting_fingerprint: Option<String>,
+    pub gateway_minting: Option<ResolvedMinting>,
+}
+
+pub struct ResolvedMinting {
+    pub kid: String,
+    pub algorithm: crate::mint::MintAlgorithm,
+    pub key_material: SecretString,
+    pub audience: String,
+    pub max_ttl: Duration,
+    pub scope: Option<std::collections::HashSet<crate::principals::Capability>>,
+    pub aliases: Option<crate::aliases::AliasScope>,
+    pub max_request_microdollars: Option<u64>,
 }
 
 /// Why a config could not become a servable snapshot. Names the offending
@@ -110,6 +123,8 @@ pub enum SnapshotError {
         "no inbound gateway key resolved: inbound authentication fails closed and there is no keyless mode"
     )]
     NoInboundKeys,
+    #[error("gateway_minting signing key is invalid: {0}")]
+    MintingKey(String),
 }
 
 impl ConfigSnapshot {
@@ -189,6 +204,7 @@ impl ConfigSnapshot {
                     alias_scope: None,
                     max_request_microdollars: None,
                     jti: None,
+                    can_mint: k.can_mint,
                 },
             });
             gateway_key_fingerprints
@@ -209,6 +225,87 @@ impl ConfigSnapshot {
             .map(|verifier| Box::new(verifier) as Box<dyn crate::principals::PrincipalStore>)
             .collect();
         let principals = PrincipalStoreChain::new(stores, config_principals)?;
+        let gateway_minting = config
+            .gateway_minting
+            .as_ref()
+            .map(|minting| {
+                let verifier = config
+                    .gateway_verifier
+                    .iter()
+                    .find(|verifier| verifier.kid == minting.kid)
+                    .expect("validated minting verifier");
+                let source = minting.source().expect("validated minting source");
+                let material = key_material::resolve(source, env).map_err(|error| match error {
+                    KeyMaterialError::MissingEnv { name } => SnapshotError::MissingGatewayKey {
+                        namespace: "gateway_minting".into(),
+                        env: name,
+                    },
+                    KeyMaterialError::FileRead { path, kind, error } => {
+                        SnapshotError::GatewayKeyFile {
+                            namespace: "gateway_minting".into(),
+                            path,
+                            kind,
+                            error,
+                        }
+                    }
+                    KeyMaterialError::EmptyFile { path } => SnapshotError::EmptyGatewayKeyFile {
+                        namespace: "gateway_minting".into(),
+                        path,
+                    },
+                    KeyMaterialError::InvalidUtf8 { path } => {
+                        SnapshotError::InvalidGatewayKeyFileUtf8 {
+                            namespace: "gateway_minting".into(),
+                            path,
+                        }
+                    }
+                })?;
+                crate::mint::validate_signing_material(
+                    match verifier.alg {
+                        GatewayVerifierAlgorithm::EdDsa => crate::mint::MintAlgorithm::EdDsa,
+                        GatewayVerifierAlgorithm::Hs256 => crate::mint::MintAlgorithm::Hs256,
+                    },
+                    &material,
+                    &minting.kid,
+                )
+                .map_err(|error| SnapshotError::MintingKey(error.to_string()))?;
+                Ok::<ResolvedMinting, SnapshotError>(ResolvedMinting {
+                    kid: minting.kid.clone(),
+                    algorithm: match verifier.alg {
+                        GatewayVerifierAlgorithm::EdDsa => crate::mint::MintAlgorithm::EdDsa,
+                        GatewayVerifierAlgorithm::Hs256 => crate::mint::MintAlgorithm::Hs256,
+                    },
+                    key_material: SecretString::from(material),
+                    audience: config
+                        .gateway_token
+                        .as_ref()
+                        .expect("validated audience")
+                        .audience
+                        .clone(),
+                    max_ttl: minting.max_ttl.unwrap_or(verifier.max_ttl),
+                    scope: minting.scope.as_ref().map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| crate::principals::Capability::parse(value))
+                            .collect()
+                    }),
+                    aliases: minting.aliases.as_ref().map(|values| {
+                        crate::aliases::AliasScope::parse(values.iter().map(String::as_str))
+                            .expect("validated aliases")
+                    }),
+                    max_request_microdollars: minting.max_request_microdollars,
+                })
+            })
+            .transpose()?;
+        let gateway_minting_fingerprint = config
+            .gateway_minting
+            .as_ref()
+            .zip(gateway_minting.as_ref())
+            .map(|(minting, resolved)| {
+                key_material::fingerprint(
+                    minting.source_label().unwrap_or(&resolved.kid),
+                    resolved.key_material.expose_secret(),
+                )
+            });
         Ok(Self {
             config,
             credentials,
@@ -217,6 +314,8 @@ impl ConfigSnapshot {
             generation,
             gateway_key_fingerprints,
             gateway_verifier_fingerprints,
+            gateway_minting_fingerprint,
+            gateway_minting,
         })
     }
 
