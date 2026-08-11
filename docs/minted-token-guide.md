@@ -28,11 +28,17 @@ can_mint = true
 
 The endpoint uses the same authentication middleware as every other
 non-liveness route. The body accepts `sub`, optional `ttl_seconds`, `scope`,
-`aliases`, and `max_request_microdollars`; it rejects unknown fields. The
-configured scope ceiling is mandatory. Omitted scope, aliases, and microdollar
-limits inherit their configured ceilings. Requested values must narrow their
-ceilings and TTL must be between one second and the effective maximum. Minted
-tokens are never authorized to mint another token.
+`aliases`, and `max_request_microdollars`; it rejects unknown fields. Omitted
+scope and microdollar limits inherit their configured ceilings when those
+ceilings are configured; with no configured scope ceiling, the ordinary
+capability posture is inherited. An omitted alias ceiling permits `*`, while
+dispatch still narrows aliases to those the namespace can already reach.
+Every effective capability must also be held by the minting key itself.
+Operator-only capabilities cannot be configured as a minting ceiling and
+therefore cannot be minted by this endpoint.
+Requested values must narrow their ceilings and TTL must be between one second
+and the effective maximum. Minted tokens are never authorized to mint another
+token.
 
 `POST /v1/tokens` is intentionally outside the request rate limiter and usage
 fanout: issuance is unthrottled and unrecorded in the gateway by design. The
@@ -407,14 +413,10 @@ section in place but makes the endpoint reject every caller with
 `mint_not_authorized`; reload logs a warning when minting is configured without
 an authorized key.
 
-4. **`jti` denylist (#68).** A future opt-in denylist can reject one token by
-   its mandatory `jti`.
-
-The `jti` denylist is not a current Tier 0 configuration feature. Precise
-single-token revocation still requires **Tier 1** shared state, as defined by
-ADR 0017; in this design that means Redis-backed enforcement. Tier 1
-availability and its fail-closed behavior must be treated as part of the
-selected request path.
+4. **`jti` denylist (#68).** The optional denylist can reject one token by its
+   mandatory `jti`. It is separate from the stateless mint endpoint and uses
+   the configured shared revocation backend; its availability and fail-closed
+   behavior must be treated as part of the selected request path.
 
 ## 7. Delegation and attribution
 
