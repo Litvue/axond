@@ -2121,6 +2121,21 @@ max_request_microdollars = 1000
         let (status, body) = mint_request(state.clone(), json!({"sub": "agent"})).await;
         assert_eq!(status, StatusCode::OK);
         let token = body["token"].as_str().unwrap();
+        let principal = state
+            .config()
+            .resolve_principal(&Presented { credential: token })
+            .await
+            .expect("resolve minted token")
+            .expect("minted principal");
+        assert!(
+            principal
+                .scope
+                .as_ref()
+                .is_none_or(|scope| !scope.contains(&Capability::CredentialsAll))
+        );
+        let response =
+            scoped_route_request(state.clone(), "/v1/credentials?namespaces=all", token).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let response = router(state)
             .oneshot(
                 Request::get("/v1/models")
