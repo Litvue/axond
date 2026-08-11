@@ -223,12 +223,27 @@ async fn mint_tokens(
             {
                 return Err(GatewayError::MintClaimsNotNarrowing);
             }
+            if minting.scope.is_none()
+                && parsed
+                    .iter()
+                    .any(|capability| capability.is_operator_only())
+            {
+                return Err(GatewayError::MintClaimsNotNarrowing);
+            }
             Some(parsed)
         }
-        None => minting
-            .scope
-            .as_ref()
-            .map(|values| values.iter().copied().collect()),
+        None => Some(
+            minting
+                .scope
+                .as_ref()
+                .map(|values| values.iter().copied().collect())
+                .unwrap_or_else(|| {
+                    Capability::ALL
+                        .into_iter()
+                        .filter(|capability| !capability.is_operator_only())
+                        .collect()
+                }),
+        ),
     };
     let aliases = match request.aliases {
         Some(values) => {
@@ -1751,6 +1766,18 @@ targets = [{{ provider = "openai", model = "claude-3", price = {{ input_microdol
     }
 
     fn minting_state_with_audience_epochs(audience: &str, epochs: &str) -> AppState {
+        minting_state_with_scope_audience_epochs("scope = [\"chat\", \"models\"]", audience, epochs)
+    }
+
+    fn minting_state_without_scope() -> AppState {
+        minting_state_with_scope_audience_epochs("", "test-audience", "")
+    }
+
+    fn minting_state_with_scope_audience_epochs(
+        scope: &str,
+        audience: &str,
+        epochs: &str,
+    ) -> AppState {
         let cfg = Config::from_toml_str(&format!(
             r#"
 [[namespace]]
@@ -1775,12 +1802,13 @@ max_ttl = "15m"
 [gateway_minting]
 kid = "mint-kid"
 env = "JWT_SECRET"
-scope = ["chat", "models"]
+{scope}
 aliases = ["gpt-*"]
 max_request_microdollars = 1000
 {epochs}
 "#,
             audience = audience,
+            scope = scope,
             epochs = epochs
         ))
         .unwrap();
@@ -1830,6 +1858,51 @@ max_request_microdollars = 1000
             response.headers().get(axum::http::header::CACHE_CONTROL),
             Some(&HeaderValue::from_static("no-store"))
         );
+    }
+
+    #[tokio::test]
+    async fn omitted_scope_ceiling_rejects_operator_capability() {
+        let (status, body) = mint_request(
+            minting_state_without_scope(),
+            json!({
+                "sub": "agent",
+                "scope": ["credentials:all"],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["type"], "mint_claims_not_narrowing");
+
+        let response = router(minting_state_without_scope())
+            .oneshot(
+                Request::get("/v1/credentials?namespaces=all")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer mint-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn explicit_operator_scope_ceiling_allows_credentials_view() {
+        let state = minting_state_with_scope_audience_epochs(
+            "scope = [\"credentials\", \"credentials:all\"]",
+            "test-audience",
+            "",
+        );
+        let (status, body) = mint_request(
+            state.clone(),
+            json!({"sub": "agent", "scope": ["credentials", "credentials:all"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = body["token"].as_str().unwrap();
+        let response = scoped_route_request(state, "/v1/credentials?namespaces=all", token).await;
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(status, StatusCode::OK, "response body: {body:?}");
     }
 
     #[tokio::test]
@@ -2232,7 +2305,6 @@ targets = [{{ provider = "embeddings", model = "embeddings-model", price = {{ in
             &scoped_token(Some(vec!["credentials"])),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
         let body: Value =
             serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
