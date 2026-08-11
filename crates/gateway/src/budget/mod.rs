@@ -37,7 +37,7 @@ use crate::config::{BudgetBackend, BudgetConfig, StoreUnavailable};
 use crate::telemetry::metrics;
 
 pub use postgres::PostgresBudget;
-pub use redis::RedisBudget;
+pub use redis::{MigrationReport, RedisBudget};
 
 /// The dimension a budget is scoped to. Neutral vocabulary, like usage records.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -114,7 +114,17 @@ pub trait BudgetStore: Send + Sync {
     /// requests already in flight count against the cap.
     async fn reserve(&self, key: &BudgetKey, estimated_microdollars: u64) -> Admission;
     /// Release the reservation and record the measured spend, in micro-dollars.
-    /// Called exactly once per admitted request, whatever its outcome.
+    ///
+    /// **Exactly once per admitted request**, whatever its outcome — completion,
+    /// upstream failure, client cancellation, or a dropped handler. The route
+    /// guarantees it: the guard holding the reservation is disarmed before the
+    /// call, so a settlement and its drop-path fallback cannot both run, and no
+    /// caller retries a settlement. So an implementation must charge and release
+    /// in one atomic step (neither alone is recoverable afterwards), and it must
+    /// not assume a second chance: a settlement that fails at the store leaves the
+    /// hold to expire with its TTL, which the reserve path reclaims. That is the
+    /// bound on how long a failed settlement can hold a budget, and it is why the
+    /// TTL should exceed the longest expected request rather than be generous.
     async fn settle(&self, key: &BudgetKey, reservation: &Reservation, actual_microdollars: u64);
     /// Drop a reservation that consumed nothing. Settling zero is the same
     /// operation, and every backend implements it that way.
@@ -532,8 +542,27 @@ impl BudgetError {
 #[derive(Debug, Clone, Copy)]
 pub struct SharedSettings {
     pub limit_microdollars: u64,
+    /// The optional namespace-wide cap. `Some` turns every reserve and settle
+    /// into a composite `(subject, namespace)` operation on the same logical
+    /// reservation; `None` leaves the subject-only behavior untouched.
+    pub namespace_limit_microdollars: Option<u64>,
     pub reservation_ttl: Duration,
     pub unavailable: UnavailablePolicy,
+}
+
+impl SharedSettings {
+    pub fn enforces_namespace_cap(&self) -> bool {
+        self.namespace_limit_microdollars.is_some()
+    }
+}
+
+/// Which cap a composite reserve ran out of. Both answer the caller with the
+/// same `429 budget_exceeded`; they differ only in what an operator should do,
+/// so the scope is logged and counted rather than exposed on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExceededScope {
+    Subject,
+    Namespace,
 }
 
 /// Build the configured backend. Connecting here means a misconfigured budget
@@ -546,10 +575,13 @@ pub async fn build(
 ) -> Result<Box<dyn BudgetStore>, BudgetError> {
     let settings = SharedSettings {
         limit_microdollars: config.limit_microdollars,
+        namespace_limit_microdollars: config.namespace_limit_microdollars,
         reservation_ttl: Duration::from_secs(config.reservation_ttl_seconds),
         unavailable: config.on_unavailable.into(),
     };
     match config.backend {
+        // `validate_budget` already refuses a namespace cap on these two, so
+        // reaching them here means no namespace cap was asked for.
         BudgetBackend::None => Ok(Box::new(NoBudget)),
         BudgetBackend::InMemory => Ok(Box::new(InMemoryBudget::with_settings_and_policy(
             config.limit_microdollars,
@@ -580,6 +612,46 @@ pub async fn build(
             ))
         }
     }
+}
+
+/// Move Redis budget state into the layout the namespace cap needs, carrying
+/// accumulated spend forward. Run with every replica stopped; the gateway
+/// refuses to boot with a namespace cap until this has been done, and refuses to
+/// boot without one afterwards, so neither direction silently resets a ledger.
+///
+/// `namespaces` is the configured namespace id list: the v1 keys carry an
+/// unescaped `{namespace|subject}` tag, so they are attributed by resolving that
+/// tag against real namespace ids rather than by splitting it at a delimiter
+/// that may appear in either half.
+pub async fn migrate_redis(
+    config: &BudgetConfig,
+    namespaces: &[String],
+    env: &HashMap<String, String>,
+) -> Result<MigrationReport, BudgetError> {
+    if config.backend != BudgetBackend::Redis {
+        return Err(BudgetError::invalid(
+            "redis",
+            format!(
+                "the Redis budget migration needs `[budget] backend = \"redis\"`, not `{}`",
+                config.backend.as_str()
+            ),
+        ));
+    }
+    // The migration is one-way, and only a gateway with the cap set can serve what
+    // it produces. Run against a config that has none, it would take the fleet
+    // down: every replica would refuse to boot on a layout its configuration
+    // cannot read, and the documented way back is a spend reset. So the command
+    // requires the configuration it is a migration *to*.
+    if config.namespace_limit_microdollars.is_none() {
+        return Err(BudgetError::invalid(
+            "redis",
+            "the Redis budget migration moves this `key_prefix` to the v2 layout, which only a \
+             gateway with `namespace_limit_microdollars` set can serve. Set it under `[budget]` \
+             first, then migrate, then start the fleet on that same configuration.",
+        ));
+    }
+    let url = dsn(config, "redis", env)?;
+    redis::migrate_v1_to_v2(url, &config.key_prefix(), namespaces).await
 }
 
 /// The connection string, resolved from the environment. Like every other
@@ -712,6 +784,26 @@ mod tests {
             .err()
             .expect("a missing dsn must fail at boot");
         assert!(matches!(err, BudgetError::Invalid { .. }), "{err:?}");
+    }
+
+    /// The migration is one-way and only the cap-enabled configuration can serve
+    /// what it produces, so running it from a config without the cap would leave
+    /// the whole fleet unable to boot. It refuses before touching Redis.
+    #[tokio::test]
+    async fn the_redis_migration_needs_the_cap_it_migrates_to() {
+        let config = BudgetConfig {
+            backend: BudgetBackend::Redis,
+            limit_microdollars: 1_000,
+            dsn_env: Some("AXOND_TEST_MISSING_BUDGET_URL".to_owned()),
+            ..BudgetConfig::default()
+        };
+        let err = migrate_redis(&config, &[], &HashMap::new())
+            .await
+            .expect_err("migrating without the cap must fail");
+        assert!(
+            format!("{err}").contains("namespace_limit_microdollars"),
+            "the error must name the missing setting: {err}"
+        );
     }
 
     #[tokio::test]

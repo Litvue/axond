@@ -396,6 +396,7 @@ config-owned; only callers and keys may become store-owned.
 | 1 | A spend cap across replicas | `[budget] backend = "redis"` | Redis availability couples budgeted admission to Redis; `deny` fails closed. |
 | 2 | Durable usage rows | `[[usage_sink]] kind = "postgres"` | A Postgres role, the [`usage_v2.sql`](../ops/postgres/usage_v2.sql) table, ordered additive migrations, and backup/restore ownership. |
 | 2 | A spend cap across replicas | `[budget] backend = "postgres"` | Postgres availability and the [`budget_v1.sql`](../ops/postgres/budget_v1.sql) tables. |
+| 1 or 2 | A cap on a whole namespace, not just each subject | `[budget] namespace_limit_microdollars` on a `redis` or `postgres` budget | A one-time migration with the fleet stopped for either backend (below), and contention on one key or row per namespace. |
 
 For upgrades, apply each additive `usage_v1_<sequence>_<name>.sql` migration in
 filename order before deploying a gateway that writes its new column. Otherwise
@@ -405,3 +406,126 @@ the dropped-records metric, until the migrations are applied.
 A `[budget]` backend of `in-memory` enforces the cap **per replica**, so a fleet
 of N replicas admits up to N caps. Use a shared backend for a real fleet-wide
 cap.
+
+### Enabling a namespace-wide cap
+
+`namespace_limit_microdollars` caps everything a namespace spends across all its
+subjects, which is what bounds a namespace whose holder can mint fresh subjects
+(see the [minted-token guide](./minted-token-guide.md)). Only `redis` and
+`postgres` can enforce it exactly across replicas, so the other backends reject
+it at boot. Turning it on is a **migration**, not a config flip, because the
+accumulated spend has to be carried into the new shape:
+
+**Redis.** Set `namespace_limit_microdollars` in the config first, stop every
+replica, then run the migration and start the fleet on that same config:
+
+```bash
+axond budget migrate-redis --config /etc/axond/axond.toml
+```
+
+The command reads the config it is given and refuses to run if the cap is not set
+there, since only a gateway configured with one can serve the layout it produces —
+migrating first and configuring second would leave the fleet unable to start.
+
+Do not run old and new binaries at the same time. A version without namespace-cap
+support writes the previous key layout, so the two would each enforce a share of
+the traffic. The gateway fences this rather than trusting the runbook: with the
+cap set it refuses to boot until the migration marker exists and refuses to boot
+while any old-layout key remains; once migrated, it refuses to boot *without* the
+cap, because the old keys no longer hold the spend.
+
+Re-running the migration is safe, and is the repair for a replica that slipped
+through: spend is claimed out of an old counter atomically and added to the new
+one at most once, so an interrupted run loses nothing, a repeat run adds nothing
+twice, and spend a stray old replica recorded *after* the first run is carried
+over rather than discarded. The report line names the amount, so a non-zero carry
+on a re-run is the signal that something was still writing the old layout.
+
+An interrupted run is fenced rather than papered over, in both of the ways it can
+stop. The migration marks `<key_prefix>:layout` as `v2-migrating` before it moves
+anything and writes `v2` only once every subject is across, so a run that carried
+some subjects and then failed on a later one is visible even though it leaves
+nothing else behind — a carried subject has no old key — and no configuration will
+serve a `v2-migrating` prefix, since the ledger is then split between the layouts.
+Spend taken off an old counter but not yet added to the new one sits in a
+`:migration_pending` claim, which the cap-enabled boot check refuses as well. A
+gateway *without* the cap reads the marker and nothing else, so enabling this
+feature costs an un-migrated deployment one `GET` at boot and no keyspace scan.
+Re-running the migration resumes where it stopped and clears both states; that is
+all it takes.
+
+The migration attributes old keys by resolving their `{namespace|subject}` tag
+against the namespaces in your config. Neither half of that tag was escaped, so
+`{team|west|abc}` could mean namespace `team` or `team|west`; rather than guess,
+the migration stops with the offending key named, having moved and deleted
+nothing. That happens when a namespace has been removed from the config while its
+spend is still in Redis (add it back, or delete the key), when one namespace id is
+a prefix of another such that both could own the key (rename, or migrate under a
+separate `key_prefix`), and when a configured id matches but leaves a `|` in the
+subject — a match is not proof of ownership there, since the tag reads just as well
+as a longer namespace the config no longer declares.
+
+The last of those is the one no config change resolves: an old subject id
+containing a `|` cannot be attributed safely, so carry those keys into the new
+layout by hand or delete them (accepting the reset of those ledgers) before
+migrating. This is a property of the *old* keys only. The v2 layout escapes each
+identifier into its own key segment, so pipes in a namespace or subject id are
+unambiguous once carried — and a namespace id containing `|` migrates normally when
+the subject it leaves has no `|` of its own.
+
+In-flight reservations are not carried over, which is the other reason to stop
+traffic first.
+
+Turning the cap back off is deliberately not a config flip either, and there is
+no un-migrate command: the old keys are gone, so a cap-less binary would read
+zero spend for every subject and hand each one a fresh budget — which is why it
+refuses to boot against migrated state. Dropping the cap therefore means
+accepting a spend reset, which you do explicitly: stop the fleet and either
+delete `<key_prefix>:v2:*` together with `<key_prefix>:layout`, or move the
+deployment to a new `key_prefix`. Note that the layout marker is per
+`key_prefix`, so two deployments sharing one Redis and one prefix cannot disagree
+about the cap; give them separate prefixes if they need to.
+
+**Postgres.** Stop and drain the fleet here too, then apply
+[`budget_v2.sql`](../ops/postgres/budget_v2.sql) on top of `budget_v1.sql` — it is
+additive, and its backfill seeds each namespace total from the subject rows
+already present:
+
+```bash
+psql "$AXOND_BUDGET_POSTGRES_DSN" -f ops/postgres/budget_v2.sql
+```
+
+It is not a live migration. The backfill sums the subject rows, so a settlement
+that commits after that sum would be counted against its subject and never
+against its namespace, leaving a total that is permanently short — and no boot
+check can detect that, because the row exists and merely holds too small a
+number. The file therefore runs as one transaction holding an `EXCLUSIVE` lock on
+the spend table, which blocks a v1 settlement rather than losing it; stopping the
+fleet is what keeps that lock from being an outage. Re-running it is idempotent,
+and `create_table = true` applies the same statements at boot.
+
+Mixed configurations are fenced by the database, not by this runbook. The file
+installs a trigger that rejects spend and reservation writes from any session that
+has not declared namespace-cap support, which a cap-aware gateway does once per
+connection. A replica still configured without `namespace_limit_microdollars` —
+including a binary too old to have a boot check — therefore cannot charge a
+subject while leaving the namespace total behind; its writes fail loudly instead.
+Such a replica also refuses to boot, naming the fence, and a cap-enabled replica
+refuses to boot if the fence is missing from either table or a namespace has spend
+but no backfilled row, so the cap can neither begin from zero nor be quietly
+bypassed. To return to per-subject-only enforcement, stop the fleet and drop the
+two `<table>_namespace_fence` triggers.
+
+The declaration the fence looks for is sent once per connection *and* again, as
+`SET LOCAL`, inside every transaction that reserves or settles. So a pooler in
+transaction mode cannot route a write to a backend where the declaration never
+ran — which would otherwise have booted cleanly and then had every reserve and
+settlement rejected by the fence. `create_table = true` also
+re-applies the DDL on boot, but skips the v2 file once the schema is installed and
+backfilled, so a restart does not re-take the `EXCLUSIVE` lock or re-run the
+aggregate against a live fleet.
+
+Both backends then concentrate a namespace's traffic on one hot spot — one spend
+row in Postgres, one counter and reservation hash in Redis — and every reserve
+scans that namespace's live reservations. Size for that when a single namespace
+carries the bulk of the fleet's requests.

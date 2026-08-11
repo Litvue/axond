@@ -362,8 +362,16 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # # `in-memory` holds state per replica, so a fleet enforces one ceiling EACH;
 # # `redis` and `postgres` share one cap across replicas atomically.
 # backend = "redis"
-# # The cap, in micro-dollars. 10_000_000 µ$ = $10.
+# # The cap per (namespace, subject), in micro-dollars. 10_000_000 µ$ = $10.
 # limit_microdollars = 10_000_000
+# # Optional additional cap on everything the NAMESPACE spends, across all its
+# # subjects. Omit it for per-subject-only enforcement. Only `redis` and
+# # `postgres` can enforce it exactly, so the other backends reject it at boot.
+# # Set this wherever token minting is enabled: a caller who can choose `sub`
+# # can otherwise always move to a subject that has spent nothing.
+# # Redis needs a one-time `axond budget migrate-redis` with the fleet stopped,
+# # and Postgres needs ops/postgres/budget_v2.sql. See docs/deployment.md.
+# namespace_limit_microdollars = 100_000_000
 # # Env var holding the connection string (redis:// or rediss:// for Redis, a
 # # libpq DSN for Postgres). The DSN is a secret, so it is referenced by name.
 # dsn_env = "AXOND_BUDGET_REDIS_URL"

@@ -38,6 +38,7 @@ struct Instruments {
     config_reloads: Counter<u64>,
     config_generation: Gauge<u64>,
     budget_capacity_denials: Counter<u64>,
+    budget_namespace_denials: Counter<u64>,
     budget_retained_subjects: Gauge<u64>,
     rate_limit_denials: Counter<u64>,
     rate_limit_capacity_denials: Counter<u64>,
@@ -133,6 +134,12 @@ impl Instruments {
                 .u64_counter("axond.budget.capacity_denials")
                 .with_description(
                     "In-memory budget admissions denied because the ledger bound was exhausted.",
+                )
+                .build(),
+            budget_namespace_denials: meter
+                .u64_counter("axond.budget.namespace_denials")
+                .with_description(
+                    "Budget admissions denied by the namespace-wide cap rather than the subject's.",
                 )
                 .build(),
             budget_retained_subjects: meter
@@ -268,6 +275,16 @@ pub fn record_budget_capacity_denial() {
         return;
     };
     instruments.budget_capacity_denials.add(1, &[]);
+}
+
+/// Record an admission denied by the namespace-wide spend cap rather than by
+/// the subject's own. Both answer `429`, so this is how an operator tells a
+/// tenant-wide exhaustion from one noisy key.
+pub fn record_budget_namespace_denial() {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.budget_namespace_denials.add(1, &[]);
 }
 
 /// Record the retained in-memory ledger count after capacity-pressure pruning.

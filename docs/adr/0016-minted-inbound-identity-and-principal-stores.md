@@ -268,6 +268,15 @@ subjects can now arrive in tokens, the in-memory `HashMap<BudgetKey, Ledger>`
 must gain idle eviction or a TTL; otherwise a long-running replica can retain
 an unbounded number of inactive subjects.
 
+High-cardinality subjects also mean a per-subject cap no longer bounds a
+namespace: a minted token can always name a subject that has spent nothing. The
+*enforcement scope* therefore gains an optional namespace-wide cap
+(`namespace_limit_microdollars`, [ADR 0010](./0010-shared-budget-backends-and-charging-policy.md)),
+which a deployment that mints should set on a `redis` or `postgres` budget. The
+key shape is still `(namespace, subject)`; the namespace total is an additional
+scope decided in the same atomic operation, and only the shared backends can
+enforce it exactly across replicas.
+
 Usage records must continue to attribute namespace and subject. They should
 also carry `kid` and, when federation exists, `iss`, so delegated spend can
 answer which signer vouched for the caller. Downstream consumers must not
@@ -286,7 +295,8 @@ assume that subjects belong to the static config key list.
 - Offline minting preserves the zero-external-state default; token issuance
   through HTTP and precise revocation are explicit opt-ins.
 - `sub` becomes high-cardinality, so memory accounting, usage schemas, and
-  operational dashboards must handle arbitrary subjects.
+  operational dashboards must handle arbitrary subjects — and a spend ceiling for
+  a minting namespace has to be set at the namespace scope, not per subject.
 - The layered resolver makes a stateful identity backend additive rather than a
   cutover: callers on other layers remain unaffected by its outage, while a
   credential owned by the failed layer is rejected rather than falling through

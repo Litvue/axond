@@ -365,6 +365,9 @@ stalled destination drops with a count rather than delaying a request.
 Omit the section for the default: no cap, no datastore
 ([ADR 0010](./adr/0010-shared-budget-backends-and-charging-policy.md)). The cap
 is per `(namespace, subject)` — that is, per gateway key — in micro-dollars.
+`namespace_limit_microdollars` adds an optional second cap on everything a
+*namespace* spends, which is what bounds a namespace whose holder can mint fresh
+subjects; omit it and enforcement is per-subject only, exactly as before.
 
 `backend = "none"` and `"in-memory"` are Tier 0; in-memory enforcement is
 per-replica and approximate. `backend = "redis"` is Tier 1; with the default
@@ -376,6 +379,7 @@ Tier 2 and shares the cap through Postgres.
 | --- | --- | --- | --- | --- |
 | `backend` | `none` \| `in-memory` \| `redis` \| `postgres` | `none` | all | `in-memory` holds state per replica, so a fleet of N enforces N caps; `redis` and `postgres` share one cap atomically. |
 | `limit_microdollars` | integer | `0` | every backend but `none` | The cap. `10_000_000` µ$ = $10. Zero would deny everything, so it is rejected. |
+| `namespace_limit_microdollars` | integer | unset | `redis`, `postgres` | An additional cap on the whole namespace — every subject in it combined. Unset means per-subject-only enforcement. Only the shared backends can enforce it *exactly*, so `none` and `in-memory` reject it at boot; zero is rejected. Both backends need a one-time migration first (below). |
 | `on_unavailable` | `deny` \| `allow` | `deny` | `in-memory`, `redis`, `postgres` | What to do when the budget cannot enforce the cap. `deny` answers `503 budget_unavailable`; `allow` serves unenforced and warns. |
 | `dsn_env` | string | — | `redis`, `postgres` | *Name* of the env var holding the connection string (`redis://`/`rediss://`, or a libpq DSN). Required and non-empty. |
 | `table` | string | `axond_budget` | `postgres` | Base table; reservations live in `<table>_reservation`. Validated as an identifier. |
@@ -389,6 +393,70 @@ Enforcement holds a priced estimate before dispatch and settles it against
 measured spend afterwards, so concurrent requests cannot collectively overshoot.
 A cancelled or failed request is charged what it actually consumed — not the
 estimate, and not always zero.
+
+Settlement happens **exactly once** per admitted request — on completion,
+upstream failure, client cancellation, or a dropped handler — and charges and
+releases in one atomic operation, so a request can never be charged without its
+hold being freed or vice versa. It is never retried: a settlement the store
+rejects leaves the hold to lapse at `reservation_ttl_seconds`, which the next
+reserve reclaims. That TTL is therefore the upper bound on how long a failed
+settlement can hold budget out of circulation, which is why it should exceed the
+longest expected request rather than be set generously.
+
+### The namespace cap
+
+With `namespace_limit_microdollars` set, a request is admitted only if it fits
+*both* caps, and the reservation is one logical hold recorded in both scopes
+atomically — Redis in one Lua script, Postgres in one transaction. Settlement
+charges both or neither. A denial by either cap is the same
+`429 budget_exceeded` response the subject cap already returned; the
+`axond.budget.namespace_denials` counter is what distinguishes them
+([observability](./observability.md)). `on_unavailable` still applies to the
+whole operation: `deny` answers `503 budget_unavailable` and `allow` serves the
+request with nothing held in either scope, so one scope is never enforced while
+the other is not.
+
+"Exact" means settled spend plus live reservations, under the same estimate and
+reservation-TTL semantics as the subject cap — not provider billing. A namespace
+cap also concentrates load: every subject in a namespace contends on one spend
+row (Postgres) or one counter and reservation hash (Redis), so a very large
+namespace pays for that exactness in contention on its hottest key.
+
+**Redis** needs a one-time migration, because the namespace cap uses a
+cluster-safe key layout tagged by namespace rather than by
+`(namespace, subject)`. Stop every replica, then:
+
+```console
+$ axond budget migrate-redis --config axond.toml
+```
+
+It carries accumulated spend forward — claimed out of each v1 counter and added
+to the v2 ones at most once, so an interrupted run loses nothing, a re-run adds
+nothing twice, and spend a stray v1 replica wrote *after* the first run is added
+rather than dropped — sums namespace totals from it, and stamps a layout marker.
+A legacy key whose `{namespace|subject}` tag matches no configured namespace, or
+more than one, stops the migration before anything is moved, deleted, or stamped
+rather than guessing where the namespace ends. A gateway with
+the cap set refuses to boot until that marker exists, refuses to boot while any
+v1 key remains — that is, while a version without namespace-cap support is still
+writing — and, once migrated, refuses to boot *without* the cap, since the v1
+keys no longer hold the spend. Do not run mixed binaries during the migration:
+the two layouts would each enforce a share of the traffic. Reservation state is
+not carried over, so migrate with traffic stopped.
+
+**Postgres** needs `ops/postgres/budget_v2.sql`, which is additive on top of
+`budget_v1.sql`: a namespace spend table, an index for namespace-wide
+reservation cleanup, and a backfill that seeds each namespace's total from the
+subject rows already there. Custom `table` names are substituted as usual
+(`<table>_namespace`), and `create_table = true` applies both files. Apply it with
+the fleet stopped and drained: the backfill's sum would otherwise miss a
+settlement committing behind it, leaving a namespace total permanently short (the
+file takes an `EXCLUSIVE` lock so such a settlement blocks rather than being
+lost). It also installs a fence trigger, so a replica configured *without* the
+namespace cap can neither boot against that database nor write to it — its spend
+would never reach the namespace total. The gateway refuses to boot if the fence is
+missing, or if a namespace with spend has no backfilled row, so the cap cannot
+start from zero or be bypassed by an old configuration.
 
 ## `[rate_limit]` — opt-in inbound concurrency enforcement
 

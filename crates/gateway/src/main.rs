@@ -46,6 +46,10 @@ fn main() -> anyhow::Result<()> {
         Some(("mint", args)) => mint::run(args),
         Some(("keygen", args)) => mint::keygen(args),
         Some(("revoke", args)) => mint::revoke(args),
+        Some(("budget", args)) => match args.subcommand() {
+            Some(("migrate-redis", args)) => migrate_redis_budget(args),
+            _ => unreachable!("clap validates subcommands"),
+        },
         None => serve(),
         _ => unreachable!("clap validates subcommands"),
     }
@@ -82,6 +86,23 @@ fn cli() -> Command {
                         .long("config")
                         .value_name("PATH")
                         .help("Config file path"),
+                ),
+        )
+        .subcommand(
+            Command::new("budget")
+                .about("Budget state maintenance")
+                .subcommand_required(true)
+                .subcommand(
+                    Command::new("migrate-redis")
+                        .about(
+                            "Move Redis budget state to the v2 layout `namespace_limit_microdollars` needs",
+                        )
+                        .arg(
+                            Arg::new("config")
+                                .long("config")
+                                .value_name("PATH")
+                                .help("Config file path"),
+                        ),
                 ),
         )
         .subcommand(
@@ -191,6 +212,39 @@ fn cli() -> Command {
                         .help("max_ttl shown in the verifier snippet"),
                 ),
         )
+}
+
+/// Carry Redis budget state into the v2 key layout, with the fleet stopped.
+/// Separate from `serve` on purpose: enabling a namespace cap must not silently
+/// migrate (or reset) shared spend as a side effect of a rolling restart.
+fn migrate_redis_budget(args: &clap::ArgMatches) -> anyhow::Result<()> {
+    let config_path = args
+        .get_one::<String>("config")
+        .cloned()
+        .or_else(|| std::env::var("AXOND_CONFIG").ok())
+        .unwrap_or_else(|| "axond.toml".to_owned());
+    let config = Config::load(&config_path)
+        .map_err(|e| anyhow::anyhow!("failed to load config from `{config_path}`: {e}"))?;
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let runtime = tokio::runtime::Runtime::new()?;
+    // The v1 keys are attributed against the configured namespaces, so this must
+    // run with the config that wrote them.
+    // Distinct: an id may legitimately appear twice, and the same id offered
+    // twice as a candidate owner of a key is not an ambiguity.
+    let namespaces: Vec<String> = config
+        .namespace
+        .iter()
+        .map(|namespace| namespace.id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let report = runtime.block_on(budget::migrate_redis(&config.budget, &namespaces, &env))?;
+    eprintln!(
+        "migrated {} subject ledger(s) into {} namespace total(s), carrying {} micro-dollars; \
+         dropped {} stale reservation hash(es)",
+        report.subjects, report.namespaces, report.carried_microdollars, report.reservation_hashes
+    );
+    Ok(())
 }
 
 #[tokio::main]
