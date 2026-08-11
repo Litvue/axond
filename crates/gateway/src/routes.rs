@@ -1907,7 +1907,7 @@ max_request_microdollars = 1000
             principal
                 .scope
                 .as_ref()
-                .map_or(true, |scope| !scope.contains(&Capability::CredentialsAll))
+                .is_none_or(|scope| !scope.contains(&Capability::CredentialsAll))
         );
         let response = scoped_route_request(state, "/v1/credentials?namespaces=all", token).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
