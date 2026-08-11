@@ -408,6 +408,12 @@ impl Relay {
                                         }
                                     }
                                 }
+                                Err(err)
+                                    if err.is_credential_rate_limited()
+                                        && !matches!(self.phase, Phase::Streaming) =>
+                                {
+                                    return;
+                                }
                                 Err(err) => {
                                     self.phase = Phase::Failed(err.to_string());
                                     return;
@@ -1757,6 +1763,7 @@ targets = [
     #[tokio::test]
     async fn rate_limit_after_done_does_not_reopen_the_stream() {
         let ledger = Arc::new(Ledger::default());
+        let ledger_for_relay = ledger.clone();
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_open = calls.clone();
         let opener = move |_lease: CredentialLease, _attempt: u32, _index: usize| {
@@ -1769,7 +1776,7 @@ targets = [
             }) as futures::future::BoxFuture<'static, _>
         };
         let response = relay_opened(
-            state_for("http://127.0.0.1:1", ledger),
+            state_for("http://127.0.0.1:1", ledger_for_relay),
             context(),
             OpenAiCompatibleAdapter::openai()
                 .stream_decoder(Surface::ChatCompletions)
@@ -1791,10 +1798,14 @@ targets = [
             )),
         );
         let mut body = response.into_body().into_data_stream();
+        let mut output = String::new();
         while let Some(chunk) = body.next().await {
-            chunk.expect("chunk");
+            output.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!output.contains("event: error"));
+        assert!(output.ends_with("data: [DONE]\n\n"));
+        assert_eq!(settled(&ledger).await["status"], "ok");
     }
 
     #[tokio::test]
