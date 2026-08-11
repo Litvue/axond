@@ -84,6 +84,7 @@ pub struct RotationHandle {
     remaining: VecDeque<(CredentialLease, usize)>,
     serving: CredentialLease,
     opener: RotationOpener,
+    deadline: Option<Instant>,
     record_failure: Arc<dyn Fn(&CredentialLease) + Send + Sync>,
     record_success: Arc<dyn Fn(&CredentialLease) + Send + Sync>,
 }
@@ -93,6 +94,7 @@ fn is_stream_rate_limited(err: &TransportError) -> bool {
 }
 
 impl RotationHandle {
+    #[cfg(test)]
     pub fn new(
         leases: Vec<CredentialLease>,
         serving: CredentialLease,
@@ -108,6 +110,33 @@ impl RotationHandle {
         record_failure: impl Fn(&CredentialLease) + Send + Sync + 'static,
         record_success: impl Fn(&CredentialLease) + Send + Sync + 'static,
     ) -> Self {
+        Self::new_with_deadline(
+            leases,
+            serving,
+            first_lease_index,
+            opener,
+            None,
+            record_failure,
+            record_success,
+        )
+    }
+
+    pub fn new_with_deadline(
+        leases: Vec<CredentialLease>,
+        serving: CredentialLease,
+        first_lease_index: usize,
+        opener: impl Fn(
+            CredentialLease,
+            u32,
+            usize,
+        ) -> BoxFuture<'static, Result<OpenedStream, TransportError>>
+        + Send
+        + Sync
+        + 'static,
+        deadline: Option<Instant>,
+        record_failure: impl Fn(&CredentialLease) + Send + Sync + 'static,
+        record_success: impl Fn(&CredentialLease) + Send + Sync + 'static,
+    ) -> Self {
         Self {
             remaining: leases
                 .into_iter()
@@ -116,6 +145,7 @@ impl RotationHandle {
                 .collect(),
             serving,
             opener: Arc::new(opener),
+            deadline,
             record_failure: Arc::new(record_failure),
             record_success: Arc::new(record_success),
         }
@@ -133,6 +163,12 @@ impl RotationHandle {
         &mut self,
     ) -> Result<Option<(CredentialLease, OpenedStream)>, TransportError> {
         while let Some((lease, lease_index)) = self.remaining.pop_front() {
+            if self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return Ok(None);
+            }
             let open = (self.opener)(lease.clone(), 0, lease_index);
             match open.await {
                 Ok(opened) => {
@@ -1919,6 +1955,41 @@ targets = [
         while let Some(chunk) = body.next().await {
             let _ = chunk.expect("chunk");
         }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn rotation_stops_before_opening_after_deadline() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_open = calls.clone();
+        let opener = move |_lease: CredentialLease, _attempt: u32, _index: usize| {
+            let calls = calls_for_open.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(TransportError::Provider(ProviderError::from_upstream(
+                    "test",
+                    429,
+                    "rate limited",
+                )))
+            }) as futures::future::BoxFuture<'static, _>
+        };
+        let mut rotation = RotationHandle::new_with_deadline(
+            vec![test_lease("b"), test_lease("c")],
+            test_lease("a"),
+            1,
+            opener,
+            Some(Instant::now() - Duration::from_millis(1)),
+            |_| {},
+            |_| {},
+        );
+
+        assert!(
+            rotation
+                .open_next()
+                .await
+                .expect("rotation result")
+                .is_none()
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

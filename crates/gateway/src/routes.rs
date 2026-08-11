@@ -1122,6 +1122,15 @@ async fn stream_with_failover(
             telemetry::finish_credential_lease(&span, telemetry::LEASE_PARKED);
         }
         for (lease_index, lease) in plan.attempts.iter().enumerate() {
+            if Instant::now() >= deadline {
+                telemetry::finish_upstream_attempt(
+                    &attempt_span,
+                    telemetry::ATTEMPT_ERROR,
+                    attempt_started.elapsed().as_millis() as u64,
+                    None,
+                );
+                break 'targets;
+            }
             let mut ctx = StreamContext {
                 namespace: caller.namespace.clone(),
                 subject: caller.subject.clone(),
@@ -1230,11 +1239,12 @@ async fn stream_with_failover(
                             }) as futures::future::BoxFuture<'static, _>
                         };
                     let snapshot_for_health = snapshot.clone();
-                    let rotation = streaming::RotationHandle::new(
+                    let rotation = streaming::RotationHandle::new_with_deadline(
                         remaining,
                         lease.clone(),
                         plan.parked.len() + lease_index + 1,
                         opener,
+                        Some(deadline),
                         move |lease| snapshot_for_health.credentials.record_failure(lease),
                         {
                             let snapshot = snapshot.clone();
