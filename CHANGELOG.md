@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.1](https://github.com/Litvue/axond/compare/v0.2.0...v0.2.1) (2026-08-11)
+
+
+### Features
+
+* **auth:** opt-in jti denylist for precise revocation ([9d3e7c5](https://github.com/Litvue/axond/commit/9d3e7c51c93354bf37fdb055f6154bf11abe3ccb))
+* **ops:** docker compose deployment quickstart ([2952bf8](https://github.com/Litvue/axond/commit/2952bf84c44b30b189032eeee848c03524e5396e))
+
+
+### Bug Fixes
+
+* **auth:** harden revocation boot and expiry handling ([75f29aa](https://github.com/Litvue/axond/commit/75f29aa4e5e574434d2bf5fff34f434a668299f1))
+* harden compose quickstart walkthrough ([8ac34ba](https://github.com/Litvue/axond/commit/8ac34ba852458d18769d111cb467bd2318d377c8))
+
 ## [0.2.0](https://github.com/Litvue/axond/compare/v0.1.6...v0.2.0) (2026-08-11)
 
 
