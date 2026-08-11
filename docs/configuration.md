@@ -371,6 +371,13 @@ leftovers and are not removed on the request path.
 | `timeout_ms` | integer | `250` | shared | Maximum time a request waits for the operation; the owned Redis operation may continue under a longer liveness budget, and must be nonzero. |
 | `connect_timeout_ms` | integer | `5000` | shared | Bounded connection/PING timeout; must be nonzero. |
 
+For Redis, a liveness-budget expiry retires the shared connection generation.
+Until the replacement connection is published, all revocation checks use the
+configured unavailable policy, so the default `deny` produces a `503` window
+for minted-token traffic rather than only failing the triggering operation.
+The separate request-wait and liveness budgets keep ordinary slowness from
+triggering that generation-wide recovery path.
+
 ## Telemetry
 
 There is no telemetry section: telemetry is environment-only, exactly as in any

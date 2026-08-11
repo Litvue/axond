@@ -89,6 +89,19 @@ impl RevocationStore for RedisRevocation {
         let task_recovery = recovery.clone();
         let generation = snapshot.generation;
         let connection = snapshot.manager.clone();
+        let Some(invoke_permit) = self
+            .recovery
+            .invoke_semaphore
+            .clone()
+            .try_acquire_owned()
+            .ok()
+        else {
+            return unavailable(
+                self.on_unavailable,
+                "redis",
+                "redis invoke cap is exhausted",
+            );
+        };
         // Keep the Redis future in an owned task to remove caller-side
         // cancellation. The request deadline only ends the caller's wait;
         // the longer liveness deadline owns future cancellation, and the
@@ -105,6 +118,7 @@ impl RevocationStore for RedisRevocation {
             if result.is_err() {
                 task_recovery.mark_suspect(generation);
             }
+            drop(invoke_permit);
             result
         });
         let result = tokio::time::timeout(timeout, task).await;
@@ -124,10 +138,10 @@ impl RevocationStore for RedisRevocation {
                 }
                 Ok(value)
             }
-            Ok(Ok(Ok(Err(_)))) | Err(_) => {
+            Ok(Ok(Ok(Err(error)))) => unavailable(self.on_unavailable, "redis", error),
+            Ok(Ok(Err(_))) | Err(_) => {
                 unavailable(self.on_unavailable, "redis", "operation timed out")
             }
-            Ok(Ok(Err(error))) => unavailable(self.on_unavailable, "redis", error),
             Ok(Err(_)) => unavailable(self.on_unavailable, "redis", "operation failed"),
         }
     }
@@ -155,6 +169,18 @@ impl RevocationStore for RedisRevocation {
         let task_recovery = recovery.clone();
         let generation = snapshot.generation;
         let connection = snapshot.manager.clone();
+        let Some(invoke_permit) = self
+            .recovery
+            .invoke_semaphore
+            .clone()
+            .try_acquire_owned()
+            .ok()
+        else {
+            return Err(RevocationError::Unavailable {
+                backend: "redis",
+                message: "redis invoke cap is exhausted".to_owned(),
+            });
+        };
         let task = tokio::spawn(async move {
             let mut connection = connection;
             let result = tokio::time::timeout(liveness_timeout, async move {
@@ -170,6 +196,7 @@ impl RevocationStore for RedisRevocation {
             if result.is_err() {
                 task_recovery.mark_suspect(generation);
             }
+            drop(invoke_permit);
             result
         });
         let result = tokio::time::timeout(timeout, task).await;
@@ -188,13 +215,13 @@ impl RevocationStore for RedisRevocation {
                 }
                 Ok(())
             }
-            Ok(Ok(Ok(Err(_)))) | Err(_) => Err(RevocationError::Unavailable {
-                backend: "redis",
-                message: "operation timed out".to_owned(),
-            }),
-            Ok(Ok(Err(error))) => Err(RevocationError::Unavailable {
+            Ok(Ok(Ok(Err(error)))) => Err(RevocationError::Unavailable {
                 backend: "redis",
                 message: error.to_string(),
+            }),
+            Ok(Ok(Err(_))) | Err(_) => Err(RevocationError::Unavailable {
+                backend: "redis",
+                message: "operation timed out".to_owned(),
             }),
             Ok(Err(_)) => Err(RevocationError::Unavailable {
                 backend: "redis",
@@ -326,6 +353,19 @@ mod tests {
                 }
             } else if name.eq_ignore_ascii_case(b"EXISTS") {
                 if connection == 0 && drop_first.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if command.iter().any(|part| {
+                    part.windows(b"redis-error".len())
+                        .any(|window| window == b"redis-error")
+                }) {
+                    if write_half
+                        .write_all(b"-ERR alignment test error\r\n")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                     continue;
                 }
                 let delay = response_delay_ms.load(Ordering::Relaxed);
@@ -501,6 +541,29 @@ mod tests {
             store.connection.load_full().generation,
             generation,
             "a caller timeout must not retire a healthy generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_command_errors_preserve_the_backend_message() {
+        let stub = RevocationTimeoutStub::start().await;
+        let store = RedisRevocation::connect(
+            &stub.url(),
+            "axond:test:revocation-error",
+            Duration::from_millis(25),
+            Duration::from_secs(1),
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect");
+        stub.drop_first.store(false, Ordering::Relaxed);
+        let error = store
+            .is_revoked("redis-error")
+            .await
+            .expect_err("Redis error unexpectedly succeeded");
+        assert!(
+            error.to_string().contains("alignment test error"),
+            "backend error was lost: {error}"
         );
     }
 
