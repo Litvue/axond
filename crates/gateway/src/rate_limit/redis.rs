@@ -1,20 +1,21 @@
 //! Exact cross-replica in-flight concurrency leases in Redis.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use redis::aio::ConnectionLike;
-use redis::aio::{ConnectionManager, ConnectionManagerConfig};
+use redis::aio::ConnectionManager;
 use redis::{Client, Script};
 use ring::rand::{SecureRandom, SystemRandom};
 use thiserror::Error;
-use tokio::sync::{Notify, Semaphore, SemaphorePermit, oneshot};
+use tokio::sync::{Semaphore, SemaphorePermit, oneshot};
 
 use super::{PermitRelease, RateLimitError, RateLimitKey, RateLimitPermit, RateLimiter};
 use crate::config::StoreUnavailable;
+use crate::redis_support::{RedisConnection as SharedConnection, RedisRecovery as SharedRecovery};
 use crate::telemetry::metrics;
 
 const ACQUIRE: &str = r#"
@@ -46,29 +47,12 @@ const RELEASE_RETRY_CONCURRENCY: usize = 16;
 const RELEASE_RETRY_WINDOW_MULTIPLIER: u32 = 10;
 const REDIS_OPERATION_TIMEOUT_MULTIPLIER: u32 = 4;
 const RELEASE_TIMEOUT_FLOOR: Duration = Duration::from_secs(1);
-const INVOKE_TIMEOUT_FLOOR: Duration = Duration::from_millis(500);
-const SHARED_CONNECTION_REPLACEMENT_COOLDOWN: Duration = Duration::from_millis(250);
-// The old 256-invoke cap with the 250 ms admission timeout allowed
-// 256 / 0.25 = 1,024 admissions per second before shedding. Owned invokes now
-// live for up to 1 second at that default, so 1,024 preserves that headroom:
-// 1,024 / 1 = 1,024 outstanding invokes per second. At a 2-second admission
-// timeout the liveness budget is 8 seconds, so this fixed ceiling intentionally
-// sheds at 1,024 / 8 = 128 admissions per second rather than allowing 8,192
-// stalled tasks. The cap is therefore a safety ceiling, not a configurable
-// throughput promise; configurability can be considered once production
-// concurrency data justifies it. Saturation refuses only the current request
-// and is not evidence that the socket failed.
-const SHARED_INVOKE_CONCURRENCY: usize = 1024;
+#[cfg(test)]
+const SHARED_INVOKE_CONCURRENCY: usize = crate::redis_support::INVOKE_CONCURRENCY;
 
 // Keep fresh-connection retries below a small fixed concurrency cap; the
 // shared manager's first attempt remains available to every release.
 static RELEASE_RETRY_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
-
-#[derive(Clone)]
-struct SharedConnection {
-    manager: ConnectionManager,
-    generation: u64,
-}
 
 struct SharedInvokeGuard {
     generation: u64,
@@ -102,115 +86,6 @@ impl Drop for SharedInvokeGuard {
                 .suspect_generation
                 .fetch_max(self.generation, Ordering::AcqRel);
             self.recovery.request_replacement();
-        }
-    }
-}
-
-struct SharedRecovery {
-    connection: Arc<ArcSwap<SharedConnection>>,
-    client: Client,
-    connect_timeout: Duration,
-    suspect_generation: Arc<AtomicU64>,
-    replacement_in_flight: Arc<AtomicBool>,
-    last_replacement_ms: Arc<AtomicU64>,
-    invoke_semaphore: Arc<Semaphore>,
-    replacement_notify: Arc<Notify>,
-}
-
-impl Drop for SharedRecovery {
-    fn drop(&mut self) {
-        // Store a wakeup so a worker between iterations observes that its
-        // Weak reference can no longer be upgraded and exits.
-        self.replacement_notify.notify_one();
-    }
-}
-
-impl SharedRecovery {
-    fn request_replacement(&self) {
-        self.replacement_notify.notify_one();
-    }
-
-    fn schedule_replacement(&self, generation: u64) {
-        let current = self.connection.load_full();
-        if current.generation != generation
-            || self.suspect_generation.load(Ordering::Acquire) != generation
-        {
-            return;
-        }
-        if self
-            .replacement_in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            return;
-        }
-        let previous = self.last_replacement_ms.load(Ordering::Relaxed);
-        let connection = self.connection.clone();
-        let client = self.client.clone();
-        let connect_timeout = self.connect_timeout;
-        let suspect_generation = self.suspect_generation.clone();
-        let replacement_in_flight = self.replacement_in_flight.clone();
-        let last_replacement_ms = self.last_replacement_ms.clone();
-        tokio::spawn(async move {
-            if previous != 0 {
-                let elapsed = now_ms().saturating_sub(previous);
-                if elapsed < SHARED_CONNECTION_REPLACEMENT_COOLDOWN.as_millis() as u64 {
-                    tokio::time::sleep(
-                        SHARED_CONNECTION_REPLACEMENT_COOLDOWN
-                            .saturating_sub(Duration::from_millis(elapsed)),
-                    )
-                    .await;
-                }
-            }
-            let current = connection.load_full();
-            if current.generation != generation
-                || suspect_generation.load(Ordering::Acquire) != generation
-            {
-                replacement_in_flight.store(false, Ordering::Release);
-                return;
-            }
-            last_replacement_ms.store(now_ms(), Ordering::Relaxed);
-            let replacement = tokio::time::timeout(connect_timeout, async {
-                let mut connection =
-                    ConnectionManager::new_with_config(client, connection_manager_config()).await?;
-                redis::cmd("PING")
-                    .query_async::<String>(&mut connection)
-                    .await?;
-                Ok::<_, redis::RedisError>(connection)
-            })
-            .await;
-            if let Ok(Ok(manager)) = replacement {
-                let current = connection.load_full();
-                if current.generation == generation
-                    && suspect_generation.load(Ordering::Acquire) == generation
-                {
-                    connection.store(Arc::new(SharedConnection {
-                        manager,
-                        generation: generation + 1,
-                    }));
-                    suspect_generation.store(0, Ordering::Release);
-                }
-            }
-            replacement_in_flight.store(false, Ordering::Release);
-        });
-    }
-
-    async fn replacement_worker(worker: Weak<Self>) {
-        loop {
-            let notify = match worker.upgrade() {
-                Some(recovery) => recovery.replacement_notify.clone(),
-                None => return,
-            };
-            notify.notified().await;
-            let Some(recovery) = worker.upgrade() else {
-                return;
-            };
-            // Re-read the current generation after waking. If a newer
-            // generation was already published, its lower suspect marker
-            // makes schedule_replacement a safe no-op; otherwise this is the
-            // generation that still needs repair.
-            let generation = recovery.connection.load_full().generation;
-            recovery.schedule_replacement(generation);
         }
     }
 }
@@ -415,12 +290,7 @@ fn release_timeout(admission_timeout: Duration) -> Duration {
 }
 
 fn invoke_timeout(admission_timeout: Duration) -> Duration {
-    // Use the same four-times admission shape as release_timeout, but a
-    // shorter floor keeps low-timeout configurations from delaying recovery
-    // longer than necessary while still allowing ordinary Redis latency.
-    admission_timeout
-        .saturating_mul(REDIS_OPERATION_TIMEOUT_MULTIPLIER)
-        .max(INVOKE_TIMEOUT_FLOOR)
+    crate::redis_support::operation_liveness_timeout(admission_timeout)
 }
 
 type OwnedAcquireResult = Result<redis::RedisResult<(i64, String)>, tokio::time::error::Elapsed>;
@@ -463,14 +333,6 @@ fn reclaim_timed_out_acquire(
     }
 }
 
-fn connection_manager_config() -> ConnectionManagerConfig {
-    // redis-rs 1.4.1 defaults response_timeout to Some(500 ms)
-    // (src/client.rs::DEFAULT_RESPONSE_TIMEOUT). Its internal cancellation
-    // can drop a multiplexed waiter and misalign later replies, so invoke
-    // tasks own the deadline and retire the generation if it expires.
-    ConnectionManagerConfig::new().set_response_timeout(None)
-}
-
 pub struct RedisRateLimiter {
     key_prefix: String,
     max_in_flight: usize,
@@ -507,8 +369,11 @@ impl RedisRateLimiter {
         let client = redis::Client::open(url)?;
         let release_client = client.clone();
         let connection = tokio::time::timeout(connect_timeout, async {
-            let mut connection =
-                ConnectionManager::new_with_config(client, connection_manager_config()).await?;
+            let mut connection = ConnectionManager::new_with_config(
+                client,
+                crate::redis_support::connection_manager_config(),
+            )
+            .await?;
             redis::cmd("PING")
                 .query_async::<String>(&mut connection)
                 .await?;
@@ -522,22 +387,9 @@ impl RedisRateLimiter {
             manager: connection,
             generation: 1,
         }));
-        let suspect_generation = Arc::new(AtomicU64::new(0));
-        let replacement_in_flight = Arc::new(AtomicBool::new(false));
-        let last_replacement_ms = Arc::new(AtomicU64::new(0));
-        let recovery = Arc::new(SharedRecovery {
-            connection: connection.clone(),
-            client: release_client.clone(),
-            connect_timeout,
-            suspect_generation: suspect_generation.clone(),
-            replacement_in_flight: replacement_in_flight.clone(),
-            last_replacement_ms: last_replacement_ms.clone(),
-            invoke_semaphore: Arc::new(Semaphore::new(SHARED_INVOKE_CONCURRENCY)),
-            replacement_notify: Arc::new(Notify::new()),
-        });
-        tokio::spawn(SharedRecovery::replacement_worker(Arc::downgrade(
-            &recovery,
-        )));
+        let recovery =
+            SharedRecovery::new(connection.clone(), release_client.clone(), connect_timeout);
+        let suspect_generation = recovery.suspect_generation.clone();
         Ok(Self {
             key_prefix,
             max_in_flight,

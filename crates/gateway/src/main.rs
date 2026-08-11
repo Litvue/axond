@@ -18,6 +18,7 @@ mod key_material;
 mod mint;
 mod principals;
 mod rate_limit;
+mod redis_support;
 mod reload;
 mod revocation;
 mod routes;

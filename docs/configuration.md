@@ -404,9 +404,18 @@ leftovers and are not removed on the request path.
 | `key_prefix` | string | `axond:revocation` | `redis` | Prefix for `<prefix>:{<jti>}` keys. |
 | `table` | string | `axond_revocation` | `postgres` | Revocation table, validated as an identifier. |
 | `create_table` | bool | `false` | `postgres` | Apply the shipped versioned DDL at boot. |
-| `on_unavailable` | `deny` \| `allow` | `deny` | shared | For outages after boot, fail closed with `503 revocation_unavailable`, or explicitly admit and warn. The backend connects and PINGs/`SELECT`s before the listener binds, so an unreachable store aborts startup for either value. |
-| `timeout_ms` | integer | `250` | shared | Bounded operation timeout; must be nonzero. |
+| `on_unavailable` | `deny` \| `allow` | `deny` | shared | For outages after boot, fail closed with `503 revocation_unavailable`, or explicitly admit and warn. `allow` is an explicit fail-open opt-in: during a store-wide recovery window or invoke-cap exhaustion, every revoked JTI is admitted, not just the triggering request. The backend connects and PINGs/`SELECT`s before the listener binds, so an unreachable store aborts startup for either value. |
+| `timeout_ms` | integer | `250` | shared | Maximum time a request waits for the operation; the owned Redis operation may continue under a longer liveness budget, and must be nonzero. |
 | `connect_timeout_ms` | integer | `5000` | shared | Bounded connection/PING timeout; must be nonzero. |
+
+For Redis, a liveness-budget expiry retires the shared connection generation.
+Until the replacement connection is published, all revocation checks use the
+configured unavailable policy, so the default `deny` produces a `503` window
+for all minted-token traffic rather than only failing the triggering operation.
+With `allow`, that same window admits all revoked JTIs. Invoke-cap exhaustion
+also applies the policy store-wide.
+The separate request-wait and liveness budgets keep ordinary slowness from
+triggering that generation-wide recovery path.
 
 ## Telemetry
 
