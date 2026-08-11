@@ -952,6 +952,7 @@ max_ttl = "10m"
             usage_sink: before.config.usage_sink.clone(),
             budget: before.config.budget.clone(),
             rate_limit: before.config.rate_limit.clone(),
+            revocation: before.config.revocation.clone(),
         };
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(
@@ -980,6 +981,7 @@ max_ttl = "10m"
             usage_sink: before.config.usage_sink.clone(),
             budget: before.config.budget.clone(),
             rate_limit: before.config.rate_limit.clone(),
+            revocation: before.config.revocation.clone(),
         };
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(
@@ -1011,6 +1013,7 @@ max_ttl = "10m"
             usage_sink: disabled.config.usage_sink.clone(),
             budget: disabled.config.budget.clone(),
             rate_limit: disabled.config.rate_limit.clone(),
+            revocation: disabled.config.revocation.clone(),
         };
 
         let added = ReloadSummary::between(&boot, &disabled, &enabled);
