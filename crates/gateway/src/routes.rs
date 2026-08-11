@@ -1759,7 +1759,7 @@ env = "AXOND_PLATFORM_OPENAI"
 {GATEWAY_KEY}
 
 [gateway_token]
-audience = "{audience}"
+audience = "test-audience"
 
 [[gateway_verifier]]
 kid = "scope-test-kid"
