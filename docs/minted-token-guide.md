@@ -40,6 +40,14 @@ all tokens for that verifier, and `[[gateway_token_epoch]]` `min_iat` to revoke
 tokens issued before a configured time. The token itself is the issuance
 receipt; this Tier 0 path does not maintain an issuance registry.
 
+Because `sub` is caller-chosen, a trusted minting key can rotate subjects and
+give each new `(namespace, subject)` a fresh budget ledger and per-subject
+`max_in_flight_per_subject` allowance. Per-subject budgets are therefore not a
+ceiling on a minting namespace, and `max_request_microdollars` limits one
+request rather than cumulative spend. Keep minting namespaces separate from
+namespaces where those controls are the spend boundary, treat `can_mint` as
+trusted for the whole namespace, and keep `max_ttl` short.
+
 ```bash
 curl -s https://gateway.example/v1/tokens -H "Authorization: Bearer $GW_INBOUND_PLATFORM_KEY" -H 'content-type: application/json' -d '{"sub":"agent-7","ttl_seconds":300,"scope":["chat"],"aliases":["gpt-4o"],"max_request_microdollars":500}'
 # {"token":"axt1.…","exp":...,"expires_in":300,"namespace":"platform","sub":"agent-7"}

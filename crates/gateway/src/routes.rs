@@ -183,20 +183,21 @@ async fn mint_tokens(
     if request.sub.trim().is_empty() {
         return Err(GatewayError::BadRequest("`sub` must not be empty".into()));
     }
+    let subject = request.sub.trim().to_owned();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| GatewayError::MintingBlockedByEpoch {
             namespace: caller.namespace.clone(),
-            subject: request.sub.clone(),
+            subject: subject.clone(),
         })?
         .as_secs();
     if snapshot
-        .gateway_token_epoch(&caller.namespace, &request.sub)
+        .gateway_token_epoch(&caller.namespace, &subject)
         .is_some_and(|min_iat| min_iat > now)
     {
         return Err(GatewayError::MintingBlockedByEpoch {
             namespace: caller.namespace.clone(),
-            subject: request.sub.clone(),
+            subject: subject.clone(),
         });
     }
     let ttl = Duration::from_secs(request.ttl_seconds.unwrap_or(minting.max_ttl.as_secs()));
@@ -272,7 +273,7 @@ async fn mint_tokens(
         algorithm: minting.algorithm,
         key_material: minting.key_material.expose_secret(),
         namespace: &caller.namespace,
-        subject: &request.sub,
+        subject: &subject,
         audience: &minting.audience,
         ttl,
         aliases,
@@ -292,7 +293,7 @@ async fn mint_tokens(
             "exp": minted.exp,
             "expires_in": ttl.as_secs(),
             "namespace": caller.namespace,
-            "sub": request.sub,
+        "sub": subject,
         })),
     ))
 }
@@ -1833,23 +1834,30 @@ max_request_microdollars = 1000
             .unwrap()
             .as_secs()
             + 3600;
-        for epoch in [
-            format!("[[gateway_token_epoch]]\nnamespace = \"platform\"\nmin_iat = {future}"),
-            format!(
-                "[[gateway_token_epoch]]\nnamespace = \"platform\"\nsubject = \"agent\"\nmin_iat = {future}"
+        for (epoch, subject) in [
+            (
+                format!("[[gateway_token_epoch]]\nnamespace = \"platform\"\nmin_iat = {future}"),
+                "agent",
+            ),
+            (
+                format!(
+                    "[[gateway_token_epoch]]\nnamespace = \"platform\"\nsubject = \"agent\"\nmin_iat = {future}"
+                ),
+                " agent ",
             ),
         ] {
             let (status, body) =
-                mint_request(minting_state_with_epochs(&epoch), json!({"sub": "agent"})).await;
+                mint_request(minting_state_with_epochs(&epoch), json!({"sub": subject})).await;
             assert_eq!(status, StatusCode::FORBIDDEN);
             assert_eq!(body["error"]["type"], "minting_blocked_by_epoch");
         }
 
         let past = future - 7200;
         let epoch = format!("[[gateway_token_epoch]]\nnamespace = \"platform\"\nmin_iat = {past}");
-        let (status, _) =
-            mint_request(minting_state_with_epochs(&epoch), json!({"sub": "agent"})).await;
+        let (status, body) =
+            mint_request(minting_state_with_epochs(&epoch), json!({"sub": " agent "})).await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["sub"], "agent");
     }
 
     #[test]
