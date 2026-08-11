@@ -1,4 +1,155 @@
-use redis::aio::ConnectionManagerConfig;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use arc_swap::ArcSwap;
+use redis::Client;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
+use tokio::sync::{Notify, Semaphore};
+
+const REPLACEMENT_COOLDOWN: Duration = Duration::from_millis(250);
+pub(crate) const INVOKE_CONCURRENCY: usize = 1024;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            duration.as_millis().min(u64::MAX as u128) as u64
+        })
+}
+
+#[derive(Clone)]
+pub(crate) struct RedisConnection {
+    pub(crate) manager: ConnectionManager,
+    pub(crate) generation: u64,
+}
+
+pub(crate) struct RedisRecovery {
+    pub(crate) connection: Arc<ArcSwap<RedisConnection>>,
+    client: Client,
+    connect_timeout: Duration,
+    pub(crate) suspect_generation: Arc<AtomicU64>,
+    pub(crate) replacement_in_flight: Arc<AtomicBool>,
+    last_replacement_ms: Arc<AtomicU64>,
+    pub(crate) invoke_semaphore: Arc<Semaphore>,
+    replacement_notify: Arc<Notify>,
+}
+
+impl Drop for RedisRecovery {
+    fn drop(&mut self) {
+        self.replacement_notify.notify_one();
+    }
+}
+
+impl RedisRecovery {
+    pub(crate) fn new(
+        connection: Arc<ArcSwap<RedisConnection>>,
+        client: Client,
+        connect_timeout: Duration,
+    ) -> Arc<Self> {
+        let recovery = Arc::new(Self {
+            connection,
+            client,
+            connect_timeout,
+            suspect_generation: Arc::new(AtomicU64::new(0)),
+            replacement_in_flight: Arc::new(AtomicBool::new(false)),
+            last_replacement_ms: Arc::new(AtomicU64::new(0)),
+            invoke_semaphore: Arc::new(Semaphore::new(INVOKE_CONCURRENCY)),
+            replacement_notify: Arc::new(Notify::new()),
+        });
+        tokio::spawn(Self::replacement_worker(Arc::downgrade(&recovery)));
+        recovery
+    }
+
+    pub(crate) fn request_replacement(&self) {
+        self.replacement_notify.notify_one();
+    }
+
+    pub(crate) fn mark_suspect(&self, generation: u64) {
+        self.suspect_generation
+            .fetch_max(generation, Ordering::AcqRel);
+        self.request_replacement();
+    }
+
+    pub(crate) fn schedule_replacement(&self, generation: u64) {
+        let current = self.connection.load_full();
+        if current.generation != generation
+            || self.suspect_generation.load(Ordering::Acquire) != generation
+        {
+            return;
+        }
+        if self
+            .replacement_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let previous = self.last_replacement_ms.load(Ordering::Relaxed);
+        let connection = self.connection.clone();
+        let client = self.client.clone();
+        let connect_timeout = self.connect_timeout;
+        let suspect_generation = self.suspect_generation.clone();
+        let replacement_in_flight = self.replacement_in_flight.clone();
+        let last_replacement_ms = self.last_replacement_ms.clone();
+        tokio::spawn(async move {
+            if previous != 0 {
+                let elapsed = now_ms().saturating_sub(previous);
+                if elapsed < REPLACEMENT_COOLDOWN.as_millis() as u64 {
+                    tokio::time::sleep(
+                        REPLACEMENT_COOLDOWN.saturating_sub(Duration::from_millis(elapsed)),
+                    )
+                    .await;
+                }
+            }
+            let current = connection.load_full();
+            if current.generation != generation
+                || suspect_generation.load(Ordering::Acquire) != generation
+            {
+                replacement_in_flight.store(false, Ordering::Release);
+                return;
+            }
+            last_replacement_ms.store(now_ms(), Ordering::Relaxed);
+            let replacement = tokio::time::timeout(connect_timeout, async {
+                let mut manager =
+                    ConnectionManager::new_with_config(client, connection_manager_config()).await?;
+                redis::cmd("PING")
+                    .query_async::<String>(&mut manager)
+                    .await?;
+                Ok::<_, redis::RedisError>(manager)
+            })
+            .await;
+            if let Ok(Ok(manager)) = replacement {
+                let current = connection.load_full();
+                if current.generation == generation
+                    && suspect_generation.load(Ordering::Acquire) == generation
+                {
+                    connection.store(Arc::new(RedisConnection {
+                        manager,
+                        generation: generation + 1,
+                    }));
+                    suspect_generation.store(0, Ordering::Release);
+                }
+            }
+            replacement_in_flight.store(false, Ordering::Release);
+        });
+    }
+
+    async fn replacement_worker(worker: Weak<Self>) {
+        loop {
+            let notify = match worker.upgrade() {
+                Some(recovery) => recovery.replacement_notify.clone(),
+                None => return,
+            };
+            notify.notified().await;
+            let Some(recovery) = worker.upgrade() else {
+                return;
+            };
+            let generation = recovery.connection.load_full().generation;
+            recovery.schedule_replacement(generation);
+        }
+    }
+}
 
 pub(crate) fn connection_manager_config() -> ConnectionManagerConfig {
     // redis-rs 1.4.1 defaults response_timeout to Some(500 ms)
