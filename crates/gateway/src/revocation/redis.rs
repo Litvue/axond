@@ -69,12 +69,13 @@ impl RevocationStore for RedisRevocation {
 
     async fn revoke(&self, jti: &str, expires_at: SystemTime) -> Result<(), RevocationError> {
         validate_expiry(expires_at)?;
+        let expiry_ms = expiry_ms(expires_at)?;
         let result = tokio::time::timeout(self.timeout, async {
             redis::cmd("SET")
                 .arg(self.key(jti))
                 .arg("")
                 .arg("PXAT")
-                .arg(expiry_ms(expires_at))
+                .arg(expiry_ms)
                 .query_async::<()>(&mut self.connection.clone())
                 .await
         })

@@ -40,15 +40,34 @@ impl PostgresRevocation {
             on_unavailable,
             client: tokio::sync::Mutex::new(None),
         };
-        let client = tokio::time::timeout(connect_timeout, store.connect_client())
+        let mut client = tokio::time::timeout(connect_timeout, store.connect_client())
             .await
-            .map_err(|_| RevocationError::Invalid("Postgres connection timed out".to_owned()))?
-            .map_err(|e| RevocationError::Invalid(format!("Postgres connection failed: {e}")))?;
+            .map_err(|_| RevocationError::Startup {
+                backend: "postgres",
+                message: "connection timed out".to_owned(),
+            })?
+            .map_err(|e| RevocationError::Startup {
+                backend: "postgres",
+                message: format!("connection failed: {e}"),
+            })?;
         if create_table {
-            client
+            let transaction = client
+                .transaction()
+                .await
+                .map_err(|e| startup_error("begin schema transaction", e))?;
+            let lock_key = advisory_lock_key(table);
+            transaction
+                .query_one("SELECT pg_advisory_xact_lock($1::bigint)", &[&lock_key])
+                .await
+                .map_err(|e| startup_error("acquire schema lock", e))?;
+            transaction
                 .batch_execute(&store.schema_ddl())
                 .await
-                .map_err(|e| RevocationError::Invalid(format!("create table failed: {e}")))?;
+                .map_err(|e| startup_error("create table", e))?;
+            transaction
+                .commit()
+                .await
+                .map_err(|e| startup_error("commit schema transaction", e))?;
         }
         *store.client.lock().await = Some(client);
         Ok(store)
@@ -107,6 +126,30 @@ impl PostgresRevocation {
             *guard = None;
         }
         result
+    }
+}
+
+fn advisory_lock_key(table: &str) -> i64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in table.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash as i64
+}
+
+fn startup_error(operation: &str, error: tokio_postgres::Error) -> RevocationError {
+    let message = match error.as_db_error() {
+        Some(db_error) => format!(
+            "{operation} failed: {} (SQLSTATE {})",
+            db_error.message(),
+            db_error.code().code()
+        ),
+        None => format!("{operation} failed: {error}"),
+    };
+    RevocationError::Startup {
+        backend: "postgres",
+        message,
     }
 }
 
@@ -179,6 +222,43 @@ mod tests {
         assert!(ddl.contains("tenant.axond_revocation"));
         assert!(ddl.contains("axond_revocation_expires_at_idx"));
         assert!(!ddl.contains("tenant.axond_revocation_expires_at_idx"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_table_boots_are_serialized() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let table = format!(
+            "axond_revocation_concurrent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let first_dsn = dsn.clone();
+        let first_table = table.clone();
+        let second_dsn = dsn;
+        let second_table = table;
+        let first = PostgresRevocation::connect(
+            &first_dsn,
+            &first_table,
+            true,
+            Duration::from_millis(500),
+            Duration::from_secs(5),
+            StoreUnavailable::Deny,
+        );
+        let second = PostgresRevocation::connect(
+            &second_dsn,
+            &second_table,
+            true,
+            Duration::from_millis(500),
+            Duration::from_secs(5),
+            StoreUnavailable::Deny,
+        );
+        let (first, second) = tokio::join!(first, second);
+        first.expect("first concurrent boot");
+        second.expect("second concurrent boot");
     }
 
     #[tokio::test]

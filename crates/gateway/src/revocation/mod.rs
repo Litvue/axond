@@ -20,6 +20,11 @@ pub enum RevocationError {
         backend: &'static str,
         message: String,
     },
+    #[error("revocation backend `{backend}` failed during startup: {message}")]
+    Startup {
+        backend: &'static str,
+        message: String,
+    },
     #[error("invalid revocation backend configuration: {0}")]
     Invalid(String),
 }
@@ -67,11 +72,13 @@ fn unavailable(
     }
 }
 
-pub(crate) fn expiry_ms(expires_at: SystemTime) -> u64 {
-    expires_at
+pub(crate) fn expiry_ms(expires_at: SystemTime) -> Result<u64, RevocationError> {
+    let millis = expires_at
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
-        .as_millis() as u64
+        .as_millis();
+    u64::try_from(millis)
+        .map_err(|_| RevocationError::Invalid("--expires-at is too far in the future".to_owned()))
 }
 
 pub(crate) fn validate_expiry(expires_at: SystemTime) -> Result<(), RevocationError> {
@@ -166,5 +173,18 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("no revocation denylist"));
+    }
+
+    #[test]
+    fn expiry_millis_rejects_values_that_do_not_fit_redis() {
+        let expiry = UNIX_EPOCH
+            .checked_add(Duration::from_secs(i64::MAX as u64))
+            .expect("SystemTime supports a wide future range");
+        let error = expiry_ms(expiry).expect_err("millisecond conversion must be bounded");
+        assert!(
+            error
+                .to_string()
+                .contains("--expires-at is too far in the future")
+        );
     }
 }

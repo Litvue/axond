@@ -299,8 +299,8 @@ pub fn revoke(args: &ArgMatches) -> Result<()> {
         .cloned()
         .or_else(|| std::env::var("AXOND_CONFIG").ok())
         .unwrap_or_else(|| "axond.toml".to_owned());
-    let config = Config::load(&config_path)
-        .map_err(|error| anyhow::anyhow!("failed to load config from `{config_path}`: {error}"))?;
+    let config = load_config_path(&config_path, true)?
+        .ok_or_else(|| anyhow::anyhow!("config file `{config_path}` was not loaded"))?;
     let env = std::env::vars().collect();
     let expires_at = resolve_revocation_expiry(
         jti,
@@ -340,7 +340,9 @@ pub(crate) fn resolve_revocation_expiry(
                 .parse::<u64>()
                 .or_else(|_| crate::config::parse_gateway_rfc3339_utc(value))
                 .map_err(|_| anyhow::anyhow!("--expires-at must be unix seconds or RFC3339 UTC"))?;
-            Ok(UNIX_EPOCH + Duration::from_secs(seconds))
+            UNIX_EPOCH
+                .checked_add(Duration::from_secs(seconds))
+                .ok_or_else(|| anyhow::anyhow!("--expires-at is too far in the future"))
         }
         (None, None) => {
             let max_ttl = config
@@ -421,6 +423,9 @@ fn load_optional_config(args: &ArgMatches) -> Result<Option<Config>> {
 }
 
 fn load_config_path(path: &str, explicit: bool) -> Result<Option<Config>> {
+    if explicit && !Path::new(path).is_file() {
+        return Err(anyhow::anyhow!("config file `{path}` does not exist"));
+    }
     match Config::load(path) {
         Ok(config) => Ok(Some(config)),
         Err(error) => {
@@ -909,7 +914,8 @@ max_ttl = "15m"
             "--config",
             "/definitely/missing/axond.toml",
         ]);
-        assert!(load_optional_config(&explicit).is_err());
+        let error = load_optional_config(&explicit).unwrap_err().to_string();
+        assert!(error.contains("config file `/definitely/missing/axond.toml` does not exist"));
 
         assert!(
             load_config_path("/definitely/missing/axond.toml", false)
@@ -1136,6 +1142,14 @@ max_ttl = "{max_ttl}"
             resolve_revocation_expiry("jti-1", None, Some("2033-05-18T03:33:20Z"), &config)
                 .unwrap();
         assert_eq!(rfc3339, unix);
+
+        let error = resolve_revocation_expiry("jti-1", None, Some("18446744073709551615"), &config)
+            .expect_err("an overflowing expiry must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("--expires-at is too far in the future")
+        );
     }
 
     #[test]
