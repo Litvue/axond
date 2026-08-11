@@ -33,7 +33,8 @@ lockfile sync re-bases onto the remote branch tip with a bounded retry instead
 of force-pushing.
 
 **CI is one job per concern** (`fmt`, `clippy`, `build`, `tests`,
-`stateful-tests`, `docs`, `dependency-policy`, `static-binary`, `docker-smoke`)
+`stateful-tests`, `docs`, `dependency-policy`, `static-binary`, `docker-smoke`,
+and `publish-dry-run` per [ADR 0025](./0025-crates-io-publication.md))
 behind a single required `CI-Success` gate. The hermetic `tests` lane remains
 service-free; `stateful-tests` runs the gated Redis/Postgres tests in pinned
 service containers with `AXOND_TEST_REQUIRE_SERVICES=1`, so a missing service
@@ -54,13 +55,17 @@ and `docker-smoke` boots the image against the example config and probes
   image, plus a keyless **cosign** signature on the image digest. The release
   job verifies the signature and provenance before completing, and the image is
   smoke-tested before it is signed.
+- The `gateway-core`, `gateway-transport`, and `axond` crates.io versions, added
+  by [ADR 0025](./0025-crates-io-publication.md), published last because they are
+  the only irreversible artifact.
 
 **Supply-chain policy (`deny.toml`)** is enforced in CI and re-run daily against
 `main`. Advisories and unmaintained crates fail; the license allowlist is the
 permissive set plus `CDLA-Permissive-2.0` (Mozilla's CA bundle in
-`webpki-roots`). `wildcards = "allow"` because the workspace's own path crates
-read as wildcards and pinning them would drift from the single
-release-please-managed version; external floating ranges are caught in review.
+`webpki-roots`). `wildcards` was originally `"allow"`, because the workspace's
+own path crates read as wildcards; **[ADR 0025](./0025-crates-io-publication.md)
+supersedes that** with `"deny"`, since the internal crates now carry exact
+version requirements and crates.io rejects a wildcard dependency on publish.
 
 **PR titles are gated to Conventional Commits** so release-please can classify
 every merge.

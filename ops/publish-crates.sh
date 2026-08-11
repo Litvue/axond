@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# Publish the Axond workspace to crates.io in dependency order, idempotently.
+#
+# The three packages are a single release at one version: `gateway-core`, then
+# `gateway-transport`, then `axond`. Order matters because each package's
+# registry dependency on the previous one must already be resolvable — for
+# `cargo publish`'s own verification build and for any external consumer.
+#
+# A crates.io version is immutable, so a re-run after a partial release must not
+# re-upload what is already there: each package is skipped when the exact
+# version is already on the registry. That makes this script the resume path for
+# a release that failed halfway (see RELEASE.md), and it is why the release
+# workflow can be re-dispatched for an existing tag.
+#
+# Usage:
+#   ops/publish-crates.sh <version>              # real publish; needs CARGO_REGISTRY_TOKEN
+#   ops/publish-crates.sh [<version>] --dry-run  # package + publish dry-run, no token, no upload
+#
+# A real publish demands the version explicitly: the release workflow passes the
+# tag's version so a mismatched checkout fails instead of shipping whatever the
+# manifest happens to say. The dry-run defaults to the workspace version, which
+# is what CI checks on every pull request.
+#
+# `--dry-run` never uploads and never consults the registry for the skip check.
+# It packages and verifies the whole workspace in one cargo invocation, because
+# a per-package dry-run of `gateway-transport` or `axond` cannot resolve a
+# sibling that is not on crates.io yet; `--workspace` lets cargo satisfy the
+# registry requirements from the local packages, in dependency order.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+# Dependency order. Do not reorder: `gateway-transport` depends on
+# `gateway-core`, and `axond` depends on both.
+packages=(gateway-core gateway-transport axond)
+
+usage() {
+  echo "Usage: ops/publish-crates.sh [<version>] [--dry-run]" >&2
+}
+
+version=""
+mode="publish"
+for argument in "$@"; do
+  case "$argument" in
+    --dry-run) mode="dry-run" ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -*)
+      usage
+      exit 2
+      ;;
+    *)
+      if [[ -n "$version" ]]; then
+        usage
+        exit 2
+      fi
+      version="$argument"
+      ;;
+  esac
+done
+
+fail() {
+  echo >&2
+  echo "PUBLISH FAILED: $*" >&2
+  exit 1
+}
+
+workspace_version() {
+  cargo metadata --no-deps --format-version 1 --locked |
+    python3 -c '
+import json, sys
+metadata = json.load(sys.stdin)
+print(next(p["version"] for p in metadata["packages"] if p["name"] == "axond"))
+'
+}
+
+if [[ -z "$version" ]]; then
+  if [[ "$mode" == publish ]]; then
+    fail "a real publish requires the version explicitly, e.g. ops/publish-crates.sh 0.3.0"
+  fi
+  version="$(workspace_version)"
+  echo "dry-run against the workspace version $version"
+fi
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+  fail "'$version' is not a semantic version"
+fi
+
+# Every package ships at the single workspace version. A mismatch means the
+# release is not coherent, so refuse before touching the registry rather than
+# publishing a half-aligned set that cannot be unpublished.
+require_aligned_versions() {
+  local manifest_versions
+  manifest_versions="$(
+    cargo metadata --no-deps --format-version 1 --locked |
+      python3 -c '
+import json, sys
+metadata = json.load(sys.stdin)
+for package in sorted(metadata["packages"], key=lambda p: p["name"]):
+    print(package["name"], package["version"])
+'
+  )"
+  local name found
+  while read -r name found; do
+    [[ -n "$name" ]] || continue
+    if [[ "$found" != "$version" ]]; then
+      fail "package $name is at $found but the release is $version; align every workspace version before publishing"
+    fi
+  done <<<"$manifest_versions"
+
+  local declared
+  for name in gateway-core gateway-transport; do
+    declared="$(
+      python3 - "$name" <<'PY'
+import re, sys
+name = sys.argv[1]
+manifest = open("Cargo.toml", encoding="utf-8").read()
+match = re.search(rf'^{re.escape(name)}\s*=\s*\{{(.*)\}}\s*$', manifest, re.MULTILINE)
+if not match:
+    raise SystemExit(f"no workspace dependency entry for {name}")
+version = re.search(r'version\s*=\s*"([^"]+)"', match.group(1))
+print(version.group(1) if version else "")
+PY
+    )"
+    if [[ "$declared" != "$version" ]]; then
+      fail "[workspace.dependencies] $name declares version '$declared', not $version; external consumers would resolve the wrong release"
+    fi
+  done
+  echo "versions: all workspace packages and internal dependency requirements are at $version"
+}
+
+# The shipped DDL is an operator interface and lives in `ops/postgres/`, which is
+# outside `crates/gateway/` and therefore outside the published package. The
+# gateway embeds package-local copies under `crates/gateway/sql/`. Publishing a
+# copy that has drifted from the operator-facing file would ship a gateway that
+# builds a different table than the runbook does, so refuse — and refuse before
+# the first upload, since a published version cannot be replaced.
+# `crates/gateway/tests/shipped_ddl.rs` is the same gate in the test suite.
+require_ddl_copies_match() {
+  local operator_dir=ops/postgres packaged_dir=crates/gateway/sql name
+  local -a names=()
+  for name in "$operator_dir"/*.sql "$packaged_dir"/*.sql; do
+    [[ -e "$name" ]] || fail "no shipped DDL found in $operator_dir and $packaged_dir"
+    names+=("$(basename "$name")")
+  done
+  while read -r name; do
+    [[ -f "$operator_dir/$name" ]] ||
+      fail "$packaged_dir/$name has no $operator_dir/$name; operators applying the schema by hand would never see it"
+    [[ -f "$packaged_dir/$name" ]] ||
+      fail "$operator_dir/$name has no packaged copy at $packaged_dir/$name; the published axond package cannot embed it"
+    cmp --silent "$operator_dir/$name" "$packaged_dir/$name" ||
+      fail "$operator_dir/$name and $packaged_dir/$name differ; copy the operator-facing file over the packaged one"
+  done < <(printf '%s\n' "${names[@]}" | sort -u)
+  echo "shipped DDL: every ops/postgres file has a byte-identical packaged copy"
+}
+
+# release-please bumps the manifest strings through `extra-files` JSONPaths, and
+# its TOML updater *warns* rather than fails when a path matches nothing: an
+# unregistered or mistyped path silently leaves a version behind, and the first
+# symptom would be an incoherent release at the tag. So assert here that every
+# version string this release depends on is both reachable by a configured path
+# and already at $version — and that no internal `path` + `version` dependency
+# is missing an entry, which is the way a fourth publishable crate would
+# reintroduce the silent no-op.
+require_release_config_bumps_every_version() {
+  python3 - "$version" <<'PY' || fail "release-please-config.json does not cover every version string (see above)"
+import json
+import re
+import sys
+import tomllib
+
+release_version = sys.argv[1]
+manifest = tomllib.loads(open("Cargo.toml", "rb").read().decode("utf-8"))
+config = json.load(open("release-please-config.json", encoding="utf-8"))
+
+
+def segments(jsonpath):
+    """The member names of a plain `$.a.b` / `$['a']['b']` JSONPath.
+
+    release-please resolves these with jsonpath-plus, which accepts a hyphenated
+    key in dot notation as well as in brackets. Only the plain forms are used
+    here, so anything with a wildcard or filter is reported rather than guessed
+    at.
+    """
+    if not re.fullmatch(r"\$(\.[A-Za-z0-9_-]+|\['[^']+'\])+", jsonpath):
+        return None
+    matches = re.findall(r"\.([A-Za-z0-9_-]+)|\['([^']+)'\]", jsonpath)
+    return [dotted or bracketed for dotted, bracketed in matches]
+
+
+def resolve(names):
+    node = manifest
+    for name in names:
+        if not isinstance(node, dict) or name not in node:
+            return None
+        node = node[name]
+    return node
+
+
+problems = []
+covered = set()
+for entry in config["packages"]["."]["extra-files"]:
+    if entry.get("type") != "toml" or entry.get("path") != "Cargo.toml":
+        continue
+    jsonpath = entry["jsonpath"]
+    names = segments(jsonpath)
+    if names is None:
+        problems.append(f"{jsonpath} is not a plain member path; this gate cannot verify it")
+        continue
+    found = resolve(names)
+    if found is None:
+        problems.append(f"{jsonpath} matches nothing in Cargo.toml; release-please would only warn and leave the version unbumped")
+        continue
+    if found != release_version:
+        problems.append(f"{jsonpath} is '{found}', not {release_version}")
+    covered.add(tuple(names))
+
+if ("workspace", "package", "version") not in covered:
+    problems.append("$.workspace.package.version has no extra-files entry; the workspace version would not be bumped")
+
+for name, dependency in manifest["workspace"]["dependencies"].items():
+    if not isinstance(dependency, dict) or "path" not in dependency or "version" not in dependency:
+        continue
+    if ("workspace", "dependencies", name, "version") not in covered:
+        problems.append(
+            f"[workspace.dependencies] {name} pins a version but no extra-files entry bumps it; "
+            f"add $.workspace.dependencies.{name}.version to release-please-config.json"
+        )
+
+for problem in problems:
+    print(f"  {problem}", file=sys.stderr)
+raise SystemExit(1 if problems else 0)
+PY
+  echo "release config: every version string is bumped by an extra-files path and is at $version"
+}
+
+# 200 = this exact version is already published (immutable, so skip it).
+# 404 = absent. Anything else is an unknown registry state: refuse rather than
+# guess, because guessing "absent" risks a duplicate upload attempt mid-release.
+published() {
+  local name="$1" status
+  status="$(
+    curl --silent --show-error --location --max-time 30 --retry 3 --retry-delay 2 \
+      --output /dev/null --write-out '%{http_code}' \
+      --header 'User-Agent: axond-release (https://github.com/Litvue/axond)' \
+      "https://crates.io/api/v1/crates/${name}/${version}" || echo 000
+  )"
+  case "$status" in
+    200) return 0 ;;
+    404) return 1 ;;
+    *) fail "crates.io returned HTTP $status for ${name}@${version}; refusing to publish against an unknown registry state" ;;
+  esac
+}
+
+if [[ "$mode" == publish && -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+  fail "CARGO_REGISTRY_TOKEN is not set; a real crates.io publish needs the release token (see RELEASE.md)"
+fi
+
+require_aligned_versions
+require_release_config_bumps_every_version
+require_ddl_copies_match
+
+if [[ "$mode" == dry-run ]]; then
+  echo
+  echo "=== packaging the workspace at $version"
+  cargo package --locked --workspace
+  echo
+  echo "=== publish dry-run in dependency order: ${packages[*]}"
+  cargo publish --dry-run --locked --workspace
+  echo
+  echo "publish dry-run passed in dependency order: ${packages[*]}"
+  exit 0
+fi
+
+published_now=()
+skipped=()
+
+for name in "${packages[@]}"; do
+  echo
+  echo "=== ${name}@${version}"
+
+  if published "$name"; then
+    echo "skip: ${name}@${version} is already on crates.io (immutable); nothing to re-upload"
+    skipped+=("$name")
+    continue
+  fi
+
+  # cargo blocks until the uploaded version is visible in the index, so the
+  # next package in the order can resolve it.
+  if cargo publish --locked --package "$name"; then
+    published_now+=("$name")
+    continue
+  fi
+
+  # A publish can fail after the upload is accepted (a dropped response, a
+  # concurrent run). Re-check the registry: if the version is there, the release
+  # step succeeded and the retry is a no-op rather than a failure.
+  if published "$name"; then
+    echo "recovered: ${name}@${version} is on crates.io despite the failed publish call; continuing"
+    skipped+=("$name")
+    continue
+  fi
+  fail "could not publish ${name}@${version}; re-run this script (or re-dispatch the release) to resume from here"
+done
+
+echo
+echo "published now: ${published_now[*]:-none}"
+echo "already present: ${skipped[*]:-none}"
+echo "crates.io release $version complete in dependency order: ${packages[*]}"

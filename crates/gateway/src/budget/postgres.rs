@@ -24,7 +24,9 @@ const BACKEND: &str = "postgres";
 
 /// The DDL for the current schema version, shared with operators who apply it
 /// themselves.
-const SCHEMA_DDL: &str = include_str!("../../../../ops/postgres/budget_v1.sql");
+// Embedded from the package-local copy of `ops/postgres/budget_v1.sql`; see
+// `tests/shipped_ddl.rs`, which gates the two copies against drift.
+const SCHEMA_DDL: &str = include_str!("../../sql/budget_v1.sql");
 
 /// The table name the shipped DDL uses; substituted when another is configured.
 const DEFAULT_TABLE: &str = "axond_budget";

@@ -3,8 +3,9 @@
 default:
     @just --list
 
-# Format, lint (warnings = errors), test, docs, and supply-chain — the CI gates.
-check: fmt-check clippy test docs deny
+# Format, lint (warnings = errors), test, docs, supply-chain, and release
+# packaging — the CI gates.
+check: fmt-check clippy test docs deny publish-dry-run
 
 fmt:
     cargo fmt --all
@@ -24,6 +25,11 @@ docs:
 # Supply-chain policy: advisories, licenses, sources (see deny.toml).
 deny:
     cargo deny --locked --all-features check
+
+# Package and publish-dry-run the three crates in dependency order. No upload,
+# no token; the real publish only ever runs from the tagged release workflow.
+publish-dry-run:
+    ops/publish-crates.sh --dry-run
 
 # Provider-SDK compatibility: the vendors' own Python SDKs against a real
 # axond and the committed fixtures. Offline; needs python3.

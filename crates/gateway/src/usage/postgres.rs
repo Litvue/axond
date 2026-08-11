@@ -25,12 +25,15 @@ use super::{ObservedRecord, SinkFailure, UsageRecord, UsageSink, UsageSinkError}
 /// The DDL for the current schema version, shared with operators who apply it
 /// themselves. The table and the serialized record are one schema with one
 /// version — [`UsageRecord::SCHEMA_VERSION`] — not two that can drift.
-const SCHEMA_DDL: &str = include_str!("../../../../ops/postgres/usage_v2.sql");
+// Embedded from the package-local copy of `ops/postgres/usage_v2.sql`, because
+// `ops/` is outside this crate and so outside the published package.
+// `tests/shipped_ddl.rs` fails if the two copies differ by a byte.
+const SCHEMA_DDL: &str = include_str!("../../sql/usage_v2.sql");
 
 /// Additive migrations for the current schema version. These are applied after
 /// the base DDL for fresh tables; existing installations apply them before
 /// deploying a writer that emits the new column.
-const ADDITIVE_DDL: &str = include_str!("../../../../ops/postgres/usage_v1_001_add_signer_kid.sql");
+const ADDITIVE_DDL: &str = include_str!("../../sql/usage_v1_001_add_signer_kid.sql");
 
 /// The table name the shipped DDL uses; substituted when the sink is configured
 /// with another one.

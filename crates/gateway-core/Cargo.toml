@@ -1,10 +1,18 @@
 [package]
 name = "gateway-core"
-version = "0.0.0"
-edition = "2024"
-license = "Apache-2.0 OR MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "Runtime-neutral LLM provider adapters, wire translation, and routing primitives for the Axond AI gateway."
-repository = "https://github.com/Litvue/axond"
+keywords = ["llm", "gateway", "openai", "anthropic", "proxy"]
+categories = ["api-bindings", "web-programming"]
+# Only the library sources ship; the workspace README is added by Cargo because
+# `readme` is inherited from the workspace.
+include = ["src/**/*.rs"]
 
 [lib]
 name = "gateway_core"
