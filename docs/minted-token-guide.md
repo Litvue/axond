@@ -39,6 +39,8 @@ available controls are a short `max_ttl`, removing the signing `kid` to revoke
 all tokens for that verifier, and `[[gateway_token_epoch]]` `min_iat` to revoke
 tokens issued before a configured time. The token itself is the issuance
 receipt; this Tier 0 path does not maintain an issuance registry.
+Because epochs are the revocation mechanism for minted tokens, every deployment
+that enables gateway minting must configure the applicable namespace epochs.
 
 ```bash
 curl -s https://gateway.example/v1/tokens -H "Authorization: Bearer $GW_INBOUND_PLATFORM_KEY" -H 'content-type: application/json' -d '{"sub":"agent-7","ttl_seconds":300,"scope":["chat"],"aliases":["gpt-4o"],"max_request_microdollars":500}'

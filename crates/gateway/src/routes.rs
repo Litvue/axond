@@ -47,10 +47,12 @@ use tracing::{Instrument, debug, warn};
 
 use crate::aliases::AliasScope;
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
-use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target};
+use crate::config::{
+    Model, Provider, ProviderKind, ProviderWire, Target, gateway_token_min_iat,
+};
 use crate::credentials::{CredentialPlan, CredentialSource, CredentialStatusView};
 use crate::error::GatewayError;
-use crate::mint::{MintRequest, mint_token};
+use crate::mint::{MintRequest, mint_issued_at, mint_token_at};
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
 use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
@@ -251,18 +253,30 @@ async fn mint_tokens(
     {
         return Err(GatewayError::MintClaimsNotNarrowing);
     }
-    let minted = mint_token(MintRequest {
-        kid: &minting.kid,
-        algorithm: minting.algorithm,
-        key_material: minting.key_material.expose_secret(),
-        namespace: &caller.namespace,
-        subject: &request.sub,
-        audience: &minting.audience,
-        ttl,
-        aliases,
-        max_request_microdollars,
-        scope,
-    })
+    let epoch = gateway_token_min_iat(&snapshot.config, &caller.namespace, &request.sub);
+    let iat = epoch
+        .map(|min_iat| {
+            mint_issued_at(Some(min_iat)).map_err(|_| GatewayError::MintEpochNotUsable {
+                kid: minting.kid.clone(),
+                min_iat,
+            })
+        })
+        .transpose()?;
+    let minted = mint_token_at(
+        MintRequest {
+            kid: &minting.kid,
+            algorithm: minting.algorithm,
+            key_material: minting.key_material.expose_secret(),
+            namespace: &caller.namespace,
+            subject: &request.sub,
+            audience: &minting.audience,
+            ttl,
+            aliases,
+            max_request_microdollars,
+            scope,
+        },
+        iat,
+    )
     .map_err(|error| GatewayError::BadRequest(error.to_string()))?;
     Ok(Json(json!({
         "token": minted.token,
@@ -1624,7 +1638,7 @@ mod tests {
     use super::*;
     use crate::aliases::AliasScope;
     use crate::budget::NoBudget;
-    use crate::config::Config;
+    use crate::config::{Config, GatewayTokenEpoch};
     use crate::rate_limit::{InMemoryRateLimiter, NoLimit, RateLimitKey, RateLimiter};
     use crate::usage::{StdoutSink, UsageFanout, UsageSink};
     use axum::body::Body;
@@ -1636,7 +1650,7 @@ mod tests {
     use std::future::pending;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::sync::oneshot;
     use tower::util::ServiceExt;
 
@@ -2603,6 +2617,54 @@ max_ttl = "15m"
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn minting_honors_epochs_and_rejects_an_unusable_future_epoch() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs();
+        let env = HashMap::from([
+            ("MINT_KEY".to_owned(), "mint-key".to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
+
+        let state = minting_state();
+        let mut config = state.config().config.clone();
+        config.gateway_token_epoch.push(GatewayTokenEpoch {
+            namespace: "platform".to_owned(),
+            subject: Some("epoch-agent".to_owned()),
+            min_iat: now.saturating_sub(1),
+        });
+        state.publish(ConfigSnapshot::build(config, &env, 1).unwrap());
+        let (status, body) = mint_request(state.clone(), json!({"sub": "epoch-agent"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let token = body["token"].as_str().expect("minted token");
+        assert!(
+            state
+                .config()
+                .resolve_principal(&Presented { credential: token })
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let state = minting_state();
+        let mut config = state.config().config.clone();
+        let min_iat = now.saturating_add(60);
+        config.gateway_token_epoch.push(GatewayTokenEpoch {
+            namespace: "platform".to_owned(),
+            subject: Some("future-agent".to_owned()),
+            min_iat,
+        });
+        state.publish(ConfigSnapshot::build(config, &env, 1).unwrap());
+        let (status, body) = mint_request(state, json!({"sub": "future-agent"})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["type"], "mint_epoch_not_usable");
     }
 
     #[tokio::test]

@@ -19,7 +19,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 
 use crate::aliases::AliasScope;
-use crate::config::{Config, GatewayVerifierAlgorithm, MAX_GATEWAY_VERIFIER_TTL_SECONDS};
+use crate::config::{
+    Config, GatewayVerifierAlgorithm, MAX_GATEWAY_VERIFIER_TTL_SECONDS, gateway_token_min_iat,
+};
 use crate::principals::Capability;
 
 #[derive(Debug, Serialize)]
@@ -186,18 +188,26 @@ fn mint_from_args(args: &ArgMatches, config: Option<Config>, key_material: &str)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
 
-    Ok(mint_token(MintRequest {
-        kid,
-        algorithm,
-        key_material,
-        namespace,
-        subject,
-        audience: &audience,
-        ttl,
-        aliases,
-        max_request_microdollars,
-        scope,
-    })?
+    let iat = config
+        .as_ref()
+        .and_then(|config| gateway_token_min_iat(config, namespace, subject))
+        .map(|min_iat| mint_issued_at(Some(min_iat)))
+        .transpose()?;
+    Ok(mint_token_at(
+        MintRequest {
+            kid,
+            algorithm,
+            key_material,
+            namespace,
+            subject,
+            audience: &audience,
+            ttl,
+            aliases,
+            max_request_microdollars,
+            scope,
+        },
+        iat,
+    )?
     .token)
 }
 
@@ -219,7 +229,29 @@ pub(crate) struct MintedToken {
     pub(crate) exp: u64,
 }
 
+#[cfg(test)]
 pub(crate) fn mint_token(request: MintRequest<'_>) -> Result<MintedToken> {
+    mint_token_at(request, None)
+}
+
+pub(crate) fn mint_issued_at(min_iat: Option<u64>) -> Result<u64> {
+    const CLOCK_SKEW_SECONDS: u64 = 5;
+    let now = unix_now()?;
+    match min_iat {
+        Some(min_iat) if min_iat > now.saturating_add(CLOCK_SKEW_SECONDS) => {
+            bail!(
+                "configured token epoch {min_iat} is too far in the future to issue a valid token"
+            );
+        }
+        Some(min_iat) => Ok(now.max(min_iat)),
+        None => Ok(now),
+    }
+}
+
+pub(crate) fn mint_token_at(
+    request: MintRequest<'_>,
+    issued_at: Option<u64>,
+) -> Result<MintedToken> {
     let MintRequest {
         kid,
         algorithm,
@@ -233,10 +265,10 @@ pub(crate) fn mint_token(request: MintRequest<'_>) -> Result<MintedToken> {
         scope,
     } = request;
     let encoding_key = encoding_key(algorithm, key_material, kid)?;
-    let now = unix_now()?;
+    let iat = issued_at.unwrap_or(unix_now()?);
     let claims = MintClaims {
-        exp: now + ttl.as_secs(),
-        iat: now,
+        exp: iat + ttl.as_secs(),
+        iat,
         aud: audience.to_owned(),
         jti: random_jti()?,
         ns: namespace.to_owned(),

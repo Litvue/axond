@@ -763,6 +763,26 @@ pub struct GatewayTokenEpoch {
     pub min_iat: u64,
 }
 
+/// Return the epoch that token verification applies to a namespace and subject.
+/// Subject-specific entries take precedence over the namespace-wide entry.
+pub(crate) fn gateway_token_min_iat(
+    config: &Config,
+    namespace: &str,
+    subject: &str,
+) -> Option<u64> {
+    config
+        .gateway_token_epoch
+        .iter()
+        .find(|epoch| epoch.namespace == namespace && epoch.subject.as_deref() == Some(subject))
+        .or_else(|| {
+            config
+                .gateway_token_epoch
+                .iter()
+                .find(|epoch| epoch.namespace == namespace && epoch.subject.is_none())
+        })
+        .map(|epoch| epoch.min_iat)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum GatewayVerifierAlgorithm {
     #[serde(rename = "EdDSA")]
