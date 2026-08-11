@@ -178,6 +178,8 @@ impl RotationHandle {
                 Err(err) if is_stream_rate_limited(&err) => {
                     (self.record_failure)(&lease);
                 }
+                // A non-rate-limit reopen error ends this credential walk,
+                // matching stream-open dispatch before target failover.
                 Err(err) => return Err(err),
             }
         }
@@ -423,6 +425,15 @@ impl Relay {
                                     if err.is_credential_rate_limited()
                                         && !matches!(self.phase, Phase::Streaming) =>
                                 {
+                                    // A post-Done rate limit follows a successful
+                                    // relay; do not penalize the serving credential.
+                                    return;
+                                }
+                                Err(err) if err.is_credential_rate_limited() => {
+                                    if let Some(rotation) = self.rotation.as_ref() {
+                                        rotation.record_serving_failure();
+                                    }
+                                    self.phase = Phase::Failed(err.to_string());
                                     return;
                                 }
                                 Err(err) => {
@@ -1761,6 +1772,7 @@ targets = [
         let ledger = Arc::new(Ledger::default());
         let ledger_for_relay = ledger.clone();
         let calls = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(AtomicUsize::new(0));
         let calls_for_open = calls.clone();
         let opener = move |_lease: CredentialLease, _attempt: u32, _index: usize| {
             let calls = calls_for_open.clone();
@@ -1788,7 +1800,12 @@ targets = [
                 test_lease("a"),
                 1,
                 opener,
-                |_| {},
+                {
+                    let failures = failures.clone();
+                    move |_| {
+                        failures.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
                 |_| {},
             )),
         );
@@ -1864,6 +1881,7 @@ targets = [
     async fn post_content_rate_limit_is_terminal_without_rotation() {
         let ledger = Arc::new(Ledger::default());
         let calls = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(AtomicUsize::new(0));
         let calls_for_open = calls.clone();
         let opener = move |_lease: CredentialLease, _attempt: u32, _index: usize| {
             let calls = calls_for_open.clone();
@@ -1891,7 +1909,12 @@ targets = [
                 test_lease("a"),
                 1,
                 opener,
-                |_| {},
+                {
+                    let failures = failures.clone();
+                    move |_| {
+                        failures.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
                 |_| {},
             )),
         );
@@ -1903,6 +1926,8 @@ targets = [
         assert!(output.contains("\"content\":\"a\""));
         assert!(output.contains("OpenAI stream rate limited"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

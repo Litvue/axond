@@ -1123,14 +1123,17 @@ async fn stream_with_failover(
         }
         for (lease_index, lease) in plan.attempts.iter().enumerate() {
             if Instant::now() >= deadline {
-                telemetry::finish_upstream_attempt(
-                    &attempt_span,
-                    telemetry::ATTEMPT_ERROR,
-                    attempt_started.elapsed().as_millis() as u64,
-                    None,
-                );
                 if lease_index > 0 {
+                    telemetry::finish_upstream_attempt(
+                        &attempt_span,
+                        telemetry::ATTEMPT_ERROR,
+                        attempt_started.elapsed().as_millis() as u64,
+                        None,
+                    );
                     walk.attempts += 1;
+                } else {
+                    // No open was issued, so this target has no attempt span.
+                    drop(attempt_span);
                 }
                 break 'targets;
             }
