@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use redis::aio::ConnectionLike;
-use redis::aio::{ConnectionManager, ConnectionManagerConfig};
+use redis::aio::ConnectionManager;
 use redis::{Client, Script};
 use ring::rand::{SecureRandom, SystemRandom};
 use thiserror::Error;
@@ -171,8 +171,11 @@ impl SharedRecovery {
             }
             last_replacement_ms.store(now_ms(), Ordering::Relaxed);
             let replacement = tokio::time::timeout(connect_timeout, async {
-                let mut connection =
-                    ConnectionManager::new_with_config(client, connection_manager_config()).await?;
+                let mut connection = ConnectionManager::new_with_config(
+                    client,
+                    crate::redis_support::connection_manager_config(),
+                )
+                .await?;
                 redis::cmd("PING")
                     .query_async::<String>(&mut connection)
                     .await?;
@@ -463,14 +466,6 @@ fn reclaim_timed_out_acquire(
     }
 }
 
-fn connection_manager_config() -> ConnectionManagerConfig {
-    // redis-rs 1.4.1 defaults response_timeout to Some(500 ms)
-    // (src/client.rs::DEFAULT_RESPONSE_TIMEOUT). Its internal cancellation
-    // can drop a multiplexed waiter and misalign later replies, so invoke
-    // tasks own the deadline and retire the generation if it expires.
-    ConnectionManagerConfig::new().set_response_timeout(None)
-}
-
 pub struct RedisRateLimiter {
     key_prefix: String,
     max_in_flight: usize,
@@ -507,8 +502,11 @@ impl RedisRateLimiter {
         let client = redis::Client::open(url)?;
         let release_client = client.clone();
         let connection = tokio::time::timeout(connect_timeout, async {
-            let mut connection =
-                ConnectionManager::new_with_config(client, connection_manager_config()).await?;
+            let mut connection = ConnectionManager::new_with_config(
+                client,
+                crate::redis_support::connection_manager_config(),
+            )
+            .await?;
             redis::cmd("PING")
                 .query_async::<String>(&mut connection)
                 .await?;

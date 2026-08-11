@@ -24,7 +24,11 @@ impl RedisRevocation {
         let client = redis::Client::open(url)
             .map_err(|e| RevocationError::Invalid(format!("unusable URL: {e}")))?;
         let connection = tokio::time::timeout(connect_timeout, async {
-            let mut connection = ConnectionManager::new(client).await?;
+            let mut connection = ConnectionManager::new_with_config(
+                client,
+                crate::redis_support::connection_manager_config(),
+            )
+            .await?;
             redis::cmd("PING")
                 .query_async::<String>(&mut connection)
                 .await?;
@@ -53,40 +57,58 @@ impl RevocationStore for RedisRevocation {
     }
 
     async fn is_revoked(&self, jti: &str) -> Result<bool, RevocationError> {
-        let result = tokio::time::timeout(self.timeout, async {
-            redis::cmd("EXISTS")
-                .arg(self.key(jti))
-                .query_async::<bool>(&mut self.connection.clone())
-                .await
+        let key = self.key(jti);
+        let timeout = self.timeout;
+        let connection = self.connection.clone();
+        // Keep the Redis future in an owned task: cancelling a multiplexed
+        // waiter at the request boundary can misalign later replies. The task
+        // owns the configured deadline and response-timeout is disabled in the
+        // shared manager configuration.
+        let result = tokio::spawn(async move {
+            let mut connection = connection;
+            tokio::time::timeout(timeout, async move {
+                redis::cmd("EXISTS")
+                    .arg(key)
+                    .query_async::<bool>(&mut connection)
+                    .await
+            })
+            .await
         })
         .await;
         match result {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => unavailable(self.on_unavailable, "redis", error),
-            Err(_) => unavailable(self.on_unavailable, "redis", "operation timed out"),
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(error))) => unavailable(self.on_unavailable, "redis", error),
+            Ok(Err(_)) | Err(_) => unavailable(self.on_unavailable, "redis", "operation timed out"),
         }
     }
 
     async fn revoke(&self, jti: &str, expires_at: SystemTime) -> Result<(), RevocationError> {
         validate_expiry(expires_at)?;
         let expiry_ms = expiry_ms(expires_at)?;
-        let result = tokio::time::timeout(self.timeout, async {
-            redis::cmd("SET")
-                .arg(self.key(jti))
-                .arg("")
-                .arg("PXAT")
-                .arg(expiry_ms)
-                .query_async::<()>(&mut self.connection.clone())
-                .await
+        let key = self.key(jti);
+        let timeout = self.timeout;
+        let connection = self.connection.clone();
+        let result = tokio::spawn(async move {
+            let mut connection = connection;
+            tokio::time::timeout(timeout, async move {
+                redis::cmd("SET")
+                    .arg(key)
+                    .arg("")
+                    .arg("PXAT")
+                    .arg(expiry_ms)
+                    .query_async::<()>(&mut connection)
+                    .await
+            })
+            .await
         })
         .await;
         match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(RevocationError::Unavailable {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(RevocationError::Unavailable {
                 backend: "redis",
                 message: error.to_string(),
             }),
-            Err(_) => Err(RevocationError::Unavailable {
+            Ok(Err(_)) | Err(_) => Err(RevocationError::Unavailable {
                 backend: "redis",
                 message: "operation timed out".to_owned(),
             }),
