@@ -353,7 +353,11 @@ impl ReloadSummary {
                             &m.aliases,
                             &m.max_request_microdollars,
                         )
-                    }))
+                    })
+                    || (before_config.gateway_minting.is_some()
+                        && after_config.gateway_minting.is_some()
+                        && before.gateway_minting.as_ref().map(|m| m.max_ttl)
+                            != after.gateway_minting.as_ref().map(|m| m.max_ttl)))
                 .then(|| "enabled".to_owned())
                 .into_iter()
                 .chain(
@@ -1033,6 +1037,33 @@ max_ttl = "10m"
         let removed = ReloadSummary::between(&boot, &enabled, &disabled);
         assert_eq!(removed.gateway_minting.removed, vec!["enabled".to_owned()]);
         assert!(removed.gateway_minting.changed.is_empty());
+    }
+
+    #[test]
+    fn reload_summary_reports_inherited_minting_ttl_changes() {
+        let before_config = WITH_GATEWAY_MINTING.replace("max_ttl = \"10m\"\n", "");
+        let after_config = before_config.replace("max_ttl = \"15m\"", "max_ttl = \"20m\"");
+        let before = ConfigSnapshot::build(
+            Config::from_toml_str(&before_config).unwrap(),
+            &minting_env(),
+            0,
+        )
+        .unwrap();
+        let after = ConfigSnapshot::build(
+            Config::from_toml_str(&after_config).unwrap(),
+            &minting_env(),
+            1,
+        )
+        .unwrap();
+        let boot = Boot {
+            bind: before.config.server.bind,
+            usage_sink: before.config.usage_sink.clone(),
+            budget: before.config.budget.clone(),
+            rate_limit: before.config.rate_limit.clone(),
+            revocation: before.config.revocation.clone(),
+        };
+        let summary = ReloadSummary::between(&boot, &before, &after);
+        assert_eq!(summary.gateway_minting.changed, vec!["enabled".to_owned()]);
     }
 
     /// An issuance epoch is part of the immutable candidate snapshot: SIGHUP

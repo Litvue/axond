@@ -192,7 +192,7 @@ signing key in the gateway.
 | --- | --- | --- | --- |
 | `kid` | string | — | Existing verifier key identifier used for the minted token. |
 | `env` / `file` | string | — | Exactly one signing-material source; resolved at boot and reload. |
-| `max_ttl` | duration | verifier `max_ttl` | Issuance ceiling, never above the matching verifier's ceiling and at most 24h. |
+| `max_ttl` | duration | verifier `max_ttl` | Issuance ceiling, never above the matching verifier's ceiling and at most 24h. When omitted, it tracks the verifier's `max_ttl`; raising that verifier ceiling also raises the issuance ceiling. |
 | `scope` | array of string | — | Optional capability ceiling. Omitted requests inherit it. |
 | `aliases` | array of string | — | Optional alias-pattern ceiling. Omitted requests inherit it. |
 | `max_request_microdollars` | u64 | — | Optional per-request ceiling. Omitted requests inherit it. |
