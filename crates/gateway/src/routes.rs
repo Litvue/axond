@@ -1821,7 +1821,7 @@ namespace = "platform"
 can_mint = true
 
 [gateway_token]
-audience = "test-audience"
+audience = "{audience}"
 
 [[gateway_verifier]]
 kid = "mint-kid"
