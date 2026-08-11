@@ -19,10 +19,22 @@ set +a
 project_name="axond-quickstart-smoke-$$"
 smoke_port="${AXOND_QUICKSTART_SMOKE_PORT:-8080}"
 base_url="http://127.0.0.1:${smoke_port}"
+probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/axond-compose-smoke.XXXXXX")"
+healthz_file="${probe_dir}/healthz"
+readyz_file="${probe_dir}/readyz"
+platform_models_file="${probe_dir}/platform-models"
+acme_models_file="${probe_dir}/acme-models"
+unauth_file="${probe_dir}/unauth"
+chat_file="${probe_dir}/chat"
+# The gateway default is 30,000 ms (crates/gateway/src/config.rs). Keep the
+# client deadline five seconds beyond it so typed transport errors can surface.
+gateway_overall_timeout_ms=30000
+chat_timeout_seconds=$((gateway_overall_timeout_ms / 1000 + 5))
 compose=(env "AXOND_QUICKSTART_HOST_PORT=127.0.0.1:${smoke_port}" docker compose --project-name "$project_name")
 
 cleanup() {
   "${compose[@]}" down -v >/dev/null 2>&1 || true
+  rm -rf "$probe_dir"
 }
 trap cleanup EXIT
 
@@ -31,8 +43,7 @@ AXOND_QUICKSTART_CONFIG=./ops/compose/axond.quickstart.toml \
   "${compose[@]}" up -d --build
 healthy=false
 for attempt in $(seq 1 60); do
-  : > /tmp/axond-compose-healthz
-  if curl --fail --silent "${base_url}/healthz" >/tmp/axond-compose-healthz; then
+  if curl --fail --silent "${base_url}/healthz" >"$healthz_file"; then
     healthy=true
     break
   fi
@@ -45,41 +56,36 @@ if [[ "$healthy" != true ]]; then
 fi
 
 printf 'healthz: '
-: > /tmp/axond-compose-healthz
-curl --fail --silent "${base_url}/healthz" >/tmp/axond-compose-healthz
-cat /tmp/axond-compose-healthz
+curl --fail --silent "${base_url}/healthz" >"$healthz_file"
+cat "$healthz_file"
 echo
 printf 'readyz: '
-: > /tmp/axond-compose-readyz
-curl --fail --silent "${base_url}/readyz" >/tmp/axond-compose-readyz
-cat /tmp/axond-compose-readyz
+curl --fail --silent "${base_url}/readyz" >"$readyz_file"
+cat "$readyz_file"
 echo
 printf 'platform models: '
-: > /tmp/axond-compose-platform-models
 curl --fail --silent \
   -H "Authorization: Bearer ${GW_INBOUND_PLATFORM_KEY}" \
-  "${base_url}/v1/models" >/tmp/axond-compose-platform-models
-cat /tmp/axond-compose-platform-models
+  "${base_url}/v1/models" >"$platform_models_file"
+cat "$platform_models_file"
 echo
 printf 'acme models: '
-: > /tmp/axond-compose-acme-models
 curl --fail --silent \
   -H "Authorization: Bearer ${GW_INBOUND_ACME_KEY}" \
-  "${base_url}/v1/models" >/tmp/axond-compose-acme-models
-cat /tmp/axond-compose-acme-models
+  "${base_url}/v1/models" >"$acme_models_file"
+cat "$acme_models_file"
 echo
 printf 'unauthenticated models: '
-: > /tmp/axond-compose-unauth
-unauth_status="$(curl --silent --show-error --output /tmp/axond-compose-unauth \
+unauth_status="$(curl --silent --show-error --output "$unauth_file" \
   --write-out '%{http_code}' "${base_url}/v1/models")"
 [[ "$unauth_status" == 401 ]]
 printf '%s ' "$unauth_status"
-cat /tmp/axond-compose-unauth
+cat "$unauth_file"
 echo
 printf 'placeholder chat/completions: '
-: > /tmp/axond-compose-chat
-if chat_status="$(curl --silent --show-error --output /tmp/axond-compose-chat \
-    --connect-timeout 5 --max-time 30 \
+: >"$chat_file"
+if chat_status="$(curl --silent --show-error --output "$chat_file" \
+    --connect-timeout 5 --max-time "$chat_timeout_seconds" \
     --write-out '%{http_code}' \
     -H "Authorization: Bearer ${GW_INBOUND_PLATFORM_KEY}" \
     -H 'content-type: application/json' \
@@ -91,13 +97,13 @@ else
   chat_status="curl_exit_${curl_status}"
 fi
 printf '%s ' "$chat_status"
-cat /tmp/axond-compose-chat
+cat "$chat_file"
 echo
 if [[ "$chat_status" == 200 ]]; then
   echo "chat/completions: provider success"
 elif [[ "$chat_status" =~ ^[45][0-9][0-9]$ ]] \
-  && grep -q '"error"' /tmp/axond-compose-chat \
-  && grep -q '"type"' /tmp/axond-compose-chat; then
+  && grep -q '"error"' "$chat_file" \
+  && grep -q '"type"' "$chat_file"; then
   echo "chat/completions: typed provider/transport error"
 else
   echo "unexpected chat/completions result: HTTP $chat_status" >&2
