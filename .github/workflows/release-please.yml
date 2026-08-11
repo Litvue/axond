@@ -150,9 +150,9 @@ jobs:
       - name: Resolve automatic or requested release
         id: release
         env:
-          AUTO_RELEASE_CREATED: ${{ needs.release-please.outputs.release_created }}
-          AUTO_TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
-          AUTO_VERSION: ${{ needs.release-please.outputs.version }}
+          AUTO_RELEASE_CREATED: ${{ needs['release-please'].outputs.release_created }}
+          AUTO_TAG_NAME: ${{ needs['release-please'].outputs.tag_name }}
+          AUTO_VERSION: ${{ needs['release-please'].outputs.version }}
           DISPATCH_TAG_NAME: ${{ inputs.release_tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -188,7 +188,10 @@ jobs:
   release-binaries:
     name: Binary ${{ matrix.target }}
     needs: release-metadata
-    if: needs.release-metadata.outputs.release_created == 'true'
+    if: >-
+      !cancelled() &&
+      needs['release-metadata'].result == 'success' &&
+      needs['release-metadata'].outputs.release_created == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -212,13 +215,13 @@ jobs:
       attestations: write
       artifact-metadata: write
     env:
-      RELEASE_TAG: ${{ needs.release-metadata.outputs.tag_name }}
-      RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+      RELEASE_TAG: ${{ needs['release-metadata'].outputs.tag_name }}
+      RELEASE_VERSION: ${{ needs['release-metadata'].outputs.version }}
       RELEASE_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.release-metadata.outputs.tag_name }}
+          ref: ${{ needs['release-metadata'].outputs.tag_name }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
@@ -258,18 +261,18 @@ jobs:
         with:
           path: release-bin
           format: spdx-json
-          output-file: dist/axond-${{ needs.release-metadata.outputs.version }}-${{ matrix.target }}.spdx.json
+          output-file: dist/axond-${{ needs['release-metadata'].outputs.version }}-${{ matrix.target }}.spdx.json
           upload-artifact: false
           upload-release-assets: false
       - name: Attest binary provenance
         uses: actions/attest@v4
         with:
-          subject-path: dist/axond-${{ needs.release-metadata.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+          subject-path: dist/axond-${{ needs['release-metadata'].outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
       - name: Attest binary SBOM
         uses: actions/attest@v4
         with:
-          subject-path: dist/axond-${{ needs.release-metadata.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
-          sbom-path: dist/axond-${{ needs.release-metadata.outputs.version }}-${{ matrix.target }}.spdx.json
+          subject-path: dist/axond-${{ needs['release-metadata'].outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+          sbom-path: dist/axond-${{ needs['release-metadata'].outputs.version }}-${{ matrix.target }}.spdx.json
       - name: Attach Unix binary assets
         if: runner.os != 'Windows'
         shell: bash
@@ -288,7 +291,10 @@ jobs:
   release-image:
     name: Signed OCI image
     needs: release-metadata
-    if: needs.release-metadata.outputs.release_created == 'true'
+    if: >-
+      !cancelled() &&
+      needs['release-metadata'].result == 'success' &&
+      needs['release-metadata'].outputs.release_created == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -297,12 +303,12 @@ jobs:
       attestations: write
       artifact-metadata: write
     env:
-      RELEASE_TAG: ${{ needs.release-metadata.outputs.tag_name }}
-      RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+      RELEASE_TAG: ${{ needs['release-metadata'].outputs.tag_name }}
+      RELEASE_VERSION: ${{ needs['release-metadata'].outputs.version }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.release-metadata.outputs.tag_name }}
+          ref: ${{ needs['release-metadata'].outputs.tag_name }}
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -317,8 +323,8 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           flavor: latest=false
           tags: |
-            type=raw,value=${{ needs.release-metadata.outputs.version }}
-            type=raw,value=sha-${{ needs.release-metadata.outputs.short_sha }}
+            type=raw,value=${{ needs['release-metadata'].outputs.version }}
+            type=raw,value=sha-${{ needs['release-metadata'].outputs.short_sha }}
       - name: Build and publish the image
         id: image
         uses: docker/build-push-action@v6
@@ -331,8 +337,8 @@ jobs:
           labels: |
             ${{ steps.metadata.outputs.labels }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ needs.release-metadata.outputs.commit_sha }}
-            org.opencontainers.image.version=${{ needs.release-metadata.outputs.version }}
+            org.opencontainers.image.revision=${{ needs['release-metadata'].outputs.commit_sha }}
+            org.opencontainers.image.version=${{ needs['release-metadata'].outputs.version }}
           provenance: false
           sbom: false
       - name: Smoke the published image before signing
@@ -342,7 +348,7 @@ jobs:
         with:
           image: ${{ env.IMAGE_NAME }}@${{ steps.image.outputs.digest }}
           format: spdx-json
-          output-file: axond-image-${{ needs.release-metadata.outputs.version }}.spdx.json
+          output-file: axond-image-${{ needs['release-metadata'].outputs.version }}.spdx.json
           upload-artifact: false
           upload-release-assets: false
       - name: Attest image provenance
@@ -356,7 +362,7 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.image.outputs.digest }}
-          sbom-path: axond-image-${{ needs.release-metadata.outputs.version }}.spdx.json
+          sbom-path: axond-image-${{ needs['release-metadata'].outputs.version }}.spdx.json
           push-to-registry: true
       - uses: sigstore/cosign-installer@v3
       - name: Sign the digest keylessly
@@ -392,13 +398,18 @@ jobs:
       - release-metadata
       - release-binaries
       - release-image
-    if: always() && needs.release-metadata.outputs.release_created == 'true'
+    if: >-
+      always() &&
+      (needs['release-metadata'].result != 'success' ||
+       needs['release-metadata'].outputs.release_created == 'true')
     runs-on: ubuntu-latest
     steps:
       - name: Require every release lane
         run: |
-          test "${{ needs.release-binaries.result }}" = success
-          test "${{ needs.release-image.result }}" = success
+          test "${{ needs['release-metadata'].result }}" = success
+          test "${{ needs['release-metadata'].outputs.release_created }}" = true
+          test "${{ needs['release-binaries'].result }}" = success
+          test "${{ needs['release-image'].result }}" = success
 
   # crates.io is the one irreversible lane: a published version can be yanked
   # but never replaced or removed. So it runs last, only after the tagged
@@ -411,12 +422,16 @@ jobs:
     needs:
       - release-metadata
       - release-success
-    if: needs.release-metadata.outputs.release_created == 'true'
+    if: >-
+      !cancelled() &&
+      needs['release-metadata'].result == 'success' &&
+      needs['release-success'].result == 'success' &&
+      needs['release-metadata'].outputs.release_created == 'true'
     # Serialize per tag so a re-dispatch cannot race the original run into a
     # duplicate upload; never cancel, because a cancelled publish is the one
     # that may have uploaded without recording it.
     concurrency:
-      group: release-crates-${{ needs.release-metadata.outputs.tag_name }}
+      group: release-crates-${{ needs['release-metadata'].outputs.tag_name }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     # Holds CARGO_REGISTRY_TOKEN, so the token is reachable only from this job
@@ -428,8 +443,8 @@ jobs:
       # reason to write to the repository or the release.
       checks: read
     env:
-      RELEASE_TAG: ${{ needs.release-metadata.outputs.tag_name }}
-      RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+      RELEASE_TAG: ${{ needs['release-metadata'].outputs.tag_name }}
+      RELEASE_VERSION: ${{ needs['release-metadata'].outputs.version }}
     steps:
       # The artifact lanes above rebuild the tagged commit but do not re-run the
       # full test matrix, so require the commit's own `CI Success` aggregate
@@ -437,7 +452,7 @@ jobs:
       - name: Require CI to be green for the released commit
         env:
           GH_TOKEN: ${{ github.token }}
-          COMMIT_SHA: ${{ needs.release-metadata.outputs.commit_sha }}
+          COMMIT_SHA: ${{ needs['release-metadata'].outputs.commit_sha }}
         run: |
           set -euo pipefail
           for attempt in $(seq 1 60); do
@@ -465,7 +480,7 @@ jobs:
           exit 1
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.release-metadata.outputs.tag_name }}
+          ref: ${{ needs['release-metadata'].outputs.tag_name }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
