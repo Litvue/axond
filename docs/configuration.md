@@ -40,6 +40,7 @@ egress: upstream provider calls still use the network at Tier 0.
 | `[rate_limit] backend = "none"` or `"in-memory"` | Tier 0; in-memory state is per replica and approximate. |
 | `[budget] backend = "postgres"` | Tier 2: shared caps. |
 | `[revocation] backend = "postgres"` | Tier 2: durable precise token revocation. |
+| `[shutdown]` | Tier 0: process-level bounds on termination. |
 | `/healthz`, `/readyz` | Tier 0. |
 
 Namespaces, providers, aliases, prices, and provider credentials are
@@ -77,6 +78,24 @@ planning a stateful deployment.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `bind` | socket address | `0.0.0.0:8080` | Listening address. Changing it needs a restart; a reload warns and ignores it. |
+
+## `[shutdown]` — Tier 0
+
+Bounds on the `SIGTERM`/`SIGINT` sequence. All three are read when the signal
+arrives, so a reload applies to the termination that follows it.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `drain_grace_ms` | integer | `5000` | How long `/readyz` fails while the replica *keeps* admitting work, so a load balancer can remove it before anything is refused. `0` closes admission immediately — only safe when something else already drained the endpoint. |
+| `deadline_ms` | integer | `15000` | How long requests admitted before the close have to finish. Anything still open is cut: its response body ends in an error and a stream settles as `client_cancelled` up to the last relayed token. Rejected at `0`. |
+| `flush_timeout_ms` | integer | `5000` | Bound on the whole post-serving sequence: settling cut responses, flushing buffered usage sinks, and flushing telemetry exporters. Records that cannot be written are counted as `shutdown` drops. Rejected at `0`. |
+
+`/healthz` answers `ok` throughout; only `/readyz` reports the drain, because a
+terminating replica is not an unhealthy one. Worst-case termination is the sum
+of the three, so the supervisor's stopping timeout
+(`terminationGracePeriodSeconds`, `TimeoutStopSec`, `docker stop -t`) must
+exceed it or a `SIGKILL` lands mid-flush. A second termination signal skips the
+remaining drain grace and closes admission at once.
 
 ## `[[namespace]]`
 

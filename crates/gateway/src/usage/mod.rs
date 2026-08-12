@@ -18,7 +18,7 @@ mod postgres;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -171,6 +171,37 @@ impl SinkFailure {
     }
 }
 
+/// What one bounded flush achieved for one sink. A sink that writes inline has
+/// nothing buffered, so it reports `Flushed { records: 0 }`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FlushOutcome {
+    /// Everything the sink was holding reached the destination.
+    Flushed { records: u64 },
+    /// The destination rejected the buffered records; they are counted as
+    /// `sink_error` drops, exactly as they would be while serving.
+    Failed { records: u64, error: String },
+    /// The flush did not finish inside its bound. Whatever was still queued is
+    /// counted as a `shutdown` drop, so the records are accounted for rather
+    /// than silently missing.
+    TimedOut { abandoned: u64 },
+}
+
+impl FlushOutcome {
+    /// Stable, low-cardinality label — a metric dimension.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Flushed { .. } => "flushed",
+            Self::Failed { .. } => "failed",
+            Self::TimedOut { .. } => "timeout",
+        }
+    }
+
+    /// Whether every buffered record reached the destination.
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Flushed { .. })
+    }
+}
+
 #[async_trait]
 pub trait UsageSink: Send + Sync {
     fn name(&self) -> &'static str;
@@ -185,6 +216,22 @@ pub trait UsageSink: Send + Sync {
             self.record(&observed.record).await;
         }
         Ok(())
+    }
+
+    /// Write everything buffered, now. Called once on the shutdown path, under
+    /// a bound the caller owns; the default is the honest answer for a sink
+    /// whose `record` already wrote through.
+    async fn flush(&self) -> FlushOutcome {
+        FlushOutcome::Flushed { records: 0 }
+    }
+
+    /// Give up on whatever is still buffered, counting it as dropped for
+    /// `reason`, and report how much that was. Called when a [`UsageSink::flush`]
+    /// did not finish inside its bound — the buffer is unreachable at that point,
+    /// so the only honest thing left is to account for it.
+    fn abandon(&self, reason: DropReason) -> u64 {
+        let _ = reason;
+        0
     }
 }
 
@@ -222,6 +269,67 @@ impl UsageFanout {
     pub async fn record(&self, record: &UsageRecord) {
         for sink in &self.sinks {
             sink.record(record).await;
+        }
+    }
+
+    /// Flush every sink within one shared `budget`, and report what each one
+    /// managed. The budget is shared rather than per-sink so the fan-out's total
+    /// contribution to shutdown stays bounded however many sinks are configured;
+    /// a sink that runs out of it abandons its buffer with an explicit drop
+    /// reason instead of extending the process's life.
+    pub async fn flush(&self, budget: Duration) -> FlushReport {
+        let deadline = Instant::now() + budget;
+        let mut sinks = Vec::with_capacity(self.sinks.len());
+        for sink in &self.sinks {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let outcome = match tokio::time::timeout(remaining, sink.flush()).await {
+                Ok(outcome) => outcome,
+                Err(_) => FlushOutcome::TimedOut {
+                    abandoned: sink.abandon(DropReason::Shutdown),
+                },
+            };
+            crate::telemetry::metrics::record_usage_flush(sink.name(), outcome.as_str());
+            sinks.push((sink.name(), outcome));
+        }
+        FlushReport { sinks }
+    }
+}
+
+/// What the shutdown flush achieved, per sink. Logged as the process's last
+/// word on durability.
+#[derive(Debug)]
+pub struct FlushReport {
+    pub sinks: Vec<(&'static str, FlushOutcome)>,
+}
+
+impl FlushReport {
+    /// Whether every sink drained. False is the signal that usage rows are
+    /// missing — the count and the reason are on
+    /// `axond.usage.records_dropped`.
+    pub fn is_complete(&self) -> bool {
+        self.sinks.iter().all(|(_, outcome)| outcome.is_complete())
+    }
+
+    pub fn log(&self) {
+        for (sink, outcome) in &self.sinks {
+            match outcome {
+                FlushOutcome::Flushed { records } => {
+                    tracing::info!(sink, records, "usage sink flushed on shutdown")
+                }
+                FlushOutcome::Failed { records, error } => tracing::error!(
+                    sink,
+                    records,
+                    error = %error,
+                    reason = DropReason::SinkError.as_str(),
+                    "usage sink rejected its buffered records on shutdown"
+                ),
+                FlushOutcome::TimedOut { abandoned } => tracing::error!(
+                    sink,
+                    abandoned,
+                    reason = DropReason::Shutdown.as_str(),
+                    "usage sink flush exceeded its bound; buffered records were abandoned"
+                ),
+            }
         }
     }
 }
@@ -317,6 +425,63 @@ mod tests {
             latency_ms: 812,
             attempts: 1,
         }
+    }
+
+    /// A sink whose batch write never returns, so the fan-out's bound is the
+    /// only thing that ends the flush.
+    struct StalledSink;
+
+    #[async_trait]
+    impl UsageSink for StalledSink {
+        fn name(&self) -> &'static str {
+            "stalled"
+        }
+
+        async fn record(&self, _record: &UsageRecord) {}
+
+        async fn record_batch(&self, _batch: &[ObservedRecord]) -> Result<(), SinkFailure> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_through_sink_has_nothing_to_flush() {
+        let fanout = UsageFanout::new(vec![Box::new(StdoutSink)]);
+        let report = fanout.flush(Duration::from_secs(5)).await;
+        assert!(report.is_complete());
+        assert_eq!(
+            report.sinks,
+            vec![("stdout", FlushOutcome::Flushed { records: 0 })]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_sink_flush_ends_at_the_bound_with_its_buffer_accounted() {
+        let batched = BatchedSink::spawn(
+            Arc::new(StalledSink),
+            BatchSettings {
+                capacity: 16,
+                max_batch: 1,
+                flush_interval: Duration::from_millis(5),
+            },
+        );
+        let fanout = UsageFanout::new(vec![Box::new(batched)]);
+        for _ in 0..4 {
+            fanout.record(&sample_record()).await;
+        }
+        // Give the flush task time to pick up the first record and stall on it.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let report = fanout.flush(Duration::from_millis(50)).await;
+        assert!(
+            !report.is_complete(),
+            "a stalled sink cannot report success"
+        );
+        let (sink, outcome) = &report.sinks[0];
+        assert_eq!(*sink, "stalled");
+        assert!(
+            matches!(outcome, FlushOutcome::TimedOut { abandoned } if *abandoned > 0),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test]

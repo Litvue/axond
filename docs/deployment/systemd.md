@@ -86,7 +86,19 @@ set timeouts for long-lived SSE streams. Preserve caller authentication and
 
 ## Rollout behavior
 
-The current process does not implement application-level SIGTERM draining.
-Before stopping a service instance, remove it from the load balancer and wait
-for the configured upstream drain window. Interrupted clients must be able to
-retry. See [Upgrades and rollback](../operations/upgrades.md).
+`systemctl stop` sends `SIGTERM`, which starts the process's own bounded drain:
+`/readyz` fails immediately, admission closes after
+`shutdown.drain_grace_ms`, admitted requests get `shutdown.deadline_ms`, and
+usage/telemetry sinks flush within `shutdown.flush_timeout_ms`. A second
+`SIGTERM` closes admission at once instead of waiting out the grace window.
+
+`TimeoutStopSec` must exceed the sum of those three bounds, or systemd
+`SIGKILL`s the process mid-flush and buffered usage records are lost. The unit
+ships `TimeoutStopSec=30s` against 25s of defaults; raise it with the
+configuration.
+
+A load balancer that watches `/readyz` drains the instance on its own. One that
+does not should have the instance removed before the stop, or
+`shutdown.drain_grace_ms` raised to cover its polling interval. Interrupted
+clients must still be able to retry. See
+[Upgrades and rollback](../operations/upgrades.md).

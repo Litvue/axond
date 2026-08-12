@@ -50,6 +50,10 @@ pub struct Config {
     /// How the running config is replaced without a restart.
     #[serde(default)]
     pub reload: Reload,
+    /// How termination is sequenced: how long readiness fails before admission
+    /// closes, how long admitted requests then have, and the flush bound.
+    #[serde(default)]
+    pub shutdown: Shutdown,
     /// Inbound gateway keys. Each binds a secret (resolved from `env` or
     /// `file`) to a namespace. At least one is required: inbound authentication
     /// fails closed, so there is no keyless mode (ADR 0013).
@@ -401,6 +405,58 @@ fn default_reload_poll_interval_ms() -> u64 {
 
 /// Below this the watcher would spend more time reading the file than serving.
 const MIN_RELOAD_POLL_INTERVAL_MS: u64 = 100;
+
+/// Graceful shutdown bounds. Every value is a *bound*, not a target: the
+/// process moves on as soon as the work it is waiting for is done, and the sum
+/// of the three is the worst case an orchestrator's termination grace period
+/// has to cover.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Shutdown {
+    /// How long `/readyz` fails while the replica keeps admitting work, giving
+    /// the load balancer time to observe the drain. `0` closes admission as soon
+    /// as the signal arrives, which is only safe behind a `preStop` hook that
+    /// already waited.
+    #[serde(default = "default_shutdown_drain_grace_ms")]
+    pub drain_grace_ms: u64,
+    /// How long requests admitted before the drain have to finish once
+    /// admission is closed. Whatever is still open at the deadline is dropped.
+    #[serde(default = "default_shutdown_deadline_ms")]
+    pub deadline_ms: u64,
+    /// The bound on the whole post-serving sequence: settling the responses the
+    /// deadline ended, flushing the buffered usage sinks, and flushing the
+    /// telemetry exporters. `terminationGracePeriodSeconds` must exceed
+    /// `drain_grace_ms + deadline_ms + flush_timeout_ms`.
+    #[serde(default = "default_shutdown_flush_timeout_ms")]
+    pub flush_timeout_ms: u64,
+}
+
+impl Default for Shutdown {
+    fn default() -> Self {
+        Self {
+            drain_grace_ms: default_shutdown_drain_grace_ms(),
+            deadline_ms: default_shutdown_deadline_ms(),
+            flush_timeout_ms: default_shutdown_flush_timeout_ms(),
+        }
+    }
+}
+
+/// Two readiness probe periods at the shipped manifest's 5s interval: long
+/// enough for a load balancer to stop routing, short enough that a rollout is
+/// not perceptibly slower.
+fn default_shutdown_drain_grace_ms() -> u64 {
+    5_000
+}
+
+/// Leaves headroom under the shipped `terminationGracePeriodSeconds = 30`
+/// for the drain window and the flush that follows.
+fn default_shutdown_deadline_ms() -> u64 {
+    15_000
+}
+
+fn default_shutdown_flush_timeout_ms() -> u64 {
+    5_000
+}
 
 fn default_weight() -> u32 {
     1
@@ -1281,6 +1337,18 @@ impl Config {
             return Err(ConfigError::Invalid(format!(
                 "reload.poll_interval_ms must be at least {MIN_RELOAD_POLL_INTERVAL_MS}"
             )));
+        }
+        // `0` would mean "wait forever", which is the unbounded wait a
+        // termination grace period ends with `SIGKILL` — before anything flushes.
+        for (field, value) in [
+            ("deadline_ms", self.shutdown.deadline_ms),
+            ("flush_timeout_ms", self.shutdown.flush_timeout_ms),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "shutdown.{field} must be at least 1: shutdown waits are bounded"
+                )));
+            }
         }
         let mut labels: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
         for c in &self.credential {

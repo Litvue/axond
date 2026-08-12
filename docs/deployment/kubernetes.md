@@ -60,6 +60,10 @@ serving snapshot at boot, but it does not continuously probe providers, Redis,
 or Postgres. Alert on request-path metrics and typed `503` responses for
 runtime dependency health.
 
+`/readyz` also reports the drain: it answers `503 draining` from the moment
+`SIGTERM` arrives (see [Rollouts and termination](#rollouts-and-termination)).
+Both probes stay unauthenticated.
+
 ## Scaling
 
 The HTTP process is stateless, so replicas can scale horizontally. These parts
@@ -89,11 +93,44 @@ Axond does not terminate TLS. The Ingress or external load balancer must:
 
 ## Rollouts and termination
 
-The current binary has no application-level SIGTERM drain. A Pod may therefore
-terminate an in-flight request or stream. Use `maxUnavailable: 0`, a
-PodDisruptionBudget, sufficient replicas, and load-balancer endpoint removal to
-reduce interruption. Clients must be prepared to retry requests that end before
-response commitment.
+`SIGTERM` starts a bounded drain in the process itself, so a rollout no longer
+depends on endpoint removal winning a race:
 
-Do not describe `terminationGracePeriodSeconds` as graceful draining; it is
-only the outer Kubernetes deadline until Axond implements a shutdown handler.
+1. `/readyz` answers `503 draining` immediately. A Pod deleted through the API
+   is removed from the Service endpoints as soon as it is marked terminating, so
+   for in-cluster traffic the failing probe is confirmation rather than the
+   mechanism; it is the mechanism for anything that only polls readiness, such
+   as an ingress or cloud load balancer with its own target health. `/healthz`
+   keeps answering `200` for the whole sequence — a draining Pod is not a wedged
+   one, and failing liveness would only earn it a `SIGKILL`.
+2. For `shutdown.drain_grace_ms` the Pod keeps serving, including requests that
+   arrive while endpoint propagation catches up.
+3. The listener then stops accepting. Anything that still reaches the process is
+   refused with a typed `503` (`error.type = "draining"`).
+4. Requests admitted earlier have `shutdown.deadline_ms` to finish. A stream
+   still open at the deadline is ended with a body error; its spend is settled
+   as `client_cancelled` up to the last relayed token, so an interrupted stream
+   is charged for what the caller received, not discarded.
+5. Usage sinks and telemetry exporters flush within one
+   `shutdown.flush_timeout_ms`. Records that cannot be written are counted as
+   `shutdown` drops on `axond.usage.dropped`, never dropped silently.
+
+Size the grace period above the sum of the three bounds:
+
+```
+terminationGracePeriodSeconds > (drain_grace_ms + deadline_ms + flush_timeout_ms) / 1000
+```
+
+The shipped manifest pairs `terminationGracePeriodSeconds: 30` with the
+defaults (5s drain, 15s deadline, 5s flush — 25s worst case). Raise both
+together if callers hold longer streams; the process, not Kubernetes, is what
+decides when a stream is cut.
+
+A `preStop` hook is not required, because readiness fails before admission
+closes. Add one only to lengthen the endpoint-removal window on a load balancer
+that does not watch endpoints (some cloud L7 ingresses), and set
+`shutdown.drain_grace_ms = 0` if the hook already waited.
+
+Keep `maxUnavailable: 0`, a PodDisruptionBudget, and enough replicas: they are
+what keeps capacity up during the drain. Clients should still retry requests
+that end before response commitment.

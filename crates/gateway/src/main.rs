@@ -5,6 +5,11 @@
 //! credential resolution, connect the configured usage sinks, build shared
 //! state, install the reload triggers, then serve.
 //!
+//! Termination is the boot sequence in reverse and bounded at every step:
+//! `SIGTERM` fails readiness, then closes admission, then lets admitted requests
+//! finish, then flushes the usage sinks and the exporters. [`shutdown`] owns the
+//! sequencing; this module owns the order the resources are released in.
+//!
 //! The config the process serves is replaceable at runtime: `SIGHUP` (and, when
 //! `[reload] watch` is on, a change to the config file) re-runs this same load +
 //! validate path and swaps the result in atomically (ADR 0011).
@@ -22,6 +27,7 @@ mod redis_support;
 mod reload;
 mod revocation;
 mod routes;
+mod shutdown;
 mod state;
 mod streaming;
 mod telemetry;
@@ -31,6 +37,7 @@ mod usage;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use budget::BudgetStore;
 use clap::{Arg, ArgAction, Command};
@@ -250,7 +257,11 @@ fn migrate_redis_budget(args: &clap::ArgMatches) -> anyhow::Result<()> {
 #[tokio::main]
 async fn serve() -> anyhow::Result<()> {
     // Held until shutdown so the exporters flush; a no-op when telemetry is off.
-    let _telemetry = telemetry::init().map_err(|e| anyhow::anyhow!("telemetry: {e}"))?;
+    let mut telemetry_guard = telemetry::init().map_err(|e| anyhow::anyhow!("telemetry: {e}"))?;
+    // Installed before the listener exists: a platform that will not give us a
+    // handler must fail at boot, not when the rollout depends on it.
+    let signals = shutdown::Signals::install()
+        .map_err(|e| anyhow::anyhow!("failed to install termination signal handlers: {e}"))?;
 
     let config_path = std::env::var("AXOND_CONFIG").unwrap_or_else(|_| "axond.toml".to_string());
     let config = Config::load(&config_path)
@@ -302,6 +313,10 @@ async fn serve() -> anyhow::Result<()> {
         );
     }
     reload::spawn(Arc::new(reload::Reloader::new(config_path, state.clone())));
+    let lifecycle = Arc::clone(state.lifecycle());
+    // Kept past the router so the sinks can be flushed after the last request:
+    // shutdown is the one point where durability outranks the request path.
+    let resources = state.clone();
     let app = routes::router(state).layer(telemetry::TelemetryLayer);
 
     tracing::info!(
@@ -311,6 +326,50 @@ async fn serve() -> anyhow::Result<()> {
         "axond listening"
     );
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+    // The plan is read when the signal arrives rather than now, so a reload of
+    // `[shutdown]` applies to the termination that follows it.
+    let drain = shutdown::drain(Arc::clone(&lifecycle), signals, {
+        let resources = resources.clone();
+        move || shutdown::Plan::from(&resources.config().config.shutdown)
+    });
+    let served = axum::serve(listener, app).with_graceful_shutdown(drain);
+    let plan = shutdown::Plan::from(&resources.config().config.shutdown);
+    let outcome = shutdown::serve_bounded(served, &lifecycle, plan).await;
+
+    // One budget for the whole post-serving sequence, not one per step: what an
+    // orchestrator's termination grace period has to cover is the total, and the
+    // steps are ordered by how much of the record depends on them.
+    let flush_by = Instant::now() + plan.flush_timeout;
+    let remaining = || flush_by.saturating_duration_since(Instant::now());
+
+    // Abandoned responses settle as they end, so the settlements queued by the
+    // requests that just finished have to land before the sinks are flushed.
+    let stuck = lifecycle.quiesce(remaining()).await;
+    let unsettled = streaming::await_settlements(remaining()).await;
+    if stuck > 0 || unsettled > 0 {
+        tracing::error!(
+            in_flight = stuck,
+            unsettled,
+            "some spend could not be settled before the flush budget expired"
+        );
+    }
+    // Records already accepted are written even when requests were abandoned:
+    // spend that was incurred must be accounted for either way.
+    let flushed = resources.0.usage.flush(remaining()).await;
+    flushed.log();
+    let telemetry_failures = telemetry_guard.shutdown(remaining());
+    tracing::info!(
+        outcome = outcome.as_str(),
+        usage_flushed = flushed.is_complete(),
+        telemetry_flushed = telemetry_failures.is_empty(),
+        "axond stopped"
+    );
+
+    match outcome {
+        // Abandoned work and an incomplete flush are reported, not fatal: the
+        // process did what it promised within its bounds, and exiting non-zero
+        // would make an orchestrator treat a clean rollout as a crash.
+        shutdown::Outcome::Completed | shutdown::Outcome::Abandoned { .. } => Ok(()),
+        shutdown::Outcome::Failed(error) => Err(anyhow::anyhow!("serving failed: {error}")),
+    }
 }

@@ -16,7 +16,8 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -823,6 +824,13 @@ impl Drop for Accounting {
     }
 }
 
+/// Settlements spawned and not yet finished. Tracked because shutdown has to
+/// wait for them: a stream cut short at the deadline settles *after* its body is
+/// dropped, and flushing the sinks before that ran would lose exactly the spend
+/// the drain was protecting.
+static OUTSTANDING_SETTLEMENTS: AtomicU64 = AtomicU64::new(0);
+static SETTLED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
 /// Settlement outlives the request body, so it runs detached. Outside a
 /// runtime (process teardown) there is nothing left to settle onto.
 pub(crate) fn spawn_settlement<F>(future: F)
@@ -830,8 +838,33 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(future);
+        OUTSTANDING_SETTLEMENTS.fetch_add(1, Ordering::AcqRel);
+        handle.spawn(async move {
+            future.await;
+            if OUTSTANDING_SETTLEMENTS.fetch_sub(1, Ordering::AcqRel) == 1 {
+                SETTLED.notify_waiters();
+            }
+        });
     }
+}
+
+/// Wait up to `bound` for detached settlements to reach the sinks, and report
+/// how many are still outstanding. Called once on the shutdown path, before the
+/// sinks are flushed.
+pub(crate) async fn await_settlements(bound: Duration) -> u64 {
+    let _ = tokio::time::timeout(bound, async {
+        loop {
+            // Registered before the count is read, so a settlement finishing in
+            // between wakes this rather than being missed.
+            let settled = SETTLED.notified();
+            if OUTSTANDING_SETTLEMENTS.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            settled.await;
+        }
+    })
+    .await;
+    OUTSTANDING_SETTLEMENTS.load(Ordering::Acquire)
 }
 
 #[cfg(test)]

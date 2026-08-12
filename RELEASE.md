@@ -48,8 +48,12 @@ and publishes crates.io last because registry versions are immutable.
   exhausted first key is returned to the caller. Changing an alias's target
   order or credential pool order strands response IDs created under the previous
   order.
-- The server does not yet install an application-level SIGTERM drain; deployment
-  infrastructure must remove replicas from traffic before termination.
+- Shutdown is bounded, not unlimited: `SIGTERM` fails readiness, keeps admitting
+  for `shutdown.drain_grace_ms`, then gives admitted requests
+  `shutdown.deadline_ms`. A stream still open at the deadline is cut — settled as
+  `client_cancelled` up to the last relayed token, not silently completed — and
+  the supervisor's stopping timeout must exceed the sum of the configured bounds
+  or buffered usage records are lost to a `SIGKILL`.
 
 None of these limitations is hidden by an optimistic health response or silent
 fallback. The compatibility contract and deployment guides describe their

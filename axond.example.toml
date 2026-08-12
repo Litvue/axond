@@ -15,6 +15,23 @@
 [server]
 bind = "0.0.0.0:8080"
 
+# ── Termination (optional) ────────────────────────────────────────────────────
+# What SIGTERM does. `/readyz` starts failing at once so a load balancer can
+# drain the replica, while `/healthz` keeps answering `ok` — a terminating
+# replica is not an unhealthy one. Admission stays open for `drain_grace_ms`,
+# then new requests get a typed `503 draining`; requests admitted earlier have
+# `deadline_ms` to finish, and a stream still open at the deadline is cut and
+# settled as `client_cancelled` up to the last relayed token.
+#
+# Worst-case termination is the sum of the three, so keep the supervisor's
+# stopping timeout (terminationGracePeriodSeconds, TimeoutStopSec) above it —
+# a SIGKILL mid-flush is how buffered usage records get lost.
+
+[shutdown]
+drain_grace_ms = 5_000    # readiness fails but work is still admitted
+deadline_ms = 15_000      # admitted requests finish within this; 0 is rejected
+flush_timeout_ms = 5_000  # whole post-serving usage/telemetry flush; 0 rejected
+
 # ── Namespaces ────────────────────────────────────────────────────────────────
 # Exactly one namespace is the default. Authentication always fails closed;
 # "default" identifies the platform/operator namespace and the source of

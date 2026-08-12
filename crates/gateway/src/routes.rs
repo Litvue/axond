@@ -26,14 +26,17 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::body::Body;
 use axum::extract::{Extension, RawQuery, Request, State};
-use axum::http::{HeaderMap, HeaderValue};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
+use futures::StreamExt;
 use gateway_core::{
     CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, ModelPrice, ModelUsage,
     NativeMessagesDecoder, ProviderError, ProviderRequest, ProviderResponse, ProviderStreamDecoder,
@@ -58,6 +61,7 @@ use crate::principals::{
     Capability, Presented, PrincipalAuthority, PrincipalStoreError, TokenVerificationError,
 };
 use crate::rate_limit::{RateLimitKey, RateLimitPermit};
+use crate::shutdown::Phase;
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::streaming::{self, Framing, StreamContext};
 use crate::telemetry;
@@ -71,10 +75,17 @@ pub fn router(state: AppState) -> Router {
             let route = (spec.router)();
             let route = match spec.auth {
                 AuthPosture::LivenessProbe => route,
-                AuthPosture::Authenticated => route.layer(from_fn_with_state(
-                    (state.clone(), spec.capability),
-                    authenticate_middleware,
-                )),
+                // Admission is the outermost layer, so a request arriving after
+                // the drain window is refused before it touches authentication,
+                // budgets, or an upstream. The probes deliberately stay outside
+                // it: a draining replica is still alive, and killing it early
+                // would cut the very requests the drain exists to finish.
+                AuthPosture::Authenticated => route
+                    .layer(from_fn_with_state(
+                        (state.clone(), spec.capability),
+                        authenticate_middleware,
+                    ))
+                    .layer(from_fn_with_state(state.clone(), admission_middleware)),
             };
             router.route(spec.path, route)
         })
@@ -340,14 +351,67 @@ fn caller_can_mint_capability(
         })
 }
 
+/// Reserve a slot for a request and hold it until the response body is fully
+/// delivered, so an open SSE stream counts as in-flight for as long as it runs.
+async fn admission_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, GatewayError> {
+    let Some(admitted) = state.lifecycle().admit() else {
+        telemetry::metrics::record_shutdown_rejection();
+        return Err(GatewayError::Draining);
+    };
+    let (parts, body) = next.run(request).await.into_parts();
+    let lifecycle = Arc::clone(state.lifecycle());
+    let mut relayed = Some(body.into_data_stream());
+    let mut admitted = Some(admitted);
+    let mut abandoned = Box::pin(async move { lifecycle.abandoned().await });
+    // The guard rides along inside the body, not this future: the response is
+    // handed to hyper long before a streamed body ends, so releasing the slot
+    // here would undercount every stream. Ending the body when the shutdown
+    // deadline expires is also what settles an abandoned stream's spend, since
+    // dropping the inner body is what cancels it upstream.
+    let body = Body::from_stream(futures::stream::poll_fn(move |cx| {
+        let Some(inner) = relayed.as_mut() else {
+            return Poll::Ready(None);
+        };
+        if abandoned.as_mut().poll(cx).is_ready() {
+            // Dropping the inner body cancels the stream upstream, which settles
+            // the spend accrued so far; releasing the slot lets shutdown see it.
+            drop(relayed.take());
+            drop(admitted.take());
+            // An error rather than a clean end: the caller must not read a
+            // truncated stream as a complete answer.
+            return Poll::Ready(Some(Err(axum::Error::new(std::io::Error::other(
+                "the gateway shut down before this response finished",
+            )))));
+        }
+        match inner.poll_next_unpin(cx) {
+            Poll::Ready(None) => {
+                drop(relayed.take());
+                drop(admitted.take());
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }));
+    Ok(Response::from_parts(parts, body))
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Liveness is trivially true; real readiness (config loaded, at least one
-/// credential present) is a follow-up — kept honest rather than always-200.
-async fn readyz() -> &'static str {
-    "ready"
+/// Readiness is where a rolling deployment learns this replica is leaving: it
+/// fails as soon as the drain begins, before admission closes, so a load
+/// balancer can stop routing while the replica is still able to serve. Real
+/// dependency readiness (config loaded, credentials present) is a follow-up.
+async fn readyz(State(state): State<AppState>) -> (StatusCode, &'static str) {
+    match state.lifecycle().phase() {
+        Phase::Serving => (StatusCode::OK, "ready"),
+        Phase::Draining | Phase::Closing => (StatusCode::SERVICE_UNAVAILABLE, "draining"),
+    }
 }
 
 /// Replica-local Tier 0 credential status. Presence is expressed by each
@@ -3809,6 +3873,121 @@ min_iat = {}
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Draining is what a rolling deployment observes, and it must not take the
+    /// liveness probe with it: a `/healthz` failure earns a `SIGKILL`, which is
+    /// the one thing that would cut the requests the drain exists to finish.
+    #[tokio::test]
+    async fn draining_fails_readiness_while_liveness_stays_ok() {
+        let state = test_state();
+        let lifecycle = Arc::clone(state.lifecycle());
+        let app = router(state);
+
+        let ready = app
+            .clone()
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+
+        lifecycle.begin_drain();
+        let draining = app
+            .clone()
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(draining.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let live = app
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(live.status(), StatusCode::OK);
+    }
+
+    /// The drain window keeps serving: readiness has failed, but a request that
+    /// arrives before routing catches up is still answered rather than lost.
+    #[tokio::test]
+    async fn a_request_arriving_during_the_drain_window_is_still_served() {
+        let state = test_state();
+        let lifecycle = Arc::clone(state.lifecycle());
+        let app = router(state);
+        lifecycle.begin_drain();
+
+        let resp = app
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {CALLER_SECRET}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_request_arriving_after_admission_closes_is_refused_as_draining() {
+        let state = test_state();
+        let lifecycle = Arc::clone(state.lifecycle());
+        let app = router(state);
+        lifecycle.close();
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {CALLER_SECRET}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "draining");
+
+        // The probes stay outside admission, so an orchestrator can still tell a
+        // draining replica from a dead one.
+        let live = app
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(live.status(), StatusCode::OK);
+    }
+
+    /// Admission is released by the *response body*, not by the handler future:
+    /// a streamed response is in flight for as long as its body is open, and
+    /// that is precisely the work the shutdown deadline bounds.
+    #[tokio::test]
+    async fn a_request_counts_as_in_flight_until_its_body_is_dropped() {
+        let state = test_state();
+        let lifecycle = Arc::clone(state.lifecycle());
+        let app = router(state);
+
+        let resp = app
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {CALLER_SECRET}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(lifecycle.in_flight(), 1, "the body is still undelivered");
+        let body = resp.into_body();
+        drop(body);
+        assert_eq!(lifecycle.in_flight(), 0);
     }
 
     /// `/v1/models` fails closed like every other request path: no gateway key
