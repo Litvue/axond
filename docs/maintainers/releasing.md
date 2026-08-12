@@ -47,6 +47,11 @@ release resumes at the first missing crate.
   arrive as public issues.
 - `packages: write`, `id-token: write`, and attestation permissions in the
   release jobs.
+- The `area:operations` label, which
+  [`.github/dependabot.yml`](../../.github/dependabot.yml) applies to its pin
+  bumps. Dependabot rejects its whole configuration on an unknown label and
+  reports it only on the repository's Dependabot page, so a renamed label stops
+  the Action pins from being refreshed without failing CI.
 
 The crates.io token owner must have a verified email address.
 
