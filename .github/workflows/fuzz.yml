@@ -80,6 +80,10 @@ jobs:
       - uses: actions/checkout@v7
       # libFuzzer needs the sanitizer runtimes, which only nightly ships.
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          # Nightly ships the minimal profile, and this lane lints the
+          # coverage-guided targets that the stable lane cannot build.
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
