@@ -18,6 +18,12 @@
 //! append-mostly instead of scattering inserts across a random key space.
 //! [`Uuid7Generator`] additionally makes ordering *strict* — see
 //! [`Uuid7Generator::next`].
+//!
+//! Strict only *per generator*, though, so id order is a convenience and not the
+//! authority on "which revision is newest": across a restart or a second replica
+//! it degrades to wall-clock agreement. The store answers that question from
+//! publication order (the oracle from its `order` vector, #165 from a sequence or
+//! the transaction that assigned it), never from comparing ids.
 
 use std::fmt;
 use std::sync::Mutex;
@@ -186,6 +192,8 @@ pub struct Uuid7Generator {
 
 impl Uuid7Generator {
     const MAX_SEQUENCE: u16 = (1 << 12) - 1;
+    /// The largest value the 48-bit timestamp field holds.
+    const MAX_MILLIS: u64 = (1 << 48) - 1;
 
     pub fn new() -> Self {
         Self {
@@ -195,12 +203,17 @@ impl Uuid7Generator {
     }
 
     /// The next id: strictly greater than every id this generator has returned.
+    ///
+    /// A wildly wrong host clock degrades to a saturated timestamp rather than a
+    /// panic: issuing ids is on the publication path, and a machine whose clock
+    /// reads the year 10889 should still be able to record a mutation.
     pub fn next(&self) -> Uuid7 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| {
-                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-            });
+                u64::try_from(since.as_millis()).unwrap_or(Self::MAX_MILLIS)
+            })
+            .min(Self::MAX_MILLIS);
         let (millis, sequence) = {
             let mut last = self.last.lock().expect("uuid generator is not poisoned");
             let (last_millis, last_sequence) = *last;
@@ -209,7 +222,11 @@ impl Uuid7Generator {
             } else if last_sequence < Self::MAX_SEQUENCE {
                 (last_millis, last_sequence + 1)
             } else {
-                (last_millis + 1, 0)
+                // Saturating rather than wrapping: at the end of the
+                // representable range ids stop advancing, which is a
+                // degradation, where wrapping would hand out an id that sorts
+                // before ones already issued.
+                (last_millis.saturating_add(1).min(Self::MAX_MILLIS), 0)
             };
             *last = next;
             next
@@ -219,7 +236,7 @@ impl Uuid7Generator {
             .fill(&mut entropy)
             .expect("system random generator must be available");
         Uuid7::from_parts(millis, sequence, u64::from_be_bytes(entropy))
-            .expect("a clamped timestamp and sequence always fit")
+            .expect("timestamp and sequence are clamped to their fields above")
     }
 }
 
@@ -505,6 +522,18 @@ mod tests {
         }
         let unique: std::collections::BTreeSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "ids are never reused");
+    }
+
+    #[test]
+    fn a_generator_at_the_end_of_the_timestamp_range_degrades_instead_of_panicking() {
+        // A host whose clock reads past the representable range must still be able
+        // to issue an id: publication is the wrong place to discover a bad clock.
+        let generator = Uuid7Generator::new();
+        *generator.last.lock().unwrap() =
+            (Uuid7Generator::MAX_MILLIS, Uuid7Generator::MAX_SEQUENCE);
+        let id = generator.next();
+        assert_eq!(id.timestamp_millis(), Uuid7Generator::MAX_MILLIS);
+        assert_eq!(id.sequence(), 0);
     }
 
     #[test]

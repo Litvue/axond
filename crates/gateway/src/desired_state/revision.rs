@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use super::canonical::{Canonical, CanonicalError, CanonicalValue, Checksum, SerializerVersion};
-use super::ids::{MutationId, RevisionId, Slug};
+use super::ids::{AuditEventId, MutationId, RevisionId, Slug};
 use super::mutation::{AuditEvent, ExpectedRevision, Mutation};
 use super::resource::{BlobRef, ResourceRef, ResourceScope, ResourceVersion};
 
@@ -66,6 +66,14 @@ pub enum ValidationError {
     UnreferencedBlob { digest: Checksum },
     #[error("{from} depends on {to}, which belongs to another tenant")]
     CrossTenantReference { from: ResourceRef, to: ResourceRef },
+    #[error("deployment-scoped {from} depends on tenant-scoped {to}")]
+    TenantScopedDependency { from: ResourceRef, to: ResourceRef },
+    #[error("audit event {audit} records mutation {recorded}, not this candidate's {mutation}")]
+    AuditMutationMismatch {
+        audit: AuditEventId,
+        recorded: MutationId,
+        mutation: MutationId,
+    },
     #[error("desired state has no canonical form: {0}")]
     Canonical(#[from] CanonicalError),
 }
@@ -195,18 +203,26 @@ impl DesiredState {
                         to: *dependency,
                     });
                 };
-                // Deployment-scoped resources (tenants, catalogue metadata) are
-                // referenceable from any tenant; two *different* tenants are not
-                // referenceable from each other, whatever a body claims.
-                let (Some(from), Some(to)) = (resource.scope.tenant(), target.scope.tenant())
-                else {
-                    continue;
-                };
-                if from != to {
-                    return Err(ValidationError::CrossTenantReference {
-                        from: resource.reference,
-                        to: *dependency,
-                    });
+                // The rule is asymmetric on purpose. A tenant-scoped resource may
+                // depend on deployment-scoped state (an alias on the shared
+                // catalogue), because that state is shared by construction. The
+                // reverse is not allowed: shared, deployment-wide state that
+                // depends on one tenant's private resource would make that
+                // tenant's data reachable from every other tenant's hydration.
+                match (resource.scope.tenant(), target.scope.tenant()) {
+                    (Some(from), Some(to)) if from != to => {
+                        return Err(ValidationError::CrossTenantReference {
+                            from: resource.reference,
+                            to: *dependency,
+                        });
+                    }
+                    (None, Some(_)) => {
+                        return Err(ValidationError::TenantScopedDependency {
+                            from: resource.reference,
+                            to: *dependency,
+                        });
+                    }
+                    _ => {}
                 }
             }
         }
@@ -263,7 +279,19 @@ impl RevisionCandidate {
     /// Callers get both in one step because a store must never persist state it
     /// has not validated, nor a checksum it did not compute from the state it
     /// persisted.
+    ///
+    /// The audit event must record *this* candidate's mutation: an audit row
+    /// pointing at some other mutation is a dangling reference, refused here for
+    /// the same reason a dangling resource reference is, and before #165 stores it
+    /// as a foreign key.
     pub fn validated_checksum(&self) -> Result<Checksum, ValidationError> {
+        if self.audit.mutation != self.mutation.id {
+            return Err(ValidationError::AuditMutationMismatch {
+                audit: self.audit.id,
+                recorded: self.audit.mutation,
+                mutation: self.mutation.id,
+            });
+        }
         self.state.validate()?;
         Ok(self.state.checksum()?)
     }
@@ -796,6 +824,27 @@ mod tests {
     }
 
     #[test]
+    fn deployment_scoped_state_may_not_depend_on_one_tenants_resource() {
+        // The reverse of the case above, and not symmetric with it: shared state
+        // reachable from every tenant must not depend on one tenant's private
+        // resource.
+        let acme = tenant_id(1);
+        let credential = credential(&acme, 3, "primary");
+        let shared = tenant(9, "globex").depending_on([credential.reference]);
+        let mut state = DesiredState::new();
+        state.insert(tenant(1, "acme")).unwrap();
+        state.insert(credential.clone()).unwrap();
+        state.insert(shared.clone()).unwrap();
+        assert_eq!(
+            state.validate(),
+            Err(ValidationError::TenantScopedDependency {
+                from: shared.reference,
+                to: credential.reference
+            })
+        );
+    }
+
+    #[test]
     fn project_scoped_state_may_reference_its_own_tenant() {
         let tenant = tenant_id(1);
         let project_id = super::super::ids::ProjectId::new(Uuid7::from_parts(2, 0, 2).unwrap());
@@ -1131,6 +1180,23 @@ mod tests {
         assert_eq!(
             candidate(DesiredState::new()).validated_checksum(),
             Err(ValidationError::Empty)
+        );
+    }
+
+    #[test]
+    fn an_audit_event_recording_another_mutation_is_refused() {
+        // An audit row pointing at a mutation this candidate is not publishing is
+        // a dangling reference, and it is refused before the state is even walked.
+        let mut detached = candidate(state());
+        let elsewhere = MutationId::new(Uuid7::from_parts(7, 0, 7).unwrap());
+        detached.audit.mutation = elsewhere;
+        assert_eq!(
+            detached.validated_checksum(),
+            Err(ValidationError::AuditMutationMismatch {
+                audit: detached.audit.id,
+                recorded: elsewhere,
+                mutation: detached.mutation.id
+            })
         );
     }
 
