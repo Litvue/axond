@@ -18,6 +18,7 @@ use super::resource::{
     ResourceVersionNumber,
 };
 use super::revision::{DesiredState, RevisionCandidate};
+use super::tenancy::{DisplayName, ProjectBody, TenantBody};
 
 /// How many resource versions [`state`] contains.
 pub(crate) const DESIRED_STATE_RESOURCES: usize = 5;
@@ -53,22 +54,60 @@ fn inline(field: &str, value: &str) -> ResourceBody {
     )]))
 }
 
+pub(crate) fn display_name(name: &str) -> DisplayName {
+    DisplayName::parse(name).expect("fixture display name")
+}
+
+/// The typed body of the tenant `tenant` builds, so a test can assert on the
+/// body a resource carries without rebuilding the record by hand.
+pub(crate) fn tenant_body(seed: u64, name: &str) -> TenantBody {
+    TenantBody::new(tenant_id(seed), display_name(name))
+}
+
+pub(crate) fn project_body(seed: u64, tenant: u64, name: &str) -> ProjectBody {
+    ProjectBody::new(project_id(seed), tenant_id(tenant), display_name(name))
+}
+
+/// A tenant whose id is its resource id, named `slug`, displayed capitalized.
+///
+/// The seed is the tenant's id *and* its resource id, which is the binding
+/// [`TenantBody::read`] enforces: one durable object, one identity.
 pub(crate) fn tenant(seed: u64, slug: &str) -> ResourceVersion {
+    tenant_body(seed, &capitalize(slug)).version(Slug::parse(slug).expect("fixture slug"))
+}
+
+/// The tenant `tenant` builds, as a build that predates typed tenancy bodies
+/// would have written it: same envelope, an untyped body carrying no schema.
+///
+/// What a legacy row in a long-lived deployment looks like, so a test can assert
+/// that this build refuses it as an *incompatibility* rather than reading it as a
+/// typed tenant or reporting it as corruption.
+pub(crate) fn legacy_tenant(seed: u64, slug: &str) -> ResourceVersion {
     ResourceVersion::new(
-        reference(ResourceKind::Tenant, seed),
+        ResourceRef::new(
+            ResourceKind::Tenant,
+            ResourceId::new(tenant_id(seed).uuid()),
+            ResourceVersionNumber::FIRST,
+        ),
         ResourceScope::Deployment,
         Slug::parse(slug).expect("fixture slug"),
-        inline("display_name", slug),
+        inline("display_name", &capitalize(slug)),
     )
 }
 
 pub(crate) fn project(tenant: &TenantId, seed: u64, slug: &str) -> ResourceVersion {
-    ResourceVersion::new(
-        reference(ResourceKind::Project, seed),
-        ResourceScope::Tenant(*tenant),
-        Slug::parse(slug).expect("fixture slug"),
-        inline("display_name", slug),
-    )
+    ProjectBody::new(project_id(seed), *tenant, display_name(&capitalize(slug)))
+        .version(Slug::parse(slug).expect("fixture slug"))
+}
+
+/// `acme` displayed as `Acme`: a display name is prose, so a fixture's is not
+/// its slug.
+fn capitalize(slug: &str) -> String {
+    let mut characters = slug.chars();
+    match characters.next() {
+        None => String::new(),
+        Some(first) => first.to_ascii_uppercase().to_string() + characters.as_str(),
+    }
 }
 
 pub(crate) fn credential(tenant: &TenantId, seed: u64, slug: &str) -> ResourceVersion {
@@ -77,6 +116,24 @@ pub(crate) fn credential(tenant: &TenantId, seed: u64, slug: &str) -> ResourceVe
         ResourceScope::Tenant(*tenant),
         Slug::parse(slug).expect("fixture slug"),
         inline("secret_ref", slug),
+    )
+}
+
+/// An alias inside a project rather than merely inside its tenant.
+pub(crate) fn project_alias(
+    tenant: &TenantId,
+    project: &ProjectId,
+    seed: u64,
+    slug: &str,
+) -> ResourceVersion {
+    ResourceVersion::new(
+        reference(ResourceKind::Alias, seed),
+        ResourceScope::Project {
+            tenant: *tenant,
+            project: *project,
+        },
+        Slug::parse(slug).expect("fixture slug"),
+        inline("wire_family", "openai-chat"),
     )
 }
 
@@ -171,6 +228,51 @@ pub(crate) fn state() -> DesiredState {
             ))
         })
         .expect("fixture state is valid");
+    state
+}
+
+/// [`state`], with its tenant row as a build predating typed tenancy bodies
+/// wrote it: what a newer build's storage — or its exported cache — looks like to
+/// an older one, so a test can drive the incompatibility path from realistic
+/// state rather than from one hand-edited row.
+pub(crate) fn state_with_legacy_tenant() -> DesiredState {
+    let mut state = DesiredState::new();
+    state.declare_blob(*blob_backed_catalog(5).body.blob().expect("a blob body"));
+    let credential = credential(&tenant_id(1), 3, "primary");
+    let catalog = blob_backed_catalog(5);
+    state
+        .insert(legacy_tenant(1, "acme"))
+        .and_then(|state| state.insert(project(&tenant_id(1), 2, "core")))
+        .and_then(|state| state.insert(credential.clone()))
+        .and_then(|state| state.insert(catalog.clone()))
+        .and_then(|state| {
+            state.insert(alias(
+                &tenant_id(1),
+                4,
+                "fast",
+                &[credential.reference, catalog.reference],
+            ))
+        })
+        .expect("the envelopes are consistent; only the body is untyped");
+    state
+}
+
+/// A revision shaped the way a build predating typed tenancy could publish one:
+/// tenant- and project-scoped resources with no tenant or project row anywhere.
+///
+/// The exemption in [`Tenancy::of`](super::Tenancy) exists for exactly this
+/// state, so a fixture holds it rather than a comment: nothing here names an
+/// owner that contradicts anything, so there is nothing to refuse, and what the
+/// project scope names is simply unroutable.
+pub(crate) fn state_a_pre_tenancy_build_published() -> DesiredState {
+    let owner = tenant_id(1);
+    let credential = credential(&owner, 23, "legacy-primary");
+    let mut state = DesiredState::new();
+    state
+        .insert(credential.clone())
+        .and_then(|state| state.insert(alias(&owner, 24, "legacy-fast", &[credential.reference])))
+        .and_then(|state| state.insert(project_alias(&owner, &project_id(2), 26, "legacy-inner")))
+        .expect("a revision without its owner rows is valid desired state");
     state
 }
 

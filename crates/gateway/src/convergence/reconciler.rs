@@ -136,8 +136,14 @@ impl Outcome {
     }
 }
 
+/// A revision, or a last-known-good snapshot, this build cannot read: intact
+/// storage that calls for a deployment rather than a repair. A label of both
+/// `axond.revision.reason` and `axond.revision.outcome`.
+pub const INCOMPATIBLE_REASON: &str = "incompatible";
+
 /// Every value the `axond.revision.reason` label can carry: the store
-/// categories [`category_reason`] classifies, and the compile reasons
+/// categories [`category_reason`] classifies, the refusals
+/// [`AttemptError::reason`] labels ahead of them, and the compile reasons
 /// [`CompileError::reason`] returns. The catalogue enumerates this list rather
 /// than a copy of it, so a new category cannot ship an uncatalogued label.
 pub const REVISION_REASONS: &[&str] = &[
@@ -147,6 +153,9 @@ pub const REVISION_REASONS: &[&str] = &[
     "invalid",
     "denied",
     "corrupt",
+    // Named rather than spelled, because it is the one label no store category
+    // produces and a second instrument also carries it.
+    INCOMPATIBLE_REASON,
     "secret",
     "projection",
     "validation",
@@ -182,8 +191,14 @@ impl AttemptError {
     /// The low-cardinality reason label. Store failures are classified by the
     /// backend's own category, so "unavailable" (retry) and "corrupt" (page
     /// someone) never collapse into one bucket.
+    ///
+    /// An incompatible revision gets its own label ahead of the category mapping:
+    /// its category is a refusal a retry cannot clear, like a bound, but the
+    /// action it calls for is a deployment, and reporting it as `denied` or
+    /// `corrupt` would send an operator looking for the wrong thing.
     fn reason(&self) -> &'static str {
         match self {
+            Self::Store(ControlPlaneError::Incompatible { .. }) => INCOMPATIBLE_REASON,
             Self::Store(error) => category_reason(error.category()),
             Self::Compile(error) => error.reason(),
         }
@@ -192,6 +207,7 @@ impl AttemptError {
     fn revision(&self) -> Option<RevisionId> {
         match self {
             Self::Store(ControlPlaneError::Corrupt { revision, .. })
+            | Self::Store(ControlPlaneError::Incompatible { revision, .. })
             | Self::Store(ControlPlaneError::RevisionNotFound(revision))
             | Self::Store(ControlPlaneError::TooLarge { revision, .. }) => Some(*revision),
             Self::Store(_) => None,
@@ -223,6 +239,11 @@ pub enum BootstrapError {
     /// unreadable storage, a refused read, a revision larger than this build
     /// hydrates. Never answered from cache — cached state would mask storage an
     /// operator has to repair.
+    ///
+    /// A desired revision this build simply cannot *read*
+    /// ([`ControlPlaneError::Incompatible`]) is the exception: storage is intact,
+    /// so the cache is consulted first, and this is only reached when there is no
+    /// cache to restore.
     #[error("the control plane refused to yield desired state: {source}")]
     Store {
         #[source]
@@ -301,11 +322,13 @@ impl Reconciler {
     /// Reach a first servable snapshot, or explain why the replica must not
     /// start.
     ///
-    /// The cache is consulted for exactly one failure — the control plane being
-    /// unreachable — because that is the only one where cached state is the
-    /// better answer. A revision that does not compile is fatal here: booting
-    /// from an older cached revision would silently serve state an operator
-    /// already replaced.
+    /// The cache is consulted for the two failures where cached state is the
+    /// better answer: the control plane being unreachable, and a desired revision
+    /// this build cannot read (a newer schema during a rollout). Both leave
+    /// storage intact and neither is repaired by refusing to start. Corruption, a
+    /// revision past this build's bounds, and a revision that does not compile are
+    /// all fatal here: booting from an older cached revision would silently serve
+    /// state an operator already replaced, or hide damage.
     pub async fn bootstrap(&self) -> Result<RevisionId, BootstrapError> {
         let span = telemetry::revision_convergence_span(telemetry::CONVERGENCE_BOOT);
         let result = self.bootstrap_inner().await;
@@ -341,7 +364,19 @@ impl Reconciler {
             Err(error) => {
                 self.record_failure(&error);
                 match error {
-                    AttemptError::Store(source) if source.retryable() => {
+                    // A cache is the answer to "this replica cannot use what the
+                    // control plane holds", and being unable to *read* the desired
+                    // revision is that, not a repair job: during a mixed-version
+                    // rollout a replica on the older build meets a revision the
+                    // newer one published, and a replica that refused to start
+                    // there would withdraw capacity exactly when a rollback needs
+                    // it. Corruption and a revision past this build's bounds still
+                    // refuse the cache, because cached state would mask storage an
+                    // operator has to fix.
+                    AttemptError::Store(source)
+                        if source.retryable()
+                            || matches!(source, ControlPlaneError::Incompatible { .. }) =>
+                    {
                         self.restore_from_cache(source).await
                     }
                     AttemptError::Store(source) => Err(BootstrapError::Store { source }),
@@ -510,19 +545,41 @@ impl Reconciler {
         }
     }
 
-    /// Boot from the signed cache because the control plane is unreachable.
+    /// Boot from the signed cache because desired state is unusable on this
+    /// replica: the control plane is unreachable, or the desired revision is one
+    /// this build cannot read.
     async fn restore_from_cache(
         &self,
         source: ControlPlaneError,
     ) -> Result<RevisionId, BootstrapError> {
         let Some(cache) = &self.cache else {
-            return Err(BootstrapError::Unavailable { source });
+            return Err(Self::uncached(source));
         };
-        let restored = cache.load().map_err(|source| BootstrapError::Cache {
-            source: Box::new(source),
-        })?;
+        let restored = match cache.load() {
+            Ok(restored) => restored,
+            // A cache this build cannot *read* is the same version skew as
+            // desired state being unreadable — a rollback onto an older build
+            // that reuses the volume finds a cache the newer build wrote — so the
+            // refusal names the skew rather than blaming the cache file, which is
+            // authentic and intact. An inconsistent or unauthentic cache is still
+            // the cache's own failure.
+            Err(LastKnownGoodError::Integrity(integrity)) if integrity.is_incompatible() => {
+                telemetry::record_last_known_good(INCOMPATIBLE_REASON);
+                tracing::warn!(
+                    error = %integrity,
+                    "the last-known-good snapshot was written by a build this one cannot read; \
+                     it cannot stand in for desired state"
+                );
+                return Err(Self::uncached(source));
+            }
+            Err(source) => {
+                return Err(BootstrapError::Cache {
+                    source: Box::new(source),
+                });
+            }
+        };
         let Some(revision) = restored else {
-            return Err(BootstrapError::Unavailable { source });
+            return Err(Self::uncached(source));
         };
         let started = self.clock.now();
         let id = self
@@ -534,10 +591,20 @@ impl Reconciler {
         tracing::warn!(
             revision = %id,
             error = %source,
-            "the control plane is unreachable; booted from the signed last-known-good snapshot, \
-             which may be older than desired state"
+            "desired state is not usable on this replica; booted from the signed \
+             last-known-good snapshot, which may be older than desired state"
         );
         Ok(id)
+    }
+
+    /// The refusal when the cache could not answer: an outage the replica may yet
+    /// ride out, or a refusal it cannot.
+    fn uncached(source: ControlPlaneError) -> BootstrapError {
+        if source.retryable() {
+            BootstrapError::Unavailable { source }
+        } else {
+            BootstrapError::Store { source }
+        }
     }
 
     /// Record a refusal and its backoff, and return the reason label.

@@ -55,6 +55,13 @@ impl SerializerVersion {
     /// be confused with another format's bytes that happen to collide.
     const MAGIC: &'static [u8] = b"axond.desired-state\0";
 
+    /// What every version of this encoding is named after.
+    ///
+    /// A stored name this build does not know but that belongs to this family is
+    /// a version it has not learned yet — a skew — while any other text is
+    /// something no release ever wrote.
+    pub const FAMILY: &'static str = "axond.desired-state.v";
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::V1 => "axond.desired-state.v1",
@@ -293,15 +300,24 @@ pub enum CanonicalError {
 }
 
 impl CanonicalValue {
-    /// A record built from unsorted pairs. Sorting happens at encode time, so
-    /// callers never have to.
+    /// A record built from unsorted pairs, sorted into the order it encodes in.
+    ///
+    /// Sorted here as well as at encode time (in the same order), so a record a caller builds is
+    /// *equal* to the same record read back out of storage rather than merely
+    /// hashing the same. Without that, a multi-field body would compare unequal
+    /// to its own round trip on field order alone, and every consumer would have
+    /// to compare checksums instead of values.
     pub fn map<K: Into<String>>(fields: impl IntoIterator<Item = (K, CanonicalValue)>) -> Self {
-        Self::Map(
-            fields
-                .into_iter()
-                .map(|(key, value)| (key.into(), value))
-                .collect(),
-        )
+        let mut fields: Vec<(String, CanonicalValue)> = fields
+            .into_iter()
+            .map(|(key, value)| (key.into(), value))
+            .collect();
+        // The encoder's order — length first, then content — so this is the same
+        // record a decoder returns and not merely one that hashes the same.
+        fields.sort_by(|(left, _), (right, _)| {
+            (left.len(), left.as_bytes()).cmp(&(right.len(), right.as_bytes()))
+        });
+        Self::Map(fields)
     }
 
     /// A set-like collection built from members in any order.
@@ -344,13 +360,16 @@ impl CanonicalValue {
                     .map(Self::try_from_json)
                     .collect::<Result<_, _>>()?,
             )),
-            serde_json::Value::Object(fields) => Ok(Self::Map(
+            // Through `map` rather than `Map` directly: JSON hands fields over in
+            // its own order, and a record has one, so a body read out of a request
+            // is the same value as that body read back out of storage.
+            serde_json::Value::Object(fields) => Ok(Self::map(
                 fields
                     .iter()
                     .map(|(key, value)| {
                         Self::try_from_json(value).map(|value| (key.clone(), value))
                     })
-                    .collect::<Result<_, _>>()?,
+                    .collect::<Result<Vec<_>, _>>()?,
             )),
         }
     }
@@ -783,6 +802,33 @@ mod tests {
         assert_eq!(
             CanonicalValue::try_from_json(&one).unwrap().checksum(),
             CanonicalValue::try_from_json(&other).unwrap().checksum()
+        );
+    }
+
+    /// A body from a request has to be *equal* to that body read back out of
+    /// storage, not merely hash the same: consumers compare whole resource
+    /// versions. JSON's key order is lexicographic and the encoder's is length
+    /// first, so `display_name`/`tenant_id` is where the two diverge.
+    #[test]
+    fn a_record_from_json_is_the_record_a_decoder_returns() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"display_name":"Acme","tenant_id":"ten_x","schema":"axond.tenant.v1"}"#,
+        )
+        .unwrap();
+        let from_json = CanonicalValue::try_from_json(&body).expect("a record canonicalizes");
+
+        let bytes = from_json.to_canonical_bytes().expect("canonical bytes");
+        let decoded = SerializerVersion::default()
+            .decode(&bytes)
+            .expect("its own round trip");
+        assert_eq!(from_json, decoded);
+        assert_eq!(
+            from_json,
+            CanonicalValue::map([
+                ("tenant_id", CanonicalValue::string("ten_x")),
+                ("schema", CanonicalValue::string("axond.tenant.v1")),
+                ("display_name", CanonicalValue::string("Acme")),
+            ])
         );
     }
 

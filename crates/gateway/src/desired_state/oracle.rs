@@ -95,6 +95,15 @@ impl InMemoryControlPlane {
         self.locked().versions.remove(reference);
     }
 
+    /// Replace a stored resource version, as a row written by a build with a
+    /// different body schema would read.
+    ///
+    /// The complement of [`InMemoryControlPlane::forget_version`]: that one models
+    /// a row that went missing, this one a row this build cannot interpret.
+    pub(crate) fn rewrite_version(&self, version: ResourceVersion) {
+        self.locked().versions.insert(version.reference, version);
+    }
+
     /// Rewrite a manifest's recorded checksum, as a corrupted column would.
     pub(crate) fn corrupt_checksum(&self, id: RevisionId, checksum: Checksum) {
         if let Some(manifest) = self.locked().manifests.get_mut(&id) {
@@ -180,7 +189,7 @@ impl ControlPlaneStore for InMemoryControlPlane {
                 .map_err(|source| ControlPlaneError::corrupt(id, IntegrityError::from(source)))?;
         }
         LoadedRevision::assemble(manifest, state)
-            .map_err(|source| ControlPlaneError::corrupt(id, source))
+            .map_err(|source| ControlPlaneError::integrity(id, source))
     }
 
     async fn publish_revision(
@@ -270,12 +279,13 @@ impl ControlPlaneStore for InMemoryControlPlane {
 mod tests {
     use super::super::canonical::CanonicalValue;
     use super::super::fixtures::{
-        DESIRED_STATE_RESOURCES, alias, candidate, reference, revision_id, state,
+        DESIRED_STATE_RESOURCES, alias, candidate, legacy_tenant, reference, revision_id, state,
         state_with_renamed_alias, tenant_id,
     };
     use super::super::mutation::{Actor, ExpectedRevision};
     use super::super::resource::{ResourceBody, ResourceKind};
     use super::super::revision::ValidationError;
+    use super::super::tenancy::TenancyError;
     use super::*;
     use crate::backends::{BackendFailure, FailureCategory};
 
@@ -676,6 +686,49 @@ mod tests {
                 if matches!(**source, IntegrityError::ChecksumMismatch { .. })
         ));
         assert_eq!(error.category(), FailureCategory::Corrupt);
+    }
+
+    /// The upgrade case: a retained revision whose tenant body predates typed
+    /// tenancy schemas. Nothing about storage is broken, so reporting it as
+    /// corruption would send an operator to repair a database that is intact —
+    /// and reading it as a typed tenant would be worse still.
+    #[tokio::test]
+    async fn a_revision_this_build_cannot_read_is_an_incompatibility_not_corruption() {
+        let store = InMemoryControlPlane::new();
+        let manifest = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "first", state()))
+            .await
+            .unwrap();
+
+        store.rewrite_version(legacy_tenant(1, "acme"));
+        let error = store
+            .load_revision(manifest.id)
+            .await
+            .expect_err("an untyped tenancy body must not hydrate");
+        let ControlPlaneError::Incompatible { revision, source } = &error else {
+            panic!("expected an incompatibility, got {error:?}");
+        };
+        assert_eq!(*revision, manifest.id);
+        assert!(source.is_incompatible());
+        assert!(
+            matches!(
+                **source,
+                IntegrityError::Incompatible(TenancyError::MissingField {
+                    field: "schema",
+                    ..
+                })
+            ),
+            "{source}"
+        );
+        assert_ne!(
+            error.category(),
+            FailureCategory::Corrupt,
+            "an upgrade is not a storage repair"
+        );
+        assert!(!error.retryable(), "a retry cannot make this build read it");
+        // The revision is refused whole: nothing partial is returned, and the
+        // manifest stays readable so convergence can name what it cannot load.
+        assert!(store.load_manifest(manifest.id).await.is_ok());
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ use super::compile::testing::{AliasProjection, bootstrap, env};
 use super::lkg::testing::{KEY, cache_path};
 use super::status::testing::ManualClock;
 use super::*;
-use crate::backends::control_plane::ControlPlaneStore;
+use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::budget::NoBudget;
 use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{DesiredState, ExpectedRevision, RevisionId, fixtures};
@@ -346,6 +346,62 @@ async fn a_revision_that_fails_the_boot_gate_publishes_nothing() {
     assert_eq!(replica.served_aliases(), before);
 }
 
+/// A revision this build cannot read — here a tenant body written before tenancy
+/// bodies were typed — is refused as an *incompatibility*, under its own reason,
+/// while the replica keeps serving the revision it already converged onto.
+///
+/// The distinction is operational: `corrupt` sends someone to repair storage,
+/// which is exactly the wrong response to a fleet mid-upgrade.
+#[tokio::test]
+async fn a_revision_this_build_cannot_read_is_refused_as_an_incompatibility() {
+    let store = control_plane();
+    let first = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let replica = Replica::serving(&store);
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    let serving = replica.served_aliases();
+
+    let second = publish(
+        &store,
+        "second",
+        ExpectedRevision::Exactly(first),
+        fixtures::state_with_renamed_alias(),
+    )
+    .await;
+    // The retained tenant row, as an older writer left it.
+    store.rewrite_version(fixtures::legacy_tenant(1, "acme"));
+
+    let outcome = replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Rejected { revision, reason }
+                if revision == Some(second) && reason == "incompatible"
+        ),
+        "{outcome:?}"
+    );
+    let report = replica.report();
+    let rejection = report.last_rejection.expect("a reason is reported");
+    assert_eq!(rejection.reason, "incompatible");
+    assert!(
+        rejection.detail.contains("not compatible with this build"),
+        "{}",
+        rejection.detail
+    );
+
+    // Last known good is retained in the only sense that matters: the replica is
+    // still serving the revision it converged onto, at the same generation.
+    assert_eq!(report.active, Some(first));
+    assert_eq!(report.desired, Some(second));
+    assert_eq!(replica.generation(), 1);
+    assert_eq!(replica.served_aliases(), serving);
+}
+
 /// A control-plane outage degrades to staleness: the replica keeps serving the
 /// revision it already has, reports growing lag, and converges when Postgres
 /// comes back.
@@ -576,6 +632,147 @@ async fn a_cold_boot_during_an_outage_restores_the_signed_snapshot() {
     let converged = cold.report();
     assert_eq!(converged.active, Some(second));
     assert_eq!(converged.source, Some(SnapshotSource::ControlPlane));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A replica added to a fleet mid-rollout meets a desired revision its build
+/// cannot read, and starts from its signed cache rather than refusing to boot.
+///
+/// Storage is intact here, so there is nothing for an operator to repair, and a
+/// replica that would not start would withdraw capacity during exactly the
+/// rollout or rollback that needs it added. The cache was written by this build,
+/// so it is readable by definition.
+#[tokio::test]
+async fn a_cold_boot_onto_an_unreadable_revision_restores_the_signed_snapshot() {
+    let store = control_plane();
+    let published = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let path = cache_path("cold-boot-incompatible");
+
+    let warm = Replica::with_cache(
+        &store,
+        LastKnownGood::new(&path, KEY).expect("a long enough key"),
+    );
+    warm.reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    assert!(path.exists(), "converging exported the cache");
+
+    // Desired state moves on, and its retained tenant row is one an older writer
+    // left behind: this build cannot read the revision it must converge onto.
+    let second = publish(
+        &store,
+        "second",
+        ExpectedRevision::Exactly(published),
+        fixtures::state_with_renamed_alias(),
+    )
+    .await;
+    store.rewrite_version(fixtures::legacy_tenant(1, "acme"));
+
+    let cold = Replica::with_cache(
+        &store,
+        LastKnownGood::new(&path, KEY).expect("a long enough key"),
+    );
+    let restored = cold
+        .reconciler
+        .bootstrap()
+        .await
+        .expect("an unreadable revision is not a reason to refuse to start");
+
+    assert_eq!(restored, published);
+    let report = cold.report();
+    assert_eq!(report.active, Some(published));
+    assert_eq!(report.source, Some(SnapshotSource::LastKnownGood));
+    assert_eq!(report.generation, 1);
+    assert!(cold.served_aliases().contains(&"fast".to_owned()));
+
+    // The cache is a fallback, not a way to stop reporting refusals: converging
+    // still refuses the revision under its own reason, and keeps serving.
+    let outcome = cold
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Rejected { revision, reason }
+                if revision == Some(second) && reason == "incompatible"
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(cold.report().active, Some(published));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// With no cache to restore, the same unreadable revision refuses the boot: there
+/// is nothing to serve, and serving nothing while reporting healthy is worse.
+#[tokio::test]
+async fn a_cold_boot_onto_an_unreadable_revision_without_a_cache_refuses_to_start() {
+    let store = control_plane();
+    publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    store.rewrite_version(fixtures::legacy_tenant(1, "acme"));
+
+    let error = Replica::serving(&store)
+        .reconciler
+        .bootstrap()
+        .await
+        .expect_err("there is nothing to serve");
+    assert!(
+        matches!(
+            error,
+            BootstrapError::Store {
+                source: ControlPlaneError::Incompatible { .. }
+            }
+        ),
+        "an unreadable revision is named as such, not as an outage: {error}"
+    );
+}
+
+/// A rollback that reuses the volume: neither desired state nor the cache the
+/// newer build left behind is readable here. The refusal names the version skew
+/// rather than blaming a cache file that is authentic and intact.
+#[tokio::test]
+async fn a_cold_boot_whose_cache_a_newer_build_wrote_is_refused_as_a_skew() {
+    let store = control_plane();
+    let published = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let path = cache_path("cold-boot-newer-cache");
+
+    let warm = Replica::with_cache(
+        &store,
+        LastKnownGood::new(&path, KEY).expect("a long enough key"),
+    );
+    warm.reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    let cached = LastKnownGood::new(&path, KEY).expect("a long enough key");
+    let readable = cached.load().expect("reads back").expect("a cache exists");
+    cached
+        .export_unassembled(readable.manifest(), &fixtures::state_with_legacy_tenant())
+        .expect("a newer build's export");
+    assert_eq!(readable.manifest().id, published);
+
+    // And desired state is what the newer build published, which this build also
+    // does not read.
+    store.rewrite_version(fixtures::legacy_tenant(1, "acme"));
+
+    let error = Replica::with_cache(
+        &store,
+        LastKnownGood::new(&path, KEY).expect("a long enough key"),
+    )
+    .reconciler
+    .bootstrap()
+    .await
+    .expect_err("there is nothing this build can serve");
+    assert!(
+        matches!(
+            error,
+            BootstrapError::Store {
+                source: ControlPlaneError::Incompatible { .. }
+            }
+        ),
+        "the skew is named, not the cache that faithfully recorded it: {error}"
+    );
 
     let _ = std::fs::remove_file(&path);
 }
