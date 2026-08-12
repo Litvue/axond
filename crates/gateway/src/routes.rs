@@ -39,7 +39,9 @@ use gateway_core::{
     NativeMessagesDecoder, ProviderError, ProviderRequest, ProviderResponse, ProviderStreamDecoder,
     Surface, Usage,
 };
-use gateway_transport::{AuthScheme, NativeCall, TransportError, Upstream};
+use gateway_transport::{
+    AuthScheme, Deadline, NativeCall, TimeoutBound, TimeoutKind, TransportError, Upstream,
+};
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -1151,6 +1153,7 @@ async fn dispatch_with_failover(
             &target.model,
             req_body,
             wire,
+            Deadline::at(deadline),
         )
         .instrument(attempt_span.clone())
         .await;
@@ -1158,6 +1161,9 @@ async fn dispatch_with_failover(
         // A non-streamed response arrives whole, so the first token lands with
         // the last one; the streaming relay reports the real first chunk.
         let ttft_ms = attempt.result.is_ok().then_some(latency_ms);
+        if let Err(err) = &attempt.result {
+            note_attempt_timeout(&attempt_span, target, err);
+        }
         telemetry::finish_upstream_attempt(
             &attempt_span,
             if attempt.result.is_ok() {
@@ -1237,6 +1243,7 @@ async fn open_stream_lease(
     lease: &CredentialLease,
     lease_index: usize,
     parent: StreamLeaseParent<'_>,
+    deadline: Deadline,
 ) -> Result<
     (
         Box<dyn ProviderStreamDecoder>,
@@ -1279,6 +1286,7 @@ async fn open_stream_lease(
                             &upstream,
                             Surface::ChatCompletions,
                             request,
+                            deadline,
                         ),
                     )
                     .await?
@@ -1289,6 +1297,7 @@ async fn open_stream_lease(
                         &upstream,
                         Surface::ChatCompletions,
                         request,
+                        deadline,
                     );
                     streaming::open_stream_with_lease_parent(
                         ctx,
@@ -1310,12 +1319,12 @@ async fn open_stream_lease(
                         span,
                         &lease.id,
                         lease_index,
-                        state.0.dispatcher.send_stream(&upstream, &call),
+                        state.0.dispatcher.send_stream(&upstream, &call, deadline),
                     )
                     .await?
                 }
                 StreamLeaseParent::Rotation(parent) => {
-                    let open = state.0.dispatcher.send_stream(&upstream, &call);
+                    let open = state.0.dispatcher.send_stream(&upstream, &call, deadline);
                     streaming::open_stream_with_lease_parent(
                         ctx,
                         &lease.id,
@@ -1475,6 +1484,7 @@ async fn stream_with_failover(
                 lease,
                 plan.parked.len() + lease_index,
                 StreamLeaseParent::Attempt(span),
+                Deadline::at(deadline),
             )
             .await;
             ctx.attempts = target_attempt + 1;
@@ -1554,6 +1564,7 @@ async fn stream_with_failover(
                                     &next_lease,
                                     lease_index,
                                     StreamLeaseParent::Rotation(parent_context),
+                                    Deadline::at(deadline),
                                 )
                                 .await
                                 .map(|(decoder, bytes)| streaming::OpenedStream { decoder, bytes })
@@ -1589,6 +1600,7 @@ async fn stream_with_failover(
                     continue;
                 }
                 Err(err) => {
+                    note_attempt_timeout(span, target, &err);
                     record_target_failure(&snapshot, target, &circuit_key, &err);
                     let has_next = index + 1 < walk.total
                         && walk.attempts < max_attempts
@@ -1784,6 +1796,32 @@ fn auth_scheme(kind: ProviderKind) -> AuthScheme {
     }
 }
 
+/// Attribute a failed attempt's timeout class to its span and the timeout
+/// counter. Only the bound is recorded — never the upstream URL, which the
+/// transport has already kept out of the error.
+fn note_attempt_timeout(span: &tracing::Span, target: &Target, err: &TransportError) {
+    if let Some(kind) = err.timeout_kind() {
+        let bound = err
+            .timeout_bound()
+            .map(TimeoutBound::label)
+            .unwrap_or_default();
+        telemetry::record_attempt_timeout(
+            span,
+            &target.provider,
+            &target.model,
+            kind.label(),
+            bound,
+        );
+        warn!(
+            provider = %target.provider,
+            model = %target.model,
+            timeout = kind.label(),
+            timeout_bound = bound,
+            "upstream attempt exceeded a transport bound"
+        );
+    }
+}
+
 fn record_target_success(snapshot: &ConfigSnapshot, target: &Target, circuit_key: &str) {
     snapshot.target_circuits.record_success(circuit_key);
     telemetry::metrics::record_circuit_state(
@@ -1796,14 +1834,19 @@ fn record_target_success(snapshot: &ConfigSnapshot, target: &Target, circuit_key
 /// A target failure trips its circuit only when it reflects on the *target*'s
 /// health. A `429` that exhausted the pool is credential-scoped (ADR 0006) and a
 /// `404` names a missing deployment, not an unhealthy target — both fail over
-/// without opening the target's breaker.
+/// without opening the target's breaker. A walk budget spent before this target
+/// was ever dispatched to belongs in the same category; a target that was given
+/// time and stalled does not, however short that time was.
 fn record_target_failure(
     snapshot: &ConfigSnapshot,
     target: &Target,
     circuit_key: &str,
     err: &TransportError,
 ) {
-    if as_provider_error(err).affects_provider_health() && !is_credential_exhausted(err) {
+    if as_provider_error(err).affects_provider_health()
+        && !is_credential_exhausted(err)
+        && !was_never_dispatched(err)
+    {
         snapshot.target_circuits.record_failure(circuit_key);
         telemetry::metrics::record_circuit_state(
             &target.provider,
@@ -1820,6 +1863,13 @@ fn as_provider_error(err: &TransportError) -> ProviderError {
     match err {
         TransportError::Provider(pe) => pe.clone(),
         TransportError::Http(message) => ProviderError::transport("upstream", message.clone()),
+        // A timeout says nothing conclusive about the target beyond "it did not
+        // answer in time", which is exactly a target-scoped dependency failure.
+        // An oversized body is the same: the target produced something this
+        // gateway will not serve.
+        TransportError::Timeout { .. } | TransportError::BodyTooLarge { .. } => {
+            ProviderError::transport("upstream", err.to_string())
+        }
     }
 }
 
@@ -1834,6 +1884,7 @@ struct PooledAttempt {
 /// credential-scoped failure (rate limit / quota) park that credential and
 /// retry the *same* target with the next one. Target-level failover is a
 /// separate concern and is not attempted here.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_over_pool(
     state: &AppState,
     snapshot: &ConfigSnapshot,
@@ -1842,6 +1893,7 @@ async fn dispatch_over_pool(
     target_model: &str,
     body: Value,
     wire: &Wire,
+    deadline: Deadline,
 ) -> PooledAttempt {
     let adapter = adapter_for(provider.kind);
     let mut exhausted: Option<PooledAttempt> = None;
@@ -1884,13 +1936,18 @@ async fn dispatch_over_pool(
                             &upstream,
                             Surface::ChatCompletions,
                             request,
+                            deadline,
                         )
                         .await
                 }
                 route => state
                     .0
                     .dispatcher
-                    .send(&upstream, &wire.call(body.clone(), adapter.name()))
+                    .send(
+                        &upstream,
+                        &wire.call(body.clone(), adapter.name()),
+                        deadline,
+                    )
                     .await
                     .map(|body| ProviderResponse {
                         usage: route.native_usage(&body),
@@ -1943,6 +2000,20 @@ async fn dispatch_over_pool(
 /// the target's problem, not the key's.
 fn is_credential_exhausted(err: &TransportError) -> bool {
     matches!(err, TransportError::Provider(error) if error.is_credential_rate_limited())
+}
+
+/// `TimeoutKind::Overall` is the one timeout no target earned: the walk's budget
+/// was already spent, so nothing was dispatched and there is no evidence about
+/// this target to record. Parking a target the gateway never called would let
+/// one slow target take healthy ones out of rotation.
+///
+/// Every other timeout names the phase that stalled — including one cut short by
+/// what was left of `failover.overall_timeout_ms` — because a target that
+/// accepted a request and produced nothing in the time it was given *is*
+/// evidence, and treating a late-in-the-walk stall as the gateway's own problem
+/// would keep a black-holing target's breaker closed forever.
+fn was_never_dispatched(err: &TransportError) -> bool {
+    err.timeout_kind() == Some(TimeoutKind::Overall)
 }
 
 fn to_usage(u: &gateway_core::ModelUsage) -> Usage {
@@ -2075,6 +2146,41 @@ namespace = "platform"
             .chain([("AXOND_INBOUND_KEY", CALLER_SECRET)])
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect()
+    }
+
+    /// A stall is the target's problem whichever bound ended the wait; only a
+    /// budget spent before dispatch is the gateway's, because then no target was
+    /// asked anything.
+    #[test]
+    fn a_stalled_target_is_recorded_even_when_the_walk_budget_ended_the_wait() {
+        for kind in [
+            TimeoutKind::Connect,
+            TimeoutKind::ResponseHeaders,
+            TimeoutKind::BufferedBody,
+            TimeoutKind::StreamIdle,
+        ] {
+            for bound in [TimeoutBound::Phase, TimeoutBound::WalkBudget] {
+                let err = TransportError::Timeout {
+                    kind,
+                    bound,
+                    budget_ms: 100,
+                };
+                assert!(as_provider_error(&err).affects_provider_health());
+                assert!(
+                    !was_never_dispatched(&err),
+                    "{} on {}",
+                    kind.label(),
+                    bound.label()
+                );
+            }
+        }
+
+        let unattempted = TransportError::Timeout {
+            kind: TimeoutKind::Overall,
+            bound: TimeoutBound::WalkBudget,
+            budget_ms: 0,
+        };
+        assert!(was_never_dispatched(&unattempted));
     }
 
     /// A JSON `POST` that already carries the caller's gateway key.

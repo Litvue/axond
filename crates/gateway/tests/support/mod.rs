@@ -22,6 +22,14 @@ pub async fn boot() -> (FakeUpstream, Axond) {
     (upstream, gateway)
 }
 
+/// Boot a fake upstream and a gateway whose `[failover]`/`[transport]` bounds
+/// come from `tuning`.
+pub async fn boot_with(tuning: &str) -> (FakeUpstream, Axond) {
+    let upstream = FakeUpstream::start().await;
+    let gateway = Axond::start_with(&upstream.base_url, tuning).await;
+    (upstream, gateway)
+}
+
 /// A client with no whole-request deadline: the soak holds streams open
 /// deliberately, and a deadline would cut one off and look like a client
 /// hang-up. Connecting is still bounded, since that cannot legitimately hang.

@@ -21,8 +21,8 @@ pub use http::TelemetryLayer;
 pub use spans::{
     ATTEMPT_ERROR, ATTEMPT_OK, LEASE_ERROR, LEASE_PARKED, LEASE_RATE_LIMITED, LEASE_SERVED,
     RELOAD_APPLIED, RELOAD_REJECTED, config_reload_span, credential_lease_span,
-    finish_config_reload, finish_credential_lease, finish_upstream_attempt, record_request,
-    record_routing, record_streamed, trace_id, upstream_attempt_span,
+    finish_config_reload, finish_credential_lease, finish_upstream_attempt, record_attempt_timeout,
+    record_request, record_routing, record_streamed, trace_id, upstream_attempt_span,
 };
 
 use std::sync::OnceLock;

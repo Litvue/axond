@@ -32,6 +32,7 @@ struct Instruments {
     output_tokens: Counter<u64>,
     cost: Counter<u64>,
     upstream_errors: Counter<u64>,
+    upstream_timeouts: Counter<u64>,
     circuit_state: Gauge<u64>,
     usage_written: Counter<u64>,
     usage_dropped: Counter<u64>,
@@ -105,6 +106,12 @@ impl Instruments {
             upstream_errors: meter
                 .u64_counter("axond.upstream.errors")
                 .with_description("Upstream attempts that failed, by target.")
+                .build(),
+            upstream_timeouts: meter
+                .u64_counter("axond.upstream.timeouts")
+                .with_description(
+                    "Upstream attempts that exceeded a transport bound, by target and phase.",
+                )
                 .build(),
             circuit_state: meter
                 .u64_gauge("axond.upstream.circuit_state")
@@ -223,6 +230,31 @@ pub(super) fn record_request(record: &UsageRecord, ttft_ms: Option<u64>) {
     if record.status.is_error() {
         instruments.upstream_errors.add(1, &attributes);
     }
+}
+
+/// One upstream attempt that exceeded a transport bound. `phase` is what was
+/// waiting ([`gateway_transport::TimeoutKind::label`]) and `bound` whether the
+/// phase's own bound or what was left of the failover budget ended the wait
+/// ([`gateway_transport::TimeoutBound::label`]) — together, what separates "the
+/// provider is slow" from "our own failover budget ran out".
+pub fn record_upstream_timeout(
+    target_provider: &str,
+    target_model: &str,
+    phase: &'static str,
+    bound: &'static str,
+) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.upstream_timeouts.add(
+        1,
+        &[
+            KeyValue::new("axond.target.provider", target_provider.to_owned()),
+            KeyValue::new("axond.target.model", target_model.to_owned()),
+            KeyValue::new("axond.timeout", phase),
+            KeyValue::new("axond.timeout.bound", bound),
+        ],
+    );
 }
 
 /// Usage records a sink durably accepted. Counted by the batching fan-out, so

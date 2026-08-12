@@ -163,14 +163,28 @@ impl RotationHandle {
         &mut self,
     ) -> Result<Option<(CredentialLease, OpenedStream)>, TransportError> {
         while let Some((lease, lease_index)) = self.remaining.pop_front() {
-            if self
-                .deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                return Ok(None);
-            }
+            // The walk's budget bounds the reopen itself, not just the decision
+            // to attempt one: a rotation that hangs would otherwise outlive the
+            // deadline it was checked against.
+            let remaining = match self.deadline {
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Ok(None);
+                    }
+                    Some(left)
+                }
+                None => None,
+            };
             let open = (self.opener)(lease.clone(), 0, lease_index);
-            match open.await {
+            let opened = match remaining {
+                Some(left) => match tokio::time::timeout(left, open).await {
+                    Ok(opened) => opened,
+                    Err(_) => return Ok(None),
+                },
+                None => open.await,
+            };
+            match opened {
                 Ok(opened) => {
                     self.serving = lease.clone();
                     return Ok(Some((lease, opened)));
@@ -450,7 +464,29 @@ impl Relay {
                     Err(err) => self.phase = Phase::Failed(err.to_string()),
                 }
             }
-            Some(Err(err)) => self.phase = Phase::Failed(err.to_string()),
+            Some(Err(err)) => {
+                // An open stream that goes silent is terminated honestly: bytes
+                // may already be committed downstream, so there is nothing to
+                // retry and no new completion to splice in.
+                if let Some(kind) = err.timeout_kind() {
+                    telemetry::metrics::record_upstream_timeout(
+                        &self.accounting.ctx.target_provider,
+                        &self.accounting.ctx.target_model,
+                        kind.label(),
+                        err.timeout_bound()
+                            .map(gateway_transport::TimeoutBound::label)
+                            .unwrap_or_default(),
+                    );
+                    tracing::warn!(
+                        provider = %self.accounting.ctx.target_provider,
+                        model = %self.accounting.ctx.target_model,
+                        timeout = kind.label(),
+                        committed = self.queued_downstream,
+                        "open stream exceeded a transport bound"
+                    );
+                }
+                self.phase = Phase::Failed(err.to_string());
+            }
             None => self.finish_upstream(),
         }
     }

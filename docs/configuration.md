@@ -29,6 +29,7 @@ egress: upstream provider calls still use the network at Tier 0.
 | --- | --- |
 | `[server]`, `[[namespace]]`, `[[provider]]`, `[[model]]`, `[[credential]]` | Tier 0: config-only. |
 | `[credential_pool]`, `[failover]` | Tier 0: in-memory, per replica. |
+| `[transport]` | Tier 0: process-level bounds on provider egress. |
 | `[[gateway_key]]`, `[gateway_token]`, `[[gateway_verifier]]`, `[[gateway_token_epoch]]`, offline `keygen`/`mint` | Tier 0: config, referenced files, and environment only. |
 | `[reload]` | Tier 0: reload reads the config file, referenced key-material files, and process environment. |
 | `[[usage_sink]]` omitted or `kind = "stdout"` | Tier 0: one JSON line on stdout. |
@@ -188,6 +189,56 @@ makes Responses requests fail rather than move on.
 
 Circuits are in-memory and per replica, consistent with running stateless
 ([ADR 0002](./adr/0002-stateless-by-default-stateful-by-opt-in.md)).
+
+`overall_timeout_ms` is authoritative for everything that happens *before* a
+response is being served: connecting, waiting for response headers, reading a
+buffered body, and opening a stream — including a credential rotation's open. An
+in-flight attempt is cancelled when it is spent, so a request cannot outlive the
+budget by having started just inside it. Once a stream is open the budget stops
+applying, because a long answer is not a stalled one: from there
+`transport.stream_idle_timeout_ms` governs each wait for the next chunk.
+
+## `[transport]` — per-phase upstream bounds, Tier 0
+
+Bounds on one upstream call. Each phase is separate because they fail for
+different reasons: connecting is egress or DNS, no headers is an overloaded
+provider, a silent open socket is a half-dead connection. Every bound must be
+≥ 1 — zero is not "unbounded", it is a gateway that cannot call anything
+([ADR 0028](./adr/0028-transport-phase-bounds.md)).
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `connect_timeout_ms` | integer | `5000` | Bound on establishing the TCP + TLS connection to a provider. |
+| `response_header_timeout_ms` | integer | `30000` | Bound on waiting for response headers (time to first byte) after dispatch. For a non-streamed call this covers the whole completion — see below. |
+| `buffered_body_timeout_ms` | integer | `30000` | Bound on reading a whole buffered response body once headers arrived. |
+| `stream_idle_timeout_ms` | integer | `120000` | Bound on waiting for the *next* chunk of an already-open stream. Not a stream lifetime: a productive stream may run for as long as it keeps producing. |
+| `max_response_bytes` | integer | `33554432` | Largest buffered response body that will be read. A larger one is refused as `upstream_body_too_large` rather than buffered. |
+| `max_error_bytes` | integer | `65536` | Largest provider *error* body read for diagnostics. A larger one is truncated, so the provider's own status still reaches the caller. Must not exceed `max_response_bytes`. |
+
+The tighter of a phase bound and the remaining `failover.overall_timeout_ms`
+governs each phase, and the caller-visible error names which one fired:
+`upstream_timeout` (`504`) for a bound, `upstream_body_too_large` (`502`) for a
+byte bound. Neither message names the provider endpoint.
+
+The error names the phase that was waiting, and `axond.timeout.bound` records
+which bound ended the wait (`phase` or `walk_budget`). A stalled phase is the
+target's own failure and counts towards its circuit either way: a target that
+accepted a request and produced nothing in the time it was given is evidence
+about the target, not about the gateway's budget. Only `overall` — the walk's
+budget already spent before the attempt was dispatched, so no target was called —
+is excluded from target health.
+
+The header and buffered-body defaults are therefore *not* tighter than the
+default walk budget. A non-streamed provider call sends no headers until the
+completion exists, so those two bounds are the model's thinking time rather than
+a liveness signal, and a tighter default would refuse answers the walk still had
+time for; `failover.overall_timeout_ms` is what keeps them finite in practice.
+Tighten them below the walk budget only when you want to cap a single attempt so
+later targets get a turn.
+
+`connect_timeout_ms` configures the shared pooled HTTP client, so the whole
+section is read at boot: a reload validates a changed `[transport]` and warns
+that a restart is needed to apply it, exactly as `[server] bind` behaves.
 
 ## `[[gateway_key]]` — inbound authentication (required, Tier 0)
 
@@ -353,7 +404,7 @@ or via an atomic rename is therefore reload-reachable without a process
 restart. `[[namespace]]` changes are reloadable and appear in the reported
 namespace delta, but the namespace count used for in-memory budget retention
 floors is captured at boot and does not resize until restart. `[server] bind`,
-`[[usage_sink]]`, `[budget]`, `[rate_limit]`, and `[revocation]`
+`[transport]`, `[[usage_sink]]`, `[budget]`, `[rate_limit]`, and `[revocation]`
 changes warn and are ignored until restart; this includes
 `limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
 

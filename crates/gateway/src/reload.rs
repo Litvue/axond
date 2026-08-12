@@ -25,7 +25,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::config::{
-    BudgetConfig, Config, ConfigError, RateLimitConfig, Reload, RevocationConfig, UsageSinkConfig,
+    BudgetConfig, Config, ConfigError, RateLimitConfig, Reload, RevocationConfig, Transport,
+    UsageSinkConfig,
 };
 use crate::state::{AppState, ConfigSnapshot, SnapshotError};
 use crate::telemetry;
@@ -52,6 +53,7 @@ struct Boot {
     budget: BudgetConfig,
     rate_limit: RateLimitConfig,
     revocation: RevocationConfig,
+    transport: Transport,
 }
 
 /// Owns the config path and the state whose snapshot it replaces.
@@ -77,6 +79,7 @@ impl Reloader {
                 budget: booted.config.budget.clone(),
                 rate_limit: booted.config.rate_limit.clone(),
                 revocation: booted.config.revocation.clone(),
+                transport: booted.config.transport.clone(),
             },
             path,
             state,
@@ -223,6 +226,9 @@ pub struct ReloadSummary {
     pub rate_limit_changed: bool,
     /// `[revocation]` differs from the booted revocation store configuration.
     pub revocation_changed: bool,
+    /// `[transport]` differs from the bounds the shared HTTP client was built
+    /// with. Validated on reload, applied on restart.
+    pub transport_changed: bool,
 }
 
 /// The added and removed identifiers of one config collection.
@@ -415,6 +421,7 @@ impl ReloadSummary {
             budget_changed: boot.budget != after_config.budget,
             rate_limit_changed: boot.rate_limit != after_config.rate_limit,
             revocation_changed: boot.revocation != after_config.revocation,
+            transport_changed: boot.transport != after_config.transport,
         }
     }
 
@@ -497,6 +504,11 @@ impl ReloadSummary {
         if self.revocation_changed {
             tracing::warn!(
                 "`[revocation]` changed, but the revocation store is already serving; restart to apply it"
+            );
+        }
+        if self.transport_changed {
+            tracing::warn!(
+                "`[transport]` changed, but the upstream HTTP client is already pooled; restart to apply it"
             );
         }
     }
@@ -994,6 +1006,7 @@ scope = ["chat", "models"]
             budget: before.config.budget.clone(),
             rate_limit: before.config.rate_limit.clone(),
             revocation: before.config.revocation.clone(),
+            transport: before.config.transport.clone(),
         };
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(
@@ -1023,6 +1036,7 @@ scope = ["chat", "models"]
             budget: before.config.budget.clone(),
             rate_limit: before.config.rate_limit.clone(),
             revocation: before.config.revocation.clone(),
+            transport: before.config.transport.clone(),
         };
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(
@@ -1059,6 +1073,7 @@ scope = ["chat", "models"]
             budget: disabled.config.budget.clone(),
             rate_limit: disabled.config.rate_limit.clone(),
             revocation: disabled.config.revocation.clone(),
+            transport: disabled.config.transport.clone(),
         };
 
         let added = ReloadSummary::between(&boot, &disabled, &enabled);
@@ -1125,6 +1140,7 @@ scope = ["chat", "models"]
             budget: before.config.budget.clone(),
             rate_limit: before.config.rate_limit.clone(),
             revocation: before.config.revocation.clone(),
+            transport: before.config.transport.clone(),
         };
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(summary.gateway_minting.changed, vec!["enabled".to_owned()]);
