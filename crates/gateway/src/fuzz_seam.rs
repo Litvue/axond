@@ -41,6 +41,7 @@ mod revocation;
 mod routes;
 mod shutdown;
 mod state;
+mod status;
 mod streaming;
 // The layer re-export this module makes for `main.rs` has no consumer here.
 #[allow(unused_imports)]
