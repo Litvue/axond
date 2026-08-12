@@ -96,14 +96,30 @@ describes is a public interface. Within `0.x`:
 
 Practically: the config that boots on `0.x.y` boots on `0.x.(y+1)`.
 
-**Operating modes do not change that promise.**
-[ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md) accepts an
-opt-in stateful mode whose resources live in a Postgres control plane rather
-than TOML. The mode key is optional and defaults to `stateless`, so it is an
-additive change under the rules above: no existing key is renamed or removed, no
-default changes, and stateless validation is not tightened. Stateful mode is a
-deliberate operator choice with its own bootstrap surface, and configuration
-valid in one mode is not expected to be valid in the other.
+**Operating modes do not change that promise.** `mode` selects which authority
+owns durable resources ([ADR 0027]): the default `stateless` is TOML as it is
+documented today, and the opt-in `stateful` bootstrap points at a Postgres
+control plane. Adding the key was additive under the rules above — nothing is
+renamed or removed and no default changed, so omitting `mode` still means exactly
+what it always meant.
+
+With one deliberate exception, stated rather than glossed: a stateless file that
+already contained `[control_plane]`, `[secret_store]`, or `[[admin_breakglass]]`
+used to boot, because unknown sections are tolerated, and is now a boot error.
+That is a tightening under the rules above. It is accepted because those names
+had no meaning before this release, so such a file was either hand-written
+against an unimplemented surface or a `mode = "stateful"` line short of what its
+author intended — and silently ignoring a control-plane reference is exactly the
+ambiguity the mode boundary exists to remove. The diagnostic names the section
+and the missing `mode`. No key that ever had a meaning became stricter.
+
+Stateful mode is a deliberate operator choice with its own bootstrap surface,
+and configuration valid in one mode is *not* expected to be valid in the other:
+each mode rejects the other's sections at boot rather than merging them. The
+stateful bootstrap surface is not under the `0.x` promise until the control plane
+it bootstraps exists; see [the reference](./configuration.md#operating-mode).
+
+[ADR 0027]: ./adr/0027-stateless-and-stateful-operating-modes.md
 
 ### The usage schema
 
@@ -171,7 +187,8 @@ version 2 transition.
 - **Deferred features arriving on a date.** Cross-provider translation and
   further usage sinks (Tinybird, ClickHouse) remain post-beta with no committed
   schedule.
-- **The stateful control plane.** The design is accepted in
-  [ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md), but no
-  stateful mode, `/admin/v1` route, or durable schema ships yet. Nothing about
-  its surface is under the `0.x` config or HTTP promise until it exists.
+- **The stateful control plane.** `mode = "stateful"` bootstrap configuration
+  parses and validates ([ADR 0027]), and a stateful process then refuses to
+  start: no `/admin/v1` route, durable schema, or snapshot compiler ships yet.
+  Nothing about that surface is under the `0.x` config or HTTP promise until it
+  exists.

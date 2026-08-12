@@ -54,24 +54,105 @@ namespace authority (ADR 0016). See
 
 ## Operating mode
 
-Everything in this reference describes the **stateless** operating mode, which
-is what the gateway does today and what it does when no mode is selected.
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `mode` | `stateless` \| `stateful` | `stateless` | Which authority owns durable resources. Any other value is rejected. |
 
-[ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md) accepts a
-second, opt-in **stateful** mode in which tenants, identities, providers,
-credentials, catalogues, prices, aliases, and policies are owned by a durable
-Postgres control plane and administered through `/admin/v1` instead of TOML,
-while ordinary inference still reads one immutable in-memory snapshot. In that
-mode bootstrap TOML shrinks to `mode`, `[server]`, telemetry, control-plane
-connectivity, secret-store/KEK settings, a mandatory static breakglass operator
-credential for `/admin/v1`, and connectivity references for any opt-in
-budget/rate-limit/revocation backend; a stateful-owned section appearing in TOML
-is a boot error.
+Everything else in this reference describes the **stateless** mode: TOML plus
+the environment and files it references own every resource. It is the default,
+so no existing configuration needs the key and none of its behaviour is
+tightened by having one — omitting `mode` and writing `mode = "stateless"` are
+the same configuration.
 
-No key in this reference has changed, and no existing configuration needs one:
-the mode key is optional, omitting it means stateless, and the stateful surface
-is not implemented yet. Read the ADR's ownership and failure matrices before
-planning a stateful deployment.
+[ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md) adds an opt-in
+`mode = "stateful"`, in which tenants, projects, identities, providers, provider
+credentials, catalogues, prices, aliases, and policy are owned by a durable
+Postgres control plane and administered through `/admin/v1`, while inference
+still serves one immutable in-memory snapshot. The mode is process-wide and
+exclusive: there is no per-resource migration state, and therefore no merge
+policy between a file and a database. It is a bootstrap property, so a reload
+cannot switch a serving process between modes — that needs a restart.
+
+**The control plane this bootstraps is not implemented yet.** Stateful
+configuration parses and validates today, and a stateful process then refuses to
+start rather than serve an empty snapshot. Read the ADR's ownership and failure
+matrices before planning a deployment.
+
+### Stateful bootstrap
+
+The whole file a stateful replica reads is `mode`, `[server]`, `[transport]`,
+`[reload]`, telemetry (`[[usage_sink]]`, plus the environment-only OTLP
+settings), the three sections below, and *backend selection with DSN references*
+for the opt-in `[budget]`, `[rate_limit]`, and `[revocation]` backends.
+[`axond.stateful.example.toml`](../axond.stateful.example.toml) is that file with
+prose.
+
+Two symmetrical rejections happen before the socket is bound, and again on every
+reload:
+
+- Any stateful-owned section in a stateful file — `[[namespace]]`,
+  `[[provider]]`, `[[model]]`, `[[credential]]`, `[credential_pool]`,
+  `[failover]`, `[[gateway_key]]`, `[[gateway_verifier]]`, `[gateway_minting]`,
+  `[gateway_token]`, `[[gateway_token_epoch]]` — is rejected, and so is any
+  *policy value* under `[budget]` or `[rate_limit]` (`limit_microdollars`,
+  `namespace_limit_microdollars`, `max_in_flight_per_subject`, the TTLs, and
+  `max_subjects`). Bootstrap owns connectivity to those backends; the control
+  plane owns their limits. Every offending section is named in one error.
+- Any stateful bootstrap section in a stateless file — `[control_plane]`,
+  `[secret_store]`, `[[admin_breakglass]]` — is rejected, since stateless mode
+  never reads it. That is almost always a missing `mode = "stateful"`.
+
+Every value below is a *reference*: an environment-variable name or a file path.
+Nothing here connects to Postgres, reads a key, or resolves a DSN, and
+diagnostics name the reference rather than its value.
+
+A referenced env var must also stay clear of the `AXOND_<section>` shape, because
+`AXOND_`-prefixed variables are the override layer described at the top of this
+reference: `AXOND_ADMIN_BREAKGLASS` would be merged as the `admin_breakglass`
+*key* rather than resolved as a reference, so exporting it would fail config load
+and put the credential in the error. Such a name is rejected at validation,
+naming the variable and the key it collides with. The examples use the `GW_`
+prefix for secret-bearing variables.
+
+#### `[control_plane]`
+
+Required in stateful mode. Initial cold boot needs the control plane: a replica
+with no snapshot fails readiness rather than serving partial state.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `dsn_env` | string | — | Name of the env var holding the control-plane Postgres connection string. Required and non-empty. |
+| `connect_timeout_ms` | integer | `5000` | Bound on establishing a control-plane connection. `0` is rejected. |
+
+#### `[secret_store]`
+
+Required in stateful mode. Tenant provider credentials are stored wrapped and
+unwrapped only while a snapshot is compiled; a request never unwraps a secret.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `backend` | `postgres` | `postgres` | Which store holds wrapped material. Encrypted Postgres is the first implementation ADR 0027 approves. |
+| `dsn_env` | string | `[control_plane] dsn_env` | Name of the env var holding the store's connection string. Omit to reuse the control plane's own reference, which is the common single-database deployment. |
+| `kek_env` | string | — | Name of the env var holding the key-encryption key. |
+| `kek_file` | string | — | Path to a file holding the key-encryption key. |
+
+Exactly one of `kek_env` and `kek_file` must be non-empty; zero or both is
+rejected.
+
+#### `[[admin_breakglass]]`
+
+Exactly one is required in stateful mode. Human `/admin/v1` identity is OIDC;
+this static credential is what remains when the identity provider is down or the
+control plane rejected the last change. A second one would make an audited
+operator action ambiguous, so two are rejected.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `env` | string | — | Name of the env var holding the credential. |
+| `file` | string | — | Path to a file holding the credential. |
+| `id` | string | the source reference | Non-secret attribution label for audit events. |
+
+Exactly one of `env` and `file` must be non-empty; zero or both is rejected.
 
 ## `[server]`
 

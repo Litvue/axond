@@ -41,7 +41,7 @@ use std::time::Instant;
 
 use budget::BudgetStore;
 use clap::{Arg, ArgAction, Command};
-use config::Config;
+use config::{Config, Mode};
 use rate_limit::RateLimiter;
 use revocation::RevocationStore;
 use state::AppState;
@@ -266,6 +266,20 @@ async fn serve() -> anyhow::Result<()> {
     let config_path = std::env::var("AXOND_CONFIG").unwrap_or_else(|_| "axond.toml".to_string());
     let config = Config::load(&config_path)
         .map_err(|e| anyhow::anyhow!("failed to load config from `{config_path}`: {e}"))?;
+
+    // Stateful bootstrap parses and validates (ADR 0027, #162), but the durable
+    // control plane it points at does not exist yet (#141, #163, #142). A
+    // stateful cold boot must reach the control plane or fail loudly, so this
+    // refuses rather than serving the empty snapshot an unread control plane
+    // would leave behind.
+    if config.mode == Mode::Stateful {
+        anyhow::bail!(
+            "`mode = \"stateful\"` is accepted by configuration validation, but the durable \
+             control plane it bootstraps is not implemented yet; a stateful replica must reach \
+             the control plane rather than serve an empty snapshot, so this process refuses to \
+             start. Use `mode = \"stateless\"` (the default) until the control plane ships."
+        );
+    }
 
     let env: HashMap<String, String> = std::env::vars().collect();
 

@@ -11,6 +11,16 @@
 # OTel service: unset means JSON logs on stdout and nothing exported; set
 # OTEL_EXPORTER_OTLP_ENDPOINT (OTLP/HTTP, e.g. http://collector:4318) to turn on
 # traces and metrics. See docs/adr/0007-telemetry-model.md.
+#
+# Operating mode: this file is stateless mode, where TOML owns every resource.
+# It is the default, so the key is omitted here and nothing below needs it. The
+# opt-in `mode = "stateful"` hands tenants, providers, credentials, catalogues,
+# prices, aliases, and policy to a Postgres control plane and shrinks this file
+# to bootstrap references — see `axond.stateful.example.toml` and
+# docs/adr/0027-stateless-and-stateful-operating-modes.md. Declaring a
+# stateful-owned section in a stateful file is a boot error, and vice versa.
+
+# mode = "stateless"
 
 [server]
 bind = "0.0.0.0:8080"

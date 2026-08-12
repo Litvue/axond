@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::config::{
-    BudgetConfig, Config, ConfigError, RateLimitConfig, Reload, RevocationConfig, Transport,
+    BudgetConfig, Config, ConfigError, Mode, RateLimitConfig, Reload, RevocationConfig, Transport,
     UsageSinkConfig,
 };
 use crate::state::{AppState, ConfigSnapshot, SnapshotError};
@@ -48,6 +48,9 @@ pub enum ReloadError {
 /// candidate is compared against what is *in effect* rather than against the
 /// previous candidate.
 struct Boot {
+    /// Which authority the process booted with. `mode` is a bootstrap property:
+    /// a reload cannot move a serving process between authorities (ADR 0027).
+    mode: Mode,
     bind: SocketAddr,
     usage_sink: Vec<UsageSinkConfig>,
     budget: BudgetConfig,
@@ -74,6 +77,7 @@ impl Reloader {
         Self {
             seen: Mutex::new(std::fs::read(&path).ok()),
             boot: Boot {
+                mode: booted.config.mode,
                 bind: booted.config.server.bind,
                 usage_sink: booted.config.usage_sink.clone(),
                 budget: booted.config.budget.clone(),
@@ -187,6 +191,14 @@ impl Reloader {
         generation: u64,
     ) -> Result<ConfigSnapshot, ReloadError> {
         let config = Config::load(&self.path)?;
+        if config.mode != self.boot.mode {
+            return Err(ReloadError::Config(ConfigError::Invalid(format!(
+                "`mode` is a bootstrap property: this process booted in `{}` mode and a reload \
+                 cannot switch it to `{}`; restart with the new configuration",
+                self.boot.mode.as_str(),
+                config.mode.as_str()
+            ))));
+        }
         Ok(ConfigSnapshot::build(config, env, generation)?)
     }
 
@@ -950,6 +962,40 @@ scope = ["chat", "models"]
         assert!(aliases.contains(&"acme-fast".to_string()));
     }
 
+    /// The mode picks which authority owns durable resources, which a serving
+    /// process cannot change under itself: the reload is refused and the
+    /// previous configuration keeps serving (ADR 0027).
+    #[tokio::test]
+    async fn a_reload_cannot_switch_operating_mode() {
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let reloader = Reloader::new(file.path(), state.clone());
+
+        file.rewrite(
+            r#"
+mode = "stateful"
+
+[control_plane]
+dsn_env = "GW_CONTROL_PLANE_DSN"
+
+[secret_store]
+kek_env = "GW_SECRET_STORE_KEK"
+
+[[admin_breakglass]]
+env = "GW_ADMIN_BREAKGLASS"
+"#,
+        );
+        let error = reloader
+            .reload_with_env(TRIGGER_SIGNAL, &inbound_env())
+            .expect_err("a mode switch needs a restart");
+
+        let message = error.to_string();
+        assert!(message.contains("stateless"), "{message}");
+        assert!(message.contains("stateful"), "{message}");
+        assert_eq!(state.config().generation, 0, "the old config keeps serving");
+        assert_eq!(listed_aliases(&state).await, vec!["gpt-4o".to_string()]);
+    }
+
     /// An epoch-only edit is visible in the applied reload summary, while a
     /// second reload of the same content is a no-op.
     #[tokio::test]
@@ -1001,6 +1047,7 @@ scope = ["chat", "models"]
         let before = ConfigSnapshot::build(before_config, &minting_env(), 0).unwrap();
         let after = ConfigSnapshot::build(after_config, &minting_env(), 1).unwrap();
         let boot = Boot {
+            mode: before.config.mode,
             bind: before.config.server.bind,
             usage_sink: before.config.usage_sink.clone(),
             budget: before.config.budget.clone(),
@@ -1031,6 +1078,7 @@ scope = ["chat", "models"]
         );
         let after = ConfigSnapshot::build(config, &rotated_env, 1).unwrap();
         let boot = Boot {
+            mode: before.config.mode,
             bind: before.config.server.bind,
             usage_sink: before.config.usage_sink.clone(),
             budget: before.config.budget.clone(),
@@ -1068,6 +1116,7 @@ scope = ["chat", "models"]
         )
         .unwrap();
         let boot = Boot {
+            mode: disabled.config.mode,
             bind: disabled.config.server.bind,
             usage_sink: disabled.config.usage_sink.clone(),
             budget: disabled.config.budget.clone(),
@@ -1135,6 +1184,7 @@ scope = ["chat", "models"]
         )
         .unwrap();
         let boot = Boot {
+            mode: before.config.mode,
             bind: before.config.server.bind,
             usage_sink: before.config.usage_sink.clone(),
             budget: before.config.budget.clone(),

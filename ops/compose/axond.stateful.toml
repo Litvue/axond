@@ -1,5 +1,10 @@
 # Docker Compose stateful quickstart configuration.
 #
+# "Stateful" here means the shared *state backends* of ADR 0017 (Tier 1 Redis,
+# Tier 2 Postgres), not the `mode = "stateful"` control plane of ADR 0027. This
+# is a stateless-mode file: TOML still owns every resource, which is why the
+# catalogue below is present and `mode` is absent.
+#
 # This duplicates axond.quickstart.toml because TOML has no include. Keep the
 # catalogue and routing sections in sync; only the trailing budget,
 # rate_limit, and usage_sink sections differ. The shared backends are:

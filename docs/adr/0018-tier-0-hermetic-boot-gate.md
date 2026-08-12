@@ -34,6 +34,15 @@ errors, and sends a real chat request to the committed-fixture fake upstream on
 loopback. The configuration includes token-verifier env resolution so all
 startup dependencies are exercised before process exec.
 
+The same namespace also runs a committed stateful bootstrap configuration
+([ADR 0027](./0027-stateless-and-stateful-operating-modes.md)) with its
+referenced env vars unset. Validating it must not resolve a DSN or reach
+Postgres, so a clean refusal inside a network-denied namespace is the mechanical
+evidence that stateful bootstrap parsing connects to nothing — and that a
+stateful process refuses to start rather than serve an empty snapshot while the
+control plane is unimplemented. The gate also fails if that diagnostic contains
+a connection string rather than a reference name.
+
 The gate deliberately does **not** claim that loopback is a network boundary.
 Loopback is allowed so a local fake upstream can prove the serving path. The
 post-boot listener assertion catches an embedded or spawned datastore (or

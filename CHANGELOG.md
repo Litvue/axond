@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.4](https://github.com/Litvue/axond/compare/v0.3.3...v0.3.4) (2026-08-12)
+
+
+### Bug Fixes
+
+* **release:** use repository PAT fallback ([#171](https://github.com/Litvue/axond/issues/171)) ([e423670](https://github.com/Litvue/axond/commit/e423670df8351e49e79f1d277b7f5826e488f13d))
+* **transport:** enforce hard attempt deadlines and stream idle timeouts ([#169](https://github.com/Litvue/axond/issues/169)) ([57f2e42](https://github.com/Litvue/axond/commit/57f2e42b43ba3f6b7d4ca5807c9af0b47a51fd3f))
+
 ## [0.3.3](https://github.com/Litvue/axond/compare/v0.3.2...v0.3.3) (2026-08-12)
 
 

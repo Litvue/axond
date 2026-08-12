@@ -30,7 +30,7 @@ the boot failure, instead of hiding it in a restart loop.
 Override the image or host binding through `.env` or the command environment:
 
 ```dotenv
-AXOND_IMAGE=ghcr.io/litvue/axond:0.3.3 # x-release-please-version
+AXOND_IMAGE=ghcr.io/litvue/axond:0.3.4 # x-release-please-version
 AXOND_QUICKSTART_HOST_PORT=127.0.0.1:18080
 ```
 
