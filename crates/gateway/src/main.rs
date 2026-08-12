@@ -10,6 +10,10 @@
 //! validate path and swaps the result in atomically (ADR 0011).
 
 mod aliases;
+// Contracts only: the durable implementations land in #141/#142, so nothing
+// here is constructed by `serve` yet and the runtime stays stateless.
+#[allow(dead_code)]
+mod backends;
 mod budget;
 mod config;
 mod credentials;
