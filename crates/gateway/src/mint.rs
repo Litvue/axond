@@ -256,7 +256,11 @@ pub(crate) fn mint_token_at(
     let encoding_key = encoding_key(algorithm, key_material, kid)?;
     let iat = issued_at.unwrap_or(unix_now()?);
     let claims = MintClaims {
-        exp: iat + ttl.as_secs(),
+        // Saturating: a clock far enough ahead, or a TTL near `u64::MAX`, must
+        // produce a token the verifier refuses for its lifetime rather than an
+        // arithmetic panic. The callers bound both, so this only ever bites when
+        // one of them stops doing so.
+        exp: iat.saturating_add(ttl.as_secs()),
         iat,
         aud: audience.to_owned(),
         jti: random_jti()?,
@@ -813,6 +817,31 @@ max_ttl = "15m"
             .unwrap_err()
             .to_string();
         assert!(error.contains("policy ceiling"));
+    }
+
+    // Found by the `token_verify` fuzz target: an `iat` near the end of the
+    // epoch used to overflow while computing `exp`, which is an abort in a
+    // release build with overflow checks and a wrong `exp` without them. The
+    // token it produces now is one the verifier refuses on its lifetime.
+    #[test]
+    fn mint_saturates_rather_than_overflowing_an_extreme_issue_time() {
+        let minted = mint_token_at(
+            MintRequest {
+                kid: "hs-kid",
+                algorithm: MintAlgorithm::Hs256,
+                key_material: "01234567890123456789012345678901",
+                namespace: "acme",
+                subject: "caller",
+                audience: "configured-audience",
+                ttl: Duration::from_secs(600),
+                aliases: None,
+                max_request_microdollars: None,
+                scope: None,
+            },
+            Some(u64::MAX),
+        )
+        .unwrap();
+        assert_eq!(minted.exp, u64::MAX);
     }
 
     #[test]

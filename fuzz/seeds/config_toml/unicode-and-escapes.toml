@@ -1,0 +1,7 @@
+[[namespace]]
+id = "\u0000\u001b[31m"
+default = true
+
+[[gateway_key]]
+env = "AXOND_\ud83d\udca9"
+namespace = "ﬀ"

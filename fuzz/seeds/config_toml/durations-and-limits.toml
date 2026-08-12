@@ -1,0 +1,16 @@
+[server]
+bind = "0.0.0.0:8080"
+
+[transport]
+connect_timeout = "1s"
+headers_timeout = "30s"
+
+[admission]
+max_request_bytes = 18446744073709551615
+max_prompt_tokens = 0
+
+[reload]
+watch = true
+
+[shutdown]
+drain = "0s"

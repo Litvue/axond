@@ -75,6 +75,8 @@ and operate it.
   boundaries, TLS termination, secret delivery, and image verification.
 - [Security policy](../SECURITY.md) — private vulnerability reporting, the
   supported-version window, response targets, and how a fix and advisory ship.
+- [Fuzzing](./security/fuzzing.md) — the config, token, and query targets, the
+  properties they assert, and the required-versus-scheduled lanes.
 
 ## Develop and maintain
 

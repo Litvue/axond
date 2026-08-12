@@ -14,10 +14,12 @@ That pin is newer than the project's minimum supported Rust version, which is
 on that floor the way CI does.
 
 ```bash
-just check      # fmt --check, clippy -D warnings, tests, docs, supply chain,
-                # packaging, MSRV, and public-API compatibility — the CI gates
+just check      # fmt --check, clippy -D warnings, tests, the fuzz smoke, docs,
+                # supply chain, packaging, MSRV, and public-API compatibility
+                # — the CI gates
 just run        # run against ./axond.toml
 just compat     # run the Python SDK compatibility lane
+just fuzz-smoke # replay the committed fuzz corpora (see fuzz/README.md)
 just msrv       # build on the declared minimum supported Rust version
 just api-compat # semver-check the published library crates against crates.io
 ```
@@ -50,6 +52,14 @@ with `just compat-lock`; the recipe resolves from
 published less than seven days ago. The refresh requires
 [`uv`](https://docs.astral.sh/uv/getting-started/installation/) on `PATH`.
 Review the generated diff, then run `just compat`.
+
+Touching a parser that reads untrusted input — configuration, minted tokens, or
+a query string? [`fuzz/`](./fuzz/README.md) is a separate Cargo workspace, so the
+root checks skip it; `just fuzz-smoke` runs the required pull-request replay on
+stable, and `just fuzz <target>` runs a bounded coverage-guided run once
+[`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) and a nightly toolchain
+are installed. A reproducer belongs in `fuzz/seeds/<target>/` in the same PR as
+the fix.
 
 Changing anything public in `gateway-core` or `gateway-transport`? Run the
 compatibility gate, which compares the crates against the versions on crates.io

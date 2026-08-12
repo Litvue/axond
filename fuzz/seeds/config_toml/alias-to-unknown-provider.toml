@@ -1,0 +1,11 @@
+[[namespace]]
+id = "fuzz"
+default = true
+
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "fuzz"
+
+[[model]]
+name = "gpt-4o"
+targets = [{ provider = "missing", model = "gpt-4o" }]

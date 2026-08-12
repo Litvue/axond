@@ -115,6 +115,30 @@ jobs:
           cache-targets: false
       - run: cargo test --workspace --all-features --locked
 
+  # The pull-request half of the fuzzing program (`fuzz/`, issue #212). The
+  # coverage-guided runs are scheduled in `fuzz.yml` because they are unbounded;
+  # what every change gets is this: the committed corpora and their fixed
+  # derivations replayed through the same target bodies, on the pinned stable
+  # toolchain, under panic, time, and allocation bounds. Required, so a parser
+  # that starts panicking on a known input cannot merge.
+  fuzz-smoke:
+    name: Fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          cache-targets: false
+      # `--no-default-features` drops libfuzzer-sys: the replay is the part that
+      # must run without nightly or a sanitizer runtime.
+      - name: Replay the committed fuzz corpora
+        working-directory: fuzz
+        run: cargo run --no-default-features --locked --bin fuzz-smoke
+
   stateful-tests:
     name: Stateful tests
     runs-on: ubuntu-latest
@@ -337,6 +361,7 @@ jobs:
       - api-compat
       - build
       - tests
+      - fuzz-smoke
       - stateful-tests
       - sdk-compat
       - docs
@@ -355,6 +380,7 @@ jobs:
           test "${{ needs.api-compat.result }}" = success
           test "${{ needs.build.result }}" = success
           test "${{ needs.tests.result }}" = success
+          test "${{ needs.fuzz-smoke.result }}" = success
           test "${{ needs.stateful-tests.result }}" = success
           test "${{ needs.sdk-compat.result }}" = success
           test "${{ needs.docs.result }}" = success

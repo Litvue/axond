@@ -1,0 +1,7 @@
+# `--cfg fuzzing` is what compiles the private seam in `axond`
+# (`crates/gateway/src/fuzz_seam.rs`). `cargo fuzz` sets it itself; this makes
+# the plain `cargo run --bin fuzz-smoke` build — the stable pull-request lane —
+# set it too. It is scoped to this directory, so no build at the repository root
+# ever sees it.
+[build]
+rustflags = ["--cfg", "fuzzing"]

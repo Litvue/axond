@@ -1,0 +1,8 @@
+# Build output and everything a fuzz run generates. Seeds under `seeds/` are the
+# committed corpus; `corpus/` is the working copy a run grows from them, and
+# `artifacts/` holds reproducers, which belong in an issue (and in `seeds/` once
+# fixed), not in a drive-by commit.
+/target
+/corpus
+/artifacts
+/coverage

@@ -1,0 +1,11 @@
+mode = "stateful"
+
+[control_plane]
+dsn_env = "AXOND_CONTROL_PLANE_DSN"
+
+[secret_store]
+kind = "local"
+key_env = "AXOND_SECRET_STORE_KEY"
+
+[[admin_breakglass]]
+env = "AXOND_ADMIN_BREAKGLASS"

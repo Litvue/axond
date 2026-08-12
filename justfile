@@ -3,9 +3,9 @@
 default:
     @just --list
 
-# Format, lint (warnings = errors), test, docs, supply-chain, and release
-# packaging — the CI gates.
-check: fmt-check clippy test docs deny publish-dry-run msrv api-compat
+# Format, lint (warnings = errors), test, fuzz smoke, docs, supply-chain, and
+# release packaging — the CI gates.
+check: fmt-check clippy test fuzz-smoke docs deny publish-dry-run msrv api-compat
 
 fmt:
     cargo fmt --all
@@ -67,6 +67,26 @@ compat:
 # Refresh the hash-pinned provider-SDK lockfile, excluding releases newer than a week.
 compat-lock:
     uv pip compile --generate-hashes --universal --python-version 3.10 --exclude-newer "$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"))')" -o tests/compat/requirements.txt tests/compat/requirements.in
+
+# The bounded, deterministic fuzz replay CI requires on every pull request:
+# every committed seed and its fixed derivations, on stable, under panic, time,
+# and allocation bounds. See fuzz/README.md.
+fuzz-smoke:
+    cd fuzz && cargo run --no-default-features --locked --bin fuzz-smoke
+
+# A bounded coverage-guided run of one target, starting from the committed seeds.
+# Needs a nightly toolchain and cargo-fuzz; the unbounded runs are scheduled in
+# .github/workflows/fuzz.yml.
+fuzz target seconds="60":
+    mkdir -p fuzz/corpus/{{target}}
+    cp -n fuzz/seeds/{{target}}/* fuzz/corpus/{{target}}/ || true
+    cd fuzz && cargo +nightly fuzz run {{target}} corpus/{{target}} -- -max_total_time={{seconds}} -max_len=65536 -rss_limit_mb=2048 -malloc_limit_mb=1024 -timeout=25
+
+# Every fuzz target in turn, the way the scheduled lane runs them.
+fuzz-all seconds="60":
+    just fuzz config_toml {{seconds}}
+    just fuzz token_verify {{seconds}}
+    just fuzz credentials_query {{seconds}}
 
 # The heavy SSE soak: hundreds of concurrent streams with cancels and drops.
 # The short subset runs in `just test`; this is the long one.

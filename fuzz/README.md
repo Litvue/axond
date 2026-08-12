@@ -1,0 +1,70 @@
+# Fuzzing Axond
+
+Axond parses two kinds of untrusted input: what an operator's configuration file
+says, and what a caller puts in a request. This project fuzzes both, on the
+parsers the process actually runs.
+
+| Target | What it drives | Why |
+| --- | --- | --- |
+| `config_toml` | `Config::from_toml_str` and the whole validation graph | Boot and every `SIGHUP` reload re-parse a file the gateway does not control |
+| `token_verify` | `axt1.` JWS decoding, key selection, signature, and every claim check | A minted token is the one credential an attacker can shape freely |
+| `credentials_query` | `GET /v1/credentials/status?namespaces=…` parsing | Hand-rolled percent-decoding, so malformed escapes, duplicate keys, empty values, and oversized inputs all land here |
+
+The properties each target asserts live in [`src/lib.rs`](./src/lib.rs): a
+parser returns rather than panicking, a refusal is a typed value the gateway
+could answer with, and what it accepts stays inside the bounds the request path
+relies on — including that a signature from one namespace's signer never
+verifies into another.
+
+Runs are hermetic. The seam the targets call
+([`crates/gateway/src/fuzz_seam.rs`](../crates/gateway/src/fuzz_seam.rs)) builds
+its verifiers from a configuration compiled into the binary with synthetic key
+material, so nothing here opens a socket, reads a file, or holds a real secret.
+
+## Layout
+
+- `fuzz_targets/` — the `cargo fuzz` entry points, one per target.
+- `src/lib.rs` — the target bodies and their assertions, shared with the smoke.
+- `src/bin/smoke.rs` — the bounded, deterministic seed replay CI requires.
+- `seeds/<target>/` — the committed corpus. `corpus/` and `artifacts/` are
+  generated and ignored.
+
+This is deliberately its own Cargo workspace: the targets need nightly and a
+sanitizer runtime, and they depend on `axond` with a `fuzzing` feature no other
+consumer may enable. Nothing at the repository root builds or lints it.
+
+## The smoke (stable, bounded, on every pull request)
+
+```bash
+just fuzz-smoke
+```
+
+Replays every seed plus fixed derivations — truncations, single-byte flips, one
+oversized repetition — and a set of tokens minted at replay time, then fails on
+a panic, on an input slower than its budget, or on an allocation past a hard cap
+enforced by the binary's own global allocator. It also fails if the corpus stops
+reaching a spread of outcome classes, so the lane cannot go green by refusing
+everything at the door.
+
+## Coverage-guided runs (nightly toolchain)
+
+```bash
+cargo install cargo-fuzz --locked
+just fuzz config_toml         # one target, a bounded local run
+just fuzz-all                 # every target, the way the scheduled lane does
+```
+
+`just fuzz` copies `seeds/<target>/` into `corpus/<target>/` first, so a local
+run starts where the committed corpus left off.
+
+## When a run finds something
+
+1. `cargo fuzz tmin <target> artifacts/<target>/<crash>` to shrink it.
+2. Commit the minimized reproducer to `seeds/<target>/` with a name that says
+   what it is. The smoke then covers it on every pull request.
+3. Fix the parser. A finding is a bug in the parser, not in the fuzzer, unless
+   the assertion itself was wrong — in which case fix the assertion and say why
+   in the commit.
+
+Scheduled runs keep their corpus between runs and upload both the corpus and any
+artifact, so a finding is reproducible from the workflow run alone.

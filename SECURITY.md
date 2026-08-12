@@ -101,7 +101,10 @@ to be.
 1. Triage in the draft advisory, with a private fork for the patch when the fix
    would otherwise disclose the issue.
 2. A regression test that fails before the fix. A security fix without one is
-   not finished.
+   not finished. When the finding is a parser — configuration, a minted token, a
+   query string — the regression is a seed in the
+   [fuzz corpora](./docs/security/fuzzing.md), so the required smoke replays that
+   exact input from then on.
 3. A release from `main` through the ordinary
    [release runbook](./docs/maintainers/releasing.md) — a security fix is not a
    different pipeline, so it inherits the same required CI, signed artifacts, and
@@ -127,6 +130,7 @@ deploying rather than reporting: the
 [deployment security model](./docs/security/deployment-model.md) for trust
 boundaries, the [production checklist](./docs/deployment/production-checklist.md)
 before going live, the [minted-token guide](./docs/minted-token-guide.md) for
-scoped credentials and revocation, and the
+scoped credentials and revocation, [fuzzing](./docs/security/fuzzing.md) for what
+the config, token, and query parsers are continuously tested against, and the
 [security review](./docs/security-review-2026-08-05.md) for the reviewed
 baseline.
