@@ -464,6 +464,13 @@ impl ProviderCredentialBody {
     /// The new version is staged: rotation stores material, and putting it in
     /// service is a separate decision. The previous version keeps whatever state
     /// it had, in the revision that named it.
+    ///
+    /// One resource names one version, so *this* body no longer names the version
+    /// it was serving. A rotation that must not interrupt service is therefore two
+    /// credential resources — the serving one untouched, a second one staged
+    /// against the new version — and the credential the old one names is withdrawn
+    /// only after the new one is active. Publishing this body alone is the
+    /// deliberate cut-over, not the overlap.
     pub fn rotated(&self) -> Self {
         Self {
             secret: self.secret.rotated(),

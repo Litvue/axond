@@ -56,7 +56,10 @@ display_name, secret_id, secret_version, lifecycle
 - **Rotation mints a version; it does not edit one.** Material is immutable per
   version. Rotating stages a *new* version under the same secret id and publishes
   a new resource version of the credential; the revision that pinned the old
-  version keeps pinning it.
+  version keeps pinning it. Because one resource names one version, an
+  uninterrupted rotation is two credential resources — the serving one untouched
+  while the new one is staged and proven — and the old one is withdrawn after the
+  new one is active. Repointing a single credential is the deliberate cut-over.
 - **Ownership is the envelope's scope, exactly.** A `SecretOwner` is a tenant and
   optionally one of its projects, derived from the resource's scope rather than
   authored beside it, so the owner of the resource and the owner of the material
