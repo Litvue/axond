@@ -65,6 +65,9 @@ and operate it.
   migration ordering, mixed-version rules, and rollback limits.
 - [Usage schema](./usage-schema.md) — durable row contract and delivery
   guarantees.
+- [Control-plane revision journal](./operations/control-plane-journal.md) — the
+  stateful mode's Postgres schema, migrations, schema-status refusals, and
+  outage behaviour.
 - [Deployment security model](./security/deployment-model.md) — trust
   boundaries, TLS termination, secret delivery, and image verification.
 

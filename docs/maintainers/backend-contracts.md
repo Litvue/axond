@@ -179,14 +179,64 @@ to the runtime. `desired_state::oracle` is the test-only in-memory
 `ControlPlaneStore` that states these behaviours executably; like the other
 fakes, it is not a selectable backend.
 
+## The durable control plane is Postgres, and only Postgres
+
+`backends::control_plane::postgres::PostgresControlPlane` is the real
+`ControlPlaneStore`: the revision journal in
+[`ops/postgres/control_plane_0001_initial.sql`](../../ops/postgres/control_plane_0001_initial.sql),
+plus the transactions that keep it consistent. The
+[journal runbook](../operations/control-plane-journal.md) is the operator's view;
+the boundaries that matter to a maintainer are these.
+
+**A publication is one transaction.** The head row is read `FOR UPDATE`, so
+publishers serialize on one row instead of racing to append, and the manifest,
+the resource versions, the blob references, the mutation, the audit event, the
+idempotency record, and the head advancement commit together. A failure anywhere
+rolls all of it back, which is why a refused publication leaves no resource
+version and no audit event rather than leaving them to be cleaned up.
+
+**Order is part of the contract.** Validation happens before any durable write;
+the caller's retry window is consulted *before* the expected revision, so a retry
+of a candidate that has since gone stale replays its own outcome instead of being
+told it conflicts with the revision it published; only then is the expectation
+checked, and only then is version immutability.
+
+**Replay identity is the state checksum, and nothing else.** Not the request
+bytes, not the mutation id, not the actor's attribution. The retry window is
+scoped by a digest of the authenticated caller's identity so one administrator's
+key cannot replay or block another's, and it expires — deduplication is a window,
+not a permanent namespace. That scope is a retry namespace only: it is not an
+access-attempt record, and `Mutation`/`AuditEvent` attribution is not reused as
+one.
+
+**The domain decides what a stored row means.** SQL constrains structure — id and
+checksum shapes, scope ownership, actor attribution, body exclusivity,
+referential integrity, the linearity of the chain — but it does not enumerate the
+resource or blob vocabularies, because a new `ResourceKind` must not require a
+migration. A row naming a kind the build cannot read is corruption reported as
+such, not an outage, and `load_revision` returns a `LoadedRevision` only through
+`LoadedRevision::assemble`, so an unverifiable revision fails to load.
+
+**Storage is deduplicated, and blobs stay references.** A resource version is
+written once and shared by every revision that pins it; the journal holds a
+blob's kind, digest, and size, never its payload.
+
+One consequence of canonical encoding is worth stating: an inline body reads back
+in canonical order, which need not be the order a caller wrote its map keys in.
+It is the same value by the only measure the journal, the manifest, and the
+checksum use.
+
 ## What is not here yet
 
-These are contracts. Nothing in `backends` is constructed by `serve`, so the
-running gateway is the stateless gateway it was: no new boot step, no new
-request-path work, no Postgres, and no schema. The contract tests run against
+Nothing in `backends` is constructed by `serve`, so the running gateway is the
+stateless gateway it was: no new boot step, no new request-path work, and no
+Postgres on the inference path. A replica serves an immutable snapshot it already
+holds, which is what makes a control-plane outage an administrative failure
+rather than a serving one. The non-Postgres contract tests still run against
 in-memory fakes (`backends::fakes`), which keeps the Tier 0 hermetic gate
 hermetic and is why a fake is test-only — an in-memory control plane is not a
 selectable backend.
 
-The durable Postgres implementation, deterministic hydration, and revision
-reconciliation follow.
+Deterministic hydration of a loaded revision into a runtime snapshot (#166) and
+revision convergence and publication to replicas (#142) follow. `load_revision`
+is the seam they read from.

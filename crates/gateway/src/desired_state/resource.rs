@@ -245,6 +245,10 @@ pub enum BlobKind {
 }
 
 impl BlobKind {
+    /// Every kind, so a stored spelling can be resolved back to a variant
+    /// exhaustively rather than by a lookup table a new variant would leave out.
+    pub const ALL: &'static [Self] = &[Self::CatalogSnapshot, Self::PriceBook, Self::PolicyBundle];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CatalogSnapshot => "catalog-snapshot",

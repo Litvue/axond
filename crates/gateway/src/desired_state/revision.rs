@@ -424,6 +424,12 @@ pub enum IntegrityError {
     UnexpectedBlob { digest: Checksum },
     #[error("stored revision is not valid desired state: {0}")]
     Invalid(#[from] ValidationError),
+    /// A stored record could not be interpreted at all: an id, checksum, kind,
+    /// scope, or canonical body that is not the value it was written as. Distinct
+    /// from the mismatch arms above, which compare two things that were both
+    /// readable.
+    #[error("stored revision is unreadable: {detail}")]
+    Unreadable { detail: String },
 }
 
 /// A retained revision, hydrated and proven complete: the seam #142 publishes a

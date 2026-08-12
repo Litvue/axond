@@ -75,6 +75,173 @@ impl SerializerVersion {
         value.write(&mut out)?;
         Ok(out)
     }
+
+    /// Recover the value canonical bytes encode.
+    ///
+    /// A store has to read state back, and the only representation it is allowed
+    /// to keep is the canonical one — a second encoding of desired state would
+    /// bring its own ways of disagreeing with a checksum. So this is the inverse
+    /// of [`SerializerVersion::encode`], and it is deliberately strict: the input
+    /// is storage-supplied, so every length is checked against what remains,
+    /// nesting is bounded, and a value whose re-encoding is not byte-identical to
+    /// its input is refused as non-canonical rather than accepted as close
+    /// enough. Unsorted set members and unsorted or duplicated map keys are
+    /// therefore rejected, which is what stops two byte strings from decoding to
+    /// one state.
+    pub fn decode(self, bytes: &[u8]) -> Result<CanonicalValue, CanonicalDecodeError> {
+        let rest = bytes
+            .strip_prefix(Self::MAGIC)
+            .ok_or(CanonicalDecodeError::Magic)?;
+        let (tag, rest) = rest.split_first().ok_or(CanonicalDecodeError::Truncated)?;
+        if *tag != self.tag() {
+            return Err(CanonicalDecodeError::Serializer { tag: *tag });
+        }
+        let mut cursor = Cursor { rest, depth: 0 };
+        let value = cursor.value()?;
+        if !cursor.rest.is_empty() {
+            return Err(CanonicalDecodeError::TrailingBytes {
+                count: cursor.rest.len(),
+            });
+        }
+        if self.encode(&value).as_deref() != Ok(bytes) {
+            return Err(CanonicalDecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+/// Why canonical bytes could not be read back.
+///
+/// Every arm describes a corrupt record rather than a transient failure: none of
+/// them can be repaired by retrying, and a caller that meets one is looking at
+/// storage that no longer holds what it was given.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CanonicalDecodeError {
+    #[error("canonical bytes do not begin with the domain separator")]
+    Magic,
+    #[error("canonical bytes end mid-value")]
+    Truncated,
+    #[error("{count} bytes follow the encoded value")]
+    TrailingBytes { count: usize },
+    #[error("serializer tag {tag} is not the expected encoding")]
+    Serializer { tag: u8 },
+    #[error("value tag {tag:#04x} is not a canonical value")]
+    UnknownTag { tag: u8 },
+    #[error("a length of {length} exceeds the {remaining} bytes that remain")]
+    Length { length: u64, remaining: usize },
+    #[error("nesting deeper than {max} levels is refused")]
+    TooDeep { max: usize },
+    #[error("a canonical string is not UTF-8")]
+    Utf8,
+    #[error("a map key is not a string")]
+    MapKey,
+    #[error("the bytes are not the canonical encoding of the value they decode to")]
+    NonCanonical,
+}
+
+/// A decoding position: the bytes still to read, and how deep reading has gone.
+struct Cursor<'a> {
+    rest: &'a [u8],
+    depth: usize,
+}
+
+impl<'a> Cursor<'a> {
+    /// Deep enough for any resource envelope, shallow enough that hostile input
+    /// cannot exhaust the stack.
+    const MAX_DEPTH: usize = 32;
+
+    fn take(&mut self, count: usize) -> Result<&'a [u8], CanonicalDecodeError> {
+        if self.rest.len() < count {
+            return Err(CanonicalDecodeError::Truncated);
+        }
+        let (taken, rest) = self.rest.split_at(count);
+        self.rest = rest;
+        Ok(taken)
+    }
+
+    fn byte(&mut self) -> Result<u8, CanonicalDecodeError> {
+        Ok(self.take(1)?[0])
+    }
+
+    /// A length or count, refused when it cannot fit in what remains. Every
+    /// encoded value is at least one byte, so a count larger than the remaining
+    /// bytes is unsatisfiable — checking it here is what keeps a corrupt length
+    /// from becoming a multi-gigabyte allocation.
+    fn length(&mut self) -> Result<usize, CanonicalDecodeError> {
+        let length = u64::from_be_bytes(self.take(8)?.try_into().expect("eight bytes were taken"));
+        let remaining = self.rest.len();
+        usize::try_from(length)
+            .ok()
+            .filter(|length| *length <= remaining)
+            .ok_or(CanonicalDecodeError::Length { length, remaining })
+    }
+
+    fn nested<T>(
+        &mut self,
+        read: impl FnOnce(&mut Self) -> Result<T, CanonicalDecodeError>,
+    ) -> Result<T, CanonicalDecodeError> {
+        if self.depth >= Self::MAX_DEPTH {
+            return Err(CanonicalDecodeError::TooDeep {
+                max: Self::MAX_DEPTH,
+            });
+        }
+        self.depth += 1;
+        let value = read(self);
+        self.depth -= 1;
+        value
+    }
+
+    fn string(&mut self) -> Result<String, CanonicalDecodeError> {
+        let length = self.length()?;
+        let bytes = self.take(length)?;
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| CanonicalDecodeError::Utf8)
+    }
+
+    fn value(&mut self) -> Result<CanonicalValue, CanonicalDecodeError> {
+        let tag = self.byte()?;
+        match tag {
+            0x01 => Ok(CanonicalValue::Bool(self.byte()? != 0)),
+            0x02 => Ok(CanonicalValue::Integer(i128::from_be_bytes(
+                self.take(16)?.try_into().expect("sixteen bytes were taken"),
+            ))),
+            0x03 => Ok(CanonicalValue::String(self.string()?)),
+            0x04 => {
+                let length = self.length()?;
+                Ok(CanonicalValue::Bytes(self.take(length)?.to_vec()))
+            }
+            0x05 | 0x06 => {
+                let count = self.length()?;
+                let members = self.nested(|cursor| {
+                    (0..count)
+                        .map(|_| cursor.value())
+                        .collect::<Result<Vec<_>, _>>()
+                })?;
+                Ok(if tag == 0x05 {
+                    CanonicalValue::List(members)
+                } else {
+                    CanonicalValue::Set(members)
+                })
+            }
+            0x07 => {
+                let count = self.length()?;
+                let fields = self.nested(|cursor| {
+                    (0..count)
+                        .map(|_| {
+                            if cursor.byte()? != 0x03 {
+                                return Err(CanonicalDecodeError::MapKey);
+                            }
+                            let key = cursor.string()?;
+                            Ok((key, cursor.value()?))
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })?;
+                Ok(CanonicalValue::Map(fields))
+            }
+            tag => Err(CanonicalDecodeError::UnknownTag { tag }),
+        }
+    }
 }
 
 impl fmt::Display for SerializerVersion {
