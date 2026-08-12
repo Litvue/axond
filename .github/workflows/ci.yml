@@ -369,6 +369,14 @@ jobs:
         run: ops/workflow-policy.py --self-test
       - name: Check Action pins, least privilege, and signer restrictions
         run: ops/workflow-policy.py
+      # A label Dependabot cannot find disables its whole configuration, and the
+      # pins are refreshed by nothing else.
+      - name: Prove the labels Dependabot applies exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shellcheck ops/dependabot-labels.sh
+          ops/dependabot-labels.sh
       # The runners answer 503 for the actionlint release asset, so the script
       # falls back to the same version as a digest-pinned image.
       - name: Lint the workflow definitions

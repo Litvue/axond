@@ -50,8 +50,10 @@ release resumes at the first missing crate.
 - The `area:operations` label, which
   [`.github/dependabot.yml`](../../.github/dependabot.yml) applies to its pin
   bumps. Dependabot rejects its whole configuration on an unknown label and
-  reports it only on the repository's Dependabot page, so a renamed label stops
-  the Action pins from being refreshed without failing CI.
+  reports it only on the repository's Dependabot page, so a renamed label would
+  stop the Action pins from being refreshed silently —
+  [`ops/dependabot-labels.sh`](../../ops/dependabot-labels.sh) fails the
+  `workflow-policy` lane instead.
 
 The crates.io token owner must have a verified email address.
 
@@ -252,7 +254,7 @@ floor still builds.
 ## Workflow Action pins
 
 The policy behind this section is
-[ADR 0031](../adr/0031-pinned-github-actions.md). The release jobs can reach the
+[ADR 0032](../adr/0032-pinned-github-actions.md). The release jobs can reach the
 release GitHub App token, `CARGO_REGISTRY_TOKEN`, and the keyless signing
 identity, so a third-party Action running there is as privileged as this runbook.
 `owner/action@v3` is a pointer the upstream owner can move, so every `uses:` in
@@ -283,9 +285,12 @@ it cannot execute. Bumping `actionlint` means updating the version, all four
 checksums, and the image digest together. Locally:
 
 ```bash
-just workflow-policy   # pins, permissions, signer restrictions (offline)
+just workflow-policy   # pins, permissions, signer restrictions, Dependabot labels
 just actionlint        # workflow linting; downloads the pinned actionlint
 ```
+
+Everything in that lane is offline except the label check, which needs an
+authenticated `gh` and reports that it skipped when there is none.
 
 If a host has neither a supported release archive nor `docker`, the script says
 so and fails instead of linting with an unpinned version.

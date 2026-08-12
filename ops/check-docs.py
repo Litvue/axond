@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -342,6 +343,21 @@ def self_test() -> int:
     assert len(omitted) == 1, omitted
     assert "'ops/binary-smoke.py' runs in the release workflow" in omitted[0], omitted
 
+    with tempfile.TemporaryDirectory() as raw:
+        records = Path(raw)
+        (records / "0031-first.md").write_text("# 31. First\n", encoding="utf-8")
+        assert check_adr_numbering(records) == []
+        # The collision this gate exists for: two branches both took 0031.
+        (records / "0031-second.md").write_text("# 31. Second\n", encoding="utf-8")
+        collision = check_adr_numbering(records)
+        assert len(collision) == 1, collision
+        assert "ADR 0031 is already" in collision[0], collision
+        # A renamed file whose heading kept the old number is just as ambiguous.
+        (records / "0031-second.md").unlink()
+        (records / "0032-renumbered.md").write_text("# 31. First\n", encoding="utf-8")
+        heading = check_adr_numbering(records)
+        assert len(heading) == 1 and "does not start with" in heading[0], heading
+
     print("check-docs: release-path gate self-test passed")
     return 0
 
@@ -396,6 +412,32 @@ def check_review_trigger_tests() -> list[str]:
     return failures
 
 
+def check_adr_numbering(directory: Path | None = None) -> list[str]:
+    """One decision per ADR number, and the heading agrees with the filename.
+
+    Two records sharing a number makes every "ADR 00NN" reference ambiguous, and
+    the collision is easy to create: the number is chosen when the branch is cut,
+    not when it merges.
+    """
+    failures: list[str] = []
+    by_number: dict[str, Path] = {}
+    for record in sorted((directory or ROOT / "docs/adr").glob("[0-9]*.md")):
+        number = record.name[:4]
+        first = by_number.setdefault(number, record)
+        if first is not record:
+            failures.append(
+                f"docs/adr/{record.name}: ADR {number} is already "
+                f"{first.name}; renumber one of them"
+            )
+        heading = record.read_text(encoding="utf-8").splitlines()[0]
+        if not heading.startswith(f"# {int(number)}. "):
+            failures.append(
+                f"docs/adr/{record.name}: heading {heading!r} does not start with "
+                f"'# {int(number)}. '"
+            )
+    return failures
+
+
 def main(argv: list[str]) -> int:
     if argv == ["--self-test"]:
         return self_test()
@@ -416,6 +458,7 @@ def main(argv: list[str]) -> int:
     failures.extend(check_release_script_triggers())
     failures.extend(check_review_trigger_tests())
     failures.extend(check_front_door_size())
+    failures.extend(check_adr_numbering())
     if failures:
         for failure in failures:
             print(f"documentation check failed: {failure}", file=sys.stderr)

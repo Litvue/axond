@@ -1,4 +1,4 @@
-# 31. Pinned GitHub Actions and an enforced pin policy
+# 32. Pinned GitHub Actions and an enforced pin policy
 
 Date: 2026-08-12
 
