@@ -51,7 +51,8 @@ const TOTAL_BUDGET: Duration = Duration::from_secs(60);
 const OVERSIZED_BYTES: usize = 64 * 1024;
 
 /// How many outcome classes the freshly-minted token scenarios must reach.
-const MINIMUM_MINTED_CLASSES: usize = 5;
+/// [`EXPECTED_MINTED_CLASSES`] pins which ones; this is the floor for the rest.
+const MINIMUM_MINTED_CLASSES: usize = 8;
 
 #[global_allocator]
 static ALLOCATOR: Capped = Capped;
@@ -252,8 +253,60 @@ fn minted_scenarios() -> Vec<(&'static str, TokenInput<'static>)> {
             "empty-subject",
             minted(in_namespace, "", None, 300, None, None, None),
         ),
+        (
+            // The issuance epoch is the last check `resolve` runs, so reaching it
+            // needs a token that is old enough to precede the epoch and still
+            // live: `iat` a minute below it, `exp` a full permitted lifetime
+            // later.
+            "issued-before-the-namespace-epoch",
+            minted(
+                in_namespace,
+                "smoke",
+                None,
+                axond::MAX_TTL_SECONDS,
+                Some(axond::epoch_min_iat() - 60),
+                None,
+                None,
+            ),
+        ),
+        (
+            // The other side of the same epoch, so the check is shown to accept
+            // as well as refuse.
+            "issued-just-after-the-namespace-epoch",
+            minted(
+                in_namespace,
+                "smoke",
+                None,
+                axond::MAX_TTL_SECONDS,
+                Some(axond::epoch_min_iat() + 1),
+                None,
+                None,
+            ),
+        ),
     ]
 }
+
+/// Scenarios whose whole purpose is the class they land in: a check that stopped
+/// being reachable would otherwise still satisfy the class-count threshold.
+const EXPECTED_MINTED_CLASSES: &[(&str, &str)] = &[
+    ("unscoped", "accepted"),
+    ("empty-scope", "accepted"),
+    // The unknown capability is the verifier's to discard, not the seam's.
+    ("every-capability-and-one-unknown", "accepted"),
+    (
+        "namespace-the-signer-does-not-hold",
+        "token_signer_not_permitted",
+    ),
+    ("undeclared-namespace", "token_unknown_namespace"),
+    ("foreign-audience", "token_wrong_audience"),
+    ("lifetime-past-the-policy-ceiling", "token_invalid_lifetime"),
+    ("empty-subject", "token_missing_claim"),
+    (
+        "issued-before-the-namespace-epoch",
+        "token_issued_before_epoch",
+    ),
+    ("issued-just-after-the-namespace-epoch", "accepted"),
+];
 
 fn seed_directory(target: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -368,9 +421,18 @@ fn main() {
     let mut minted_classes: BTreeMap<&'static str, usize> = BTreeMap::new();
     for (label, input) in minted_scenarios() {
         let input_started = Instant::now();
-        *minted_classes
-            .entry(axond_fuzz::token_verify(&input))
-            .or_default() += 1;
+        let class = axond_fuzz::token_verify(&input);
+        if let Some((_, expected)) = EXPECTED_MINTED_CLASSES
+            .iter()
+            .find(|(scenario, _)| *scenario == label)
+        {
+            assert_eq!(
+                class, *expected,
+                "minted scenario {label} reached {class} rather than {expected}, so the check it \
+                 exists for is no longer the one it lands on"
+            );
+        }
+        *minted_classes.entry(class).or_default() += 1;
         let elapsed = input_started.elapsed();
         assert!(
             elapsed < PER_INPUT_BUDGET,

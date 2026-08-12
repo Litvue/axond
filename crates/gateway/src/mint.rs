@@ -241,6 +241,31 @@ pub(crate) fn mint_token_at(
     request: MintRequest<'_>,
     issued_at: Option<u64>,
 ) -> Result<MintedToken> {
+    let scope = request
+        .scope
+        .as_ref()
+        .map(|values| values.iter().map(ToString::to_string).collect());
+    mint_token_with_scope_claim(request, issued_at, scope)
+}
+
+/// Mint with the `scope` claim written verbatim, so a fuzz target can present a
+/// capability name the gateway does not define and let the verifier decide.
+/// Minting cannot express that, because [`MintRequest`] takes parsed
+/// [`Capability`] values.
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_mint_token_with_raw_scope(
+    request: MintRequest<'_>,
+    issued_at: Option<u64>,
+    scope: Option<Vec<String>>,
+) -> Result<MintedToken> {
+    mint_token_with_scope_claim(request, issued_at, scope)
+}
+
+fn mint_token_with_scope_claim(
+    request: MintRequest<'_>,
+    issued_at: Option<u64>,
+    scope_claim: Option<Vec<String>>,
+) -> Result<MintedToken> {
     let MintRequest {
         kid,
         algorithm,
@@ -251,7 +276,7 @@ pub(crate) fn mint_token_at(
         ttl,
         aliases,
         max_request_microdollars,
-        scope,
+        scope: _,
     } = request;
     let encoding_key = encoding_key(algorithm, key_material, kid)?;
     let iat = issued_at.unwrap_or(unix_now()?);
@@ -268,7 +293,7 @@ pub(crate) fn mint_token_at(
         sub: subject.to_owned(),
         aliases,
         max_request_microdollars,
-        scope: scope.map(|values| values.into_iter().map(|value| value.to_string()).collect()),
+        scope: scope_claim,
     };
     let mut header = Header::new(algorithm.jwt());
     header.kid = Some(kid.to_owned());

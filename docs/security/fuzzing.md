@@ -47,7 +47,15 @@ public for the same reason.
 **Pull requests — `Fuzz smoke`, required.** Replays every committed seed plus
 fixed derivations of it (truncations, single-byte flips, one oversized
 repetition) and a set of tokens minted at replay time, on the pinned stable
-toolchain. It fails on a panic, on an input slower than its per-input budget, on
+toolchain. Minting at replay time is what keeps the checks *behind* expiry live:
+a committed token seed has expired by the time it is replayed, so every claim
+check past `exp` — audience, lifetime, namespace, signer authority, subject,
+scope, issuance epoch — is reached only by the minted scenarios, and each of
+those asserts the specific outcome it exists for rather than merely counting
+classes. The issuance epoch the seam declares is anchored to the run for the same
+reason: the check runs after the lifetime check, so a token old enough to precede
+a *committed* epoch would already have been refused as expired.
+It fails on a panic, on an input slower than its per-input budget, on
 an allocation past a hard cap the binary enforces through its own global
 allocator, and on the corpus no longer reaching a spread of outcome classes —
 that last one is what stops the lane from going green by refusing every input at

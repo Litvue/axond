@@ -107,13 +107,26 @@ jobs:
           cp -n fuzz/seeds/${{ matrix.target }}/* "fuzz/corpus/${{ matrix.target }}/" || true
           echo "corpus size: $(find "fuzz/corpus/${{ matrix.target }}" -type f | wc -l)"
 
+      # The pull-request lane lints this workspace without libfuzzer-sys, because
+      # that dependency needs nightly to link. Here is where the coverage-guided
+      # targets themselves get linted.
+      - name: Clippy the coverage-guided targets
+        working-directory: fuzz
+        run: cargo clippy --all-targets --locked -- -D warnings
+
       - name: Fuzz
         working-directory: fuzz
         env:
           SECONDS_PER_TARGET: ${{ inputs.seconds_per_target || '600' }}
         run: |
           set -euo pipefail
+          # Fail with the cause rather than with sanitizer flags stable rejects,
+          # in case a future toolchain-selection change silently loses again.
           cargo --version
+          cargo --version | grep -q nightly || {
+            echo "the fuzz lane resolved a non-nightly cargo; libFuzzer needs nightly" >&2
+            exit 1
+          }
           # -rss_limit_mb and -malloc_limit_mb are the uncontrolled-allocation
           # gate: an input that makes a parser ask for more than 2 GiB, or a
           # single allocation over 1 GiB, is a finding rather than an OOM kill.

@@ -139,9 +139,13 @@ jobs:
       - name: Format
         working-directory: fuzz
         run: cargo fmt --all -- --check
+      # `--no-default-features` here too: with the default feature on, this would
+      # compile libFuzzer's C++ sources and the `#![no_main]` targets on stable,
+      # coupling a required lane to a dependency the replay does not need. The
+      # coverage-guided targets are linted on nightly in `fuzz.yml`.
       - name: Clippy
         working-directory: fuzz
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --all-targets --no-default-features --locked -- -D warnings
       # `--no-default-features` drops libfuzzer-sys: the replay is the part that
       # must run without nightly or a sanitizer runtime.
       - name: Replay the committed fuzz corpora

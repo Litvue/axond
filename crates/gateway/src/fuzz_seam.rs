@@ -176,6 +176,11 @@ pub fn verify_token(credential: &str) -> Result<Option<VerifiedToken>, Rejection
 /// Mint an `axt1.` credential with the seam's synthetic HS256 signer so a
 /// fuzzer can reach the claim checks that sit past signature verification.
 ///
+/// `scope` is written into the claim **verbatim**: a name the capability
+/// vocabulary does not define has to reach the verifier, because discarding it
+/// here would leave the verifier's own handling of an unknown capability
+/// unfuzzed.
+///
 /// Returns `None` when the requested claims cannot be encoded at all, which is
 /// a rejection of the fuzzer's request rather than a finding.
 pub fn mint_hs256_token(
@@ -187,13 +192,7 @@ pub fn mint_hs256_token(
     scope: Option<Vec<String>>,
     aliases: Option<Vec<String>>,
 ) -> Option<String> {
-    let scope = scope.map(|values| {
-        values
-            .iter()
-            .filter_map(|value| principals::Capability::parse(value))
-            .collect()
-    });
-    mint::mint_token_at(
+    mint::fuzz_mint_token_with_raw_scope(
         MintRequest {
             kid: HS256_KID,
             algorithm: MintAlgorithm::Hs256,
@@ -204,9 +203,11 @@ pub fn mint_hs256_token(
             ttl: Duration::from_secs(ttl_seconds),
             aliases,
             max_request_microdollars: None,
-            scope,
+            // Ignored by the raw-scope mint, which takes the claim below.
+            scope: None,
         },
         issued_at,
+        scope,
     )
     .ok()
     .map(|minted| minted.token)
@@ -223,6 +224,34 @@ pub const NAMESPACES: [&str; 2] = ["fuzz", "denied"];
 /// How many capabilities the scope vocabulary defines, which bounds what any
 /// token can present however its `scope` claim is shaped.
 pub const CAPABILITY_COUNT: usize = principals::Capability::ALL.len();
+
+/// The longest lifetime the seam's verifiers accept, so a fuzzer can mint a
+/// token that straddles the issuance epoch without tripping the lifetime check
+/// on the way there.
+pub const MAX_TTL_SECONDS: u64 = 900;
+
+/// The issuance epoch the seam declares for [`NAMESPACES`]`[0]`, as unix
+/// seconds: a token this namespace's signer produced *before* this instant is
+/// refused with `token_issued_before_epoch`.
+///
+/// It is anchored to the run rather than committed, because the check sits
+/// behind the lifetime check — a fixed past epoch is unreachable, since any
+/// token old enough to precede it is either expired or over its TTL. Resolved
+/// once per process, so a replay stays internally consistent.
+pub fn epoch_min_iat() -> u64 {
+    static MIN_IAT: OnceLock<u64> = OnceLock::new();
+    *MIN_IAT.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs())
+            .saturating_sub(EPOCH_LOOKBACK_SECONDS)
+    })
+}
+
+/// How far behind the start of a run the issuance epoch sits. Long enough that
+/// a token minted before it still has a live `exp` inside [`MAX_TTL_SECONDS`],
+/// short enough that an ordinary minted token lands after it.
+const EPOCH_LOOKBACK_SECONDS: u64 = 300;
 
 /// The `kid` of the seam's HS256 signer.
 pub const HS256_KID: &str = "fuzz-hs256";
@@ -269,14 +298,17 @@ namespaces = ["fuzz", "denied"]
 max_ttl = "15m"
 
 [[gateway_token_epoch]]
-namespace = "denied"
-min_iat = "2026-01-01T00:00:00Z"
+namespace = "fuzz"
+min_iat = {MIN_IAT}
 "#;
 
 fn verifier() -> &'static TokenVerifier {
     static VERIFIER: OnceLock<TokenVerifier> = OnceLock::new();
     VERIFIER.get_or_init(|| {
-        let config = Config::from_toml_str(CONFIG).expect("the seam's own config is valid");
+        // The epoch is the one value that cannot be committed: see
+        // [`epoch_min_iat`].
+        let text = CONFIG.replace("{MIN_IAT}", &epoch_min_iat().to_string());
+        let config = Config::from_toml_str(&text).expect("the seam's own config is valid");
         let env = HashMap::from([
             (
                 "AXOND_FUZZ_STATIC_KEY".to_owned(),
