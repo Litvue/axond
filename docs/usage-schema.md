@@ -15,7 +15,7 @@ meaning, and how they are allowed to change. The design rationale is
 | --- | --- | --- |
 | `id` | `bigserial` | Surrogate key. Postgres-only; not part of the record. |
 | `schema_version` | `integer` | Version of this row's shape. Always populated. |
-| `request_id` | `text` | Identifies one request. Unique **per gateway process**, not globally. |
+| `request_id` | `text` | Identifies one request, and therefore one usage event. Globally unique: `req_` followed by a lowercase canonical UUIDv7 (`req_0192f5e1-2b3c-7def-8123-456789abcdef`). Opaque — treat it as a string, not as a parsed timestamp. |
 | `trace_id` | `text` | W3C trace id of the caller's trace; NULL when the request was not traced. One trace usually spans many requests. |
 | `namespace` | `text` | Tenant/namespace the request was served under. |
 | `subject` | `text` | Authenticated caller — the gateway key's env-var label or file path for static authentication, or the token's `sub` claim for token authentication. Switching a static key from `env` to `file` changes this value and therefore the corresponding budget subject; file paths are emitted as written. |
@@ -63,6 +63,14 @@ omitted when absent), and the OTLP sink emits it as an OTel log record with
   though the cache columns were reserved in version 1.
 - One table may hold rows written by several gateway versions. Read
   `schema_version` rather than assuming a deploy timeline.
+- Making `request_id` globally unique is **not** a bump. The column keeps its
+  type, its `req_` prefix, and its meaning ("identifies one request"); only the
+  set of ids it can hold widened, and it was always documented as opaque. A
+  reader that stored, compared, or grouped by it is unaffected; the only reader
+  affected is one that parsed the old 16-hex-digit body, which was never part of
+  the contract. Nothing else was strengthened in step: the shipped DDL declares
+  no unique index on it (see below), so the promise is about what the writer
+  emits, not about what an existing table enforces.
 
 This schema versions independently of the gateway's own version; where it sits
 among axond's other published interfaces is the
@@ -72,10 +80,28 @@ among axond's other published interfaces is the
 ## Reading the rows
 
 Writes are **at least once**: a batch whose commit outcome is unknown is retried,
-so a duplicate row is possible. Deduplicate on `(request_id, recorded_at)`.
-Because `request_id` is unique per process rather than globally, a fleet of
-replicas can in principle mint the same id — include `recorded_at` (and, when
-present, `trace_id`) in any join that must be exact.
+so a duplicate row is possible. Deduplicate on `request_id` alone — it is
+globally unique across replicas and restarts, so it is the whole key of a usage
+event and nothing else needs to be added to make a join exact.
+
+The shipped DDL does **not** declare a unique index on it, because a table may
+already hold rows written by an older gateway whose ids were only unique per
+process. Deployments with no such rows can add one, which turns a duplicate write
+into a collision instead of a second row:
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY axond_usage_request_id_key
+    ON axond_usage (request_id);
+```
+
+Ids are time-ordered: sorting by `request_id` sorts by when the gateway settled
+the request, so an index on it stays append-mostly and "everything after id X" is
+a usable cursor. That ordering is a property to rely on; the embedded timestamp is
+not — read `recorded_at` for time.
+
+Rows written before this change carry a `req_` + 16-hex-digit id
+(`req_0000000000000001`) and are unique only within the process that wrote them.
+The two shapes are distinguishable by length, and both are just text to a reader.
 
 Spend for a period, per namespace:
 
@@ -104,3 +130,11 @@ observable:
 
 Alert on the second one. A sustained non-zero rate means the buffer
 (`buffer_capacity`) or the destination is undersized for the offered load.
+
+This is the **telemetry-grade** delivery mode, and it is the only one the gateway
+offers today. The opt-in **billing-grade** mode — an accepted request's event is
+durable before the request settles, replayed until a consumer acknowledges it —
+is specified as the `UsageJournal` contract in `crates/gateway/src/usage/journal.rs`
+and tracked by [#155](https://github.com/Litvue/axond/issues/155). Nothing
+constructs a journal yet, so no configuration turns it on and no sink's behaviour
+changes.

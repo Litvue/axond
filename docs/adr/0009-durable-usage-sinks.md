@@ -119,3 +119,67 @@ limit.
   and adding one would only matter if writes were parallelised across
   connections — which would in turn weaken the ordering that makes the
   drop-accounting simple.
+
+## Amendment (2026-08-12)
+
+Issue #193 takes the follow-up this ADR named — a globally unique request id —
+and adds the contract the durable delivery mode of #155 will be built on. The
+drop-not-stall contract above is unchanged and remains the default.
+
+**`request_id` is now globally unique, without a schema bump.** It is `req_`
+followed by a lowercase canonical UUIDv7 (RFC 9562 §5.7), minted from the same
+`Uuid7Generator` the control-plane domain uses rather than a new dependency. The
+column stays `text`, the field stays a string, the prefix stays, and the value was
+always documented as opaque — so what changed is the *set* of ids the writer can
+emit, which no reader can observe as a change in meaning. Deduplication is
+therefore on `request_id` alone; `(request_id, recorded_at)` still works and is no
+longer necessary.
+
+Two things were deliberately *not* strengthened in step. The shipped DDL declares
+no unique index, because an existing table may hold rows from a writer whose ids
+were only unique per process, and adding a constraint those rows can violate would
+turn an upgrade into an outage; `docs/usage-schema.md` gives the `CREATE UNIQUE
+INDEX CONCURRENTLY` an operator can apply once they know their table is clean. And
+`SCHEMA_VERSION` stays at 2 — bumping it would make every reader branch on a
+version whose row shape is identical.
+
+The id is minted **once, when a request is admitted**, and carried on the request
+(alongside the trace id, captured at the same moment because settlement runs in a
+detached task where the server span is no longer current). Every way a request can
+end — buffered success or failure, terminal stream, credential rotation, client
+cancellation, a walk that never opened a stream — settles the one event that
+identity names. It used to be minted at settlement, in whichever path got there
+first, so nothing before settlement could refer to the event a request was going
+to produce.
+
+**`UsageJournal` is the durable contract, and it is not a `UsageSink`.** A sink is
+a destination that may drop; a journal is a log with named consumers, where an
+event is forgotten only once a consumer acknowledges it. Flattening them would
+hide exactly the decision this ADR is about, so they are separate traits:
+`append` (idempotent on the event id: identical content is `AlreadyPresent`,
+different content under the same key is a `Conflict`, never an overwrite), `claim`
+(a bounded batch under a lease, at most one in-flight event per
+`(namespace, subject)` ordering key), `ack` (idempotent, so a crash between the
+destination write and the acknowledgement is recoverable by repeating it),
+`quarantine` (a poison event leaves the delivery path instead of blocking its key
+forever), and `stats` (depth, in-flight, oldest pending age, quarantined, dropped,
+and the capacity they are bounded by). Delivery is at least once by design:
+exactly-once would require committing an arbitrary sink's side effect and the
+acknowledgement together. What makes replay safe is that the idempotency key *is*
+the `request_id` column, so a conforming consumer constrains it and lets the second
+write collide; the per-attempt `DeliveryId` keeps a redelivery distinguishable in
+logs without being distinguishable as a billable event.
+
+Capacity is an explicit decision rather than an accident: `Refuse` tells the caller
+its event is not durable (the only policy that keeps a billing-grade promise),
+`DropOldest` buys bounded storage by losing the longest-waiting events and reports
+what it lost.
+
+This slice is contract plus executable oracle only, in the same posture as
+`crate::desired_state`: the trait and its in-memory test double define the
+behaviour, no journal is constructed, no configuration selects one, and settlement
+order is untouched. `DeliveryMode` names the two postures (`TelemetryGrade`,
+`BillingGrade`) so the durable mode has a name in documentation before it has an
+implementation. The Postgres outbox worker that makes billing-grade real — an
+outbox table, per-consumer delivery rows, `FOR UPDATE SKIP LOCKED` claims, a lease
+column, and the append-before-settlement ordering — is the next slice of #155.

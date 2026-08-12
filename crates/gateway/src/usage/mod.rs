@@ -19,6 +19,12 @@
 //! per-seam policy a shared trait would have had to flatten.
 
 mod batch;
+pub mod identity;
+// Contract only, like [`crate::desired_state`]: the Postgres outbox worker that
+// implements the journal is the next slice of #155, so nothing here is
+// constructed by `serve` and the runtime's delivery mode stays telemetry-grade.
+#[allow(dead_code)]
+pub mod journal;
 mod otlp;
 mod postgres;
 
@@ -39,7 +45,7 @@ pub use postgres::{PostgresSink, PostgresSinkSettings, tls_connector, validate_t
 /// The terminal outcome of a request. Every terminated request produces
 /// exactly one record — including failures, cancellations, and partial
 /// streams — so spend reconciles (delta B6).
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)] // Ok/UpstreamError wired now; the rest as streaming + cancellation land
 pub enum Status {
@@ -71,11 +77,18 @@ impl Status {
 
 /// Neutral, versioned usage vocabulary (delta A3). No product-specific terms:
 /// this schema lands in customers' own tables, so it is treated as an API.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Comparable by value, which the journal needs: an append under an
+/// already-present idempotency key is a benign retry only if the content matches,
+/// and a mismatch has to be refused rather than overwritten.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UsageRecord {
     pub schema_version: u32,
-    /// Unique per request, so rows can be de-duplicated. Distinct from
-    /// `trace_id`, which one caller trace shares across many requests.
+    /// The event's identity: a globally unique, time-ordered
+    /// [`RequestId`](identity::RequestId) rendered as text, so rows can be
+    /// deduplicated across a whole fleet rather than within one process.
+    /// Distinct from `trace_id`, which one caller trace shares across many
+    /// requests.
     pub request_id: String,
     /// Set when the request was traced, joining the row to the caller's trace.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -411,7 +424,7 @@ mod tests {
     pub(super) fn sample_record() -> UsageRecord {
         UsageRecord {
             schema_version: UsageRecord::SCHEMA_VERSION,
-            request_id: "req_0000000000000001".to_string(),
+            request_id: identity::next_request_id().to_string(),
             trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string()),
             namespace: "acme".to_string(),
             subject: "GW_INBOUND_ACME_KEY".to_string(),
