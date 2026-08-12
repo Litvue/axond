@@ -60,6 +60,11 @@ struct ControlPlaneState {
     audit: HashMap<RevisionId, Vec<AuditEvent>>,
     /// The revision a key published, plus the desired state it published, so a
     /// reused key can be told apart from a retried one.
+    ///
+    /// One unscoped, never-expiring namespace, which is adequate for a
+    /// single-caller test double and is *not* the contract: per-caller scoping
+    /// and expiry are required of a durable store, per
+    /// [`IdempotencyKey`](super::control_plane::IdempotencyKey).
     applied: HashMap<IdempotencyKey, (RevisionId, RevisionChecksum)>,
 }
 

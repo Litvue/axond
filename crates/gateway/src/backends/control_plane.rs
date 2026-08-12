@@ -189,6 +189,13 @@ pub struct AuditEvent {
 /// publishing a second revision; the same key with different desired state is
 /// [`ControlPlaneError::IdempotencyKeyReused`], never a silent replay of the
 /// revision the caller did not describe.
+///
+/// The token carries no scope of its own, so a durable implementation must
+/// dedupe within the *authenticated caller's* scope and expire records rather
+/// than retaining them forever: a global, immortal namespace would let one
+/// administrator's `retry-1` replay or block another's. Two callers submitting
+/// the same string are two independent writes. The in-memory fake deliberately
+/// does neither — it is a single-tenant test double, not the scoping decision.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IdempotencyKey(pub String);
 
