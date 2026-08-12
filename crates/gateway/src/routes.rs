@@ -2628,7 +2628,8 @@ max_request_microdollars = 1000
 
     /// A mint request that names no scope inherits the caller's route
     /// capabilities, but never `status`: the dependency-status view is a grant an
-    /// operator writes down, not one a subject inherits (#199).
+    /// operator writes down, not one a subject inherits (#199). A configured
+    /// ceiling is that writing down, so one naming `status` still confers it.
     #[tokio::test]
     async fn a_scope_less_mint_grants_route_capabilities_but_not_status() {
         let state = minting_state_without_scope();
@@ -2653,6 +2654,29 @@ max_request_microdollars = 1000
 
         let (status, _) = mint_request(state, json!({"sub": "agent", "scope": ["status"]})).await;
         assert_eq!(status, StatusCode::OK);
+
+        // A configured ceiling is the deployment's own written-down grant, so a
+        // ceiling naming `status` still confers it: the exclusion is the default,
+        // not an override of the operator's configuration.
+        let state = minting_state_with_scope_audience_epochs(
+            r#"scope = ["chat", "status"]"#,
+            "test-audience",
+            "",
+        );
+        let (status, body) = mint_request(state.clone(), json!({"sub": "agent"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let token = body["token"].as_str().expect("minted token").to_owned();
+        let snapshot = state.config();
+        let headers = HeaderMap::from_iter([(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        )]);
+        let caller = authenticate(&snapshot, &headers)
+            .await
+            .expect("the minted token authenticates");
+        let scope = caller.scope.expect("the ceiling is written down");
+        assert!(scope.contains(&Capability::Status));
+        assert!(!scope.contains(&Capability::Models));
     }
 
     #[tokio::test]

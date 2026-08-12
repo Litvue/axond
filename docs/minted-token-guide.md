@@ -300,7 +300,10 @@ and its route ships with the stateful slices. It is also the only capability
 `POST /v1/tokens` does **not** grant when the request names no `scope`: that
 route writes a concrete claim, and it now writes every route capability except
 `status`, so a monitoring grant from the minting route has to be asked for rather
-than inherited. `axond mint` is not that route. Omitting `--scope` omits the
+than inherited. A configured `[gateway_minting] scope` ceiling is still what a
+scope-less request inherits, so a ceiling that lists `status` grants it: the
+exclusion is the *default*, not an override of the deployment's own ceiling.
+`axond mint` is not that route. Omitting `--scope` omits the
 claim, and an unscoped token is unrestricted under
 [ADR 0019](./adr/0019-scoped-route-capabilities.md) — it satisfies `status` like
 every other capability. A monitoring token from the command line is therefore

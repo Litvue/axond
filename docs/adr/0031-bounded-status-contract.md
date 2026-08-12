@@ -57,7 +57,10 @@ route, because a namespace's dependency health is a legitimate question even whe
 it can invoke nothing. It is also the first capability a scope-less mint request
 does **not** confer: `POST /v1/tokens` without a `scope` grants the caller's route
 capabilities, and granting the deployment's dependency view along with them would
-make monitoring reach a side effect of minting an inference token. That exclusion
+make monitoring reach a side effect of minting an inference token. A configured
+`[gateway_minting] scope` ceiling still governs that request, so a deployment that
+names `status` in its ceiling does confer it — the ceiling *is* the written-down
+grant, and the default is what this decision changes. The exclusion
 is a property of the minting route, which writes a concrete claim; it is not a
 change to ADR 0019's rule that a token carrying no `scope` claim at all is
 unrestricted, so an offline `axond mint` without `--scope` still satisfies
