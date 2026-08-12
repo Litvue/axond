@@ -49,7 +49,7 @@ Use this checklist before exposing Axond beyond a local development network.
 - [ ] Load balancer drains on `/readyz` failure, or `shutdown.drain_grace_ms` covers its polling interval.
 - [ ] `terminationGracePeriodSeconds` / `TimeoutStopSec` exceed `drain_grace_ms + deadline_ms + flush_timeout_ms`.
 - [ ] `shutdown.deadline_ms` reflects how long callers are allowed to hold a stream, since streams open at the deadline are cut.
-- [ ] `axond.usage.dropped{reason="shutdown"}` is alerted on: it means records were lost at termination.
+- [ ] `axond.usage.records_dropped{axond.drop_reason="shutdown"}` is alerted on: it means records were lost at termination.
 - [ ] Mixed-version restrictions in the release's migration notes are respected.
 
 ## Observability

@@ -114,7 +114,7 @@ depends on endpoint removal winning a race
    is charged for what the caller received, not discarded.
 5. Usage sinks and telemetry exporters flush within one
    `shutdown.flush_timeout_ms`. Records that cannot be written are counted as
-   `shutdown` drops on `axond.usage.dropped`, never dropped silently.
+   `shutdown` drops on `axond.usage.records_dropped`, never dropped silently.
 
 Size the grace period above the sum of the three bounds:
 

@@ -87,7 +87,7 @@ metric and a usage row can never disagree.
 | Alert | Signal | Why |
 | --- | --- | --- |
 | Usage is being lost | `axond.usage.records_dropped` rate > 0, sustained | Spend data is gone and will not come back. Buffer or destination is undersized. |
-| Spend lost at termination | `axond.usage.records_dropped{reason="shutdown"}` > 0, or `axond.usage.flushes{outcome!="flushed"}` > 0 | A replica exited before its buffered records landed. Raise `shutdown.flush_timeout_ms` (and the stopping timeout with it), or check the sink. |
+| Spend lost at termination | `axond.usage.records_dropped{axond.drop_reason="shutdown"}` > 0, or `axond.usage.flushes{axond.flush_outcome!="flushed"}` > 0 | A replica exited before its buffered records landed. Raise `shutdown.flush_timeout_ms` (and the stopping timeout with it), or check the sink. |
 | Rollouts are cutting streams | `axond.shutdown.abandoned_requests` > 0 per rollout | Callers hold streams longer than `shutdown.deadline_ms`; their responses end mid-stream. |
 | A replica is stuck draining | `axond.shutdown.phase` ≥ 1 for longer than `drain_grace_ms + deadline_ms + flush_timeout_ms` | The orchestrator sent `SIGTERM` but the process is not going away; expect a `SIGKILL` and lost buffered usage. |
 | A target is out | `axond.upstream.circuit_state = 2`, sustained | Every request is failing over (or failing) for that target. |
