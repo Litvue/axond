@@ -101,6 +101,31 @@ pub fn load(path: &str) -> Result<Config, OpsError> {
         .map_err(|error| OpsError::Config(format!("failed to load config from `{path}`: {error}")))
 }
 
+/// Why `serve` will not start a replica against this config, if it will not.
+///
+/// One definition for two callers: `serve` bails with it, and [`preflight`]
+/// reports it as a failed check, so an operator gating a rollout learns it from a
+/// command instead of from a crash loop. Both read the same function on purpose —
+/// when the runtime is wired to the control plane, deleting this makes both call
+/// sites fail to compile, rather than leaving a preflight that refuses every
+/// stateful deployment forever.
+pub fn serving_refusal(config: &Config) -> Option<&'static str> {
+    // Stateful bootstrap parses and validates (ADR 0027, #162), but the durable
+    // control plane it points at is not wired to the runtime (#141, #163, #142).
+    // A stateful cold boot must reach the control plane or fail loudly, so this
+    // refuses rather than serving the empty snapshot an unread control plane
+    // would leave behind.
+    match config.mode {
+        Mode::Stateless => None,
+        Mode::Stateful => Some(
+            "`mode = \"stateful\"` is accepted by configuration validation, but the durable \
+             control plane it bootstraps is not implemented yet; a stateful replica must reach \
+             the control plane rather than serve an empty snapshot, so this process refuses to \
+             start. Use `mode = \"stateless\"` (the default) until the control plane ships.",
+        ),
+    }
+}
+
 /// How a report names the control-plane database in output.
 pub(crate) const CONTROL_PLANE: &str = "control plane";
 

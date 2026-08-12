@@ -154,23 +154,23 @@ pub async fn run(config: &Config, config_path: &Path, env: &HashMap<String, Stri
             }
         ),
     );
-    // Reported rather than assumed: every other check here answers "would a
-    // replica boot?", and in stateful mode there is currently one answer none of
-    // them can reach. `serve` refuses `mode = "stateful"` outright until the
-    // runtime is wired to the control plane, so an operator gating a rollout on
-    // this command has to be told that from the command rather than from a crash
-    // loop. Failed rather than skipped, because the honest answer to this
-    // command's question is no: a rollout gating on a zero exit would pass here
-    // and then crash-loop. The database checks below still run and are still
-    // reported — and `axond migrate status`/`apply` are separate commands with
-    // their own exit codes, so preparing a database is not blocked by this.
-    if config.mode == Mode::Stateful {
+    // Read from `serve`'s own refusal rather than restated here, so this command
+    // cannot promise a boot `serve` would decline: today that is `mode =
+    // "stateful"`, and when the runtime wiring lands this line disappears with it
+    // instead of failing every stateful deployment forever. Failed rather than
+    // skipped, because the honest answer to this command's question is no: a
+    // rollout gating on a zero exit would pass here and then crash-loop. The
+    // database checks below still run and are still reported — and `axond migrate
+    // status`/`apply` are separate commands with their own exit codes, so
+    // preparing a database is not blocked by this.
+    if let Some(refusal) = super::serving_refusal(config) {
         report.failed(
-            "stateful serving",
-            "`serve` still refuses `mode = \"stateful\"`: the durable control plane is not wired \
-             to the runtime yet, so no replica can start against this config. The checks below \
-             still describe the database, and `axond migrate status` reports it without this \
-             failure",
+            "serving",
+            format!(
+                "`serve` refuses this config, so no replica can start against it: {refusal} The \
+                 checks below still describe the database, and `axond migrate status` reports it \
+                 without this failure"
+            ),
         );
     }
     check_file_ownership(&mut report, config_path);
@@ -279,8 +279,8 @@ fn check_file_ownership(report: &mut Report, path: &Path) {
 /// A reference is a name, not a value: the check is that something answers to the
 /// name, and no resolved value is ever reported. Every reference a boot resolves
 /// is here — the stateful bootstrap set (control plane, secret store KEK,
-/// breakglass credential), the inbound keys and verifiers, the stateless provider
-/// credentials, and the opt-in stores — because an unset name fails a boot
+/// breakglass credential), the inbound keys, verifiers and minting key, the
+/// stateless provider credentials, and the opt-in stores — an unset name fails a boot
 /// whichever section it is in, and a preflight that passed on one of those would
 /// be the failure this command exists to catch.
 fn check_references(report: &mut Report, config: &Config, env: &HashMap<String, String>) {
@@ -333,6 +333,16 @@ fn check_references(report: &mut Report, config: &Config, env: &HashMap<String, 
         if let Some(name) = non_empty(verifier.env.as_deref()) {
             references.push((label, Reference::Env(name.to_owned())));
         } else if let Some(path) = non_empty(verifier.file.as_deref()) {
+            references.push((label, Reference::File(path.to_owned())));
+        }
+    }
+    // Resolved at boot exactly like a verifier's key, and by the same code path,
+    // so an unset one is a boot failure this gate has to reach too.
+    if let Some(minting) = config.gateway_minting.as_ref() {
+        let label = format!("[gateway_minting] `{}`", minting.kid);
+        if let Some(name) = non_empty(minting.env.as_deref()) {
+            references.push((label, Reference::Env(name.to_owned())));
+        } else if let Some(path) = non_empty(minting.file.as_deref()) {
             references.push((label, Reference::File(path.to_owned())));
         }
     }
@@ -665,7 +675,7 @@ mod tests {
         let refusal = report
             .checks
             .iter()
-            .find(|check| check.name == "stateful serving")
+            .find(|check| check.name == "serving")
             .expect("a stateful preflight must name the refusal");
         assert!(
             matches!(refusal.outcome, Outcome::Failed(_)),
@@ -691,11 +701,45 @@ mod tests {
         )
         .await;
         assert!(
-            !report
-                .checks
-                .iter()
-                .any(|check| check.name == "stateful serving"),
+            !report.checks.iter().any(|check| check.name == "serving"),
             "stateless mode has no such refusal to report: {report}"
+        );
+        assert!(
+            super::super::serving_refusal(&stateless).is_none(),
+            "and the reported refusal is `serve`'s own, not a second opinion"
+        );
+    }
+
+    /// The minting key is resolved at boot the same way a verifier's is, so an
+    /// unset one is a crash loop a green preflight would have promised away.
+    #[tokio::test]
+    async fn the_minting_key_is_a_reference_too() {
+        let toml = "[[gateway_key]]\nenv = \"GW_KEY\"\nnamespace = \"platform\"\n\
+             [gateway_token]\naudience = \"axond-test\"\n\
+             [[gateway_verifier]]\nkid = \"acme-1\"\nalg = \"EdDSA\"\n\
+             env = \"GW_VERIFY_ACME\"\nnamespaces = [\"platform\"]\nmax_ttl = \"15m\"\n\
+             [gateway_minting]\nkid = \"acme-1\"\nenv = \"GW_MINT_KEY\"\n\
+             [[namespace]]\nid = \"platform\"\ndefault = true\n";
+        let path = write("axond.toml", toml);
+        let config = Config::from_toml_str(toml).expect("valid stateless config");
+        let mut env = HashMap::from([
+            ("GW_KEY".to_owned(), "secret".to_owned()),
+            ("GW_VERIFY_ACME".to_owned(), "verifier".to_owned()),
+        ]);
+
+        let report = run(&config, &path, &env).await;
+        let rendered = report.to_string();
+        assert!(
+            !report.is_ok() && rendered.contains("GW_MINT_KEY"),
+            "an unset minting key fails a boot, so it fails here: {rendered}"
+        );
+
+        env.insert("GW_MINT_KEY".to_owned(), "minting".to_owned());
+        let report = run(&config, &path, &env).await;
+        assert!(report.is_ok(), "{report}");
+        assert!(
+            !report.to_string().contains("minting"),
+            "a resolved value is never reported: {report}"
         );
     }
 

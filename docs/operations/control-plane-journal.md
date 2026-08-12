@@ -80,13 +80,15 @@ checks as skipped and `migrate` has nothing to do. Neither command requires
 PostgreSQL to exist.
 
 Until stateful serving is wired up, a stateful `preflight` **fails** on a
-`stateful serving` line and exits non-zero: `axond serve` still refuses
+`serving` line and exits non-zero: `axond serve` still refuses
 `mode = "stateful"` outright because the durable control plane is not wired to the
 runtime yet, so no replica can boot against that config and a zero exit would
 promise one that cannot. Every other check still runs and is still printed, so the
 report is the same description of the database it would otherwise be — and
 `axond migrate status` / `axond migrate apply` are separate commands with their own
-exit codes, so preparing the database is not blocked by the serving refusal.
+exit codes, so preparing the database is not blocked by the serving refusal. The
+line is printed from the refusal `serve` itself raises, not from a second copy of
+the rule, so it disappears when that refusal does rather than outliving it.
 
 Only the control-plane journal is migrated by these commands. It is the only store
 with a ledger — recorded version, file name, checksum — so it is the only one where
@@ -110,7 +112,7 @@ Then start replicas. Run `apply` once from one place; it is safe if that
 accidentally becomes twice, or two places at once.
 
 While stateful serving is unwired, that `preflight` exits non-zero on its
-`stateful serving` line even when the database is ready; read the rest of the
+`serving` line even when the database is ready; read the rest of the
 report, and gate the rollout on `axond migrate status` until the refusal is gone.
 
 ### Upgrade

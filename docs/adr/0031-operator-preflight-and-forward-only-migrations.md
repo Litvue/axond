@@ -84,4 +84,5 @@ account can rewrite fails the gate while it would start a gateway. And until the
 durable control plane is wired to the runtime, `serve` still refuses
 `mode = "stateful"`; a stateful preflight reports that as a failure rather than
 promising a boot that cannot happen, while the database checks it accompanies
-still run.
+still run. Preflight reads that refusal from `serve`'s own definition, so the two
+cannot disagree and lifting the refusal removes the reported failure with it.

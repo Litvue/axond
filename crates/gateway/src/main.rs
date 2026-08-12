@@ -60,7 +60,7 @@ use std::time::Instant;
 
 use budget::BudgetStore;
 use clap::{Arg, ArgAction, Command};
-use config::{Config, Mode};
+use config::Config;
 use rate_limit::RateLimiter;
 use revocation::RevocationStore;
 use state::AppState;
@@ -429,18 +429,10 @@ async fn serve() -> anyhow::Result<()> {
     let config = Config::load(&config_path)
         .map_err(|e| anyhow::anyhow!("failed to load config from `{config_path}`: {e}"))?;
 
-    // Stateful bootstrap parses and validates (ADR 0027, #162), but the durable
-    // control plane it points at does not exist yet (#141, #163, #142). A
-    // stateful cold boot must reach the control plane or fail loudly, so this
-    // refuses rather than serving the empty snapshot an unread control plane
-    // would leave behind.
-    if config.mode == Mode::Stateful {
-        anyhow::bail!(
-            "`mode = \"stateful\"` is accepted by configuration validation, but the durable \
-             control plane it bootstraps is not implemented yet; a stateful replica must reach \
-             the control plane rather than serve an empty snapshot, so this process refuses to \
-             start. Use `mode = \"stateless\"` (the default) until the control plane ships."
-        );
+    // The same refusal `axond check preflight` reports, read from the same place,
+    // so the command cannot describe a boot this function would not perform.
+    if let Some(refusal) = ops::serving_refusal(&config) {
+        anyhow::bail!("{refusal}");
     }
 
     let env: HashMap<String, String> = std::env::vars().collect();
