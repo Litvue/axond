@@ -25,15 +25,17 @@
 //! - **Ordering is per key, and enforced by the claim.** At most one event per
 //!   [`OrderingKey`] is in flight, so a second concurrent consumer of the same
 //!   journal cannot reorder one caller's events.
-//! - **Capacity is a decision, not an accident.** It bounds the *undelivered*
-//!   events, quarantine included, so a destination that rejects every event fills
-//!   the journal and is reported rather than growing it forever. A full journal
-//!   either refuses the append or drops its oldest *non-quarantined* event, and the
-//!   dropped count is reported rather than inferred.
-//! - **Retention is what bounds a drained journal.** An event every consumer
-//!   acknowledged is pruned once [`Capacity::retain_acknowledged`] has passed
-//!   since it was observed, so storage does not grow without limit just because
-//!   delivery kept up. A quarantined event is not pruned.
+//! - **Capacity bounds everything stored.** Undelivered events, quarantined ones,
+//!   and delivered ones still inside their retention window all occupy it, so the
+//!   limit is true of the journal's footprint. A full journal gives up delivered
+//!   events first (a re-acknowledgement is cheaper than a refusal), and only then
+//!   refuses the append or drops its oldest *non-quarantined* event — with the
+//!   dropped count reported rather than inferred.
+//! - **Retention is a maximum, not a promise.** An event every consumer
+//!   acknowledged is pruned once [`Capacity::retain_acknowledged`] has passed since
+//!   it was observed, or earlier if the journal needs the room, so storage does not
+//!   grow without limit just because delivery kept up. A quarantined event is not
+//!   pruned.
 //!
 //! The mutex is this fake's transaction; the Postgres implementation's is a
 //! transaction.
@@ -88,33 +90,68 @@ impl Storage {
         self.entries.iter().find(|entry| entry.position == position)
     }
 
-    /// Positions the journal is still holding *undelivered*, in append order — what
-    /// capacity bounds. An event no consumer has finished with counts, and so does a
-    /// quarantined one: it is waiting for an operator rather than for a clock, so
-    /// nothing else will ever reclaim its space. That is what makes a systematic
-    /// poison condition fill the journal and be reported, instead of growing the
-    /// store forever.
+    /// Positions every registered consumer has acknowledged, in append order.
+    /// Quarantine excludes an event, and so does having no consumer at all: a
+    /// journal nobody reads has acknowledged nothing.
     ///
-    /// An event every consumer acknowledged does not count: it is on its way out
-    /// under [`Capacity::retain_acknowledged`], the separate bound on the delivered
-    /// tail, and a journal that is keeping up must not refuse an append because of
-    /// events it has already delivered.
-    ///
-    /// With no consumer registered every entry counts: a journal nobody reads
-    /// still fills up.
-    fn held(&self) -> Vec<u64> {
+    /// These are the events retention is holding as a courtesy to a consumer that
+    /// may re-acknowledge after a restart — the first space a full journal reclaims,
+    /// because they have already been delivered.
+    fn delivered(&self) -> Vec<u64> {
+        if self.consumers.is_empty() {
+            return Vec::new();
+        }
         self.entries
             .iter()
             .map(|entry| entry.position)
+            .filter(|position| !self.is_quarantined(*position))
             .filter(|position| {
-                self.consumers.is_empty()
-                    || self.is_quarantined(*position)
-                    || self
-                        .consumers
-                        .values()
-                        .any(|state| !state.acked.contains(position))
+                self.consumers
+                    .values()
+                    .all(|state| state.acked.contains(position))
             })
             .collect()
+    }
+
+    /// Remove one event and every trace of it, including its idempotency-key index
+    /// entry — which is why a retention window has to outlive any retry: past it,
+    /// the same event appends as a new one.
+    fn forget(&mut self, position: u64) {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.position == position)
+        else {
+            return;
+        };
+        let removed = self.entries.remove(index);
+        self.positions.remove(removed.event.idempotency_key());
+        for state in self.consumers.values_mut() {
+            state.acked.remove(&position);
+            state.attempts.remove(&position);
+            state.leases.remove(&position);
+        }
+    }
+
+    /// Make room by forgetting already-delivered events ahead of their retention
+    /// window, oldest first, until the journal is back inside `max_events`.
+    ///
+    /// This is what keeps the capacity bound true of *everything* stored while a
+    /// journal that is keeping up still accepts appends: the retention window is a
+    /// courtesy to a re-acknowledging consumer, and a courtesy is the first thing to
+    /// give up when the alternative is refusing an event that has not been delivered
+    /// at all. Returns how many were forgotten — they are not losses, so the caller
+    /// does not count them as dropped.
+    fn reclaim_delivered(&mut self, max_events: u64) -> usize {
+        let mut reclaimed = 0;
+        for position in self.delivered() {
+            if (self.entries.len() as u64) < max_events {
+                break;
+            }
+            self.forget(position);
+            reclaimed += 1;
+        }
+        reclaimed
     }
 
     /// Whether any consumer has this position set aside as poison. Such an event
@@ -135,38 +172,16 @@ impl Storage {
     /// everything, if no consumer is registered — a journal nobody reads has
     /// acknowledged nothing.
     fn prune_acknowledged(&mut self, retain: Duration, now: SystemTime) {
-        if self.consumers.is_empty() {
-            return;
-        }
-        let prunable: Vec<u64> = self
-            .entries
-            .iter()
-            .filter(|entry| entry.event.observed_at() + retain <= now)
-            .filter(|entry| !self.is_quarantined(entry.position))
-            .filter(|entry| {
-                self.consumers
-                    .values()
-                    .all(|state| state.acked.contains(&entry.position))
+        let expired: Vec<u64> = self
+            .delivered()
+            .into_iter()
+            .filter(|position| {
+                self.entry(*position)
+                    .is_some_and(|entry| entry.event.observed_at() + retain <= now)
             })
-            .map(|entry| entry.position)
             .collect();
-        for position in prunable {
-            let Some(index) = self
-                .entries
-                .iter()
-                .position(|entry| entry.position == position)
-            else {
-                continue;
-            };
-            let pruned = self.entries.remove(index);
-            // The unique index goes with the row, which is why the window has to
-            // outlive any retry: past it, the same event appends as a new one.
-            self.positions.remove(pruned.event.idempotency_key());
-            for state in self.consumers.values_mut() {
-                state.acked.remove(&position);
-                state.attempts.remove(&position);
-                state.leases.remove(&position);
-            }
+        for position in expired {
+            self.forget(position);
         }
     }
 }
@@ -240,12 +255,20 @@ impl UsageJournal for InMemoryUsageJournal {
                 key: event.idempotency_key().clone(),
             });
         }
-        let pending = storage.held();
-        if pending.len() as u64 >= self.capacity.max_events {
+        // Capacity is measured on everything stored, so the limit is true of the
+        // journal's footprint rather than of one class of event inside it. Delivered
+        // events still inside their retention window are given up first: they cost
+        // nothing but a re-acknowledgement, which is a better trade than refusing an
+        // event nobody has delivered.
+        if storage.entries.len() as u64 >= self.capacity.max_events {
+            storage.reclaim_delivered(self.capacity.max_events);
+        }
+        if storage.entries.len() as u64 >= self.capacity.max_events {
+            let retained = storage.entries.len() as u64;
             match self.capacity.policy {
                 CapacityPolicy::Refuse => {
                     return Err(JournalError::AtCapacity {
-                        pending: pending.len() as u64,
+                        pending: retained,
                         capacity: self.capacity,
                     });
                 }
@@ -255,27 +278,18 @@ impl UsageJournal for InMemoryUsageJournal {
                     // the record they were asked to look at. A journal whose whole
                     // backlog is poison therefore refuses — the honest answer, since
                     // the only room left to make is somebody else's evidence.
-                    let Some(oldest) = pending
+                    let Some(oldest) = storage
+                        .entries
                         .iter()
-                        .copied()
+                        .map(|entry| entry.position)
                         .find(|position| !storage.is_quarantined(*position))
                     else {
                         return Err(JournalError::AtCapacity {
-                            pending: pending.len() as u64,
+                            pending: retained,
                             capacity: self.capacity,
                         });
                     };
-                    let dropped = storage
-                        .entries
-                        .iter()
-                        .position(|entry| entry.position == oldest)
-                        .map(|index| storage.entries.remove(index))
-                        .expect("pending position is stored");
-                    storage.positions.remove(dropped.event.idempotency_key());
-                    for state in storage.consumers.values_mut() {
-                        state.leases.remove(&oldest);
-                        state.attempts.remove(&oldest);
-                    }
+                    storage.forget(oldest);
                     storage.dropped += 1;
                 }
             }

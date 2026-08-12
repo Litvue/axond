@@ -464,22 +464,21 @@ impl CapacityPolicy {
 /// can see the limit next to the depth it is being compared against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capacity {
-    /// Events the journal will hold *undelivered* before its
-    /// [`policy`](Self::policy) applies.
+    /// Events the journal will hold before its [`policy`](Self::policy) applies —
+    /// **everything** it is storing, not one class of event inside it.
     ///
-    /// It counts an event no consumer has finished with **and** a quarantined one
-    /// waiting for an operator — the latter because nothing but an operator will
-    /// ever reclaim its space, so a systematic poison condition (a destination that
-    /// rejects every event) fills the journal and is reported instead of growing
-    /// the store forever.
+    /// So an event no consumer has finished with counts, a quarantined one waiting
+    /// for an operator counts, and one every consumer acknowledged but that is still
+    /// inside its [`retain_acknowledged`](Self::retain_acknowledged) window counts
+    /// too. That is the only reading under which the number bounds the journal's
+    /// footprint, which is what an operator sizing storage is asking about.
     ///
-    /// It does *not* count an event every consumer acknowledged: that one is on its
-    /// way out under [`retain_acknowledged`](Self::retain_acknowledged), which is
-    /// the bound on the delivered tail. The two limits are deliberately separate —
-    /// a journal that is keeping up must not refuse an append because of events it
-    /// has already delivered — so peak storage is `max_events` plus whatever a
-    /// retention window's worth of delivered events amounts to, and an implementation
-    /// sizing its disk has to budget for both.
+    /// A full journal reclaims in order of what the space is still worth. Delivered
+    /// events inside their retention window go first, ahead of their window: the
+    /// window is a courtesy to a consumer that may re-acknowledge after a restart,
+    /// and giving it up costs a redundant re-acknowledgement, whereas refusing the
+    /// append costs an event nobody has delivered. Only when there is no such event
+    /// does [`policy`](Self::policy) decide.
     pub max_events: u64,
     /// Attempts one event gets before it is quarantined as poison.
     pub max_delivery_attempts: u32,
@@ -490,11 +489,15 @@ pub struct Capacity {
     ///
     /// A window rather than an immediate delete, because a consumer that
     /// re-acknowledges after a restart must find the event it is talking about
-    /// instead of an absence it has to interpret. Two consequences worth stating,
+    /// instead of an absence it has to interpret. Three consequences worth stating,
     /// since they are the ones an implementation gets wrong:
     ///
     /// - Only an event *every* registered consumer has finished with is prunable.
     ///   Adding a consumer therefore extends what the journal holds.
+    /// - The window is a maximum, not a guarantee: a journal at
+    ///   [`max_events`](Self::max_events) forgets delivered events early rather than
+    ///   refuse an undelivered one, so a consumer must treat a missing event as
+    ///   "already acknowledged" rather than as an anomaly.
     /// - Pruning forgets the [`IdempotencyKey`], so an append of the same event
     ///   after its window is a *new* event rather than [`Appended::AlreadyPresent`].
     ///   The window must exceed the longest retry horizon a caller can have.
@@ -555,13 +558,13 @@ pub enum JournalError {
     /// and therefore not a drop candidate. The caller has *not* journaled the
     /// event.
     #[error(
-        "usage journal is at capacity ({pending} undelivered events, limit {}); the event was not journaled",
+        "usage journal is at capacity ({pending} events retained, limit {}); the event was not journaled",
         capacity.max_events
     )]
     AtCapacity {
-        /// Events the journal is holding undelivered: unfinished deliveries plus
-        /// quarantined events. Acknowledged events awaiting pruning are not
-        /// counted — see [`Capacity::max_events`].
+        /// Events the journal is retaining, all of which are undelivered by the
+        /// time this error is returned: anything already delivered was given up to
+        /// make room first — see [`Capacity::max_events`].
         pending: u64,
         capacity: Capacity,
     },

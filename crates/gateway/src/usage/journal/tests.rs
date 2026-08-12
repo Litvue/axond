@@ -627,15 +627,16 @@ async fn a_full_journal_refuses_the_append_and_says_what_it_is_bounded_by() {
     assert!(stats.oldest_pending_age.is_some());
 }
 
-/// The two limits are separate, and stored rows can exceed `max_events` by a
-/// retention window's worth of delivered events: capacity bounds the *undelivered*
-/// backlog, retention bounds the delivered tail. A journal that is keeping up must
-/// not refuse an append because of events it has already delivered.
+/// Capacity bounds the footprint, so a delivered event inside its retention window
+/// occupies it like any other — otherwise the limit an operator sizes storage
+/// against would be false by a whole window's worth of rows. The room is taken from
+/// the delivered tail rather than by refusing, because a redundant
+/// re-acknowledgement is cheaper than an event nobody has delivered.
 #[tokio::test]
-async fn capacity_bounds_the_backlog_while_retention_bounds_the_delivered_tail() {
+async fn a_delivered_event_still_in_its_window_occupies_capacity_and_yields_it_first() {
     let journal = InMemoryUsageJournal::with_capacity(Capacity {
-        max_events: 1,
-        // Long enough that nothing is pruned during the test.
+        max_events: 2,
+        // Long enough that nothing is pruned by the window during the test.
         retain_acknowledged: Duration::from_secs(60 * 60),
         ..Capacity::BILLING_GRADE
     });
@@ -645,19 +646,64 @@ async fn capacity_bounds_the_backlog_while_retention_bounds_the_delivered_tail()
         journal
             .append(&event)
             .await
-            .expect("a delivered event does not occupy the backlog");
+            .expect("the delivered tail makes room instead of refusing");
         let claimed = journal.claim(&billing, claim(1)).await.expect("claim");
         journal.ack(&claimed[0].id).await.expect("ack");
+        assert!(
+            journal.stored_events() <= 2,
+            "capacity is the bound on everything stored, delivered events included"
+        );
     }
 
-    assert_eq!(
-        journal.stored_events(),
-        3,
-        "the delivered tail is retention's to bound, not capacity's"
-    );
     let stats = journal.stats(&billing).await.expect("stats");
     assert!(stats.is_drained(), "{stats:?}");
-    assert_eq!(stats.dropped, 0);
+    assert_eq!(
+        stats.dropped, 0,
+        "giving up a retention courtesy is not losing an event"
+    );
+}
+
+/// An undelivered backlog is never sacrificed to keep a delivered event's retention
+/// window: the courtesy is what yields, and once it is gone the policy decides.
+#[tokio::test]
+async fn a_full_journal_refuses_rather_than_drop_what_it_has_not_delivered() {
+    let journal = InMemoryUsageJournal::with_capacity(Capacity {
+        max_events: 2,
+        retain_acknowledged: Duration::from_secs(60 * 60),
+        ..Capacity::BILLING_GRADE
+    });
+    let billing = consumer("billing");
+    let delivered = event_for("acme-one");
+    journal.append(&delivered).await.expect("append");
+    let claimed = journal.claim(&billing, claim(1)).await.expect("claim");
+    journal.ack(&claimed[0].id).await.expect("ack");
+    journal
+        .append(&event_for("acme-two"))
+        .await
+        .expect("append");
+
+    journal
+        .append(&event_for("acme-three"))
+        .await
+        .expect("the acknowledged event yields its window");
+    assert_eq!(journal.stored_events(), 2);
+
+    let error = journal
+        .append(&event_for("acme-four"))
+        .await
+        .expect_err("nothing delivered is left to give up");
+    assert!(
+        matches!(&error, JournalError::AtCapacity { pending, .. } if *pending == 2),
+        "{error:?}"
+    );
+
+    // Its idempotency key went with it, which is the guarantee retention does not
+    // make: re-appending it is a new event competing for room, not `AlreadyPresent`.
+    let error = journal.append(&delivered).await.expect_err("a new event");
+    assert!(
+        matches!(&error, JournalError::AtCapacity { .. }),
+        "{error:?}"
+    );
 }
 
 /// A verdict from a consumer that never read the journal must not register it.
