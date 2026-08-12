@@ -10,11 +10,13 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use futures::StreamExt;
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 
 use super::manifest::{Profile, RESULT_SCHEMA_VERSION, Tier, Workload};
 use super::probe::Sampler;
@@ -196,10 +198,33 @@ struct Attempt {
     stream_lifetime_ms: Option<f64>,
 }
 
+/// Whether the driver hangs up on the request at `index`, given a cadence. Every
+/// index divisible by the cadence over `0..requests`, which is
+/// [`expected_cancellations`] of them — one more than integer division when the
+/// count is not a multiple of the cadence.
+pub fn cancels(index: usize, every: usize) -> bool {
+    index.is_multiple_of(every)
+}
+
+/// How many of `offered` requests [`cancels`] selects at cadence `every`.
+pub fn expected_cancellations(offered: u64, every: usize) -> u64 {
+    offered.div_ceil(every as u64)
+}
+
+/// Only one profile offers load at a time, whatever the harness runs it from:
+/// two tiers driving two gateways on one machine measure each other's
+/// contention, and the artifact would still read as an envelope. The libtest
+/// `--test-threads=1` in the `capacity` workflow says the same thing; this makes
+/// it true rather than configured.
+fn load_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(Mutex::default)
+}
+
 /// Driver-side gauges. `awaiting_first_byte` is the closest a client can get to
 /// the replica's queue occupancy without trusting the replica's own telemetry.
 #[derive(Default)]
-struct Gauges {
+pub struct Gauges {
     in_flight: AtomicU64,
     in_flight_peak: AtomicU64,
     awaiting: AtomicU64,
@@ -207,24 +232,43 @@ struct Gauges {
 }
 
 impl Gauges {
-    fn enter(&self) {
+    pub fn enter(&self) {
         let now = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         self.in_flight_peak.fetch_max(now, Ordering::Relaxed);
         let waiting = self.awaiting.fetch_add(1, Ordering::Relaxed) + 1;
         self.awaiting_peak.fetch_max(waiting, Ordering::Relaxed);
     }
 
-    fn first_byte(&self) {
-        self.awaiting.fetch_sub(1, Ordering::Relaxed);
+    /// Called when the first byte of the *answer* arrives: response headers for a
+    /// buffered request, the first relayed chunk for a stream. A stream's headers
+    /// can precede its first token by hundreds of milliseconds, and the request is
+    /// still waiting during that gap.
+    pub fn first_byte(&self, waiting: &mut bool) {
+        if *waiting {
+            *waiting = false;
+            self.awaiting.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
-    fn leave(&self) {
+    pub fn leave(&self, waiting: &mut bool) {
+        self.first_byte(waiting);
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// The most requests that waited for a first byte at once.
+    pub fn awaiting_peak(&self) -> u64 {
+        self.awaiting_peak.load(Ordering::Relaxed)
+    }
+
+    /// How many are waiting for a first byte right now.
+    pub fn awaiting(&self) -> u64 {
+        self.awaiting.load(Ordering::Relaxed)
     }
 }
 
 /// Run `profile` at `tier` and return its result artifact.
 pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> CapacityResult {
+    let _offering = load_lock().lock().await;
     let scale = *profile.scale(tier);
     let tuning = match profile.workload {
         Workload::Mixed => format!("{TUNING}{}", credential_pool()),
@@ -263,7 +307,7 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Capacity
                     return attempts;
                 }
                 let shape = shape_for(workload, index);
-                let cancel = cancel_every.is_some_and(|every| index % every == 0);
+                let cancel = cancel_every.is_some_and(|every| cancels(index, every));
                 attempts.push(
                     attempt(
                         &client,
@@ -412,6 +456,9 @@ async fn attempt(
 ) -> Attempt {
     let started = Instant::now();
     gauges.enter();
+    // Cleared by the answer's first byte, and unconditionally when the attempt
+    // ends, so an attempt that never gets one cannot pin the gauge.
+    let waiting = &mut true;
     let sent = client
         .post(format!("{base_url}{}", shape.route))
         .bearer_auth(GATEWAY_KEY)
@@ -421,8 +468,7 @@ async fn attempt(
     let response = match sent {
         Ok(response) => response,
         Err(_) => {
-            gauges.first_byte();
-            gauges.leave();
+            gauges.leave(waiting);
             return Attempt {
                 outcome: Outcome::TransportFailure,
                 status: None,
@@ -433,13 +479,12 @@ async fn attempt(
             };
         }
     };
-    gauges.first_byte();
     let status = response.status();
     let headers_at = started.elapsed();
 
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        gauges.leave();
+        gauges.leave(waiting);
         let error_type = serde_json::from_str::<Value>(&body)
             .ok()
             .and_then(|value| value.get("error")?.get("type")?.as_str().map(str::to_owned));
@@ -458,8 +503,11 @@ async fn attempt(
     }
 
     if !shape.stream {
+        // A buffered answer's headers *are* its first bytes: the gateway has the
+        // whole body before it answers at all.
+        gauges.first_byte(waiting);
         let read = response.bytes().await;
-        gauges.leave();
+        gauges.leave(waiting);
         return Attempt {
             outcome: if read.is_ok() {
                 Outcome::Accepted
@@ -487,6 +535,7 @@ async fn attempt(
             break;
         };
         first_byte.get_or_insert_with(|| started.elapsed());
+        gauges.first_byte(waiting);
         // Relayed model output, rather than a transport chunk: the two do not
         // map one-to-one, and only output makes a cancellation charge real.
         let text = String::from_utf8_lossy(&chunk);
@@ -501,7 +550,7 @@ async fn attempt(
     // Dropping the body without draining it is what a closed browser tab looks
     // like, and it is the case that leaks an upstream when it is mishandled.
     drop(stream);
-    gauges.leave();
+    gauges.leave(waiting);
     let total = started.elapsed();
     Attempt {
         outcome: match (cancelled, torn) {

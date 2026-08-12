@@ -14,13 +14,15 @@
 //!
 //! The reduced tier runs under `cargo test`. The heavy tier is the same code and
 //! the same assertions at a scale that needs its own runner, behind
-//! `AXOND_CAPACITY=1` and the `capacity` workflow.
+//! `AXOND_CAPACITY=1` and the `capacity` workflow — which runs this binary with
+//! `--test-threads=1`, so the two tiers never offer load at the same time and
+//! the heavy numbers are not measured against the reduced tier's contention.
 //!
 //! Nothing here qualifies stateful serving: the profiles run a Tier 0 process.
 
 mod support;
 
-use support::capacity::{self, CapacityResult, Tier, Workload};
+use support::capacity::{self, CapacityResult, Gauges, Tier, Workload};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_reduced_capacity_profiles_qualify_and_publish_their_evidence() {
@@ -123,6 +125,78 @@ async fn qualify(tier: Tier) {
     );
 }
 
+/// The expected hang-up count must agree with the driver's own selection for
+/// *any* request count, not only the multiples of the cadence the manifest
+/// happens to hold today. Rounding it down turns an odd request count into a red
+/// build with a misleading message.
+#[test]
+fn the_expected_cancellation_count_matches_the_driver_selection() {
+    for every in 1..8usize {
+        for requests in 0..64usize {
+            let selected = (0..requests)
+                .filter(|&i| capacity::cancels(i, every))
+                .count() as u64;
+            assert_eq!(
+                capacity::expected_cancellations(requests as u64, every),
+                selected,
+                "cadence {every} over {requests} requests"
+            );
+        }
+    }
+    assert_eq!(capacity::expected_cancellations(49, 2), 25);
+}
+
+/// A stream is waiting for its answer until the first *relayed* byte, not until
+/// its response headers: the gateway answers a stream's headers as soon as the
+/// upstream does, and the first token can be far behind them. Releasing at
+/// headers would report an occupancy the replica never had.
+#[test]
+fn a_stream_waits_in_the_first_byte_gauge_until_its_first_relayed_chunk() {
+    let gauges = Gauges::default();
+    let (headers, chunk) = (&mut true, &mut true);
+    gauges.enter();
+    gauges.enter();
+    assert_eq!(gauges.awaiting(), 2, "both requests are waiting");
+
+    // One gets a first byte; the other only ever got headers.
+    gauges.first_byte(chunk);
+    assert_eq!(gauges.awaiting(), 1);
+    assert_eq!(gauges.awaiting_peak(), 2);
+
+    // An attempt that never sees a first byte still releases when it ends, so a
+    // torn stream cannot pin the gauge for the rest of the run.
+    gauges.leave(headers);
+    gauges.leave(chunk);
+    assert_eq!(gauges.awaiting(), 0);
+}
+
+/// Both tiers live in one test binary, so the harness that runs the heavy tier
+/// must run it alone: two tiers offering load at once measure each other's
+/// contention, and the artifact still reads as an envelope. The driver holds a
+/// lock as well, and this keeps the invocations honest about why.
+#[test]
+fn every_heavy_invocation_runs_one_test_at_a_time() {
+    for (path, contents) in [
+        (
+            ".github/workflows/capacity.yml",
+            include_str!("../../../.github/workflows/capacity.yml"),
+        ),
+        ("justfile", include_str!("../../../justfile")),
+    ] {
+        let lines: Vec<&str> = contents.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.contains("--test capacity"))
+            .unwrap_or_else(|| panic!("{path}: no capacity invocation"));
+        // The invocation may be wrapped across a line continuation.
+        let invocation = lines[at..(at + 2).min(lines.len())].join(" ");
+        assert!(
+            invocation.contains("--test-threads=1"),
+            "{path}: the capacity binary must run one tier at a time:{invocation}"
+        );
+    }
+}
+
 /// The workload-specific shape of a run, beyond the numeric thresholds: a
 /// cancellation profile that recorded no cancelled stream measured something
 /// else, and a streaming profile with no TTFT never opened a stream.
@@ -131,8 +205,10 @@ fn assert_expected_outcomes(profile: &capacity::Profile, result: &CapacityResult
     match profile.workload {
         Workload::Cancellation => {
             let cancelled = result.outcomes.client_cancelled;
-            let expected = result.throughput.offered
-                / profile.cancel_every.expect("a cancellation cadence") as u64;
+            let expected = capacity::expected_cancellations(
+                result.throughput.offered,
+                profile.cancel_every.expect("a cancellation cadence"),
+            );
             assert_eq!(
                 cancelled, expected,
                 "{}: the cancellation cadence did not hold: {result:#?}",

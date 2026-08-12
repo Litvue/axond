@@ -34,8 +34,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+      # `--test-threads=1`: the reduced tier lives in the same binary, and two
+      # tiers offering load at once would measure each other's contention rather
+      # than the replica.
       - name: Run the committed capacity profiles
-        run: cargo test --locked --all-features --test capacity -- --nocapture
+        run: |
+          cargo test --locked --all-features --test capacity -- \
+            --nocapture --test-threads=1
         env:
           AXOND_CAPACITY: '1'
       - name: Publish the result artifacts

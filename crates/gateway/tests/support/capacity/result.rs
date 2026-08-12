@@ -393,9 +393,11 @@ pub struct Occupancy {
     pub offered_concurrency: usize,
     /// The most requests the driver had in flight at once.
     pub in_flight_peak: u64,
-    /// The most requests waiting for their first byte at once — the driver-side
-    /// view of the queue the replica is holding, which is what an operator sees
-    /// as `axond.admission.in_flight{resource="queue"}` from the inside.
+    /// The most requests waiting for the first byte of their *answer* at once —
+    /// response headers for a buffered request, the first relayed chunk for a
+    /// stream. The driver-side view of the queue the replica is holding, which is
+    /// what an operator sees as `axond.admission.in_flight{resource="queue"}`
+    /// from the inside.
     pub awaiting_first_byte_peak: u64,
     /// The admission queue the process was configured with, for context.
     pub admission_queue_capacity: u64,

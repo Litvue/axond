@@ -80,6 +80,12 @@ heavy tier is the identical driver, manifest, and assertions at a scale that
 wants a runner to itself: `AXOND_CAPACITY=1`, run by the `Capacity` workflow on
 dispatch and weekly. There is no second implementation to drift.
 
+**One profile offers load at a time.** Both tiers live in one test binary, and
+two of them driving two gateways on one host would measure each other's
+contention while still producing an artifact that reads as an envelope. The
+driver holds a process-wide lock across a run, and the heavy invocations pass
+`--test-threads=1`, so the subject under measurement is one replica.
+
 ### State tier
 
 Tier 0. The harness boots a config-only process — no Redis, no Postgres, no

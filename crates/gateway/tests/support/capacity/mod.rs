@@ -12,4 +12,4 @@ pub mod run;
 
 pub use manifest::{Manifest, Profile, Tier, Workload};
 pub use result::CapacityResult;
-pub use run::run;
+pub use run::{Gauges, cancels, expected_cancellations, run};

@@ -38,7 +38,9 @@ whose provenance differs are not comparable.**
 cargo test --locked --all-features --test capacity -- --nocapture
 
 # The heavy tier. Same driver, same manifest, same assertions, larger scale.
-AXOND_CAPACITY=1 cargo test --locked --all-features --test capacity -- --nocapture
+# `--test-threads=1` keeps the two tiers from offering load at the same time.
+AXOND_CAPACITY=1 cargo test --locked --all-features --test capacity -- \
+  --nocapture --test-threads=1
 ```
 
 The `Capacity` workflow runs the heavy tier on dispatch and weekly and uploads
@@ -56,11 +58,16 @@ Platinum 8175M @ 2.50 GHz, 31 GiB RAM, Linux 5.15, rustc 1.97.1, no queueing
 
 | Profile | Concurrency | Requests | Accepted req/s | p50 | p95 | p99 | TTFT p95 | Peak RSS | Peak sockets | CPU cores used |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `buffered` | 128 | 40 000 | 4 628 | 26.5 ms | 41.6 ms | 50.6 ms | — | 44 MiB | 356 | 4.2 |
-| `streaming` | 300 | 8 000 | 677 | 427 ms | 515 ms | 826 ms | 133 ms | 51 MiB | 750 | 4.4 |
-| `mixed` | 128 | 12 000 | 1 172 | 9.1 ms | 319 ms | 331 ms | 61 ms | 38 MiB | 281 | 3.4 |
-| `response-size` | 64 | 6 000 | 491 | 121 ms | 212 ms | 246 ms | — | 67 MiB | 149 | 3.8 |
-| `cancellation` | 300 | 8 000 | 952 | 357 ms | 580 ms | 692 ms | 153 ms | 58 MiB | 733 | 3.3 |
+| `buffered` | 128 | 40 000 | 3 726 | 33.1 ms | 51.2 ms | 62.8 ms | — | 44 MiB | 342 | 4.2 |
+| `streaming` | 300 | 8 000 | 522 | 562 ms | 681 ms | 1 054 ms | 165 ms | 52 MiB | 743 | 4.2 |
+| `mixed` | 128 | 12 000 | 1 001 | 15.5 ms | 371 ms | 389 ms | 71 ms | 39 MiB | 294 | 3.7 |
+| `response-size` | 64 | 6 000 | 362 | 165 ms | 294 ms | 352 ms | — | 68 MiB | 154 | 3.5 |
+| `cancellation` | 300 | 8 000 | 705 | 422 ms | 839 ms | 1 002 ms | 211 ms | 58 MiB | 728 | 3.8 |
+
+Throughput and latency move 10–25% between runs on a shared host, while the
+socket and memory columns barely move: read the first two as an order of
+magnitude and the last two as the shape of a replica's resource use. Compare two
+artifacts only when their `environment` blocks match.
 
 Streamed latency is dominated by the fake upstream's pacing (a fixed ~40-chunk
 answer), not by the gateway: read the stream rows as *concurrency the replica
@@ -140,7 +147,10 @@ Fields worth knowing:
   time, not an input.
 - `occupancy.awaiting_first_byte_peak` is the driver's view of the queue the
   replica is holding — the client-side counterpart to
-  `axond.admission.in_flight` (see [observability](../observability.md)).
+  `axond.admission.in_flight` (see [observability](../observability.md)). It
+  counts a request until the first byte of its *answer* arrives: response headers
+  for a buffered request, the first relayed chunk for a stream, whose headers can
+  precede its first token by a long way.
 - `resources.*.settled` is sampled when the last client byte arrives, before the
   usage-record settle wait, so idle-time cleanup is not reflected in it. Upstream
   socket cleanup is asserted separately through `upstream.streams_open_at_end`.
