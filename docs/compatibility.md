@@ -167,6 +167,58 @@ interface — read it at your own risk.
   terminates at a bound, which is a behaviour change rather than a status
   change, since there was no earlier response to reclassify.
 
+### The published Rust API
+
+Three crates are published: `gateway-core` and `gateway-transport` are libraries
+with a public Rust API, and `axond` is the binary — its compatibility surface is
+the config, HTTP, and telemetry contracts above, not Rust items.
+
+The library API follows Cargo's `0.x` rules, and mechanically: a required CI lane
+runs [`cargo-semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks)
+against the versions already on crates.io, so removing or renaming a public item,
+changing a signature, or adding a variant to an exhaustive public enum fails the
+build rather than a downstream `cargo update`. Additive change — a new item, a new
+method, a new `#[non_exhaustive]` variant — is a patch.
+
+An intentional break is a minor bump plus a reviewed entry in
+[`ops/api-compat-overrides.toml`](../ops/api-compat-overrides.toml) naming the
+crate, the published baseline, and the review; the process is in the
+[release runbook](./maintainers/releasing.md#public-api-compatibility). There is
+no blanket allow list, and an override stops applying as soon as the next release
+moves the baseline.
+
+`gateway-core` and `gateway-transport` are published so the gateway can be
+assembled from its parts, but they are *the gateway's* internals: the promise
+above is about not breaking you silently, not a commitment to a stable embedding
+API before `1.0`.
+
+### The Rust version floor (MSRV)
+
+The minimum supported Rust version is **1.97**, declared once as
+`rust-version` in `[workspace.package]` and inherited by every published crate,
+so `cargo add gateway-core` on 1.97.0 resolves and builds.
+
+The floor and the toolchain this repository builds with are deliberately
+different things:
+
+| Declaration | Value | Why |
+| --- | --- | --- |
+| `rust-version` (`Cargo.toml`) | `1.97` | the floor consumers may rely on; enforced by Cargo for them |
+| `rust-toolchain.toml` | `1.97.1` | one pinned patch for reproducible `rustfmt`/`clippy` results |
+| `FROM rust:` (`Dockerfile`) | `1.97` | the release image builds on the floor's minor |
+| CI lanes | `1.97.1`, plus one `1.97.0` MSRV lane | the stable lane keeps its pin; the floor is proved separately |
+
+`ops/msrv-gate.sh` is the enforcement: it reads the floor from `Cargo.toml`,
+refuses a pinned toolchain older than it, refuses a `Dockerfile` or a crate
+manifest that drifts from it, and then builds the workspace — `--locked`, all
+features, all targets — on the first patch of that minor. A dependency bump that
+quietly raises its own MSRV therefore fails in CI rather than in a consumer's
+build.
+
+Raising the floor is a **minor** bump with a changelog entry, treated like any
+other break in this document, and is done for a reason that is written down —
+not merely because a newer compiler exists.
+
 ### Telemetry
 
 Metric and span names, and the `axond.*` attribute keys, are stable within `0.x`
@@ -194,3 +246,22 @@ version 2 transition.
   start: no `/admin/v1` route, durable schema, or snapshot compiler ships yet.
   Nothing about that surface is under the `0.x` config or HTTP promise until it
   exists.
+
+## Supported releases and who owns each matrix
+
+Four matrices decide what "supported" means, and each has one owner file so a
+claim here cannot drift from what CI and the release actually do:
+
+| Matrix | Owner (source of truth) | Exercised by |
+| --- | --- | --- |
+| Supported versions for fixes | [`SECURITY.md`](../SECURITY.md) — latest `0.x` release plus the immediately previous minor, security fixes only | the release/backport process |
+| Release targets | the `binaries` matrix in [`release-please.yml`](../.github/workflows/release-please.yml): `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`, plus the `linux/amd64` image | the release workflow, and the musl static-binary and Docker smoke lanes on every change |
+| Provider-SDK compatibility | [`tests/compat/requirements.in`](../tests/compat/requirements.in) (exact pins, hash-locked in `requirements.txt`) | the required `sdk-compat` lane against committed fixtures ([ADR 0014](./adr/0014-compatibility-and-soak-harness.md)) |
+| Rust floor and published API | `rust-version` in [`Cargo.toml`](../Cargo.toml); [`ops/api-compat-overrides.toml`](../ops/api-compat-overrides.toml) for accepted breaks | the required `msrv` and `api-compat` lanes |
+
+Adding a target, an SDK, or a supported version means editing the owner file
+above; this document describes the policy and does not restate the values it
+cannot enforce. What is *not* covered: only `x86_64-unknown-linux-musl` boots
+hermetically in CI on every change (the Tier 0 gate), the other three targets are
+built and attested but not smoke-booted, and only the Python SDKs are exercised
+end to end.

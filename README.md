@@ -194,6 +194,9 @@ Read the [deployment security model](./docs/security/deployment-model.md),
 [minted-token guide](./docs/minted-token-guide.md), and latest
 [security review](./docs/security-review-2026-08-05.md).
 
+To report a vulnerability, follow [`SECURITY.md`](./SECURITY.md) — privately,
+not in an issue. It also states which releases receive fixes.
+
 ## Documentation
 
 The [documentation index](./docs/index.md) is organized by task:
