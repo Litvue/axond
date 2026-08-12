@@ -9,9 +9,10 @@ Stateful mode is still being assembled: this is the convergence layer
 ([#142](https://github.com/Litvue/axond/issues/142)), built on the revision
 journal ([#165](https://github.com/Litvue/axond/issues/165)). The loop, its
 telemetry, and the signed cache are complete and tested, but `serve` does not yet
-construct them — projecting resource *bodies* (tenants, providers, aliases,
-prices, policies) onto a runtime configuration belongs to the slices that own
-those schemas. Read
+construct them. Tenants and projects have durable schemas and a projection
+([#191](https://github.com/Litvue/axond/issues/191)); the remaining resource
+*bodies* (providers, credentials, catalogue models, prices, policies) belong to
+the slices that own those schemas. Read
 [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md) for the mode as
 a whole.
 
@@ -106,6 +107,64 @@ Alongside them:
 Alert on **lag above the convergence target**, and on
 `axond.revision.last_known_good{outcome="restored"}`, which means a replica
 started without reaching the control plane.
+
+## Resource body schemas
+
+A published resource carries a **body**: a record whose meaning is fixed by an
+explicit schema identifier stored inside it, alongside the resource's identity,
+scope, and slug. Two schemas exist today:
+
+| Schema | Resource | Fields |
+| --- | --- | --- |
+| `axond.tenant.v1` | a deployment tenant | `schema`, `tenant_id`, `display_name` |
+| `axond.project.v1` | a tenant-owned project | `schema`, `project_id`, `tenant_id`, `display_name` |
+
+Three rules hold for every body schema, present and future:
+
+- **The identifier is inside the checksummed body.** A replica reads the schema
+  before it reads anything else, so a revision cannot be interpreted under a
+  schema it did not declare.
+- **An unknown schema, or an unknown field, is a refusal.** A body declaring
+  `axond.tenant.v2`, or an extra field a newer release added, is rejected with
+  reason `projection` rather than being read partially. An older replica keeps
+  serving the revision it already had instead of serving a half-understood newer
+  one. Roll the replica forward, or publish a revision the deployed version
+  understands.
+- **A change to a field's presence or meaning is a new identifier.** `v1` bodies
+  never change shape, so a checksum computed by one release is computed the same
+  way by every release that accepts it. Adding a field, renaming one, or changing
+  what one means all produce `axond.<kind>.v2`.
+
+Identity in a body is bound to its envelope rather than merely carried by it: a
+tenant body's `tenant_id` *is* its resource identity, a project's `tenant_id` *is*
+the tenant it is scoped to, and a mismatch is refused at publication and again at
+hydration. Human-readable slugs live on the envelope, so renaming a tenant leaves
+every body and every reference untouched.
+
+### How a project becomes a namespace
+
+The runtime's tenancy boundary is the namespace: keys bind to one, credential
+pools are per `(namespace, provider)`, and usage is accounted against it. A
+project *is* that boundary made durable, so each published project projects to
+exactly one namespace.
+
+Its projected id is **tenant-qualified**: `acme/core`, not `core`. A project slug
+is unique within its tenant and only within it — two tenants may each have a
+`core` — while a namespace id is deployment-wide. Qualifying is what keeps two
+tenants' projects out of one budget, one credential pool, and one key binding, and
+`/` is not a legal slug character, so the qualified form decomposes exactly one
+way. A projected namespace whose id a bootstrap namespace already claims is
+refused rather than merged.
+
+What projection does *not* touch is everything the local file owns: listener,
+transport bounds, admission, telemetry, datastore connectivity, and — until their
+own slices land — providers, credentials, models, and prices. The bootstrap's
+default namespace stays the default, and a projected project starts with no
+platform fallback: it borrows no other namespace's credentials.
+
+A stateless deployment is unaffected by all of this. Tenants and projects are
+published, never declared in `axond.toml`, and a stateless config's namespace ids
+are exactly the ids the file wrote.
 
 ## When a replica will not converge
 

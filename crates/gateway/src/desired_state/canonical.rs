@@ -293,15 +293,24 @@ pub enum CanonicalError {
 }
 
 impl CanonicalValue {
-    /// A record built from unsorted pairs. Sorting happens at encode time, so
-    /// callers never have to.
+    /// A record built from unsorted pairs, sorted into the order it encodes in.
+    ///
+    /// Sorted here as well as at encode time (in the same order), so a record a caller builds is
+    /// *equal* to the same record read back out of storage rather than merely
+    /// hashing the same. Without that, a multi-field body would compare unequal
+    /// to its own round trip on field order alone, and every consumer would have
+    /// to compare checksums instead of values.
     pub fn map<K: Into<String>>(fields: impl IntoIterator<Item = (K, CanonicalValue)>) -> Self {
-        Self::Map(
-            fields
-                .into_iter()
-                .map(|(key, value)| (key.into(), value))
-                .collect(),
-        )
+        let mut fields: Vec<(String, CanonicalValue)> = fields
+            .into_iter()
+            .map(|(key, value)| (key.into(), value))
+            .collect();
+        // The encoder's order — length first, then content — so this is the same
+        // record a decoder returns and not merely one that hashes the same.
+        fields.sort_by(|(left, _), (right, _)| {
+            (left.len(), left.as_bytes()).cmp(&(right.len(), right.as_bytes()))
+        });
+        Self::Map(fields)
     }
 
     /// A set-like collection built from members in any order.

@@ -253,7 +253,10 @@ outcomes need different responses:
   a missing resource version, a declared blob whose record is gone, a dependency
   that leaves the revision or closes a cycle, a body this build cannot decode, a
   checksum that no longer matches, or a reference that crosses a tenant boundary.
-  The message names the resource or edge. This is corruption,
+  Tenancy ownership is re-read here too, so a project row edited to claim a tenant
+  that does not own it does not hydrate — see
+  [resource body schemas](./revision-convergence.md#resource-body-schemas). The
+  message names the resource or edge. This is corruption,
   not an outage — retrying will not clear it — and it means something wrote to the
   journal outside the gateway, or a restore was partial. Compare against a backup;
   a healthy older revision still loads, so serving can continue from one while the

@@ -29,6 +29,7 @@ use super::canonical::{Canonical, CanonicalError, CanonicalValue, Checksum, Seri
 use super::ids::{AuditEventId, MutationId, RevisionId, Slug};
 use super::mutation::{AuditEvent, ExpectedRevision, Mutation};
 use super::resource::{BlobRef, ResourceRef, ResourceScope, ResourceVersion};
+use super::tenancy::{Tenancy, TenancyError};
 
 /// Why a desired state is not a valid revision.
 ///
@@ -68,6 +69,8 @@ pub enum ValidationError {
     CrossTenantReference { from: ResourceRef, to: ResourceRef },
     #[error("deployment-scoped {from} depends on tenant-scoped {to}")]
     TenantScopedDependency { from: ResourceRef, to: ResourceRef },
+    #[error("this revision's tenancy is not valid: {0}")]
+    Tenancy(#[from] TenancyError),
     #[error("audit event {audit} records mutation {recorded}, not this candidate's {mutation}")]
     AuditMutationMismatch {
         audit: AuditEventId,
@@ -236,6 +239,13 @@ impl DesiredState {
             // never be reclaimed, and both are worth refusing while it is cheap.
             return Err(ValidationError::UnreferencedBlob { digest: *digest });
         }
+
+        // Last, because it is the only step that reads a *body*: everything above
+        // holds for every resource kind, including the ones whose schemas later
+        // slices own. Tenancy is the one schema the domain knows (#191), and it is
+        // what makes ownership — a project's tenant, and the tenant of anything
+        // scoped to one — a domain invariant rather than a projection's problem.
+        Tenancy::of(self)?;
 
         Ok(())
     }
@@ -1209,14 +1219,17 @@ mod tests {
     #[test]
     fn unrepresentable_state_is_a_validation_error_not_a_panic() {
         let mut state = DesiredState::new();
+        state.insert(tenant(1, "acme")).unwrap();
         state
             .insert(ResourceVersion::new(
-                reference(ResourceKind::Tenant, 1),
-                ResourceScope::Deployment,
-                Slug::parse("acme").unwrap(),
+                reference(ResourceKind::Alias, 2),
+                ResourceScope::Tenant(tenant_id(1)),
+                Slug::parse("fast").unwrap(),
                 // A control character has no canonical form, so the state has no
-                // checksum — and therefore cannot be published.
-                ResourceBody::Inline(CanonicalValue::string("display\tname")),
+                // checksum — and therefore cannot be published. The body of a kind
+                // whose schema is not this slice's is opaque to validation, so the
+                // encoder is what refuses it.
+                ResourceBody::Inline(CanonicalValue::string("wire\tfamily")),
             ))
             .unwrap();
         assert!(matches!(

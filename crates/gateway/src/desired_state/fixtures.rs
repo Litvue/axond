@@ -18,6 +18,7 @@ use super::resource::{
     ResourceVersionNumber,
 };
 use super::revision::{DesiredState, RevisionCandidate};
+use super::tenancy::{DisplayName, ProjectBody, TenantBody};
 
 /// How many resource versions [`state`] contains.
 pub(crate) const DESIRED_STATE_RESOURCES: usize = 5;
@@ -53,22 +54,41 @@ fn inline(field: &str, value: &str) -> ResourceBody {
     )]))
 }
 
+pub(crate) fn display_name(name: &str) -> DisplayName {
+    DisplayName::parse(name).expect("fixture display name")
+}
+
+/// The typed body of the tenant `tenant` builds, so a test can assert on the
+/// body a resource carries without rebuilding the record by hand.
+pub(crate) fn tenant_body(seed: u64, name: &str) -> TenantBody {
+    TenantBody::new(tenant_id(seed), display_name(name))
+}
+
+pub(crate) fn project_body(seed: u64, tenant: u64, name: &str) -> ProjectBody {
+    ProjectBody::new(project_id(seed), tenant_id(tenant), display_name(name))
+}
+
+/// A tenant whose id is its resource id, named `slug`, displayed capitalized.
+///
+/// The seed is the tenant's id *and* its resource id, which is the binding
+/// [`TenantBody::read`] enforces: one durable object, one identity.
 pub(crate) fn tenant(seed: u64, slug: &str) -> ResourceVersion {
-    ResourceVersion::new(
-        reference(ResourceKind::Tenant, seed),
-        ResourceScope::Deployment,
-        Slug::parse(slug).expect("fixture slug"),
-        inline("display_name", slug),
-    )
+    tenant_body(seed, &capitalize(slug)).version(Slug::parse(slug).expect("fixture slug"))
 }
 
 pub(crate) fn project(tenant: &TenantId, seed: u64, slug: &str) -> ResourceVersion {
-    ResourceVersion::new(
-        reference(ResourceKind::Project, seed),
-        ResourceScope::Tenant(*tenant),
-        Slug::parse(slug).expect("fixture slug"),
-        inline("display_name", slug),
-    )
+    ProjectBody::new(project_id(seed), *tenant, display_name(&capitalize(slug)))
+        .version(Slug::parse(slug).expect("fixture slug"))
+}
+
+/// `acme` displayed as `Acme`: a display name is prose, so a fixture's is not
+/// its slug.
+fn capitalize(slug: &str) -> String {
+    let mut characters = slug.chars();
+    match characters.next() {
+        None => String::new(),
+        Some(first) => first.to_ascii_uppercase().to_string() + characters.as_str(),
+    }
 }
 
 pub(crate) fn credential(tenant: &TenantId, seed: u64, slug: &str) -> ResourceVersion {

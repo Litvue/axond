@@ -59,6 +59,7 @@ pub mod lkg;
 pub mod reconciler;
 pub mod settings;
 pub mod status;
+pub mod tenancy;
 
 // The convergence facade. `allow(unused_imports)` for the same reason the
 // desired-state facade carries it: this is a binary crate, and a re-export that
@@ -78,6 +79,8 @@ pub use reconciler::{BootstrapError, ChangeSignal, Outcome, Reconciler, Snapshot
 pub use settings::{ConvergenceSettings, InvalidSettings};
 #[allow(unused_imports)]
 pub use status::{Clock, Rejection, RevisionReport, RevisionStatus, SnapshotSource, SystemClock};
+#[allow(unused_imports)]
+pub use tenancy::TenancyProjection;
 
 #[cfg(test)]
 mod tests;

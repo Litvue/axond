@@ -4537,4 +4537,37 @@ targets = [{ provider = "openai", model = "gpt-4o" }]
             Err(ConfigError::Load(_))
         ));
     }
+
+    /// Landing the durable tenancy schemas (#191) does not give a *file* tenants
+    /// or projects: a stateless deployment's namespaces are still exactly the ids
+    /// it wrote, and the body schemas are not a TOML surface.
+    #[test]
+    fn tenancy_schemas_do_not_change_what_a_file_can_declare() {
+        let config = Config::from_toml_str(VALID).expect("the stateless example still parses");
+        assert_eq!(config.mode, Mode::Stateless);
+        assert_eq!(
+            config
+                .namespace
+                .iter()
+                .map(|namespace| namespace.id.as_str())
+                .collect::<Vec<_>>(),
+            ["platform"],
+            "a namespace id is the id the file wrote, unqualified"
+        );
+
+        // Durable tenancy is published, never declared: a file naming a tenant
+        // configures nothing, and in particular does not become a namespace.
+        let with_tenant = format!("{VALID}\n[[tenant]]\nid = \"acme\"\ndisplay_name = \"Acme\"\n");
+        let parsed =
+            Config::from_toml_str(&with_tenant).expect("an unread section is not a boot failure");
+        assert_eq!(
+            parsed
+                .namespace
+                .iter()
+                .map(|namespace| (namespace.id.as_str(), namespace.default))
+                .collect::<Vec<_>>(),
+            [("platform", true)]
+        );
+        assert_eq!(parsed.mode, config.mode);
+    }
 }
