@@ -11,14 +11,24 @@ are the same signals as assets you can import, and every rule's `runbook_url`
 points at a section of this page.
 
 **What is live today.** Every metric named below is emitted, with one exception:
-no release yet runs a status refresher, so `axond_status_component_state`,
-`axond_status_observation_age`, and `axond_status_refreshes` are not produced and
-`GET /admin/v1/status` answers with every component `disabled`. The dependency
-and staleness panels stay empty and their alerts cannot fire until a deployment
-observes its dependencies — see
-[stateful backends](../deployment/stateful-backends.md).
-Import the assets now if you want them versioned with your deployment; do not
-read a flat dependency panel as a healthy dependency.
+no release yet constructs a status refresher, so `axond_status_component_state`,
+`axond_status_observation_age`, and `axond_status_refreshes` are not produced on
+any deployment — stateless or not — and `GET /admin/v1/status` answers with every
+component `disabled`. Three shipped rules are therefore inert until a future
+slice injects a refresher for the backend it owns: `AxondDependencyImpaired`,
+`AxondStatusObservationsStale`, and `AxondStatusRefreshesFailing`, together with
+the *Dependency state*, *Observation age*, and *Refresh outcomes* panels on the
+fleet dashboard. Everything else — served traffic, latency, convergence,
+providers, capacity, lifecycle — is live now.
+
+So do not read a flat dependency panel as a healthy dependency: until that
+wiring lands, use `axond_config_reloads`, `axond_revision_*`, and the fail-closed
+denial counters (`axond_rate_limit_unavailable_denials`,
+`axond_revocation_unavailable_denials`, `axond_budget_capacity_denials`) as the
+evidence that a dependency is impaired. Importing the assets now keeps them
+versioned with your deployment and makes the drift gate meaningful; see
+[stateful backends](../deployment/stateful-backends.md) for which components a
+deployment enables.
 
 Three things to hold onto before reading on:
 

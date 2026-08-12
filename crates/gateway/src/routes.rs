@@ -6685,6 +6685,46 @@ max_ttl = "15m"
         }
     }
 
+    /// What a released binary answers today. `main.rs` builds its state through
+    /// `new_with_rate_limiter`, which injects
+    /// [`ReplicaObservability::stateless`], so no component is observed and no
+    /// revision is tracked: every component is `disabled` with reason
+    /// `not_configured`. This is the boundary the shipped dependency panels and
+    /// their three alerts wait on, and it is documented as such in the
+    /// observability runbook — a slice that injects a refresher should turn this
+    /// test into its own opposite.
+    #[tokio::test]
+    async fn the_production_constructor_observes_nothing_yet() {
+        let config = Config::from_toml_str(STATUS_CONFIG).expect("status config");
+        let env = HashMap::from([
+            ("AXOND_OPERATOR_KEY".to_owned(), OPERATOR_KEY.to_owned()),
+            ("AXOND_TENANT_KEY".to_owned(), TENANT_KEY.to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        let state = AppState::new_with_rate_limiter(
+            config,
+            &env,
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+            Box::new(NoLimit),
+            Box::new(crate::revocation::NoDenylist),
+        )
+        .expect("state");
+        assert!(state.revision_report().is_none());
+
+        let (status, body) = status_response(state, Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["revision"].is_null(), "{body}");
+        for entry in body["components"].as_array().expect("components") {
+            assert_eq!(entry["state"], "disabled", "{entry}");
+            assert_eq!(entry["reason"], "not_configured", "{entry}");
+        }
+    }
+
     /// A status read is a cache read: the handler returns the last observation
     /// and never probes, so a dependency outage cannot be turned into a status
     /// outage — or into load on a struggling backend — by polling this route.
