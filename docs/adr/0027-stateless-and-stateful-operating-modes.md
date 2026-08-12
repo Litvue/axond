@@ -75,8 +75,8 @@ declares, under the shape-ownership, TTL-cache, and fail-closed rules of
 caller/key lifecycle only — namespaces, providers, aliases, prices, and provider
 credentials stay config-owned in stateless mode — and it is a different
 mechanism from stateful mode, where identities are compiled into the snapshot
-instead of resolved per request. **Stateless mode is otherwise unchanged by this ADR**, including its
-Tier 0 hermetic guarantee.
+instead of resolved per request. **Stateless mode is otherwise unchanged by this
+ADR**, including its Tier 0 hermetic guarantee.
 
 **Stateful mode moves durable-resource ownership to the control plane.**
 Bootstrap TOML shrinks to the things a process needs before it can read
