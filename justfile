@@ -18,7 +18,14 @@ fmt-check:
 
 clippy:
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-    cd fuzz && cargo clippy --all-targets --locked -- -D warnings
+    # Matches the required lane: `--no-default-features` leaves out libfuzzer-sys
+    # and its C++ build, which need nightly. `just fuzz-targets-clippy` covers them.
+    cd fuzz && cargo clippy --all-targets --no-default-features --locked -- -D warnings
+
+# What the scheduled fuzz lane lints: the coverage-guided targets, which need the
+# nightly toolchain `cargo fuzz` builds them with.
+fuzz-targets-clippy:
+    cd fuzz && RUSTUP_TOOLCHAIN=nightly cargo clippy --all-targets --locked -- -D warnings
 
 test:
     cargo test --workspace --all-features --locked

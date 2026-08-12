@@ -454,20 +454,41 @@ fn main() {
         );
     }
     let mut resigned_classes: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut resigned_seeds_asserted = 0_usize;
     for (seed, bytes) in seeds("token_verify") {
-        let Ok(text) = str::from_utf8(&bytes) else {
-            continue;
-        };
-        let input_started = Instant::now();
-        let Some(class) = axond_fuzz::token_verify_resigned_seed(text) else {
-            continue;
-        };
-        if let Some((_, expected)) = EXPECTED_RESIGNED_SEED_CLASSES
+        let pinned = EXPECTED_RESIGNED_SEED_CLASSES
             .iter()
             .find(|(name, _)| *name == seed.as_str())
-        {
+            .map(|(_, expected)| *expected);
+        let text = match str::from_utf8(&bytes) {
+            Ok(text) => text,
+            // A seed pinned to a class has to *reach* it. Skipping the ones that
+            // are not signable is how the corpus keeps its decode-path inputs;
+            // skipping a pinned one would retire its check in silence.
+            Err(error) => {
+                assert!(
+                    pinned.is_none(),
+                    "{seed} is pinned to an outcome but is no longer utf-8: {error}"
+                );
+                continue;
+            }
+        };
+        let input_started = Instant::now();
+        let class = match axond_fuzz::token_verify_resigned_seed(text) {
+            Some(class) => class,
+            None => {
+                assert!(
+                    pinned.is_none(),
+                    "{seed} is pinned to an outcome but can no longer be re-signed, so its check \
+                     would go unexercised"
+                );
+                continue;
+            }
+        };
+        if let Some(expected) = pinned {
+            resigned_seeds_asserted += 1;
             assert_eq!(
-                class, *expected,
+                class, expected,
                 "re-signed seed {seed} reached {class} rather than {expected}, so the check it is \
                  named for is no longer the one it lands on"
             );
@@ -486,6 +507,12 @@ fn main() {
             "{seed} is pinned to an outcome but no longer exists in the corpus"
         );
     }
+    assert_eq!(
+        resigned_seeds_asserted,
+        EXPECTED_RESIGNED_SEED_CLASSES.len(),
+        "only {resigned_seeds_asserted} of the {} pinned seeds were asserted",
+        EXPECTED_RESIGNED_SEED_CLASSES.len()
+    );
     assert!(
         resigned_classes.len() >= MINIMUM_RESIGNED_CLASSES,
         "re-signed seeds reached {} outcome classes, fewer than the {MINIMUM_RESIGNED_CLASSES} \
