@@ -15,6 +15,18 @@ fail() {
 
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 
+case "$require_attestation" in
+  1|true|TRUE|yes|YES|on|ON)
+    require_attestation=1
+    ;;
+  0|false|FALSE|no|NO|off|OFF|'')
+    require_attestation=0
+    ;;
+  *)
+    fail "AXOND_REQUIRE_ATTESTATION must be 1/0, true/false, yes/no, or on/off"
+    ;;
+esac
+
 if [ -z "$version" ]; then
   latest_url="$(curl --proto '=https' --tlsv1.2 -LsS -o /dev/null \
     -w '%{url_effective}' "https://github.com/${repo}/releases/latest")"

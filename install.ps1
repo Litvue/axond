@@ -8,7 +8,20 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Repository = if ($env:AXOND_REPOSITORY) { $env:AXOND_REPOSITORY } else { "Litvue/axond" }
-$MustVerifyAttestation = $RequireAttestation -or ($env:AXOND_REQUIRE_ATTESTATION -eq "1")
+$AttestationSetting = if ($env:AXOND_REQUIRE_ATTESTATION) {
+    $env:AXOND_REQUIRE_ATTESTATION.ToLowerInvariant()
+}
+else {
+    "0"
+}
+switch ($AttestationSetting) {
+    { $_ -in "1", "true", "yes", "on" } { $AttestationFromEnvironment = $true; break }
+    { $_ -in "0", "false", "no", "off" } { $AttestationFromEnvironment = $false; break }
+    default {
+        throw "AXOND_REQUIRE_ATTESTATION must be 1/0, true/false, yes/no, or on/off"
+    }
+}
+$MustVerifyAttestation = $RequireAttestation -or $AttestationFromEnvironment
 
 if ($PSVersionTable.PSEdition -eq "Desktop") {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -19,10 +32,18 @@ else {
 }
 
 if (-not $Version) {
-    $headers = @{ "User-Agent" = "axond-installer" }
-    $release = Invoke-RestMethod -Headers $headers `
-        -Uri "https://api.github.com/repos/$Repository/releases/latest"
-    $Version = $release.tag_name -replace '^v', ''
+    $LatestRequest = [Net.WebRequest]::Create("https://github.com/$Repository/releases/latest")
+    $LatestRequest.Method = "HEAD"
+    $LatestRequest.AllowAutoRedirect = $true
+    $LatestRequest.UserAgent = "axond-installer"
+    $LatestResponse = $LatestRequest.GetResponse()
+    try {
+        $LatestUrl = $LatestResponse.ResponseUri.AbsoluteUri
+    }
+    finally {
+        $LatestResponse.Close()
+    }
+    $Version = ($LatestUrl.TrimEnd('/') -split '/')[-1] -replace '^v', ''
 }
 
 if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$') {

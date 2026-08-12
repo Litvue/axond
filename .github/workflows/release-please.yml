@@ -108,6 +108,13 @@ jobs:
               exit 1
             fi
             release_branch="${release_branches[0]}"
+            git fetch --no-tags origin \
+              "+refs/heads/${release_branch}:refs/remotes/origin/${release_branch}"
+            if ! git merge-base --is-ancestor \
+              "$GITHUB_SHA" "refs/remotes/origin/${release_branch}"; then
+              echo "refusing to recover stale release branch $release_branch: it does not contain $GITHUB_SHA" >&2
+              exit 1
+            fi
             echo "release-please PR creation failed; recovering $release_branch for a manual PR"
           else
             echo "release-please produced no release PR"
@@ -125,6 +132,7 @@ jobs:
           ref: ${{ steps.release-branch.outputs.name }}
           token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
       - name: Install the sync toolchain
+        id: sync-toolchain
         if: ${{ !cancelled() && steps.release-checkout.outcome == 'success' }}
         run: rustup toolchain install stable --profile minimal
       # The job concurrency group serializes lockfile sync for main, but a
@@ -134,7 +142,7 @@ jobs:
       # avoided: the goal is to include release-please's regenerated content,
       # not overwrite it.
       - name: Sync Cargo.lock onto the release branch
-        if: ${{ !cancelled() && steps.release-checkout.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sync-toolchain.outcome == 'success' }}
         env:
           RELEASE_BRANCH: ${{ steps.release-branch.outputs.name }}
         run: |

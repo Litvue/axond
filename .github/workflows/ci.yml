@@ -157,12 +157,27 @@ jobs:
         run: |
           python3 ops/check-docs.py
           shellcheck install.sh
-          AXOND_VERSION=0.0.0 \
+          unix_installer_output="$(AXOND_VERSION=0.0.0 \
             AXOND_TARGET=x86_64-unknown-linux-musl \
+            AXOND_REQUIRE_ATTESTATION=true \
             AXOND_INSTALL_DRY_RUN=1 \
-            sh install.sh | grep -F 'axond-0.0.0-x86_64-unknown-linux-musl.tar.gz'
-          pwsh -NoProfile -File ./install.ps1 \
-            -Version 0.0.0 -Target x86_64-pc-windows-msvc -DryRun
+            sh install.sh)"
+          grep -F 'axond-0.0.0-x86_64-unknown-linux-musl.tar.gz' \
+            <<<"$unix_installer_output"
+          grep -F 'require_attestation=1' <<<"$unix_installer_output"
+          if AXOND_VERSION=0.0.0 AXOND_REQUIRE_ATTESTATION=maybe \
+            AXOND_INSTALL_DRY_RUN=1 sh install.sh; then
+            echo "Unix installer accepted an invalid attestation setting" >&2
+            exit 1
+          fi
+          AXOND_REQUIRE_ATTESTATION=true pwsh -NoProfile -File ./install.ps1 \
+            -Version 0.0.0 -Target x86_64-pc-windows-msvc -DryRun |
+            grep -F 'require_attestation=True'
+          if AXOND_REQUIRE_ATTESTATION=maybe pwsh -NoProfile -File ./install.ps1 \
+            -Version 0.0.0 -Target x86_64-pc-windows-msvc -DryRun; then
+            echo "Windows installer accepted an invalid attestation setting" >&2
+            exit 1
+          fi
           docker compose --env-file ops/compose/env.example config --quiet
           docker compose --env-file ops/compose/env.example \
             -f docker-compose.yml -f docker-compose.build.yml config --quiet
