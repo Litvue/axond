@@ -86,12 +86,19 @@ no provider account and no network
 Every version above is pinned exactly, including the Node runtime, so a failure
 means a *release* changed the wire rather than that a range floated. The
 TypeScript lane is compiled with `tsc --strict` before it runs, so it also holds
-the gateway to what the SDKs' own type definitions describe. Both lanes cover
-buffered and streamed chat, Responses, embeddings, native Anthropic Messages
-with thinking and tool-use blocks, the `/v1/models` catalogue, rejection of an
-unknown gateway key, and — the property no unit test can see — that the
-credential reaching the upstream is the *provider's*, never the caller's gateway
-key.
+the gateway to what the SDKs' own type definitions describe — including those
+definitions themselves, since `skipLibCheck` is deliberately off: a release whose
+shipped `.d.ts` no longer type-checks is a compatibility fact about that release.
+Those two failures are not the same claim, so the lane's build labels which one
+broke — declarations, before any request was made, or a call the SDKs' types
+reject — and [`tests/compat-ts/README.md`](../tests/compat-ts/README.md) says
+what each calls for.
+
+Both lanes cover buffered and streamed chat, Responses, embeddings, native
+Anthropic Messages with thinking and tool-use blocks, the `/v1/models` catalogue,
+rejection of an unknown gateway key, and — the property no unit test can see —
+that the credential reaching the upstream is the *provider's*, never the caller's
+gateway key.
 
 **Go is deliberately not covered.** A third runtime would re-assert the same
 wire; the case for one is the stateful/admin API, which is not stable yet, so
