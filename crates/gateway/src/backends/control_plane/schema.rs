@@ -209,6 +209,14 @@ pub(super) async fn status(
     // [`SchemaStatus::Malformed`] rather than an error: the table exists, so this
     // is a schema disagreement an operator has to resolve, not a database that
     // could not be reached. Something else owns that name.
+    //
+    // Only errors that say *that*, though. Every server-reported error carries a
+    // SQLSTATE, including `57014 query_canceled` and `40001 serialization_failure`,
+    // and calling a cancelled statement a broken schema would tell an operator to
+    // go and fix a history that is fine — and would strip the retryable
+    // classification the error type exists to carry. Class 42 (syntax and access
+    // rules: undefined table, undefined column, insufficient privilege) is the
+    // class that means the name is not this build's ledger.
     let rows = match transaction
         .query(
             &format!("SELECT version, name, checksum FROM {MIGRATION_TABLE} ORDER BY version"),
@@ -217,7 +225,7 @@ pub(super) async fn status(
         .await
     {
         Ok(rows) => rows,
-        Err(error) if error.code().is_some() => {
+        Err(error) if is_schema_disagreement(&error) => {
             return Ok(SchemaStatus::Malformed {
                 message: format!(
                     "reading `{MIGRATION_TABLE}` as (version, name, checksum) failed: {error}"
@@ -226,15 +234,41 @@ pub(super) async fn status(
         }
         Err(error) => return Err(error),
     };
-    let recorded: Vec<Recorded> = rows
-        .iter()
-        .map(|row| Recorded {
-            version: row.get(0),
-            name: row.get(1),
-            checksum: row.get(2),
-        })
-        .collect();
+    // Decoded fallibly for the same reason: a table that answers to those three
+    // column *names* with other types (`version text`, `checksum bytea`) makes the
+    // query succeed, and `Row::get` would panic on it. That is the documented
+    // `Malformed` case — a version that is not a version — not a crash.
+    let mut recorded = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let decoded = row
+            .try_get(0)
+            .and_then(|version| {
+                Ok(Recorded {
+                    version,
+                    name: row.try_get(1)?,
+                    checksum: row.try_get(2)?,
+                })
+            })
+            .map_err(|error| format!("`{MIGRATION_TABLE}` holds a row this build cannot read as (version integer, name text, checksum text): {error}"));
+        match decoded {
+            Ok(row) => recorded.push(row),
+            Err(message) => return Ok(SchemaStatus::Malformed { message }),
+        }
+    }
     Ok(classify(&recorded))
+}
+
+/// Whether a failed ledger read means the table is not this build's ledger, as
+/// opposed to a database that had a bad moment.
+///
+/// SQLSTATE class 42 is "syntax error or access rule violation": `42P01`
+/// undefined table, `42703` undefined column, `42501` insufficient privilege.
+/// Anything else — a cancelled statement, a serialization failure, a deadlock —
+/// stays an error, so it keeps its retryable classification.
+fn is_schema_disagreement(error: &tokio_postgres::Error) -> bool {
+    error
+        .code()
+        .is_some_and(|code| code.code().starts_with("42"))
 }
 
 /// One row of the migration ledger, as the database holds it.

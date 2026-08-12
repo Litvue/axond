@@ -2090,6 +2090,17 @@ impl Config {
             crate::usage::validate_table_name(schema).map_err(|message| {
                 ConfigError::Invalid(format!("`[control_plane] schema`: {message}"))
             })?;
+            // That validator is written for table names, so it allows one
+            // qualifying dot. A search path takes a single schema, and accepting a
+            // grammar the statement cannot use is a validation gap on a value that
+            // reaches SQL text.
+            if schema.contains('.') {
+                return Err(ConfigError::Invalid(
+                    "`[control_plane] schema` must be a single unqualified schema name: it names \
+                     the search path, not a table"
+                        .into(),
+                ));
+            }
         }
         reject_env_override_collision(
             "[control_plane] dsn_env",
@@ -4238,6 +4249,22 @@ dsn_env = "AXOND_REDIS_URL"
         );
         assert_eq!(control_plane.connect_timeout_ms, 5_000);
         assert_eq!(control_plane.operation_timeout_ms, 30_000);
+    }
+
+    /// The identifier validator this borrows is written for table names, so it
+    /// allows one qualifying dot. A search path takes one schema, so the config has
+    /// to be narrower than the validator it reuses.
+    #[test]
+    fn a_qualified_control_plane_schema_is_rejected() {
+        let error = Config::from_toml_str(
+            "mode = \"stateful\"\n[control_plane]\ndsn_env = \"DSN\"\nschema = \"public.axond\"\n\
+             [secret_store]\nkek_env = \"KEK\"\n[[admin_breakglass]]\nenv = \"BG\"",
+        )
+        .expect_err("`a.b` is not a schema name");
+        assert!(
+            error.to_string().contains("unqualified"),
+            "the error has to say which grammar is wanted: {error}"
+        );
     }
 
     #[test]

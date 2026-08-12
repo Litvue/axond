@@ -3,12 +3,18 @@
 //!
 //! A boot failure in a rollout is expensive in a way a command-line failure is
 //! not: the listener is already gone, the old replica is already terminating, and
-//! the operator finds out from a crash loop. Every check here is one a boot
-//! performs anyway — the config parses and validates, the file it came from is
-//! not one anybody can rewrite, the references it makes resolve, the control-plane
-//! database answers, and its schema is the one this build writes — run in the
-//! order a boot would hit them and reported all at once rather than one per
-//! restart.
+//! the operator finds out from a crash loop. Most checks here are ones a boot
+//! performs anyway — the config parses and validates, the references it makes
+//! resolve, the control-plane database answers, and its schema is the one this
+//! build writes — run in the order a boot would hit them and reported all at once
+//! rather than one per restart.
+//!
+//! One is stricter than boot on purpose: `Config::load` does not look at the
+//! config file's ownership or mode, and this command fails a config another
+//! account can rewrite. A deployment gate is the right place to be stricter than a
+//! process that is already running — the file names every secret the gateway will
+//! read, so who can rewrite it is a property of the deployment rather than of the
+//! boot.
 //!
 //! Strictly read-only. Nothing here creates, migrates, or writes: the control
 //! plane is opened for maintenance with migration off, and the schema is read
@@ -153,14 +159,18 @@ pub async fn run(config: &Config, config_path: &Path, env: &HashMap<String, Stri
     // them can reach. `serve` refuses `mode = "stateful"` outright until the
     // runtime is wired to the control plane, so an operator gating a rollout on
     // this command has to be told that from the command rather than from a crash
-    // loop. Skipped rather than failed: the database checks below are still the
-    // useful answer, and they are what `axond migrate` is gated on.
+    // loop. Failed rather than skipped, because the honest answer to this
+    // command's question is no: a rollout gating on a zero exit would pass here
+    // and then crash-loop. The database checks below still run and are still
+    // reported — and `axond migrate status`/`apply` are separate commands with
+    // their own exit codes, so preparing a database is not blocked by this.
     if config.mode == Mode::Stateful {
-        report.skipped(
+        report.failed(
             "stateful serving",
             "`serve` still refuses `mode = \"stateful\"`: the durable control plane is not wired \
-             to the runtime yet, so the checks below describe the database rather than a replica \
-             that can start",
+             to the runtime yet, so no replica can start against this config. The checks below \
+             still describe the database, and `axond migrate status` reports it without this \
+             failure",
         );
     }
     check_file_ownership(&mut report, config_path);
@@ -170,8 +180,13 @@ pub async fn run(config: &Config, config_path: &Path, env: &HashMap<String, Stri
 }
 
 /// The config file names every secret the process will read. A file another
-/// account can rewrite is a file that can redirect the control plane, so
-/// ownership and mode are a boot property rather than a lint.
+/// account can rewrite is a file that can redirect the control plane, so ownership
+/// and mode are a deployment property rather than a lint.
+///
+/// Deliberately stricter than boot: `Config::load` reads whatever it can open, so
+/// a `umask 002` config (mode 0664) starts a gateway and fails this gate. The gate
+/// is where that is worth saying, and saying it here does not change what `serve`
+/// accepts.
 #[cfg(unix)]
 fn check_file_ownership(report: &mut Report, path: &Path) {
     use std::os::unix::fs::MetadataExt;
@@ -640,8 +655,8 @@ mod tests {
 
     /// `serve` still refuses `mode = "stateful"`. An operator gating a rollout on
     /// preflight has to learn that here rather than from a crash loop, so the
-    /// refusal is a reported line — and a skipped one, because the database
-    /// checks it accompanies are still the useful answer.
+    /// refusal is a reported *failure*: a green exit would promise a boot that
+    /// cannot happen. The other checks still run, so the report is still useful.
     #[tokio::test]
     async fn a_stateful_preflight_names_the_serving_refusal_it_cannot_rehearse() {
         let path = write("axond.toml", stateful_toml());
@@ -653,8 +668,19 @@ mod tests {
             .find(|check| check.name == "stateful serving")
             .expect("a stateful preflight must name the refusal");
         assert!(
-            matches!(refusal.outcome, Outcome::Skipped(_)),
-            "the refusal is reported, not counted as a failure: {refusal}"
+            matches!(refusal.outcome, Outcome::Failed(_)),
+            "a config no replica can boot must not exit zero: {refusal}"
+        );
+        assert!(
+            !report.is_ok(),
+            "the exit code has to carry the refusal too: {report}"
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "control-plane database"),
+            "the database checks still run and are still reported: {report}"
         );
 
         let stateless = Config::from_toml_str(stateless_toml()).expect("valid stateless config");

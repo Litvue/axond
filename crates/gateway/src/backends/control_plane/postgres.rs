@@ -198,9 +198,16 @@ impl PostgresControlPlane {
             .schema
             .as_deref()
             .map(|schema| {
-                crate::usage::validate_table_name(schema)
-                    .map(|()| schema.to_owned())
-                    .map_err(denied)
+                crate::usage::validate_table_name(schema).map_err(denied)?;
+                // The table-name validator allows one qualifying dot; a search path
+                // takes one unqualified schema. Checked here as well as in config
+                // validation, because settings can be built without a config file.
+                if schema.contains('.') {
+                    return Err(denied(format!(
+                        "`{schema}` is not a single unqualified schema name"
+                    )));
+                }
+                Ok(schema.to_owned())
             })
             .transpose()?;
 
@@ -236,8 +243,17 @@ impl PostgresControlPlane {
     pub async fn apply_migrations(&self) -> Result<Vec<i32>, ControlPlaneError> {
         self.run(|client| {
             Box::pin(async move {
+                // Read committed explicitly rather than by inheritance: the status
+                // is read *after* the lock is granted, and it has to be the winner's
+                // committed history rather than a snapshot taken before the wait. A
+                // server with `default_transaction_isolation = 'repeatable read'`
+                // would freeze the snapshot at the first statement, so the loser of
+                // the lock would re-read a pre-migration ledger and apply the same
+                // files again.
                 let transaction = client
-                    .transaction()
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
                     .await
                     .map_err(|error| unavailable("begin schema transaction", &error))?;
                 transaction

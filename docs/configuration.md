@@ -123,7 +123,7 @@ with no snapshot fails readiness rather than serving partial state.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `dsn_env` | string | — | Name of the env var holding the control-plane Postgres connection string. Required and non-empty. |
-| `schema` | string | connection default | PostgreSQL schema the journal lives in. A plain identifier: it becomes `SET search_path`, so anything else is rejected at load. Omit to use whatever the DSN's own `search_path` selects. |
+| `schema` | string | connection default | PostgreSQL schema the journal lives in. A single unqualified identifier: it becomes `SET search_path`, so a qualified name like `a.b` and anything that is not an identifier are rejected at load. Omit to use whatever the DSN's own `search_path` selects. |
 | `migrate` | boolean | `false` | Whether a *booting replica* may apply pending migrations. Off by default: the safe order is one `axond migrate apply` before any replica starts, so a rollout cannot have one replica migrating a database the others are already reading. A replica checks the schema either way and refuses to serve one it does not recognise. |
 | `connect_timeout_ms` | integer | `5000` | Bound on establishing a control-plane connection. `0` is rejected. |
 | `operation_timeout_ms` | integer | `30000` | Bound on one control-plane operation, including a migration transaction. Higher than the connect bound because applying DDL to a large database is slower than opening a socket. `0` is rejected. |

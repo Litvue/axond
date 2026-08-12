@@ -57,6 +57,9 @@ Three commands run *before* replicas do, all with the same grammar —
 | `axond migrate status --config PATH` | No | What schema does this database have, and what would an apply do? |
 | `axond migrate apply --config PATH` | Yes | Apply the pending migrations, forward only. |
 
+The command surface, the forward-only policy, and the refusal to migrate at boot
+are [ADR 0031](../adr/0031-operator-preflight-and-forward-only-migrations.md).
+
 `preflight` and `status` cannot change a database, and not merely by convention:
 they open the control plane on a maintenance path that does not prepare a schema,
 with migration permission forced off, and read the ledger inside a `READ ONLY`
@@ -76,11 +79,14 @@ In stateless mode there is no control plane, so `preflight` reports the database
 checks as skipped and `migrate` has nothing to do. Neither command requires
 PostgreSQL to exist.
 
-One thing `preflight` cannot rehearse in stateful mode, and says so as a skipped
-`stateful serving` line: `axond serve` still refuses `mode = "stateful"` outright,
-because the durable control plane is not wired to the runtime yet. A stateful
-preflight with every other check green describes the *database*, not a replica
-that can start.
+Until stateful serving is wired up, a stateful `preflight` **fails** on a
+`stateful serving` line and exits non-zero: `axond serve` still refuses
+`mode = "stateful"` outright because the durable control plane is not wired to the
+runtime yet, so no replica can boot against that config and a zero exit would
+promise one that cannot. Every other check still runs and is still printed, so the
+report is the same description of the database it would otherwise be — and
+`axond migrate status` / `axond migrate apply` are separate commands with their own
+exit codes, so preparing the database is not blocked by the serving refusal.
 
 Only the control-plane journal is migrated by these commands. It is the only store
 with a ledger — recorded version, file name, checksum — so it is the only one where
@@ -102,6 +108,10 @@ axond check preflight --config /etc/axond/axond.toml # then verify a replica wou
 
 Then start replicas. Run `apply` once from one place; it is safe if that
 accidentally becomes twice, or two places at once.
+
+While stateful serving is unwired, that `preflight` exits non-zero on its
+`stateful serving` line even when the database is ready; read the rest of the
+report, and gate the rollout on `axond migrate status` until the refusal is gone.
 
 ### Upgrade
 

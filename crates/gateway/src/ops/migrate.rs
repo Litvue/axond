@@ -743,6 +743,104 @@ mod tests {
         );
     }
 
+    /// The same-names-wrong-types case: a foreign table that answers to `version`,
+    /// `name`, and `checksum` makes the ledger query *succeed*, so the disagreement
+    /// only shows up while decoding. That has to be the reported refusal too,
+    /// rather than a panic in the middle of an operator's command.
+    #[tokio::test]
+    async fn a_ledger_shaped_table_with_other_column_types_is_refused_not_a_panic() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        fixture
+            .observe()
+            .await
+            .batch_execute(
+                "CREATE TABLE axond_cp_schema_migration \
+                 (version text primary key, name text, checksum bytea)",
+            )
+            .await
+            .expect("take the ledger's name with other types");
+        fixture
+            .observe()
+            .await
+            .batch_execute(
+                "INSERT INTO axond_cp_schema_migration VALUES ('one', 'whatever', '\\x00')",
+            )
+            .await
+            .expect("give it a row to decode");
+
+        let report = status(&fixture.config, &fixture.env)
+            .await
+            .expect("a decode disagreement is a status, not an error");
+        let Some(State::Refused { reason }) = report.state() else {
+            panic!("a ledger this build cannot read is refused: {report}");
+        };
+        assert!(
+            reason.contains("is not the one this build writes"),
+            "{reason}"
+        );
+        assert!(
+            apply(&fixture.config, &fixture.env).await.is_err(),
+            "an apply must not write into a table it cannot account for"
+        );
+    }
+
+    /// A bad moment is not a broken history. Every server-reported error carries a
+    /// SQLSTATE, so classifying the ledger read by "did the server answer with a
+    /// code?" would tell an operator to go and repair a history that is fine — and
+    /// would drop the retryable classification. Class 42 means the name is not this
+    /// build's ledger; a serialization failure means try again.
+    #[tokio::test]
+    async fn a_transient_ledger_read_failure_stays_retryable() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        // A view over a function that raises a chosen SQLSTATE: the ledger's name
+        // resolves and its columns type-check, so the only thing under test is how
+        // the error is classified.
+        let raise = |code: &str| {
+            format!(
+                "CREATE FUNCTION ledger_{code}() RETURNS TABLE(version integer, name text, \
+                 checksum text) AS $$ BEGIN RAISE EXCEPTION 'simulated' USING ERRCODE = \
+                 '{code}'; END $$ LANGUAGE plpgsql;\n\
+                 CREATE VIEW axond_cp_schema_migration AS SELECT * FROM ledger_{code}();"
+            )
+        };
+        fixture
+            .observe()
+            .await
+            .batch_execute(&raise("40001"))
+            .await
+            .expect("stand in for a serialization failure");
+        let error = status(&fixture.config, &fixture.env)
+            .await
+            .expect_err("a serialization failure is an outage, not a verdict");
+        assert!(
+            error.is_retryable(),
+            "a transient server error must stay retryable: {error}"
+        );
+
+        // The same shape with a class-42 code is the permanent verdict it looks
+        // like: this table is not the ledger.
+        let client = fixture.observe().await;
+        client
+            .batch_execute("DROP VIEW axond_cp_schema_migration")
+            .await
+            .expect("drop the stand-in");
+        client
+            .batch_execute(&raise("42703"))
+            .await
+            .expect("stand in for an undefined column");
+        let report = status(&fixture.config, &fixture.env)
+            .await
+            .expect("a schema disagreement is a status, not an error");
+        assert!(
+            matches!(report.state(), Some(State::Refused { .. })),
+            "{report}"
+        );
+    }
+
     /// The missing-database case end to end: a reference that resolves to a
     /// database nothing answers at is an outage, is worth retrying, and still
     /// never prints the DSN it failed to connect with.
