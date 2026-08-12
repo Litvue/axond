@@ -1,4 +1,4 @@
-# 27. Per-phase transport bounds and stream idle timeouts
+# 28. Per-phase transport bounds and stream idle timeouts
 
 Date: 2026-08-12
 
