@@ -246,18 +246,41 @@ So a partially published revision is not a state the journal can be in, and
 Loading a revision reads its manifest, resolves every resource version it pins,
 and verifies the result against the checksums recorded at publication. It either
 returns the whole revision or fails; there is no partially loaded revision to
-inspect or repair, and a failed load never becomes state a replica serves. Three
+inspect or repair, and a failed load never becomes state a replica serves. Four
 outcomes need different responses:
 
 - **Unreadable (`stored revision … is unreadable`).** The rows no longer add up:
   a missing resource version, a declared blob whose record is gone, a dependency
-  that leaves the revision or closes a cycle, a body this build cannot decode, a
-  checksum that no longer matches, or a reference that crosses a tenant boundary.
-  The message names the resource or edge. This is corruption,
+  that leaves the revision or closes a cycle, a checksum that no longer matches,
+  or a reference that crosses a tenant boundary. Tenancy ownership is re-read here
+  too, so a project row edited to claim a tenant that does not own it does not
+  hydrate, and neither does a project whose tenant row is gone — see
+  [resource body schemas](./revision-convergence.md#resource-body-schemas). The
+  message names the resource or edge. This is corruption,
   not an outage — retrying will not clear it — and it means something wrote to the
   journal outside the gateway, or a restore was partial. Compare against a backup;
   a healthy older revision still loads, so serving can continue from one while the
   damage is investigated.
+- **Incompatible (`stored revision … is not compatible with this build`).** The
+  rows add up and this build cannot read them: a body whose schema identifier or
+  field set belongs to a newer release, a tenant or project body written before
+  those bodies were typed, or a row — or a whole revision — naming a canonical
+  encoding version this build does not write, whether or not this build knows that
+  version's name, which a restored backup holding rows from two builds produces.
+  (A serializer column naming no version of this encoding at all is unreadable
+  storage, below.) **This is not corruption, and nothing about the database needs
+  repairing.** It is reported separately for exactly that reason, and convergence
+  reports it as reason `incompatible`. The replica keeps serving the revision it
+  already holds. Roll the replica onto a build that reads the revision, or publish
+  a revision the deployed build reads — which for a legacy tenant or project means
+  republishing it from a build that writes typed bodies. Revisions older than that
+  upgrade stay unreadable to this build by design and remain in the journal as
+  history. A body that *declares* a schema this build reads and then is not one —
+  a field gone, a field whose type changed — is not this outcome; that is
+  unreadable, above, because no version skew produces it. Neither is a tenancy body
+  that is not an inline record at all, or one under a kind it does not match: no
+  release ever wrote one, typed or untyped, so the shape itself says the row was
+  rewritten.
 - **Too large (`exceeds what hydration reads`).** The revision is intact but
   larger than this build's read bounds (resource versions, blobs, blob bytes,
   dependency edges or nesting, inline body bytes, or total candidate size); the
@@ -268,9 +291,12 @@ outcomes need different responses:
 - **Unavailable.** Postgres is unreachable. Retryable, and covered by
   [During a Postgres outage](#during-a-postgres-outage).
 
-A revision that loads once loads forever: revisions are immutable, so a
-successful load is repeatable, and history stays answerable after any number of
-newer publications.
+A revision that loads once loads forever *on that build*: revisions are
+immutable, so a successful load is repeatable, and history stays answerable after
+any number of newer publications. Compatibility is the one axis that is not
+immutable — a build reads the schemas and enforces the rules it knows — so an
+upgrade can turn a revision that loaded into one reported as incompatible, above.
+That is a property of the build, not a change to the journal.
 
 ## Backup and retention
 

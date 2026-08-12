@@ -29,6 +29,7 @@ use super::canonical::{Canonical, CanonicalError, CanonicalValue, Checksum, Seri
 use super::ids::{AuditEventId, MutationId, RevisionId, Slug};
 use super::mutation::{AuditEvent, ExpectedRevision, Mutation};
 use super::resource::{BlobRef, ResourceRef, ResourceScope, ResourceVersion};
+use super::tenancy::{Tenancy, TenancyError};
 
 /// Why a desired state is not a valid revision.
 ///
@@ -68,6 +69,8 @@ pub enum ValidationError {
     CrossTenantReference { from: ResourceRef, to: ResourceRef },
     #[error("deployment-scoped {from} depends on tenant-scoped {to}")]
     TenantScopedDependency { from: ResourceRef, to: ResourceRef },
+    #[error("this revision's tenancy is not valid: {0}")]
+    Tenancy(#[from] TenancyError),
     #[error("audit event {audit} records mutation {recorded}, not this candidate's {mutation}")]
     AuditMutationMismatch {
         audit: AuditEventId,
@@ -237,6 +240,13 @@ impl DesiredState {
             return Err(ValidationError::UnreferencedBlob { digest: *digest });
         }
 
+        // Last, because it is the only step that reads a *body*: everything above
+        // holds for every resource kind, including the ones whose schemas later
+        // slices own. Tenancy is the one schema the domain knows (#191), and it is
+        // what makes ownership — a project's tenant, and the tenant of anything
+        // scoped to one — a domain invariant rather than a projection's problem.
+        Tenancy::of(self)?;
+
         Ok(())
     }
 
@@ -394,6 +404,14 @@ pub enum IntegrityError {
         stored: SerializerVersion,
         current: SerializerVersion,
     },
+    #[error(
+        "stored serializer `{stored}` is a canonical encoding this build does not know; \
+         it canonicalizes with `{current}`"
+    )]
+    UnknownSerializer {
+        stored: String,
+        current: SerializerVersion,
+    },
     #[error("revision checksum is {expected}, but the loaded state hashes to {actual}")]
     ChecksumMismatch {
         expected: Checksum,
@@ -424,12 +442,52 @@ pub enum IntegrityError {
     UnexpectedBlob { digest: Checksum },
     #[error("stored revision is not valid desired state: {0}")]
     Invalid(#[from] ValidationError),
+    /// A retained revision this build cannot interpret, because a body declares a
+    /// schema, form, or field set that belongs to a different release: a revision
+    /// published by a newer build, or one published before that body was typed.
+    ///
+    /// Deliberately *not* an [`IntegrityError::Invalid`] and not corruption. The
+    /// rows may be entirely self-consistent; what is wrong is this build's ability
+    /// to read them, and the actions differ — roll the replica forward, or publish
+    /// a revision the deployed version understands, rather than repair storage.
+    /// The replica keeps serving what it already holds either way.
+    #[error("stored revision is not compatible with this build: {0}")]
+    Incompatible(TenancyError),
     /// A stored record could not be interpreted at all: an id, checksum, kind,
     /// scope, or canonical body that is not the value it was written as. Distinct
     /// from the mismatch arms above, which compare two things that were both
     /// readable.
     #[error("stored revision is unreadable: {detail}")]
     Unreadable { detail: String },
+}
+
+impl IntegrityError {
+    /// Classify a validation failure on *stored* state as an incompatibility or
+    /// as corruption.
+    ///
+    /// Hydration re-validates what storage returned, so this is where "a body
+    /// this build cannot read" stops being indistinguishable from "these rows
+    /// contradict each other". See [`TenancyError::is_incompatible`].
+    fn classify(error: ValidationError) -> Self {
+        match error {
+            ValidationError::Tenancy(tenancy) if tenancy.is_incompatible() => {
+                Self::Incompatible(tenancy)
+            }
+            other => Self::Invalid(other),
+        }
+    }
+
+    /// Whether this is a compatibility refusal rather than unreadable storage.
+    ///
+    /// The store and convergence both classify by this rather than by matching
+    /// arms of their own, so one revision cannot be reported as an incompatibility
+    /// at one layer and as corruption at the next.
+    pub const fn is_incompatible(&self) -> bool {
+        matches!(
+            self,
+            Self::Incompatible(_) | Self::Serializer { .. } | Self::UnknownSerializer { .. }
+        )
+    }
 }
 
 /// A retained revision, hydrated and proven complete: the seam #142 publishes a
@@ -466,7 +524,7 @@ impl LoadedRevision {
                 current,
             });
         }
-        state.validate()?;
+        state.validate().map_err(IntegrityError::classify)?;
 
         for entry in &manifest.entries {
             let Some(resource) = state.get(&entry.reference) else {
@@ -1209,14 +1267,17 @@ mod tests {
     #[test]
     fn unrepresentable_state_is_a_validation_error_not_a_panic() {
         let mut state = DesiredState::new();
+        state.insert(tenant(1, "acme")).unwrap();
         state
             .insert(ResourceVersion::new(
-                reference(ResourceKind::Tenant, 1),
-                ResourceScope::Deployment,
-                Slug::parse("acme").unwrap(),
+                reference(ResourceKind::Alias, 2),
+                ResourceScope::Tenant(tenant_id(1)),
+                Slug::parse("fast").unwrap(),
                 // A control character has no canonical form, so the state has no
-                // checksum — and therefore cannot be published.
-                ResourceBody::Inline(CanonicalValue::string("display\tname")),
+                // checksum — and therefore cannot be published. The body of a kind
+                // whose schema is not this slice's is opaque to validation, so the
+                // encoder is what refuses it.
+                ResourceBody::Inline(CanonicalValue::string("wire\tfamily")),
             ))
             .unwrap();
         assert!(matches!(

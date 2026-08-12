@@ -1214,8 +1214,9 @@ mod tests {
     use super::*;
     use crate::backends::{BackendFailure, FailureCategory};
     use crate::desired_state::fixtures::{
-        DESIRED_STATE_RESOURCES, candidate, reference, state, state_with_renamed_alias,
-        state_with_second_tenant, state_with_two_blobs, tenant,
+        DESIRED_STATE_RESOURCES, candidate, project_alias, project_id, reference, state,
+        state_a_pre_tenancy_build_published, state_with_renamed_alias, state_with_second_tenant,
+        state_with_two_blobs, tenant, tenant_id,
     };
     use crate::desired_state::{
         Actor, AuditEventId, DesiredState, ExpectedRevision, MutationId, ResourceKind, Uuid7,
@@ -2030,6 +2031,77 @@ mod tests {
         assert_eq!(once.manifest(), twice.manifest());
     }
 
+    /// The exemption that keeps already-published journals loadable, against a
+    /// journal rather than against a hand-built state.
+    ///
+    /// Typed tenancy made hydration read bodies, so what an older build could
+    /// publish has to keep hydrating: tenant-scoped resources with no tenant row,
+    /// and a project scope naming a project no row declares — unroutable, not a
+    /// contradiction. What is refused is a contradiction, and it is refused as
+    /// damage, because no release ever wrote a resource into a project owned by a
+    /// tenant other than the one its scope names.
+    #[tokio::test]
+    async fn a_revision_an_older_build_published_still_hydrates() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+
+        let published = state_a_pre_tenancy_build_published();
+        let manifest = store
+            .publish_revision(candidate(
+                ExpectedRevision::Empty,
+                "pre-tenancy",
+                published.clone(),
+            ))
+            .await
+            .expect("a revision without owner rows publishes");
+        let loaded = store
+            .load_revision(manifest.id)
+            .await
+            .expect("and hydrates on a build that reads typed bodies");
+        assert_eq!(loaded.state(), &published);
+
+        // The same project scope, now with the project declared and owned by the
+        // tenant the scope names: the rule applies, and holds.
+        let owner = tenant_id(1);
+        let mut owned = state();
+        owned
+            .insert(project_alias(&owner, &project_id(2), 6, "inner"))
+            .expect("a project's own alias is valid");
+        let second = store
+            .publish_revision(candidate(
+                ExpectedRevision::Exactly(manifest.id),
+                "owned",
+                owned.clone(),
+            ))
+            .await
+            .expect("a declared owner is not a new requirement");
+        assert_eq!(
+            store
+                .load_revision(second.id)
+                .await
+                .expect("hydrate")
+                .state(),
+            &owned
+        );
+
+        // And a contradiction of it, as a restored backup or a manual `UPDATE`
+        // produces one: the row now sits in a project whose tenant is not the one
+        // it names.
+        let stranger = tenant_id(11);
+        store
+            .corrupt_with(&format!(
+                "UPDATE axond_cp_resource_version SET tenant_id = '{stranger}' \
+                 WHERE scope_kind = 'project'"
+            ))
+            .await;
+        let error = store
+            .load_revision(second.id)
+            .await
+            .expect_err("a resource in another tenant's project is not hydratable");
+        assert_eq!(error.category(), FailureCategory::Corrupt);
+    }
+
     #[tokio::test]
     async fn two_revisions_share_immutable_resources_without_sharing_a_value() {
         let Some((store, _, _)) = journal().await else {
@@ -2460,10 +2532,30 @@ mod tests {
             )
             .await;
 
+        // A version of this encoding this build has not learned: the rows may be
+        // entirely intact, and the action is a deployment rather than a restore.
         let error = store
             .load_revision(first.id)
             .await
             .expect_err("a row this build cannot read is not hydratable");
+        assert_ne!(error.category(), FailureCategory::Corrupt);
+        let ControlPlaneError::Incompatible { source, .. } = &error else {
+            panic!("expected an incompatibility, got {error:?}");
+        };
+        assert!(
+            matches!(**source, IntegrityError::UnknownSerializer { .. }),
+            "{error:?}"
+        );
+
+        // Text naming no version of this encoding at all is the other thing: no
+        // release wrote it, so it points at storage.
+        store
+            .corrupt_with("UPDATE axond_cp_resource_version SET serializer = 'json'")
+            .await;
+        let error = store
+            .load_revision(first.id)
+            .await
+            .expect_err("a column no build ever wrote is not hydratable");
         assert_eq!(error.category(), FailureCategory::Corrupt);
         let ControlPlaneError::Corrupt { source, .. } = &error else {
             panic!("expected corruption, got {error:?}");

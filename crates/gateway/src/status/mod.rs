@@ -335,6 +335,7 @@ impl StatusReason {
         match reason {
             "unavailable" => Self::Unreachable,
             "corrupt" => Self::PayloadCorrupt,
+            "incompatible" => Self::SchemaIncompatible,
             "projection" => Self::ProjectionRejected,
             "validation" | "invalid" => Self::ValidationRejected,
             "secret" => Self::SecretUnresolved,

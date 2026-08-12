@@ -551,6 +551,10 @@ fn backend_and_revision_failures_map_to_bounded_codes() {
     let revision_reasons = [
         ("unavailable", StatusReason::Unreachable),
         ("corrupt", StatusReason::PayloadCorrupt),
+        // Intact storage this build cannot read: its own code, because the action
+        // is a deployment and `payload_corrupt` would send an operator to the
+        // database.
+        ("incompatible", StatusReason::SchemaIncompatible),
         ("projection", StatusReason::ProjectionRejected),
         ("validation", StatusReason::ValidationRejected),
         ("secret", StatusReason::SecretUnresolved),

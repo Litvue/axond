@@ -9,9 +9,10 @@ Stateful mode is still being assembled: this is the convergence layer
 ([#142](https://github.com/Litvue/axond/issues/142)), built on the revision
 journal ([#165](https://github.com/Litvue/axond/issues/165)). The loop, its
 telemetry, and the signed cache are complete and tested, but `serve` does not yet
-construct them — projecting resource *bodies* (tenants, providers, aliases,
-prices, policies) onto a runtime configuration belongs to the slices that own
-those schemas. Read
+construct them. Tenants and projects have durable schemas and a projection
+([#191](https://github.com/Litvue/axond/issues/191)); the remaining resource
+*bodies* (providers, credentials, catalogue models, prices, policies) belong to
+the slices that own those schemas. Read
 [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md) for the mode as
 a whole.
 
@@ -82,7 +83,8 @@ Alongside them:
 - **lag** — how long `desired` has differed from `active`. This is the alerting
   signal. One second of lag is convergence working; ten minutes is an incident.
 - **reason** — the stage that refused the last candidate: `unavailable`,
-  `corrupt`, `not_found`, `projection`, `validation`, `secret`, or `snapshot`.
+  `incompatible`, `corrupt`, `not_found`, `projection`, `validation`, `secret`,
+  or `snapshot`.
 - **source** — `control-plane` or `last-known-good`. A replica reporting
   `last-known-good` booted from its cache and may be serving something older
   than desired.
@@ -100,12 +102,136 @@ Alongside them:
 | `axond.revision.convergence_duration` (ms) | How long an accepted revision takes to compile and publish |
 | `axond.revision.attempts` (by `trigger`, `outcome`) | Whether convergence is being driven by notifications or by polls |
 | `axond.revision.desired_at` / `axond.revision.active_at` | Publication timestamps embedded in the revision identifiers, for comparing replicas |
-| `axond.revision.last_known_good` (by `outcome`) | Cache exports, export failures, and cold-boot restores |
+| `axond.revision.last_known_good` (by `outcome`) | Cache exports, export failures, cold-boot restores, and a cache this build cannot read (`incompatible`) |
 | `axond.config.generation` | Which snapshot generation a replica serves |
 
 Alert on **lag above the convergence target**, and on
 `axond.revision.last_known_good{outcome="restored"}`, which means a replica
 started without reaching the control plane.
+
+A refusal this build cannot read is its own label rather than a bucket shared with
+damage: `axond.revision.rejections{reason="incompatible"}`, and `schema_incompatible`
+in a status response. Alert on it separately from `corrupt` — the action is a
+deployment, not a restore.
+
+## Resource body schemas
+
+A published resource carries a **body**: a record whose meaning is fixed by an
+explicit schema identifier stored inside it, alongside the resource's identity,
+scope, and slug. Two schemas exist today:
+
+| Schema | Resource | Fields |
+| --- | --- | --- |
+| `axond.tenant.v1` | a deployment tenant | `schema`, `tenant_id`, `display_name` |
+| `axond.project.v1` | a tenant-owned project | `schema`, `project_id`, `tenant_id`, `display_name` |
+
+Five rules hold for every body schema, present and future:
+
+- **The identifier is inside the checksummed body.** A replica reads the schema
+  before it reads anything else, so a revision cannot be interpreted under a
+  schema it did not declare.
+- **An unknown schema, or an unknown field, is a refusal.** A body declaring
+  `axond.tenant.v2`, or an extra field a newer release added, is rejected rather
+  than read partially — as `projection` when a *candidate* is compiled, and as
+  `incompatible` when a *stored* revision is hydrated. An older replica keeps
+  serving the revision it already had instead of serving a half-understood newer
+  one. Roll the replica forward, or publish a revision the deployed version
+  understands.
+- **A body written before its schema was typed is the same refusal, not
+  corruption.** Revisions published before `axond.tenant.v1` and
+  `axond.project.v1` existed carry tenant and project bodies with no `schema`
+  field. This build does not read them, and it does not guess: hydrating one is
+  `incompatible`, and nothing untyped is ever accepted *as* a typed tenancy
+  resource. Storage is intact, so there is nothing to repair — republish the
+  affected tenants and projects from a build that writes typed bodies, and the
+  fleet converges onto the new revision. Older revisions in the journal stay
+  unreadable to this build by design; they remain in the journal as history.
+- **A body that declares a schema this build reads, and then is not one, is
+  damage.** Past the identifier the field set is known, so a `v1` body missing a
+  `v1` field, or carrying one whose type changed, is reported as `corrupt` and not
+  as `incompatible`: nothing about a release skew can produce it, and the operator
+  is pointed at storage rather than away from it. (A *display name* this build will
+  not take is the exception, and is `incompatible`: validation rules can tighten
+  within one schema — this build refuses an invisible byte-order mark an earlier
+  one accepted.) A body that is not an inline record, or that sits under a kind it
+  does not match, is damage for the same reason: every release that has written a
+  tenancy body wrote an inline record, so no skew produces a scalar or a blob there.
+- **A change to a field's presence or meaning is a new identifier.** `v1` bodies
+  never change shape, so a checksum computed by one release is computed the same
+  way by every release that accepts it. Adding a field, renaming one, or changing
+  what one means all produce `axond.<kind>.v2`.
+
+Identity in a body is bound to its envelope rather than merely carried by it: a
+tenant body's `tenant_id` *is* its resource identity, a project's `tenant_id` *is*
+the tenant it is scoped to, and a mismatch is refused at publication and again at
+hydration. Human-readable slugs live on the envelope, so renaming a tenant leaves
+every body and every reference untouched.
+
+What a revision is *not* required to carry is a tenant row for everything scoped
+to a tenant. A project must name a tenant the same revision declares — nothing can
+name that project's namespace otherwise, and this build never writes a project
+without its tenant, so a project whose tenant row is gone is damage rather than a
+release skew. Other tenant-scoped resources are deliberately not held to it: a
+credential or an alias published before tenancy bodies existed may carry a tenant
+no row describes, and adding that requirement now would make revisions already in
+the journal stop hydrating on upgrade. Such a scope is *unroutable*, which the
+boundary that routes reports, rather than unreadable.
+
+### How a project becomes a namespace
+
+The runtime's tenancy boundary is the namespace: keys bind to one, credential
+pools are per `(namespace, provider)`, and usage is accounted against it. A
+project *is* that boundary made durable, so each published project projects to
+exactly one namespace.
+
+Its projected id is **tenant-qualified**: `acme/core`, not `core`. A project slug
+is unique within its tenant and only within it — two tenants may each have a
+`core` — while a namespace id is deployment-wide. Qualifying is what keeps two
+tenants' projects out of one budget, one credential pool, and one key binding, and
+`/` is not a legal slug character, so the qualified form decomposes exactly one
+way. A projected namespace whose id a bootstrap namespace already claims is
+refused rather than merged.
+
+A qualified id is a *name*, and both halves of it are renameable, so it is not
+what the namespace **is**. A projected namespace also carries the tenant and
+project ids it was made from, and those never change: renaming `acme` to
+`acme-inc` renames what callers say and what an operator reads in a label, and
+moves nothing that was accounted. Per-namespace durable state — budgets,
+credential pools, gateway-key bindings — therefore keys on that identity and not
+on the name, and a rename is a rename rather than a delete plus a create. A
+file-declared namespace has no such identity: its id is immutable for the same
+reason the file is, and it keeps keying on the id.
+
+Every compiled configuration's namespace ids are also held to a shape a file's
+never were: one slug, or two joined by `/`, and never repeated. A file may
+legitimately declare the same id twice (it means one namespace), but a *generated*
+id nobody reviewed may not — a duplicate would put two tenants' budgets,
+credentials, and keys on one name. What that gate does not cover is `/` where an
+id is *used* rather than declared: before the runtime slice wires this projection
+into `serve`, metric and trace label values, Redis and Postgres key composition,
+and gateway-key bindings all have to be checked against a separator no
+`axond.toml` could have produced.
+
+What projection does *not* touch is everything the local file owns: listener,
+transport bounds, admission, telemetry, datastore connectivity, and — until their
+own slices land — providers, credentials, models, and prices. The bootstrap's
+default namespace stays the default, and a projected project starts with no
+platform fallback: it borrows no other namespace's credentials.
+
+**No published project is ever made the deployment default.** A request that names
+no namespace is served by whatever the file made default, and publishing a project
+does not move that target — promoting one, even when it is the only one, would let
+an unrelated publication silently redirect unnamed traffic. A bootstrap that
+declares no default namespace is therefore refused with reason `projection`, and
+the message says so. Since `[[namespace]]` is a control-plane-owned section that a
+stateful file may not declare, that is the shape a stateful bootstrap has today:
+**stateful serving stays gated until the runtime slice that selects a default from
+desired state lands.** Nothing in `serve` constructs this projection yet, so the
+refusal is a design boundary rather than an outage.
+
+A stateless deployment is unaffected by all of this. Tenants and projects are
+published, never declared in `axond.toml`, and a stateless config's namespace ids
+are exactly the ids the file wrote.
 
 ## When a replica will not converge
 
@@ -126,9 +252,18 @@ The refusal reason is the triage key.
   a secret the store does not hold. Messages name the *reference*, never the
   value. Frequently replica-specific — one replica missing an environment
   variable while its siblings converge looks exactly like this.
-- **`projection`** — a resource body this build cannot read, usually a revision
-  published by a newer version. Roll the replica forward, or publish a revision
-  the deployed version understands.
+- **`projection`** — a candidate this build cannot project: a resource body it
+  does not read, or a bootstrap that is missing something projection may not
+  supply for it (today, a default namespace). Roll the replica forward, publish a
+  revision the deployed version understands, or fix the bootstrap file.
+- **`incompatible`** — a *stored* revision this build cannot read: a schema from a
+  newer release, an unknown field, or a body written before that resource's schema
+  was typed. Distinct from `corrupt` on purpose — storage is intact and there is
+  nothing to repair, so this is an upgrade or a republication, never a database
+  investigation. The replica keeps serving its last known good revision and does
+  not retry into a different answer. During a rolling upgrade, expect it on
+  replicas still running the older build. A body that *declares* a schema this
+  build reads and then is not one is `corrupt` instead — see the rules above.
 - **`corrupt`** / **`not_found`** — the journal itself does not add up. Retrying
   will not clear it; see
   [when a revision will not load](./control-plane-journal.md#when-a-revision-will-not-load).
@@ -182,17 +317,34 @@ What to know about it operationally:
 - **It may be stale.** A replica reports `source = last-known-good` exactly so
   this is visible. Once the control plane returns, the replica converges to
   desired state normally and stops reporting the cache as its source.
-- **A cache is a cache, not a fallback for bad state.** It is consulted only when
-  the control plane is *unreachable*. A desired revision that exists but does not
-  compile is a fatal boot failure — booting an older cached revision instead
-  would silently serve state an operator already replaced.
+- **A cache is a cache, not a fallback for bad state.** It is consulted for the
+  two refusals where cached state is the better answer: the control plane being
+  *unreachable*, and a desired revision this build cannot *read* (`incompatible`,
+  the mixed-version case above). Both leave storage intact and neither is repaired
+  by a replica refusing to start — a replica added mid-rollout that would not boot
+  withdraws capacity exactly when a rollback needs it added. Corruption, a revision
+  past this build's bounds, and a revision that exists but does not compile are all
+  fatal at boot: booting an older cached revision instead would hide damage, or
+  silently serve state an operator already replaced.
+
+  A replica that boots this way reports `source = last-known-good` and keeps
+  reporting `incompatible` for the revision it will not read, so the mixed-version
+  state is visible rather than papered over. Roll it forward, as above.
+
+  A rollback that reuses the volume can find a cache the *newer* build exported.
+  It is authentic and intact, and this build still cannot read it, so the boot
+  refusal names the version skew rather than the cache file: the action is to roll
+  the replica forward or repave the volume, not to hunt a disk fault. A cache that
+  fails its signature, or holds rows that do not add up, is still reported as the
+  cache's own failure.
 - **An unwritable cache is a warning, not an outage.** A replica whose disk is
   full keeps serving and logs once; what it loses is the ability to cold-boot
   during an outage.
 
 Without a cache — or with one that fails its signature — a replica that cannot
-reach the control plane refuses to become ready. It never serves an empty or
-partial configuration while reporting itself healthy.
+reach the control plane, or cannot read the revision it finds, refuses to become
+ready. It never serves an empty or partial configuration while reporting itself
+healthy.
 
 ## Related
 
