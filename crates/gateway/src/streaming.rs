@@ -829,7 +829,12 @@ impl Drop for Accounting {
 /// dropped, and flushing the sinks before that ran would lose exactly the spend
 /// the drain was protecting.
 static OUTSTANDING_SETTLEMENTS: AtomicU64 = AtomicU64::new(0);
-static SETTLED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+/// Bumped when a settlement finishes. A `watch` channel rather than a `Notify`
+/// because a `Notify` waiter only enqueues on its first poll, so a wake-up
+/// racing the count check would be lost and the shutdown wait would sleep out
+/// its whole budget instead of noticing the work was already done.
+static SETTLED: std::sync::LazyLock<tokio::sync::watch::Sender<u64>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::Sender::new(0));
 
 /// Settlement outlives the request body, so it runs detached. Outside a
 /// runtime (process teardown) there is nothing left to settle onto.
@@ -842,7 +847,7 @@ where
         handle.spawn(async move {
             future.await;
             if OUTSTANDING_SETTLEMENTS.fetch_sub(1, Ordering::AcqRel) == 1 {
-                SETTLED.notify_waiters();
+                SETTLED.send_modify(|version| *version += 1);
             }
         });
     }
@@ -853,14 +858,14 @@ where
 /// sinks are flushed.
 pub(crate) async fn await_settlements(bound: Duration) -> u64 {
     let _ = tokio::time::timeout(bound, async {
-        loop {
-            // Registered before the count is read, so a settlement finishing in
-            // between wakes this rather than being missed.
-            let settled = SETTLED.notified();
-            if OUTSTANDING_SETTLEMENTS.load(Ordering::Acquire) == 0 {
+        // Subscribed before the count is read, so a settlement finishing in
+        // between bumps a version this receiver has not seen and `changed()`
+        // returns at once rather than sleeping on a wake-up that already fired.
+        let mut settled = SETTLED.subscribe();
+        while OUTSTANDING_SETTLEMENTS.load(Ordering::Acquire) != 0 {
+            if settled.changed().await.is_err() {
                 return;
             }
-            settled.await;
         }
     })
     .await;

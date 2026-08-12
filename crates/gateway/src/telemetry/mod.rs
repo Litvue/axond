@@ -27,7 +27,7 @@ pub use spans::{
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use opentelemetry::global;
 use opentelemetry::logs::LoggerProvider as _;
@@ -136,27 +136,34 @@ pub struct TelemetryGuard {
 }
 
 impl TelemetryGuard {
-    /// Flush and stop the exporters within `timeout` *per signal*, reporting the
-    /// signals that did not drain.
+    /// Flush and stop the exporters by `deadline`, reporting the signals that
+    /// did not drain.
+    ///
+    /// One *absolute* deadline shared by all three signals, not a timeout each:
+    /// the termination grace period an orchestrator is configured with has to
+    /// cover the total, so three signals against three full timeouts would let
+    /// the last step run past the sum this shutdown promises and earn the
+    /// `SIGKILL` the sequence exists to avoid.
     ///
     /// The serving path calls this explicitly rather than relying on `Drop`:
     /// exported usage records and the shutdown's own spans are the ones most
     /// likely to be lost, and a failure to export them is an operational fact
     /// worth logging rather than a silently discarded `Result`.
-    pub fn shutdown(&mut self, timeout: Duration) -> Vec<(&'static str, String)> {
+    pub fn shutdown(&mut self, deadline: Instant) -> Vec<(&'static str, String)> {
+        let remaining = || deadline.saturating_duration_since(Instant::now());
         let mut failures = Vec::new();
         if let Some(provider) = self.tracer.take()
-            && let Err(error) = provider.shutdown_with_timeout(timeout)
+            && let Err(error) = provider.shutdown_with_timeout(remaining())
         {
             failures.push(("traces", error.to_string()));
         }
         if let Some(provider) = self.meter.take()
-            && let Err(error) = provider.shutdown_with_timeout(timeout)
+            && let Err(error) = provider.shutdown_with_timeout(remaining())
         {
             failures.push(("metrics", error.to_string()));
         }
         if let Some(provider) = self.logger.take()
-            && let Err(error) = provider.shutdown_with_timeout(timeout)
+            && let Err(error) = provider.shutdown_with_timeout(remaining())
         {
             failures.push(("logs", error.to_string()));
         }
@@ -174,7 +181,7 @@ impl TelemetryGuard {
 impl Drop for TelemetryGuard {
     fn drop(&mut self) {
         // A no-op after an explicit `shutdown`, which takes the providers.
-        let _ = self.shutdown(FLUSH_TIMEOUT);
+        let _ = self.shutdown(Instant::now() + FLUSH_TIMEOUT);
     }
 }
 

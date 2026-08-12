@@ -327,14 +327,24 @@ async fn serve() -> anyhow::Result<()> {
     );
     let listener = tokio::net::TcpListener::bind(bind).await?;
     // The plan is read when the signal arrives rather than now, so a reload of
-    // `[shutdown]` applies to the termination that follows it.
-    let drain = shutdown::drain(Arc::clone(&lifecycle), signals, {
-        let resources = resources.clone();
-        move || shutdown::Plan::from(&resources.config().config.shutdown)
-    });
+    // `[shutdown]` applies to the termination that follows it. The drain
+    // publishes what it read, and every later step reads it back from there:
+    // all three bounds come from one snapshot.
+    let resolved = shutdown::ResolvedPlan::new();
+    let drain = shutdown::drain(
+        Arc::clone(&lifecycle),
+        signals,
+        {
+            let resources = resources.clone();
+            move || shutdown::Plan::from(&resources.config().config.shutdown)
+        },
+        resolved.clone(),
+    );
     let served = axum::serve(listener, app).with_graceful_shutdown(drain);
-    let plan = shutdown::Plan::from(&resources.config().config.shutdown);
-    let outcome = shutdown::serve_bounded(served, &lifecycle, plan).await;
+    // Only used if the server ends without ever being signalled.
+    let boot = shutdown::Plan::from(&resources.config().config.shutdown);
+    let outcome = shutdown::serve_bounded(served, &lifecycle, &resolved, boot).await;
+    let plan = resolved.or(boot);
 
     // One budget for the whole post-serving sequence, not one per step: what an
     // orchestrator's termination grace period has to cover is the total, and the
@@ -357,7 +367,7 @@ async fn serve() -> anyhow::Result<()> {
     // spend that was incurred must be accounted for either way.
     let flushed = resources.0.usage.flush(remaining()).await;
     flushed.log();
-    let telemetry_failures = telemetry_guard.shutdown(remaining());
+    let telemetry_failures = telemetry_guard.shutdown(flush_by);
     tracing::info!(
         outcome = outcome.as_str(),
         usage_flushed = flushed.is_complete(),

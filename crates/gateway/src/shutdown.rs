@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 use crate::config::Shutdown as ShutdownConfig;
 use crate::telemetry::metrics;
@@ -90,16 +90,20 @@ impl Phase {
 pub struct Lifecycle {
     phase: AtomicU8,
     in_flight: AtomicU64,
-    /// Woken once, when admission closes, so the bounded completion wait can
-    /// start its clock at that moment rather than at boot.
-    closed: Notify,
     /// Set when the deadline expires: in-flight responses end themselves rather
     /// than being torn down by the runtime, which is what lets their spend
     /// settle at all (see [`Lifecycle::abandon`]).
     abandoning: AtomicBool,
-    abandon: Notify,
-    /// Woken when the last in-flight request finishes.
-    idle: Notify,
+    /// Bumped whenever any of the above changes, so a waiter can sleep until
+    /// something it cares about happened.
+    ///
+    /// A `watch` channel rather than a `Notify`: a `Notify` waiter is only
+    /// enqueued when its future is first polled, so a `notify_waiters` landing
+    /// between the state check and that first poll wakes nobody and the waiter
+    /// sleeps until its timeout — burning the very budget the flush needs. A
+    /// `watch` receiver records its version at `subscribe`, so a change racing
+    /// the check is still observed.
+    changes: watch::Sender<u64>,
 }
 
 impl Default for Lifecycle {
@@ -113,10 +117,8 @@ impl Lifecycle {
         Self {
             phase: AtomicU8::new(Phase::Serving.code()),
             in_flight: AtomicU64::new(0),
-            closed: Notify::new(),
             abandoning: AtomicBool::new(false),
-            abandon: Notify::new(),
-            idle: Notify::new(),
+            changes: watch::Sender::new(0),
         }
     }
 
@@ -157,18 +159,35 @@ impl Lifecycle {
     /// Close admission and release the bounded completion wait.
     pub fn close(&self) {
         self.phase.store(Phase::Closing.code(), Ordering::Release);
-        self.closed.notify_waiters();
+        self.announce();
     }
 
-    /// Resolves once admission has closed. Registering the waiter before
-    /// re-reading the phase is what makes a concurrent [`Lifecycle::close`]
-    /// impossible to miss.
+    /// Resolves once admission has closed.
     pub async fn closed(&self) {
-        let notified = self.closed.notified();
-        if self.phase() == Phase::Closing {
-            return;
+        self.wait_for(|| self.phase() == Phase::Closing).await;
+    }
+
+    /// Publish that something a waiter might be sleeping on has changed. The
+    /// state itself stays in the atomics; the version is only a wake-up.
+    fn announce(&self) {
+        self.changes.send_modify(|version| *version += 1);
+    }
+
+    /// Sleep until `reached` holds, waking on every announced change.
+    ///
+    /// Subscribing *before* the first check is the whole point: a change that
+    /// lands between the check and the sleep bumps a version this receiver has
+    /// not seen, so `changed()` returns immediately instead of waiting for a
+    /// notification that already happened.
+    async fn wait_for(&self, mut reached: impl FnMut() -> bool) {
+        let mut changes = self.changes.subscribe();
+        while !reached() {
+            if changes.changed().await.is_err() {
+                // The sender lives in `self`, so this is unreachable while the
+                // borrow is held; treat it as "nothing will change again".
+                return;
+            }
         }
-        notified.await;
     }
 
     /// Tell every still-open response to end.
@@ -180,31 +199,19 @@ impl Lifecycle {
     /// cancellation on the normal accounting path.
     pub fn abandon(&self) {
         self.abandoning.store(true, Ordering::Release);
-        self.abandon.notify_waiters();
+        self.announce();
     }
 
     /// Resolves once [`Lifecycle::abandon`] has been called.
     pub async fn abandoned(&self) {
-        let notified = self.abandon.notified();
-        if self.abandoning.load(Ordering::Acquire) {
-            return;
-        }
-        notified.await;
+        self.wait_for(|| self.abandoning.load(Ordering::Acquire))
+            .await;
     }
 
     /// Wait up to `bound` for in-flight requests to finish, and report how many
     /// are left.
     pub async fn quiesce(&self, bound: Duration) -> u64 {
-        let _ = tokio::time::timeout(bound, async {
-            loop {
-                let idle = self.idle.notified();
-                if self.in_flight() == 0 {
-                    return;
-                }
-                idle.await;
-            }
-        })
-        .await;
+        let _ = tokio::time::timeout(bound, self.wait_for(|| self.in_flight() == 0)).await;
         self.in_flight()
     }
 }
@@ -218,7 +225,7 @@ pub struct Admitted {
 impl Drop for Admitted {
     fn drop(&mut self) {
         if self.lifecycle.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.lifecycle.idle.notify_waiters();
+            self.lifecycle.announce();
         }
     }
 }
@@ -243,6 +250,33 @@ impl From<&ShutdownConfig> for Plan {
             deadline: Duration::from_millis(config.deadline_ms),
             flush_timeout: Duration::from_millis(config.flush_timeout_ms),
         }
+    }
+}
+
+/// The signal-time [`Plan`], published by [`drain`] for the steps that run
+/// after serving.
+///
+/// Without this the deadline and the flush budget would be whatever `[shutdown]`
+/// said at boot, while the drain logged — and the documentation promised — the
+/// reloaded values: an operator would see the new bounds and get the old ones.
+#[derive(Clone, Default)]
+pub struct ResolvedPlan(Arc<std::sync::OnceLock<Plan>>);
+
+impl ResolvedPlan {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The plan resolved when the signal arrived, or `fallback` if the server
+    /// ended on its own and no signal was ever handled.
+    pub fn or(&self, fallback: Plan) -> Plan {
+        self.0.get().copied().unwrap_or(fallback)
+    }
+
+    /// Set once, by the drain: a second signal re-uses the first plan so the
+    /// bounds cannot change midway through one termination.
+    fn publish(&self, plan: Plan) {
+        let _ = self.0.set(plan);
     }
 }
 
@@ -272,10 +306,18 @@ impl Outcome {
 /// Drive the drain sequence and resolve once admission is closed. This is the
 /// future `axum::serve(..).with_graceful_shutdown(..)` waits on, so returning
 /// from it is what stops the listener.
-pub async fn drain(lifecycle: Arc<Lifecycle>, signals: Signals, plan: impl Fn() -> Plan) {
+pub async fn drain(
+    lifecycle: Arc<Lifecycle>,
+    signals: Signals,
+    plan: impl Fn() -> Plan,
+    resolved: ResolvedPlan,
+) {
     let mut signals = signals;
     let signal = signals.recv().await;
     let plan = plan();
+    // Published before anything else waits on it, so the deadline and flush
+    // budget enforced later are the ones logged below.
+    resolved.publish(plan);
     lifecycle.begin_drain();
     metrics::record_shutdown_phase(Phase::Draining);
     tracing::warn!(
@@ -286,7 +328,9 @@ pub async fn drain(lifecycle: Arc<Lifecycle>, signals: Signals, plan: impl Fn() 
         "shutdown requested: readiness now fails while admitted requests keep being served"
     );
     // A second signal means the operator (or the runtime) is no longer willing
-    // to wait for routing to catch up, so the grace window is cut short.
+    // to wait for routing to catch up, so the grace window is cut short. With
+    // `drain_grace_ms = 0` there is no window to cut short: admission closes on
+    // the first signal, and the arm below is never reached.
     if !plan.drain_grace.is_zero() {
         tokio::select! {
             () = tokio::time::sleep(plan.drain_grace) => {}
@@ -302,6 +346,22 @@ pub async fn drain(lifecycle: Arc<Lifecycle>, signals: Signals, plan: impl Fn() 
         deadline_ms = plan.deadline.as_millis() as u64,
         "admission closed: new requests are refused with `draining`"
     );
+    // Handlers stay installed for the rest of the sequence rather than being
+    // dropped here: a signal arriving during the deadline or the flush would
+    // otherwise hit the default disposition and kill the process mid-flush,
+    // discarding exactly the records this sequence exists to write. Past this
+    // point the remaining bounds are what shortens termination, so further
+    // signals are logged and otherwise ignored.
+    tokio::spawn(async move {
+        loop {
+            let signal = signals.recv().await;
+            tracing::warn!(
+                signal,
+                "termination signal ignored: admission is already closed and the remaining \
+                 waits are bounded"
+            );
+        }
+    });
 }
 
 /// Await the server, bounding the wait for in-flight work by `deadline` once
@@ -312,7 +372,16 @@ pub async fn drain(lifecycle: Arc<Lifecycle>, signals: Signals, plan: impl Fn() 
 /// resolve with `SIGKILL` — after the flush never ran. The deadline starts when
 /// admission closes, so time spent failing readiness is not charged to
 /// in-flight requests.
-pub async fn serve_bounded<S, E>(served: S, lifecycle: &Lifecycle, plan: Plan) -> Outcome
+///
+/// The deadline comes from `resolved` — the plan the drain read when the signal
+/// arrived — and only falls back to `boot` when the server ended without a
+/// signal, so a reloaded `[shutdown]` is what is actually enforced.
+pub async fn serve_bounded<S, E>(
+    served: S,
+    lifecycle: &Lifecycle,
+    resolved: &ResolvedPlan,
+    boot: Plan,
+) -> Outcome
 where
     S: std::future::IntoFuture<Output = Result<(), E>>,
     E: std::fmt::Display,
@@ -325,6 +394,8 @@ where
             () = closed => {}
         }
     }
+    // Admission has closed, so the drain has published its plan.
+    let plan = resolved.or(boot);
     match tokio::time::timeout(plan.deadline, served).await {
         Ok(result) => finish(result),
         Err(_) => {
@@ -353,41 +424,69 @@ fn finish<E: std::fmt::Display>(result: Result<(), E>) -> Outcome {
 
 /// The termination signals, installed before serving so a platform that refuses
 /// a handler fails at boot rather than at shutdown.
-pub struct Signals {
+pub struct Signals(Source);
+
+enum Source {
     #[cfg(unix)]
-    terminate: tokio::signal::unix::Signal,
-    #[cfg(unix)]
-    interrupt: tokio::signal::unix::Signal,
+    Os {
+        terminate: tokio::signal::unix::Signal,
+        interrupt: tokio::signal::unix::Signal,
+    },
+    #[cfg(not(unix))]
+    CtrlC,
+    /// One immediate signal and nothing after it, so a test can drive the drain
+    /// without touching process-wide handlers.
+    #[cfg(test)]
+    Once { delivered: bool },
 }
 
 impl Signals {
     #[cfg(unix)]
     pub fn install() -> std::io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
-        Ok(Self {
+        Ok(Self(Source::Os {
             terminate: signal(SignalKind::terminate())?,
             interrupt: signal(SignalKind::interrupt())?,
-        })
+        }))
     }
 
     #[cfg(not(unix))]
     pub fn install() -> std::io::Result<Self> {
-        Ok(Self {})
+        Ok(Self(Source::CtrlC))
+    }
+
+    #[cfg(test)]
+    fn once() -> Self {
+        Self(Source::Once { delivered: false })
     }
 
     /// The next termination request, named for the log line.
-    #[cfg(unix)]
     pub async fn recv(&mut self) -> &'static str {
-        tokio::select! {
-            _ = self.terminate.recv() => "SIGTERM",
-            _ = self.interrupt.recv() => "SIGINT",
+        match &mut self.0 {
+            #[cfg(unix)]
+            Source::Os {
+                terminate,
+                interrupt,
+            } => {
+                tokio::select! {
+                    _ = terminate.recv() => "SIGTERM",
+                    _ = interrupt.recv() => "SIGINT",
+                }
+            }
+            #[cfg(not(unix))]
+            Source::CtrlC => {
+                let _ = tokio::signal::ctrl_c().await;
+                "ctrl-c"
+            }
+            #[cfg(test)]
+            Source::Once { delivered } => {
+                if *delivered {
+                    std::future::pending::<()>().await;
+                }
+                *delivered = true;
+                "SIGTERM"
+            }
         }
-    }
-
-    #[cfg(not(unix))]
-    pub async fn recv(&mut self) -> &'static str {
-        let _ = tokio::signal::ctrl_c().await;
-        "ctrl-c"
     }
 }
 
@@ -447,9 +546,68 @@ mod tests {
     #[tokio::test]
     async fn a_finished_server_completes_without_waiting_for_the_deadline() {
         let lifecycle = Lifecycle::new();
-        let outcome =
-            serve_bounded(async { Ok::<(), std::io::Error>(()) }, &lifecycle, plan()).await;
+        let outcome = serve_bounded(
+            async { Ok::<(), std::io::Error>(()) },
+            &lifecycle,
+            &ResolvedPlan::new(),
+            plan(),
+        )
+        .await;
         assert_eq!(outcome, Outcome::Completed);
+    }
+
+    /// A reload between boot and the signal has to change the bound that is
+    /// enforced, not just the one that is logged.
+    #[tokio::test]
+    async fn the_deadline_enforced_is_the_one_read_when_the_signal_arrived() {
+        let lifecycle = Arc::new(Lifecycle::new());
+        let _admitted = lifecycle.admit().expect("serving admits");
+        let resolved = ResolvedPlan::new();
+
+        let reloaded = Plan {
+            drain_grace: Duration::ZERO,
+            // Long enough that enforcing the boot plan's 50ms instead would
+            // abandon the request and fail the assertion below.
+            deadline: Duration::from_secs(30),
+            flush_timeout: Duration::from_millis(200),
+        };
+        let draining = {
+            let lifecycle = Arc::clone(&lifecycle);
+            let resolved = resolved.clone();
+            tokio::spawn(async move {
+                drain(lifecycle, Signals::once(), move || reloaded, resolved.clone()).await;
+            })
+        };
+
+        let served = {
+            let lifecycle = Arc::clone(&lifecycle);
+            async move {
+                lifecycle.closed().await;
+                // Past the boot deadline, inside the reloaded one.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                Ok::<(), std::io::Error>(())
+            }
+        };
+        let outcome = serve_bounded(served, &lifecycle, &resolved, plan()).await;
+
+        assert_eq!(
+            outcome,
+            Outcome::Completed,
+            "the reloaded deadline must be the one enforced"
+        );
+        assert_eq!(resolved.or(plan()).deadline, reloaded.deadline);
+        assert_eq!(
+            resolved.or(plan()).flush_timeout,
+            reloaded.flush_timeout,
+            "the flush budget must come from the same snapshot as the deadline"
+        );
+        draining.await.expect("the drain finished");
+    }
+
+    /// Without a signal there is nothing to publish, so the boot values stand.
+    #[test]
+    fn the_boot_plan_stands_when_no_signal_was_ever_handled() {
+        assert_eq!(ResolvedPlan::new().or(plan()), plan());
     }
 
     /// The deadline both bounds the wait and tells the still-open responses to
@@ -470,6 +628,7 @@ mod tests {
         let outcome = serve_bounded(
             std::future::pending::<Result<(), std::io::Error>>(),
             &lifecycle,
+            &ResolvedPlan::new(),
             plan(),
         )
         .await;
@@ -488,6 +647,7 @@ mod tests {
         let outcome = serve_bounded(
             async { Err::<(), std::io::Error>(std::io::Error::other("listener failed")) },
             &lifecycle,
+            &ResolvedPlan::new(),
             plan(),
         )
         .await;
@@ -499,6 +659,72 @@ mod tests {
         let lifecycle = Arc::new(Lifecycle::new());
         let _admitted = lifecycle.admit().expect("serving admits");
         assert_eq!(lifecycle.quiesce(Duration::from_millis(20)).await, 1);
+    }
+
+    /// The property the waits rely on, asserted directly: a change published
+    /// after a receiver exists is observable by that receiver, whether or not it
+    /// has been polled. This is what a `Notify` does not give — its waiter is
+    /// enqueued only on first poll, so a wake-up in that window is dropped and
+    /// the waiter sleeps out its bound instead of seeing work already finished.
+    #[test]
+    fn a_change_published_before_the_first_poll_is_still_observable() {
+        let lifecycle = Arc::new(Lifecycle::new());
+        let mut changes = lifecycle.changes.subscribe();
+        assert!(!changes.has_changed().expect("the sender is alive"));
+
+        let admitted = lifecycle.admit().expect("serving admits");
+        lifecycle.close();
+        drop(admitted);
+
+        assert!(
+            changes.has_changed().expect("the sender is alive"),
+            "a waiter armed before the change must not have to be woken again"
+        );
+    }
+
+    /// The same window, exercised through the public waits: the state reaches
+    /// its terminal value before the future is ever polled.
+    #[tokio::test]
+    async fn a_wait_created_before_the_change_resolves_without_a_wake_up() {
+        let lifecycle = Arc::new(Lifecycle::new());
+        let admitted = lifecycle.admit().expect("serving admits");
+        let abandoned = lifecycle.abandoned();
+        let quiesced = lifecycle.quiesce(Duration::from_secs(30));
+
+        lifecycle.abandon();
+        drop(admitted);
+
+        tokio::time::timeout(Duration::from_secs(1), abandoned)
+            .await
+            .expect("`abandoned` must not wait for a notification that already fired");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), quiesced)
+                .await
+                .expect("`quiesce` must not sleep out its bound once nothing is in flight"),
+            0
+        );
+    }
+
+    /// The costly case: the last guard drops on another thread while `quiesce`
+    /// is arming. A lost wake-up here does not fail loudly — it spends the whole
+    /// flush budget, so the usage records are dropped as `shutdown` instead of
+    /// written. The bound is far larger than the work so that a miss shows up as
+    /// a stall rather than a flake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quiesce_sees_a_guard_released_while_it_is_arming() {
+        let started = std::time::Instant::now();
+        for _ in 0..1_000 {
+            let lifecycle = Arc::new(Lifecycle::new());
+            let admitted = lifecycle.admit().expect("serving admits");
+            let releasing = tokio::task::spawn_blocking(move || drop(admitted));
+
+            assert_eq!(lifecycle.quiesce(Duration::from_secs(30)).await, 0);
+            releasing.await.expect("the guard was released");
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "quiesce stalled: a release was missed and the bound is being slept out"
+            );
+        }
     }
 
     #[test]
