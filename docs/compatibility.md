@@ -348,5 +348,6 @@ What is *not* covered: the hermetic Tier 0 gate applies to
 `x86_64-unknown-linux-musl` alone on every change — every Linux archive passes
 through it at release time, but there with the namespace treated as best-effort
 ([ADR 0018](./adr/0018-tier-0-hermetic-boot-gate.md)) — the smoke exercises one
-buffered fixture request rather than streaming or a real provider, and only the
-Python SDKs are exercised end to end.
+buffered fixture request rather than streaming or a real provider, and the SDKs
+exercised end to end are the Python and Node ones above — no Go SDK, and no other
+runtime.

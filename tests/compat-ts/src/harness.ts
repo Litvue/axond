@@ -141,11 +141,16 @@ export async function start(): Promise<Harness> {
   return harness;
 }
 
+/** Whether the process is gone, however it went: a status or a signal. */
+function dead(child: ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
 async function awaitReady(child: ChildProcess, baseUrl: string): Promise<void> {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) {
-      throw new Error(`axond exited with ${child.exitCode}`);
+    if (dead(child)) {
+      throw new Error(`axond exited with ${child.exitCode ?? child.signalCode}`);
     }
     try {
       const response = await fetch(`${baseUrl}/healthz`);
@@ -162,7 +167,7 @@ async function awaitReady(child: ChildProcess, baseUrl: string): Promise<void> {
 }
 
 async function terminate(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null) {
+  if (dead(child)) {
     return;
   }
   const exited = new Promise<void>((done) => child.once("exit", () => done()));

@@ -84,6 +84,7 @@ compat-ts:
 
 # Pin policy for the TypeScript lane: exact versions, locked hashes, pinned Node.
 compat-ts-pins:
+    ops/compat-ts-pins.py --self-test
     ops/compat-ts-pins.py
 
 # Refresh the hash-pinned provider-SDK lockfile, excluding releases newer than a week.

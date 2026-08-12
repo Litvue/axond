@@ -11,7 +11,8 @@ Runs on any `python3` from 3.10 up — the same floor as the other gates — and
 reads JSON only, so it needs neither `node` nor a network.
 
 Usage:
-    ops/compat-ts-pins.py
+    ops/compat-ts-pins.py              # check the committed lane
+    ops/compat-ts-pins.py --self-test  # exercise the version-range comparison only
 """
 
 from __future__ import annotations
@@ -70,7 +71,7 @@ def check() -> list[str]:
     declared = NODE_VERSION_FILE.read_text(encoding="utf-8").strip()
     if not EXACT.match(declared):
         failures.append(f"{NODE_VERSION_FILE.name}: {declared!r} is not an exact Node version")
-    elif declared not in node and not _satisfies(declared, node):
+    elif not _satisfies(declared, node):
         failures.append(
             f"{NODE_VERSION_FILE.name} pins Node {declared}, which engines.node ({node}) excludes"
         )
@@ -97,7 +98,33 @@ def _satisfies(version: str, engines: str) -> bool:
     return True
 
 
+def self_test() -> int:
+    """Prove the range comparison, which decides whether a Node pin is allowed.
+
+    The committed manifest only ever exercises the passing case, so without this
+    the interesting ones — a pin under the floor, one at the ceiling, a
+    comparator the parser does not understand — are never executed.
+    """
+    allowed = [("22.12.0", ">=22.12.0 <23"), ("22.20.1", ">=22.12.0 <23")]
+    refused = [
+        ("22.11.0", ">=22.12.0 <23"),
+        ("23.0.0", ">=22.12.0 <23"),
+        ("22.12.0", ">=20.0.0 <22.12.0"),
+        ("22.12.0", "^22.12.0"),
+    ]
+    for version, engines in allowed:
+        if not _satisfies(version, engines):
+            raise AssertionError(f"{version} should satisfy {engines!r}")
+    for version, engines in refused:
+        if _satisfies(version, engines):
+            raise AssertionError(f"{version} should not satisfy {engines!r}")
+    print(f"compat-ts pins: range self-test passed on Python {sys.version.split()[0]}")
+    return 0
+
+
 def main() -> int:
+    if "--self-test" in sys.argv[1:]:
+        return self_test()
     failures = check()
     for failure in failures:
         print(failure, file=sys.stderr)
