@@ -63,23 +63,26 @@ try {
         throw "SHA-256 mismatch for $Asset"
     }
 
-    $CanVerifyAttestation = $false
-    if (Get-Command gh -ErrorAction SilentlyContinue) {
+    if ($MustVerifyAttestation) {
+        if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+            throw "GitHub CLI is required by -RequireAttestation or AXOND_REQUIRE_ATTESTATION=1"
+        }
         & gh auth status *> $null
-        $CanVerifyAttestation = ($LASTEXITCODE -eq 0)
-    }
-    if ($CanVerifyAttestation) {
+        if ($LASTEXITCODE -ne 0) {
+            throw "Authenticated GitHub CLI is required by -RequireAttestation or AXOND_REQUIRE_ATTESTATION=1"
+        }
+        & gh attestation --help *> $null
+        if ($LASTEXITCODE -ne 0) {
+            throw "GitHub CLI with attestation support is required by -RequireAttestation or AXOND_REQUIRE_ATTESTATION=1"
+        }
         "Verifying GitHub build provenance for $Asset"
         & gh attestation verify $Archive --repo $Repository
         if ($LASTEXITCODE -ne 0) {
             throw "GitHub attestation verification failed for $Asset"
         }
     }
-    elseif ($MustVerifyAttestation) {
-        throw "Authenticated GitHub CLI is required by -RequireAttestation or AXOND_REQUIRE_ATTESTATION=1"
-    }
     else {
-        Write-Warning "Checksum verified; install and authenticate gh for provenance verification."
+        Write-Warning "Checksum verified; use -RequireAttestation to verify GitHub build provenance."
     }
 
     Expand-Archive -Path $Archive -DestinationPath $TempDir

@@ -90,14 +90,18 @@ else
   fail "sha256sum or shasum is required to verify the release"
 fi
 
-if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+if [ "$require_attestation" = "1" ]; then
+  command -v gh >/dev/null 2>&1 || \
+    fail "GitHub CLI is required by AXOND_REQUIRE_ATTESTATION=1"
+  gh auth status >/dev/null 2>&1 || \
+    fail "authenticated GitHub CLI is required by AXOND_REQUIRE_ATTESTATION=1"
+  gh attestation --help >/dev/null 2>&1 || \
+    fail "GitHub CLI with attestation support is required by AXOND_REQUIRE_ATTESTATION=1"
   printf 'verifying GitHub build provenance for %s\n' "$asset"
   gh attestation verify "$temp_dir/$asset" --repo "$repo"
-elif [ "$require_attestation" = "1" ]; then
-  fail "authenticated GitHub CLI is required by AXOND_REQUIRE_ATTESTATION=1"
 else
   printf '%s\n' \
-    "axond installer: checksum verified; install and authenticate gh for provenance verification" >&2
+    "axond installer: checksum verified; set AXOND_REQUIRE_ATTESTATION=1 to verify GitHub build provenance" >&2
 fi
 
 tar -xzf "$temp_dir/$asset" -C "$temp_dir"
