@@ -73,10 +73,13 @@ from `main`, while every artifact lane checks out and verifies the immutable
 tag.
 
 The preflight requires the tag's `Dockerfile`, `ops/docker-smoke.sh`, and
-`ops/binary-smoke.py` — the binary lanes boot what they archive, so a tag
-without the smoke runner cannot be repaired from `main`.
-crates.io publication is enabled only if the tag also contains
-`ops/publish-crates.sh`; older tags skip that lane explicitly.
+`ops/binary-smoke.py`, because every artifact lane runs the tag's own copy of
+them: it fails early and by name rather than at the step that would not find the
+file. A tag that predates the smoke runner is therefore repaired by dispatching
+from `refs/tags/<tag>` instead, which runs that tag's workflow definition and its
+gates. crates.io publication is enabled only if the tag also contains
+`ops/publish-crates.sh`; older tags skip that lane explicitly, because the lane
+is optional in a way a boot gate is not.
 
 ```bash
 gh workflow run .github/workflows/release-please.yml \
