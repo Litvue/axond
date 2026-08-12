@@ -81,9 +81,11 @@ for (const stream of [child.stdout, child.stderr]) {
     process.stdout.write(chunk);
   });
 }
+// Never `process.exit`: writes to a piped stdout are asynchronous, and exiting
+// drops whatever is still queued — which here is the diagnostic itself.
 child.once("error", (error) => {
   console.error(`compat-ts: could not run tsc: ${error.message}`);
-  process.exit(1);
+  process.exitCode = 1;
 });
 child.once("close", (status) => {
   if (status !== 0) {
@@ -91,5 +93,5 @@ child.once("close", (status) => {
       console.error(line);
     }
   }
-  process.exit(status ?? 1);
+  process.exitCode = status ?? 1;
 });
