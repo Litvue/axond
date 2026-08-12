@@ -173,6 +173,16 @@ carries `axond-image-<version>.digest` (the index), the per-architecture
 `axond-image-<version>-amd64.digest` and `-arm64.digest`, and one SPDX SBOM per
 architecture.
 
+### Older releases
+
+Linux ARM64 archives and the multi-architecture image exist from the first
+release that published them; earlier releases carry the x86-64 Linux, macOS, and
+Windows artifacts only. Asking an older release for an ARM64 archive fails with
+an explicit message naming the release and target rather than a transfer error,
+and the Compose quickstart keeps an `AXOND_PLATFORM` default that runs the
+last amd64-only image on ARM hosts under emulation — see [architecture
+selection](./deployment/docker-compose.md#architecture-selection).
+
 ## Build from source
 
 The toolchain is pinned by `rust-toolchain.toml`:

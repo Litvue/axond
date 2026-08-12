@@ -93,10 +93,15 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
+# A release older than a target is a 404, which is worth explaining: ARM64 Linux
+# archives only exist from the first release that published them, so an older
+# pinned version on an ARM host must not fail with a bare transfer error.
 curl --proto '=https' --tlsv1.2 -fLsS \
-  -o "$temp_dir/$asset" "$base_url/$asset"
+  -o "$temp_dir/$asset" "$base_url/$asset" || \
+  fail "release v${version} has no ${asset}; it may predate prebuilt ${target} archives. Use a newer AXOND_VERSION, another AXOND_TARGET, or build from source: https://github.com/${repo}/releases/tag/v${version}"
 curl --proto '=https' --tlsv1.2 -fLsS \
-  -o "$temp_dir/$asset.sha256" "$base_url/$asset.sha256"
+  -o "$temp_dir/$asset.sha256" "$base_url/$asset.sha256" || \
+  fail "release v${version} does not contain ${asset}.sha256"
 
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "$temp_dir" && sha256sum -c "$asset.sha256")
