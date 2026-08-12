@@ -22,6 +22,7 @@ def markdown_files() -> list[Path]:
     files.extend((ROOT / "docs").rglob("*.md"))
     files.extend((ROOT / "crates").rglob("README.md"))
     files.extend((ROOT / "tests").rglob("README.md"))
+    files.append(ROOT / "fuzz/README.md")
     return sorted(set(files))
 
 

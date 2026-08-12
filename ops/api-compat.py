@@ -37,6 +37,8 @@ ROOT = Path(__file__).resolve().parent.parent
 OVERRIDES = ROOT / "ops/api-compat-overrides.toml"
 OVERRIDE_KEYS = {"crate", "baseline", "justification", "reviewed_in"}
 LIBRARY_KINDS = {"lib", "rlib", "dylib", "cdylib", "proc-macro"}
+# A crate-level gate that removes the entire library outside a fuzzing build.
+FUZZ_ONLY_LIBRARY = re.compile(r"^#!\[cfg\(fuzzing\)\]\s*$", re.MULTILINE)
 CHECKING = re.compile(r"^\s*Checking (\S+) v(\S+) -> v(\S+)", re.MULTILINE)
 TABLE = re.compile(r"\[\[break\]\]\s*(?:#.*)?")
 KEY_VALUE = re.compile(r'([A-Za-z0-9_-]+)\s*=\s*"([^"]*)"\s*(?:#.*)?')
@@ -51,6 +53,11 @@ def published_library_crates() -> list[str]:
     rather than keeping a hard-coded list means a new published library crate is
     covered the day it is added, and Cargo — not this script — decides what
     counts as a library target or an inherited `publish` setting.
+
+    A library target that is `cfg`-ed away for every build the workspace performs
+    (`#![cfg(fuzzing)]`, which only the out-of-tree `fuzz/` project sets) exports
+    nothing and so has no API to compare. `axond` has one of those, as the seam
+    the fuzz targets link against, and stays binary-only here.
     """
     completed = subprocess.run(
         ["cargo", "metadata", "--no-deps", "--format-version", "1", "--locked"],
@@ -67,13 +74,32 @@ def published_library_crates() -> list[str]:
         # `publish` is null when unrestricted and [] for `publish = false`.
         if package.get("publish") == []:
             continue
-        kinds = {kind for target in package["targets"] for kind in target["kind"]}
-        if kinds.isdisjoint(LIBRARY_KINDS):
+        libraries = [
+            target
+            for target in package["targets"]
+            if not LIBRARY_KINDS.isdisjoint(target["kind"])
+        ]
+        if not libraries or all(exports_nothing(target) for target in libraries):
             continue
         crates.append(package["name"])
     if not crates:
         raise SystemExit("no published library crates found in the workspace")
     return sorted(crates)
+
+
+def exports_nothing(target: dict) -> bool:
+    """Whether a library target compiles to nothing outside a fuzzing build.
+
+    A crate-level `#![cfg(fuzzing)]` removes the whole module tree, so the target
+    is an empty crate for every consumer: there is no API to compare against
+    crates.io, and asking `cargo-semver-checks` to try fails on a baseline that
+    has no library at all.
+    """
+    try:
+        source = Path(target["src_path"]).read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return FUZZ_ONLY_LIBRARY.search(source) is not None
 
 
 def parse_overrides(text: str, name: str) -> list[dict[str, str]]:

@@ -171,7 +171,11 @@ interface — read it at your own risk.
 
 Three crates are published: `gateway-core` and `gateway-transport` are libraries
 with a public Rust API, and `axond` is the binary — its compatibility surface is
-the config, HTTP, and telemetry contracts above, not Rust items.
+the config, HTTP, and telemetry contracts above, not Rust items. `axond` does
+carry a library target, but it is empty outside `--cfg fuzzing`: it exists so the
+out-of-tree [fuzz project](./security/fuzzing.md) can link the parsers under
+test, exports nothing to any other consumer, and is therefore excluded from the
+compatibility gate rather than promised.
 
 The library API follows Cargo's `0.x` rules, and mechanically: a required CI lane
 runs [`cargo-semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks)
