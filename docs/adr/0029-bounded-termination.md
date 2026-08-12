@@ -67,15 +67,21 @@ the handler returned would report a replica as quiesced while it was still
 relaying tokens.
 
 **The deadline actively ends work rather than waiting for it.** Requests
-admitted before the close get `deadline_ms`. Whatever remains is *told to end*:
-the response body returns an error, which drops the upstream stream and settles
+admitted before the close get `deadline_ms`. A response that has begun is *told
+to end*: the body returns an error, which drops the upstream stream and settles
 it through the ordinary cancellation path, so the usage record is written as
-`client_cancelled` with spend measured up to the last relayed token. Dropping
-the server future instead would not do this — `hyper` serves each connection on
-its own task, so those connections outlive the future and are torn down only
-with the runtime, too late for anything to settle. A truncated response ends in
-an error rather than cleanly, because a clean end would present a partial
-answer as a complete one.
+`client_cancelled` with spend measured up to the last relayed token. The signal
+reaches responses, not handlers — a request still inside its handler (a buffered
+completion waiting on an upstream, bounded by `failover.overall_timeout_ms`) has
+no body to end yet, so it is bounded only by the deadline and the waits that
+follow it, and is cut by process exit with nothing settled if it outlasts them.
+Carrying cancellation into the handler path is a follow-up.
+
+Dropping the server future instead of ending bodies would settle nothing at all:
+`hyper` serves each connection on its own task, so those connections outlive the
+future and are torn down only with the runtime, too late for anything to settle.
+A truncated response ends in an error rather than cleanly, because a clean end
+would present a partial answer as a complete one.
 
 **One flush budget covers everything after serving.** Inside a single
 `flush_timeout_ms`, measured as one absolute deadline: abandoned responses are
