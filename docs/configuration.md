@@ -162,8 +162,10 @@ Exactly one of `env` and `file` must be non-empty; zero or both is rejected.
 
 ## `[shutdown]` — Tier 0
 
-Bounds on the `SIGTERM`/`SIGINT` sequence. All three are read when the signal
-arrives, so a reload applies to the termination that follows it.
+Bounds on the `SIGTERM`/`SIGINT` sequence
+([ADR 0029](./adr/0029-bounded-termination.md)). All three are read when the
+signal arrives and enforced as one snapshot, so a reload applies to the
+termination that follows it.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -175,8 +177,14 @@ arrives, so a reload applies to the termination that follows it.
 terminating replica is not an unhealthy one. Worst-case termination is the sum
 of the three, so the supervisor's stopping timeout
 (`terminationGracePeriodSeconds`, `TimeoutStopSec`, `docker stop -t`) must
-exceed it or a `SIGKILL` lands mid-flush. A second termination signal skips the
-remaining drain grace and closes admission at once.
+exceed it or a `SIGKILL` lands mid-flush.
+
+A second termination signal *during the drain window* skips the rest of it and
+closes admission at once. With `drain_grace_ms = 0` there is no window to skip:
+the first signal closes admission. Once admission is closed — by either route —
+further signals are logged and otherwise ignored, because the deadline and the
+flush budget already bound what is left and honoring one there would kill the
+process mid-flush, discarding the usage records the sequence exists to write.
 
 ## `[[namespace]]`
 

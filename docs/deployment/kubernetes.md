@@ -94,7 +94,8 @@ Axond does not terminate TLS. The Ingress or external load balancer must:
 ## Rollouts and termination
 
 `SIGTERM` starts a bounded drain in the process itself, so a rollout no longer
-depends on endpoint removal winning a race:
+depends on endpoint removal winning a race
+([ADR 0029](../adr/0029-bounded-termination.md)):
 
 1. `/readyz` answers `503 draining` immediately. A Pod deleted through the API
    is removed from the Service endpoints as soon as it is marked terminating, so
@@ -129,7 +130,11 @@ decides when a stream is cut.
 A `preStop` hook is not required, because readiness fails before admission
 closes. Add one only to lengthen the endpoint-removal window on a load balancer
 that does not watch endpoints (some cloud L7 ingresses), and set
-`shutdown.drain_grace_ms = 0` if the hook already waited.
+`shutdown.drain_grace_ms = 0` if the hook already waited — with no drain window
+the first `SIGTERM` closes admission straight away. During a drain window, a
+second `SIGTERM` closes admission immediately; after admission has closed,
+further signals are logged and ignored so a `kubectl delete --now` cannot cut
+the flush short.
 
 Keep `maxUnavailable: 0`, a PodDisruptionBudget, and enough replicas: they are
 what keeps capacity up during the drain. Clients should still retry requests

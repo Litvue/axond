@@ -434,10 +434,11 @@ enum Source {
     },
     #[cfg(not(unix))]
     CtrlC,
-    /// One immediate signal and nothing after it, so a test can drive the drain
-    /// without touching process-wide handlers.
+    /// Signals a test delivers itself, so the drain can be driven without
+    /// touching process-wide handlers. The sequence ends by never resolving
+    /// again, exactly like a process that receives one `SIGTERM`.
     #[cfg(test)]
-    Once { delivered: bool },
+    Scripted(tokio::sync::mpsc::UnboundedReceiver<&'static str>),
 }
 
 impl Signals {
@@ -455,9 +456,25 @@ impl Signals {
         Ok(Self(Source::CtrlC))
     }
 
+    /// One `SIGTERM` and nothing after it.
     #[cfg(test)]
     fn once() -> Self {
-        Self(Source::Once { delivered: false })
+        let (deliver, signals) = Self::scripted();
+        deliver("SIGTERM");
+        signals
+    }
+
+    /// A sender for the test to deliver signals through, and the source the
+    /// drain reads them from.
+    #[cfg(test)]
+    fn scripted() -> (impl Fn(&'static str), Self) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            move |signal| {
+                let _ = tx.send(signal);
+            },
+            Self(Source::Scripted(rx)),
+        )
     }
 
     /// The next termination request, named for the log line.
@@ -479,13 +496,10 @@ impl Signals {
                 "ctrl-c"
             }
             #[cfg(test)]
-            Source::Once { delivered } => {
-                if *delivered {
-                    std::future::pending::<()>().await;
-                }
-                *delivered = true;
-                "SIGTERM"
-            }
+            Source::Scripted(signals) => match signals.recv().await {
+                Some(signal) => signal,
+                None => std::future::pending().await,
+            },
         }
     }
 }
@@ -575,7 +589,13 @@ mod tests {
             let lifecycle = Arc::clone(&lifecycle);
             let resolved = resolved.clone();
             tokio::spawn(async move {
-                drain(lifecycle, Signals::once(), move || reloaded, resolved.clone()).await;
+                drain(
+                    lifecycle,
+                    Signals::once(),
+                    move || reloaded,
+                    resolved.clone(),
+                )
+                .await;
             })
         };
 
@@ -669,7 +689,7 @@ mod tests {
     #[test]
     fn a_change_published_before_the_first_poll_is_still_observable() {
         let lifecycle = Arc::new(Lifecycle::new());
-        let mut changes = lifecycle.changes.subscribe();
+        let changes = lifecycle.changes.subscribe();
         assert!(!changes.has_changed().expect("the sender is alive"));
 
         let admitted = lifecycle.admit().expect("serving admits");
@@ -725,6 +745,100 @@ mod tests {
                 "quiesce stalled: a release was missed and the bound is being slept out"
             );
         }
+    }
+
+    /// The escape hatch an operator reaches for when routing has already caught
+    /// up: the second signal closes admission instead of waiting out a grace
+    /// window sized for the slowest load balancer.
+    #[tokio::test]
+    async fn a_second_signal_cuts_the_grace_window_short() {
+        let lifecycle = Arc::new(Lifecycle::new());
+        let (deliver, signals) = Signals::scripted();
+        let long_grace = Plan {
+            // Far longer than the test's patience: only the second signal can
+            // close admission this quickly.
+            drain_grace: Duration::from_secs(30),
+            ..plan()
+        };
+        let draining = {
+            let lifecycle = Arc::clone(&lifecycle);
+            tokio::spawn(async move {
+                drain(lifecycle, signals, move || long_grace, ResolvedPlan::new()).await;
+            })
+        };
+
+        deliver("SIGTERM");
+        // The drain has to be inside the grace window for the second signal to
+        // be the thing that ends it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while lifecycle.phase() != Phase::Draining {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first signal begins the drain");
+        assert!(
+            lifecycle.admit().is_some(),
+            "the grace window keeps admitting"
+        );
+
+        deliver("SIGINT");
+        tokio::time::timeout(Duration::from_secs(5), draining)
+            .await
+            .expect("the second signal must not wait out the grace window")
+            .expect("the drain finished");
+        assert_eq!(lifecycle.phase(), Phase::Closing);
+    }
+
+    /// With no window there is nothing to cut short, so the first signal closes
+    /// admission and no second one is required to make progress.
+    #[tokio::test]
+    async fn a_zero_grace_window_closes_admission_on_the_first_signal() {
+        let lifecycle = Arc::new(Lifecycle::new());
+        let zero_grace = Plan {
+            drain_grace: Duration::ZERO,
+            ..plan()
+        };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            drain(
+                Arc::clone(&lifecycle),
+                Signals::once(),
+                move || zero_grace,
+                ResolvedPlan::new(),
+            ),
+        )
+        .await
+        .expect("a zero grace window needs no second signal");
+        assert_eq!(lifecycle.phase(), Phase::Closing);
+        assert!(lifecycle.admit().is_none());
+    }
+
+    /// Past the close the remaining bounds are what shortens termination, so a
+    /// further signal is logged and the phase stays where it is — it must not
+    /// re-enter the sequence or take the process down mid-flush.
+    #[tokio::test]
+    async fn a_signal_after_the_close_leaves_the_sequence_alone() {
+        let lifecycle = Arc::new(Lifecycle::new());
+        let (deliver, signals) = Signals::scripted();
+        let zero_grace = Plan {
+            drain_grace: Duration::ZERO,
+            ..plan()
+        };
+        deliver("SIGTERM");
+        drain(
+            Arc::clone(&lifecycle),
+            signals,
+            move || zero_grace,
+            ResolvedPlan::new(),
+        )
+        .await;
+
+        deliver("SIGTERM");
+        // Let the installed consumer take it.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(lifecycle.phase(), Phase::Closing);
+        assert!(lifecycle.admit().is_none());
     }
 
     #[test]
