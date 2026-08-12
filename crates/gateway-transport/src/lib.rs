@@ -508,7 +508,11 @@ impl HttpDispatcher {
             upstream.base_url.trim_end_matches('/')
         );
 
-        let mut req = self.client.post(url).json(&body);
+        let mut req = self
+            .client
+            .post(url)
+            .headers(trace_context_headers())
+            .json(&body);
         req = match &upstream.auth {
             AuthScheme::Bearer => req.bearer_auth(upstream.api_key.expose_secret()),
             AuthScheme::Header(name) => req.header(*name, upstream.api_key.expose_secret()),
