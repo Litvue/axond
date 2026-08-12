@@ -81,7 +81,12 @@ as its own API names them (`gpt-5.5`), so an offering resolves to the neutral
 record it is the unauthored tail of at a segment boundary, and a tail matching
 two authored records is refused rather than attributed to one of them.
 `published_model_id` keeps the provider's own string, which is what a request to
-that provider must use.
+that provider must use. Resolution reads only the key and the neutral index, so a
+provider that publishes one model under two callable ids (`qiniu-ai` offers both
+`mimo-v2-flash` and `xiaomi/mimo-v2-flash`) contributes two offerings of one
+model rather than two models: what identifies an offering is
+`(provider, published_model_id)`, and a projection of distinct models is
+therefore a projection of the catalogue's models.
 
 **A real excerpt of the source document is compiled into the binary** as an
 offline seed and parsed through the same strict adapter as a fetched payload, so

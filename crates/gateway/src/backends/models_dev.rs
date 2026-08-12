@@ -563,14 +563,16 @@ type NeutralRecords = BTreeMap<ModelId, (ModelFacts, JsonPointer)>;
 /// Resolve every key one provider publishes to the id the catalogue files it
 /// under.
 ///
-/// Resolution is per provider rather than per key because a provider may publish
-/// one model under two callable ids — `qiniu-ai` offers both `mimo-v2-flash` and
-/// `xiaomi/mimo-v2-flash` — and an offering is one provider's statement about one
-/// model. When two keys would resolve to the same model, only a key that *is*
-/// the model's id keeps it; the others stay filed under the id they were
-/// published as, which is the id a request to that provider uses. Two published
-/// aliases therefore remain two offerings, as upstream states them, rather than
-/// one of them being dropped or the import refused.
+/// A provider may publish one model under two callable ids — `qiniu-ai` offers
+/// both `mimo-v2-flash` and `xiaomi/mimo-v2-flash` — and both resolve to the one
+/// model they are, so the catalogue files one model rather than two. Each key
+/// stays a separate offering, keeping the id a request to that provider must
+/// send, because each is separately callable.
+///
+/// Resolution depends only on the key and the neutral index, never on what else
+/// the same provider happens to publish: two providers offering the same model
+/// file it under the same id whether or not either of them also publishes an
+/// alias of it.
 fn resolve_provider_models<'a>(
     published: &BTreeMap<&'a str, ModelId>,
     neutral: &NeutralRecords,
@@ -580,16 +582,6 @@ fn resolve_provider_models<'a>(
     for (key, id) in published {
         let pointer = &pointers[key];
         resolved.insert(*key, canonical_model_id(id, neutral, pointer)?);
-    }
-    let claimed: BTreeMap<ModelId, usize> =
-        resolved.values().fold(BTreeMap::new(), |mut counts, id| {
-            *counts.entry(id.clone()).or_default() += 1;
-            counts
-        });
-    for (key, id) in &mut resolved {
-        if claimed[id] > 1 && *id != published[key] {
-            *id = published[key].clone();
-        }
     }
     Ok(resolved)
 }
@@ -2061,33 +2053,39 @@ mod tests {
         );
     }
 
-    /// A provider may publish one model under two callable ids, and both are
-    /// ids a request can use, so neither the import nor either offering may be
-    /// lost to the join that files provider-local keys under authored ones.
+    /// A provider may publish one model under two callable ids. Both are ids a
+    /// request can use, so both stay offerings — and both name the one model
+    /// they are, so the catalogue does not list that model twice and does not
+    /// file it differently depending on which aliases a provider happens to
+    /// publish.
     #[test]
-    fn two_published_aliases_of_one_model_stay_two_offerings() {
+    fn two_published_aliases_of_one_model_are_two_offerings_of_one_model() {
         let content = parse(ALIASES).expect("fixture parses").content;
         let authored = ModelId::parse("xiaomi/mimo-v2-flash").expect("id");
-        let alias = ModelId::parse("mimo-v2-flash").expect("id");
         let provider = ProviderId::parse("qiniu-ai").expect("id");
 
-        let joined = content
-            .offering(&authored, &provider)
-            .expect("the authored id is the model it names");
-        assert_eq!(joined.published_model_id, "xiaomi/mimo-v2-flash");
         assert!(
             content
-                .model(&authored)
-                .and_then(|entry| entry.neutral.as_ref())
-                .is_some()
+                .model(&ModelId::parse("mimo-v2-flash").expect("id"))
+                .is_none(),
+            "an alias of a model is not a second model"
         );
-
-        let kept = content
-            .offering(&alias, &provider)
-            .expect("the provider's other id is still an offering");
+        let entry = content.model(&authored).expect("the authored record");
+        assert!(entry.neutral.is_some());
         assert_eq!(
-            kept.published_model_id, "mimo-v2-flash",
+            entry
+                .offerings_by(&provider)
+                .map(|offering| offering.published_model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mimo-v2-flash", "xiaomi/mimo-v2-flash"],
             "a request may use either published id, so neither is dropped"
+        );
+        assert_eq!(
+            content
+                .offering(&authored, &provider)
+                .map(|offering| offering.model.clone()),
+            Some(authored.clone()),
+            "and every one of them is an offering of the model it names"
         );
         assert_eq!(content.offering_count(), 2);
     }

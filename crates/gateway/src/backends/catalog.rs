@@ -1064,15 +1064,43 @@ pub struct CatalogModelEntry {
     /// publishes offerings for a model without a neutral record — common, and not
     /// an error: the offerings are still usable metadata.
     pub neutral: Option<ModelFacts>,
-    /// Offerings, ordered by provider.
+    /// Offerings, ordered by provider and then by the id that provider
+    /// publishes.
+    ///
+    /// A provider may offer one model under more than one callable id — the
+    /// upstream's `qiniu-ai` publishes both `mimo-v2-flash` and
+    /// `xiaomi/mimo-v2-flash` — and each is a separate offering because each is
+    /// separately requestable. What identifies an offering within a model is
+    /// therefore `(provider, published_model_id)`, not the provider alone.
     pub offerings: Vec<ProviderOffering>,
 }
 
 impl CatalogModelEntry {
+    /// This provider's offering of the model, or its first by published id when
+    /// the provider publishes the model under several.
     pub fn offering(&self, provider: &ProviderId) -> Option<&ProviderOffering> {
         self.offerings
             .iter()
             .find(|offering| &offering.provider == provider)
+    }
+
+    /// Every offering this provider publishes of the model, ordered by the id it
+    /// publishes them under.
+    pub fn offerings_by(&self, provider: &ProviderId) -> impl Iterator<Item = &ProviderOffering> {
+        self.offerings
+            .iter()
+            .filter(move |offering| &offering.provider == provider)
+    }
+
+    /// The offering a request naming `published` would reach.
+    pub fn offering_published_as(
+        &self,
+        provider: &ProviderId,
+        published: &str,
+    ) -> Option<&ProviderOffering> {
+        self.offerings.iter().find(|offering| {
+            &offering.provider == provider && offering.published_model_id == published
+        })
     }
 }
 
@@ -1099,10 +1127,11 @@ pub enum CatalogContentError {
     DuplicateProvider { provider: ProviderId },
     #[error("model `{model}` appears twice")]
     DuplicateModel { model: ModelId },
-    #[error("model `{model}` lists provider `{provider}` twice")]
+    #[error("model `{model}` lists `{provider}`'s `{published}` twice")]
     DuplicateOffering {
         model: ModelId,
         provider: ProviderId,
+        published: String,
     },
     #[error("model `{model}` is offered by `{provider}`, which the payload does not describe")]
     UnknownProvider {
@@ -1171,15 +1200,19 @@ impl CatalogContent {
             });
         }
         for model in &mut models {
-            model
-                .offerings
-                .sort_by(|left, right| left.provider.cmp(&right.provider));
-            if let Some(duplicate) =
-                first_duplicate(model.offerings.iter().map(|offering| &offering.provider))
-            {
+            model.offerings.sort_by(|left, right| {
+                left.provider
+                    .cmp(&right.provider)
+                    .then_with(|| left.published_model_id.cmp(&right.published_model_id))
+            });
+            if let Some(duplicate) = model.offerings.windows(2).find(|pair| {
+                pair[0].provider == pair[1].provider
+                    && pair[0].published_model_id == pair[1].published_model_id
+            }) {
                 return Err(CatalogContentError::DuplicateOffering {
                     model: model.id.clone(),
-                    provider: duplicate.clone(),
+                    provider: duplicate[0].provider.clone(),
+                    published: duplicate[0].published_model_id.clone(),
                 });
             }
             for offering in &model.offerings {
@@ -1546,7 +1579,7 @@ impl CatalogDiff {
                 (None, None) => {}
             }
             for offering in &model.offerings {
-                let Some(previous_offering) = before.offering(&offering.provider) else {
+                let Some(previous_offering) = paired(before, model, offering) else {
                     changes.push(CatalogChange::OfferingAdded {
                         model: (*id).clone(),
                         provider: offering.provider.clone(),
@@ -1556,7 +1589,7 @@ impl CatalogDiff {
                 changes.extend(offering_changes(id, previous_offering, offering));
             }
             for offering in &before.offerings {
-                if model.offering(&offering.provider).is_none() {
+                if paired(model, before, offering).is_none() {
                     changes.push(CatalogChange::OfferingRemoved {
                         model: (*id).clone(),
                         provider: offering.provider.clone(),
@@ -1612,6 +1645,26 @@ impl CatalogDiff {
             .iter()
             .any(|change| matches!(change, CatalogChange::PriceChanged { .. }))
     }
+}
+
+/// The offering in `entry` that `offering` is the other revision of.
+///
+/// A provider that offers the model once is paired by provider alone, so
+/// renaming the id callers must send reads as that one offering changing rather
+/// than as one disappearing and another arriving. A provider offering the model
+/// under several ids has no such single counterpart, so those are paired by the
+/// id each is published under.
+fn paired<'a>(
+    entry: &'a CatalogModelEntry,
+    from: &CatalogModelEntry,
+    offering: &ProviderOffering,
+) -> Option<&'a ProviderOffering> {
+    let mut published = entry.offerings_by(&offering.provider);
+    let first = published.next()?;
+    if published.next().is_none() && from.offerings_by(&offering.provider).count() == 1 {
+        return Some(first);
+    }
+    entry.offering_published_as(&offering.provider, &offering.published_model_id)
 }
 
 fn offering_changes(
@@ -1820,6 +1873,29 @@ mod tests {
                 .child("models")
                 .child(model),
         }
+    }
+
+    /// A provider offering one model under two ids has two offerings, so each is
+    /// compared against the id it is published under: a price moving on one is
+    /// that offering changing, not one offering disappearing and another
+    /// arriving.
+    #[test]
+    fn a_second_published_id_from_one_provider_is_diffed_as_its_own_offering() {
+        let mut alias = offering("openai", "gpt-4o", Some(price(1, 2)));
+        alias.published_model_id = "gpt-4o-latest".to_owned();
+        let mut dearer = alias.clone();
+        dearer.price = Some(price(1, 3));
+        let before = content(vec![offering("openai", "gpt-4o", Some(price(1, 2))), alias]);
+        let after = content(vec![
+            offering("openai", "gpt-4o", Some(price(1, 2))),
+            dearer,
+        ]);
+
+        assert_ne!(before.content_id(), after.content_id());
+        let diff = after.diff(&before);
+        assert_eq!(diff.counts().prices_changed, 1);
+        assert_eq!(diff.counts().offerings_added, 0);
+        assert_eq!(diff.counts().offerings_removed, 0);
     }
 
     fn price(input: u64, output: u64) -> ObservedPrice {
@@ -2103,6 +2179,7 @@ mod tests {
             Err(CatalogContentError::DuplicateOffering {
                 model: ModelId::parse("gpt-4o").expect("id"),
                 provider: ProviderId::parse("openai").expect("id"),
+                published: "gpt-4o".to_owned(),
             })
         );
         assert_eq!(
