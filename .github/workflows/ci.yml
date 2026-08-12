@@ -204,6 +204,40 @@ jobs:
         env:
           AXOND_BIN: ${{ github.workspace }}/target/debug/axond
 
+  # The same wire claim through the vendors' Node SDKs, which additionally
+  # type-checks every call against the SDKs' own definitions. Deliberately a
+  # second runtime rather than a second assertion: a customer runs one of these.
+  sdk-compat-ts:
+    name: Provider-SDK compatibility (TypeScript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: tests/compat-ts/.nvmrc
+          cache: npm
+          cache-dependency-path: tests/compat-ts/package-lock.json
+      - name: Build the gateway the SDKs will talk to
+        run: cargo build -p axond --locked
+      - name: Check the compatibility pins
+        run: ops/compat-ts-pins.py
+      # Hermetic: the SDKs are pointed at a local fake upstream serving the
+      # committed fixtures, so this lane makes no provider call and needs no key.
+      - name: Install the pinned provider SDKs from the lockfile
+        run: npm ci --ignore-scripts
+        working-directory: tests/compat-ts
+      - name: Type-check and drive axond with the vendors' own Node SDKs
+        run: npm test
+        working-directory: tests/compat-ts
+        env:
+          AXOND_BIN: ${{ github.workspace }}/target/debug/axond
+
   docs:
     name: Documentation
     runs-on: ubuntu-latest
@@ -430,6 +464,7 @@ jobs:
       - tests
       - stateful-tests
       - sdk-compat
+      - sdk-compat-ts
       - docs
       - publish-dry-run
       - dependency-policy
@@ -449,6 +484,7 @@ jobs:
           test "${{ needs.tests.result }}" = success
           test "${{ needs.stateful-tests.result }}" = success
           test "${{ needs.sdk-compat.result }}" = success
+          test "${{ needs.sdk-compat-ts.result }}" = success
           test "${{ needs.docs.result }}" = success
           test "${{ needs.publish-dry-run.result }}" = success
           test "${{ needs.dependency-policy.result }}" = success
