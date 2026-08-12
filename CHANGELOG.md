@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.7](https://github.com/Litvue/axond/compare/v0.3.6...v0.3.7) (2026-08-12)
+
+
+### Features
+
+* **state:** define the desired-state and immutable revision contract ([#178](https://github.com/Litvue/axond/issues/178)) ([2c99804](https://github.com/Litvue/axond/commit/2c99804e62c05d58116d9400a69a5d2f39a303c1))
+
 ## [0.3.6](https://github.com/Litvue/axond/compare/v0.3.5...v0.3.6) (2026-08-12)
 
 
