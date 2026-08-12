@@ -2,7 +2,7 @@ services:
   axond:
     # Pull-first for evaluators. Development and CI add docker-compose.build.yml
     # to build the checked-out tree instead.
-    image: ${AXOND_IMAGE:-ghcr.io/litvue/axond:0.3.14} # x-release-please-version
+    image: ${AXOND_IMAGE:-ghcr.io/litvue/axond:0.3.15} # x-release-please-version
     # The pinned tag above is still an amd64-only release, so the default keeps
     # ARM hosts working through emulation instead of failing to pull. Once a
     # multi-architecture tag is selected — a bumped default, or AXOND_IMAGE —

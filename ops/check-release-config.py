@@ -46,7 +46,7 @@ IMAGE_PLATFORMS = {"linux/amd64", "linux/arm64"}
 # hosts unable to pull an image that has no ARM child yet. The moment
 # release-please bumps the pinned tag past it, the fallback is wrong and this
 # check demands the unpinned form, so the transition cannot be forgotten.
-LAST_AMD64_ONLY_VERSION = (0, 3, 14)
+LAST_AMD64_ONLY_VERSION = (0, 3, 15)
 AMD64_FALLBACK_PLATFORM = "platform: ${AXOND_PLATFORM-linux/amd64}"
 NATIVE_PLATFORM = "platform: ${AXOND_PLATFORM-}"
 # Documentation that must name every target and platform an operator can pick.
