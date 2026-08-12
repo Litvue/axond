@@ -29,9 +29,8 @@
 //! Both halves of that name are renameable, and per-namespace durable state —
 //! budgets, credential pools, gateway-key bindings — must survive a rename. So a
 //! projected namespace carries what it *is* as well as what it is called:
-//! [`Namespace::project`] holds the immutable
-//! [`ProjectIdentity`](crate::config::ProjectIdentity), and the id is the name a
-//! request uses to reach it. Renaming `acme` to `acme-inc` therefore changes the
+//! [`Namespace::project`] holds the immutable [`ProjectIdentity`], and the id is
+//! the name a request uses to reach it. Renaming `acme` to `acme-inc` changes the
 //! name callers say and the labels an operator reads, and changes nothing about
 //! which durable object was charged: the runtime slice keys per-namespace state on
 //! the identity, and treats the id as display and routing only. A file-declared
