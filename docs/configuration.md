@@ -82,8 +82,8 @@ matrices before planning a deployment.
 ### Stateful bootstrap
 
 The whole file a stateful replica reads is `mode`, `[server]`, `[transport]`,
-`[reload]`, telemetry (`[[usage_sink]]`, plus the environment-only OTLP
-settings), the three sections below, and *backend selection with DSN references*
+`[admission]`, `[reload]`, telemetry (`[[usage_sink]]`, plus the environment-only
+OTLP settings), the three sections below, and *backend selection with DSN references*
 for the opt-in `[budget]`, `[rate_limit]`, and `[revocation]` backends.
 [`axond.stateful.example.toml`](../axond.stateful.example.toml) is that file with
 prose.

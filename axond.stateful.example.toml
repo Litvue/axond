@@ -80,6 +80,16 @@ id = "breakglass"
 # backend = "redis" # none (default) | redis | postgres
 # dsn_env = "AXOND_REDIS_URL"
 
+# ── Process-local bounds ─────────────────────────────────────────────────────
+# `[transport]` and `[admission]` are read in this mode too: they bound what one
+# replica does to a provider and what callers may do to one replica, which is a
+# serving parameter of this process rather than a durable resource the control
+# plane owns. Both default to the values `axond.example.toml` documents.
+
+# [admission]
+# max_in_flight = 1_024
+# max_in_flight_per_tenant = 0 # set once a second namespace shares the replica
+
 # ── Telemetry ────────────────────────────────────────────────────────────────
 # Unchanged by the mode, and environment-only for traces/metrics/logs
 # (OTEL_EXPORTER_OTLP_ENDPOINT). Usage rows keep their own transport settings.
