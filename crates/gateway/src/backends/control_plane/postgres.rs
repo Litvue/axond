@@ -2460,10 +2460,30 @@ mod tests {
             )
             .await;
 
+        // A version of this encoding this build has not learned: the rows may be
+        // entirely intact, and the action is a deployment rather than a restore.
         let error = store
             .load_revision(first.id)
             .await
             .expect_err("a row this build cannot read is not hydratable");
+        assert_ne!(error.category(), FailureCategory::Corrupt);
+        let ControlPlaneError::Incompatible { source, .. } = &error else {
+            panic!("expected an incompatibility, got {error:?}");
+        };
+        assert!(
+            matches!(**source, IntegrityError::UnknownSerializer { .. }),
+            "{error:?}"
+        );
+
+        // Text naming no version of this encoding at all is the other thing: no
+        // release wrote it, so it points at storage.
+        store
+            .corrupt_with("UPDATE axond_cp_resource_version SET serializer = 'json'")
+            .await;
+        let error = store
+            .load_revision(first.id)
+            .await
+            .expect_err("a column no build ever wrote is not hydratable");
         assert_eq!(error.category(), FailureCategory::Corrupt);
         let ControlPlaneError::Corrupt { source, .. } = &error else {
             panic!("expected corruption, got {error:?}");
