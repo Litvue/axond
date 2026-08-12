@@ -2138,11 +2138,16 @@ fn estimate_usage(body: &Value) -> Usage {
 
 /// The output allowance a request asked for, in whichever spelling its surface
 /// uses. `None` when the caller left it to the provider.
+///
+/// A body carrying several spellings takes the largest of them, because a
+/// present-but-unusable field (`null`, a string) must not hide a usable one from
+/// the ceiling or from the hold: whichever field the provider honors, the answer
+/// here is never below it.
 fn requested_output_tokens(body: &Value) -> Option<u64> {
-    body.get("max_tokens")
-        .or_else(|| body.get("max_completion_tokens"))
-        .or_else(|| body.get("max_output_tokens"))
-        .and_then(Value::as_u64)
+    ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+        .into_iter()
+        .filter_map(|field| body.get(field).and_then(Value::as_u64))
+        .max()
 }
 
 /// Monotonic per-process request id. The trace it belongs to travels in the
@@ -2226,6 +2231,40 @@ mod tests {
     use tokio::sync::oneshot;
     use tower::util::ServiceExt;
     use tracing_subscriber::layer::SubscriberExt;
+
+    /// An unusable spelling of the output allowance never hides a usable one, so
+    /// neither the output ceiling nor the budget hold can be dodged by sending
+    /// `max_tokens: null` alongside a real allowance.
+    #[test]
+    fn the_requested_output_allowance_takes_the_largest_usable_spelling() {
+        for (body, expected) in [
+            (serde_json::json!({}), None),
+            (serde_json::json!({"max_tokens": 32}), Some(32)),
+            (
+                serde_json::json!({"max_tokens": Value::Null, "max_completion_tokens": 500_000}),
+                Some(500_000),
+            ),
+            (
+                serde_json::json!({"max_tokens": "many", "max_output_tokens": 64}),
+                Some(64),
+            ),
+            (
+                serde_json::json!({"max_tokens": 8, "max_completion_tokens": 4_096}),
+                Some(4_096),
+            ),
+            (serde_json::json!({"max_tokens": -1}), None),
+        ] {
+            assert_eq!(requested_output_tokens(&body), expected, "{body}");
+        }
+        assert_eq!(
+            estimate_usage(
+                &serde_json::json!({"max_tokens": Value::Null, "max_completion_tokens": 500_000})
+            )
+            .output_tokens,
+            500_000,
+            "the hold prices the allowance the provider will honor"
+        );
+    }
 
     /// The inbound key every test config declares, and the secret the caller
     /// presents for it. Inbound auth is always enforced (ADR 0013).
