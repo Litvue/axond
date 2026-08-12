@@ -586,6 +586,12 @@ pub trait UsageJournal: Send + Sync {
     /// Set an event aside as poison. It stops being delivered — and stops
     /// blocking its ordering key — and is counted in
     /// [`JournalStats::quarantined`] until an operator deals with it.
+    ///
+    /// Gated and idempotent on the same terms as [`ack`](Self::ack): a delivery
+    /// this consumer never attempted is [`JournalError::NotOutstanding`], because
+    /// a verdict on an event is only a consumer's to give once the event was
+    /// handed to it; quarantining an already quarantined event is `Ok` and keeps
+    /// the first reason.
     async fn quarantine(
         &self,
         delivery: &DeliveryId,

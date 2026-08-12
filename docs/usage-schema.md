@@ -86,13 +86,21 @@ event and nothing else needs to be added to make a join exact.
 
 The shipped DDL does **not** declare a unique index on it, because a table may
 already hold rows written by an older gateway whose ids were only unique per
-process. Deployments with no such rows can add one, which turns a duplicate write
-into a collision instead of a second row:
+process. Deployments with no such rows can add one:
 
 ```sql
 CREATE UNIQUE INDEX CONCURRENTLY axond_usage_request_id_key
     ON axond_usage (request_id);
 ```
+
+Understand what that trades before you do, though: the Postgres sink inserts
+without `ON CONFLICT`, and retries a batch whose commit outcome it never learned.
+With the index in place that retry hits a duplicate key, fails the whole
+transaction, and counts the entire batch — rows that are in fact already
+committed — as `records_dropped{axond.drop_reason="sink_error"}`. So the index
+buys a table that cannot hold a duplicate row, at the cost of a false alarm on
+the metric below. Until the sink writes `ON CONFLICT (request_id) DO NOTHING`,
+deduplicating in the reader is the quieter choice.
 
 Ids are time-ordered, but by **admission**, not settlement: one is minted when the
 gateway accepts a request, and rows are written when requests end. A long stream's

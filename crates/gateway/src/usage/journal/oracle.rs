@@ -316,6 +316,17 @@ impl UsageJournal for InMemoryUsageJournal {
             .consumers
             .entry(delivery.consumer.clone())
             .or_default();
+        // Idempotent, and gated on the same "was it ever handed out?" test as
+        // `ack`: quarantining is a verdict on a delivery this consumer attempted,
+        // not a way to remove an event it never saw.
+        if state.quarantined.contains_key(&position) {
+            return Ok(());
+        }
+        if !state.attempts.contains_key(&position) {
+            return Err(JournalError::NotOutstanding {
+                delivery: delivery.clone(),
+            });
+        }
         state.quarantined.insert(position, reason);
         state.leases.remove(&position);
         Ok(())

@@ -351,6 +351,57 @@ async fn a_quarantined_event_stops_blocking_its_ordering_key() {
     assert_eq!(PoisonReason::Malformed.as_str(), "malformed");
 }
 
+/// Quarantine is gated like `ack`, and for the same reason: a verdict on an event
+/// is a consumer's to give only once the event was handed to it, so a second
+/// consumer cannot remove an event from a delivery path it never read. Repeating
+/// the verdict is `Ok`, and the first reason stands.
+#[tokio::test]
+async fn only_a_consumer_that_was_handed_an_event_can_condemn_it() {
+    let journal = InMemoryUsageJournal::new();
+    let billing = consumer("billing");
+    let event = event();
+    journal.append(&event).await.expect("append");
+
+    let unclaimed = DeliveryId {
+        consumer: consumer("warehouse"),
+        event: event.id(),
+        attempt: 1,
+    };
+    let error = journal
+        .quarantine(&unclaimed, PoisonReason::Malformed)
+        .await
+        .expect_err("a consumer that never claimed the event has no verdict to give");
+    assert!(
+        matches!(&error, JournalError::NotOutstanding { delivery } if delivery == &unclaimed),
+        "{error:?}"
+    );
+
+    let claimed = journal
+        .claim(&billing, claim_of(1, SystemTime::now()))
+        .await
+        .expect("claim");
+    journal
+        .quarantine(&claimed[0].id, PoisonReason::Malformed)
+        .await
+        .expect("quarantine");
+    journal
+        .quarantine(&claimed[0].id, PoisonReason::Rejected)
+        .await
+        .expect("a repeated verdict is not an error");
+
+    let stats = journal.stats(&billing).await.expect("stats");
+    assert_eq!(stats.quarantined, 1);
+    assert_eq!(
+        journal
+            .stats(&consumer("warehouse"))
+            .await
+            .expect("stats")
+            .quarantined,
+        0,
+        "one consumer's verdict is not another's"
+    );
+}
+
 #[tokio::test]
 async fn an_event_that_exhausts_its_attempts_is_quarantined_not_retried_forever() {
     let capacity = Capacity {
