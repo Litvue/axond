@@ -369,14 +369,8 @@ jobs:
         run: ops/workflow-policy.py --self-test
       - name: Check Action pins, least privilege, and signer restrictions
         run: ops/workflow-policy.py
-      # The runners cannot reach the actionlint release asset (a persistent 503),
-      # so the pinned version comes from the installer this repository already
-      # uses for its other tools; ops/actionlint.sh runs whatever matching
-      # binary is on PATH and only downloads as a fallback.
-      - name: Install the pinned workflow linter
-        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.85.12
-        with:
-          tool: actionlint@1.7.12
+      # The runners answer 503 for the actionlint release asset, so the script
+      # falls back to the same version as a digest-pinned image.
       - name: Lint the workflow definitions
         run: |
           shellcheck ops/actionlint.sh

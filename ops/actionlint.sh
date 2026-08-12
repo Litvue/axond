@@ -13,6 +13,11 @@ ACTIONLINT_VERSION=1.7.12
 ACTIONLINT_SHA256=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
 ARCHIVE="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
 URL="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${ARCHIVE}"
+# Same linter, same version, pinned by manifest digest rather than by archive
+# checksum. GitHub-hosted runners answer 503 for the release asset, so the image
+# is the path that actually works there; it also carries the shellcheck and
+# pyflakes that actionlint shells out to.
+IMAGE="docker.io/rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667"
 
 cd "$(dirname "$0")/.."
 repository="$PWD"
@@ -28,14 +33,24 @@ fi
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
-# The release CDN answers an occasional 503, and a lint lane that fails on one
-# is a false red, so retry before giving up. The checksum below is what makes
-# the download trustworthy, not the transport.
-curl --fail --silent --show-error --location \
-    --retry 5 --retry-delay 2 --retry-connrefused --retry-all-errors \
-    --output "$workdir/$ARCHIVE" "$URL"
-echo "$ACTIONLINT_SHA256  $workdir/$ARCHIVE" | sha256sum --check --quiet
-tar -C "$workdir" -xzf "$workdir/$ARCHIVE" actionlint
+# The release asset is the first choice because it needs no container runtime.
+# Both paths land on the same pinned version, so a fallback cannot change what
+# the gate runs.
+if curl --fail --silent --show-error --location \
+    --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
+    --output "$workdir/$ARCHIVE" "$URL"; then
+    echo "$ACTIONLINT_SHA256  $workdir/$ARCHIVE" | sha256sum --check --quiet
+    tar -C "$workdir" -xzf "$workdir/$ARCHIVE" actionlint
+    cd "$repository"
+    "$workdir/actionlint" -color
+    exit 0
+fi
 
-cd "$repository"
-"$workdir/actionlint" -color
+if ! command -v docker >/dev/null 2>&1; then
+    echo "cannot reach $URL and docker is unavailable for the pinned image" >&2
+    exit 1
+fi
+
+echo "$URL is unreachable; running the pinned actionlint image instead"
+exec docker run --rm --network none \
+    --volume "$repository:/repo:ro" --workdir /repo "$IMAGE" -color

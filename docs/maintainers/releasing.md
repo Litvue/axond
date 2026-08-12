@@ -265,10 +265,11 @@ identity and issuer. It also requires one reviewed pin per action across all
 workflows, so two lanes cannot silently run different builds of the same Action.
 The lane proves it still rejects those with `ops/workflow-policy.py --self-test`
 before it checks the repository, and then lints the workflows with
-[`ops/actionlint.sh`](../../ops/actionlint.sh), which runs the pinned
-`actionlint` version from `PATH` and otherwise downloads and checksum-verifies
-it. In CI the binary comes from `taiki-e/install-action`, because the runners get
-a persistent 503 from the release asset. Locally:
+[`ops/actionlint.sh`](../../ops/actionlint.sh). That script runs one pinned
+`actionlint` version, reached three ways: a matching binary already on `PATH`,
+otherwise the checksum-verified release archive, otherwise — the case on
+GitHub-hosted runners, which answer 503 for that asset — the same version as a
+digest-pinned container image. Locally:
 
 ```bash
 just workflow-policy   # pins, permissions, signer restrictions (offline)
