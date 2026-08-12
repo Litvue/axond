@@ -521,6 +521,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_audit_actor_round_trips_from_owned_data() {
+        let store = InMemoryControlPlane::new();
+        // What a durable store has when it reads an audit row back: owned bytes
+        // with no static lifetime available to borrow from.
+        let read_back = |column: &str| Actor::System {
+            component: column.to_string(),
+        };
+        let mut candidate = candidate(ExpectedRevision::Empty, "refresh", "a");
+        candidate.audit.actor = read_back(&String::from("catalog-refresh"));
+
+        let revision = store.publish_revision(candidate).await.unwrap();
+        let trail = store.audit_trail(revision.id).await.unwrap();
+        assert_eq!(trail[0].actor, read_back("catalog-refresh"));
+        assert_ne!(trail[0].actor, read_back("someone-else"));
+    }
+
+    #[tokio::test]
     async fn a_rejected_candidate_leaves_no_trace() {
         let store = InMemoryControlPlane::new();
         let mut invalid = candidate(ExpectedRevision::Empty, "invalid", "a");
