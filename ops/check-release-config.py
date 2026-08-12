@@ -47,6 +47,14 @@ IMAGE_PLATFORMS = {"linux/amd64", "linux/arm64"}
 # release-please bumps the pinned tag past it, the fallback is wrong and this
 # check demands the unpinned form, so the transition cannot be forgotten.
 LAST_AMD64_ONLY_VERSION = (0, 3, 15)
+# Paths the repair dispatch needs in the tag it rebuilds. A tag lacking any of
+# them cannot publish or verify the image index, so the preflight refuses.
+REPAIR_REQUIRED_PATHS = (
+    "Dockerfile",
+    "ops/docker-smoke.sh",
+    "ops/publish-image-index.sh",
+    "ops/verify-image-evidence.sh",
+)
 AMD64_FALLBACK_PLATFORM = "platform: ${AXOND_PLATFORM-linux/amd64}"
 NATIVE_PLATFORM = "platform: ${AXOND_PLATFORM-}"
 # Documentation that must name every target and platform an operator can pick.
@@ -374,6 +382,39 @@ def check_documented_matrix() -> list[str]:
     return failures
 
 
+def check_repair_preflight(text: str) -> list[str]:
+    """A tag that cannot be repaired from `main` must say so, and say what to do.
+
+    The image lanes publish and verify an index, so a tag whose tree predates
+    those scripts cannot be rebuilt by the current workflow. That is a deliberate
+    explicit failure rather than a silent partial release — but an operator
+    reading the log has to be told the remediation, and the runbook has to name
+    the same prerequisites.
+    """
+    block = job_block(text, "release-metadata")
+    if block is None:
+        return ["release-please.yml: release-metadata job not found"]
+    failures: list[str] = []
+    for required in REPAIR_REQUIRED_PATHS:
+        if required not in block:
+            failures.append(
+                f"release-please.yml: the repair preflight does not require {required}"
+            )
+    if "Remediation: dispatch this workflow from" not in block:
+        failures.append(
+            "release-please.yml: the repair preflight fails without naming the "
+            "remediation; an operator should not have to find the runbook"
+        )
+    runbook = (ROOT / "docs/maintainers/releasing.md").read_text(encoding="utf-8")
+    for required in REPAIR_REQUIRED_PATHS:
+        if required not in runbook:
+            failures.append(
+                f"docs/maintainers/releasing.md: repair prerequisite {required} is "
+                "not documented"
+            )
+    return failures
+
+
 def main() -> int:
     text = workflow_text()
     notes: list[str] = []
@@ -386,6 +427,7 @@ def main() -> int:
     failures.extend(check_compose_platform(notes))
     failures.extend(check_no_latest_tag(text))
     failures.extend(check_documented_matrix())
+    failures.extend(check_repair_preflight(text))
     for note in notes:
         print(f"release configuration note: {note}", file=sys.stderr)
     if failures:
