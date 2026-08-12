@@ -33,6 +33,7 @@ use serde_json::{Value, json};
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use crate::admission::AdmissionPermit;
 use crate::budget::{BudgetKey, Reservation};
 use crate::credentials::{CredentialLease, CredentialSource};
 use crate::rate_limit::RateLimitPermit;
@@ -60,6 +61,10 @@ pub struct StreamContext {
     /// ends however it ends.
     pub reservation: Reservation,
     pub rate_limit_permit: Option<RateLimitPermit>,
+    /// The admission capacity the request was let in under. An open stream holds
+    /// it for as long as the relay lives, so completion, cancellation, and the
+    /// duration bound all return it through the accounting's own drop.
+    pub admission_permit: Option<AdmissionPermit>,
     /// Input tokens estimated from the request body when the hold was taken.
     /// A stream that ends before the provider reports usage still consumed its
     /// prompt, so this is what the partial charge is priced from.
@@ -275,6 +280,11 @@ pub fn relay_opened(
     framing: Framing,
     rotation: Option<RotationHandle>,
 ) -> Response {
+    // A stream's *total* lifetime, as opposed to the transport's idle bound,
+    // which a trickle of keepalives resets forever.
+    let limits = state.0.admission.limits();
+    let deadline = limits.max_stream_duration.map(|budget| started + budget);
+    let max_bytes = limits.max_stream_bytes;
     let relay = Relay {
         bytes,
         carry: Vec::new(),
@@ -286,6 +296,9 @@ pub fn relay_opened(
         accounting: Accounting::new(state, ctx, started),
         rotation,
         queued_downstream: false,
+        deadline,
+        max_bytes,
+        relayed_bytes: 0,
     };
 
     let body = Body::from_stream(futures::stream::unfold(relay, |mut relay| async move {
@@ -372,7 +385,21 @@ struct Relay {
     accounting: Accounting,
     rotation: Option<RotationHandle>,
     queued_downstream: bool,
+    /// When this stream must end, whatever the upstream is still willing to
+    /// send (`admission.max_stream_duration_ms`).
+    deadline: Option<Instant>,
+    /// How many upstream bytes this stream may relay
+    /// (`admission.max_stream_bytes`).
+    max_bytes: Option<u64>,
+    relayed_bytes: u64,
 }
+
+/// What a caller is told when the total-duration bound ends its stream. Static:
+/// it names the bound that fired and nothing about the request.
+const STREAM_DURATION_EXCEEDED: &str = "stream exceeded the gateway's maximum stream duration";
+
+/// The same, for the relayed-bytes bound.
+const STREAM_BYTES_EXCEEDED: &str = "stream exceeded the gateway's maximum stream size";
 
 impl Relay {
     async fn next_chunk(&mut self) -> Option<Result<Bytes, Infallible>> {
@@ -403,8 +430,37 @@ impl Relay {
     }
 
     async fn poll_upstream(&mut self) {
-        match self.bytes.next().await {
+        let next = match self.deadline {
+            Some(deadline) => {
+                match tokio::time::timeout_at(deadline.into(), self.bytes.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        tracing::warn!(
+                            provider = %self.accounting.ctx.target_provider,
+                            model = %self.accounting.ctx.target_model,
+                            committed = self.queued_downstream,
+                            "open stream exceeded the maximum stream duration"
+                        );
+                        self.phase = Phase::Failed(STREAM_DURATION_EXCEEDED.to_owned());
+                        return;
+                    }
+                }
+            }
+            None => self.bytes.next().await,
+        };
+        match next {
             Some(Ok(chunk)) => {
+                self.relayed_bytes = self.relayed_bytes.saturating_add(chunk.len() as u64);
+                if self.max_bytes.is_some_and(|max| self.relayed_bytes > max) {
+                    tracing::warn!(
+                        provider = %self.accounting.ctx.target_provider,
+                        model = %self.accounting.ctx.target_model,
+                        relayed_bytes = self.relayed_bytes,
+                        "open stream exceeded the maximum stream size"
+                    );
+                    self.phase = Phase::Failed(STREAM_BYTES_EXCEEDED.to_owned());
+                    return;
+                }
                 // A native stream is byte-faithful: the provider's own bytes go
                 // out as they arrive, and the decode below only observes usage.
                 if !self.framing.reemits() {
@@ -1158,6 +1214,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
                 estimate_microdollars: 1_000,
             },
             rate_limit_permit: None,
+            admission_permit: None,
             estimated_input_tokens: 8,
             attempts: 1,
         }
@@ -1463,6 +1520,9 @@ data: [DONE]\n\n",
             pending: VecDeque::new(),
             phase: Phase::Streaming,
             framing: Framing::OpenAiSse,
+            deadline: None,
+            max_bytes: None,
+            relayed_bytes: 0,
             accounting: Accounting::new(
                 state_for("http://127.0.0.1:1", Arc::new(Ledger::default())),
                 context(),

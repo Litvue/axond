@@ -16,7 +16,18 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
+
+# One in-flight request costs a socket to the caller and one upstream, so the
+# descriptor limit must exceed 2 x admission.max_in_flight with room for the
+# listener, the config watch, and the store connections.
 LimitNOFILE=65536
+# A ceiling the kernel enforces if a bound is ever misconfigured: axond's own
+# `[admission]` bounds are what should refuse work, and this is what keeps a
+# breach of them from taking the host down with it. Size it above
+# admission.max_in_flight x admission.max_request_bytes plus the process's
+# steady-state footprint.
+MemoryMax=2G
+TasksMax=4096
 
 NoNewPrivileges=true
 PrivateDevices=true

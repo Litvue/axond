@@ -84,6 +84,19 @@ HAProxy, or the platform load balancer. Disable proxy response buffering and
 set timeouts for long-lived SSE streams. Preserve caller authentication and
 `traceparent` headers.
 
+## Bound the host, not just the gateway
+
+The unit file sets `LimitNOFILE`, `MemoryMax`, and `TasksMax` deliberately.
+Axond's own `[admission]` ceilings are what should refuse work — a shed request
+is a typed `429`/`503` the caller can act on — and these are the kernel's backstop
+if one of those ceilings is ever set above what the host can hold. Keep them
+consistent: `MemoryMax` above `admission.max_in_flight` x
+`admission.max_request_bytes` plus steady-state footprint, and `LimitNOFILE`
+above twice `max_in_flight` (one caller socket and one upstream socket per
+in-flight request) plus the listener and store connections. A unit that hits
+`MemoryMax` is killed rather than shedding, so the gateway's bounds should always
+fire first.
+
 ## Rollout behavior
 
 The current process does not implement application-level SIGTERM draining.

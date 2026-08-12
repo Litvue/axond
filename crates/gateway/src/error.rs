@@ -15,6 +15,7 @@ use gateway_core::ProviderError;
 use gateway_transport::TransportError;
 use serde_json::json;
 
+use crate::admission::AdmissionRejection;
 use crate::principals::{Capability, TokenVerificationError};
 
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +44,28 @@ pub enum GatewayError {
     RevocationUnavailable,
     #[error("inbound concurrency limit exceeded")]
     RateLimitExceeded { retry_after_seconds: Option<u64> },
+    /// Load shed by admission control: the process, the tenant, or the stream
+    /// ceiling is full (see [`crate::admission`]). Typed per ceiling so an
+    /// operator can tell a saturated replica from one noisy tenant.
+    #[error(transparent)]
+    Overloaded(#[from] AdmissionRejection),
+    /// The inbound body exceeded `admission.max_request_bytes`. Refused before
+    /// it is buffered, so an oversized request costs no memory.
+    #[error("request body exceeds the configured inbound limit")]
+    RequestTooLarge,
+    /// The prompt's estimated token count exceeded
+    /// `admission.max_prompt_tokens`. Reports the bound, never the prompt.
+    #[error("prompt exceeds the configured limit of {limit_tokens} tokens")]
+    PromptTooLarge { limit_tokens: u64 },
+    /// The request asked for a larger output allowance than
+    /// `admission.max_output_tokens`. Refused rather than clamped.
+    #[error(
+        "requested output of {requested_tokens} tokens exceeds the configured limit of {limit_tokens} tokens"
+    )]
+    OutputLimitExceeded {
+        requested_tokens: u64,
+        limit_tokens: u64,
+    },
     #[error("unauthorized")]
     Unauthorized,
     #[error("token authentication failed: {0}")]
@@ -93,6 +116,15 @@ impl GatewayError {
             Self::ContinuationAffinityUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::RevocationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::RateLimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::Overloaded(rejection) => {
+                if rejection.is_caller_limit() {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }
+            Self::RequestTooLarge | Self::PromptTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::OutputLimitExceeded { .. } => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::TokenUnauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::TokenForbidden(_) => StatusCode::FORBIDDEN,
@@ -136,6 +168,10 @@ impl GatewayError {
             Self::ContinuationAffinityUnavailable { .. } => "continuation_affinity_unavailable",
             Self::RevocationUnavailable => "revocation_unavailable",
             Self::RateLimitExceeded { .. } => "rate_limited",
+            Self::Overloaded(rejection) => rejection.code(),
+            Self::RequestTooLarge => "request_too_large",
+            Self::PromptTooLarge { .. } => "prompt_too_large",
+            Self::OutputLimitExceeded { .. } => "output_limit_exceeded",
             Self::Unauthorized => "unauthorized",
             Self::TokenUnauthorized(error) | Self::TokenForbidden(error) => error.code(),
             Self::ScopeInsufficient(_) => "token_scope_insufficient",
@@ -164,6 +200,9 @@ impl IntoResponse for GatewayError {
             Self::RateLimitExceeded {
                 retry_after_seconds: Some(seconds),
             } => Some(seconds.to_string()),
+            Self::Overloaded(rejection) => rejection
+                .retry_after_seconds()
+                .map(|seconds| seconds.to_string()),
             _ => None,
         };
         let message = match &self {
@@ -281,6 +320,60 @@ mod tests {
                     "message": "inbound concurrency limit exceeded"
                 }
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_saturation_is_429_and_process_saturation_is_503() {
+        let tenant = GatewayError::Overloaded(AdmissionRejection::Tenant);
+        assert_eq!(tenant.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(tenant.code(), "tenant_concurrency_exceeded");
+
+        let global = GatewayError::Overloaded(AdmissionRejection::Global).into_response();
+        assert_eq!(global.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            global
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .map(|value| value.to_str().expect("ascii").to_owned()),
+            Some("1".to_owned())
+        );
+        let body = global
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "gateway_overloaded");
+
+        // Tenant-table capacity frees when some other tenant goes idle, which
+        // this replica cannot predict, so it advertises no retry window.
+        let capacity = GatewayError::Overloaded(AdmissionRejection::TenantCapacity).into_response();
+        assert_eq!(capacity.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            capacity
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_request_is_typed_413_without_echoing_the_body() {
+        let response = GatewayError::RequestTooLarge.into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "request_too_large");
+        assert_eq!(
+            body["error"]["message"],
+            "request body exceeds the configured inbound limit"
         );
     }
 

@@ -28,8 +28,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Extension, RawQuery, Request, State};
-use axum::http::{HeaderMap, HeaderValue};
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{DefaultBodyLimit, Extension, RawQuery, Request, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
@@ -48,6 +49,7 @@ use serde_json::{Value, json};
 use tracing::{Instrument, debug, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use crate::admission::{AdmissionPermit, RequestKind};
 use crate::aliases::AliasScope;
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target};
@@ -65,10 +67,13 @@ use crate::usage::{Status, UsageRecord};
 
 pub fn router(state: AppState) -> Router {
     let minting_enabled = state.config().gateway_minting.is_some();
+    // The inbound body bound is declared rather than inherited: axum's own
+    // default would otherwise be the process's real memory ceiling per request.
+    let max_request_bytes = state.0.admission.limits().max_request_bytes;
     route_specs(minting_enabled)
         .into_iter()
         .fold(Router::new(), |router, spec| {
-            let route = (spec.router)();
+            let route = (spec.router)().layer(DefaultBodyLimit::max(max_request_bytes));
             let route = match spec.auth {
                 AuthPosture::LivenessProbe => route,
                 AuthPosture::Authenticated => route.layer(from_fn_with_state(
@@ -801,17 +806,35 @@ impl Wire {
     }
 }
 
+/// The inbound body, or a typed refusal. An oversized body is a bound the
+/// gateway imposed (`413`), a malformed one is the caller's (`400`); neither
+/// response echoes the body it read.
+fn inbound_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, GatewayError> {
+    match body {
+        Ok(Json(body)) => Ok(body),
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            Err(GatewayError::RequestTooLarge)
+        }
+        Err(JsonRejection::MissingJsonContentType(_)) => Err(GatewayError::BadRequest(
+            "expected a `content-type: application/json` request".into(),
+        )),
+        Err(_) => Err(GatewayError::BadRequest(
+            "request body is not valid JSON".into(),
+        )),
+    }
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
-    Json(body): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, GatewayError> {
     serve(
         state,
         headers,
-        body,
+        inbound_body(body)?,
         Route::ChatCompletions,
         snapshot,
         caller,
@@ -828,12 +851,12 @@ async fn native_messages(
     headers: HeaderMap,
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
-    Json(body): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, GatewayError> {
     serve(
         state,
         headers,
-        body,
+        inbound_body(body)?,
         Route::NativeMessages,
         snapshot,
         caller,
@@ -846,9 +869,17 @@ async fn embeddings(
     headers: HeaderMap,
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
-    Json(body): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, GatewayError> {
-    serve(state, headers, body, Route::Embeddings, snapshot, caller).await
+    serve(
+        state,
+        headers,
+        inbound_body(body)?,
+        Route::Embeddings,
+        snapshot,
+        caller,
+    )
+    .await
 }
 
 async fn responses(
@@ -856,9 +887,17 @@ async fn responses(
     headers: HeaderMap,
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
-    Json(body): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, GatewayError> {
-    serve(state, headers, body, Route::Responses, snapshot, caller).await
+    serve(
+        state,
+        headers,
+        inbound_body(body)?,
+        Route::Responses,
+        snapshot,
+        caller,
+    )
+    .await
 }
 
 /// The one request path every route shares: use the authenticated request
@@ -901,6 +940,48 @@ async fn serve(
     };
     wire.check_targets(cfg, model, &alias)?;
 
+    // The per-request bounds are checked before any dependency work and before
+    // admission: they are pure functions of the parsed body, and a request that
+    // cannot legally be served should not occupy capacity while it is refused.
+    // Neither error repeats any part of the body.
+    let estimate = route.estimate(&body);
+    let limits = state.0.admission.limits();
+    if let Some(limit_tokens) = limits.max_prompt_tokens
+        && estimate.input_tokens > limit_tokens
+    {
+        return Err(GatewayError::PromptTooLarge { limit_tokens });
+    }
+    if let Some(limit_tokens) = limits.max_output_tokens
+        && let Some(requested_tokens) = requested_output_tokens(&body)
+        && requested_tokens > limit_tokens
+    {
+        return Err(GatewayError::OutputLimitExceeded {
+            requested_tokens,
+            limit_tokens,
+        });
+    }
+
+    // Load shedding before any dependency work: an overloaded replica must not
+    // spend a rate-limit round trip or a budget reservation on a request it is
+    // about to refuse. It is also strictly after authentication, so unauthenticated
+    // traffic can never occupy the process's or a tenant's capacity.
+    //
+    // Held for the request's lifetime the same way the rate-limit permit is:
+    // dropped at scope end on a buffered request, moved into the relay's
+    // accounting on a streamed one.
+    let admission_permit = state
+        .0
+        .admission
+        .admit(
+            &caller.namespace,
+            if streamed {
+                RequestKind::Streamed
+            } else {
+                RequestKind::Buffered
+            },
+        )
+        .await?;
+
     // The permit is held for the request's lifetime: buffered paths drop it at
     // scope end, and a stream moves it into the accounting owner that settles it.
     let rate_limit_key = RateLimitKey {
@@ -931,7 +1012,6 @@ async fn serve(
         namespace: caller.namespace.clone(),
         subject: caller.subject.clone(),
     };
-    let estimate = route.estimate(&body);
     let estimated_cost = model.targets[0].price.cost_microdollars(estimate);
     if let Some(ceiling) = caller.max_request_microdollars
         && estimated_cost > ceiling
@@ -963,6 +1043,7 @@ async fn serve(
                     reservation,
                     estimated_input_tokens: estimate.input_tokens,
                     permit: Some(rate_limit_permit),
+                    admission: Some(admission_permit),
                 },
             },
         )
@@ -1470,6 +1551,7 @@ async fn stream_with_failover(
                 budget_key: hold.key.clone(),
                 reservation: hold.reservation.clone(),
                 rate_limit_permit: None,
+                admission_permit: None,
                 estimated_input_tokens: hold.estimated_input_tokens,
                 attempts: 0,
             };
@@ -1501,6 +1583,7 @@ async fn stream_with_failover(
                         None,
                     );
                     ctx.rate_limit_permit = hold.permit.take();
+                    ctx.admission_permit = hold.admission.take();
                     record_target_success(&snapshot, target, &circuit_key);
                     telemetry::record_routing(
                         &ctx.namespace,
@@ -1551,6 +1634,9 @@ async fn stream_with_failover(
                                     budget_key,
                                     reservation,
                                     rate_limit_permit: None,
+                                    // Rotation re-opens upstream for a relay that
+                                    // already holds the request's permits.
+                                    admission_permit: None,
                                     estimated_input_tokens: estimate_for_open,
                                     attempts: 0,
                                 };
@@ -1643,6 +1729,7 @@ async fn stream_with_failover(
             reservation_guard.disarm();
             ctx.attempts = walk.attempts;
             ctx.rate_limit_permit = hold.permit.take();
+            ctx.admission_permit = hold.admission.take();
             streaming::settle_upstream_error(state.clone(), ctx, started);
         } else {
             reservation_guard.release().await;
@@ -1672,6 +1759,11 @@ struct BudgetHold {
     reservation: Reservation,
     estimated_input_tokens: u64,
     permit: Option<RateLimitPermit>,
+    /// The admission capacity the request was let in under. Moved into the
+    /// stream context that ends up owning the relay, so an open stream keeps
+    /// occupying a slot for exactly as long as it is open — and a walk that
+    /// never opens one drops it here.
+    admission: Option<AdmissionPermit>,
 }
 
 /// A buffered request's reservation must be reconciled even when its handler is
@@ -2033,12 +2125,7 @@ fn to_usage(u: &gateway_core::ModelUsage) -> Usage {
 fn estimate_usage(body: &Value) -> Usage {
     const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1_024;
     let input_tokens = (serde_json::to_string(body).map(|s| s.len()).unwrap_or(0) / 4) as u64;
-    let output_tokens = body
-        .get("max_tokens")
-        .or_else(|| body.get("max_completion_tokens"))
-        .or_else(|| body.get("max_output_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+    let output_tokens = requested_output_tokens(body).unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
     Usage {
         input_tokens,
         output_tokens,
@@ -2046,6 +2133,15 @@ fn estimate_usage(body: &Value) -> Usage {
         cache_read_tokens: 0,
         cache_write_tokens: 0,
     }
+}
+
+/// The output allowance a request asked for, in whichever spelling its surface
+/// uses. `None` when the caller left it to the provider.
+fn requested_output_tokens(body: &Value) -> Option<u64> {
+    body.get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .or_else(|| body.get("max_output_tokens"))
+        .and_then(Value::as_u64)
 }
 
 /// Monotonic per-process request id. The trace it belongs to travels in the
@@ -4726,6 +4822,224 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             Box::new(crate::revocation::NoDenylist),
         )
         .unwrap()
+    }
+
+    /// One target, one credential, and an explicit `[admission]` section.
+    fn admitting_state(
+        base_url: &str,
+        admission: &str,
+        budget: Box<dyn crate::budget::BudgetStore>,
+    ) -> AppState {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "{base_url}"
+
+{GATEWAY_KEY}
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K1"
+
+[[model]]
+name = "gpt-4o"
+targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 1000000 }} }}]
+
+[admission]
+{admission}
+"#
+        ))
+        .unwrap();
+        let env = env_with([("K1", "sk-test")]);
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        AppState::new_with_rate_limiter(
+            cfg,
+            &env,
+            UsageFanout::new(sinks),
+            budget,
+            Box::new(NoLimit),
+            Box::new(crate::revocation::NoDenylist),
+        )
+        .unwrap()
+    }
+
+    /// Shedding is the first thing the request path spends nothing on: a
+    /// saturated replica must not pay for a rate-limit round trip, a budget
+    /// reservation, or a provider call to say no.
+    #[tokio::test]
+    async fn a_shed_request_costs_no_budget_and_no_provider_call() {
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let budget = RecordingBudget::default();
+        let state = admitting_state(
+            &base_url,
+            "max_in_flight = 1\nmax_in_flight_streams = 1\nmax_in_flight_per_tenant = 0",
+            Box::new(budget.clone()),
+        );
+        let held = state
+            .0
+            .admission
+            .admit("platform", crate::admission::RequestKind::Buffered)
+            .await
+            .expect("the only slot");
+
+        let response = router(state.clone()).oneshot(chat_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "gateway_overloaded");
+        assert!(budget.0.lock().unwrap().is_empty());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        // The permit the shed request never took is still the held one; giving
+        // it back admits the next caller.
+        drop(held);
+        let served = router(state).oneshot(chat_request()).await.unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+        assert!(hits.load(Ordering::SeqCst) > 0);
+    }
+
+    /// A tenant's own ceiling is the caller's problem (429); the process's is
+    /// the replica's (503). An operator reading either one knows which.
+    #[tokio::test]
+    async fn a_tenant_ceiling_sheds_as_429_and_leaves_the_replica_serving() {
+        let (base_url, _) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let state = admitting_state(
+            &base_url,
+            "max_in_flight = 8\nmax_in_flight_streams = 8\nmax_in_flight_per_tenant = 1",
+            Box::new(NoBudget),
+        );
+        let held = state
+            .0
+            .admission
+            .admit("platform", crate::admission::RequestKind::Buffered)
+            .await
+            .expect("the tenant's only slot");
+
+        let response = router(state.clone()).oneshot(chat_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "tenant_concurrency_exceeded");
+
+        // Another tenant's request is unaffected: the ceiling that fired was
+        // this tenant's, not the process's.
+        assert!(
+            state
+                .0
+                .admission
+                .admit("other", crate::admission::RequestKind::Buffered)
+                .await
+                .is_ok()
+        );
+        drop(held);
+    }
+
+    /// An admitted request gives its capacity back when the handler returns, so
+    /// a bounded replica serves an unbounded number of sequential requests.
+    #[tokio::test]
+    async fn a_completed_request_releases_the_capacity_it_held() {
+        let (base_url, _) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let state = admitting_state(
+            &base_url,
+            "max_in_flight = 1\nmax_in_flight_streams = 1\nmax_in_flight_per_tenant = 1",
+            Box::new(NoBudget),
+        );
+        for _ in 0..3 {
+            let response = router(state.clone()).oneshot(chat_request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    /// The per-request bounds are refusals, not clamps, and neither answer
+    /// repeats what the caller sent.
+    #[tokio::test]
+    async fn per_request_bounds_are_typed_and_never_echo_the_request() {
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let budget = RecordingBudget::default();
+        let state = admitting_state(
+            &base_url,
+            "max_prompt_tokens = 64\nmax_output_tokens = 16",
+            Box::new(budget.clone()),
+        );
+
+        let long_prompt = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "sensitive ".repeat(32)}]
+        });
+        let response = router(state.clone())
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(serde_json::to_vec(&long_prompt).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "prompt_too_large");
+        assert!(!body.to_string().contains("sensitive"), "{body}");
+
+        let large_output = json!({
+            "model": "gpt-4o",
+            "messages": [],
+            "max_tokens": 4096
+        });
+        let response = router(state)
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(serde_json::to_vec(&large_output).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "output_limit_exceeded");
+
+        assert!(budget.0.lock().unwrap().is_empty());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// The router's own body limit answers before the body is buffered, so an
+    /// oversized request is a typed 413 rather than a parse error.
+    #[tokio::test]
+    async fn an_oversized_body_is_refused_by_the_router_not_the_parser() {
+        let (base_url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let state = admitting_state(&base_url, "max_request_bytes = 512", Box::new(NoBudget));
+        let response = router(state)
+            .oneshot(
+                authorized("/v1/chat/completions")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "gpt-4o",
+                            "messages": [{"role": "user", "content": "x".repeat(4096)}]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "request_too_large");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

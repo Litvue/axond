@@ -157,7 +157,9 @@ interface — read it at your own risk.
 - Status codes for the documented failure modes (see the
   [runbook](./observability.md#failure-modes)) are part of the contract:
   notably `429 budget_exceeded` (the tenant is over cap) versus
-  `503 budget_unavailable` (the gateway's own dependency is down), and
+  `503 budget_unavailable` (the gateway's own dependency is down),
+  `429 tenant_concurrency_exceeded` (this tenant is at its own concurrency
+  ceiling) versus `503 gateway_overloaded` (the replica itself is saturated), and
   `504 upstream_timeout` (a transport bound fired before anything could be
   served) versus `502 upstream_body_too_large` (a buffered provider body was
   refused rather than held in memory). Both are new `type` values under the

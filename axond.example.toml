@@ -134,6 +134,51 @@ stream_idle_timeout_ms = 120000
 max_response_bytes = 33554432
 max_error_bytes = 65536
 
+# ── Request bounds and load shedding ──────────────────────────────────────────
+# `[transport]` bounds what a PROVIDER may do to the gateway. This section bounds
+# what CALLERS may do to it: how large one request may be, and how many may be in
+# flight at once. Every ceiling is per replica and in-memory — the gateway is
+# stateless, so two replicas admit twice this much (see the per-replica sizing
+# note in `docs/configuration.md`). Fleet-wide admission policy is #150's job;
+# the shared-store rate limit in `[rate_limit]` is still the fleet-wide bound on
+# one subject's request RATE, which is a different question from concurrency.
+#
+# `0` means "this ceiling is off" for every value here except
+# `max_request_bytes`, which must be at least 1: a gateway that buffers no bytes
+# cannot serve anything.
+#
+# Shedding happens after authentication and before the rate-limit store, the
+# budget reservation, and the provider — an overloaded replica spends nothing to
+# say no. What the caller gets is typed:
+#
+#   429 tenant_concurrency_exceeded         this namespace is at its own ceiling
+#   503 gateway_overloaded                  the replica is at its ceiling
+#   503 stream_capacity_exhausted           no stream slot is free
+#   503 admission_queue_full / _timeout     queued, then shed (see below)
+#   503 admission_tenant_capacity_exhausted more tenants than `max_tenants`
+#   413 request_too_large / prompt_too_large
+#   400 output_limit_exceeded
+#
+# `queue_capacity = 0` — the default — refuses immediately instead of queueing,
+# which is what a caller can act on. Set it (with `queue_wait_ms`) only when the
+# traffic is bursty and short queueing is genuinely better than a retry.
+#
+# The ceilings own semaphores built at boot, so a reload validates `[admission]`
+# and warns; a change takes effect on restart, exactly like `[transport]`.
+
+[admission]
+max_request_bytes = 2097152
+max_prompt_tokens = 1000000
+max_output_tokens = 200000
+max_in_flight = 1024
+max_in_flight_streams = 512
+max_in_flight_per_tenant = 256
+max_tenants = 1024
+queue_capacity = 0
+queue_wait_ms = 0
+max_stream_duration_ms = 3600000
+max_stream_bytes = 67108864
+
 # ── Credentials ───────────────────────────────────────────────────────────────
 # Explicit (namespace, provider) → env-var binding. Never inferred from the
 # namespace name. Declaring several entries for the same pair pools them.

@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::config::{
-    BudgetConfig, Config, ConfigError, Mode, RateLimitConfig, Reload, RevocationConfig, Transport,
-    UsageSinkConfig,
+    AdmissionConfig, BudgetConfig, Config, ConfigError, Mode, RateLimitConfig, Reload,
+    RevocationConfig, Transport, UsageSinkConfig,
 };
 use crate::state::{AppState, ConfigSnapshot, SnapshotError};
 use crate::telemetry;
@@ -57,6 +57,7 @@ struct Boot {
     rate_limit: RateLimitConfig,
     revocation: RevocationConfig,
     transport: Transport,
+    admission: AdmissionConfig,
 }
 
 /// Owns the config path and the state whose snapshot it replaces.
@@ -84,6 +85,7 @@ impl Reloader {
                 rate_limit: booted.config.rate_limit.clone(),
                 revocation: booted.config.revocation.clone(),
                 transport: booted.config.transport.clone(),
+                admission: booted.config.admission.clone(),
             },
             path,
             state,
@@ -241,6 +243,9 @@ pub struct ReloadSummary {
     /// `[transport]` differs from the bounds the shared HTTP client was built
     /// with. Validated on reload, applied on restart.
     pub transport_changed: bool,
+    /// `[admission]` differs from the ceilings admission control was built with.
+    /// Validated on reload, applied on restart.
+    pub admission_changed: bool,
 }
 
 /// The added and removed identifiers of one config collection.
@@ -434,6 +439,7 @@ impl ReloadSummary {
             rate_limit_changed: boot.rate_limit != after_config.rate_limit,
             revocation_changed: boot.revocation != after_config.revocation,
             transport_changed: boot.transport != after_config.transport,
+            admission_changed: boot.admission != after_config.admission,
         }
     }
 
@@ -521,6 +527,11 @@ impl ReloadSummary {
         if self.transport_changed {
             tracing::warn!(
                 "`[transport]` changed, but the upstream HTTP client is already pooled; restart to apply it"
+            );
+        }
+        if self.admission_changed {
+            tracing::warn!(
+                "`[admission]` changed, but the admission ceilings are already serving requests; restart to apply them"
             );
         }
     }
@@ -1054,6 +1065,7 @@ env = "GW_ADMIN_BREAKGLASS"
             rate_limit: before.config.rate_limit.clone(),
             revocation: before.config.revocation.clone(),
             transport: before.config.transport.clone(),
+            admission: before.config.admission.clone(),
         };
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(
@@ -1085,6 +1097,7 @@ env = "GW_ADMIN_BREAKGLASS"
             rate_limit: before.config.rate_limit.clone(),
             revocation: before.config.revocation.clone(),
             transport: before.config.transport.clone(),
+            admission: before.config.admission.clone(),
         };
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(
@@ -1123,6 +1136,7 @@ env = "GW_ADMIN_BREAKGLASS"
             rate_limit: disabled.config.rate_limit.clone(),
             revocation: disabled.config.revocation.clone(),
             transport: disabled.config.transport.clone(),
+            admission: disabled.config.admission.clone(),
         };
 
         let added = ReloadSummary::between(&boot, &disabled, &enabled);
@@ -1191,6 +1205,7 @@ env = "GW_ADMIN_BREAKGLASS"
             rate_limit: before.config.rate_limit.clone(),
             revocation: before.config.revocation.clone(),
             transport: before.config.transport.clone(),
+            admission: before.config.admission.clone(),
         };
         let summary = ReloadSummary::between(&boot, &before, &after);
         assert_eq!(summary.gateway_minting.changed, vec!["enabled".to_owned()]);
