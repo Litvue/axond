@@ -16,30 +16,74 @@ ACTIONLINT_VERSION=1.7.12
 # pyflakes that actionlint shells out to.
 IMAGE="docker.io/rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667"
 
-# From actionlint_1.7.12_checksums.txt. A host outside this table goes straight
-# to the image rather than downloading a binary it cannot execute.
-case "$(uname -s)/$(uname -m)" in
-Linux/x86_64)
-    PLATFORM=linux_amd64
-    ARCHIVE_SHA256=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
-    ;;
-Linux/aarch64 | Linux/arm64)
-    PLATFORM=linux_arm64
-    ARCHIVE_SHA256=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6
-    ;;
-Darwin/x86_64)
-    PLATFORM=darwin_amd64
-    ARCHIVE_SHA256=5b44c3bc2255115c9b69e30efc0fecdf498fdb63c5d58e17084fd5f16324c644
-    ;;
-Darwin/arm64)
-    PLATFORM=darwin_arm64
-    ARCHIVE_SHA256=aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f
-    ;;
-*)
-    PLATFORM=
-    ARCHIVE_SHA256=
-    ;;
-esac
+# From actionlint_1.7.12_checksums.txt. A host outside this table has no pinned
+# archive and goes straight to the image, rather than downloading the amd64 Linux
+# binary it cannot execute.
+select_platform() {
+    case "$1" in
+    Linux/x86_64)
+        PLATFORM=linux_amd64
+        ARCHIVE_SHA256=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        ;;
+    Linux/aarch64 | Linux/arm64)
+        PLATFORM=linux_arm64
+        ARCHIVE_SHA256=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6
+        ;;
+    Darwin/x86_64)
+        PLATFORM=darwin_amd64
+        ARCHIVE_SHA256=5b44c3bc2255115c9b69e30efc0fecdf498fdb63c5d58e17084fd5f16324c644
+        ;;
+    Darwin/arm64)
+        PLATFORM=darwin_arm64
+        ARCHIVE_SHA256=aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f
+        ;;
+    *)
+        PLATFORM=
+        ARCHIVE_SHA256=
+        ;;
+    esac
+}
+
+# `--self-test` asserts the host table rather than the linting, so a refactor of
+# the acquisition paths cannot quietly send a developer machine at the wrong
+# archive; it is what CI runs before the lint itself.
+self_test() {
+    local host expected_platform problems=0
+    while read -r host expected_platform; do
+        select_platform "$host"
+        if [[ $PLATFORM != "$expected_platform" ]]; then
+            echo "self-test: $host selected '${PLATFORM:-<image>}', expected '${expected_platform}'" >&2
+            problems=1
+        fi
+        if [[ -n $PLATFORM && ${#ARCHIVE_SHA256} -ne 64 ]]; then
+            echo "self-test: $host has no pinned checksum for $PLATFORM" >&2
+            problems=1
+        fi
+        if [[ -z $PLATFORM && -n $ARCHIVE_SHA256 ]]; then
+            echo "self-test: $host has a checksum but no archive" >&2
+            problems=1
+        fi
+    done <<'HOSTS'
+Linux/x86_64 linux_amd64
+Linux/aarch64 linux_arm64
+Linux/arm64 linux_arm64
+Darwin/x86_64 darwin_amd64
+Darwin/arm64 darwin_arm64
+Linux/riscv64
+MINGW64_NT-10.0/x86_64
+HOSTS
+    if ((problems)); then
+        return 1
+    fi
+    echo "actionlint host-selection self-test passed"
+}
+
+if [[ ${1-} == --self-test ]]; then
+    self_test
+    exit
+fi
+
+select_platform "$(uname -s)/$(uname -m)"
 ARCHIVE="actionlint_${ACTIONLINT_VERSION}_${PLATFORM}.tar.gz"
 URL="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${ARCHIVE}"
 

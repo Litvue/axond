@@ -269,14 +269,21 @@ The lane proves it still rejects those with `ops/workflow-policy.py --self-test`
 before it checks the repository, and then lints the workflows with
 [`ops/actionlint.sh`](../../ops/actionlint.sh). That script runs one pinned
 `actionlint` version, reached three ways: a matching binary already on `PATH`,
-otherwise the checksum-verified release archive, otherwise — the case on
-GitHub-hosted runners, which answer 503 for that asset — the same version as a
-digest-pinned container image. Locally:
+otherwise the checksum-verified release archive for this host (Linux and macOS,
+x86-64 and arm64, each with its own checksum from the release's
+`checksums.txt`), otherwise the same version as a digest-pinned container image —
+which is the path GitHub-hosted runners take, because they answer 503 for the
+release asset, and the path any other host takes rather than downloading a binary
+it cannot execute. Bumping `actionlint` means updating the version, all four
+checksums, and the image digest together. Locally:
 
 ```bash
 just workflow-policy   # pins, permissions, signer restrictions (offline)
 just actionlint        # workflow linting; downloads the pinned actionlint
 ```
+
+If a host has neither a supported release archive nor `docker`, the script says
+so and fails instead of linting with an unpinned version.
 
 [`.github/dependabot.yml`](../../.github/dependabot.yml) opens one grouped
 `ci(deps):` pull request a week that moves the pins and their comments forward

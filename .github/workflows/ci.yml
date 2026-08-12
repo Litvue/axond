@@ -374,6 +374,7 @@ jobs:
       - name: Lint the workflow definitions
         run: |
           shellcheck ops/actionlint.sh
+          ops/actionlint.sh --self-test
           ops/actionlint.sh
 
   static-binary:

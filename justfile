@@ -65,6 +65,7 @@ workflow-policy:
     ops/workflow-policy.py
 
 actionlint:
+    ops/actionlint.sh --self-test
     ops/actionlint.sh
 
 # Supply-chain policy: advisories, licenses, sources (see deny.toml).
