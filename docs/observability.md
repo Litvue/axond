@@ -25,15 +25,13 @@ Logs are always JSON on stdout, filtered by `RUST_LOG` (default
 ## Health surfaces
 
 Three surfaces answer three different questions, and none of them substitutes for
-another ([ADR 0031](./adr/0031-bounded-status-contract.md)). Two of them ship
-today; the third is a fixed contract whose route arrives with the stateful
-slices, so treat its row as the shape to expect rather than something to curl:
+another ([ADR 0031](./adr/0031-bounded-status-contract.md)):
 
 | Surface | Authentication | Question it answers |
 | --- | --- | --- |
 | `GET /healthz` | none | *Is the process alive?* Answers `ok` throughout, including the shutdown drain. Restart it if this fails. |
 | `GET /readyz` | none | *Should traffic be sent here?* `ready`, or `503 draining` once termination begins. Point the load balancer here. |
-| `GET /admin/v1/status` **(not registered yet)** | gateway credential with the `status` capability | *Which dependencies is this replica talking to?* Cached component states with an observation age. |
+| `GET /admin/v1/status` | gateway credential with the `status` capability | *Which dependencies is this replica talking to?* Cached component states with an observation age. |
 
 Neither `/healthz` nor `/readyz` observes a dependency. A store outage must not
 remove healthy replicas from service, so dependency state lives only on the
@@ -62,10 +60,22 @@ authority additionally sees only the components its own traffic depends on,
 reasons coarsened to `unavailable`, ages rounded to whole seconds, and no revision
 summary.
 
-A stateless replica reports every component `disabled`; that is the correct
-answer, not a degraded one. No route serves this yet, and no component is probed:
-the contract, its redaction, and its metrics ship first, and each stateful slice
-adds the probe for the backend it owns behind them.
+A stateless replica reports every component `disabled` — that is the correct
+answer, not a degraded one — because no component is *enabled*, and an enabled
+component is one this deployment configured. The route, its scoping, and its
+redaction ship now; each stateful slice adds the probe for the backend it owns
+behind them, and the response shape does not change when it does:
+
+```bash
+curl -sS -H "Authorization: Bearer $AXOND_KEY" http://localhost:8080/admin/v1/status
+```
+
+What to reach for, in order: `/readyz` says whether traffic belongs here,
+`/admin/v1/status` says which dependency is impaired and how fresh that knowledge
+is, and the [observability runbook](./operations/observability-runbook.md) says
+what to do about it. The shipped dashboard and alert assets under
+[`ops/observability/`](../ops/observability/) are the fleet-wide view of the same
+signals.
 
 ## Traces
 
@@ -146,6 +156,12 @@ readable from a scrape endpoint
 ([ADR 0031](./adr/0031-bounded-status-contract.md)).
 
 ### What to alert on
+
+The table below is the reasoning; [`ops/observability/alerts/axond-alerts.yml`](../ops/observability/alerts/axond-alerts.yml)
+is the same content as Prometheus rules, each carrying a `runbook_url` into the
+[observability runbook](./operations/observability-runbook.md). A test validates
+every expression in the shipped rules and dashboards against the catalogue, so a
+renamed instrument cannot leave an alert silently matching nothing.
 
 | Alert | Signal | Why |
 | --- | --- | --- |

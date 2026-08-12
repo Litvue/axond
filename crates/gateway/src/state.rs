@@ -28,6 +28,7 @@ use crate::availability::AvailabilityIndex;
 use crate::budget::BudgetStore;
 use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind};
 use crate::convergence::secrets::ResolvedSecrets;
+use crate::convergence::{RevisionReport, RevisionStatus};
 use crate::credentials::{CredentialError, Credentials};
 use crate::desired_state::pricing::PricingSnapshot;
 use crate::key_material::{self, KeyMaterialError};
@@ -41,6 +42,7 @@ use crate::rate_limit::NoLimit;
 use crate::rate_limit::RateLimiter;
 use crate::revocation::RevocationStore;
 use crate::shutdown::Lifecycle;
+use crate::status::registry::CachedStatusRegistry;
 use crate::usage::UsageFanout;
 
 pub use crate::principals::InboundKey;
@@ -61,7 +63,38 @@ pub struct Inner {
     /// reload replaces what a request is served *with*, never whether the
     /// process is still accepting requests at all.
     pub lifecycle: Arc<Lifecycle>,
+    /// What the authenticated status view reads. Process-level and *cached*: the
+    /// registry is filled by a background refresher, so a status request reads a
+    /// map rather than a backend (ADR 0031).
+    pub status: Arc<CachedStatusRegistry>,
+    /// This replica's convergence state, when it converges against a control
+    /// plane at all. `None` in the stateless posture, where a replica serves the
+    /// file it booted from and there is no revision to lag behind.
+    pub revision: Option<Arc<RevisionStatus>>,
     config: ArcSwap<ConfigSnapshot>,
+}
+
+/// What a replica reports about itself, as distinct from what it serves.
+///
+/// Passed in rather than built inside [`AppState::new_with_rate_limiter`] because
+/// the two fields have no stateless implementation to default to *usefully*: a
+/// stateless replica has an all-`disabled` registry and no convergence, and a
+/// stateful one is handed the registry its probes publish into and the status the
+/// reconciler writes.
+pub struct ReplicaObservability {
+    pub status: Arc<CachedStatusRegistry>,
+    pub revision: Option<Arc<RevisionStatus>>,
+}
+
+impl ReplicaObservability {
+    /// The stateless posture: every component `disabled`, nothing probed, no
+    /// revision.
+    pub fn stateless() -> Self {
+        Self {
+            status: Arc::new(CachedStatusRegistry::stateless()),
+            revision: None,
+        }
+    }
 }
 
 /// The config and everything resolved from it: the credential graph, the
@@ -565,6 +598,28 @@ impl AppState {
         rate_limiter: Box<dyn RateLimiter>,
         revocation: Box<dyn RevocationStore>,
     ) -> Result<Self, SnapshotError> {
+        Self::new_with_observability(
+            config,
+            env,
+            usage,
+            budget,
+            rate_limiter,
+            revocation,
+            ReplicaObservability::stateless(),
+        )
+    }
+
+    /// The full constructor: what this replica serves, plus what it reports about
+    /// itself.
+    pub fn new_with_observability(
+        config: Config,
+        env: &HashMap<String, String>,
+        usage: UsageFanout,
+        budget: Box<dyn BudgetStore>,
+        rate_limiter: Box<dyn RateLimiter>,
+        revocation: Box<dyn RevocationStore>,
+        observability: ReplicaObservability,
+    ) -> Result<Self, SnapshotError> {
         // The transport bounds configure the shared client, so they are read
         // once here: a reload validates a change and reports that it needs a
         // restart rather than swapping the pool under in-flight requests.
@@ -582,6 +637,8 @@ impl AppState {
             rate_limiter,
             revocation,
             lifecycle: Arc::new(Lifecycle::new()),
+            status: observability.status,
+            revision: observability.revision,
             config: ArcSwap::from_pointee(snapshot),
         })))
     }
@@ -589,6 +646,16 @@ impl AppState {
     /// The process lifecycle: what readiness reports and what admission checks.
     pub fn lifecycle(&self) -> &Arc<Lifecycle> {
         &self.0.lifecycle
+    }
+
+    /// The cached dependency observations the authenticated status view projects.
+    pub fn status(&self) -> &Arc<CachedStatusRegistry> {
+        &self.0.status
+    }
+
+    /// This replica's convergence report, when it converges at all.
+    pub fn revision_report(&self) -> Option<RevisionReport> {
+        self.0.revision.as_ref().map(|status| status.report())
     }
 
     /// The config snapshot a request runs against. Taken once per request and

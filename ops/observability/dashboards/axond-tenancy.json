@@ -1,0 +1,771 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "The Prometheus instance scraping the collector that receives axond's OTLP metrics.",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "10.0.0"
+    },
+    {
+      "type": "datasource",
+      "id": "prometheus",
+      "name": "Prometheus",
+      "version": "1.0.0"
+    }
+  ],
+  "uid": "axond-tenancy",
+  "title": "Axond \u2014 tenant, alias, and target drill-down",
+  "description": "Per-namespace, per-alias, per-provider, and per-target volume, latency, tokens, and spend. Those four are the only drill-down dimensions axond's metrics carry: subject, credential, and request identity are refused as metric labels and live on usage records and spans instead.",
+  "tags": [
+    "axond",
+    "gateway",
+    "tenancy"
+  ],
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "utc",
+  "links": [
+    {
+      "title": "Observability runbook",
+      "type": "link",
+      "url": "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md",
+      "targetBlank": true,
+      "icon": "doc",
+      "tooltip": "First response for every alert on this dashboard",
+      "tags": []
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "label": "namespace",
+        "description": "The tenant namespaces you declare.",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "definition": "label_values(axond_request_count, axond_namespace)",
+        "query": {
+          "query": "label_values(axond_request_count, axond_namespace)",
+          "refId": "StandardVariableQuery"
+        },
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "options": []
+      },
+      {
+        "name": "alias",
+        "label": "alias",
+        "description": "The [[model]] aliases you declare.",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "definition": "label_values(axond_request_count, gen_ai_request_model)",
+        "query": {
+          "query": "label_values(axond_request_count, gen_ai_request_model)",
+          "refId": "StandardVariableQuery"
+        },
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "options": []
+      },
+      {
+        "name": "provider",
+        "label": "provider",
+        "description": "The [[provider]] ids you declare.",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "definition": "label_values(axond_request_count, axond_target_provider)",
+        "query": {
+          "query": "label_values(axond_request_count, axond_target_provider)",
+          "refId": "StandardVariableQuery"
+        },
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "options": []
+      },
+      {
+        "name": "target_model",
+        "label": "target model",
+        "description": "The target models you declare.",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "definition": "label_values(axond_request_count, axond_target_model)",
+        "query": {
+          "query": "label_values(axond_request_count, axond_target_model)",
+          "refId": "StandardVariableQuery"
+        },
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "options": []
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Volume and outcome",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Requests by namespace",
+      "description": "Drill-down stops at the four configured dimensions; per-request attribution lives on usage records and spans.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (axond_namespace) (rate(axond_request_count{axond_namespace=~\"$namespace\", gen_ai_request_model=~\"$alias\", axond_target_provider=~\"$provider\", axond_target_model=~\"$target_model\"}[5m]))",
+          "legendFormat": "{{axond_namespace}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Requests by alias",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (gen_ai_request_model) (rate(axond_request_count{axond_namespace=~\"$namespace\", gen_ai_request_model=~\"$alias\", axond_target_provider=~\"$provider\", axond_target_model=~\"$target_model\"}[5m]))",
+          "legendFormat": "{{gen_ai_request_model}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Outcome mix",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (axond_status) (rate(axond_request_count{axond_namespace=~\"$namespace\", gen_ai_request_model=~\"$alias\", axond_target_provider=~\"$provider\", axond_target_model=~\"$target_model\"}[5m]))",
+          "legendFormat": "{{axond_status}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Upstream errors by target",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (axond_target_provider, axond_target_model) (rate(axond_upstream_errors{axond_namespace=~\"$namespace\", gen_ai_request_model=~\"$alias\", axond_target_provider=~\"$provider\", axond_target_model=~\"$target_model\"}[5m]))",
+          "legendFormat": "{{axond_target_provider}}/{{axond_target_model}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "links": [
+        {
+          "title": "Runbook: first response",
+          "url": "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#a-provider-target-is-out",
+          "targetBlank": true
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Latency",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "panels": []
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Gateway latency p95",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, axond_namespace) (rate(axond_request_duration_bucket{axond_namespace=~\"$namespace\", gen_ai_request_model=~\"$alias\", axond_target_provider=~\"$provider\", axond_target_model=~\"$target_model\"}[10m])))",
+          "legendFormat": "{{axond_namespace}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "links": [
+        {
+          "title": "Runbook: first response",
+          "url": "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#served-errors-are-elevated",
+          "targetBlank": true
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Time to first token p95",
+      "description": "The number streaming callers feel; provider degradation shows here first.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_request_model) (rate(axond_request_time_to_first_token_bucket{axond_namespace=~\"$namespace\", gen_ai_request_model=~\"$alias\", axond_target_provider=~\"$provider\", axond_target_model=~\"$target_model\"}[10m])))",
+          "legendFormat": "{{gen_ai_request_model}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "links": [
+        {
+          "title": "Runbook: first response",
+          "url": "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#upstream-requests-are-timing-out",
+          "targetBlank": true
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Tokens and spend",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "panels": []
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Token throughput",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 27
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (axond_namespace) (rate(axond_tokens_input{axond_namespace=~\"$namespace\", gen_ai_request_model=~\"$alias\", axond_target_provider=~\"$provider\", axond_target_model=~\"$target_model\"}[5m]))",
+          "legendFormat": "input {{axond_namespace}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (axond_namespace) (rate(axond_tokens_output{axond_namespace=~\"$namespace\", gen_ai_request_model=~\"$alias\", axond_target_provider=~\"$provider\", axond_target_model=~\"$target_model\"}[5m]))",
+          "legendFormat": "output {{axond_namespace}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (axond_namespace) (rate(axond_tokens_cache_read{axond_namespace=~\"$namespace\", gen_ai_request_model=~\"$alias\", axond_target_provider=~\"$provider\", axond_target_model=~\"$target_model\"}[5m]))",
+          "legendFormat": "cache read {{axond_namespace}}",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (axond_namespace) (rate(axond_tokens_cache_write{axond_namespace=~\"$namespace\", gen_ai_request_model=~\"$alias\", axond_target_provider=~\"$provider\", axond_target_model=~\"$target_model\"}[5m]))",
+          "legendFormat": "cache write {{axond_namespace}}",
+          "range": true,
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Spend rate",
+      "description": "Priced from your target catalogue, in USD per second.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 27
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (axond_namespace) (rate(axond_cost_microdollars{axond_namespace=~\"$namespace\", gen_ai_request_model=~\"$alias\", axond_target_provider=~\"$provider\", axond_target_model=~\"$target_model\"}[5m])) / 1e6",
+          "legendFormat": "{{axond_namespace}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "links": [
+        {
+          "title": "Runbook: first response",
+          "url": "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#budget-or-rate-limit-capacity-is-exhausted",
+          "targetBlank": true
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Credential source mix",
+      "description": "platform is your own key paying; byok is the tenant's.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 35
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (axond_credential_source) (rate(axond_request_count{axond_namespace=~\"$namespace\", gen_ai_request_model=~\"$alias\", axond_target_provider=~\"$provider\", axond_target_model=~\"$target_model\"}[5m]))",
+          "legendFormat": "{{axond_credential_source}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Spend by alias",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 35
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (gen_ai_request_model) (rate(axond_cost_microdollars{axond_namespace=~\"$namespace\", gen_ai_request_model=~\"$alias\", axond_target_provider=~\"$provider\", axond_target_model=~\"$target_model\"}[5m])) / 1e6",
+          "legendFormat": "{{gen_ai_request_model}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

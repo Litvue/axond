@@ -63,6 +63,7 @@ use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerific
 use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::shutdown::Phase;
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
+use crate::status::{StatusResponse, StatusScope};
 use crate::streaming::{self, Framing, StreamContext};
 use crate::telemetry;
 use crate::usage::identity::EventIdentity;
@@ -167,6 +168,12 @@ fn route_specs(minting_enabled: bool) -> Vec<RouteSpec> {
             auth: AuthPosture::Authenticated,
             capability: Some(Capability::Credentials),
             router: || get(list_credentials),
+        },
+        RouteSpec {
+            path: "/admin/v1/status",
+            auth: AuthPosture::Authenticated,
+            capability: Some(Capability::Status),
+            router: || get(replica_status),
         },
         RouteSpec {
             path: "/v1/chat/completions",
@@ -454,6 +461,34 @@ async fn readyz(State(state): State<AppState>) -> (StatusCode, &'static str) {
         Phase::Serving => (StatusCode::OK, "ready"),
         Phase::Draining | Phase::Closing => (StatusCode::SERVICE_UNAVAILABLE, "draining"),
     }
+}
+
+/// This replica's own dependency status, projected into what the caller is
+/// entitled to see (ADR 0031).
+///
+/// Three properties are structural rather than checked here. The read is a
+/// *cache* read — [`crate::status::registry::CachedStatusRegistry::view`] is
+/// synchronous, so this handler cannot probe a backend however it is edited. The
+/// scope comes from the caller's authority rather than from a query parameter, so
+/// a tenant cannot ask for the operator's view. And the response type has no
+/// free-text field, so the probe detail behind a coarse reason code cannot be
+/// projected into it.
+///
+/// Unlike the two probes this reports a dependency, and unlike them it is
+/// authenticated: an orchestrator polling `/readyz` must never learn that the
+/// budget store is down, because removing healthy replicas from service is how a
+/// dependency outage becomes a fleet outage.
+async fn replica_status(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
+    Extension(caller): Extension<InboundKey>,
+) -> Json<StatusResponse> {
+    let scope = StatusScope::for_operator_authority(caller_holds_direct_operator_authority(
+        &caller, &snapshot,
+    ));
+    let view = state.status().view();
+    let revision = state.revision_report();
+    Json(view.project(scope, state.lifecycle().phase(), revision.as_ref()))
 }
 
 /// Replica-local Tier 0 credential status. Presence is expressed by each
@@ -2327,8 +2362,14 @@ mod tests {
     use crate::aliases::AliasScope;
     use crate::budget::NoBudget;
     use crate::config::Config;
+    use crate::convergence::status::testing::ManualClock;
+    use crate::convergence::{Rejection, RevisionStatus, SnapshotSource};
+    use crate::desired_state::fixtures::revision_id;
     use crate::principals::PrincipalAuthority;
     use crate::rate_limit::{InMemoryRateLimiter, NoLimit, RateLimitKey, RateLimiter};
+    use crate::state::ReplicaObservability;
+    use crate::status::registry::{CachedStatusRegistry, StatusRefresher, StatusSettings};
+    use crate::status::{Component, ComponentObservation, ComponentState, StatusReason};
     use crate::usage::identity::RequestId;
     use crate::usage::{StdoutSink, UsageFanout, UsageSink};
     use axum::body::Body;
@@ -6335,5 +6376,463 @@ targets = [{{ provider = "p", model = "upstream-model", price = {{ input_microdo
         assert_eq!(records.len(), 3);
         assert_eq!(records[2].target_provider, "pa");
         assert_eq!(records[2].attempts, 1);
+    }
+
+    // ----------------------------------------------------------------
+    // `/admin/v1/status`: authorization, redaction, and revision visibility.
+    //
+    // The route reports on dependencies, which makes it the one surface where a
+    // leak is a leak of the operator's infrastructure rather than of a request.
+    // Four properties are asserted, all fail-closed: an unauthenticated caller
+    // learns nothing, a token without the capability learns nothing, a tenant
+    // sees its own request path with coarsened reasons, and no scope sees a
+    // secret, a DSN, a raw backend error, or a revision id.
+
+    /// The status deployment: an operator's scope-less key in the default
+    /// namespace, a tenant's key in another namespace, and a verifier for minted
+    /// tokens.
+    const STATUS_CONFIG: &str = r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[namespace]]
+id = "tenant"
+
+[[gateway_key]]
+env = "AXOND_OPERATOR_KEY"
+namespace = "platform"
+
+[[gateway_key]]
+env = "AXOND_TENANT_KEY"
+namespace = "tenant"
+
+[gateway_token]
+audience = "test-audience"
+
+[[gateway_verifier]]
+kid = "scope-test-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+"#;
+
+    const OPERATOR_KEY: &str = "operator-secret";
+    const TENANT_KEY: &str = "tenant-secret";
+
+    /// What a probe of a broken Postgres would carry into the registry: a DSN
+    /// with a password, and the backend's own error text. Published through the
+    /// same `publish` the refresher uses, so the redaction under test is the
+    /// shipped path rather than a test-only one.
+    const LEAKY_DETAIL: &str = "connection to postgres://axond:s3cr3t-password@db.internal:5432/axond failed: FATAL: password authentication failed";
+
+    fn status_state(observability: ReplicaObservability) -> AppState {
+        let config = Config::from_toml_str(STATUS_CONFIG).expect("status config");
+        let env = HashMap::from([
+            ("AXOND_OPERATOR_KEY".to_owned(), OPERATOR_KEY.to_owned()),
+            ("AXOND_TENANT_KEY".to_owned(), TENANT_KEY.to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        AppState::new_with_observability(
+            config,
+            &env,
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+            Box::new(NoLimit),
+            Box::new(crate::revocation::NoDenylist),
+            observability,
+        )
+        .expect("status state")
+    }
+
+    /// A stateful replica's registry: every component enabled, with the
+    /// control plane refusing the replica's own credentials and the budget store
+    /// unreachable. One is operator-only and one is on the tenant's request path,
+    /// which is what makes the two scopes distinguishable.
+    fn observed_registry() -> Arc<CachedStatusRegistry> {
+        let registry = Arc::new(CachedStatusRegistry::new(
+            StatusSettings {
+                enabled: Component::ALL.to_vec(),
+                ..StatusSettings::default()
+            },
+            Arc::new(crate::convergence::SystemClock),
+        ));
+        registry.publish(ComponentObservation::unavailable(
+            Component::ControlPlane,
+            StatusReason::AuthenticationRejected,
+            LEAKY_DETAIL.to_owned(),
+        ));
+        registry.publish(ComponentObservation::unavailable(
+            Component::BudgetStore,
+            StatusReason::Unreachable,
+            LEAKY_DETAIL.to_owned(),
+        ));
+        registry.publish(ComponentObservation {
+            component: Component::Catalogue,
+            state: ComponentState::Ok,
+            reason: None,
+            detail: None,
+        });
+        registry
+    }
+
+    async fn status_response(state: AppState, credential: Option<&str>) -> (StatusCode, Value) {
+        let mut request = Request::get("/admin/v1/status");
+        if let Some(credential) = credential {
+            request = request.header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {credential}"),
+            );
+        }
+        let response = router(state)
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    fn component_reason(body: &Value, component: &str) -> Option<String> {
+        body["components"]
+            .as_array()
+            .expect("components")
+            .iter()
+            .find(|entry| entry["component"] == component)
+            .map(|entry| entry["reason"].as_str().unwrap_or_default().to_owned())
+    }
+
+    /// Fail-closed: dependency status is not a public health endpoint. An
+    /// unauthenticated poller gets `401` and no component list, because "which of
+    /// the operator's backends is down" is reconnaissance.
+    #[tokio::test]
+    async fn status_refuses_an_unauthenticated_caller() {
+        let (status, body) = status_response(
+            status_state(ReplicaObservability {
+                status: observed_registry(),
+                revision: None,
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.get("components").is_none(), "{body}");
+    }
+
+    /// `status` is not granted to a scope-less minted token, so a token minted
+    /// for inference cannot read dependency status by pointing at the route.
+    #[tokio::test]
+    async fn status_refuses_a_token_without_the_capability() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let token = scoped_token_for("test-audience", Some(vec!["chat", "models"]));
+        let (status, body) = status_response(state, Some(&token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["type"], "token_scope_insufficient");
+        assert!(body.get("components").is_none(), "{body}");
+    }
+
+    /// The operator's own authority — a scope-less static key in the default
+    /// namespace — is what deployment scope is derived from, never a request
+    /// parameter.
+    #[tokio::test]
+    async fn status_gives_the_operator_the_deployment_view() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let (status, body) = status_response(state, Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["scope"], "deployment");
+        assert_eq!(body["observed"], "replica");
+        assert_eq!(body["phase"], "serving");
+        assert_eq!(
+            body["components"].as_array().expect("components").len(),
+            Component::ALL.len()
+        );
+        // Exact reasons, including the operator-only ones.
+        assert_eq!(
+            component_reason(&body, "control_plane").as_deref(),
+            Some("authentication_rejected")
+        );
+        assert_eq!(
+            component_reason(&body, "budget_store").as_deref(),
+            Some("unreachable")
+        );
+    }
+
+    /// A tenant sees its own request path, with the operator's internals removed
+    /// and the reasons behind them coarsened: it learns *that* a dependency is
+    /// impaired, not that the operator's control-plane credential was rejected.
+    #[tokio::test]
+    async fn status_gives_a_tenant_only_its_own_request_path() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let (status, body) = status_response(state, Some(TENANT_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["scope"], "namespace");
+        let components: Vec<&str> = body["components"]
+            .as_array()
+            .expect("components")
+            .iter()
+            .map(|entry| entry["component"].as_str().expect("a component name"))
+            .collect();
+        assert!(!components.contains(&"control_plane"), "{body}");
+        assert!(!components.contains(&"secret_store"), "{body}");
+        assert!(!components.contains(&"usage_sink"), "{body}");
+        assert!(components.contains(&"budget_store"), "{body}");
+        // On the tenant's request path, but the reason is coarsened.
+        assert_eq!(
+            component_reason(&body, "budget_store").as_deref(),
+            Some("unavailable")
+        );
+    }
+
+    /// A minted token is not the operator however it is scoped: authority, not
+    /// namespace, is what deployment scope turns on. A `status`-scoped token in
+    /// the *default* namespace still gets the namespace view.
+    #[tokio::test]
+    async fn a_minted_status_token_is_not_the_operator() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let token = scoped_token_for("test-audience", Some(vec!["status"]));
+        let (status, body) = status_response(state, Some(&token)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["scope"], "namespace");
+        assert!(body.get("revision").is_none(), "{body}");
+    }
+
+    /// The redaction assertion, made against the serialized bytes rather than
+    /// against fields: a probe published a DSN, a password, and a backend error,
+    /// and none of it appears in either scope's response.
+    #[tokio::test]
+    async fn status_never_serializes_a_secret_a_dsn_or_a_backend_error() {
+        for credential in [OPERATOR_KEY, TENANT_KEY] {
+            let state = status_state(ReplicaObservability {
+                status: observed_registry(),
+                revision: Some(lagging_replica().1),
+            });
+            let (status, body) = status_response(state, Some(credential)).await;
+            assert_eq!(status, StatusCode::OK);
+            let serialized = body.to_string();
+            for leaked in [
+                "s3cr3t-password",
+                "postgres://",
+                "db.internal",
+                "password authentication failed",
+                "FATAL",
+                LEAKY_DETAIL,
+            ] {
+                assert!(
+                    !serialized.contains(leaked),
+                    "`{leaked}` reached a {credential} response: {serialized}"
+                );
+            }
+            // Revision *identifiers* are absent in every scope, including the
+            // operator's, because they are unbounded over a deployment's life.
+            for revision in [revision_id(7), revision_id(8)] {
+                assert!(!serialized.contains(&revision.to_string()), "{serialized}");
+            }
+        }
+    }
+
+    /// The response carries only bounded values, which is the cardinality
+    /// property the metric labels depend on: every component name, state, and
+    /// reason in it comes from a closed vocabulary the catalogue also names.
+    #[tokio::test]
+    async fn status_reports_only_bounded_vocabulary_values() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let (_, body) = status_response(state, Some(OPERATOR_KEY)).await;
+        let states: Vec<&str> = ComponentState::ALL
+            .iter()
+            .map(|state| state.as_str())
+            .collect();
+        let reasons: Vec<&str> = StatusReason::ALL
+            .iter()
+            .map(|reason| reason.code())
+            .collect();
+        for entry in body["components"].as_array().expect("components") {
+            let component = entry["component"].as_str().expect("a component");
+            assert!(
+                crate::status::COMPONENTS.contains(&component),
+                "`{component}` is outside the catalogued vocabulary"
+            );
+            assert!(states.contains(&entry["state"].as_str().expect("a state")));
+            if let Some(reason) = entry["reason"].as_str() {
+                assert!(
+                    reasons.contains(&reason),
+                    "`{reason}` is not a status reason"
+                );
+            }
+            assert!(entry["observed_age_ms"].is_u64(), "{entry}");
+        }
+    }
+
+    /// A status read is a cache read: the handler returns the last observation
+    /// and never probes, so a dependency outage cannot be turned into a status
+    /// outage — or into load on a struggling backend — by polling this route.
+    #[tokio::test]
+    async fn status_reads_the_cache_without_probing() {
+        let registry = observed_registry();
+        let probe = Arc::new(CountingProbe {
+            observations: Arc::new(AtomicUsize::new(0)),
+        });
+        let state = status_state(ReplicaObservability {
+            status: Arc::clone(&registry),
+            revision: None,
+        });
+        for _ in 0..5 {
+            let (status, _) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        assert_eq!(
+            probe.observations.load(Ordering::SeqCst),
+            0,
+            "serving status observed a component"
+        );
+        // The refresher is the only caller that can: it observes once per round.
+        StatusRefresher::new(Arc::clone(&registry), vec![probe.clone()])
+            .refresh_once()
+            .await;
+        assert_eq!(probe.observations.load(Ordering::SeqCst), 1);
+    }
+
+    /// A probe that records being called. Reachable only from the refresher,
+    /// which is what the test above turns into an assertion.
+    struct CountingProbe {
+        observations: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::status::registry::ComponentProbe for CountingProbe {
+        fn component(&self) -> Component {
+            Component::BudgetStore
+        }
+
+        async fn observe(&self) -> ComponentObservation {
+            self.observations.fetch_add(1, Ordering::SeqCst);
+            ComponentObservation {
+                component: Component::BudgetStore,
+                state: ComponentState::Ok,
+                reason: None,
+                detail: None,
+            }
+        }
+    }
+
+    /// A replica that converged on the revision the control plane wants.
+    fn converged_replica() -> Arc<RevisionStatus> {
+        let clock = ManualClock::new();
+        let status = Arc::new(RevisionStatus::new(Box::new(clock.clone())));
+        let desired = revision_id(7);
+        status.observe_desired(Some(desired));
+        status.record_published(
+            desired,
+            9,
+            SnapshotSource::ControlPlane,
+            Duration::from_millis(120),
+        );
+        status.observe_desired(Some(desired));
+        status
+    }
+
+    /// A replica still serving an older snapshot, with the clock moved on so the
+    /// lag is an exact number rather than a race.
+    fn lagging_replica() -> (ManualClock, Arc<RevisionStatus>) {
+        let clock = ManualClock::new();
+        let status = Arc::new(RevisionStatus::new(Box::new(clock.clone())));
+        let old = revision_id(7);
+        status.observe_desired(Some(old));
+        status.record_published(
+            old,
+            9,
+            SnapshotSource::ControlPlane,
+            Duration::from_millis(120),
+        );
+        // The control plane publishes a newer revision this replica refuses.
+        status.observe_desired(Some(revision_id(8)));
+        status.record_rejection(
+            Rejection {
+                revision: Some(revision_id(8)),
+                reason: "secret",
+                detail: LEAKY_DETAIL.to_owned(),
+            },
+            3,
+        );
+        clock.advance(Duration::from_secs(90));
+        (clock, status)
+    }
+
+    /// The fleet-convergence fixture: two replicas of the same deployment, one
+    /// converged and one ninety seconds behind, each answering `/admin/v1/status`
+    /// for itself.
+    ///
+    /// This is what makes a split fleet visible at all — a replica reports its
+    /// own convergence and nothing else, so "the fleet disagrees" is a comparison
+    /// an operator (or the shipped `AxondFleetRevisionSplit` rule) makes across
+    /// replicas, not a claim any one replica makes.
+    #[tokio::test]
+    async fn two_replicas_report_their_own_revision_lag() {
+        let converged = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: Some(converged_replica()),
+        });
+        let (_clock, lagging_status) = lagging_replica();
+        let lagging = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: Some(lagging_status),
+        });
+
+        let (status, healthy) = status_response(converged, Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(healthy["revision"]["converged"], true);
+        assert_eq!(healthy["revision"]["lag_ms"], 0);
+        assert_eq!(healthy["revision"]["consecutive_failures"], 0);
+        assert_eq!(healthy["revision"]["source"], "control-plane");
+
+        let (status, behind) = status_response(lagging, Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(behind["revision"]["converged"], false);
+        assert_eq!(behind["revision"]["lag_ms"], 90_000);
+        assert_eq!(behind["revision"]["consecutive_failures"], 3);
+        // The refusal reaches the response as a code, not as the rejection's own
+        // detail, which named a secret.
+        assert_eq!(behind["revision"]["reason"], "secret_unresolved");
+        assert_eq!(behind["revision"]["generation"], 9);
+
+        // Same deployment, same route, different answers: the lag is per replica.
+        assert_ne!(healthy["revision"], behind["revision"]);
+    }
+
+    /// A tenant never learns what the fleet is converging on, in either state:
+    /// convergence is the operator's business, and `lag_ms` plus a generation is
+    /// enough to fingerprint a rollout.
+    #[tokio::test]
+    async fn a_tenant_sees_no_revision_summary_however_far_behind_the_replica_is() {
+        let (_clock, lagging_status) = lagging_replica();
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: Some(lagging_status),
+        });
+        let (status, body) = status_response(state, Some(TENANT_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("revision").is_none(), "{body}");
     }
 }

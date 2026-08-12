@@ -1,0 +1,33 @@
+# The collector pipeline the shipped dashboards and alert rules assume.
+#
+# axond exports OTLP/HTTP only, so every Prometheus-side metric name is produced
+# here rather than by the gateway. `add_metric_suffixes: false` is what makes the
+# translation exactly "dots become underscores": no `_total` on counters and no
+# unit suffix, which is the spelling the shipped assets use. Flip it and the
+# assets match nothing.
+#
+# Everything else below is a minimum, not a recommendation: add your own
+# processors, authentication, and exporters as your environment requires.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 10s
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:9464
+    add_metric_suffixes: false
+    resource_to_telemetry_conversion:
+      enabled: false
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]

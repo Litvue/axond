@@ -18,6 +18,12 @@
 // reason the other contract modules do.
 #[allow(dead_code)]
 pub mod catalog;
+// The drift gate for `ops/observability/`: the shipped dashboards and alert rules
+// are checked against the catalogue by `cargo test`, so a renamed instrument
+// cannot leave an operator with a panel that graphs nothing. Nothing in the
+// request path reads it either, so it is compiled for tests only.
+#[cfg(test)]
+mod assets;
 mod exporter;
 pub mod http;
 pub mod metrics;
