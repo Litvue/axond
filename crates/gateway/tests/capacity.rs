@@ -198,6 +198,18 @@ fn output_events_are_counted_however_the_transport_frames_them() {
             "anthropic={anthropic}: nothing is relayed before the first token"
         );
 
+        // Event by event: the greeting and the trailers score nothing, and each
+        // delta scores exactly one — never two for naming its type twice.
+        for event in upstream::slow_events(anthropic, 5) {
+            let event = String::from_utf8(event.to_vec()).expect("UTF-8 events");
+            let relays_a_token = (0..5).any(|i| event.contains(&format!("tok{i} ")));
+            assert_eq!(
+                capacity::output_events(&event),
+                usize::from(relays_a_token),
+                "anthropic={anthropic}: misclassified event:\n{event}"
+            );
+        }
+
         // Whole events arriving in one read count as several; a partial event
         // counts once its remainder arrives, which is why the text accumulates.
         let mid = wire.len() / 2;
