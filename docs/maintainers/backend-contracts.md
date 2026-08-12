@@ -221,6 +221,31 @@ such, not an outage, and `load_revision` returns a `LoadedRevision` only through
 written once and shared by every revision that pins it; the journal holds a
 blob's kind, digest, and size, never its payload.
 
+**A read is bounded, and a bound is a refusal.** `control_plane::hydration` owns
+the manifest and revision reads, under `ControlPlaneSettings::hydration`: entry
+rows, blobs, declared blob bytes, dependency edges, dependency depth, inline body
+bytes, and the canonical size of the assembled candidate. Exceeding one is
+`ControlPlaneError::TooLarge`, categorized `Denied` — policy an operator raises or
+a revision an operator splits, not corruption and not an outage. Two properties
+follow from *how* the bounds are applied. Each bounded read asks for one row past
+its bound, so an oversized revision is detected rather than silently truncated to
+the rows that fit; and the body bounds are server-side predicates
+(`octet_length(...) > $2`), so an oversized body is refused without transferring
+it. Nothing hydrated before the refusal is returned with it: a partial candidate
+is the outcome this module exists to make unrepresentable.
+
+**Hydration is deterministic, and cross-tenant isolation is checked twice.**
+Every read is ordered and collects into `BTreeMap`/`BTreeSet`, so a stored
+revision round-trips to the checksum it was published with, and a reference whose
+version row is missing is named (`IntegrityError::MissingResource`) rather than
+dropped from a shorter manifest that would then fail its checksum for reasons
+naming no row. A reference-layer query refuses a dependency edge that crosses a
+tenant boundary — or that makes deployment-scoped state depend on one tenant's —
+before anything is hydrated, and `DesiredState::validate` checks the same rule on
+the value that comes back. The dependency walk is iterative and memoized, so the
+depth it bounds is not depth on the call stack, and a cycle storage holds (which
+the domain would never publish) terminates as a refusal.
+
 One consequence of canonical encoding is worth stating: an inline body reads back
 in canonical order, which need not be the order a caller wrote its map keys in.
 It is the same value by the only measure the journal, the manifest, and the
@@ -237,6 +262,7 @@ in-memory fakes (`backends::fakes`), which keeps the Tier 0 hermetic gate
 hermetic and is why a fake is test-only — an in-memory control plane is not a
 selectable backend.
 
-Deterministic hydration of a loaded revision into a runtime snapshot (#166) and
-revision convergence and publication to replicas (#142) follow. `load_revision`
-is the seam they read from.
+Revision convergence and publication to replicas (#142) follow.
+`load_revision` — and `load_desired_revision`, which Postgres answers in a single
+transaction so a head read cannot disagree with the hydration following it — is
+the seam they read from.
