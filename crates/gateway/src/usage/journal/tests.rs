@@ -351,6 +351,79 @@ async fn a_quarantined_event_stops_blocking_its_ordering_key() {
     assert_eq!(PoisonReason::Malformed.as_str(), "malformed");
 }
 
+/// Capacity bounds what is *waiting*; retention is what bounds a journal that is
+/// keeping up. Without it a drained journal grows forever, which is the quiet way
+/// a durable store runs out of disk.
+#[tokio::test]
+async fn an_event_every_consumer_finished_with_is_pruned_once_its_window_passes() {
+    // Zero retention: an event is prunable as soon as every consumer is done with
+    // it, which is the boundary case a duration-based window has to get right.
+    let journal = InMemoryUsageJournal::with_capacity(Capacity {
+        retain_acknowledged: Duration::ZERO,
+        ..Capacity::BILLING_GRADE
+    });
+    let billing = consumer("billing");
+    let delivered = event();
+    let poison = event_for("acme");
+    journal.append(&delivered).await.expect("append");
+    journal.append(&poison).await.expect("append");
+
+    let claimed = journal
+        .claim(&billing, claim_of(10, SystemTime::now()))
+        .await
+        .expect("claim");
+    for delivery in &claimed {
+        if delivery.event.id() == poison.id() {
+            journal
+                .quarantine(&delivery.id, PoisonReason::Malformed)
+                .await
+                .expect("quarantine");
+        } else {
+            journal.ack(&delivery.id).await.expect("ack");
+        }
+    }
+
+    // Pruning happens on the next append, as a store's would happen in its own
+    // maintenance statement rather than on the delivery path.
+    journal.append(&event_for("other")).await.expect("append");
+
+    assert_eq!(
+        journal.stored_events(),
+        2,
+        "the acknowledged event is gone; the quarantined one waits for an operator"
+    );
+    let stats = journal.stats(&billing).await.expect("stats");
+    assert_eq!(stats.quarantined, 1);
+    assert_eq!(stats.pending, 1);
+}
+
+/// A journal with a real retention window keeps what it delivered, so a consumer
+/// that re-acknowledges after a restart finds the event rather than an absence.
+#[tokio::test]
+async fn a_retained_event_is_still_there_after_it_was_acknowledged() {
+    let journal = InMemoryUsageJournal::new();
+    let billing = consumer("billing");
+    let event = event();
+    journal.append(&event).await.expect("append");
+    let claimed = journal
+        .claim(&billing, claim_of(1, SystemTime::now()))
+        .await
+        .expect("claim");
+    journal.ack(&claimed[0].id).await.expect("ack");
+
+    journal.append(&event_for("other")).await.expect("append");
+
+    assert_eq!(journal.stored_events(), 2);
+    assert_eq!(
+        Capacity::BILLING_GRADE.retain_acknowledged,
+        Duration::from_secs(24 * 60 * 60)
+    );
+    journal
+        .ack(&claimed[0].id)
+        .await
+        .expect("a re-acknowledgement inside the window finds its event");
+}
+
 /// Quarantine is gated like `ack`, and for the same reason: a verdict on an event
 /// is a consumer's to give only once the event was handed to it, so a second
 /// consumer cannot remove an event from a delivery path it never read. Repeating

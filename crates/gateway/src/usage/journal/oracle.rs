@@ -25,6 +25,10 @@
 //! - **Capacity is a decision, not an accident.** A full journal either refuses
 //!   the append or drops its oldest unacknowledged event, and the dropped count
 //!   is reported rather than inferred.
+//! - **Retention is what bounds a drained journal.** An event every consumer
+//!   acknowledged is pruned once [`Capacity::retain_acknowledged`] has passed
+//!   since it was observed, so storage does not grow without limit just because
+//!   delivery kept up. A quarantined event is not pruned.
 //!
 //! The mutex is this fake's transaction; the Postgres implementation's is a
 //! transaction.
@@ -94,6 +98,49 @@ impl Storage {
             })
             .collect()
     }
+
+    /// Drop events every registered consumer has acknowledged and whose retention
+    /// window has passed, measured from the event's own observation time — the
+    /// `recorded_at` a store already has, so this is one `DELETE ... WHERE` and
+    /// not a second timestamp column.
+    ///
+    /// Quarantined events stay: they are waiting for an operator. So does
+    /// everything, if no consumer is registered — a journal nobody reads has
+    /// acknowledged nothing.
+    fn prune_acknowledged(&mut self, retain: Duration, now: SystemTime) {
+        if self.consumers.is_empty() {
+            return;
+        }
+        let prunable: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.event.observed_at() + retain <= now)
+            .filter(|entry| {
+                self.consumers
+                    .values()
+                    .all(|state| state.acked.contains(&entry.position))
+            })
+            .map(|entry| entry.position)
+            .collect();
+        for position in prunable {
+            let Some(index) = self
+                .entries
+                .iter()
+                .position(|entry| entry.position == position)
+            else {
+                continue;
+            };
+            let pruned = self.entries.remove(index);
+            // The unique index goes with the row, which is why the window has to
+            // outlive any retry: past it, the same event appends as a new one.
+            self.positions.remove(pruned.event.idempotency_key());
+            for state in self.consumers.values_mut() {
+                state.acked.remove(&position);
+                state.attempts.remove(&position);
+                state.leases.remove(&position);
+            }
+        }
+    }
 }
 
 /// A `UsageJournal` whose transaction is a mutex.
@@ -155,6 +202,7 @@ impl UsageJournal for InMemoryUsageJournal {
 
     async fn append(&self, event: &UsageEvent) -> Result<Appended, JournalError> {
         let mut storage = self.locked();
+        storage.prune_acknowledged(self.capacity.retain_acknowledged, SystemTime::now());
         if let Some(position) = storage.positions.get(event.idempotency_key()).copied() {
             let stored = storage.entry(position).expect("indexed position exists");
             if stored.event.is_same_fact_as(event) {

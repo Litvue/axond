@@ -462,10 +462,24 @@ pub struct Capacity {
     pub max_events: u64,
     /// Attempts one event gets before it is quarantined as poison.
     pub max_delivery_attempts: u32,
-    /// How long an acknowledged event is retained before it may be pruned. A
-    /// retention window rather than an immediate delete, so a consumer that
-    /// double-acknowledges after a restart still finds the event it is talking
-    /// about instead of an absence it has to interpret.
+    /// How long an acknowledged event is retained before it is pruned, measured
+    /// from [`UsageEvent::observed_at`] — the record's own `recorded_at`, so a
+    /// store prunes with a predicate over a column it already has rather than a
+    /// second timestamp it has to write.
+    ///
+    /// A window rather than an immediate delete, because a consumer that
+    /// re-acknowledges after a restart must find the event it is talking about
+    /// instead of an absence it has to interpret. Two consequences worth stating,
+    /// since they are the ones an implementation gets wrong:
+    ///
+    /// - Only an event *every* registered consumer has finished with is prunable.
+    ///   Adding a consumer therefore extends what the journal holds.
+    /// - Pruning forgets the [`IdempotencyKey`], so an append of the same event
+    ///   after its window is a *new* event rather than [`Appended::AlreadyPresent`].
+    ///   The window must exceed the longest retry horizon a caller can have.
+    ///
+    /// A quarantined event is never pruned: it is waiting for an operator, not
+    /// for a clock.
     pub retain_acknowledged: Duration,
     pub policy: CapacityPolicy,
 }
