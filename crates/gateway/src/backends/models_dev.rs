@@ -26,6 +26,17 @@
 //! value. Provider values therefore win by construction, and *why* they won is
 //! auditable against the raw payload the snapshot's digest names.
 //!
+//! The two maps do not share one id namespace, though — the neutral index is
+//! authored (`openai/gpt-5.5`) while a provider keys its offerings the way its
+//! own API names them (`gpt-5.5`) — so filing an offering under the model it
+//! belongs to is [`canonical_model_id`]'s job, and
+//! [`ProviderOffering::published_model_id`] keeps the string a request to that
+//! provider must actually use.
+//!
+//! The decisions this module rests on — the observed-rate unit, the three
+//! identities, and the compiled-in seed — are recorded in
+//! [ADR 0031](https://github.com/Litvue/axond/blob/main/docs/adr/0031-catalogue-source-imports.md).
+//!
 //! # Strict where a mistake would be silent
 //!
 //! The rule is: **be tolerant of new information, intolerant of changed
@@ -135,6 +146,15 @@ pub enum ModelsDevError {
     DuplicateTier { pointer: JsonPointer },
     #[error("`{pointer}` publishes a price on a provider-neutral record")]
     NeutralPrice { pointer: JsonPointer },
+    #[error(
+        "`{pointer}` offers `{key}`, which could be any of `{}`",
+        candidates.join("`, `")
+    )]
+    AmbiguousModelKey {
+        pointer: JsonPointer,
+        key: String,
+        candidates: Vec<String>,
+    },
     #[error("the payload's catalogue is not usable: {source}")]
     Content {
         #[source]
@@ -537,10 +557,102 @@ impl WireTierRates {
     }
 }
 
+/// The provider-neutral records, keyed as the upstream publishes them.
+type NeutralRecords = BTreeMap<ModelId, (ModelFacts, JsonPointer)>;
+
+/// Resolve every key one provider publishes to the id the catalogue files it
+/// under.
+///
+/// Resolution is per provider rather than per key because a provider may publish
+/// one model under two callable ids — `qiniu-ai` offers both `mimo-v2-flash` and
+/// `xiaomi/mimo-v2-flash` — and an offering is one provider's statement about one
+/// model. When two keys would resolve to the same model, only a key that *is*
+/// the model's id keeps it; the others stay filed under the id they were
+/// published as, which is the id a request to that provider uses. Two published
+/// aliases therefore remain two offerings, as upstream states them, rather than
+/// one of them being dropped or the import refused.
+fn resolve_provider_models<'a>(
+    published: &BTreeMap<&'a str, ModelId>,
+    neutral: &NeutralRecords,
+    pointers: &BTreeMap<&'a str, JsonPointer>,
+) -> Result<BTreeMap<&'a str, ModelId>, ModelsDevError> {
+    let mut resolved = BTreeMap::new();
+    for (key, id) in published {
+        let pointer = &pointers[key];
+        resolved.insert(*key, canonical_model_id(id, neutral, pointer)?);
+    }
+    let claimed: BTreeMap<ModelId, usize> =
+        resolved.values().fold(BTreeMap::new(), |mut counts, id| {
+            *counts.entry(id.clone()).or_default() += 1;
+            counts
+        });
+    for (key, id) in &mut resolved {
+        if claimed[id] > 1 && *id != published[key] {
+            *id = published[key].clone();
+        }
+    }
+    Ok(resolved)
+}
+
+/// Resolve a provider's key for a model to the id the catalogue files it under.
+///
+/// The two indexes of the document do not share one id namespace: every key of
+/// the top-level `models` map is authored (`openai/gpt-5.5`, and all 310 of them
+/// in the live document carry an author), while a provider keys its offerings
+/// the way *its own API* names them (`gpt-5.5` from `openai`, `openai/gpt-5.5`
+/// from an aggregator that republishes the authored id). Joining the two by
+/// string equality alone would file one model under two ids — the neutral record
+/// under the authored one, the first-party offering under the provider-local one
+/// — leaving 1,465 of the live document's offerings without the neutral record
+/// they are variations of, and no consumer able to ask "who offers this model?".
+///
+/// So a key also resolves to a neutral record it is the unauthored tail of, at a
+/// segment boundary: `gpt-5.5` is `openai/gpt-5.5` offered by its author.
+/// `Qwen/Qwen3-32B` is not `some-author/other/Qwen/Qwen3-32B` unless the segments
+/// line up, and a tail that matches two authored records is refused rather than
+/// attributed to one of them: an offering whose model cannot be identified is
+/// exactly the "changed meaning" this adapter will not guess at. No key in the
+/// live document is ambiguous, so nothing upstream publishes today is refused by
+/// this rule.
+fn canonical_model_id(
+    published: &ModelId,
+    neutral: &NeutralRecords,
+    pointer: &JsonPointer,
+) -> Result<ModelId, ModelsDevError> {
+    if neutral.contains_key(published) {
+        return Ok(published.clone());
+    }
+    let tail = format!("/{published}");
+    let candidates: Vec<&ModelId> = neutral
+        .keys()
+        .filter(|id| id.as_str().ends_with(&tail))
+        .collect();
+    match candidates.as_slice() {
+        [] => Ok(published.clone()),
+        [only] => Ok((*only).clone()),
+        many => Err(ModelsDevError::AmbiguousModelKey {
+            pointer: pointer.clone(),
+            key: published.to_string(),
+            candidates: many.iter().map(ToString::to_string).collect(),
+        }),
+    }
+}
+
 fn normalize(document: &WireCatalog) -> Result<CatalogContent, ModelsDevError> {
     let root = JsonPointer::new("");
     let providers_pointer = root.child("providers");
     let models_pointer = root.child("models");
+
+    let mut neutral: NeutralRecords = BTreeMap::new();
+    for (key, model) in &document.models {
+        let pointer = models_pointer.child(key);
+        let id = identifier(key, &pointer)?;
+        expect_key(key, &model.id, &pointer)?;
+        if model.cost.is_some() {
+            return Err(ModelsDevError::NeutralPrice { pointer });
+        }
+        neutral.insert(id, (facts(model, &pointer)?, pointer));
+    }
 
     let mut providers = Vec::with_capacity(document.providers.len());
     let mut offerings: BTreeMap<ModelId, Vec<ProviderOffering>> = BTreeMap::new();
@@ -566,10 +678,20 @@ fn normalize(document: &WireCatalog) -> Result<CatalogContent, ModelsDevError> {
         });
 
         let offered_pointer = pointer.child("models");
+        let mut published_ids = BTreeMap::new();
+        let mut pointers = BTreeMap::new();
         for (model_key, model) in &provider.models {
             let model_pointer = offered_pointer.child(model_key);
-            let model_id = identifier(model_key, &model_pointer)?;
+            let published = identifier(model_key, &model_pointer)?;
             expect_key(model_key, &model.id, &model_pointer)?;
+            published_ids.insert(model_key.as_str(), published);
+            pointers.insert(model_key.as_str(), model_pointer);
+        }
+        let resolved = resolve_provider_models(&published_ids, &neutral, &pointers)?;
+
+        for (model_key, model) in &provider.models {
+            let model_pointer = pointers[model_key.as_str()].clone();
+            let model_id = resolved[model_key.as_str()].clone();
             let endpoint =
                 model
                     .provider
@@ -593,17 +715,6 @@ fn normalize(document: &WireCatalog) -> Result<CatalogContent, ModelsDevError> {
                     pointer: model_pointer,
                 });
         }
-    }
-
-    let mut neutral: BTreeMap<ModelId, (ModelFacts, JsonPointer)> = BTreeMap::new();
-    for (key, model) in &document.models {
-        let pointer = models_pointer.child(key);
-        let id = identifier(key, &pointer)?;
-        expect_key(key, &model.id, &pointer)?;
-        if model.cost.is_some() {
-            return Err(ModelsDevError::NeutralPrice { pointer });
-        }
-        neutral.insert(id, (facts(model, &pointer)?, pointer));
     }
 
     let ids: BTreeSet<ModelId> = neutral.keys().chain(offerings.keys()).cloned().collect();
@@ -1293,6 +1404,7 @@ mod tests {
     use super::*;
 
     const IDENTITY: &str = include_str!("fixtures/models_dev/catalog.identity.json");
+    const ALIASES: &str = include_str!("fixtures/models_dev/catalog.aliases.json");
     const IDENTITY_REORDERED: &str =
         include_str!("fixtures/models_dev/catalog.identity-reordered.json");
 
@@ -1333,6 +1445,9 @@ mod tests {
             }
             "price-tiers-without-base" => {
                 include_str!("fixtures/models_dev/drift.price-tiers-without-base.json")
+            }
+            "model-key-ambiguous" => {
+                include_str!("fixtures/models_dev/drift.model-key-ambiguous.json")
             }
             other => panic!("no drift fixture named `{other}`"),
         }
@@ -1656,6 +1771,16 @@ mod tests {
             ("provider-id-mismatch", |error| {
                 matches!(error, ModelsDevError::IdMismatch { .. })
             }),
+            // A provider-local key that is the tail of two authored records
+            // names no single model, so it is refused rather than attributed to
+            // whichever record sorts first.
+            ("model-key-ambiguous", |error| {
+                matches!(
+                    error,
+                    ModelsDevError::AmbiguousModelKey { key, candidates, .. }
+                        if key == "m-1" && candidates == &["alpha/m-1", "beta/m-1"]
+                )
+            }),
             ("neutral-price", |error| {
                 matches!(error, ModelsDevError::NeutralPrice { .. })
             }),
@@ -1767,6 +1892,76 @@ mod tests {
         );
     }
 
+    /// The upstream's two indexes use two id namespaces — the neutral index is
+    /// authored, a provider keys offerings as its own API names them — so the
+    /// seed's `openai/gpt-5.5` and OpenAI's `gpt-5.5` are one model, and filing
+    /// them apart would leave the first-party offering with no neutral record
+    /// and the model listed twice.
+    #[test]
+    fn a_provider_local_key_files_under_the_model_it_offers() {
+        let content = seed_snapshot().content;
+        let id = ModelId::parse("openai/gpt-5.5").expect("id");
+        assert!(
+            content
+                .model(&ModelId::parse("gpt-5.5").expect("id"))
+                .is_none(),
+            "a provider-local key is not a model of its own"
+        );
+
+        let entry = content.model(&id).expect("the authored record");
+        assert!(entry.neutral.is_some());
+        let offering = content
+            .offering(&id, &ProviderId::parse("openai").expect("id"))
+            .expect("its author offers it");
+        assert_eq!(
+            offering.published_model_id, "gpt-5.5",
+            "a request to OpenAI must still use OpenAI's own id"
+        );
+        assert!(
+            offering.overrides.is_empty(),
+            "and it is compared against the neutral record it agrees with, \
+             rather than having none to compare against"
+        );
+        assert!(
+            entry
+                .offerings
+                .iter()
+                .any(|offering| offering.published_model_id == "openai/gpt-5.5"),
+            "an aggregator republishing the authored id joins the same entry"
+        );
+    }
+
+    /// A provider may publish one model under two callable ids, and both are
+    /// ids a request can use, so neither the import nor either offering may be
+    /// lost to the join that files provider-local keys under authored ones.
+    #[test]
+    fn two_published_aliases_of_one_model_stay_two_offerings() {
+        let content = parse(ALIASES).expect("fixture parses").content;
+        let authored = ModelId::parse("xiaomi/mimo-v2-flash").expect("id");
+        let alias = ModelId::parse("mimo-v2-flash").expect("id");
+        let provider = ProviderId::parse("qiniu-ai").expect("id");
+
+        let joined = content
+            .offering(&authored, &provider)
+            .expect("the authored id is the model it names");
+        assert_eq!(joined.published_model_id, "xiaomi/mimo-v2-flash");
+        assert!(
+            content
+                .model(&authored)
+                .and_then(|entry| entry.neutral.as_ref())
+                .is_some()
+        );
+
+        let kept = content
+            .offering(&alias, &provider)
+            .expect("the provider's other id is still an offering");
+        assert_eq!(
+            kept.published_model_id, "mimo-v2-flash",
+            "a request may use either published id, so neither is dropped"
+        );
+        assert_eq!(content.offering_count(), 2);
+    }
+
     /// An object-valued flag says different things for different keys, and the
     /// seed publishes both shapes: `interleaved` configures the capability it
     /// names, while `experimental` describes extra modes of an offering that is
@@ -1789,7 +1984,7 @@ mod tests {
 
         let modes = content
             .offering(
-                &ModelId::parse("gpt-5.5").expect("id"),
+                &ModelId::parse("openai/gpt-5.5").expect("id"),
                 &ProviderId::parse("openai").expect("id"),
             )
             .expect("openai offers gpt-5.5");
