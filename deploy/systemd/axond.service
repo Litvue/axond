@@ -25,8 +25,11 @@ LimitNOFILE=65536
 # `[admission]` bounds are what should refuse work, and this is what keeps a
 # breach of them from taking the host down with it. Size it above
 # admission.max_in_flight x admission.max_request_bytes plus the process's
-# steady-state footprint.
-MemoryMax=2G
+# steady-state footprint — with the shipped defaults (1024 x 2 MiB) that product
+# is already 2 GiB, so this is deliberately headroom above it. Lower it only
+# together with an explicit, smaller `[admission]` section, so that admission
+# still sheds before the cgroup killer fires.
+MemoryMax=6G
 TasksMax=4096
 
 NoNewPrivileges=true

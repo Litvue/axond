@@ -91,7 +91,10 @@ Axond's own `[admission]` ceilings are what should refuse work — a shed reques
 is a typed `429`/`503` the caller can act on — and these are the kernel's backstop
 if one of those ceilings is ever set above what the host can hold. Keep them
 consistent: `MemoryMax` above `admission.max_in_flight` x
-`admission.max_request_bytes` plus steady-state footprint, and `LimitNOFILE`
+`admission.max_request_bytes` plus steady-state footprint — with the shipped
+defaults that product is 2 GiB, which is why the unit ships `MemoryMax=6G` rather
+than 2G, and lowering it means lowering the `[admission]` ceilings with it — and
+`LimitNOFILE`
 above twice `max_in_flight` (one caller socket and one upstream socket per
 in-flight request) plus the listener and store connections. A unit that hits
 `MemoryMax` is killed rather than shedding, so the gateway's bounds should always
