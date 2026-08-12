@@ -1,0 +1,90 @@
+# Axond example STATEFUL bootstrap configuration.
+#
+# This is the whole file a stateful replica reads. Tenants, projects,
+# identities, providers, provider credentials, model catalogues, prices,
+# aliases, and policy are owned by the Postgres control plane and administered
+# through `/admin/v1`; declaring any of them here is a boot error before the
+# listener binds, because two authorities for one resource would need a merge
+# policy (docs/adr/0027-stateless-and-stateful-operating-modes.md).
+#
+# Stateless mode remains the default and is what `axond.example.toml`
+# describes. Omitting `mode` selects it, so nothing written before this file
+# existed changes meaning.
+#
+# Every secret here is a *reference*: the name of an environment variable, or a
+# path to a file. No DSN, key-encryption key, or credential is ever inlined,
+# and diagnostics name the reference rather than the value.
+#
+# Status: the control plane this bootstraps is not implemented yet. This
+# configuration parses and validates, and the process refuses to start rather
+# than serve an empty snapshot (axond #141, #142, #163).
+
+mode = "stateful"
+
+[server]
+bind = "0.0.0.0:8080"
+
+# ── Control plane ────────────────────────────────────────────────────────────
+# Durable desired state: revisions, immutable manifests, resource versions, and
+# audit events. Initial cold boot requires it: a stateful replica with no
+# snapshot fails readiness rather than serving partial state. Once a replica
+# holds a snapshot, a control-plane outage stalls change and convergence but
+# does not degrade inference.
+
+[control_plane]
+dsn_env = "AXOND_CONTROL_PLANE_DSN"
+connect_timeout_ms = 5000
+
+# ── Secret store and KEK ─────────────────────────────────────────────────────
+# Tenant provider credentials are stored wrapped under a key-encryption key and
+# unwrapped only during snapshot compilation, which is control-plane work: a
+# request never unwraps a secret and never reads the KEK.
+#
+# `backend = "postgres"` is encrypted Postgres, the first SecretStore
+# implementation. `dsn_env` may be omitted to reuse the control plane's own
+# reference, which is the common single-database deployment.
+
+[secret_store]
+backend = "postgres"
+# dsn_env = "AXOND_SECRET_STORE_DSN"
+kek_env = "AXOND_SECRET_STORE_KEK"
+# kek_file = "/run/secrets/axond-kek"
+
+# ── Breakglass operator credential ───────────────────────────────────────────
+# Human `/admin/v1` identity is OIDC; this static credential is what remains
+# when the identity provider is down or the control plane rejected the last
+# change. Exactly one is required, referenced the way `[[gateway_key]]` is.
+
+[[admin_breakglass]]
+env = "AXOND_ADMIN_BREAKGLASS"
+# file = "/run/secrets/axond-breakglass"
+id = "breakglass"
+
+# ── Optional admission backends: connectivity only ───────────────────────────
+# Bootstrap owns *connectivity* to the opt-in Tier 1/Tier 2 enforcement
+# backends; the control plane owns their *policy values*. A limit, window, or
+# scope here is the same boot error as an alias, so `limit_microdollars`,
+# `max_in_flight_per_subject`, and the TTLs are absent by design.
+
+# [budget]
+# backend = "redis" # none (default) | in-memory | redis | postgres
+# dsn_env = "AXOND_REDIS_URL"
+# on_unavailable = "deny" # deny (default) | allow
+
+# [rate_limit]
+# backend = "redis" # none (default) | in-memory | redis
+# dsn_env = "AXOND_REDIS_URL"
+# on_unavailable = "deny"
+
+# [revocation]
+# backend = "redis" # none (default) | redis | postgres
+# dsn_env = "AXOND_REDIS_URL"
+
+# ── Telemetry ────────────────────────────────────────────────────────────────
+# Unchanged by the mode, and environment-only for traces/metrics/logs
+# (OTEL_EXPORTER_OTLP_ENDPOINT). Usage rows keep their own transport settings.
+
+# [[usage_sink]]
+# kind = "postgres"
+# dsn_env = "AXOND_USAGE_POSTGRES_DSN"
+# create_table = false

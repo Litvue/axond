@@ -26,8 +26,25 @@ use crate::usage::{BatchSettings, validate_table_name};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    /// Which authority owns durable resources (ADR 0027). Omitting the key
+    /// selects `stateless`, so every configuration written before the key
+    /// existed keeps the meaning it had.
+    #[serde(default)]
+    pub mode: Mode,
     #[serde(default)]
     pub server: Server,
+    /// Stateful bootstrap: the control-plane database's connection *reference*.
+    /// Required by `mode = "stateful"`, rejected in stateless mode.
+    #[serde(default)]
+    pub control_plane: Option<ControlPlane>,
+    /// Stateful bootstrap: which `SecretStore` unwraps tenant secret material,
+    /// and the key-encryption key it unwraps with — both by reference.
+    #[serde(default)]
+    pub secret_store: Option<SecretStore>,
+    /// Stateful bootstrap: the mandatory static `/admin/v1` breakglass operator
+    /// credential, referenced the way `[[gateway_key]]` is.
+    #[serde(default)]
+    pub admin_breakglass: Vec<AdminBreakglass>,
     #[serde(default)]
     pub namespace: Vec<Namespace>,
     #[serde(default)]
@@ -81,6 +98,147 @@ pub struct Config {
     /// Precise minted-token revocation. Defaults to no denylist.
     #[serde(default)]
     pub revocation: RevocationConfig,
+}
+
+/// Which authority owns durable resources for the whole process (ADR 0027).
+///
+/// The mode is process-wide and exclusive: there is no per-dimension or
+/// per-namespace migration state, precisely so no merge policy between a file
+/// and a database ever has to exist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mode {
+    /// TOML plus the environment and files it references own every resource.
+    /// The default, and what every configuration written so far means.
+    #[default]
+    Stateless,
+    /// A durable Postgres control plane owns tenants, identities, providers,
+    /// credentials, catalogues, prices, aliases, and policy; bootstrap TOML
+    /// shrinks to what a process needs before it can read anything else.
+    Stateful,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stateless => "stateless",
+            Self::Stateful => "stateful",
+        }
+    }
+}
+
+/// Connectivity to the durable control plane. A DSN is a secret, so — like
+/// every other DSN in this file — it is named rather than inlined.
+///
+/// Parsing this section connects to nothing: the `ControlPlaneStore` that uses
+/// it lands with #141.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ControlPlane {
+    /// Name of the env var holding the control-plane Postgres connection string.
+    #[serde(default)]
+    pub dsn_env: Option<String>,
+    /// Bound on establishing a control-plane connection.
+    #[serde(default = "default_control_plane_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+}
+
+fn default_control_plane_connect_timeout_ms() -> u64 {
+    5_000
+}
+
+/// Which `SecretStore` unwraps tenant secret material, and the KEK it unwraps
+/// with. Both the store's DSN and the KEK are references; no key material is
+/// ever expressible here, so nothing in this struct is secret and `Debug` on it
+/// leaks nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SecretStore {
+    #[serde(default)]
+    pub backend: SecretStoreBackend,
+    /// Name of the env var holding the secret store's connection string.
+    /// Defaults to the control plane's own reference, since encrypted Postgres
+    /// is normally the same database.
+    #[serde(default)]
+    pub dsn_env: Option<String>,
+    /// Name of the env var holding the key-encryption key. Exactly one of
+    /// `kek_env` and `kek_file` must be non-empty.
+    #[serde(default)]
+    pub kek_env: Option<String>,
+    /// Path to a file holding the key-encryption key.
+    #[serde(default)]
+    pub kek_file: Option<String>,
+}
+
+/// Encrypted Postgres is the first — and, for now, only — `SecretStore`
+/// implementation ADR 0027 approves. External managers are later adapters
+/// behind the same contract, so this is an enum rather than a bool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecretStoreBackend {
+    #[default]
+    Postgres,
+}
+
+impl SecretStoreBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
+impl SecretStore {
+    /// The KEK's reference: which source names it, and the name itself. Only
+    /// ever a name or a path — never material.
+    pub fn kek_reference(&self) -> Option<(&'static str, &str)> {
+        let env = self.kek_env.as_deref().unwrap_or("").trim();
+        let file = self.kek_file.as_deref().unwrap_or("").trim();
+        match (env.is_empty(), file.is_empty()) {
+            (false, true) => Some(("kek_env", env)),
+            (true, false) => Some(("kek_file", file)),
+            _ => None,
+        }
+    }
+}
+
+/// The static breakglass operator credential for `/admin/v1`. It exists for
+/// "the identity provider is down" and "the control plane rejected the last
+/// change", which is why stateful mode requires one even though human
+/// administration is OIDC.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AdminBreakglass {
+    /// Name of the env var holding the credential. Exactly one of `env` and
+    /// `file` must be non-empty.
+    #[serde(default)]
+    pub env: Option<String>,
+    /// Path to a file holding the credential.
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Non-secret attribution label for audit events. Defaults to the source
+    /// reference, which is a name, not a value.
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
+impl AdminBreakglass {
+    /// Which source names the credential, and the reference itself.
+    pub fn source(&self) -> Option<(&'static str, &str)> {
+        let env = self.env.as_deref().unwrap_or("").trim();
+        let file = self.file.as_deref().unwrap_or("").trim();
+        match (env.is_empty(), file.is_empty()) {
+            (false, true) => Some(("env", env)),
+            (true, false) => Some(("file", file)),
+            _ => None,
+        }
+    }
+
+    /// Non-secret label for diagnostics and audit events.
+    pub fn label(&self) -> &str {
+        self.id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .or_else(|| self.source().map(|(_, reference)| reference))
+            .unwrap_or("<unnamed>")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -202,7 +360,7 @@ impl Credential {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CredentialPool {
     #[serde(default)]
     pub strategy: SelectionStrategy,
@@ -238,7 +396,7 @@ pub enum SelectionStrategy {
 /// is skipped while its circuit is open, and a retryable upstream failure
 /// advances to the next target. The bounds cap how much failover can amplify a
 /// request's latency (ADR 0008).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Failover {
     /// Upper bound on upstream target attempts for one request. The retry count
     /// a request can add is `max_attempts - 1`, so this caps latency
@@ -1172,10 +1330,23 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Reject a structurally-invalid config at boot rather than at request
-    /// time (delta B2): exactly one default namespace, aliases point at
-    /// defined providers, credentials/keys reference defined namespaces.
+    /// Reject a structurally-invalid config at boot rather than at request time
+    /// (delta B2). Which checks apply depends on which authority owns durable
+    /// resources: the mode is the first thing read, and each mode rejects the
+    /// other's sections outright rather than merging them (ADR 0027).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        match self.mode {
+            Mode::Stateless => self.validate_stateless(),
+            Mode::Stateful => self.validate_stateful(),
+        }
+    }
+
+    /// The whole-graph gate as it has always been: exactly one default
+    /// namespace, aliases point at defined providers, credentials/keys reference
+    /// defined namespaces. Nothing here is tightened by ADR 0027 — a
+    /// configuration that booted before `mode` existed takes exactly this path.
+    fn validate_stateless(&self) -> Result<(), ConfigError> {
+        self.reject_stateful_bootstrap()?;
         let defaults = self.namespace.iter().filter(|n| n.default).count();
         if defaults != 1 {
             return Err(ConfigError::Invalid(format!(
@@ -1247,41 +1418,7 @@ impl Config {
                 "failover.cooldown_seconds must be at least 1".into(),
             ));
         }
-        for (field, value) in [
-            ("connect_timeout_ms", self.transport.connect_timeout_ms),
-            (
-                "response_header_timeout_ms",
-                self.transport.response_header_timeout_ms,
-            ),
-            (
-                "buffered_body_timeout_ms",
-                self.transport.buffered_body_timeout_ms,
-            ),
-            (
-                "stream_idle_timeout_ms",
-                self.transport.stream_idle_timeout_ms,
-            ),
-            ("max_response_bytes", self.transport.max_response_bytes),
-            ("max_error_bytes", self.transport.max_error_bytes),
-        ] {
-            if value == 0 {
-                return Err(ConfigError::Invalid(format!(
-                    "transport.{field} must be at least 1"
-                )));
-            }
-        }
-        if self.transport.max_error_bytes > self.transport.max_response_bytes {
-            return Err(ConfigError::Invalid(
-                "transport.max_error_bytes must not exceed transport.max_response_bytes: an error \
-                 body is a response body"
-                    .into(),
-            ));
-        }
-        if self.reload.poll_interval_ms < MIN_RELOAD_POLL_INTERVAL_MS {
-            return Err(ConfigError::Invalid(format!(
-                "reload.poll_interval_ms must be at least {MIN_RELOAD_POLL_INTERVAL_MS}"
-            )));
-        }
+        self.validate_process_local_bounds()?;
         let mut labels: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
         for c in &self.credential {
             if c.env.trim().is_empty() {
@@ -1329,6 +1466,340 @@ impl Config {
         self.validate_budget()?;
         self.validate_rate_limit()?;
         self.validate_revocation()?;
+        Ok(())
+    }
+
+    /// Stateful mode's gate. It **rejects** rather than reconciles: a
+    /// stateful-owned section in the file is a boot error before the listener
+    /// binds, because the alternative is a merge policy between two disagreeing
+    /// authorities (ADR 0027). Nothing here connects to anything — the
+    /// `ControlPlaneStore` and `SecretStore` that consume these references land
+    /// with #163 and #141.
+    fn validate_stateful(&self) -> Result<(), ConfigError> {
+        self.reject_stateful_owned_sections()?;
+        self.validate_control_plane()?;
+        self.validate_secret_store()?;
+        self.validate_admin_breakglass()?;
+        self.validate_process_local_bounds()?;
+        self.validate_usage_sinks()?;
+        self.validate_hot_state_connectivity()?;
+        self.validate_revocation()?;
+        Ok(())
+    }
+
+    /// Bounds the process applies to itself, in both modes: per-phase upstream
+    /// limits and how often the file is re-read. They are process-local serving
+    /// parameters rather than durable resources, so the control plane does not
+    /// own them.
+    fn validate_process_local_bounds(&self) -> Result<(), ConfigError> {
+        for (field, value) in [
+            ("connect_timeout_ms", self.transport.connect_timeout_ms),
+            (
+                "response_header_timeout_ms",
+                self.transport.response_header_timeout_ms,
+            ),
+            (
+                "buffered_body_timeout_ms",
+                self.transport.buffered_body_timeout_ms,
+            ),
+            (
+                "stream_idle_timeout_ms",
+                self.transport.stream_idle_timeout_ms,
+            ),
+            ("max_response_bytes", self.transport.max_response_bytes),
+            ("max_error_bytes", self.transport.max_error_bytes),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "transport.{field} must be at least 1"
+                )));
+            }
+        }
+        if self.transport.max_error_bytes > self.transport.max_response_bytes {
+            return Err(ConfigError::Invalid(
+                "transport.max_error_bytes must not exceed transport.max_response_bytes: an error \
+                 body is a response body"
+                    .into(),
+            ));
+        }
+        if self.reload.poll_interval_ms < MIN_RELOAD_POLL_INTERVAL_MS {
+            return Err(ConfigError::Invalid(format!(
+                "reload.poll_interval_ms must be at least {MIN_RELOAD_POLL_INTERVAL_MS}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Stateful bootstrap sections describe a control plane stateless mode does
+    /// not read, so their presence there is a mistake — most often a `mode` key
+    /// that was never added — rather than harmless extra.
+    fn reject_stateful_bootstrap(&self) -> Result<(), ConfigError> {
+        let mut sections = Vec::new();
+        if self.control_plane.is_some() {
+            sections.push("`[control_plane]`");
+        }
+        if self.secret_store.is_some() {
+            sections.push("`[secret_store]`");
+        }
+        if !self.admin_breakglass.is_empty() {
+            sections.push("`[[admin_breakglass]]`");
+        }
+        if sections.is_empty() {
+            return Ok(());
+        }
+        Err(ConfigError::Invalid(format!(
+            "{} {} stateful bootstrap, which stateless mode never reads: add `mode = \"stateful\"` \
+             to select the control plane, or remove the section",
+            sections.join(", "),
+            if sections.len() == 1 { "is" } else { "are" },
+        )))
+    }
+
+    /// Every section whose resources the control plane owns, named in one
+    /// error: an operator mid-cutover wants the whole list, not the first
+    /// offender re-discovered one restart at a time.
+    fn reject_stateful_owned_sections(&self) -> Result<(), ConfigError> {
+        let mut sections: Vec<&'static str> = Vec::new();
+        if !self.namespace.is_empty() {
+            sections.push("`[[namespace]]`");
+        }
+        if !self.provider.is_empty() {
+            sections.push("`[[provider]]`");
+        }
+        if !self.model.is_empty() {
+            sections.push("`[[model]]`");
+        }
+        if !self.credential.is_empty() {
+            sections.push("`[[credential]]`");
+        }
+        if self.credential_pool != CredentialPool::default() {
+            sections.push("`[credential_pool]`");
+        }
+        if self.failover != Failover::default() {
+            sections.push("`[failover]`");
+        }
+        if !self.gateway_key.is_empty() {
+            sections.push("`[[gateway_key]]`");
+        }
+        if !self.gateway_verifier.is_empty() {
+            sections.push("`[[gateway_verifier]]`");
+        }
+        if self.gateway_minting.is_some() {
+            sections.push("`[gateway_minting]`");
+        }
+        if self.gateway_token.is_some() {
+            sections.push("`[gateway_token]`");
+        }
+        if !self.gateway_token_epoch.is_empty() {
+            sections.push("`[[gateway_token_epoch]]`");
+        }
+        sections.extend(self.stateful_owned_policy_keys());
+        if sections.is_empty() {
+            return Ok(());
+        }
+        Err(ConfigError::Invalid(format!(
+            "`mode = \"stateful\"` gives the control plane exclusive authority over these, so they \
+             cannot also be declared in TOML: {}. Import them through `/admin/v1` and publish a \
+             revision instead; bootstrap TOML carries `mode`, `[server]`, `[transport]`, \
+             `[reload]`, telemetry (`[[usage_sink]]`), `[control_plane]`, `[secret_store]`, \
+             `[[admin_breakglass]]`, and backend selection plus DSN references for the opt-in \
+             `[budget]`, `[rate_limit]`, and `[revocation]` backends",
+            sections.join(", ")
+        )))
+    }
+
+    /// Bootstrap owns *connectivity* to the opt-in enforcement backends; the
+    /// control plane owns their *policy values*. A limit, window, or scope in
+    /// bootstrap TOML is therefore the same split-brain error as an alias.
+    ///
+    /// Presence is inferred by comparing against the documented defaults, so a
+    /// section that merely restates a default is indistinguishable from an
+    /// absent one — and means the same thing either way.
+    fn stateful_owned_policy_keys(&self) -> Vec<&'static str> {
+        let budget = BudgetConfig::default();
+        let rate_limit = RateLimitConfig::default();
+        let mut keys = Vec::new();
+        if self.budget.limit_microdollars != budget.limit_microdollars {
+            keys.push("`[budget] limit_microdollars`");
+        }
+        if self.budget.namespace_limit_microdollars.is_some() {
+            keys.push("`[budget] namespace_limit_microdollars`");
+        }
+        if self.budget.reservation_ttl_seconds != budget.reservation_ttl_seconds {
+            keys.push("`[budget] reservation_ttl_seconds`");
+        }
+        if self.budget.idle_ttl_seconds != budget.idle_ttl_seconds {
+            keys.push("`[budget] idle_ttl_seconds`");
+        }
+        if self.budget.max_subjects != budget.max_subjects {
+            keys.push("`[budget] max_subjects`");
+        }
+        if self.rate_limit.max_in_flight_per_subject != rate_limit.max_in_flight_per_subject {
+            keys.push("`[rate_limit] max_in_flight_per_subject`");
+        }
+        if self.rate_limit.max_subjects != rate_limit.max_subjects {
+            keys.push("`[rate_limit] max_subjects`");
+        }
+        if self.rate_limit.lease_ttl_seconds != rate_limit.lease_ttl_seconds {
+            keys.push("`[rate_limit] lease_ttl_seconds`");
+        }
+        keys
+    }
+
+    /// A stateful process with no control-plane reference has nothing to serve:
+    /// initial cold boot requires Postgres, and it fails loudly rather than
+    /// serving an empty configuration (ADR 0027).
+    fn validate_control_plane(&self) -> Result<(), ConfigError> {
+        let Some(control_plane) = &self.control_plane else {
+            return Err(ConfigError::Invalid(
+                "`mode = \"stateful\"` requires a `[control_plane]` section: the control plane owns \
+                 every durable resource, so a stateful process with no control-plane reference has \
+                 nothing to serve"
+                    .into(),
+            ));
+        };
+        if !control_plane
+            .dsn_env
+            .as_deref()
+            .is_some_and(|dsn_env| !dsn_env.trim().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "`[control_plane] dsn_env` must name the env var holding the control-plane Postgres \
+                 connection string"
+                    .into(),
+            ));
+        }
+        if control_plane.connect_timeout_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "`[control_plane] connect_timeout_ms` must be at least 1".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Secret material is resolved during snapshot compilation, so a stateful
+    /// process needs a store and a KEK *reference* before it can compile
+    /// anything. Both are named here; neither is ever a value.
+    fn validate_secret_store(&self) -> Result<(), ConfigError> {
+        let Some(secret_store) = &self.secret_store else {
+            return Err(ConfigError::Invalid(
+                "`mode = \"stateful\"` requires a `[secret_store]` section: a snapshot is only \
+                 publishable once every credential reference it needs is already unwrapped into \
+                 memory, which needs a store and a key-encryption key"
+                    .into(),
+            ));
+        };
+        if secret_store.kek_reference().is_none() {
+            return Err(ConfigError::Invalid(
+                "`[secret_store]` must declare exactly one non-empty key-encryption-key reference \
+                 (`kek_env` or `kek_file`); wrapped material cannot be unwrapped without it"
+                    .into(),
+            ));
+        }
+        let own_dsn = secret_store
+            .dsn_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|dsn_env| !dsn_env.is_empty());
+        let inherited_dsn = self
+            .control_plane
+            .as_ref()
+            .and_then(|control_plane| control_plane.dsn_env.as_deref())
+            .map(str::trim)
+            .filter(|dsn_env| !dsn_env.is_empty());
+        if own_dsn.is_none() && inherited_dsn.is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "`[secret_store] dsn_env` must name the env var holding the `{}` secret-store \
+                 connection string, or `[control_plane] dsn_env` must supply one to inherit",
+                secret_store.backend.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The breakglass credential is mandatory because it is the only way in when
+    /// the identity provider is down or the control plane rejected the last
+    /// change (ADR 0027). More than one would make "which operator acted" a
+    /// guess, so exactly one is permitted.
+    fn validate_admin_breakglass(&self) -> Result<(), ConfigError> {
+        match self.admin_breakglass.len() {
+            0 => {
+                return Err(ConfigError::Invalid(
+                    "`mode = \"stateful\"` requires one `[[admin_breakglass]]`: human `/admin/v1` \
+                     identity is OIDC, and the static breakglass credential is what remains when \
+                     the identity provider is unavailable"
+                        .into(),
+                ));
+            }
+            1 => {}
+            found => {
+                return Err(ConfigError::Invalid(format!(
+                    "exactly one `[[admin_breakglass]]` is permitted (found {found}): a second \
+                     breakglass identity makes an audited operator action ambiguous"
+                )));
+            }
+        }
+        let breakglass = &self.admin_breakglass[0];
+        if breakglass.source().is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "admin_breakglass `{}` must declare exactly one non-empty source (`env` or `file`)",
+                breakglass.label()
+            )));
+        }
+        Ok(())
+    }
+
+    /// In stateful mode the opt-in admission backends keep their *connectivity*
+    /// in bootstrap and take their policy from the control plane, so only the
+    /// reference-shaped checks of [`Config::validate_budget`] and
+    /// [`Config::validate_rate_limit`] apply.
+    fn validate_hot_state_connectivity(&self) -> Result<(), ConfigError> {
+        let budget = &self.budget;
+        if budget.backend.is_shared()
+            && !budget
+                .dsn_env
+                .as_deref()
+                .is_some_and(|dsn_env| !dsn_env.trim().is_empty())
+        {
+            return Err(ConfigError::Invalid(format!(
+                "budget `{}`: `dsn_env` must name the env var holding the connection string",
+                budget.backend.as_str()
+            )));
+        }
+        if budget.backend == BudgetBackend::Postgres {
+            validate_table_name(&budget.table())
+                .map_err(|message| ConfigError::Invalid(format!("budget `postgres`: {message}")))?;
+        }
+        let rate_limit = &self.rate_limit;
+        if rate_limit.backend == RateLimitBackend::Redis {
+            if rate_limit.timeout_ms == 0 {
+                return Err(ConfigError::Invalid(
+                    "rate_limit `redis`: timeout_ms must be at least 1".into(),
+                ));
+            }
+            if rate_limit.connect_timeout_ms == 0 {
+                return Err(ConfigError::Invalid(
+                    "rate_limit `redis`: connect_timeout_ms must be at least 1".into(),
+                ));
+            }
+            let has_rate_limit_dsn = rate_limit
+                .dsn_env
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty());
+            let has_budget_fallback = self.budget.backend == BudgetBackend::Redis
+                && self
+                    .budget
+                    .dsn_env
+                    .as_deref()
+                    .is_some_and(|name| !name.trim().is_empty());
+            if !has_rate_limit_dsn && !has_budget_fallback {
+                return Err(ConfigError::Invalid(
+                    "rate_limit `redis`: `dsn_env` must name the env var holding the connection \
+                     string (or use the Redis budget `dsn_env` fallback)"
+                        .into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -2865,6 +3336,411 @@ max_batch = 100000
 "#
         );
         assert!(Config::from_toml_str(&toml).is_ok());
+    }
+
+    /// The minimum a stateful replica needs before it can read anything else.
+    const STATEFUL: &str = r#"
+mode = "stateful"
+
+[control_plane]
+dsn_env = "AXOND_CONTROL_PLANE_DSN"
+
+[secret_store]
+kek_env = "AXOND_SECRET_STORE_KEK"
+
+[[admin_breakglass]]
+env = "AXOND_ADMIN_BREAKGLASS"
+"#;
+
+    fn repository_file(relative: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))
+    }
+
+    /// The compatibility promise ADR 0027 makes: a configuration written before
+    /// `mode` existed keeps meaning exactly what it meant, without adding a key.
+    #[test]
+    fn omitting_mode_means_stateless() {
+        let config = Config::from_toml_str(VALID).expect("today's config still boots");
+        assert_eq!(config.mode, Mode::Stateless);
+    }
+
+    #[test]
+    fn declaring_stateless_explicitly_changes_nothing() {
+        let explicit = Config::from_toml_str(&format!("mode = \"stateless\"\n{VALID}"))
+            .expect("an explicit stateless mode is the same configuration");
+        assert_eq!(explicit.mode, Mode::Stateless);
+    }
+
+    #[test]
+    fn rejects_an_unknown_mode() {
+        let error = Config::from_toml_str(&format!("mode = \"hybrid\"\n{VALID}"))
+            .expect_err("there are exactly two modes");
+        assert!(matches!(error, ConfigError::Load(_)), "{error:?}");
+    }
+
+    /// Stateful bootstrap in a stateless configuration is a forgotten `mode`
+    /// key, not an inert extra, so it is refused rather than ignored.
+    #[test]
+    fn stateless_mode_rejects_stateful_bootstrap_sections() {
+        for (section, snippet) in [
+            (
+                "`[control_plane]`",
+                "[control_plane]\ndsn_env = \"AXOND_CONTROL_PLANE_DSN\"",
+            ),
+            (
+                "`[secret_store]`",
+                "[secret_store]\nkek_env = \"AXOND_SECRET_STORE_KEK\"",
+            ),
+            (
+                "`[[admin_breakglass]]`",
+                "[[admin_breakglass]]\nenv = \"AXOND_ADMIN_BREAKGLASS\"",
+            ),
+        ] {
+            let error = Config::from_toml_str(&format!("{VALID}\n{snippet}"))
+                .expect_err("stateless mode has no control plane to bootstrap");
+            assert!(
+                matches!(error, ConfigError::Invalid(ref message) if message.contains(section)),
+                "{section}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_a_minimal_stateful_bootstrap() {
+        let config = Config::from_toml_str(STATEFUL).expect("the approved bootstrap set validates");
+        assert_eq!(config.mode, Mode::Stateful);
+        assert_eq!(
+            config
+                .control_plane
+                .as_ref()
+                .and_then(|cp| cp.dsn_env.as_deref()),
+            Some("AXOND_CONTROL_PLANE_DSN")
+        );
+        assert_eq!(
+            config
+                .secret_store
+                .as_ref()
+                .and_then(SecretStore::kek_reference),
+            Some(("kek_env", "AXOND_SECRET_STORE_KEK"))
+        );
+    }
+
+    /// The property ADR 0027 keeps from ADR 0017: one authority per resource
+    /// class. Mixed ownership fails before the listener binds instead of being
+    /// merged, overlaid, or preferred.
+    #[test]
+    fn stateful_mode_rejects_every_stateful_owned_section() {
+        for (section, snippet) in [
+            (
+                "`[[namespace]]`",
+                "[[namespace]]\nid = \"acme\"\ndefault = true",
+            ),
+            (
+                "`[[provider]]`",
+                "[[provider]]\nid = \"openai\"\nkind = \"openai\"\nbase_url = \"https://api.openai.com/v1\"",
+            ),
+            (
+                "`[[model]]`",
+                "[[model]]\nname = \"gpt-4o\"\ntargets = [{ provider = \"openai\", model = \"gpt-4o\", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]",
+            ),
+            (
+                "`[[credential]]`",
+                "[[credential]]\nnamespace = \"acme\"\nprovider = \"openai\"\nenv = \"GW_ACME_OPENAI\"",
+            ),
+            (
+                "`[credential_pool]`",
+                "[credential_pool]\nstrategy = \"weighted\"",
+            ),
+            ("`[failover]`", "[failover]\nmax_attempts = 5"),
+            (
+                "`[[gateway_key]]`",
+                "[[gateway_key]]\nenv = \"GW_INBOUND\"\nnamespace = \"acme\"",
+            ),
+            (
+                "`[[gateway_verifier]]`",
+                "[[gateway_verifier]]\nkid = \"acme\"\nalg = \"EdDSA\"\nenv = \"GW_VERIFY\"\nnamespaces = [\"acme\"]\nmax_ttl = \"15m\"",
+            ),
+            (
+                "`[gateway_minting]`",
+                "[gateway_minting]\nkid = \"acme\"\nenv = \"GW_SIGN\"",
+            ),
+            (
+                "`[gateway_token]`",
+                "[gateway_token]\naudience = \"https://gw.test\"",
+            ),
+            (
+                "`[[gateway_token_epoch]]`",
+                "[[gateway_token_epoch]]\nnamespace = \"acme\"\nmin_iat = 1",
+            ),
+            (
+                "`[budget] limit_microdollars`",
+                "[budget]\nbackend = \"redis\"\ndsn_env = \"AXOND_REDIS_URL\"\nlimit_microdollars = 10000",
+            ),
+            (
+                "`[rate_limit] max_in_flight_per_subject`",
+                "[rate_limit]\nbackend = \"redis\"\ndsn_env = \"AXOND_REDIS_URL\"\nmax_in_flight_per_subject = 4",
+            ),
+            (
+                "`[rate_limit] lease_ttl_seconds`",
+                "[rate_limit]\nbackend = \"redis\"\ndsn_env = \"AXOND_REDIS_URL\"\nlease_ttl_seconds = 60",
+            ),
+        ] {
+            let error = Config::from_toml_str(&format!("{STATEFUL}\n{snippet}"))
+                .expect_err("the control plane owns this, so TOML may not also declare it");
+            assert!(
+                matches!(error, ConfigError::Invalid(ref message) if message.contains(section)),
+                "{section}: {error:?}"
+            );
+        }
+    }
+
+    /// An operator mid-cutover should learn the whole list once rather than one
+    /// offender per restart.
+    #[test]
+    fn stateful_rejection_names_every_offending_section_at_once() {
+        let toml = format!(
+            r#"{STATEFUL}
+
+[[namespace]]
+id = "acme"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[failover]
+max_attempts = 5
+"#
+        );
+        let error = Config::from_toml_str(&toml).expect_err("mixed ownership never boots");
+        let ConfigError::Invalid(message) = error else {
+            panic!("{error:?}");
+        };
+        for section in ["`[[namespace]]`", "`[[provider]]`", "`[failover]`"] {
+            assert!(
+                message.contains(section),
+                "{section} missing from {message}"
+            );
+        }
+    }
+
+    /// Bootstrap owns connectivity to the opt-in admission backends; the control
+    /// plane owns their policy values. Selecting a backend with references only
+    /// is therefore valid.
+    #[test]
+    fn stateful_mode_accepts_admission_backend_connectivity_without_policy() {
+        let toml = format!(
+            r#"{STATEFUL}
+
+[budget]
+backend = "redis"
+dsn_env = "AXOND_REDIS_URL"
+on_unavailable = "deny"
+
+[rate_limit]
+backend = "redis"
+dsn_env = "AXOND_REDIS_URL"
+
+[revocation]
+backend = "redis"
+dsn_env = "AXOND_REDIS_URL"
+"#
+        );
+        let config =
+            Config::from_toml_str(&toml).expect("connectivity references are bootstrap-owned");
+        assert_eq!(config.budget.backend, BudgetBackend::Redis);
+    }
+
+    #[test]
+    fn stateful_mode_still_requires_a_dsn_reference_for_a_shared_backend() {
+        let toml = format!("{STATEFUL}\n[budget]\nbackend = \"redis\"\n");
+        let error = Config::from_toml_str(&toml)
+            .expect_err("a shared backend without a reference enforces nothing");
+        assert!(
+            matches!(error, ConfigError::Invalid(ref message) if message.contains("dsn_env")),
+            "{error:?}"
+        );
+    }
+
+    /// Cold boot in stateful mode requires Postgres, so a bootstrap without a
+    /// control-plane reference describes a replica with nothing to serve.
+    #[test]
+    fn stateful_mode_requires_a_complete_control_plane_reference() {
+        for (expected, toml) in [
+            (
+                "`[control_plane]`",
+                "mode = \"stateful\"\n[secret_store]\nkek_env = \"KEK\"\n[[admin_breakglass]]\nenv = \"BG\"",
+            ),
+            (
+                "`[control_plane] dsn_env`",
+                "mode = \"stateful\"\n[control_plane]\n[secret_store]\nkek_env = \"KEK\"\n[[admin_breakglass]]\nenv = \"BG\"",
+            ),
+            (
+                "`[control_plane] dsn_env`",
+                "mode = \"stateful\"\n[control_plane]\ndsn_env = \"   \"\n[secret_store]\nkek_env = \"KEK\"\n[[admin_breakglass]]\nenv = \"BG\"",
+            ),
+            (
+                "`[control_plane] connect_timeout_ms`",
+                "mode = \"stateful\"\n[control_plane]\ndsn_env = \"DSN\"\nconnect_timeout_ms = 0\n[secret_store]\nkek_env = \"KEK\"\n[[admin_breakglass]]\nenv = \"BG\"",
+            ),
+        ] {
+            let error = Config::from_toml_str(toml)
+                .expect_err("stateful cold boot needs the control plane");
+            assert!(
+                matches!(error, ConfigError::Invalid(ref message) if message.contains(expected)),
+                "{expected}: {error:?}"
+            );
+        }
+    }
+
+    /// A snapshot is only publishable once its credential references are
+    /// unwrapped, so the store and the KEK are boot requirements.
+    #[test]
+    fn stateful_mode_requires_a_secret_store_and_exactly_one_kek_reference() {
+        for (expected, toml) in [
+            (
+                "`[secret_store]`",
+                "mode = \"stateful\"\n[control_plane]\ndsn_env = \"DSN\"\n[[admin_breakglass]]\nenv = \"BG\"",
+            ),
+            (
+                "kek_env",
+                "mode = \"stateful\"\n[control_plane]\ndsn_env = \"DSN\"\n[secret_store]\n[[admin_breakglass]]\nenv = \"BG\"",
+            ),
+            (
+                "kek_env",
+                "mode = \"stateful\"\n[control_plane]\ndsn_env = \"DSN\"\n[secret_store]\nkek_env = \"KEK\"\nkek_file = \"/run/secrets/kek\"\n[[admin_breakglass]]\nenv = \"BG\"",
+            ),
+        ] {
+            let error = Config::from_toml_str(toml).expect_err("wrapped material needs a KEK");
+            assert!(
+                matches!(error, ConfigError::Invalid(ref message) if message.contains(expected)),
+                "{expected}: {error:?}"
+            );
+        }
+    }
+
+    /// Encrypted Postgres is normally the control-plane database itself, so the
+    /// store may inherit that reference instead of repeating it.
+    #[test]
+    fn the_secret_store_inherits_the_control_plane_dsn_reference() {
+        let config = Config::from_toml_str(STATEFUL).expect("inheriting the reference is valid");
+        let secret_store = config.secret_store.expect("secret store");
+        assert_eq!(secret_store.dsn_env, None);
+        assert_eq!(secret_store.backend, SecretStoreBackend::Postgres);
+    }
+
+    /// The breakglass credential is the way in when OIDC is down, and a second
+    /// one would make an audited operator action ambiguous.
+    #[test]
+    fn stateful_mode_requires_exactly_one_usable_breakglass_credential() {
+        for (expected, toml) in [
+            (
+                "`[[admin_breakglass]]`",
+                "mode = \"stateful\"\n[control_plane]\ndsn_env = \"DSN\"\n[secret_store]\nkek_env = \"KEK\"",
+            ),
+            (
+                "exactly one `[[admin_breakglass]]`",
+                "mode = \"stateful\"\n[control_plane]\ndsn_env = \"DSN\"\n[secret_store]\nkek_env = \"KEK\"\n[[admin_breakglass]]\nenv = \"BG\"\n[[admin_breakglass]]\nenv = \"BG2\"",
+            ),
+            (
+                "exactly one non-empty source",
+                "mode = \"stateful\"\n[control_plane]\ndsn_env = \"DSN\"\n[secret_store]\nkek_env = \"KEK\"\n[[admin_breakglass]]\nenv = \"BG\"\nfile = \"/run/secrets/bg\"",
+            ),
+            (
+                "exactly one non-empty source",
+                "mode = \"stateful\"\n[control_plane]\ndsn_env = \"DSN\"\n[secret_store]\nkek_env = \"KEK\"\n[[admin_breakglass]]\nid = \"breakglass\"",
+            ),
+        ] {
+            let error = Config::from_toml_str(toml)
+                .expect_err("one usable breakglass credential is mandatory");
+            assert!(
+                matches!(error, ConfigError::Invalid(ref message) if message.contains(expected)),
+                "{expected}: {error:?}"
+            );
+        }
+    }
+
+    /// Stateful bootstrap can hold references and nothing else, so a diagnostic
+    /// (and `Debug`) names an env var or a path, never material.
+    #[test]
+    fn stateful_bootstrap_diagnostics_name_references_only() {
+        let config = Config::from_toml_str(STATEFUL).expect("valid bootstrap");
+        let rendered = format!(
+            "{:?} {:?} {:?}",
+            config.control_plane, config.secret_store, config.admin_breakglass
+        );
+        for reference in [
+            "AXOND_CONTROL_PLANE_DSN",
+            "AXOND_SECRET_STORE_KEK",
+            "AXOND_ADMIN_BREAKGLASS",
+        ] {
+            assert!(rendered.contains(reference), "{reference} missing");
+        }
+        assert_eq!(
+            config.admin_breakglass[0].label(),
+            "AXOND_ADMIN_BREAKGLASS",
+            "an unlabelled credential is attributed by its reference"
+        );
+    }
+
+    /// The shipped stateful example is the operator-facing copy of the approved
+    /// bootstrap set; it must keep validating as the parser evolves.
+    #[test]
+    fn the_shipped_stateful_example_validates() {
+        let config = Config::from_toml_str(&repository_file("axond.stateful.example.toml"))
+            .expect("axond.stateful.example.toml must validate");
+        assert_eq!(config.mode, Mode::Stateful);
+        assert!(
+            config.namespace.is_empty(),
+            "the control plane owns tenants"
+        );
+    }
+
+    /// Documentation drift gate: every key the shipped stateful example uses is
+    /// documented in the configuration reference, so a new bootstrap key cannot
+    /// ship undocumented.
+    #[test]
+    fn the_configuration_reference_documents_the_stateful_bootstrap_surface() {
+        let reference = repository_file("docs/configuration.md");
+        let example = repository_file("axond.stateful.example.toml");
+        let mut documented_keys = 0;
+        for line in example.lines() {
+            let line = line.trim_start_matches('#').trim();
+            let Some((key, _)) = line.split_once(" = ") else {
+                continue;
+            };
+            // Prose mentions a key inside backticks; a setting is bare.
+            if key.is_empty() || !key.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                continue;
+            }
+            documented_keys += 1;
+            assert!(
+                reference.contains(&format!("`{key}`")),
+                "docs/configuration.md does not document `{key}`"
+            );
+        }
+        assert!(
+            documented_keys >= 8,
+            "expected the stateful example to exercise the bootstrap surface, found \
+             {documented_keys} keys"
+        );
+        for section in [
+            "[control_plane]",
+            "[secret_store]",
+            "[[admin_breakglass]]",
+            "mode = \"stateful\"",
+        ] {
+            assert!(
+                reference.contains(section),
+                "docs/configuration.md does not document {section}"
+            );
+        }
     }
 
     #[test]

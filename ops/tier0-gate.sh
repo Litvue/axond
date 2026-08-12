@@ -58,6 +58,7 @@ if [[ -z "${AXOND_TIER0_NETNS:-}" ]]; then
 fi
 
 config="$repo_root/tests/tier0/axond.tier0.toml"
+stateful_config="$repo_root/tests/tier0/axond.stateful-bootstrap.toml"
 upstream="$repo_root/tests/tier0/fake_upstream_serve.py"
 gateway_log="$(mktemp "$tmpdir/axond-tier0-gateway.XXXXXX.log")"
 upstream_log="$(mktemp "$tmpdir/axond-tier0-upstream.XXXXXX.log")"
@@ -68,6 +69,7 @@ ready_probe_body=""
 models_probe_body=""
 unknown_body=""
 fixture_body=""
+stateful_log=""
 
 failure() {
   echo >&2
@@ -93,7 +95,7 @@ cleanup() {
     wait "$pid" 2>/dev/null || true
   done
   rm -f "$gateway_log" "$upstream_log" "$health_probe_body" "$ready_probe_body" \
-    "$models_probe_body" "$unknown_body" "$fixture_body"
+    "$models_probe_body" "$unknown_body" "$fixture_body" "$stateful_log"
 }
 trap cleanup EXIT
 
@@ -211,10 +213,35 @@ grep -Eq '"object"[[:space:]]*:[[:space:]]*"chat.completion"' "$fixture_body" ||
   failure "fake-upstream response was not fixture-shaped"
 rm -f "$fixture_body"
 
+# Stateful bootstrap validates without a database: the same namespace that
+# denies egress is where a config-parse connection attempt would fail, so a
+# clean refusal here is evidence that parsing connects to nothing. The process
+# must also refuse to serve while the control plane is unimplemented, and its
+# diagnostic must name references rather than values (ADR 0027).
+stateful_log="$(mktemp "$tmpdir/axond-tier0-stateful.XXXXXX.log")"
+stateful_status=0
+env -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
+  -u AXOND_TIER0_CONTROL_PLANE_DSN -u AXOND_TIER0_SECRET_STORE_KEK \
+  -u AXOND_TIER0_ADMIN_BREAKGLASS \
+  AXOND_CONFIG="$stateful_config" RUST_LOG=warn \
+  timeout 10 "$bin" >"$stateful_log" 2>&1 || stateful_status=$?
+[[ "$stateful_status" != 0 ]] ||
+  failure "a stateful process started while the control plane is unimplemented; it must refuse rather than serve an empty snapshot"
+[[ "$stateful_status" != 124 ]] ||
+  failure "a stateful process kept running instead of refusing at boot (see $stateful_log)"
+grep -q 'stateful' "$stateful_log" ||
+  failure "stateful refusal did not explain the mode (see $stateful_log)"
+if grep -Eq 'postgres(ql)?://|dbname=' "$stateful_log"; then
+  failure "stateful diagnostics must name references, never a resolved DSN (see $stateful_log)"
+fi
+rm -f "$stateful_log"
+stateful_log=""
+
 echo "healthz: $health"
 echo "readyz: $ready_body"
 echo "models: fixture-chat"
 echo "auth: unauthenticated /v1/models -> 401"
 echo "errors: unknown model -> 404 unknown_model"
 echo "serving: local fixture upstream -> 200 chat.completion"
+echo "stateful: bootstrap validates with no datastore, then refuses to serve"
 echo "Tier 0 hermetic boot and serve passed"
