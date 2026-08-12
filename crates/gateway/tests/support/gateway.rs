@@ -120,20 +120,15 @@ impl Axond {
     /// One boot attempt: `None` when the process never became healthy, which on
     /// a loopback port means someone else won the bind.
     async fn try_start(upstream_base_url: &str, tuning: &str) -> Option<Self> {
-        let dir = std::env::temp_dir().join(format!(
-            "axond-compat-{}-{}",
-            std::process::id(),
-            CONFIGS.fetch_add(1, Ordering::SeqCst)
-        ));
+        // One reservation, used for both the config directory and the boot key:
+        // re-reading the counter could hand two concurrent boots the same value,
+        // and the key has to be unique by construction, not by timing.
+        let boot = CONFIGS.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("axond-compat-{}-{boot}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("test config directory");
         let addr = free_addr();
         let path = dir.join(format!("axond-{}.toml", addr.port()));
-        let boot_key = format!(
-            "test-boot-key-{}-{}-{}",
-            std::process::id(),
-            addr.port(),
-            CONFIGS.load(Ordering::SeqCst)
-        );
+        let boot_key = format!("test-boot-key-{}-{boot}", std::process::id());
         let config = config_toml(addr, upstream_base_url, tuning);
         std::fs::write(&path, &config).expect("test config is written");
 
@@ -209,7 +204,8 @@ impl Axond {
                 // Health only proves *something* serves the port. Readiness is
                 // this child's only if the server also accepts this boot's
                 // private key, which no sibling was given.
-                return self.answers_for_this_boot(&client).await;
+                let base_url = self.base_url.clone();
+                return self.answers_for_this_boot(&client, &base_url).await;
             }
             if let Ok(Some(_)) = self.child.try_wait() {
                 // The process is gone. A refused config is a test bug rather
@@ -233,14 +229,22 @@ impl Axond {
     /// window between `spawn` and the child's own bind failure, where nothing has
     /// been logged yet, is covered by asking the server who it is rather than by
     /// waiting for this child to complain.
-    async fn answers_for_this_boot(&mut self, client: &reqwest::Client) -> bool {
+    async fn answers_for_this_boot(&mut self, client: &reqwest::Client, base_url: &str) -> bool {
         let identified = client
-            .get(format!("{}/v1/models", self.base_url))
+            .get(format!("{base_url}/v1/models"))
             .bearer_auth(&self.boot_key)
             .send()
             .await
             .is_ok_and(|response| response.status().is_success());
         identified && !self.lost_the_port() && matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Whether `base_url` is served by this child, as `await_ready` decides it.
+    /// Exposed so the identity rule can be tested against a foreign server
+    /// deterministically, instead of only when the port race is actually lost.
+    pub async fn serves_this_boot(&mut self, base_url: &str) -> bool {
+        let client = reqwest::Client::new();
+        self.answers_for_this_boot(&client, base_url).await
     }
 
     /// Whether this child reported that its listener address was taken. The
