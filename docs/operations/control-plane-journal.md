@@ -154,7 +154,7 @@ material it was published against — see
 
 ## Operator commands
 
-Three commands run *before* replicas do, all with the same grammar —
+Four commands run *before* replicas do, all with the same grammar —
 `axond <command> <action> --config PATH`. `--config` may be omitted when
 `AXOND_CONFIG` is set.
 
@@ -163,6 +163,7 @@ Three commands run *before* replicas do, all with the same grammar —
 | `axond check preflight --config PATH` | No | Would a replica boot against this? Config ownership and mode, every reference a boot resolves (control plane, secret-store KEK, breakglass, inbound keys and verifiers, provider credentials, opt-in stores — including a reference a store inherits from the Redis budget), control-plane reachability, schema compatibility. |
 | `axond migrate status --config PATH` | No | What schema does this database have, and what would an apply do? |
 | `axond migrate apply --config PATH` | Yes | Apply the pending migrations, forward only. |
+| `axond migrate adopt --config PATH` | Yes (ledger rows only) | This schema was applied out of band — record the baseline its objects account for. Executes no migration file. |
 
 The command surface, the forward-only policy, and the refusal to migrate at boot
 are [ADR 0032](../adr/0032-operator-preflight-and-forward-only-migrations.md).
@@ -170,17 +171,22 @@ are [ADR 0032](../adr/0032-operator-preflight-and-forward-only-migrations.md).
 `preflight` and `status` cannot change a database, and not merely by convention:
 they open the control plane on a maintenance path that does not prepare a schema,
 with migration permission forced off, and read the ledger inside a `READ ONLY`
-transaction, so the *server* rejects a write. `apply` is the only mutation, and it
-is explicit.
+transaction, so the *server* rejects a write. `apply` and `adopt` are the only
+mutations, both are explicit, and they write different things: `apply` runs
+migration files and records them, `adopt` records ledger rows for migrations it
+verified are already applied and runs no DDL at all.
 
 Exit codes make these usable as deployment gates: `preflight` exits non-zero if
 any check failed, `status` exits non-zero while a migration is outstanding or the
-schema is refused, and `apply` exits non-zero if the schema was refused. Output
-names environment variables, never DSNs.
+schema is refused, and `apply` exits non-zero if the schema was refused. `adopt`
+exits non-zero if it refused, or if the baseline it recorded still leaves a
+migration to apply. Output names environment variables, never DSNs.
 
 `apply` against a database that is already current is a no-op rather than a
 re-run: it reports the current version and rolls its transaction back without
-executing a migration file.
+executing a migration file. `adopt` against a database whose ledger already
+records a history is the same kind of no-op — it reports that history and writes
+nothing.
 
 In stateless mode there is no control plane, so `preflight` reports the database
 checks as skipped and `migrate` has nothing to do. Neither command requires
@@ -252,13 +258,17 @@ simultaneous applies are one migration. A replica configured with
 because one apply before a rollout is the order that cannot have replicas
 migrating a database their peers are reading.
 
-Applying the DDL with `psql` still works and stays supported for operators who
-own schema changes out of band:
+### Applied out of band: `psql`, then `adopt`
+
+Applying the DDL with `psql` still works and stays supported for operators who own
+schema changes out of band:
 
 ```bash
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0001_initial.sql
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0002_tenancy_access.sql
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0003_tenancy_constraints.sql
+axond migrate adopt  --config /etc/axond/axond.toml  # record the baseline that applied
+axond migrate status --config /etc/axond/axond.toml  # now Current
 ```
 
 0003 is where the deferrable name, identity, and ownership rules live, and it
@@ -268,23 +278,43 @@ forward migration rather than an edit to 0002 for the reason the *Drifted* row
 below states: the ledger compares a recorded checksum against the shipped file,
 so an applied migration is immutable. Re-applying it is a no-op.
 
-That path does not write the ledger row, so the journal is then reported as
-*Unrecorded* — a ledger table that exists and records nothing — and both `status`
-and `apply` refuse it. An empty ledger is indistinguishable from an untouched
-database, and the ledger is the only record of what was applied, so migrating from
-zero would replay every shipped file over objects that may already be there;
-that survives only while every statement is `IF NOT EXISTS`. Either drop the
-empty `axond_cp_schema_migration` table if nothing was applied, or state the
-baseline the DDL corresponds to:
+The `psql` path creates the ledger table without recording anything in it, so the
+journal is then reported as *Unrecorded* — a ledger that exists and records nothing
+— and `status`, `apply`, and boot all refuse it. That refusal is the point. An
+empty ledger is indistinguishable from an untouched database, and the ledger is the
+only record of what was applied, so migrating from zero would replay every shipped
+file over objects that may already be there. Today every statement is
+`IF NOT EXISTS` and that replay would survive; the first `ALTER TABLE`, backfill,
+or constraint change would not, and it would corrupt a database rather than fail.
 
-```bash
-psql "$GW_CONTROL_PLANE_DSN" -c "INSERT INTO axond_cp_schema_migration (version, name, checksum)
-  VALUES (1, 'control_plane_0001_initial', '<checksum>')"
-```
+`axond migrate adopt` is how that state is resolved deliberately. It writes ledger
+rows and never DDL, and it records only what the database itself accounts for: the
+longest run of shipped migrations, starting at v1, whose every declared table is
+present. What it does instead of recording:
 
-The refusal prints the exact statement, checksum included, for every migration
-this build ships. Prefer `axond migrate apply`, which records what it applied and
-never leaves this state behind.
+- **No object present.** Nothing was applied out of band, so there is no baseline.
+  Refused, naming the way forward — drop the empty `axond_cp_schema_migration`
+  table and run `axond migrate apply`.
+- **A migration only partly applied.** Some of the tables one file declares are
+  there and some are not, so neither "applied" nor "not applied" is true. Refused,
+  naming the missing tables; finish or undo that file by hand first.
+- **A ledger that already records a history.** Nothing to adopt: the history is
+  reported and nothing is written, so a stray `adopt` in a rollout is not a ledger
+  edit.
+
+It is one transaction under the same advisory lock `apply` takes, so a refusal
+leaves no partial baseline and two simultaneous adoptions are one adoption.
+Adopting a prefix below the required version reports what is still pending and
+exits non-zero; the next command is `axond migrate apply`, which migrates forward
+from the adopted baseline.
+
+Adoption is deliberately narrow. It cannot repair a *Drifted*, *Incomplete*,
+*Renamed*, *Ahead*, or *Malformed* history: each of those is a recorded history
+that disagrees with this build, which is a different question from an unrecorded
+one, and each stays a refusal. Writing the baseline rows by hand still works and is
+classified identically — `adopt` is the checked version of that `INSERT`. Prefer
+`axond migrate apply` for a fresh install: it records what it applied and never
+leaves this state behind.
 
 ## Schema status, and what each state means
 
@@ -296,7 +326,7 @@ never leaves this state behind.
 | --- | --- | --- |
 | Current | The applied history is exactly the required one | Nothing |
 | Behind | Migrations are missing | `axond migrate apply` |
-| Unrecorded | The ledger table exists and records nothing: the DDL was applied out of band, or every row was deleted | Drop the empty ledger if nothing was applied, or record the baseline the database corresponds to (the refusal prints the statement); never migrate it from zero |
+| Unrecorded | The ledger table exists and records nothing: the DDL was applied out of band, or every row was deleted | `axond migrate adopt` if the DDL was applied — it records the baseline the objects account for, and refuses if they do not account for one; drop the empty ledger and `apply` if nothing was applied; never migrate it from zero |
 | Ahead | The database records a migration this build does not know | Deploy the newer build; do not downgrade the schema |
 | Drifted | An applied migration's recorded checksum is not this build's file | Restore the file, or add a new migration — never edit in place |
 | Incomplete | The applied versions are not a complete prefix (`v3` without `v2`, or a deleted ledger row) | Find out what applied out of order or removed the row; the maximum version alone is not evidence the history is intact |

@@ -359,6 +359,14 @@ or metric label is a closed vocabulary, and adding a value to one is gated
 mechanically by `every_revision_rejection_reason_is_catalogued`,
 `every_reason_code_is_bounded_and_distinct`, and
 `operator_only_reasons_coarsen_and_tenant_safe_ones_do_not`.
+The control-plane ledger is the record of what DDL ran, so the writes to it are
+gated too: `an_empty_ledger_is_refused_rather_than_migrated_from_zero`,
+`a_hand_applied_schema_is_adopted_as_the_baseline_its_objects_prove`,
+`a_partly_applied_schema_is_refused_without_recording_anything`,
+`adoption_refuses_every_schema_that_is_not_an_empty_ledger`, and
+`concurrent_adoptions_record_the_baseline_once` — a baseline may only be recorded
+for migrations whose objects are present, and never by executing shipped DDL over
+a database that already has it.
 
 **Threat model and ADRs.** [ADR 0007](../adr/0007-telemetry-model.md),
 [ADR 0009](../adr/0009-durable-usage-sinks.md),

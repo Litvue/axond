@@ -48,9 +48,9 @@ mod desired_state;
 mod error;
 mod key_material;
 mod mint;
-// Operator commands: `axond check preflight`, `axond migrate status`, and
-// `axond migrate apply`. Nothing here is on the request path or reachable from
-// `serve`.
+// Operator commands: `axond check preflight`, `axond migrate status`,
+// `axond migrate apply`, and `axond migrate adopt`. Nothing here is on the
+// request path or reachable from `serve`.
 mod ops;
 mod principals;
 // The recovery qualification driver (#219). Tests only: it holds a replica's
@@ -113,6 +113,7 @@ fn main() -> anyhow::Result<()> {
         Some(("migrate", args)) => match args.subcommand() {
             Some(("status", args)) => migrate_control_plane(args, Migration::Status),
             Some(("apply", args)) => migrate_control_plane(args, Migration::Apply),
+            Some(("adopt", args)) => migrate_control_plane(args, Migration::Adopt),
             _ => unreachable!("clap validates subcommands"),
         },
         None => serve(),
@@ -202,6 +203,15 @@ fn cli() -> Command {
                         .about(
                             "Apply pending control-plane migrations, forward only. Idempotent and \
                              safe to run before replicas start.",
+                        )
+                        .arg(config_arg()),
+                )
+                .subcommand(
+                    Command::new("adopt")
+                        .about(
+                            "Record the baseline an out-of-band `psql` apply left unrecorded, for \
+                             the migrations whose tables this database actually holds. Executes no \
+                             migration SQL; refuses anything but an empty ledger.",
                         )
                         .arg(config_arg()),
                 ),
@@ -377,21 +387,24 @@ fn preflight(args: &clap::ArgMatches) -> anyhow::Result<()> {
     )
 }
 
-/// Which half of `axond migrate` is running. The read and the write are one
-/// function because they share every step except the last one — and separate
-/// subcommands because only one of them changes a database.
+/// Which part of `axond migrate` is running. They are one function because they
+/// share every step except the last one — and separate subcommands because two of
+/// them change a database and one cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Migration {
     Status,
     Apply,
+    Adopt,
 }
 
-/// `axond migrate status --config PATH` and `axond migrate apply --config PATH`.
+/// `axond migrate status`, `axond migrate apply`, and `axond migrate adopt`,
+/// each `--config PATH`.
 ///
 /// `status` is read-only and exits non-zero while a migration is outstanding, so
-/// a rollout can gate on it. `apply` is the only command here that writes, is
-/// forward-only, and is idempotent: running it twice reports a current schema
-/// rather than migrating twice.
+/// a rollout can gate on it. `apply` is forward-only and idempotent: running it
+/// twice reports a current schema rather than migrating twice. `adopt` records the
+/// baseline of a database whose DDL was applied out of band, on the evidence of
+/// the objects it holds, and executes no migration file at all.
 fn migrate_control_plane(args: &clap::ArgMatches, which: Migration) -> anyhow::Result<()> {
     let path = config_path(args);
     let config = ops::load(&path).map_err(ops_failure)?;
@@ -400,6 +413,7 @@ fn migrate_control_plane(args: &clap::ArgMatches, which: Migration) -> anyhow::R
     let report = match which {
         Migration::Status => runtime.block_on(ops::migrate::status(&config, &env)),
         Migration::Apply => runtime.block_on(ops::migrate::apply(&config, &env)),
+        Migration::Adopt => runtime.block_on(ops::migrate::adopt(&config, &env)),
     }
     .map_err(ops_failure)?;
     println!("{report}");

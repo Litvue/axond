@@ -40,7 +40,11 @@ non-zero when the deployment is not ready, so a rollout can gate on them. The
 ordering and the full state table are in
 [the control-plane journal](control-plane-journal.md#operator-commands): a schema
 reported *Ahead*, *Drifted*, *Incomplete*, *Renamed*, or *Malformed* stops the
-rollout rather than being migrated over.
+rollout rather than being migrated over. A schema reported *Unrecorded* — the
+journal's DDL applied out of band, so the ledger exists and records nothing — stops
+it too, and is resolved once with
+[`axond migrate adopt`](control-plane-journal.md#applied-out-of-band-psql-then-adopt)
+before the `apply`.
 
 ## Ordinary rolling upgrade
 
