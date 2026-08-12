@@ -167,7 +167,8 @@ applying, because a long answer is not a stalled one: from there
 Bounds on one upstream call. Each phase is separate because they fail for
 different reasons: connecting is egress or DNS, no headers is an overloaded
 provider, a silent open socket is a half-dead connection. Every bound must be
-≥ 1 — zero is not "unbounded", it is a gateway that cannot call anything.
+≥ 1 — zero is not "unbounded", it is a gateway that cannot call anything
+([ADR 0027](./adr/0027-transport-phase-bounds.md)).
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |

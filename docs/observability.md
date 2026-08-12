@@ -148,7 +148,12 @@ long it takes, while one that goes silent for longer than the idle bound is
 terminated in band on the already-`200` response. Nothing is retried there, and
 no second completion is spliced in — the usage record settles once, as `partial`
 or `upstream_error`, and `axond.upstream.timeouts{axond.timeout="stream_idle"}`
-is what distinguishes a stalled provider from one that ended early.
+is what distinguishes a stalled provider from one that ended early
+([ADR 0027](./adr/0027-transport-phase-bounds.md)).
+
+A `504` whose phase is `overall` reports the gateway's own spent failover
+budget, so it is attributed to the request and the target's metrics but does not
+count against the target's circuit breaker; the per-phase bounds do.
 
 ### Boot failures
 

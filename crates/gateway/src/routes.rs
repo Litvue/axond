@@ -39,7 +39,7 @@ use gateway_core::{
     NativeMessagesDecoder, ProviderError, ProviderRequest, ProviderResponse, ProviderStreamDecoder,
     Surface, Usage,
 };
-use gateway_transport::{AuthScheme, Deadline, NativeCall, TransportError, Upstream};
+use gateway_transport::{AuthScheme, Deadline, NativeCall, TimeoutKind, TransportError, Upstream};
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -1808,14 +1808,18 @@ fn record_target_success(snapshot: &ConfigSnapshot, target: &Target, circuit_key
 /// A target failure trips its circuit only when it reflects on the *target*'s
 /// health. A `429` that exhausted the pool is credential-scoped (ADR 0006) and a
 /// `404` names a missing deployment, not an unhealthy target — both fail over
-/// without opening the target's breaker.
+/// without opening the target's breaker. A spent failover budget is the
+/// gateway's own bound and belongs in the same category.
 fn record_target_failure(
     snapshot: &ConfigSnapshot,
     target: &Target,
     circuit_key: &str,
     err: &TransportError,
 ) {
-    if as_provider_error(err).affects_provider_health() && !is_credential_exhausted(err) {
+    if as_provider_error(err).affects_provider_health()
+        && !is_credential_exhausted(err)
+        && !is_own_budget_spent(err)
+    {
         snapshot.target_circuits.record_failure(circuit_key);
         telemetry::metrics::record_circuit_state(
             &target.provider,
@@ -1971,6 +1975,14 @@ fn is_credential_exhausted(err: &TransportError) -> bool {
     matches!(err, TransportError::Provider(error) if error.is_credential_rate_limited())
 }
 
+/// An attempt cut short by `failover.overall_timeout_ms` reports the gateway's
+/// own budget, not the target's health: the remaining budget can be a
+/// millisecond because *earlier* targets spent the walk. Parking a target for
+/// that would let one slow target take a healthy one out of rotation.
+fn is_own_budget_spent(err: &TransportError) -> bool {
+    err.timeout_kind() == Some(TimeoutKind::Overall)
+}
+
 fn to_usage(u: &gateway_core::ModelUsage) -> Usage {
     Usage {
         input_tokens: u.input_tokens,
@@ -2101,6 +2113,31 @@ namespace = "platform"
             .chain([("AXOND_INBOUND_KEY", CALLER_SECRET)])
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect()
+    }
+
+    /// A phase bound is the target's problem; the walk's own spent budget is
+    /// not, so a target slow enough to exhaust it must not park a healthy one.
+    #[test]
+    fn a_spent_failover_budget_does_not_reflect_on_a_target() {
+        for kind in [
+            TimeoutKind::Connect,
+            TimeoutKind::ResponseHeaders,
+            TimeoutKind::BufferedBody,
+            TimeoutKind::StreamIdle,
+        ] {
+            let err = TransportError::Timeout {
+                kind,
+                budget_ms: 100,
+            };
+            assert!(as_provider_error(&err).affects_provider_health());
+            assert!(!is_own_budget_spent(&err), "{}", kind.label());
+        }
+
+        let spent = TransportError::Timeout {
+            kind: TimeoutKind::Overall,
+            budget_ms: 0,
+        };
+        assert!(is_own_budget_spent(&spent));
     }
 
     /// A JSON `POST` that already carries the caller's gateway key.
