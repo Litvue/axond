@@ -80,6 +80,7 @@ anything else:
 | telemetry (`OTEL_*` environment plus `[[usage_sink]]` transport settings) | Where traces, metrics, logs, and usage rows go. |
 | Postgres control-plane connectivity | DSN *reference* for the control-plane database. |
 | secret-store and KEK settings | Which `SecretStore` implementation, and the key-encryption-key reference used to unwrap tenant secrets. |
+| static breakglass operator credential | The mandatory `/admin/v1` breakglass identity, referenced the way `[[gateway_key]]` already is. |
 
 Nothing else. Tenants, projects, identities, providers, provider credentials,
 model catalogues, prices, aliases, and policies are **not** expressible in
@@ -182,8 +183,10 @@ previous revision keeps serving; there is no partial publication.
 A process starting in stateful mode with no snapshot **must** reach the control
 plane. It fails to become ready otherwise, and it fails loudly rather than
 serving an empty or partial configuration. Signed offline last-known-good boot
-(so a *new* replica can start during a control-plane outage) is explicitly a
-later slice (#142) and is not promised by this ADR.
+(so a *new* replica can start during a control-plane outage) is owned by #142
+and is deliberately not part of the first stateful release: #142 lands
+reconciliation first, and relaxes this cold-boot requirement afterwards. Until
+then, no slice in this ADR's dependency map promises offline cold boot.
 
 The asymmetry is deliberate: a running replica must survive a control-plane
 outage; a brand-new replica in the first stateful release need not.
@@ -307,7 +310,7 @@ one mode.
 
 | Dimension | Stateless owner | Stateful owner | Durability | On the request path? |
 | --- | --- | --- | --- | --- |
-| Bootstrap (`mode`, `[server]`, telemetry, control-plane DSN reference, secret-store/KEK settings) | TOML + env/files | TOML + env/files | Process-local file | No (read at boot/reload) |
+| Bootstrap (`mode`, `[server]`, telemetry, control-plane DSN reference, secret-store/KEK settings, static breakglass credential) | TOML + env/files | TOML + env/files | Process-local file | No (read at boot/reload) |
 | Tenants and projects | TOML `[[namespace]]` | `ControlPlaneStore` | Postgres revision | No — resolved from snapshot |
 | Human/administrative identities | n/a (no admin API) | OIDC issuer + `ControlPlaneStore` bindings; static breakglass in bootstrap | Postgres + IdP | No — `/admin/v1` only |
 | Inference identities (static keys, minted signing/verification policy, epochs) | TOML `[[gateway_key]]`, `[gateway_minting]`, `[gateway_token]`, `[[gateway_verifier]]`, `[[gateway_token_epoch]]` | `ControlPlaneStore` (static breakglass stays in bootstrap) | Postgres revision | No — snapshot; opt-in `RevocationStore` check is separate |
