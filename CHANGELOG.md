@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.15](https://github.com/Litvue/axond/compare/v0.3.14...v0.3.15) (2026-08-12)
+
+
+### Features
+
+* **observability:** add bounded status contract and canonical metric catalogue ([#211](https://github.com/Litvue/axond/issues/211)) ([3680fc2](https://github.com/Litvue/axond/commit/3680fc2b1f572b12ac242cf7964db906bd38dfc7))
+
 ## [0.3.14](https://github.com/Litvue/axond/compare/v0.3.13...v0.3.14) (2026-08-12)
 
 
