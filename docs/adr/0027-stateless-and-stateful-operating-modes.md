@@ -71,11 +71,11 @@ deployment stateful in the sense of this ADR.
 The one carve-out ADR 0017 already grants stands: a Tier 2 store-backed
 principal layer may own *caller and key lifecycle* for the credential shapes it
 declares, under the shape-ownership, TTL-cache, and fail-closed rules of
-[ADR 0016](./0016-minted-inbound-identity-and-principal-stores.md). That is caller/key lifecycle
-only — namespaces, providers, aliases, prices, and provider credentials stay
-config-owned in stateless mode — and it is a different mechanism from stateful
-mode, where identities are compiled into the snapshot instead of resolved per
-request. **Stateless mode is otherwise unchanged by this ADR**, including its
+[ADR 0016](./0016-minted-inbound-identity-and-principal-stores.md). That is
+caller/key lifecycle only — namespaces, providers, aliases, prices, and provider
+credentials stay config-owned in stateless mode — and it is a different
+mechanism from stateful mode, where identities are compiled into the snapshot
+instead of resolved per request. **Stateless mode is otherwise unchanged by this ADR**, including its
 Tier 0 hermetic guarantee.
 
 **Stateful mode moves durable-resource ownership to the control plane.**
