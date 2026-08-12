@@ -20,6 +20,7 @@ use gateway_core::ModelPrice;
 use gateway_transport::TransportLimits;
 use serde::{Deserialize, Deserializer};
 
+use crate::admission::MAX_PERMITS;
 use crate::aliases::AliasScope;
 use crate::principals::Capability;
 use crate::usage::{BatchSettings, validate_table_name};
@@ -598,21 +599,27 @@ fn default_max_response_bytes() -> u64 {
 /// The ceilings are process-level: they own semaphores built at boot, so a
 /// change is validated on reload but takes effect on restart, exactly like
 /// `[transport]`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+///
+/// The two sub-ceilings default *below* the global one, so lowering only
+/// `max_in_flight` would leave a stock 256-request tenant ceiling above a
+/// 16-request process. A ceiling the operator did not write is therefore clamped
+/// to `max_in_flight` on load rather than refused; one they did write is a boot
+/// error, because a contradiction between two configured numbers has no obvious
+/// resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionConfig {
     /// Largest inbound request body that will be buffered and parsed. A larger
     /// one is refused with `413` before it is read into memory, which is what
     /// bounds the prompt a caller can send.
-    #[serde(default = "default_max_request_bytes")]
     pub max_request_bytes: usize,
     /// Concurrent requests this replica will serve on the provider-dispatching
     /// routes. `0` disables the ceiling.
-    #[serde(default = "default_max_in_flight")]
     pub max_in_flight: usize,
     /// Concurrent open streams, counted separately because a stream holds a
     /// socket for as long as the model talks. `0` disables the ceiling.
-    #[serde(default = "default_max_in_flight_streams")]
     pub max_in_flight_streams: usize,
+    #[doc(hidden)]
+    pub max_in_flight_streams_explicit: bool,
     /// Concurrent requests one namespace may hold. Keep it below
     /// `max_in_flight` so no single tenant can take the whole replica. `0`
     /// disables the ceiling.
@@ -621,20 +628,18 @@ pub struct AdmissionConfig {
     /// ceiling traffic meets — and it answers `429`, which reads as the caller's
     /// fault. Raise it to `max_in_flight`, or disable it, when one namespace is
     /// the whole deployment.
-    #[serde(default = "default_max_in_flight_per_tenant")]
     pub max_in_flight_per_tenant: usize,
+    #[doc(hidden)]
+    pub max_in_flight_per_tenant_explicit: bool,
     /// Tenants tracked concurrently by the per-tenant ceiling. Entries exist
     /// only while a tenant has work in flight; a new tenant beyond this bound is
     /// refused rather than admitted without a ceiling.
-    #[serde(default = "default_max_tenants")]
     pub max_tenants: usize,
     /// Requests that may wait for global capacity. `0` — the default — rejects
     /// immediately instead of queueing, which is the bounded behavior.
-    #[serde(default = "default_queue_capacity")]
     pub queue_capacity: usize,
     /// How long a queued request waits before it is shed. Required with, and
     /// only meaningful with, `queue_capacity`.
-    #[serde(default = "default_queue_wait_ms")]
     pub queue_wait_ms: u64,
     /// Total lifetime of one open stream, as opposed to
     /// `transport.stream_idle_timeout_ms`, which resets on every chunk. This is
@@ -644,26 +649,88 @@ pub struct AdmissionConfig {
     /// draining: a client that stops reading applies write backpressure, the
     /// relay stops being polled, and the deadline cannot fire. A proxy's
     /// write/response timeout is the bound for that case.
-    #[serde(default = "default_max_stream_duration_ms")]
     pub max_stream_duration_ms: u64,
     /// Largest prompt, in the gateway's pre-dispatch token estimate, that a
     /// request may carry. Bounds the input a caller can send more meaningfully
     /// than `max_request_bytes` alone, which cannot tell a large body from a
     /// large prompt. `0` disables it.
-    #[serde(default = "default_max_prompt_tokens")]
     pub max_prompt_tokens: u64,
     /// Largest output allowance a request may *ask* for (`max_tokens` and its
     /// per-surface spellings). A request asking for more is refused rather than
     /// silently clamped, so a caller is never billed for a bound it did not
     /// choose. `0` disables it.
-    #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: u64,
     /// Bytes one stream may relay before it is ended. Bounds the output of a
     /// model that never stops talking, which neither the idle timeout nor the
     /// token allowance can (a provider need not honor `max_tokens`). `0`
     /// disables it.
-    #[serde(default = "default_max_stream_bytes")]
     pub max_stream_bytes: u64,
+}
+
+/// The `[admission]` section as written, before an unset sub-ceiling is clamped
+/// to a lowered `max_in_flight`.
+#[derive(Debug, Deserialize)]
+struct AdmissionConfigWire {
+    #[serde(default = "default_max_request_bytes")]
+    max_request_bytes: usize,
+    #[serde(default = "default_max_in_flight")]
+    max_in_flight: usize,
+    #[serde(default)]
+    max_in_flight_streams: Option<usize>,
+    #[serde(default)]
+    max_in_flight_per_tenant: Option<usize>,
+    #[serde(default = "default_max_tenants")]
+    max_tenants: usize,
+    #[serde(default = "default_queue_capacity")]
+    queue_capacity: usize,
+    #[serde(default = "default_queue_wait_ms")]
+    queue_wait_ms: u64,
+    #[serde(default = "default_max_stream_duration_ms")]
+    max_stream_duration_ms: u64,
+    #[serde(default = "default_max_prompt_tokens")]
+    max_prompt_tokens: u64,
+    #[serde(default = "default_max_output_tokens")]
+    max_output_tokens: u64,
+    #[serde(default = "default_max_stream_bytes")]
+    max_stream_bytes: u64,
+}
+
+impl<'de> Deserialize<'de> for AdmissionConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AdmissionConfigWire::deserialize(deserializer)?;
+        // A defaulted sub-ceiling follows a lowered global one instead of
+        // contradicting it; a written one is left alone so validation can refuse
+        // it by name.
+        let clamp = |written: Option<usize>, default: usize| match written {
+            Some(value) => (value, true),
+            None if wire.max_in_flight > 0 => (default.min(wire.max_in_flight), false),
+            None => (default, false),
+        };
+        let (max_in_flight_streams, max_in_flight_streams_explicit) =
+            clamp(wire.max_in_flight_streams, default_max_in_flight_streams());
+        let (max_in_flight_per_tenant, max_in_flight_per_tenant_explicit) = clamp(
+            wire.max_in_flight_per_tenant,
+            default_max_in_flight_per_tenant(),
+        );
+        Ok(Self {
+            max_request_bytes: wire.max_request_bytes,
+            max_in_flight: wire.max_in_flight,
+            max_in_flight_streams,
+            max_in_flight_streams_explicit,
+            max_in_flight_per_tenant,
+            max_in_flight_per_tenant_explicit,
+            max_tenants: wire.max_tenants,
+            queue_capacity: wire.queue_capacity,
+            queue_wait_ms: wire.queue_wait_ms,
+            max_stream_duration_ms: wire.max_stream_duration_ms,
+            max_prompt_tokens: wire.max_prompt_tokens,
+            max_output_tokens: wire.max_output_tokens,
+            max_stream_bytes: wire.max_stream_bytes,
+        })
+    }
 }
 
 impl Default for AdmissionConfig {
@@ -672,7 +739,9 @@ impl Default for AdmissionConfig {
             max_request_bytes: default_max_request_bytes(),
             max_in_flight: default_max_in_flight(),
             max_in_flight_streams: default_max_in_flight_streams(),
+            max_in_flight_streams_explicit: false,
             max_in_flight_per_tenant: default_max_in_flight_per_tenant(),
+            max_in_flight_per_tenant_explicit: false,
             max_tenants: default_max_tenants(),
             queue_capacity: default_queue_capacity(),
             queue_wait_ms: default_queue_wait_ms(),
@@ -2473,7 +2542,11 @@ impl Config {
                     .into(),
             ));
         }
+        // Only a ceiling the operator wrote can contradict another: a defaulted
+        // one was already clamped to `max_in_flight` on load, so nobody is told
+        // to fix a key they never set.
         if admission.max_in_flight > 0
+            && admission.max_in_flight_per_tenant_explicit
             && admission.max_in_flight_per_tenant > admission.max_in_flight
         {
             return Err(ConfigError::Invalid(format!(
@@ -2483,6 +2556,7 @@ impl Config {
             )));
         }
         if admission.max_in_flight > 0
+            && admission.max_in_flight_streams_explicit
             && admission.max_in_flight_streams > 0
             && admission.max_in_flight_streams > admission.max_in_flight
         {
@@ -2491,6 +2565,25 @@ impl Config {
                  ({}): a stream is an in-flight request",
                 admission.max_in_flight_streams, admission.max_in_flight
             )));
+        }
+        // Each ceiling becomes a semaphore, which asserts on an absurd size.
+        // Refused here so it is the same typed boot error as every other bound
+        // rather than a panic naming no key.
+        for (field, value) in [
+            ("admission.max_in_flight", admission.max_in_flight),
+            (
+                "admission.max_in_flight_streams",
+                admission.max_in_flight_streams,
+            ),
+            ("admission.queue_capacity", admission.queue_capacity),
+        ] {
+            if value > MAX_PERMITS {
+                return Err(ConfigError::Invalid(format!(
+                    "{field} ({value}) must not exceed {}: a larger ceiling is not a bound this \
+                     process can hold",
+                    MAX_PERMITS
+                )));
+            }
         }
         if (admission.queue_capacity == 0) != (admission.queue_wait_ms == 0) {
             return Err(ConfigError::Invalid(
@@ -3782,6 +3875,59 @@ env = "GW_ADMIN_BREAKGLASS"
                 .and_then(SecretStore::kek_reference),
             Some(("kek_env", "GW_SECRET_STORE_KEK"))
         );
+    }
+
+    /// Turning one number down is the common tuning move, and it must not fail
+    /// boot over the stock sub-ceilings the operator never wrote.
+    #[test]
+    fn a_lowered_global_ceiling_pulls_the_defaulted_sub_ceilings_down_with_it() {
+        let config = Config::from_toml_str(&format!("{VALID}\n[admission]\nmax_in_flight = 16\n"))
+            .expect("lowering only the global ceiling boots");
+        assert_eq!(config.admission.max_in_flight, 16);
+        assert_eq!(config.admission.max_in_flight_per_tenant, 16);
+        assert_eq!(config.admission.max_in_flight_streams, 16);
+        assert!(!config.admission.max_in_flight_per_tenant_explicit);
+        assert!(!config.admission.max_in_flight_streams_explicit);
+
+        let written = Config::from_toml_str(&format!(
+            "{VALID}\n[admission]\nmax_in_flight = 16\nmax_in_flight_per_tenant = 0\n"
+        ))
+        .expect("a written ceiling is honored, including the disabling zero");
+        assert_eq!(written.admission.max_in_flight_per_tenant, 0);
+        assert!(written.admission.max_in_flight_per_tenant_explicit);
+
+        let error = Config::from_toml_str(&format!(
+            "{VALID}\n[admission]\nmax_in_flight = 16\nmax_in_flight_streams = 32\n"
+        ))
+        .expect_err("two written ceilings that contradict each other are a boot error");
+        assert!(
+            error
+                .to_string()
+                .contains("admission.max_in_flight_streams"),
+            "{error}"
+        );
+    }
+
+    /// Each ceiling becomes a semaphore, and a semaphore asserts above
+    /// `MAX_PERMITS`. A refusal naming the key beats a panic naming nothing.
+    #[test]
+    fn rejects_a_ceiling_larger_than_a_semaphore_can_hold() {
+        let absurd = MAX_PERMITS as u64 + u64::from(u32::MAX);
+        for (key, extra) in [
+            ("max_in_flight", String::new()),
+            (
+                "max_in_flight_streams",
+                format!("max_in_flight = {MAX_PERMITS}\n"),
+            ),
+            ("queue_capacity", format!("max_in_flight = {MAX_PERMITS}\n")),
+        ] {
+            let toml = format!("{VALID}\n[admission]\n{extra}{key} = {absurd}\n");
+            let error = Config::from_toml_str(&toml).expect_err("an absurd ceiling is refused");
+            assert!(
+                error.to_string().contains(&format!("admission.{key}")),
+                "{error}"
+            );
+        }
     }
 
     /// `[admission]` bounds the process, not a durable resource, so the control

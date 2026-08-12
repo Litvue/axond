@@ -52,6 +52,15 @@ because a stream holds a socket and a relay task for the length of an answer,
 which makes it the scarcer resource. `0` means "this ceiling is off" everywhere
 except `max_request_bytes`, where zero would be a gateway that cannot serve.
 
+The gates are taken in the order tenant → global → stream. The tenant gate never
+waits, so a tenant at its own ceiling cannot occupy the queue other tenants are
+waiting in; the stream gate is taken last, so a stream slot is only ever held by
+a request that is about to open a stream rather than by one still queued for
+capacity. Because the two sub-ceilings ship *below* the global one, an unset
+sub-ceiling is clamped to a lowered `max_in_flight` on load: turning one number
+down must not fail boot over a default the operator never wrote. Two written
+numbers that contradict each other still refuse to boot.
+
 Admission is taken **after authentication and before the rate-limit store, the
 budget reservation, and the provider call**. Ordering is the decision, not an
 implementation detail: authentication stays fail-closed so unauthenticated

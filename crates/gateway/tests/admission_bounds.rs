@@ -52,6 +52,17 @@ queue_capacity = 4
 queue_wait_ms = 300
 "#;
 
+/// The tuning an operator actually writes when a replica is smaller than the
+/// shipped defaults assume: one number, with the sub-ceilings left alone.
+const LOWERED_GLOBAL_ONLY: &str = r#"
+[failover]
+max_attempts = 1
+overall_timeout_ms = 30000
+
+[admission]
+max_in_flight = 1
+"#;
+
 /// Room for concurrent requests globally, but one per tenant: a tenant's own
 /// ceiling is the caller's problem, not the replica's.
 const ONE_PER_TENANT: &str = r#"
@@ -240,6 +251,34 @@ async fn a_saturated_replica_sheds_with_a_503_and_serves_again_afterwards() {
     let served = await_served(&gateway).await;
     assert_eq!(
         served,
+        200,
+        "the permit was not released:\n{}",
+        gateway.output()
+    );
+}
+
+/// Lowering one ceiling must not be refused by the stock sub-ceilings, which
+/// ship above it. The clamped ceiling is the one traffic then meets.
+#[tokio::test]
+async fn lowering_only_the_global_ceiling_boots_and_sheds_at_that_ceiling() {
+    let (upstream, gateway) = boot_with(LOWERED_GLOBAL_ONLY).await;
+    let held = chat(&gateway, alias::CHAT_SLOW, true).await;
+    assert_eq!(held.status(), 200, "{}", gateway.output());
+
+    let shed = chat(&gateway, alias::CHAT, false).await;
+    assert!(
+        shed.status() == 429 || shed.status() == 503,
+        "the replica admits one request at a time: {}\n{}",
+        shed.status(),
+        gateway.output()
+    );
+    let body: Value = shed.json().await.expect("a JSON body");
+    assert_discreet(&body.to_string(), &upstream);
+
+    drain(held).await;
+    await_closed_upstreams(&upstream, &gateway).await;
+    assert_eq!(
+        await_served(&gateway).await,
         200,
         "the permit was not released:\n{}",
         gateway.output()
