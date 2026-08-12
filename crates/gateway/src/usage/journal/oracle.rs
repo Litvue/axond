@@ -116,9 +116,10 @@ impl Storage {
             .iter()
             .filter(|entry| entry.event.observed_at() + retain <= now)
             .filter(|entry| {
-                self.consumers
-                    .values()
-                    .all(|state| state.acked.contains(&entry.position))
+                self.consumers.values().all(|state| {
+                    state.acked.contains(&entry.position)
+                        && !state.quarantined.contains_key(&entry.position)
+                })
             })
             .map(|entry| entry.position)
             .collect();
@@ -335,6 +336,15 @@ impl UsageJournal for InMemoryUsageJournal {
         if state.acked.contains(&position) {
             return Ok(());
         }
+        // Quarantine is terminal until an operator intervenes. Letting an
+        // acknowledgement through here would erase the poison count an operator is
+        // watching, and make the event prunable — losing the one copy of a record
+        // somebody was asked to look at.
+        if state.quarantined.contains_key(&position) {
+            return Err(JournalError::Quarantined {
+                delivery: delivery.clone(),
+            });
+        }
         if !state.attempts.contains_key(&position) {
             return Err(JournalError::NotOutstanding {
                 delivery: delivery.clone(),
@@ -401,11 +411,13 @@ impl UsageJournal for InMemoryUsageJournal {
                     state.leases.get(&entry.position).copied(),
                 )
             });
-            if acked {
-                continue;
-            }
+            // Quarantine first: it is the state an operator is looking for, and an
+            // event cannot be both (`ack` refuses a quarantined delivery).
             if quarantined {
                 stats.quarantined += 1;
+                continue;
+            }
+            if acked {
                 continue;
             }
             if leased.is_some_and(|expiry| expiry > now) {

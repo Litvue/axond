@@ -351,6 +351,87 @@ async fn a_quarantined_event_stops_blocking_its_ordering_key() {
     assert_eq!(PoisonReason::Malformed.as_str(), "malformed");
 }
 
+/// A stale attempt number is not a reason to refuse an acknowledgement: the
+/// worker that crashed after writing its destination row can only repeat the
+/// delivery id it holds, and refusing it would redeliver an event that was already
+/// delivered until its attempt budget quarantined it.
+#[tokio::test]
+async fn an_acknowledgement_from_a_crashed_worker_is_honoured_after_redelivery() {
+    let journal = InMemoryUsageJournal::new();
+    let billing = consumer("billing");
+    let event = event();
+    journal.append(&event).await.expect("append");
+
+    let now = SystemTime::now();
+    let first = journal
+        .claim(&billing, claim_of(1, now))
+        .await
+        .expect("claim");
+    // The worker wrote its row, then died before acknowledging. The lease expires
+    // and the event comes back as a second attempt.
+    let later = now + Duration::from_secs(31);
+    let second = journal
+        .claim(&billing, claim_of(1, later))
+        .await
+        .expect("claim");
+    assert!(second[0].id.is_redelivery());
+
+    journal
+        .ack(&first[0].id)
+        .await
+        .expect("the recovered worker acknowledges the attempt it was handed");
+
+    let stats = journal.stats(&billing).await.expect("stats");
+    assert!(stats.is_drained(), "{stats:?}");
+    assert!(
+        journal
+            .claim(&billing, claim_of(1, later + Duration::from_secs(60)))
+            .await
+            .expect("claim")
+            .is_empty()
+    );
+}
+
+/// Quarantine is terminal until an operator intervenes. An acknowledgement that
+/// cleared it would take the event off the poison count and make it prunable,
+/// losing the one copy of the record somebody was asked to look at.
+#[tokio::test]
+async fn an_acknowledgement_cannot_quietly_release_a_quarantined_event() {
+    let journal = InMemoryUsageJournal::with_capacity(Capacity {
+        retain_acknowledged: Duration::ZERO,
+        ..Capacity::BILLING_GRADE
+    });
+    let billing = consumer("billing");
+    let event = event();
+    journal.append(&event).await.expect("append");
+    let claimed = journal
+        .claim(&billing, claim_of(1, SystemTime::now()))
+        .await
+        .expect("claim");
+    journal
+        .quarantine(&claimed[0].id, PoisonReason::Rejected)
+        .await
+        .expect("quarantine");
+
+    let error = journal
+        .ack(&claimed[0].id)
+        .await
+        .expect_err("a quarantined event is out of the delivery path");
+    assert!(
+        matches!(&error, JournalError::Quarantined { delivery } if delivery == &claimed[0].id),
+        "{error:?}"
+    );
+
+    journal.append(&event_for("other")).await.expect("append");
+    assert_eq!(
+        journal.stored_events(),
+        2,
+        "a quarantined event is not prunable"
+    );
+    let stats = journal.stats(&billing).await.expect("stats");
+    assert_eq!(stats.quarantined, 1, "the poison count stays visible");
+}
+
 /// Capacity bounds what is *waiting*; retention is what bounds a journal that is
 /// keeping up. Without it a drained journal grows forever, which is the quiet way
 /// a durable store runs out of disk.

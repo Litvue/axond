@@ -541,11 +541,27 @@ pub enum JournalError {
     /// overwriting a fact a consumer may already have delivered.
     #[error("usage event `{key}` was already journaled with different content")]
     Conflict { key: IdempotencyKey },
-    /// The delivery is not outstanding: never claimed, or its lease expired and
-    /// the event was claimed by someone else. Acknowledging an already
-    /// acknowledged delivery is *not* this error — that case is `Ok`.
+    /// This consumer was never handed this event, or the event is no longer
+    /// journaled (pruned after its retention window).
+    ///
+    /// Note what this is deliberately *not*: a stale attempt number. A delivery
+    /// identifies an attempt, but acknowledging and quarantining are decisions
+    /// about the *event*, so an `ack` of attempt 1 after the lease expired and the
+    /// event was redelivered as attempt 2 is honoured. That is the whole point of
+    /// the recovery path — a worker that crashed after writing its destination row
+    /// repeats its acknowledgement, and it can only repeat the delivery id it has.
+    /// Acknowledging an already acknowledged event is `Ok` for the same reason.
     #[error("delivery `{delivery}` is not outstanding")]
     NotOutstanding { delivery: DeliveryId },
+    /// The event was quarantined for this consumer, so it is out of the delivery
+    /// path until an operator decides what to do with it.
+    ///
+    /// Refused rather than absorbed: an acknowledgement that quietly cleared the
+    /// quarantine would take the event off the poison count somebody is watching
+    /// and make it prunable — losing the one copy of the record they were asked to
+    /// look at.
+    #[error("delivery `{delivery}` is quarantined; an operator has to release it")]
+    Quarantined { delivery: DeliveryId },
     /// The storage engine failed. Operational, and the one variant that carries
     /// only a message.
     #[error("usage journal backend: {0}")]
@@ -595,6 +611,14 @@ pub trait UsageJournal: Send + Sync {
     /// event this consumer has already acknowledged is `Ok`, because a crash
     /// between the destination write and the acknowledgement must be recoverable
     /// by repeating the acknowledgement.
+    ///
+    /// The recovery ack is honoured even if the lease expired and the event was
+    /// redelivered meanwhile: the attempt number in the delivery id is not part of
+    /// the condition. A store must therefore *not* gate its `UPDATE` on the lease
+    /// or attempt columns, or it would reject exactly the acknowledgement that
+    /// prevents a delivered event from being redelivered until its attempt budget
+    /// quarantines it. A quarantined event is the one exception
+    /// ([`JournalError::Quarantined`]).
     async fn ack(&self, delivery: &DeliveryId) -> Result<(), JournalError>;
 
     /// Set an event aside as poison. It stops being delivered — and stops
