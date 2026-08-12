@@ -77,6 +77,41 @@ pub struct ControlPlaneSettings {
     pub hydration: HydrationLimits,
 }
 
+impl ControlPlaneSettings {
+    /// The settings a `[control_plane]` section asks for.
+    ///
+    /// Every field the section can express is mapped here, so a setting an
+    /// operator writes cannot be silently ignored by a code path that built its
+    /// own defaults instead. The fields it cannot express — the idempotency
+    /// retention window and the hydration limits — are runtime serving
+    /// parameters rather than connection or schema ones, and keep their defaults.
+    pub fn from_config(control_plane: &crate::config::ControlPlane) -> Self {
+        Self {
+            schema: control_plane
+                .schema
+                .as_deref()
+                .map(str::trim)
+                .filter(|schema| !schema.is_empty())
+                .map(str::to_owned),
+            migrate: control_plane.migrate,
+            connect_timeout: Duration::from_millis(control_plane.connect_timeout_ms),
+            operation_timeout: Duration::from_millis(control_plane.operation_timeout_ms),
+            ..Self::default()
+        }
+    }
+
+    /// The settings a maintenance command runs with: the operator's connection
+    /// and schema, and never boot's permission to migrate. `axond migrate apply`
+    /// is the mutation, and it is explicit; nothing else may become one because
+    /// the config happened to allow boot migrations.
+    pub fn for_maintenance(control_plane: &crate::config::ControlPlane) -> Self {
+        Self {
+            migrate: false,
+            ..Self::from_config(control_plane)
+        }
+    }
+}
+
 impl Default for ControlPlaneSettings {
     fn default() -> Self {
         Self {
@@ -123,6 +158,34 @@ impl PostgresControlPlane {
         dsn: &str,
         settings: ControlPlaneSettings,
     ) -> Result<Self, ControlPlaneError> {
+        let (store, mut client) = Self::open(dsn, settings).await?;
+        store.prepare_schema(&mut client).await?;
+        *store.client.lock().await = Some(client);
+        Ok(store)
+    }
+
+    /// Connect for schema maintenance, without deciding anything about the schema.
+    ///
+    /// [`connect`](Self::connect) is a boot: it refuses a schema it cannot serve.
+    /// A `status` command has to *report* that schema instead, and an `apply` has
+    /// to be able to run against the database a boot just refused, so this checks
+    /// the server version — a statement no migration can survive an older server
+    /// running — and stops there. The store it returns is not for serving: it has
+    /// not established that the journal is the one this build writes.
+    pub async fn connect_for_maintenance(
+        dsn: &str,
+        settings: ControlPlaneSettings,
+    ) -> Result<Self, ControlPlaneError> {
+        let (store, client) = Self::open(dsn, settings).await?;
+        *store.client.lock().await = Some(client);
+        Ok(store)
+    }
+
+    /// Connect and check the server, leaving the schema decision to the caller.
+    async fn open(
+        dsn: &str,
+        settings: ControlPlaneSettings,
+    ) -> Result<(Self, Client), ControlPlaneError> {
         let mut config: Config = dsn.parse().map_err(|error| {
             denied(format!(
                 // The DSN itself is never echoed: it carries a password.
@@ -135,9 +198,16 @@ impl PostgresControlPlane {
             .schema
             .as_deref()
             .map(|schema| {
-                crate::usage::validate_table_name(schema)
-                    .map(|()| schema.to_owned())
-                    .map_err(denied)
+                crate::usage::validate_table_name(schema).map_err(denied)?;
+                // The table-name validator allows one qualifying dot; a search path
+                // takes one unqualified schema. Checked here as well as in config
+                // validation, because settings can be built without a config file.
+                if schema.contains('.') {
+                    return Err(denied(format!(
+                        "`{schema}` is not a single unqualified schema name"
+                    )));
+                }
+                Ok(schema.to_owned())
             })
             .transpose()?;
 
@@ -148,33 +218,107 @@ impl PostgresControlPlane {
             ids: Uuid7Generator::new(),
             client: tokio::sync::Mutex::new(None),
         };
-        let mut client =
-            tokio::time::timeout(store.settings.connect_timeout, store.connect_client())
-                .await
-                .map_err(|_| ControlPlaneError::Unavailable {
-                    backend: BACKEND,
-                    message: "connection timed out".to_owned(),
-                })?
-                .map_err(|error| unavailable("connect", &error))?;
+        let client = tokio::time::timeout(store.settings.connect_timeout, store.connect_client())
+            .await
+            .map_err(|_| ControlPlaneError::Unavailable {
+                backend: BACKEND,
+                message: "connection timed out".to_owned(),
+            })?
+            .map_err(|error| unavailable("connect", &error))?;
         store.check_server_version(&client).await?;
-        store.prepare_schema(&mut client).await?;
-        *store.client.lock().await = Some(client);
-        Ok(store)
+        Ok((store, client))
+    }
+
+    /// Apply every migration the journal is missing, and report which ones.
+    ///
+    /// Forward-only and idempotent: a journal that is already current is left
+    /// untouched and reports nothing applied, so re-running an `apply` is not a
+    /// second migration. A journal this build cannot own — [`SchemaStatus::Ahead`]
+    /// or [`SchemaStatus::Drifted`] — is refused with [`ControlPlaneError::Denied`]
+    /// rather than written to, because writing more DDL over it makes the
+    /// disagreement worse rather than better.
+    ///
+    /// The whole read-and-apply is one transaction under the same advisory lock
+    /// boot takes, so this is safe to run while replicas are starting.
+    pub async fn apply_migrations(&self) -> Result<Vec<i32>, ControlPlaneError> {
+        self.run(|client| {
+            Box::pin(async move {
+                // Read committed explicitly rather than by inheritance: the status
+                // is read *after* the lock is granted, and it has to be the winner's
+                // committed history rather than a snapshot taken before the wait. A
+                // server with `default_transaction_isolation = 'repeatable read'`
+                // would freeze the snapshot at the first statement, so the loser of
+                // the lock would re-read a pre-migration ledger and apply the same
+                // files again.
+                let transaction = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|error| unavailable("begin schema transaction", &error))?;
+                transaction
+                    .query_one("SELECT pg_advisory_xact_lock($1::bigint)", &[&SCHEMA_LOCK])
+                    .await
+                    .map_err(|error| unavailable("acquire schema lock", &error))?;
+                let status = schema::status(&transaction)
+                    .await
+                    .map_err(|error| unavailable("read schema status", &error))?;
+                // A database that is already current is left alone rather than
+                // handed to the runner: `migrate` starts from the recorded prefix
+                // of a `Behind` status, so a `Current` one would re-run every
+                // shipped file from v1. That happens to be harmless while every
+                // statement is `IF NOT EXISTS`, and would not survive the first
+                // `ALTER TABLE` or backfill. Returning here also rolls the
+                // transaction back, so a repeated apply writes nothing at all.
+                if status.is_current() {
+                    return Ok(Vec::new());
+                }
+                if !status.is_migratable() {
+                    return Err(denied(status.to_string()));
+                }
+                let pending = schema::pending(&status);
+                schema::migrate(&transaction, &status)
+                    .await
+                    .map_err(|error| migration_refused_or_unavailable(&error))?;
+                let migrated = schema::status(&transaction)
+                    .await
+                    .map_err(|error| unavailable("re-read schema status", &error))?;
+                if !migrated.is_current() {
+                    return Err(denied(format!(
+                        "migrations were applied but the schema is still not current: {migrated}"
+                    )));
+                }
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| unavailable("commit schema transaction", &error))?;
+                Ok(pending)
+            })
+        })
+        .await
     }
 
     /// The schema state a database is in, for a status command or a boot refusal.
+    ///
+    /// Read-only as the *database* enforces it, not just by convention: the
+    /// transaction is opened `READ ONLY`, so a statement that tried to write
+    /// would be rejected by the server rather than by this code being careful.
+    /// A status command an operator runs against production has to be a thing
+    /// that cannot change production.
     pub async fn schema_status(&self) -> Result<SchemaStatus, ControlPlaneError> {
         self.run(|client| {
             Box::pin(async move {
                 let transaction = client
-                    .transaction()
+                    .build_transaction()
+                    .read_only(true)
+                    .start()
                     .await
-                    .map_err(|error| unavailable("begin schema read", &error))?;
+                    .map_err(|error| unavailable("begin read-only schema read", &error))?;
                 let status = schema::status(&transaction)
                     .await
                     .map_err(|error| unavailable("read schema status", &error))?;
-                // Read-only: rolled back rather than committed, so a status query
-                // cannot be the thing that changed something.
+                // Rolled back rather than committed: nothing here is a change,
+                // so nothing here needs to be kept.
                 let _ = transaction.rollback().await;
                 Ok(status)
             })
@@ -210,8 +354,15 @@ impl PostgresControlPlane {
     /// serialize here instead of both running the DDL and one of them failing
     /// halfway.
     async fn prepare_schema(&self, client: &mut Client) -> Result<(), ControlPlaneError> {
+        // Read committed explicitly, for the reason `apply_migrations` pins it: the
+        // status is read after the lock is granted and has to be the winner's
+        // committed history. Under `repeatable read` the waiting replica would read
+        // the pre-migration ledger — or, because catalog lookups stay fresh while row
+        // reads do not, an existing table with no visible rows, which is a refusal.
         let transaction = client
-            .transaction()
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+            .start()
             .await
             .map_err(|error| unavailable("begin schema transaction", &error))?;
         transaction
@@ -232,7 +383,7 @@ impl PostgresControlPlane {
             }
             schema::migrate(&transaction, &status)
                 .await
-                .map_err(|error| unavailable("apply migrations", &error))?;
+                .map_err(|error| migration_refused_or_unavailable(&error))?;
             let migrated = schema::status(&transaction)
                 .await
                 .map_err(|error| unavailable("re-read schema status", &error))?;
@@ -315,6 +466,41 @@ fn denied(message: impl Into<String>) -> ControlPlaneError {
         backend: BACKEND,
         message: message.into(),
     }
+}
+
+/// Classify a failure to run the migration DDL by whether a retry could clear it.
+///
+/// The realistic failures here are the server rejecting a statement, not the
+/// server being unreachable: `3F000` when the configured `[control_plane] schema`
+/// does not exist (`SET search_path` accepts a missing schema, so the refusal
+/// arrives at the first `CREATE TABLE`) and `42501` when the role may not create
+/// objects. Both need an operator, and reporting them as an outage would tell a
+/// rollout gate to retry a thing that cannot start working.
+///
+/// The transient classes stay outages so they keep their retryable
+/// classification: connection exceptions (08), transaction rollbacks including
+/// serialization failures and deadlocks (40), insufficient resources (53), an
+/// object not in a prerequisite state such as an unavailable lock (55), operator
+/// intervention including a cancelled statement or a shutdown (57), and system
+/// errors (58). An error with no SQLSTATE never reached the server at all.
+fn migration_refused_or_unavailable(error: &tokio_postgres::Error) -> ControlPlaneError {
+    const TRANSIENT: [&str; 6] = ["08", "40", "53", "55", "57", "58"];
+    let Some(db) = error.as_db_error() else {
+        return unavailable("apply migrations", error);
+    };
+    let code = db.code().code();
+    if code
+        .get(..2)
+        .is_some_and(|class| TRANSIENT.contains(&class))
+    {
+        return unavailable("apply migrations", error);
+    }
+    denied(format!(
+        "applying migrations failed: {} (SQLSTATE {code}); the server rejected the statement, so \
+         no retry clears it — check that the configured schema exists and that the role may \
+         create objects in it",
+        db.message()
+    ))
 }
 
 /// Report a Postgres failure as an outage, naming the operation and SQLSTATE.
@@ -1657,6 +1843,99 @@ mod tests {
             heads.push(store.desired_revision().await.expect("head").is_some());
         }
         assert_eq!(heads, vec![true, true]);
+    }
+
+    /// The boot path classifies a rejected migration the way the operator command
+    /// does: a schema nothing created is an operator's to create, so a replica
+    /// says so rather than reporting an outage a supervisor would retry forever.
+    #[tokio::test]
+    async fn a_boot_migration_the_server_rejects_is_denied_rather_than_an_outage() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let missing = format!(
+            "cp_absent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let error = PostgresControlPlane::connect(
+            &dsn,
+            ControlPlaneSettings {
+                migrate: true,
+                ..settings(&missing)
+            },
+        )
+        .await
+        .expect_err("a schema that does not exist cannot be migrated into");
+        let ControlPlaneError::Denied { message, .. } = &error else {
+            panic!("a rejected statement is not an outage: {error:?}");
+        };
+        assert!(
+            message.contains("schema exists"),
+            "the refusal names what to fix: {message}"
+        );
+    }
+
+    /// Two replicas booting together against one empty database on a server whose
+    /// default isolation is `repeatable read`: the one that waits for the advisory
+    /// lock must read the winner's committed ledger, not the snapshot it took
+    /// before the wait. Reading the stale one either re-runs the DDL or — catalog
+    /// lookups being fresh while row reads are not — finds a ledger table with no
+    /// visible rows, which is a refused boot.
+    #[tokio::test]
+    async fn replicas_booting_together_migrate_once_whatever_the_server_default_is() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let schema = format!(
+            "cp_rr_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let mut config: Config = dsn.parse().expect("test dsn");
+        config.connect_timeout(Duration::from_secs(5));
+        let (client, connection) = config
+            .connect(crate::usage::tls_connector())
+            .await
+            .expect("connect to create the test schema");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .expect("create the test schema");
+
+        // The stricter default is asked for per connection rather than set on the
+        // server, so the rest of the suite is unaffected by this test.
+        let separator = if dsn.contains('?') { "&" } else { "?" };
+        // A space inside a startup option's value is escaped, because the server
+        // splits `options` on unescaped whitespace.
+        let strict = format!(
+            "{dsn}{separator}options=-c%20default_transaction_isolation%3Drepeatable%5C%20read"
+        );
+        let booting = || async {
+            PostgresControlPlane::connect(
+                &strict,
+                ControlPlaneSettings {
+                    migrate: true,
+                    ..settings(&schema)
+                },
+            )
+            .await
+        };
+        let (first, second) = tokio::join!(booting(), booting());
+        let first = first.expect("a replica migrating an empty database boots");
+        second.expect("the replica that waited for the lock boots too");
+
+        assert!(
+            first.schema_status().await.expect("status").is_current(),
+            "one migration, not two"
+        );
     }
 
     #[tokio::test]

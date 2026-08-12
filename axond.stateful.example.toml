@@ -30,10 +30,30 @@ bind = "0.0.0.0:8080"
 # snapshot fails readiness rather than serving partial state. Once a replica
 # holds a snapshot, a control-plane outage stalls change and convergence but
 # does not degrade inference.
+#
+# The schema is applied by the operator, before replicas start, and the commands
+# that do it read this same file:
+#
+#   axond migrate status --config /etc/axond/axond.toml   # read-only
+#   axond migrate apply  --config /etc/axond/axond.toml   # forward-only
+#   axond check preflight --config /etc/axond/axond.toml  # read-only rehearsal
+#
+# docs/operations/control-plane-journal.md has the ordering for a fresh install
+# and for an upgrade.
 
 [control_plane]
 dsn_env = "GW_CONTROL_PLANE_DSN"
+# The schema the journal lives in. A plain identifier; omit to use whatever the
+# DSN's own search_path selects.
+# schema = "axond_cp"
+# Whether a *booting replica* may apply pending migrations. Off by default: one
+# `axond migrate apply` before the rollout is the order that cannot have one
+# replica migrating a database its peers are already reading. A replica checks
+# the schema either way and refuses to serve one it does not recognise.
+# migrate = false
 connect_timeout_ms = 5000
+# Bound on one control-plane operation, including a migration transaction.
+operation_timeout_ms = 30000
 
 # ── Secret store and KEK ─────────────────────────────────────────────────────
 # Tenant provider credentials are stored wrapped under a key-encryption key and

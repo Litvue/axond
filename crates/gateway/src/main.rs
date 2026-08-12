@@ -36,6 +36,10 @@ mod desired_state;
 mod error;
 mod key_material;
 mod mint;
+// Operator commands: `axond check preflight`, `axond migrate status`, and
+// `axond migrate apply`. Nothing here is on the request path or reachable from
+// `serve`.
+mod ops;
 mod principals;
 mod rate_limit;
 mod redis_support;
@@ -61,7 +65,7 @@ use std::time::Instant;
 
 use budget::BudgetStore;
 use clap::{Arg, ArgAction, Command};
-use config::{Config, Mode};
+use config::Config;
 use rate_limit::RateLimiter;
 use revocation::RevocationStore;
 use state::AppState;
@@ -75,6 +79,15 @@ fn main() -> anyhow::Result<()> {
         Some(("revoke", args)) => mint::revoke(args),
         Some(("budget", args)) => match args.subcommand() {
             Some(("migrate-redis", args)) => migrate_redis_budget(args),
+            _ => unreachable!("clap validates subcommands"),
+        },
+        Some(("check", args)) => match args.subcommand() {
+            Some(("preflight", args)) => preflight(args),
+            _ => unreachable!("clap validates subcommands"),
+        },
+        Some(("migrate", args)) => match args.subcommand() {
+            Some(("status", args)) => migrate_control_plane(args, Migration::Status),
+            Some(("apply", args)) => migrate_control_plane(args, Migration::Apply),
             _ => unreachable!("clap validates subcommands"),
         },
         None => serve(),
@@ -130,6 +143,41 @@ fn cli() -> Command {
                                 .value_name("PATH")
                                 .help("Config file path"),
                         ),
+                ),
+        )
+        .subcommand(
+            Command::new("check")
+                .about("Check a deployment without starting one")
+                .subcommand_required(true)
+                .subcommand(
+                    Command::new("preflight")
+                        .about(
+                            "Report everything a replica would fail at boot: config ownership and \
+                             mode, bootstrap references, control-plane connectivity, and schema \
+                             compatibility. Reads only.",
+                        )
+                        .arg(config_arg()),
+                ),
+        )
+        .subcommand(
+            Command::new("migrate")
+                .about("Control-plane schema, reported and moved forward")
+                .subcommand_required(true)
+                .subcommand(
+                    Command::new("status")
+                        .about(
+                            "Report the control-plane schema and what an apply would do. Reads \
+                             only; exits non-zero while a migration is outstanding.",
+                        )
+                        .arg(config_arg()),
+                )
+                .subcommand(
+                    Command::new("apply")
+                        .about(
+                            "Apply pending control-plane migrations, forward only. Idempotent and \
+                             safe to run before replicas start.",
+                        )
+                        .arg(config_arg()),
                 ),
         )
         .subcommand(
@@ -241,6 +289,105 @@ fn cli() -> Command {
         )
 }
 
+/// `--config PATH`, spelled identically for every operator command.
+///
+/// One shared definition rather than a copy per subcommand: the grammar is
+/// `axond <command> <action> --config PATH`, and a flag that moved depending on
+/// which action it followed would be a grammar an operator has to remember.
+fn config_arg() -> Arg {
+    Arg::new("config")
+        .long("config")
+        .value_name("PATH")
+        .help("Config file path")
+}
+
+/// Where the config comes from: the flag, then `AXOND_CONFIG`, then the default
+/// filename — the same order `serve` resolves it in, because these commands exist
+/// to answer questions about what `serve` would do.
+fn config_path(args: &clap::ArgMatches) -> String {
+    args.get_one::<String>("config")
+        .cloned()
+        .or_else(|| std::env::var("AXOND_CONFIG").ok())
+        .unwrap_or_else(|| "axond.toml".to_owned())
+}
+
+/// Turn an operator-command failure into the process' exit, keeping the
+/// distinction the error type makes: an outage is worth another attempt, and a
+/// refusal will refuse identically forever.
+fn ops_failure(error: ops::OpsError) -> anyhow::Error {
+    if error.is_retryable() {
+        anyhow::anyhow!("{error} (the database was not reached; this is worth retrying)")
+    } else {
+        anyhow::anyhow!("{error}")
+    }
+}
+
+/// `axond check preflight --config PATH`.
+///
+/// Reports every check and *then* fails, because an operator fixing a deployment
+/// wants the whole list rather than the first item on it. Exits non-zero if any
+/// check failed, so this is usable as a deployment gate.
+fn preflight(args: &clap::ArgMatches) -> anyhow::Result<()> {
+    let path = config_path(args);
+    let config = ops::load(&path).map_err(ops_failure)?;
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let runtime = tokio::runtime::Runtime::new()?;
+    let report = runtime.block_on(ops::preflight::run(
+        &config,
+        std::path::Path::new(&path),
+        &env,
+    ));
+    print!("{report}");
+    if report.is_ok() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "preflight failed: {}",
+        report
+            .failures()
+            .map(|check| check.name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Which half of `axond migrate` is running. The read and the write are one
+/// function because they share every step except the last one — and separate
+/// subcommands because only one of them changes a database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Migration {
+    Status,
+    Apply,
+}
+
+/// `axond migrate status --config PATH` and `axond migrate apply --config PATH`.
+///
+/// `status` is read-only and exits non-zero while a migration is outstanding, so
+/// a rollout can gate on it. `apply` is the only command here that writes, is
+/// forward-only, and is idempotent: running it twice reports a current schema
+/// rather than migrating twice.
+fn migrate_control_plane(args: &clap::ArgMatches, which: Migration) -> anyhow::Result<()> {
+    let path = config_path(args);
+    let config = ops::load(&path).map_err(ops_failure)?;
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let runtime = tokio::runtime::Runtime::new()?;
+    let report = match which {
+        Migration::Status => runtime.block_on(ops::migrate::status(&config, &env)),
+        Migration::Apply => runtime.block_on(ops::migrate::apply(&config, &env)),
+    }
+    .map_err(ops_failure)?;
+    println!("{report}");
+    match which {
+        // A pending schema is the answer `status` was asked for, and it is also a
+        // "not ready": a replica must not be started against it.
+        Migration::Status if !report.is_settled() => {
+            anyhow::bail!("the control-plane schema is not ready to serve")
+        }
+        _ if !report.is_ok() => anyhow::bail!("the control-plane schema was refused"),
+        _ => Ok(()),
+    }
+}
+
 /// Carry Redis budget state into the v2 key layout, with the fleet stopped.
 /// Separate from `serve` on purpose: enabling a namespace cap must not silently
 /// migrate (or reset) shared spend as a side effect of a rolling restart.
@@ -287,18 +434,10 @@ async fn serve() -> anyhow::Result<()> {
     let config = Config::load(&config_path)
         .map_err(|e| anyhow::anyhow!("failed to load config from `{config_path}`: {e}"))?;
 
-    // Stateful bootstrap parses and validates (ADR 0027, #162), but the durable
-    // control plane it points at does not exist yet (#141, #163, #142). A
-    // stateful cold boot must reach the control plane or fail loudly, so this
-    // refuses rather than serving the empty snapshot an unread control plane
-    // would leave behind.
-    if config.mode == Mode::Stateful {
-        anyhow::bail!(
-            "`mode = \"stateful\"` is accepted by configuration validation, but the durable \
-             control plane it bootstraps is not implemented yet; a stateful replica must reach \
-             the control plane rather than serve an empty snapshot, so this process refuses to \
-             start. Use `mode = \"stateless\"` (the default) until the control plane ships."
-        );
+    // The same refusal `axond check preflight` reports, read from the same place,
+    // so the command cannot describe a boot this function would not perform.
+    if let Some(refusal) = ops::serving_refusal(&config) {
+        anyhow::bail!("{refusal}");
     }
 
     let env: HashMap<String, String> = std::env::vars().collect();
@@ -426,5 +565,71 @@ async fn serve() -> anyhow::Result<()> {
         // would make an orchestrator treat a clean rollout as a crash.
         shutdown::Outcome::Completed | shutdown::Outcome::Abandoned { .. } => Ok(()),
         shutdown::Outcome::Failed(error) => Err(anyhow::anyhow!("serving failed: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The grammar itself, pinned: `axond <command> <action> --config PATH`, with
+    /// the flag in one place. Operators write these into runbooks and Helm hooks,
+    /// so a moved flag is a broken deployment rather than a cosmetic change.
+    #[test]
+    fn the_operator_commands_take_config_after_the_action() {
+        for argv in [
+            vec!["axond", "check", "preflight", "--config", "/etc/axond.toml"],
+            vec!["axond", "migrate", "status", "--config", "/etc/axond.toml"],
+            vec!["axond", "migrate", "apply", "--config", "/etc/axond.toml"],
+        ] {
+            let matches = cli()
+                .try_get_matches_from(&argv)
+                .unwrap_or_else(|error| panic!("`{}` must parse: {error}", argv.join(" ")));
+            let (_, command) = matches.subcommand().expect("a command");
+            let (_, action) = command.subcommand().expect("an action");
+            assert_eq!(
+                action.get_one::<String>("config").map(String::as_str),
+                Some("/etc/axond.toml"),
+                "`{}` must carry the config path on the action",
+                argv.join(" ")
+            );
+        }
+    }
+
+    /// `axond check --config x preflight` is *not* the grammar. Accepting both
+    /// spellings would be two grammars to document and one of them wrong.
+    #[test]
+    fn a_config_flag_before_the_action_is_rejected_rather_than_guessed() {
+        for argv in [
+            vec!["axond", "check", "--config", "/etc/axond.toml", "preflight"],
+            vec!["axond", "migrate", "--config", "/etc/axond.toml", "status"],
+        ] {
+            assert!(
+                cli().try_get_matches_from(&argv).is_err(),
+                "`{}` must not parse",
+                argv.join(" ")
+            );
+        }
+    }
+
+    /// A bare `axond check` or `axond migrate` does nothing implicitly: there is
+    /// no default action, so neither can become an accidental migration.
+    #[test]
+    fn the_operator_commands_have_no_default_action() {
+        for argv in [vec!["axond", "check"], vec!["axond", "migrate"]] {
+            assert!(
+                cli().try_get_matches_from(&argv).is_err(),
+                "`{}` must require an action",
+                argv.join(" ")
+            );
+        }
+    }
+
+    /// `axond` with no subcommand still serves, and no operator command is
+    /// reachable without naming it.
+    #[test]
+    fn no_subcommand_is_still_serve() {
+        let matches = cli().try_get_matches_from(["axond"]).expect("serve");
+        assert!(matches.subcommand().is_none());
     }
 }
