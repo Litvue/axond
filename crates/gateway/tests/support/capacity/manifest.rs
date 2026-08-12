@@ -2,7 +2,7 @@
 //!
 //! Profiles are data rather than code so a result artifact can name the exact
 //! inputs that produced it — the manifest's own hash is recorded alongside the
-//! binary's and the fixtures' (ADR 0032).
+//! binary's and the fixtures' (ADR 0033).
 
 use std::path::{Path, PathBuf};
 

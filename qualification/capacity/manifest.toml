@@ -2,7 +2,7 @@
 #
 # A run is reproducible from this file plus the committed fixtures and the
 # binary the workspace builds — the driver records the hash of all three in each
-# result artifact (see docs/operations/capacity.md and ADR 0032).
+# result artifact (see docs/operations/capacity.md and ADR 0033).
 #
 # Each profile ships two scales. `reduced` runs inside `cargo test` on every
 # change; `heavy` is the same code and the same assertions at a scale that needs

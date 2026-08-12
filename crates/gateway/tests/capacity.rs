@@ -1,4 +1,4 @@
-//! Deterministic capacity qualification (ADR 0032).
+//! Deterministic capacity qualification (ADR 0033).
 //!
 //! Every profile in `qualification/capacity/manifest.toml` is offered to a real
 //! `axond` process talking to the deterministic fake upstream, and each run

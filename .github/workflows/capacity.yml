@@ -2,7 +2,7 @@ name: Capacity
 
 # The heavy capacity profiles: the same driver, manifest, and assertions the
 # `CI` workflow runs at the reduced scale, offered at a scale that wants a runner
-# to itself (ADR 0032). The result artifacts are uploaded so an envelope can be
+# to itself (ADR 0033). The result artifacts are uploaded so an envelope can be
 # read from evidence rather than from memory.
 #
 # Numbers from a shared runner are indicative, not a contract: every artifact
