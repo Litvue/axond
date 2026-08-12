@@ -148,7 +148,9 @@ def check_binary_gates(text: str) -> list[str]:
     required = {
         "checksum sidecar": "shasum -a 256",
         "windows checksum sidecar": "Get-FileHash",
-        "SBOM": "anchore/sbom-action@v0",
+        # Matched without a ref: the Actions are pinned to commit SHAs
+        # (ADR 0033), so only the repository name is stable here.
+        "SBOM": "anchore/sbom-action@",
         "provenance attestation": "Attest binary provenance",
         "SBOM attestation": "Attest binary SBOM",
         "static-link assertion": "Assert the musl binary is statically linked",
@@ -289,7 +291,7 @@ def check_image_gates(text: str) -> list[str]:
         return ["release-please.yml: an OCI image job is missing"]
     for label, needle in {
         "published-image smoke": "ops/docker-smoke.sh",
-        "SBOM": "anchore/sbom-action@v0",
+        "SBOM": "anchore/sbom-action@",
         "provenance attestation": "Attest image provenance",
         "SBOM attestation": "Attest image SBOM",
         "keyless signature": "cosign sign --yes",
