@@ -71,11 +71,13 @@ jobs:
         id: release
         with:
           # The org-wide release GitHub App token makes the release PR and the
-          # lockfile-sync commit trigger `ci.yml`. The GITHUB_TOKEN fallback
-          # also depends on the enterprise allowing Actions-created PRs. When
-          # that policy blocks PR creation, the recovery steps below still sync
-          # Cargo.lock on the generated branch for a human-opened PR.
-          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          # lockfile-sync commit trigger `ci.yml`. Public repositories may use
+          # a repository-scoped PAT when the org App credentials are not
+          # available. The GITHUB_TOKEN fallback depends on the enterprise
+          # allowing Actions-created PRs. When that policy blocks PR creation,
+          # the recovery steps below still sync Cargo.lock on the generated
+          # branch for a human-opened PR.
+          token: ${{ steps.app-token.outputs.token || secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
@@ -142,7 +144,7 @@ jobs:
         if: ${{ !cancelled() && steps.release-branch.outputs.name != '' }}
         with:
           ref: ${{ steps.release-branch.outputs.name }}
-          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          token: ${{ steps.app-token.outputs.token || secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
       - name: Install the sync toolchain
         id: sync-toolchain
         if: ${{ !cancelled() && steps.release-checkout.outcome == 'success' }}
