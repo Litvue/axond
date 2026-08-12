@@ -133,6 +133,28 @@ async fn an_oversized_request_body_is_refused_without_reaching_a_provider() {
 }
 
 #[tokio::test]
+async fn a_body_without_a_json_content_type_is_still_a_415() {
+    let (upstream, gateway) = boot_with(SMALL_REQUESTS).await;
+    // Mapping the extractor's rejections to typed errors must not restate an
+    // existing failure mode's status: axum answered this 415 before the bounds
+    // existed, and the contract in docs/compatibility.md keeps it.
+    let response = client()
+        .post(gateway.url("/v1/chat/completions"))
+        .bearer_auth(GATEWAY_KEY)
+        .header("content-type", "text/plain")
+        .body(r#"{"model":"x","messages":[]}"#)
+        .send()
+        .await
+        .expect("the gateway answers");
+
+    assert_eq!(response.status(), 415, "{}", gateway.output());
+    let body: Value = response.json().await.expect("a JSON body");
+    assert_eq!(body["error"]["type"], "unsupported_media_type");
+    assert_discreet(&body.to_string(), &upstream);
+    assert!(upstream.state.requests().is_empty());
+}
+
+#[tokio::test]
 async fn a_prompt_over_the_token_bound_is_refused_and_names_only_the_bound() {
     let (upstream, gateway) = boot_with(SMALL_REQUESTS).await;
     // Under `max_request_bytes`, over `max_prompt_tokens`: the two bounds are

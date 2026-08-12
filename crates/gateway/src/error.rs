@@ -53,6 +53,11 @@ pub enum GatewayError {
     /// it is buffered, so an oversized request costs no memory.
     #[error("request body exceeds the configured inbound limit")]
     RequestTooLarge,
+    /// The request did not declare a JSON content type. Axum's own extractor
+    /// answered `415` before the gateway mapped its rejections, and that status
+    /// is preserved: a wrong media type is not a malformed body.
+    #[error("expected a `content-type: application/json` request")]
+    UnsupportedMediaType,
     /// The prompt's estimated token count exceeded
     /// `admission.max_prompt_tokens`. Reports the bound, never the prompt.
     #[error("prompt exceeds the configured limit of {limit_tokens} tokens")]
@@ -124,6 +129,7 @@ impl GatewayError {
                 }
             }
             Self::RequestTooLarge | Self::PromptTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::OutputLimitExceeded { .. } => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::TokenUnauthorized(_) => StatusCode::UNAUTHORIZED,
@@ -170,6 +176,7 @@ impl GatewayError {
             Self::RateLimitExceeded { .. } => "rate_limited",
             Self::Overloaded(rejection) => rejection.code(),
             Self::RequestTooLarge => "request_too_large",
+            Self::UnsupportedMediaType => "unsupported_media_type",
             Self::PromptTooLarge { .. } => "prompt_too_large",
             Self::OutputLimitExceeded { .. } => "output_limit_exceeded",
             Self::Unauthorized => "unauthorized",

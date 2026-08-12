@@ -807,7 +807,8 @@ impl Wire {
 }
 
 /// The inbound body, or a typed refusal. An oversized body is a bound the
-/// gateway imposed (`413`), a malformed one is the caller's (`400`); neither
+/// gateway imposed (`413`), a wrong media type is `415` as axum's extractor
+/// already answered it, and a malformed one is the caller's (`400`); no
 /// response echoes the body it read.
 fn inbound_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, GatewayError> {
     match body {
@@ -815,9 +816,9 @@ fn inbound_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, Gatew
         Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
             Err(GatewayError::RequestTooLarge)
         }
-        Err(JsonRejection::MissingJsonContentType(_)) => Err(GatewayError::BadRequest(
-            "expected a `content-type: application/json` request".into(),
-        )),
+        // Axum answered this arm with `415` before these rejections were mapped,
+        // so it keeps that status; only the body becomes typed.
+        Err(JsonRejection::MissingJsonContentType(_)) => Err(GatewayError::UnsupportedMediaType),
         Err(_) => Err(GatewayError::BadRequest(
             "request body is not valid JSON".into(),
         )),
