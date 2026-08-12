@@ -366,24 +366,35 @@ async fn serve() -> anyhow::Result<()> {
 
     // One budget for the whole post-serving sequence, not one per step: what an
     // orchestrator's termination grace period has to cover is the total, and the
-    // steps are ordered by how much of the record depends on them.
-    let flush_by = Instant::now() + plan.flush_timeout;
-    let remaining = || flush_by.saturating_duration_since(Instant::now());
+    // steps are ordered by how much of the record depends on them. The waits
+    // get at most half of it ([`shutdown::Plan::settle_share`]) so that a
+    // request which cannot end cannot cost the records already accepted their
+    // write.
+    let started = Instant::now();
+    let flush_by = started + plan.flush_timeout;
+    let settle_by = started + plan.settle_share();
+    let until = |deadline: Instant| deadline.saturating_duration_since(Instant::now());
 
     // Abandoned responses settle as they end, so the settlements queued by the
     // requests that just finished have to land before the sinks are flushed.
-    let stuck = lifecycle.quiesce(remaining()).await;
-    let unsettled = streaming::await_settlements(remaining()).await;
+    let stuck = lifecycle.quiesce(until(settle_by)).await;
+    let unsettled = streaming::await_settlements(until(settle_by)).await;
     if stuck > 0 || unsettled > 0 {
+        // Counted as abandoned here as well as at the deadline: work that
+        // outlives the settle window is work whose spend this process will
+        // never record, whether or not the deadline was what cut it.
+        telemetry::metrics::record_shutdown_abandoned(stuck);
         tracing::error!(
             in_flight = stuck,
             unsettled,
-            "some spend could not be settled before the flush budget expired"
+            settle_share_ms = plan.settle_share().as_millis() as u64,
+            "some spend could not be settled within the settle share of the flush budget"
         );
     }
     // Records already accepted are written even when requests were abandoned:
-    // spend that was incurred must be accounted for either way.
-    let flushed = resources.0.usage.flush(remaining()).await;
+    // spend that was incurred must be accounted for either way, which is why the
+    // waits above cannot spend this reserve.
+    let flushed = resources.0.usage.flush(until(flush_by)).await;
     flushed.log();
     let telemetry_failures = telemetry_guard.shutdown(flush_by);
     tracing::info!(

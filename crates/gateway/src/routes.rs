@@ -362,8 +362,19 @@ async fn admission_middleware(
         telemetry::metrics::record_shutdown_rejection();
         return Err(GatewayError::Draining);
     };
-    let (parts, body) = next.run(request).await.into_parts();
     let lifecycle = Arc::clone(state.lifecycle());
+    // A request still inside its handler has no body to end, so the deadline has
+    // to reach it here: dropping the handler future cancels the upstream call at
+    // its next await, and the guards it holds settle on the ordinary
+    // cancellation path — the budget hold is released rather than charged,
+    // because a caller that received nothing owes nothing. Without this arm such
+    // a request would hold its admission slot until its own upstream budget
+    // expired, spending the flush budget the usage records need.
+    let response = tokio::select! {
+        response = next.run(request) => response,
+        () = lifecycle.abandoned() => return Err(GatewayError::Draining),
+    };
+    let (parts, body) = response.into_parts();
     let mut relayed = Some(body.into_data_stream());
     let mut admitted = Some(admitted);
     let mut abandoned = Box::pin(async move { lifecycle.abandoned().await });
@@ -5137,6 +5148,55 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// The shutdown deadline has to reach a request that has not produced a
+    /// response yet. Such a request is waiting on an upstream inside its
+    /// handler, bounded only by the failover budget — minutes, potentially — so
+    /// if the abandonment signal stopped at the response body, the request would
+    /// keep its admission slot for the whole termination and the settle wait
+    /// would spend the budget the buffered records need.
+    #[tokio::test]
+    async fn abandonment_cancels_a_request_still_inside_its_handler() {
+        let (started_tx, started_rx) = oneshot::channel();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let upstream = Router::new().route(
+            "/chat/completions",
+            post({
+                let started_tx = started_tx.clone();
+                move || async move {
+                    if let Some(started_tx) = started_tx.lock().unwrap().take() {
+                        let _ = started_tx.send(());
+                    }
+                    // Never answers: only the cancellation can end this request.
+                    pending::<()>().await;
+                    StatusCode::OK.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let budget = Arc::new(crate::budget::InMemoryBudget::new(10_000));
+        let state = budgeted_state(
+            &format!("http://{addr}"),
+            Box::new(SharedBudget(budget.clone())),
+        );
+        let lifecycle = Arc::clone(state.lifecycle());
+        let request = tokio::spawn(router(state).oneshot(chat_request()));
+        // The handler is now inside the upstream call, holding its slot.
+        started_rx.await.unwrap();
+        assert_eq!(lifecycle.in_flight(), 1);
+
+        lifecycle.abandon();
+
+        let response = request.await.unwrap().unwrap();
+        // Refused with the drain's own answer rather than left hanging: the
+        // caller learns the replica is going away and can retry elsewhere.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // And the slot is back, so the flush budget is not spent waiting for it.
+        assert_eq!(lifecycle.in_flight(), 0);
     }
 
     /// The two denials are different answers to the caller: over-cap is the

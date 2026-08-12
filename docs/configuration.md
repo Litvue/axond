@@ -171,7 +171,7 @@ termination that follows it.
 | --- | --- | --- | --- |
 | `drain_grace_ms` | integer | `5000` | How long `/readyz` fails while the replica *keeps* admitting work, so a load balancer can remove it before anything is refused. `0` closes admission immediately — only safe when something else already drained the endpoint. |
 | `deadline_ms` | integer | `15000` | How long requests admitted before the close have to finish. Anything still open is cut: its response body ends in an error and a stream settles as `client_cancelled` up to the last relayed token. Rejected at `0`. |
-| `flush_timeout_ms` | integer | `5000` | Bound on the whole post-serving sequence: settling cut responses, flushing buffered usage sinks, and flushing telemetry exporters. Records that cannot be written are counted as `shutdown` drops. Rejected at `0`. |
+| `flush_timeout_ms` | integer | `5000` | Bound on the whole post-serving sequence: settling cut responses, flushing buffered usage sinks, and flushing telemetry exporters. Settling gets at most half of it so a request that cannot end cannot starve the flush; anything still unsettled then is counted as abandoned. Records that cannot be written are counted as `shutdown` drops. Rejected at `0`. |
 
 `/healthz` answers `ok` throughout; only `/readyz` reports the drain, because a
 terminating replica is not an unhealthy one. Worst-case termination is the sum

@@ -47,6 +47,25 @@ deadline_ms = 1500
 flush_timeout_ms = 2000
 "#;
 
+/// A request that wedges inside its handler: the upstream never answers, and
+/// every bound that could rescue it — the failover budget, the header bound — is
+/// set far above the whole termination sequence, so only shutdown cancellation
+/// can end it. `flush_timeout_ms` is generous enough that half of it is still a
+/// usable share for the settle waits.
+const WEDGED: &str = r#"
+[failover]
+max_attempts = 1
+overall_timeout_ms = 60000
+
+[transport]
+response_header_timeout_ms = 60000
+
+[shutdown]
+drain_grace_ms = 300
+deadline_ms = 1000
+flush_timeout_ms = 2000
+"#;
+
 /// The longest a bounded shutdown may take before the bound is not a bound:
 /// above drain + deadline + both flush budgets, far below the 30s
 /// `terminationGracePeriodSeconds` the shipped manifest allows.
@@ -189,6 +208,79 @@ async fn new_requests_stop_being_served_once_the_drain_window_closes() {
         "the process did not exit:\n{}",
         gateway.output()
     );
+}
+
+/// The record of a request that already finished must not be lost to a request
+/// that cannot finish. A handler wedged on an upstream that never answers holds
+/// an admission slot, so without both the cancellation reaching the handler and
+/// the reserve kept for the flush, the settle wait would spend the whole budget
+/// and the earlier record would be dropped as `shutdown`.
+#[tokio::test]
+async fn a_request_wedged_in_its_handler_does_not_cost_an_earlier_record_its_flush() {
+    let (_upstream, mut gateway) = boot_with(WEDGED).await;
+
+    // Charged, buffered, and not yet written: the sinks flush at termination.
+    let answered = chat(&gateway, alias::CHAT, false).await;
+    assert_eq!(answered.status(), 200, "{}", gateway.output());
+
+    // Wedged for a minute unless shutdown ends it — far longer than the whole
+    // termination sequence, and longer than the suite would wait.
+    let wedged = tokio::spawn({
+        let url = gateway.url("/v1/chat/completions");
+        async move {
+            client()
+                .post(url)
+                .bearer_auth(GATEWAY_KEY)
+                .json(&json!({
+                    "model": alias::CHAT_NO_HEADERS,
+                    "messages": [{ "role": "user", "content": "hello" }]
+                }))
+                .send()
+                .await
+        }
+    });
+    // Long enough to be inside the handler, awaiting the upstream.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let started = Instant::now();
+    gateway.terminate();
+    let status = gateway.await_exit(GENEROUS).await.unwrap_or_else(|| {
+        panic!(
+            "a request wedged in its handler held the process:\n{}",
+            gateway.output()
+        )
+    });
+    assert!(status.success(), "shutdown was not clean: {status}");
+    // The whole sequence, not the handler's own minute-long bound.
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the handler outlasted the termination sequence: {:?}",
+        started.elapsed()
+    );
+
+    // Answered rather than dropped: the cancellation reached the handler, which
+    // is the only way this caller hears anything before its upstream bound.
+    let answered = wedged
+        .await
+        .expect("the request task did not panic")
+        .expect("the wedged caller is answered");
+    assert_eq!(
+        answered.status(),
+        503,
+        "a handler wedged on an upstream was not cancelled by the shutdown:\n{}",
+        gateway.output()
+    );
+    // And the slot it held is released before the settle waits run, so nothing
+    // is left to abandon and the flush keeps its reserve.
+    assert!(
+        !gateway.output().contains("could not be settled"),
+        "the wedged request still held its slot into the flush budget:\n{}",
+        gateway.output()
+    );
+
+    // The point of the reserve: the earlier request's spend is still written.
+    let record = settled(&gateway).await;
+    assert_eq!(record["status"], json!("ok"), "{record}");
 }
 
 async fn chat(gateway: &Axond, model: &str, streamed: bool) -> reqwest::Response {

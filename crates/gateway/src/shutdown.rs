@@ -14,16 +14,20 @@
 //!    request that arrives anyway is refused with a typed `503`
 //!    ([`crate::error::GatewayError::Draining`]).
 //! 3. Requests admitted before that point have `shutdown.deadline_ms` to
-//!    finish. Whatever is still in flight when the deadline expires — a long
-//!    stream, most likely — is abandoned: its response body ends in an error,
-//!    which drops the upstream stream and settles it through the usual
-//!    cancellation path, so the usage record is written as `client_cancelled`
-//!    with the spend measured up to the last relayed token.
+//!    finish. Whatever is still in flight when the deadline expires is
+//!    abandoned. A response that has begun ends in an error, which drops the
+//!    upstream stream and settles it through the usual cancellation path, so the
+//!    usage record is written as `client_cancelled` with the spend measured up to
+//!    the last relayed token; a request still inside its handler has no body to
+//!    end, so the same signal is taken at the handler boundary, cancelling the
+//!    upstream call and answering the caller `503 draining`.
 //! 4. Within one `shutdown.flush_timeout_ms` budget: the abandoned responses are
-//!    given a moment to end, their settlements are awaited, the buffered usage
-//!    sinks are flushed — anything that cannot be written is counted as a
-//!    `shutdown` drop rather than silently lost — and the telemetry providers
-//!    flush with whatever remains.
+//!    given a moment to end and their settlements are awaited — for at most half
+//!    the budget ([`Plan::settle_share`]), so one request that cannot end cannot
+//!    starve the step that writes the records — then the buffered usage sinks are
+//!    flushed (anything that cannot be written is counted as a `shutdown` drop
+//!    rather than silently lost) and the telemetry providers flush with whatever
+//!    remains.
 //!
 //! Every wait above is bounded, so the worst case is
 //! `drain_grace_ms + deadline_ms + flush_timeout_ms`: keep
@@ -190,7 +194,8 @@ impl Lifecycle {
         }
     }
 
-    /// Tell every still-open response to end.
+    /// Tell every still-open request to end: responses by ending their bodies,
+    /// handlers by dropping the future that is still awaiting an upstream.
     ///
     /// Dropping the server future would not do this: `hyper` serves each
     /// connection on its own task, so the connections outlive the future and are
@@ -250,6 +255,23 @@ impl From<&ShutdownConfig> for Plan {
             deadline: Duration::from_millis(config.deadline_ms),
             flush_timeout: Duration::from_millis(config.flush_timeout_ms),
         }
+    }
+}
+
+impl Plan {
+    /// The most of `flush_timeout` the waits for in-flight work may spend,
+    /// leaving the rest reserved for the flush itself.
+    ///
+    /// The waits come first because a settlement that lands after the flush is
+    /// a record nobody writes — but they must not be able to consume the whole
+    /// budget: one request that cannot end would then leave `Duration::ZERO`
+    /// for the sinks, and every record already accepted would be dropped as
+    /// `shutdown`. Losing the whole buffer to save one settlement is the wrong
+    /// trade, so the write step keeps a reserve. Half is a deliberate split
+    /// rather than a tuned one: both steps matter, and the total the operator
+    /// was promised does not change.
+    pub fn settle_share(self) -> Duration {
+        self.flush_timeout / 2
     }
 }
 
@@ -507,6 +529,27 @@ impl Signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The waits for in-flight work may never leave the flush without a budget:
+    /// records already accepted are lost if the write step gets nothing.
+    #[test]
+    fn the_settle_waits_can_never_take_the_whole_flush_budget() {
+        for flush_timeout_ms in [0, 1, 500, 5_000, 60_000] {
+            let plan = Plan::from(&ShutdownConfig {
+                flush_timeout_ms,
+                ..ShutdownConfig::default()
+            });
+            let reserved = plan.flush_timeout - plan.settle_share();
+            assert!(
+                plan.settle_share() <= plan.flush_timeout / 2,
+                "settle share must be capped at half of {flush_timeout_ms}ms"
+            );
+            assert!(
+                reserved >= plan.settle_share(),
+                "the flush must keep at least the share the waits get"
+            );
+        }
+    }
 
     #[test]
     fn draining_fails_readiness_but_still_admits() {

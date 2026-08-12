@@ -67,15 +67,24 @@ the handler returned would report a replica as quiesced while it was still
 relaying tokens.
 
 **The deadline actively ends work rather than waiting for it.** Requests
-admitted before the close get `deadline_ms`. A response that has begun is *told
-to end*: the body returns an error, which drops the upstream stream and settles
-it through the ordinary cancellation path, so the usage record is written as
-`client_cancelled` with spend measured up to the last relayed token. The signal
-reaches responses, not handlers — a request still inside its handler (a buffered
-completion waiting on an upstream, bounded by `failover.overall_timeout_ms`) has
-no body to end yet, so it is bounded only by the deadline and the waits that
-follow it, and is cut by process exit with nothing settled if it outlasts them.
-Carrying cancellation into the handler path is a follow-up.
+admitted before the close get `deadline_ms`. What ending means depends on how far
+the request got, and both cases are reached by the same signal:
+
+- A response that has begun is *told to end*: the body returns an error, which
+  drops the upstream stream and settles it through the ordinary cancellation
+  path, so the usage record is written as `client_cancelled` with spend measured
+  up to the last relayed token.
+- A request still inside its handler — a buffered completion waiting on an
+  upstream, bounded on its own only by `failover.overall_timeout_ms`, which may
+  outlast the whole sequence — has no body to end, so the signal is taken at the
+  handler boundary instead: the handler future is dropped, which cancels the
+  upstream call, and the caller is answered `503 draining`. Its budget hold is
+  released rather than charged, because a caller that received nothing owes
+  nothing.
+
+The process deadline remains the fallback under both. Cancellation is delivered
+by a signal a request observes at its next await point, so a request that never
+reaches one is still ended by process exit, with nothing settled.
 
 Dropping the server future instead of ending bodies would settle nothing at all:
 `hyper` serves each connection on its own task, so those connections outlive the
@@ -83,14 +92,19 @@ future and are torn down only with the runtime, too late for anything to settle.
 A truncated response ends in an error rather than cleanly, because a clean end
 would present a partial answer as a complete one.
 
-**One flush budget covers everything after serving.** Inside a single
-`flush_timeout_ms`, measured as one absolute deadline: abandoned responses are
-given a moment to end, their settlements are awaited, the buffered usage sinks
-are flushed in order, and the telemetry exporters flush with whatever remains.
-Each step waits only for the time left, so the budget is the total, not a
-per-step allowance. Records that cannot be written are counted as `shutdown`
-drops (sink failures as `sink_error`), because a lost row must be a number an
-operator can alert on rather than a silent gap.
+**One flush budget covers everything after serving, with a reserve the write
+step keeps.** Inside a single `flush_timeout_ms`, measured as one absolute
+deadline: abandoned responses are given a moment to end, their settlements are
+awaited, the buffered usage sinks are flushed in order, and the telemetry
+exporters flush with whatever remains. Each step waits only for the time left, so
+the budget is the total, not a per-step allowance — except that the two waits for
+in-flight work are capped at *half* the budget, and the flush keeps the rest.
+Without that cap, one request that cannot be ended would leave nothing for the
+sinks and every record already accepted would be dropped, trading a whole buffer
+for one settlement. Work still unsettled when the cap expires is counted as
+abandoned. Records that cannot be written are counted as `shutdown` drops (sink
+failures as `sink_error`), because a lost row must be a number an operator can
+alert on rather than a silent gap.
 
 **The bounds are read when the signal arrives, and enforced as one snapshot.**
 A reload therefore applies to the next termination, and the deadline and flush
@@ -129,7 +143,11 @@ keep their existing state choices; no existing deployment's tier is raised.
 - Callers can observe one additional error, `503 draining` with `Retry-After: 0`,
   during the close. It is additive and retryable at another replica.
 - Buffered usage loss is now bounded and counted rather than silent, but it is
-  not eliminated: a sink that stays unavailable for the whole flush budget still
-  drops its rows, as `shutdown` drops.
+  not eliminated: a sink that stays unavailable for its half of the flush budget
+  still drops its rows, as `shutdown` drops.
+- Half of `flush_timeout_ms` is the most the settle waits can spend, so a
+  settlement that would have landed just after that cap is abandoned and counted
+  in `axond.shutdown.abandoned_requests` rather than allowed to cost the buffered
+  records their write.
 - Shutdown diagnostics name signals and phases only. No endpoint, DSN, URL, or
   credential appears in a shutdown log line.
