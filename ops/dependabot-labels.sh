@@ -114,9 +114,13 @@ if ! labels_text="$(collect_labels "$CONFIG")"; then
     exit 1
 fi
 
+# A read loop rather than `mapfile`, which the bash 3.2 macOS still ships does
+# not have: ops/actionlint.sh supports Darwin hosts, so `just check` has to too.
 labels=()
 if [[ -n $labels_text ]]; then
-    mapfile -t labels <<<"$labels_text"
+    while IFS= read -r label; do
+        labels+=("$label")
+    done <<<"$labels_text"
 fi
 
 if ((${#labels[@]} == 0)); then
