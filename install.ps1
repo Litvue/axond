@@ -2,11 +2,21 @@ param(
     [string]$Version = $env:AXOND_VERSION,
     [string]$InstallDir = $env:AXOND_INSTALL_DIR,
     [string]$Target = "x86_64-pc-windows-msvc",
+    [switch]$RequireAttestation,
     [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
 $Repository = if ($env:AXOND_REPOSITORY) { $env:AXOND_REPOSITORY } else { "Litvue/axond" }
+$MustVerifyAttestation = $RequireAttestation -or ($env:AXOND_REQUIRE_ATTESTATION -eq "1")
+
+if ($PSVersionTable.PSEdition -eq "Desktop") {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $WebRequestParameters = @{ UseBasicParsing = $true }
+}
+else {
+    $WebRequestParameters = @{}
+}
 
 if (-not $Version) {
     $headers = @{ "User-Agent" = "axond-installer" }
@@ -33,6 +43,7 @@ if ($DryRun) {
     "target=$Target"
     "asset=$Asset"
     "install_dir=$InstallDir"
+    "require_attestation=$MustVerifyAttestation"
     "url=$BaseUrl/$Asset"
     exit 0
 }
@@ -43,13 +54,32 @@ New-Item -ItemType Directory -Path $TempDir | Out-Null
 try {
     $Archive = Join-Path $TempDir $Asset
     $ChecksumFile = "$Archive.sha256"
-    Invoke-WebRequest -Uri "$BaseUrl/$Asset" -OutFile $Archive
-    Invoke-WebRequest -Uri "$BaseUrl/$Asset.sha256" -OutFile $ChecksumFile
+    Invoke-WebRequest @WebRequestParameters -Uri "$BaseUrl/$Asset" -OutFile $Archive
+    Invoke-WebRequest @WebRequestParameters -Uri "$BaseUrl/$Asset.sha256" -OutFile $ChecksumFile
 
     $Expected = ((Get-Content -Raw $ChecksumFile).Trim() -split '\s+')[0].ToLowerInvariant()
     $Actual = (Get-FileHash -Path $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($Actual -ne $Expected) {
         throw "SHA-256 mismatch for $Asset"
+    }
+
+    $CanVerifyAttestation = $false
+    if (Get-Command gh -ErrorAction SilentlyContinue) {
+        & gh auth status *> $null
+        $CanVerifyAttestation = ($LASTEXITCODE -eq 0)
+    }
+    if ($CanVerifyAttestation) {
+        "Verifying GitHub build provenance for $Asset"
+        & gh attestation verify $Archive --repo $Repository
+        if ($LASTEXITCODE -ne 0) {
+            throw "GitHub attestation verification failed for $Asset"
+        }
+    }
+    elseif ($MustVerifyAttestation) {
+        throw "Authenticated GitHub CLI is required by -RequireAttestation or AXOND_REQUIRE_ATTESTATION=1"
+    }
+    else {
+        Write-Warning "Checksum verified; install and authenticate gh for provenance verification."
     }
 
     Expand-Archive -Path $Archive -DestinationPath $TempDir

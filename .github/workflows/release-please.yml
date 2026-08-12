@@ -81,7 +81,7 @@ jobs:
       # JSON parsing in this guarded shell step rather than an expression.
       - name: Resolve release branch
         id: release-branch
-        if: ${{ always() }}
+        if: ${{ !cancelled() }}
         env:
           RELEASE_PR: ${{ steps.release.outputs.pr }}
           RELEASE_OUTCOME: ${{ steps.release.outcome }}
@@ -91,13 +91,23 @@ jobs:
             release_branch="$(jq -r '.headBranchName' <<<"$RELEASE_PR")"
             [[ -n "$release_branch" && "$release_branch" != "null" ]]
           elif [[ "$RELEASE_OUTCOME" == "failure" ]]; then
-            release_branch="release-please--branches--main--components--axond"
-            if ! git ls-remote --exit-code --heads \
-              "https://github.com/${GITHUB_REPOSITORY}.git" \
-              "$release_branch" >/dev/null; then
+            branch_prefix="release-please--branches--${GITHUB_REF_NAME}"
+            mapfile -t release_branches < <(
+              git ls-remote --heads \
+                "https://github.com/${GITHUB_REPOSITORY}.git" \
+                "refs/heads/${branch_prefix}*" |
+                awk '{ sub("refs/heads/", "", $2); print $2 }'
+            )
+            if (( ${#release_branches[@]} == 0 )); then
               echo "release-please produced no PR or recoverable branch"
               exit 0
             fi
+            if (( ${#release_branches[@]} != 1 )); then
+              printf 'release-please recovery is ambiguous; matching branches:\n%s\n' \
+                "${release_branches[*]}" >&2
+              exit 1
+            fi
+            release_branch="${release_branches[0]}"
             echo "release-please PR creation failed; recovering $release_branch for a manual PR"
           else
             echo "release-please produced no release PR"
@@ -109,12 +119,13 @@ jobs:
       # actions/checkout persists this token by default, so the later git push
       # uses the same token without a separate credential argument.
       - uses: actions/checkout@v7
-        if: ${{ always() && steps.release-branch.outputs.name != '' }}
+        id: release-checkout
+        if: ${{ !cancelled() && steps.release-branch.outputs.name != '' }}
         with:
           ref: ${{ steps.release-branch.outputs.name }}
           token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
       - name: Install the sync toolchain
-        if: ${{ always() && steps.release-branch.outputs.name != '' }}
+        if: ${{ !cancelled() && steps.release-checkout.outcome == 'success' }}
         run: rustup toolchain install stable --profile minimal
       # The job concurrency group serializes lockfile sync for main, but a
       # dispatch or a manual push to the release branch can still move it under
@@ -123,7 +134,7 @@ jobs:
       # avoided: the goal is to include release-please's regenerated content,
       # not overwrite it.
       - name: Sync Cargo.lock onto the release branch
-        if: ${{ always() && steps.release-branch.outputs.name != '' }}
+        if: ${{ !cancelled() && steps.release-checkout.outcome == 'success' }}
         env:
           RELEASE_BRANCH: ${{ steps.release-branch.outputs.name }}
         run: |

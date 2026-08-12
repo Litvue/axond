@@ -40,9 +40,11 @@ updates the conventional release branch and synchronizes `Cargo.lock` after a
 denied PR creation, so a maintainer can open the prepared branch manually:
 
 ```bash
+gh api repos/Litvue/axond/git/matching-refs/heads/release-please--branches--main \
+  --jq '.[].ref'
 gh pr create --repo Litvue/axond \
   --base main \
-  --head release-please--branches--main--components--axond \
+  --head <generated-branch> \
   --title "chore(main): release <version>"
 ```
 

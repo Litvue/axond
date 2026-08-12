@@ -38,6 +38,19 @@ musl by default, glibc selectable through `AXOND_TARGET`), macOS Apple Silicon,
 and Windows x86-64. Other architectures must build from source until a release
 artifact is added.
 
+A same-origin checksum detects corruption but is not independent proof of
+provenance. When an authenticated GitHub CLI is available, both installers also
+run `gh attestation verify` against `Litvue/axond`. Production automation can
+require that stronger check instead of accepting checksum-only installation:
+
+```bash
+AXOND_REQUIRE_ATTESTATION=1 sh ./install.sh
+```
+
+```powershell
+.\install.ps1 -RequireAttestation
+```
+
 ## crates.io source install
 
 Cargo registries distribute source packages, not precompiled executables.

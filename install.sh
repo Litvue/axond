@@ -6,6 +6,7 @@ repo="${AXOND_REPOSITORY:-Litvue/axond}"
 version="${AXOND_VERSION:-}"
 target="${AXOND_TARGET:-}"
 dry_run="${AXOND_INSTALL_DRY_RUN:-0}"
+require_attestation="${AXOND_REQUIRE_ATTESTATION:-0}"
 
 fail() {
   printf 'axond installer: %s\n' "$*" >&2
@@ -60,8 +61,9 @@ asset="axond-${version}-${target}.tar.gz"
 base_url="https://github.com/${repo}/releases/download/v${version}"
 
 if [ "$dry_run" = "1" ]; then
-  printf 'version=%s\ntarget=%s\nasset=%s\ninstall_dir=%s\nurl=%s/%s\n' \
-    "$version" "$target" "$asset" "$install_dir" "$base_url" "$asset"
+  printf 'version=%s\ntarget=%s\nasset=%s\ninstall_dir=%s\nrequire_attestation=%s\nurl=%s/%s\n' \
+    "$version" "$target" "$asset" "$install_dir" "$require_attestation" \
+    "$base_url" "$asset"
   exit 0
 fi
 
@@ -86,6 +88,16 @@ elif command -v shasum >/dev/null 2>&1; then
   (cd "$temp_dir" && shasum -a 256 -c "$asset.sha256")
 else
   fail "sha256sum or shasum is required to verify the release"
+fi
+
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  printf 'verifying GitHub build provenance for %s\n' "$asset"
+  gh attestation verify "$temp_dir/$asset" --repo "$repo"
+elif [ "$require_attestation" = "1" ]; then
+  fail "authenticated GitHub CLI is required by AXOND_REQUIRE_ATTESTATION=1"
+else
+  printf '%s\n' \
+    "axond installer: checksum verified; install and authenticate gh for provenance verification" >&2
 fi
 
 tar -xzf "$temp_dir/$asset" -C "$temp_dir"
