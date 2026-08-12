@@ -9,7 +9,7 @@ result is required CI evidence rather than a dashboard nobody reads.
 The project lives in [`fuzz/`](https://github.com/Litvue/axond/tree/main/fuzz),
 which is its own Cargo workspace: the targets need a nightly toolchain and a
 sanitizer runtime, so nothing at the repository root builds, lints, or packages
-them. [ADR 0032](../adr/0032-fuzzing-the-untrusted-input-parsers.md) records why
+them. [ADR 0033](../adr/0033-fuzzing-the-untrusted-input-parsers.md) records why
 the project sits outside the workspace, why the seam is a cfg rather than a Cargo
 feature, and what that costs.
 
@@ -31,10 +31,11 @@ gateway relies on:
    actually answer with — a `ConfigError`, a `400`, or a stable `token_*` code —
    and carries a non-empty operator-facing message.
 3. **What is accepted stays in bounds.** Percent-decoding never expands its
-   input; an accepted config defines a namespace; a verified token names a
-   declared namespace, carries a subject, and presents no more capabilities than
-   the vocabulary defines. Most importantly, a signature from one namespace's
-   signer never verifies into another.
+   input; an accepted stateless config defines a namespace, while an accepted
+   stateful one declares none of the sections the control plane owns; a verified
+   token names a declared namespace, carries a subject, and presents no more
+   capabilities than the vocabulary defines. Most importantly, a signature from
+   one namespace's signer never verifies into another.
 
 Runs are hermetic: the seam the targets call builds its verifiers from a
 configuration compiled into the binary with synthetic key material, so a fuzz run

@@ -66,16 +66,36 @@ pub fn config_toml(data: &[u8]) -> &'static str {
     let outcome = match &first {
         Ok(shape) => {
             // A config that validated is a config the process would serve, so
-            // its own invariants have to hold on the way out.
-            assert!(
-                shape.namespaces >= 1,
-                "an accepted config defines no namespace"
-            );
-            assert!(
-                shape.verifiers == 0 || shape.namespaces >= 1,
-                "verifiers were accepted without a namespace to scope them to"
-            );
-            "accepted"
+            // its own invariants have to hold on the way out — and which
+            // invariants those are is the mode's decision (ADR 0027).
+            if shape.stateful {
+                // The control plane owns every resource in stateful mode, so a
+                // file that declared one must have been refused. An accepted
+                // config that still carries one would mean two authorities
+                // disagree about the same resource at boot.
+                assert_eq!(
+                    (
+                        shape.namespaces,
+                        shape.providers,
+                        shape.models,
+                        shape.credentials,
+                        shape.gateway_keys,
+                        shape.verifiers
+                    ),
+                    (0, 0, 0, 0, 0, 0),
+                    "a stateful config was accepted with control-plane-owned sections: {shape:?}"
+                );
+                "accepted_stateful"
+            } else {
+                // Stateless mode resolves everything from the file, so it must
+                // name the namespace a request resolves into, and a verifier or
+                // a credential is only meaningful scoped to one.
+                assert!(
+                    shape.namespaces >= 1,
+                    "an accepted stateless config defines no namespace"
+                );
+                "accepted"
+            }
         }
         Err(rejection) => assert_typed(rejection),
     };
@@ -152,7 +172,11 @@ pub enum TokenInput<'a> {
         audience: Option<&'a str>,
         ttl_seconds: u64,
         issued_at: Option<u64>,
-        scope: Vec<&'a str>,
+        /// `None` omits the claim, which is an *unrestricted* token; `Some` of an
+        /// empty vector writes `"scope": []`, which permits nothing. Both
+        /// shapes have to be reachable, because confusing them is the bug worth
+        /// finding.
+        scope: Option<Vec<&'a str>>,
         aliases: Option<Vec<&'a str>>,
     },
 }
@@ -178,7 +202,9 @@ pub fn token_verify(input: &TokenInput<'_>) -> &'static str {
                 audience,
                 *ttl_seconds,
                 *issued_at,
-                Some(scope.iter().map(|value| (*value).to_owned()).collect()),
+                scope
+                    .as_ref()
+                    .map(|values| values.iter().map(|value| (*value).to_owned()).collect()),
                 aliases
                     .as_ref()
                     .map(|values| values.iter().map(|value| (*value).to_owned()).collect()),

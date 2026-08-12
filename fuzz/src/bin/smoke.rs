@@ -160,8 +160,24 @@ fn minted_scenarios() -> Vec<(&'static str, TokenInput<'static>)> {
     let other_namespace = axond::NAMESPACES[1];
     vec![
         (
+            // No `scope` claim at all: what a plain `axond mint` issues, and
+            // unrestricted rather than empty.
             "unscoped",
-            minted(in_namespace, "smoke", None, 300, None, Vec::new(), None),
+            minted(in_namespace, "smoke", None, 300, None, None, None),
+        ),
+        (
+            // `"scope": []` instead, which permits nothing. Confusing the two is
+            // the bug worth catching, so both are replayed.
+            "empty-scope",
+            minted(
+                in_namespace,
+                "smoke",
+                None,
+                300,
+                None,
+                Some(Vec::new()),
+                None,
+            ),
         ),
         (
             "every-capability-and-one-unknown",
@@ -171,7 +187,7 @@ fn minted_scenarios() -> Vec<(&'static str, TokenInput<'static>)> {
                 None,
                 300,
                 None,
-                vec![
+                Some(vec![
                     "chat",
                     "messages",
                     "embeddings",
@@ -180,7 +196,7 @@ fn minted_scenarios() -> Vec<(&'static str, TokenInput<'static>)> {
                     "credentials",
                     "credentials:all",
                     "not-a-capability",
-                ],
+                ]),
                 None,
             ),
         ),
@@ -192,17 +208,17 @@ fn minted_scenarios() -> Vec<(&'static str, TokenInput<'static>)> {
                 None,
                 300,
                 None,
-                Vec::new(),
+                None,
                 Some(vec!["gpt-4o", ""]),
             ),
         ),
         (
             "namespace-the-signer-does-not-hold",
-            minted(other_namespace, "smoke", None, 300, None, Vec::new(), None),
+            minted(other_namespace, "smoke", None, 300, None, None, None),
         ),
         (
             "undeclared-namespace",
-            minted("not-configured", "smoke", None, 300, None, Vec::new(), None),
+            minted("not-configured", "smoke", None, 300, None, None, None),
         ),
         (
             "foreign-audience",
@@ -212,21 +228,13 @@ fn minted_scenarios() -> Vec<(&'static str, TokenInput<'static>)> {
                 Some("someone-elses-gateway"),
                 300,
                 None,
-                Vec::new(),
+                None,
                 None,
             ),
         ),
         (
             "lifetime-past-the-policy-ceiling",
-            minted(
-                in_namespace,
-                "smoke",
-                None,
-                86_400 * 7,
-                None,
-                Vec::new(),
-                None,
-            ),
+            minted(in_namespace, "smoke", None, 86_400 * 7, None, None, None),
         ),
         (
             "issued-far-in-the-future",
@@ -236,13 +244,13 @@ fn minted_scenarios() -> Vec<(&'static str, TokenInput<'static>)> {
                 None,
                 300,
                 Some(u64::MAX / 2),
-                Vec::new(),
+                None,
                 None,
             ),
         ),
         (
             "empty-subject",
-            minted(in_namespace, "", None, 300, None, Vec::new(), None),
+            minted(in_namespace, "", None, 300, None, None, None),
         ),
     ]
 }

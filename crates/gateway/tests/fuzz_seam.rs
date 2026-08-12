@@ -18,10 +18,12 @@ fn module_names(relative: &str) -> Vec<String> {
     let mut names: Vec<String> = source
         .lines()
         .filter_map(|line| {
-            // Only top-level declarations: a nested `mod` is indented, and a
-            // `#[cfg(test)]` one belongs to whichever target runs the tests.
+            // Only top-level declarations of a *file* module: a nested `mod` is
+            // indented, an inline `mod tests {` carries its own body rather than
+            // a source file, and a `#[cfg(test)]` one belongs to whichever
+            // target runs the tests.
             let rest = line.strip_prefix("mod ")?;
-            Some(rest.trim_end_matches(';').to_owned())
+            Some(rest.strip_suffix(';')?.to_owned())
         })
         .collect();
     names.sort();

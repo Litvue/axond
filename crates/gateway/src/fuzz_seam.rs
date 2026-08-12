@@ -33,6 +33,7 @@ mod desired_state;
 mod error;
 mod key_material;
 mod mint;
+mod ops;
 mod principals;
 mod rate_limit;
 mod redis_support;
@@ -81,8 +82,13 @@ pub enum Rejection {
 }
 
 /// What a config the fuzzer produced turned into, without exposing [`Config`].
+///
+/// The mode is part of the shape because it selects which invariants the
+/// validator applied: stateless mode owns its resources in TOML, stateful mode
+/// forbids every one of those sections (ADR 0027).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigShape {
+    pub stateful: bool,
     pub namespaces: usize,
     pub providers: usize,
     pub models: usize,
@@ -101,6 +107,7 @@ pub struct ConfigShape {
 pub fn config_from_toml_str(input: &str) -> Result<ConfigShape, Rejection> {
     match Config::from_toml_str(input) {
         Ok(config) => Ok(ConfigShape {
+            stateful: config.mode == config::Mode::Stateful,
             namespaces: config.namespace.len(),
             providers: config.provider.len(),
             models: config.model.len(),
