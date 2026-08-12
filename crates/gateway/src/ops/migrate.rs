@@ -695,6 +695,48 @@ mod tests {
         );
     }
 
+    /// The commands create neither the database nor the schema, so a configured
+    /// `[control_plane] schema` that does not exist is an operator error — and
+    /// `SET search_path` accepts a missing schema, so it arrives as the server
+    /// rejecting the first `CREATE TABLE` rather than as a connection failure.
+    /// A retryable classification there would have a rollout gate looping on
+    /// something no retry can clear.
+    #[tokio::test]
+    async fn a_missing_schema_refuses_the_apply_rather_than_advising_a_retry() {
+        let Some(mut fixture) = fixture().await else {
+            return;
+        };
+        // The same fixture, pointed at a schema nothing created.
+        let missing = format!("{}_absent", fixture.schema);
+        fixture.config = Config::from_toml_str(&format!(
+            "mode = \"stateful\"\n\
+             [control_plane]\n\
+             dsn_env = \"GW_CONTROL_PLANE_DSN\"\n\
+             schema = \"{missing}\"\n\
+             [secret_store]\n\
+             kek_env = \"GW_KEK\"\n\
+             [[admin_breakglass]]\n\
+             env = \"GW_BREAKGLASS\"\n"
+        ))
+        .expect("valid stateful config");
+
+        let error = apply(&fixture.config, &fixture.env)
+            .await
+            .expect_err("a schema that does not exist cannot be migrated");
+        assert!(
+            matches!(error, OpsError::Refused { .. }),
+            "the server rejected the DDL, which is an operator's to fix: {error:?}"
+        );
+        assert!(
+            !error.is_retryable(),
+            "a rollout gate must stop rather than loop: {error}"
+        );
+        assert!(
+            error.to_string().contains("schema exists"),
+            "the refusal names what to check: {error}"
+        );
+    }
+
     /// Safe before replicas start includes safe *while another operator is doing
     /// the same thing*: the advisory lock is what makes two applies one migration.
     #[tokio::test]

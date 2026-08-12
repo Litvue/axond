@@ -99,7 +99,9 @@ budget, and revocation stores are applied by hand from `ops/postgres/`, as
 ### Fresh install
 
 The database must exist and the role must be able to create objects in the target
-schema; the commands create neither the database nor the schema.
+schema; the commands create neither the database nor the schema. A missing schema
+or a role that may not create objects is reported as a refusal naming the SQLSTATE
+rather than as an outage, so an automated gate stops instead of retrying.
 
 ```bash
 export GW_CONTROL_PLANE_DSN='postgres://axond@db/axond?sslmode=require'

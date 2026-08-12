@@ -68,6 +68,11 @@ Their boundaries:
   schema either way and refuses one it does not recognise.
 - **Errors are typed by what an operator should do**: an unreachable database is
   retryable, a refused schema is not, and no output or error ever carries a DSN.
+  A server-reported rejection of the migration DDL — a missing target schema
+  (`3F000`) or a role that may not create objects (`42501`) — is a refusal too,
+  because a rollout gate that retries it loops forever; only the transient
+  SQLSTATE classes (connection, rollback, resources, prerequisite state, operator
+  intervention, system) stay outages.
 - Only the control-plane journal is migrated. The usage, budget, and revocation
   stores have no ledger, so nothing here orchestrates them; preflight still checks
   that their references resolve, because an unset one is a boot failure whichever

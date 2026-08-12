@@ -279,7 +279,7 @@ impl PostgresControlPlane {
                 let pending = schema::pending(&status);
                 schema::migrate(&transaction, &status)
                     .await
-                    .map_err(|error| unavailable("apply migrations", &error))?;
+                    .map_err(|error| migration_refused_or_unavailable(&error))?;
                 let migrated = schema::status(&transaction)
                     .await
                     .map_err(|error| unavailable("re-read schema status", &error))?;
@@ -459,6 +459,41 @@ fn denied(message: impl Into<String>) -> ControlPlaneError {
         backend: BACKEND,
         message: message.into(),
     }
+}
+
+/// Classify a failure to run the migration DDL by whether a retry could clear it.
+///
+/// The realistic failures here are the server rejecting a statement, not the
+/// server being unreachable: `3F000` when the configured `[control_plane] schema`
+/// does not exist (`SET search_path` accepts a missing schema, so the refusal
+/// arrives at the first `CREATE TABLE`) and `42501` when the role may not create
+/// objects. Both need an operator, and reporting them as an outage would tell a
+/// rollout gate to retry a thing that cannot start working.
+///
+/// The transient classes stay outages so they keep their retryable
+/// classification: connection exceptions (08), transaction rollbacks including
+/// serialization failures and deadlocks (40), insufficient resources (53), an
+/// object not in a prerequisite state such as an unavailable lock (55), operator
+/// intervention including a cancelled statement or a shutdown (57), and system
+/// errors (58). An error with no SQLSTATE never reached the server at all.
+fn migration_refused_or_unavailable(error: &tokio_postgres::Error) -> ControlPlaneError {
+    const TRANSIENT: [&str; 6] = ["08", "40", "53", "55", "57", "58"];
+    let Some(db) = error.as_db_error() else {
+        return unavailable("apply migrations", error);
+    };
+    let code = db.code().code();
+    if code
+        .get(..2)
+        .is_some_and(|class| TRANSIENT.contains(&class))
+    {
+        return unavailable("apply migrations", error);
+    }
+    denied(format!(
+        "applying migrations failed: {} (SQLSTATE {code}); the server rejected the statement, so \
+         no retry clears it — check that the configured schema exists and that the role may \
+         create objects in it",
+        db.message()
+    ))
 }
 
 /// Report a Postgres failure as an outage, naming the operation and SQLSTATE.
