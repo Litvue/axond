@@ -139,7 +139,7 @@ impl Mode {
 /// reference to resolve, and figment's resulting type error would carry the
 /// secret into the load diagnostic. Kept in step with `Config` by
 /// `the_override_key_list_matches_every_config_field`.
-const OVERRIDE_KEYS: [&str; 22] = [
+const OVERRIDE_KEYS: [&str; 23] = [
     "mode",
     "server",
     "control_plane",
@@ -161,6 +161,7 @@ const OVERRIDE_KEYS: [&str; 22] = [
     "usage_sink",
     "budget",
     "rate_limit",
+    "admission",
     "revocation",
 ];
 
