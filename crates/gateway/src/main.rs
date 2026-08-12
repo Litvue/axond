@@ -22,6 +22,11 @@ mod aliases;
 mod backends;
 mod budget;
 mod config;
+// Stateful revision convergence (#142). Dead code until a projection from
+// resource bodies to a servable config lands with the body-schema slices; the
+// loop, its contract, and its tests are complete without one.
+#[allow(dead_code)]
+mod convergence;
 mod credentials;
 // The desired-state domain the durable contracts are expressed in. Contract
 // only, for the same reason `backends` is: no revision is loaded or published on

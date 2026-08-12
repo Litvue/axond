@@ -68,6 +68,9 @@ and operate it.
 - [Control-plane revision journal](./operations/control-plane-journal.md) — the
   stateful mode's Postgres schema, migrations, schema-status refusals, and
   outage behaviour.
+- [Revision convergence](./operations/revision-convergence.md) — how a published
+  revision reaches replicas, convergence targets, what a replica reports, and
+  the signed last-known-good cache.
 - [Deployment security model](./security/deployment-model.md) — trust
   boundaries, TLS termination, secret delivery, and image verification.
 

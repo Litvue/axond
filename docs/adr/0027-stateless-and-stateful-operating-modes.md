@@ -200,14 +200,24 @@ previous revision keeps serving; there is no partial publication.
 
 A process starting in stateful mode with no snapshot **must** reach the control
 plane. It fails to become ready otherwise, and it fails loudly rather than
-serving an empty or partial configuration. Signed offline last-known-good boot
-(so a *new* replica can start during a control-plane outage) is owned by #142
-and is deliberately not part of the first stateful release: #142 lands
-reconciliation first, and relaxes this cold-boot requirement afterwards. Until
-then, no slice in this ADR's dependency map promises offline cold boot.
+serving an empty or partial configuration — *unless* it holds a signed
+last-known-good snapshot of a revision it previously served, which #142 lands
+alongside reconciliation and which relaxes this requirement to "reach the
+control plane or restore an authenticated local cache".
 
-The asymmetry is deliberate: a running replica must survive a control-plane
-outage; a brand-new replica in the first stateful release need not.
+The cache is not a general fallback. It is consulted for exactly one failure,
+the control plane being unreachable, because that is the only failure where
+cached state is the better answer: a desired revision that exists but does not
+compile stays a fatal boot failure, since booting an older cached revision
+would silently serve state an administrator already replaced. It is
+authenticated before it is interpreted and re-verified through the domain's
+integrity checks afterwards, so an edited cache refuses to boot rather than
+becoming desired state. See
+[revision convergence](../operations/revision-convergence.md).
+
+The asymmetry that remains is deliberate: a running replica must survive a
+control-plane outage, and a brand-new replica can only do so if a sibling left
+it a signed snapshot to start from.
 
 ### Administrative surface
 
@@ -431,9 +441,11 @@ absence of a universal `StateBackend`.
 
 Deliberately left open for those slices: exact TOML key names and section
 shapes within the approved bootstrap set (#162); precise error and capability
-enum variants (#163); DDL, index, and concurrency-control details (#141);
-polling interval, notification use, and convergence targets (#142); and the
-signed offline last-known-good format (#142).
+enum variants (#163); and DDL, index, and concurrency-control details (#141).
+Settled by #142: polling as the correctness mechanism with notifications as a
+latency optimization, per-replica desired/loaded/active reporting with lag as
+the alertable signal, bounded exponential retry, and the authenticated
+last-known-good cache format.
 
 ## Consequences
 
@@ -454,10 +466,11 @@ signed offline last-known-good format (#142).
 - Immutable manifests over versioned resources cost storage and add a garbage
   and retention question, and they make audit, rollback, and "what was serving"
   cheap and exact.
-- Requiring Postgres for the initial stateful cold boot means a control-plane
-  outage blocks scale-out and replacement of replicas even though running
-  replicas keep serving. Operators must size and monitor for that until #142
-  lands signed last-known-good boot.
+- A control-plane outage no longer blocks scale-out for replicas that hold a
+  signed last-known-good snapshot, at the cost of a new deployment-wide signing
+  secret and of replicas that may knowingly start on state older than desired.
+  A replica with no cache still cannot cold-boot during an outage, so operators
+  must still size and monitor for that.
 - `/admin/v1` is a new attack surface with a mandatory static breakglass
   credential — a long-lived secret whose rotation and storage become an
   operational duty, in exchange for not being locked out by an IdP outage.
