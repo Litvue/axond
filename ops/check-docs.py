@@ -3,7 +3,7 @@
 
 Usage:
     ops/check-docs.py              # every drift check against the committed tree
-    ops/check-docs.py --self-test  # only the smoke-matrix gate's own regressions
+    ops/check-docs.py --self-test  # only the release-path gates' own regressions
 """
 
 from __future__ import annotations
@@ -255,8 +255,31 @@ def check_smoke_matrix() -> list[str]:
     )
 
 
+def release_script_trigger_failures(workflow_text: str, page: str) -> list[str]:
+    """Every script the release path runs is named by the trigger that owns it.
+
+    Trigger 6 is what tells a contributor that touching the release path owes a
+    review, and it can only do that if it names the scripts that path runs: a
+    script the release workflow invokes but the page omits is load-bearing for
+    what gets signed while looking like an ordinary file.
+    """
+    return [
+        f"docs/security/threat-model-review.md: {script!r} runs in the release "
+        "workflow but trigger 6 does not name it"
+        for script in sorted(set(re.findall(r"ops/[\w.-]+\.(?:py|sh)", workflow_text)))
+        if f"`{script}`" not in page
+    ]
+
+
+def check_release_script_triggers() -> list[str]:
+    return release_script_trigger_failures(
+        (ROOT / ".github/workflows/release-please.yml").read_text(encoding="utf-8"),
+        (ROOT / "docs/security/threat-model-review.md").read_text(encoding="utf-8"),
+    )
+
+
 def self_test() -> int:
-    """Prove the smoke-matrix gate fails in both directions, and parses YAML.
+    """Prove the release-path gates fail when they should, not only pass.
 
     The gate's whole value is that it fails; a check that only ever passes on the
     committed tree would be indistinguishable from no check at all.
@@ -303,7 +326,19 @@ def self_test() -> int:
     ):
         assert len(empty) == 1 and "declares no target" in empty[0], empty
 
-    print("check-docs: smoke-matrix gate self-test passed")
+    named = release_script_trigger_failures(
+        "run: ops/docker-smoke.sh\nrun: python ops/binary-smoke.py x\n",
+        "trigger 6 fires on `ops/docker-smoke.sh` and `ops/binary-smoke.py`",
+    )
+    assert named == [], named
+    omitted = release_script_trigger_failures(
+        "run: python ops/binary-smoke.py release-bin/axond\n",
+        "trigger 6 fires on `ops/docker-smoke.sh`",
+    )
+    assert len(omitted) == 1, omitted
+    assert "'ops/binary-smoke.py' runs in the release workflow" in omitted[0], omitted
+
+    print("check-docs: release-path gate self-test passed")
     return 0
 
 
@@ -374,6 +409,7 @@ def main(argv: list[str]) -> int:
     failures.extend(check_route_contract())
     failures.extend(check_msrv_documented())
     failures.extend(check_smoke_matrix())
+    failures.extend(check_release_script_triggers())
     failures.extend(check_review_trigger_tests())
     failures.extend(check_front_door_size())
     if failures:
