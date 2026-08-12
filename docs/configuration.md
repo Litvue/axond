@@ -209,8 +209,8 @@ provider, a silent open socket is a half-dead connection. Every bound must be
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `connect_timeout_ms` | integer | `5000` | Bound on establishing the TCP + TLS connection to a provider. |
-| `response_header_timeout_ms` | integer | `30000` | Bound on waiting for response headers (time to first byte) after dispatch. |
-| `buffered_body_timeout_ms` | integer | `30000` | Bound on reading a whole buffered response body once headers arrived. |
+| `response_header_timeout_ms` | integer | `10000` | Bound on waiting for response headers (time to first byte) after dispatch. Keep it tighter than `failover.overall_timeout_ms` — see below. |
+| `buffered_body_timeout_ms` | integer | `15000` | Bound on reading a whole buffered response body once headers arrived. Keep it tighter than `failover.overall_timeout_ms` — see below. |
 | `stream_idle_timeout_ms` | integer | `120000` | Bound on waiting for the *next* chunk of an already-open stream. Not a stream lifetime: a productive stream may run for as long as it keeps producing. |
 | `max_response_bytes` | integer | `33554432` | Largest buffered response body that will be read. A larger one is refused as `upstream_body_too_large` rather than buffered. |
 | `max_error_bytes` | integer | `65536` | Largest provider *error* body read for diagnostics. A larger one is truncated, so the provider's own status still reaches the caller. Must not exceed `max_response_bytes`. |
@@ -219,6 +219,17 @@ The tighter of a phase bound and the remaining `failover.overall_timeout_ms`
 governs each phase, and the caller-visible error names which one fired:
 `upstream_timeout` (`504`) for a bound, `upstream_body_too_large` (`502`) for a
 byte bound. Neither message names the provider endpoint.
+
+Which one fired decides whether the target is blamed: a phase bound is the
+target's own failure and counts towards its circuit, while `overall` reports the
+walk's spent budget and does not (the remaining budget can be a millisecond
+because *earlier* targets spent it). Keep `response_header_timeout_ms` and
+`buffered_body_timeout_ms` strictly tighter than `failover.overall_timeout_ms`
+for that reason: a phase bound the walk budget can never reach turns every stall
+into `overall`, and a target that accepts connections and then answers nothing
+would never trip its circuit. The gateway warns at boot when the relationship is
+inverted rather than refusing to start, since a deliberately tight walk budget is
+a legitimate choice.
 
 `connect_timeout_ms` configures the shared pooled HTTP client, so the whole
 section is read at boot: a reload validates a changed `[transport]` and warns

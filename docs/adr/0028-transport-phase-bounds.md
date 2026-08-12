@@ -69,6 +69,17 @@ own budget, not evidence about a target, so it is excluded from the target
 circuit breaker in the same way a pool-wide `429` is (ADR 0006); the per-phase
 timeouts remain target-scoped dependency failures.
 
+That split makes the relationship between the phase bounds and the walk budget
+load-bearing rather than cosmetic: a phase bound at or above
+`failover.overall_timeout_ms` can only ever end on the walk budget, so every
+stall would be reported as `overall` and a target that accepts connections and
+then answers nothing would never trip its circuit. The shipped defaults are
+therefore strictly tighter than the default walk budget (10s headers, 15s
+buffered body against 30s overall), and an inverted configuration is warned about
+at boot rather than rejected, because a deliberately tight walk budget is a
+legitimate choice and the phase bounds still cap a call that starts with a full
+budget.
+
 ### State tier
 
 Tier 0. The bounds are process-level configuration for provider egress and

@@ -122,6 +122,14 @@ the diagnosis:
 | `stream_idle` | The next chunk of an **open** stream | A half-dead connection or a provider that stopped mid-answer. |
 | `overall` | Any pre-response phase | `failover.overall_timeout_ms` cancelled the in-flight attempt; the walk had no time left. |
 
+If a target that black-holes requests is never taken out of rotation, check that
+`transport.response_header_timeout_ms` and `transport.buffered_body_timeout_ms`
+are still **tighter** than `failover.overall_timeout_ms`. Only the per-phase
+timeouts count against a target's circuit; `overall` is the gateway's own spent
+budget, so a phase bound the walk budget can never reach reports every stall as
+`overall` and leaves the target's circuit closed. The gateway logs a warning at
+boot when that relationship is inverted.
+
 Two consequences are deliberate and not bugs:
 
 - A slow *productive* stream is never cut off by `failover.overall_timeout_ms`.

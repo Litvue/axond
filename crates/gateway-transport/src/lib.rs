@@ -102,8 +102,8 @@ impl Default for TransportLimits {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_millis(5_000),
-            response_header_timeout: Duration::from_millis(30_000),
-            buffered_body_timeout: Duration::from_millis(30_000),
+            response_header_timeout: Duration::from_millis(10_000),
+            buffered_body_timeout: Duration::from_millis(15_000),
             stream_idle_timeout: Duration::from_millis(120_000),
             max_response_bytes: 32 * 1024 * 1024,
             max_error_bytes: 64 * 1024,

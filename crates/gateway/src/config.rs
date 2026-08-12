@@ -337,12 +337,16 @@ fn default_connect_timeout_ms() -> u64 {
     5_000
 }
 
+/// Deliberately tighter than `failover.overall_timeout_ms`: a phase bound the
+/// walk budget can never reach would classify every stall as `overall`, and an
+/// `overall` stall is the gateway's own budget rather than evidence about the
+/// target, so a black-holing target would never trip its circuit.
 fn default_response_header_timeout_ms() -> u64 {
-    30_000
+    10_000
 }
 
 fn default_buffered_body_timeout_ms() -> u64 {
-    30_000
+    15_000
 }
 
 /// Generous by design: a reasoning model can think for a long time between
@@ -1263,6 +1267,26 @@ impl Config {
                  body is a response body"
                     .into(),
             ));
+        }
+        for (field, value) in [
+            (
+                "response_header_timeout_ms",
+                self.transport.response_header_timeout_ms,
+            ),
+            (
+                "buffered_body_timeout_ms",
+                self.transport.buffered_body_timeout_ms,
+            ),
+        ] {
+            if value >= self.failover.overall_timeout_ms {
+                tracing::warn!(
+                    bound_ms = value,
+                    overall_timeout_ms = self.failover.overall_timeout_ms,
+                    "`transport.{field}` is not tighter than `failover.overall_timeout_ms`, so this \
+                     phase can only ever end on the walk budget: the stall is reported as \
+                     `overall` and does not count towards the target's circuit"
+                );
+            }
         }
         if self.reload.poll_interval_ms < MIN_RELOAD_POLL_INTERVAL_MS {
             return Err(ConfigError::Invalid(format!(
@@ -2404,11 +2428,17 @@ dsn_env = "AXOND_BUDGET_REDIS_URL"
     fn transport_bounds_default_to_finite_values() {
         let cfg = Config::from_toml_str(VALID).expect("valid config");
         assert_eq!(cfg.transport.connect_timeout_ms, 5_000);
-        assert_eq!(cfg.transport.response_header_timeout_ms, 30_000);
-        assert_eq!(cfg.transport.buffered_body_timeout_ms, 30_000);
+        assert_eq!(cfg.transport.response_header_timeout_ms, 10_000);
+        assert_eq!(cfg.transport.buffered_body_timeout_ms, 15_000);
         assert_eq!(cfg.transport.stream_idle_timeout_ms, 120_000);
         assert_eq!(cfg.transport.max_response_bytes, 32 * 1024 * 1024);
         assert_eq!(cfg.transport.max_error_bytes, 64 * 1024);
+
+        // A phase bound the walk budget can never reach would report every
+        // stall as `overall`, which is not the target's fault and so would
+        // never trip its circuit. The shipped pair must stay reachable.
+        assert!(cfg.transport.response_header_timeout_ms < cfg.failover.overall_timeout_ms);
+        assert!(cfg.transport.buffered_body_timeout_ms < cfg.failover.overall_timeout_ms);
 
         let limits = cfg.transport.limits();
         assert_eq!(limits.connect_timeout, Duration::from_millis(5_000));
