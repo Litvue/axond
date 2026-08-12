@@ -326,8 +326,9 @@ impl PostgresControlPlane {
     /// It writes what the database's own objects account for and nothing else: the
     /// longest prefix of shipped migrations whose every declared table is present
     /// ([`schema::baseline`]). A prefix that is empty, one interrupted by a
-    /// half-applied migration, and one that is not a prefix at all are refused
-    /// with [`ControlPlaneError::Denied`] rather than recorded, because a recorded
+    /// half-applied migration, one that is not a prefix at all, and any history
+    /// containing a migration that creates no table are refused with
+    /// [`ControlPlaneError::Denied`] rather than recorded, because a recorded
     /// version is afterwards indistinguishable from an applied one — an adoption
     /// that guessed would launder a guess into the history every later decision
     /// reads.

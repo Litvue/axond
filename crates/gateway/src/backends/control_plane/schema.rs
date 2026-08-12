@@ -18,6 +18,7 @@
 //! the package-local copy under `crates/gateway/sql/`; `tests/shipped_ddl.rs`
 //! gates the two against drift.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use tokio_postgres::Transaction;
@@ -488,10 +489,12 @@ pub enum Baseline {
     /// so there is no baseline to adopt and the empty ledger is the only thing
     /// standing between this database and an ordinary `apply`.
     Nothing,
-    /// The objects present are not a prefix of the shipped history: a migration
-    /// is half applied, or a later one's tables exist without an earlier one's.
-    /// Never adopted — recording a version whose objects are incomplete would
-    /// promise a schema the database does not have.
+    /// No baseline is adoptable: a migration is half applied, a later one's tables
+    /// exist without an earlier one's, or the history contains a migration that
+    /// creates no table and so cannot be reconciled against objects at all. Never
+    /// adopted — recording a version whose objects are incomplete would promise a
+    /// schema the database does not have, and recording a prefix under an
+    /// unobservable version would leave `apply` to re-run it.
     Inconsistent { message: String },
 }
 
@@ -510,27 +513,6 @@ fn observable_relations(migration: &Migration) -> Vec<&'static str> {
         .collect()
 }
 
-/// Which of a migration's observable tables the database is missing.
-async fn missing_relations(
-    transaction: &Transaction<'_>,
-    migration: &Migration,
-) -> Result<Vec<&'static str>, tokio_postgres::Error> {
-    let mut missing = Vec::new();
-    for relation in observable_relations(migration) {
-        // Resolved through the caller's `search_path`, exactly as the ledger
-        // probe is: a journal beside other tables must be asked about in its own
-        // schema rather than in whichever one holds a table of the same name.
-        let present: Option<String> = transaction
-            .query_one("SELECT to_regclass($1)::text", &[&relation])
-            .await?
-            .get(0);
-        if present.is_none() {
-            missing.push(relation);
-        }
-    }
-    Ok(missing)
-}
-
 /// Reconcile an empty ledger against the objects the database holds.
 ///
 /// Read-only: this is evidence gathering, and the caller decides what to do with
@@ -540,35 +522,77 @@ async fn missing_relations(
 pub(super) async fn baseline(
     transaction: &Transaction<'_>,
 ) -> Result<Baseline, tokio_postgres::Error> {
-    let mut adoptable: Vec<i32> = Vec::new();
-    let mut broken: Option<i32> = None;
-    for migration in MIGRATIONS.iter() {
-        let declared = observable_relations(migration).len();
-        if declared == 0 && broken.is_some() {
-            // Above a version whose objects are absent already: an unobservable
-            // migration there is simply not adopted, and stays pending for an
-            // ordinary `apply`.
-            continue;
+    let mut present: HashSet<&'static str> = HashSet::new();
+    for relation in MIGRATIONS.iter().flat_map(observable_relations) {
+        // Qualified to the one schema this connection writes in — the schema
+        // `[control_plane] schema` selected, or the first on the DSN's own search
+        // path, which is where `apply` would have created these tables. An
+        // unqualified probe would resolve down the whole search path, so another
+        // install's journal sitting in `public` would be read as evidence that
+        // *this* schema's DDL was applied, and adoption would record a baseline
+        // for objects it cannot see.
+        let found: bool = transaction
+            .query_one(
+                "SELECT EXISTS (\
+                   SELECT 1 FROM pg_catalog.pg_class class \
+                     JOIN pg_catalog.pg_namespace namespace ON namespace.oid = class.relnamespace \
+                    WHERE class.relname = $1 \
+                      AND class.relkind IN ('r', 'p') \
+                      AND namespace.nspname = current_schema())",
+                &[&relation],
+            )
+            .await?
+            .get(0);
+        if found {
+            present.insert(relation);
         }
-        if declared == 0 {
-            // A migration that creates no table leaves nothing to observe — an
-            // `ALTER TABLE` or a backfill is exactly the migration whose effect
-            // the catalogue cannot report. Adopting a prefix that includes one
-            // would be recording a guess, which is the failure adoption exists to
-            // avoid, so it refuses instead of assuming either way.
-            return Ok(Baseline::Inconsistent {
+    }
+    Ok(reconcile(MIGRATIONS, &present))
+}
+
+/// The prefix a set of present tables accounts for, and nothing more.
+///
+/// Separated from the probing so the shape of the history — a whole version, a
+/// half-applied one, a hole, a version whose effect no table reports — is decided
+/// by a function that can be examined directly.
+fn reconcile(migrations: &[Migration], present: &HashSet<&'static str>) -> Baseline {
+    let mut adoptable: Vec<i32> = Vec::new();
+    let mut absent: Option<i32> = None;
+    for migration in migrations {
+        let declared = observable_relations(migration);
+        // A migration that creates no table leaves nothing to observe — an
+        // `ALTER TABLE` or a backfill is exactly the migration whose effect the
+        // catalogue cannot report — and it blocks adoption of this database
+        // wherever in the history it sits, including the versions below it.
+        //
+        // Fail-closed on purpose. Adopting only the prefix underneath would look
+        // safe and would not be: the ledger would then say the opaque version is
+        // pending, so the next `apply` would run it — over a database that may
+        // already have had it applied out of band. That rerun is precisely the
+        // non-idempotent replay adoption exists to prevent, and no ledger row can
+        // be written that both accounts for the objects and keeps `apply` from
+        // reaching it.
+        if declared.is_empty() {
+            return Baseline::Inconsistent {
                 message: format!(
-                    "v{} `{}` declares no tables, so whether it was applied is not something this \
-                     database can be asked; a baseline including it cannot be established from \
-                     object presence, and stating one is the operator's own `INSERT INTO \
-                     {MIGRATION_TABLE} (version, name, checksum)` to make",
+                    "v{} `{}` creates no table, so whether it was applied is not something this \
+                     database can be asked, and recording a baseline below it would leave `axond \
+                     migrate apply` to re-run it over a schema that may already have it. No \
+                     baseline is adoptable while it ships unrecorded: state the history with \
+                     `INSERT INTO {MIGRATION_TABLE} (version, name, checksum)` if you own the \
+                     change that applied it, or drop the empty ledger and apply from zero if \
+                     nothing was.",
                     migration.version, migration.name,
                 ),
-            });
+            };
         }
-        let missing = missing_relations(transaction, migration).await?;
-        if !missing.is_empty() && missing.len() < declared {
-            return Ok(Baseline::Inconsistent {
+        let missing: Vec<&'static str> = declared
+            .iter()
+            .copied()
+            .filter(|relation| !present.contains(relation))
+            .collect();
+        if !missing.is_empty() && missing.len() < declared.len() {
+            return Baseline::Inconsistent {
                 message: format!(
                     "v{} `{}` is only partly applied: `{}` {} not present, so this build cannot \
                      record it as applied and cannot apply it over what is there either. Finish \
@@ -578,33 +602,33 @@ pub(super) async fn baseline(
                     missing.join("`, `"),
                     if missing.len() == 1 { "is" } else { "are" },
                 ),
-            });
+            };
         }
-        match (missing.is_empty(), broken) {
+        match (missing.is_empty(), absent) {
             // Still extending the prefix of versions the database can account for.
             (true, None) => adoptable.push(migration.version),
             // Objects for a version above one that is absent: the database is
             // not any prefix of this history, so nothing about it can be
             // recorded as a baseline.
-            (true, Some(absent)) => {
-                return Ok(Baseline::Inconsistent {
+            (true, Some(hole)) => {
+                return Baseline::Inconsistent {
                     message: format!(
-                        "v{} `{}` declares tables that are present while v{absent} declares tables \
+                        "v{} `{}` declares tables that are present while v{hole} declares tables \
                          that are not; the objects in this database are not a prefix of the \
                          shipped migration history, so no baseline describes it",
                         migration.version, migration.name,
                     ),
-                });
+                };
             }
-            (false, _) => broken = broken.or(Some(migration.version)),
+            (false, _) => absent = absent.or(Some(migration.version)),
         }
     }
     if adoptable.is_empty() {
-        return Ok(Baseline::Nothing);
+        return Baseline::Nothing;
     }
-    Ok(Baseline::Applied {
+    Baseline::Applied {
         versions: adoptable,
-    })
+    }
 }
 
 /// Record an adopted baseline: the versions whose objects are already there.
@@ -909,12 +933,16 @@ mod tests {
             "the tables adoption looks for are the ones the shipped file creates"
         );
         // The ledger is the precondition for an adoption rather than evidence for
-        // one, so what is left after excluding it is what a baseline rests on.
+        // one, so what is left after excluding it is what a baseline rests on. Every
+        // shipped migration still declaring a table is also what keeps adoption
+        // available at all: the first one that does not blocks it outright, which is
+        // a release decision rather than something to discover from a refusal.
         for migration in MIGRATIONS.iter() {
             assert!(
                 !observable_relations(migration).contains(&MIGRATION_TABLE)
                     && !observable_relations(migration).is_empty(),
-                "v{} leaves adoption nothing to verify it by",
+                "v{} leaves adoption nothing to verify it by, so no database can be adopted while \
+                 it ships",
                 migration.version
             );
         }
@@ -936,5 +964,68 @@ mod tests {
                   CREATE TABLE IF NOT EXISTS first (id integer);\n",
         };
         assert_eq!(MIXED.relations(), vec!["first", "second"]);
+    }
+
+    /// A migration that creates no table — an `ALTER`-only or backfill migration,
+    /// the first non-idempotent kind — blocks adoption of the whole database,
+    /// wherever in the shipped history it sits. Adopting the prefix underneath it
+    /// would look safe and would not be: the ledger would then report the opaque
+    /// version as pending, and the next `apply` would run it over a schema that may
+    /// already have had it applied out of band, which is exactly the replay
+    /// adoption exists to prevent.
+    #[test]
+    fn a_migration_no_object_can_account_for_blocks_adoption_of_the_whole_history() {
+        const V1: Migration = Migration {
+            version: 1,
+            name: "first",
+            sql: "CREATE TABLE IF NOT EXISTS axond_cp_schema_migration (version integer);\n\
+                  CREATE TABLE IF NOT EXISTS one (id integer);\n",
+        };
+        const V2: Migration = Migration {
+            version: 2,
+            name: "backfill",
+            sql: "ALTER TABLE one ADD COLUMN note text;\n",
+        };
+        const V3: Migration = Migration {
+            version: 3,
+            name: "third",
+            sql: "CREATE TABLE IF NOT EXISTS three (id integer);\n",
+        };
+        let shipped = &[V1, V2, V3];
+
+        // Every state of such a database refuses, including the one where the
+        // prefix below the opaque migration is entirely accounted for.
+        for present in [
+            HashSet::from(["one"]),
+            HashSet::from(["one", "three"]),
+            HashSet::from(["three"]),
+            HashSet::new(),
+        ] {
+            let Baseline::Inconsistent { message } = reconcile(shipped, &present) else {
+                panic!("a history with an unobservable migration has no adoptable baseline");
+            };
+            assert!(
+                message.contains("v2 `backfill` creates no table") && message.contains("re-run it"),
+                "the refusal has to name the version and why nothing under it is safe: {message}"
+            );
+        }
+
+        // The same reconciliation without that migration still adopts the prefix
+        // its objects prove, so the refusals above are the opaque version's doing
+        // rather than a blanket one.
+        let observable = &[V1, V3];
+        assert_eq!(
+            reconcile(observable, &HashSet::from(["one"])),
+            Baseline::Applied { versions: vec![1] }
+        );
+        assert_eq!(reconcile(observable, &HashSet::new()), Baseline::Nothing);
+        let Baseline::Inconsistent { message } = reconcile(observable, &HashSet::from(["three"]))
+        else {
+            panic!("a hole in the applied prefix is not a baseline");
+        };
+        assert!(
+            message.contains("not a prefix"),
+            "the refusal has to say why the objects describe no baseline: {message}"
+        );
     }
 }

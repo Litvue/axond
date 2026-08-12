@@ -290,7 +290,10 @@ or constraint change would not, and it would corrupt a database rather than fail
 `axond migrate adopt` is how that state is resolved deliberately. It writes ledger
 rows and never DDL, and it records only what the database itself accounts for: the
 longest run of shipped migrations, starting at v1, whose every declared table is
-present. What it does instead of recording:
+present in the schema this configuration writes to (the one `[control_plane]
+schema` names, or the first on the DSN's own search path — a second install's
+journal further down that path is not evidence about this one). What it does
+instead of recording:
 
 - **No object present.** Nothing was applied out of band, so there is no baseline.
   Refused, naming the way forward — drop the empty `axond_cp_schema_migration`
@@ -301,12 +304,22 @@ present. What it does instead of recording:
 - **A ledger that already records a history.** Nothing to adopt: the history is
   reported and nothing is written, so a stray `adopt` in a rollout is not a ledger
   edit.
+- **A shipped migration that creates no table.** An `ALTER`-only or backfill
+  migration is the one whose application no catalogue can report on, and also the
+  one whose rerun is destructive. Adopting the versions below it would leave the
+  ledger calling it *pending*, so the next `apply` would run it over a schema that
+  may already have it. So a release that ships one refuses every adoption while it
+  is unrecorded — the whole history, not just that version — and the baseline goes
+  back to being an `INSERT INTO axond_cp_schema_migration (version, name,
+  checksum)` you write because you own the change that applied it. The refusal
+  names the version and says this.
 
 It is one transaction under the same advisory lock `apply` takes, so a refusal
 leaves no partial baseline and two simultaneous adoptions are one adoption.
 Adopting a prefix below the required version reports what is still pending and
-exits non-zero; the next command is `axond migrate apply`, which migrates forward
-from the adopted baseline.
+exits non-zero, exactly as `status` does — the baseline was recorded and the
+database is still not one a replica may serve; the next command is
+`axond migrate apply`, which migrates forward from the adopted baseline.
 
 Adoption is deliberately narrow. It cannot repair a *Drifted*, *Incomplete*,
 *Renamed*, *Ahead*, or *Malformed* history: each of those is a recorded history

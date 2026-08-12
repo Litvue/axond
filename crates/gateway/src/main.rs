@@ -417,10 +417,20 @@ fn migrate_control_plane(args: &clap::ArgMatches, which: Migration) -> anyhow::R
     }
     .map_err(ops_failure)?;
     println!("{report}");
+    migration_exit(which, &report)
+}
+
+/// What a migration command's exit code says, separated from performing it so it
+/// can be checked directly for every state.
+///
+/// A rollout gate reads the code and not the report, so "succeeded" has to mean
+/// "and there is nothing left to do": `status` and `adopt` both exit non-zero on a
+/// schema that still needs migrating. Adoption is the less obvious of the two —
+/// recording a baseline below the required version *is* a success, and it is also
+/// a database no replica may serve until `apply` runs.
+fn migration_exit(which: Migration, report: &ops::migrate::Report) -> anyhow::Result<()> {
     match which {
-        // A pending schema is the answer `status` was asked for, and it is also a
-        // "not ready": a replica must not be started against it.
-        Migration::Status if !report.is_settled() => {
+        Migration::Status | Migration::Adopt if !report.is_settled() => {
             anyhow::bail!("the control-plane schema is not ready to serve")
         }
         _ if !report.is_ok() => anyhow::bail!("the control-plane schema was refused"),
@@ -689,6 +699,58 @@ mod tests {
                 "`{}` must require an action",
                 argv.join(" ")
             );
+        }
+    }
+
+    /// The exit code every migration command hands a rollout gate.
+    ///
+    /// `adopt` is the one worth pinning: recording a baseline succeeds, and a
+    /// baseline below the required version still leaves `apply` to run, so a zero
+    /// there would let replicas start against a schema that is not ready. The same
+    /// holds for an `adopt` that found a ledger already recording a *behind*
+    /// history, which reports pending migrations rather than an adoption.
+    #[test]
+    fn only_a_settled_schema_lets_status_or_adopt_exit_zero() {
+        use ops::migrate::{Report, State};
+
+        let control_plane = |state: State| Report::ControlPlane {
+            dsn_env: "GW_CONTROL_PLANE_DSN".to_owned(),
+            state,
+        };
+        let pending = vec![(2, "control_plane_0002_example")];
+        let adopted = vec![(1, "control_plane_0001_initial")];
+
+        for state in [
+            State::Adopted {
+                adopted: adopted.clone(),
+                pending: pending.clone(),
+            },
+            State::Pending {
+                pending: pending.clone(),
+            },
+        ] {
+            let report = control_plane(state);
+            assert!(report.is_ok(), "{report}");
+            for which in [Migration::Status, Migration::Adopt] {
+                assert!(
+                    migration_exit(which, &report).is_err(),
+                    "{which:?} must not exit zero while a migration is outstanding: {report}"
+                );
+            }
+        }
+
+        // A whole baseline, and a refusal: settled succeeds for both commands, and
+        // a refused schema fails for all three whatever `is_settled` says.
+        let whole = control_plane(State::Adopted {
+            adopted,
+            pending: Vec::new(),
+        });
+        let refused = control_plane(State::Refused {
+            reason: "the ledger records nothing".to_owned(),
+        });
+        for which in [Migration::Status, Migration::Apply, Migration::Adopt] {
+            assert!(migration_exit(which, &whole).is_ok(), "{whole}");
+            assert!(migration_exit(which, &refused).is_err(), "{refused}");
         }
     }
 

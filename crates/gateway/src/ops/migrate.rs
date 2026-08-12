@@ -822,6 +822,88 @@ mod tests {
         );
     }
 
+    /// Another install's journal on the same search path is not evidence about
+    /// *this* schema.
+    ///
+    /// With `[control_plane] schema` unset the DSN's own `search_path` applies, and
+    /// it may well end in `public`. A relation probe that resolved down that path
+    /// would read the neighbour's tables as proof that this schema's DDL was
+    /// applied and record a baseline for objects it cannot even see — the one way
+    /// adoption could write a ledger row for a migration that never ran here. So
+    /// the probe is qualified to `current_schema()`, the schema an `apply` would
+    /// have created these tables in.
+    #[tokio::test]
+    async fn objects_in_another_schema_on_the_path_are_not_evidence_of_an_applied_baseline() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        // The neighbour: a complete, hand-applied journal, ledger row and all.
+        let neighbour = format!("{}_neighbour", fixture.schema);
+        let client = client(&fixture.dsn).await;
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA {neighbour}; SET search_path TO {neighbour}"
+            ))
+            .await
+            .expect("create the neighbouring schema");
+        for migration in schema::MIGRATIONS.iter() {
+            client
+                .batch_execute(migration.sql)
+                .await
+                .expect("apply the shipped DDL into the neighbour");
+        }
+
+        // This schema: the empty ledger and nothing else, on a search path that
+        // reaches the neighbour's tables.
+        fixture
+            .observe()
+            .await
+            .batch_execute(
+                "CREATE TABLE axond_cp_schema_migration (
+                     version     integer     PRIMARY KEY,
+                     name        text        NOT NULL,
+                     checksum    text        NOT NULL,
+                     applied_at  timestamptz NOT NULL DEFAULT now()
+                 )",
+            )
+            .await
+            .expect("create an empty ledger");
+        let config = Config::from_toml_str(
+            "mode = \"stateful\"\n\
+             [control_plane]\n\
+             dsn_env = \"GW_CONTROL_PLANE_DSN\"\n\
+             [secret_store]\n\
+             kek_env = \"GW_KEK\"\n\
+             [[admin_breakglass]]\n\
+             env = \"GW_BREAKGLASS\"\n",
+        )
+        .expect("valid stateful config without a schema of its own");
+        let separator = if fixture.dsn.contains('?') { '&' } else { '?' };
+        let env = HashMap::from([(
+            "GW_CONTROL_PLANE_DSN".to_owned(),
+            format!(
+                "{}{separator}options=-c%20search_path%3D{},{neighbour}",
+                fixture.dsn, fixture.schema
+            ),
+        )]);
+
+        let error = adopt(&config, &env)
+            .await
+            .expect_err("a neighbour's tables are not this schema's baseline");
+        assert!(
+            matches!(error, OpsError::Refused { .. }) && !error.is_retryable(),
+            "an operator decision, not an outage: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("drop the empty"),
+            "the refusal is the one for a database where nothing was applied: {error}"
+        );
+        assert!(
+            fixture.ledger().await.is_empty(),
+            "a baseline was recorded for objects that live in another schema"
+        );
+    }
+
     /// The commands create neither the database nor the schema, so a configured
     /// `[control_plane] schema` that does not exist is an operator error — and
     /// `SET search_path` accepts a missing schema, so it arrives as the server

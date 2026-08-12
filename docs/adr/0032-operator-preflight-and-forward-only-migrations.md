@@ -134,9 +134,23 @@ ledger row for DDL it did not run:
   — so a migration that adds a table cannot ship without adoption looking for it.
   No object present is a refusal (nothing was applied: drop the ledger and
   `apply`); a partly-present migration is a refusal naming the missing tables
-  (neither applied nor unapplied is true); a migration that declares no table is a
-  refusal, because an `ALTER`-only or backfill migration is precisely the one whose
-  effect the catalogue cannot report, and adopting it would be recording a guess.
+  (neither applied nor unapplied is true). The probe is qualified to
+  `current_schema()` — the schema an `apply` would create these tables in — rather
+  than resolved down the DSN's `search_path`, so a second install's journal in
+  `public` is not read as evidence about this one.
+- **A migration that declares no table blocks adoption of the database entirely,**
+  wherever in the shipped history it sits, including the versions below it. That is
+  fail-closed on purpose, and it is the position this decision commits to: adopting
+  only the prefix underneath would leave the ledger reporting the unobservable
+  version as *pending*, so the next `apply` would run it — over a schema that may
+  already have had it applied out of band. An `ALTER`-only or backfill migration is
+  both the one whose effect the catalogue cannot report *and* the one whose rerun is
+  destructive, so there is no ledger row that accounts for the objects and also
+  keeps `apply` away from it. Shipping such a migration therefore withdraws `adopt`,
+  and stating that history stays the operator's own `INSERT`; the refusal says so.
+  A shipped migration that declares no table is asserted against in
+  `a_migrations_declared_tables_are_read_out_of_the_shipped_ddl`, so this arrives as
+  a deliberate release decision rather than a surprise in the field.
 - **It executes no migration SQL at all**, which is what makes it safe against a
   database that already has the objects, whether or not the shipped statements are
   idempotent — the property the hand-`INSERT` path shared but the drop-and-replay
@@ -151,8 +165,7 @@ ledger row for DDL it did not run:
 Unchanged: `preflight` and `status` still cannot write, the classifications are the
 same, an empty ledger is still a refusal for `status`, `apply`, and boot, and
 recording the baseline by hand still works and is classified identically. `adopt`
-is the checked version of that `INSERT`, not a new policy — and stating a baseline
-for an unobservable migration remains the operator's own `INSERT` to make.
+is the checked version of that `INSERT`, not a new policy.
 
 State tier: unchanged. Tier 2 only where the config already selected it.
 
