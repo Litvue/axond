@@ -5,7 +5,7 @@ default:
 
 # Format, lint (warnings = errors), test, docs, supply-chain, and release
 # packaging — the CI gates.
-check: fmt-check clippy test docs deny publish-dry-run
+check: fmt-check clippy test docs deny publish-dry-run msrv api-compat
 
 fmt:
     cargo fmt --all
@@ -30,6 +30,17 @@ docs-check:
     docker compose --env-file ops/compose/env.example config --quiet
     docker compose --env-file ops/compose/env.example -f docker-compose.yml -f docker-compose.build.yml config --quiet
     AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml docker compose --env-file ops/compose/env.example -f docker-compose.yml -f docker-compose.stateful.yml --profile stateful config --quiet
+
+# The declared MSRV floor: policy consistency, then a build on that toolchain.
+# Installs the floor toolchain through rustup; the pinned newer toolchain in
+# rust-toolchain.toml is untouched.
+msrv:
+    ops/msrv-gate.sh
+
+# Public Rust API compatibility for the published library crates, against the
+# versions on crates.io. Needs cargo-semver-checks and network.
+api-compat:
+    ops/api-compat.py
 
 # Supply-chain policy: advisories, licenses, sources (see deny.toml).
 deny:

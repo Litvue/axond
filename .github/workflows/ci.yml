@@ -45,6 +45,43 @@ jobs:
           cache-targets: false
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+  # The pinned lanes above build on 1.97.1; consumers are only promised the
+  # declared MSRV floor, so that floor is built separately rather than assumed.
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - name: Check the declared MSRV and the toolchain declarations that track it
+        run: ops/msrv-gate.sh
+
+  # The published library crates' Rust API, compared against what is already on
+  # crates.io. Blocking: an intentional break needs a reviewed entry in
+  # ops/api-compat-overrides.toml.
+  api-compat:
+    name: Public API compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - name: Install pinned semver tooling
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks@0.50.0
+      - name: Compare the published library crates against crates.io
+        run: ops/api-compat.py
+
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -289,6 +326,8 @@ jobs:
     needs:
       - fmt
       - clippy
+      - msrv
+      - api-compat
       - build
       - tests
       - stateful-tests
@@ -305,6 +344,8 @@ jobs:
         run: |
           test "${{ needs.fmt.result }}" = success
           test "${{ needs.clippy.result }}" = success
+          test "${{ needs.msrv.result }}" = success
+          test "${{ needs.api-compat.result }}" = success
           test "${{ needs.build.result }}" = success
           test "${{ needs.tests.result }}" = success
           test "${{ needs.stateful-tests.result }}" = success

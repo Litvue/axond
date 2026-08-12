@@ -1,0 +1,26 @@
+# Reviewed overrides for the public-API compatibility gate (`ops/api-compat.py`).
+#
+# The gate is blocking: a public API break in `gateway-core` or
+# `gateway-transport`, measured against the version already on crates.io, fails
+# CI. An entry here is the *only* way past it, and it is a review artifact rather
+# than a switch — it names one crate, one published baseline, and the review that
+# accepted the break.
+#
+# An override applies only while `baseline` is still the published baseline. Once
+# a release ships the break, the entry stops matching and cannot hide a later
+# break; the gate then prints that it can be removed.
+#
+# There are deliberately no wildcard, per-lint, or "allow everything" forms.
+#
+# [[break]]
+# crate = "gateway-core"
+# # The crates.io version the break is measured against, exactly as the gate
+# # reports it.
+# baseline = "0.3.12"
+# # What broke, and why the break is worth an operator's migration.
+# justification = "..."
+# # The pull request or ADR where the break was reviewed and accepted.
+# reviewed_in = "https://github.com/Litvue/axond/pull/0"
+#
+# Process, including the required changelog and minor-bump handling:
+# docs/maintainers/releasing.md#public-api-compatibility.

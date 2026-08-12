@@ -28,6 +28,9 @@ release resumes at the first missing crate.
 - `CARGO_REGISTRY_TOKEN` in the protected `crates-io` environment.
 - Actions permission to create pull requests.
 - `CI Success` required on `main`.
+- Private vulnerability reporting enabled on the repository, so the
+  [`SECURITY.md`](../../SECURITY.md) advisory link works and reports do not
+  arrive as public issues.
 - `packages: write`, `id-token: write`, and attestation permissions in the
   release jobs.
 
@@ -89,6 +92,69 @@ dependency order and resumes safely.
 Never modify a packaged tarball at an existing version. If a published version
 is broken, yank all affected crates in reverse dependency order and ship a new
 patch release.
+
+## Public API compatibility
+
+The `api-compat` lane runs [`ops/api-compat.py`](../../ops/api-compat.py), which
+compares each published *library* crate — `gateway-core` and
+`gateway-transport`; the binary-only `axond` has no Rust API surface — against
+the version already on crates.io with `cargo-semver-checks` (pinned in
+`ci.yml`). It is blocking, and there are no allow rules or per-lint bypasses.
+
+Run it before pushing an API change:
+
+```bash
+just api-compat            # or: ops/api-compat.py gateway-core
+```
+
+When the break is unintended, fix the API. When it is intended:
+
+1. Confirm the break is worth it against
+   [`docs/compatibility.md`](../compatibility.md#the-published-rust-api) — pre-1.0,
+   a break is a **minor** bump, so it cannot ride in a patch.
+2. Add one entry to
+   [`ops/api-compat-overrides.toml`](../../ops/api-compat-overrides.toml) with the
+   crate, the published `baseline` exactly as the gate reports it, the
+   justification, and `reviewed_in` pointing at this pull request or an ADR.
+   Reviewers are approving that entry, not a switch.
+3. Use a `feat!:`/`fix!:` (breaking) Conventional Commit title so release-please
+   takes the minor bump, and describe the migration in the changelog body.
+4. After the release, delete the entry — the gate prints that it no longer
+   applies, because the break is now part of the baseline. An override only ever
+   matches the one baseline it names, so a forgotten entry cannot mask the next
+   break.
+
+If the lane fails without reaching a comparison (no registry access, a build
+error, a crate that has never been published), it reports that instead of a
+break; fix the invocation rather than adding an override.
+
+## Rust version floor
+
+The MSRV is `rust-version` in `[workspace.package]`, and the `msrv` lane runs
+[`ops/msrv-gate.sh`](../../ops/msrv-gate.sh): it builds the workspace on the
+first patch of that minor and refuses drift between `Cargo.toml`,
+`rust-toolchain.toml`, the `Dockerfile`, and the crate manifests. The pinned
+`1.97.1` lanes are unchanged by it — the floor is proved in its own lane rather
+than by weakening the stable one.
+
+To raise the floor, in one PR: bump `rust-version`, bump `rust-toolchain.toml`
+and the `Dockerfile` stage if they now trail it, update the `toolchain:` pins in
+the workflows, update the table in
+[`docs/compatibility.md`](../compatibility.md#the-rust-version-floor-msrv), and
+land it as a **minor** release with a changelog entry that says why. To raise
+only the pinned developer toolchain, bump `rust-toolchain.toml` and the workflow
+pins and leave `rust-version` alone; the `msrv` lane then keeps proving the older
+floor still builds.
+
+## Security releases
+
+A security fix uses this same runbook — same required CI, signed artifacts, and
+attestations — with the additions in [`SECURITY.md`](../../SECURITY.md): a
+regression test that failed before the fix, a backport to the previous supported
+minor when it is affected, the GitHub Security Advisory published with a
+requested CVE and the affected/fixed ranges, and a changelog entry referencing
+the advisory. Do not fold a security fix into an unrelated large release; ship it
+on its own so the advisory maps to one version.
 
 ## Verification
 
