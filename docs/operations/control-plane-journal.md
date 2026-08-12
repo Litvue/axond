@@ -264,9 +264,11 @@ outcomes need different responses:
 - **Incompatible (`stored revision … is not compatible with this build`).** The
   rows add up and this build cannot read them: a body whose schema identifier or
   field set belongs to a newer release, a tenant or project body written before
-  those bodies were typed, or a row — or a whole revision — written under an
-  encoding version this build does not canonicalize with, which a restored backup
-  holding rows from two builds produces. **This is not corruption, and nothing about the database needs
+  those bodies were typed, or a row — or a whole revision — naming a canonical
+  encoding version this build does not write, whether or not this build knows that
+  version's name, which a restored backup holding rows from two builds produces.
+  (A serializer column naming no version of this encoding at all is unreadable
+  storage, below.) **This is not corruption, and nothing about the database needs
   repairing.** It is reported separately for exactly that reason, and convergence
   reports it as reason `incompatible`. The replica keeps serving the revision it
   already holds. Roll the replica onto a build that reads the revision, or publish

@@ -55,6 +55,13 @@ impl SerializerVersion {
     /// be confused with another format's bytes that happen to collide.
     const MAGIC: &'static [u8] = b"axond.desired-state\0";
 
+    /// What every version of this encoding is named after.
+    ///
+    /// A stored name this build does not know but that belongs to this family is
+    /// a version it has not learned yet — a skew — while any other text is
+    /// something no release ever wrote.
+    pub const FAMILY: &'static str = "axond.desired-state.v";
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::V1 => "axond.desired-state.v1",

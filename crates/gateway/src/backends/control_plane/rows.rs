@@ -84,7 +84,19 @@ pub(super) fn serializer(text: &str) -> Result<SerializerVersion, IntegrityError
         .iter()
         .copied()
         .find(|version| version.as_str() == text)
-        .ok_or_else(|| unreadable(format!("`{text}` is not a canonical serializer")))
+        .ok_or_else(|| {
+            // A name from this encoding's family that this build does not know is a
+            // version it has not learned — the same verdict a known-but-older
+            // version gets — while any other text is a value no release wrote.
+            if text.starts_with(SerializerVersion::FAMILY) {
+                IntegrityError::UnknownSerializer {
+                    stored: text.to_owned(),
+                    current: SerializerVersion::default(),
+                }
+            } else {
+                unreadable(format!("`{text}` is not a canonical serializer"))
+            }
+        })
 }
 
 /// Parse a typed id from its prefixed text form.
@@ -281,6 +293,32 @@ mod tests {
 
     fn uuid(seed: u64) -> Uuid7 {
         Uuid7::from_parts(seed, 0, seed).expect("seed in range")
+    }
+
+    /// The row says which encoding wrote it, and a name from this family that
+    /// this build does not know is a build behind the writer — the verdict a
+    /// *known* older version already gets — not a journal to repair. Text from no
+    /// family at all is the other thing, and stays so.
+    #[test]
+    fn an_encoding_this_build_has_not_learned_is_a_skew_and_not_a_repair() {
+        assert_eq!(
+            serializer(SerializerVersion::default().as_str()).expect("the shipped encoding"),
+            SerializerVersion::default()
+        );
+
+        let newer = serializer("axond.desired-state.v2").expect_err("a version this build lacks");
+        assert!(
+            matches!(&newer, IntegrityError::UnknownSerializer { stored, .. } if stored == "axond.desired-state.v2"),
+            "{newer:?}"
+        );
+        assert!(newer.is_incompatible());
+
+        let nonsense = serializer("json").expect_err("not this encoding at all");
+        assert!(
+            matches!(nonsense, IntegrityError::Unreadable { .. }),
+            "{nonsense:?}"
+        );
+        assert!(!nonsense.is_incompatible());
     }
 
     /// Every discriminant this module writes has to be a value the shipped DDL

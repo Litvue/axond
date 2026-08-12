@@ -404,6 +404,14 @@ pub enum IntegrityError {
         stored: SerializerVersion,
         current: SerializerVersion,
     },
+    #[error(
+        "stored serializer `{stored}` is a canonical encoding this build does not know; \
+         it canonicalizes with `{current}`"
+    )]
+    UnknownSerializer {
+        stored: String,
+        current: SerializerVersion,
+    },
     #[error("revision checksum is {expected}, but the loaded state hashes to {actual}")]
     ChecksumMismatch {
         expected: Checksum,
@@ -475,7 +483,10 @@ impl IntegrityError {
     /// arms of their own, so one revision cannot be reported as an incompatibility
     /// at one layer and as corruption at the next.
     pub const fn is_incompatible(&self) -> bool {
-        matches!(self, Self::Incompatible(_) | Self::Serializer { .. })
+        matches!(
+            self,
+            Self::Incompatible(_) | Self::Serializer { .. } | Self::UnknownSerializer { .. }
+        )
     }
 }
 
