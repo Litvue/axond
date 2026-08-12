@@ -24,6 +24,24 @@ deployment unit. Read the release's `CHANGELOG.md` entry before every rollout.
 6. Verify ingress streaming behavior and client retries.
 7. Retain the old artifact and old configuration for rollback where compatible.
 
+In stateful mode the new binary owns the control-plane half of that list. Run
+these from the new artifact, with the fleet still on the old one:
+
+```bash
+axond migrate status --config /etc/axond/axond.toml   # read-only: what would apply?
+axond migrate apply  --config /etc/axond/axond.toml   # forward-only, idempotent
+axond check preflight --config /etc/axond/axond.toml  # read-only: would a replica boot?
+```
+
+`status` and `preflight` cannot write to a database, so they are safe against
+production at any time, including from a canary host. `apply` is the only mutation,
+and it is safe before replicas start and while they are starting. All three exit
+non-zero when the deployment is not ready, so a rollout can gate on them. The
+ordering and the full state table are in
+[the control-plane journal](control-plane-journal.md#operator-commands): a schema
+reported *Ahead*, *Drifted*, *Incomplete*, *Renamed*, or *Malformed* stops the
+rollout rather than being migrated over.
+
 ## Ordinary rolling upgrade
 
 An upgrade with no state-layout or configuration break can roll replicas behind
