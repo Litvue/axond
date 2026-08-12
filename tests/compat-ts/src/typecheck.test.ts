@@ -8,6 +8,10 @@
  * passing as `any`. A compiler that is silently no longer enforcing that would
  * leave every test here green, so the negative cases in `../negative` are
  * compiled on purpose and required to fail.
+ *
+ * A declaration failure is a fact about the SDK release, not about the gateway,
+ * so `scripts/typecheck.mjs` must say so rather than leaving raw `tsc` paths to be
+ * read as a wire regression. That diagnostic is asserted here too.
  */
 
 import assert from "node:assert/strict";
@@ -23,8 +27,8 @@ interface Compilation {
 }
 
 function compile(project: string): Promise<Compilation> {
-  const tsc = join(PROJECT, "node_modules/typescript/bin/tsc");
-  const child = spawn(process.execPath, [tsc, "--project", project], {
+  const wrapper = join(PROJECT, "scripts/typecheck.mjs");
+  const child = spawn(process.execPath, [wrapper, "--project", project], {
     cwd: PROJECT,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -46,4 +50,11 @@ test("the SDKs' declarations are enforced, not trusted", { timeout: 120_000 }, a
   // And a call the SDK's own definition rejects.
   assert.match(output, /cases\.ts.*error TS/s);
   assert.match(output, /messages/);
+
+  // The build must name the half that failed: a declaration error means no
+  // request was ever made, which is not a wire regression to go hunting for.
+  assert.match(output, /not in axond's wire\s+behaviour/);
+  assert.match(output, /broken-declaration\.d\.ts/);
+  assert.match(output, /skipLibCheck/);
+  assert.match(output, /also errors in this lane's own code/);
 });

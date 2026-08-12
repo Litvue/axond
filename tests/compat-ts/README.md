@@ -70,6 +70,30 @@ npm test
 
 Prefer a release at least a week old, the same rule the Python lockfile follows.
 
+### When a bump fails, read which half failed
+
+Because the SDKs' declarations are checked rather than trusted, a bump can fail
+before any request is made. `npm run build` says which it was, so a declaration
+problem is not mistaken for a wire regression:
+
+```text
+compat-ts: the failure is in shipped type declarations, not in axond's wire
+behaviour — no request was made. Declarations at fault:
+  node_modules/openai/src/foo.d.ts
+```
+
+That is a fact about the SDK release. The usual cause is an optional peer the SDK
+now references from its public types (`zod`, say) that this lane does not install;
+the fix is to install that peer at an exact version, not to turn on
+`skipLibCheck`. The other wording names the opposite case:
+
+```text
+compat-ts: a call this lane makes is rejected by the SDKs' own types.
+```
+
+There the claim under test really did move — either the gateway's shape or the
+SDK's description of it — and the tests below the build are the ones to read.
+
 ## Scope
 
 Go is deliberately **not** covered: the Go SDKs' surface for these routes adds no
