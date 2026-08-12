@@ -24,17 +24,38 @@ configured_platform() {
   # Prints the effective platform, or nothing when the service is unpinned.
   # `env` rather than a prefix assignment, so "unset" and "set but empty" stay
   # distinguishable and neither leaks into the next case.
+  #
+  # A Compose failure must not read as "unpinned": both produce no `platform:`
+  # line, and two of the assertions below expect exactly that. So the render is
+  # captured and its status checked before anything is matched.
   local mode="$1"
   shift
+  local rendered
   if [[ "$mode" == unset ]]; then
-    env -u AXOND_PLATFORM "$@" config
+    rendered="$(env -u AXOND_PLATFORM "$@" config 2>&1)" || {
+      printf 'compose platform check failed: compose config errored with AXOND_PLATFORM unset:\n%s\n' \
+        "$rendered" >&2
+      return 1
+    }
   else
-    env AXOND_PLATFORM="$mode" "$@" config
-  fi | sed -n 's/^[[:space:]]*platform:[[:space:]]*\(.*\)$/\1/p'
+    rendered="$(env AXOND_PLATFORM="$mode" "$@" config 2>&1)" || {
+      printf 'compose platform check failed: compose config errored with AXOND_PLATFORM=%s:\n%s\n' \
+        "$mode" "$rendered" >&2
+      return 1
+    }
+  fi
+  printf '%s\n' "$rendered" |
+    sed -n 's/^[[:space:]]*platform:[[:space:]]*\(.*\)$/\1/p'
 }
 
 expect_platform() {
-  local label="$1" expected="$2" actual="$3"
+  # Runs the render itself rather than taking its output: a command substitution
+  # used as an argument discards its exit status, so a failing Compose invocation
+  # would arrive here as an empty string and pass the two "unpinned" cases.
+  local label="$1" expected="$2" mode="$3"
+  shift 3
+  local actual
+  actual="$(configured_platform "$mode" "$@")"
   if [[ "$actual" != "$expected" ]]; then
     printf 'compose platform check failed: %s resolved to %s, expected %s\n' \
       "$label" "${actual:-<unpinned>}" "${expected:-<unpinned>}" >&2
@@ -50,26 +71,26 @@ declared_default="$(
 
 # 1. Unset: the file's own default applies. With an amd64-only pinned tag that is
 #    `linux/amd64`, which an ARM host runs under emulation instead of failing.
-expect_platform "quickstart, AXOND_PLATFORM unset" \
-  "$declared_default" "$(configured_platform unset "${compose[@]}")"
+expect_platform "quickstart, AXOND_PLATFORM unset" "$declared_default" \
+  unset "${compose[@]}"
 
 # 2. Set but empty: no pin, so Docker resolves the native child of an index. This
 #    is what an ARM host uses once a multi-architecture tag or digest is pinned.
-expect_platform "quickstart, AXOND_PLATFORM= (multi-arch native)" \
-  "" "$(configured_platform "" "${compose[@]}")"
+expect_platform "quickstart, AXOND_PLATFORM= (multi-arch native)" "" \
+  "" "${compose[@]}"
 
 # 3. Explicit: force one platform, emulated if the host differs.
 for platform in linux/amd64 linux/arm64; do
   expect_platform "quickstart, AXOND_PLATFORM=$platform" "$platform" \
-    "$(configured_platform "$platform" "${compose[@]}")"
+    "$platform" "${compose[@]}"
 done
 
 # 4. A source build is not limited by the last release's platforms: the
 #    Dockerfile builds either architecture natively, so it must not inherit the
 #    quickstart's fallback.
-expect_platform "source build, AXOND_PLATFORM unset" \
-  "" "$(configured_platform unset "${compose[@]}" "${build_overlay[@]}")"
+expect_platform "source build, AXOND_PLATFORM unset" "" \
+  unset "${compose[@]}" "${build_overlay[@]}"
 expect_platform "source build, AXOND_PLATFORM=linux/arm64" "linux/arm64" \
-  "$(configured_platform linux/arm64 "${compose[@]}" "${build_overlay[@]}")"
+  linux/arm64 "${compose[@]}" "${build_overlay[@]}"
 
 echo "compose platform checks passed"

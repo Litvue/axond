@@ -103,9 +103,14 @@ with the existing tag as `release_tag`. The reviewed workflow definition comes
 from `main`, while every artifact lane checks out and verifies the immutable
 tag.
 
-The preflight requires the tag's `Dockerfile` and `ops/docker-smoke.sh`.
-crates.io publication is enabled only if the tag also contains
-`ops/publish-crates.sh`; older tags skip that lane explicitly.
+The preflight requires the tag's `Dockerfile`, `ops/docker-smoke.sh`,
+`ops/publish-image-index.sh`, and `ops/verify-image-evidence.sh`: the image lanes
+publish a multi-architecture index and verify its evidence, and neither can be
+done with a tag that does not carry those scripts. So a tag cut before ARM support
+cannot be repaired through this dispatch path — dispatch the workflow **from that
+tag** instead, where its own definition and scripts are used. crates.io
+publication is enabled only if the tag also contains `ops/publish-crates.sh`;
+older tags skip that lane explicitly.
 
 ```bash
 gh workflow run .github/workflows/release-please.yml \
