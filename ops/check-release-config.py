@@ -253,29 +253,43 @@ def check_release_success(text: str) -> list[str]:
     return failures
 
 
-def check_compose_platform() -> list[str]:
-    """The quickstart's platform default must match what its pinned tag can serve."""
+def check_compose_platform(notes: list[str]) -> list[str]:
+    """The quickstart's platform default must match what its pinned tag can serve.
+
+    Only one direction can be an error. While the pinned tag is amd64-only,
+    removing the fallback breaks ARM hosts outright, so its presence is required.
+    Once the tag is multi-architecture the fallback is merely suboptimal — ARM
+    keeps working, emulated — and it cannot be a failure: release-please bumps
+    that tag inside its own generated release pull request and never touches the
+    `platform:` line, so failing here would fail the release PR with no edit that
+    could have landed beforehand. It is reported as a note instead, and
+    docs/maintainers/releasing.md carries it as a post-release step.
+    """
     failures: list[str] = []
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     pinned = re.search(r"image: \$\{AXOND_IMAGE:-ghcr\.io/litvue/axond:([0-9.]+)\}", compose)
     if pinned is None:
         return ["docker-compose.yml: could not read the pinned quickstart image tag"]
     version = tuple(int(part) for part in pinned.group(1).split("."))
-    multi_arch_tag = version > LAST_AMD64_ONLY_VERSION
-    wanted = NATIVE_PLATFORM if multi_arch_tag else AMD64_FALLBACK_PLATFORM
-    if wanted not in compose:
-        if multi_arch_tag:
-            failures.append(
-                f"docker-compose.yml: the pinned tag {pinned.group(1)} is a "
-                "multi-architecture release, so the amd64 emulation fallback is "
-                f"obsolete; use `{NATIVE_PLATFORM}` so ARM hosts resolve natively"
+    if version > LAST_AMD64_ONLY_VERSION:
+        if AMD64_FALLBACK_PLATFORM in compose:
+            notes.append(
+                f"docker-compose.yml: the pinned tag {pinned.group(1)} publishes a "
+                "multi-architecture image, so the amd64 fallback now only forces "
+                f"emulation on ARM hosts; switch to `{NATIVE_PLATFORM}` and bump "
+                f"LAST_AMD64_ONLY_VERSION to {pinned.group(1)}"
             )
-        else:
+        elif NATIVE_PLATFORM not in compose:
             failures.append(
-                f"docker-compose.yml: the pinned tag {pinned.group(1)} is "
-                "amd64-only, so the quickstart must keep "
-                f"`{AMD64_FALLBACK_PLATFORM}` for ARM hosts to run it at all"
+                "docker-compose.yml: the quickstart platform default is neither "
+                f"`{AMD64_FALLBACK_PLATFORM}` nor `{NATIVE_PLATFORM}`"
             )
+    elif AMD64_FALLBACK_PLATFORM not in compose:
+        failures.append(
+            f"docker-compose.yml: the pinned tag {pinned.group(1)} is "
+            "amd64-only, so the quickstart must keep "
+            f"`{AMD64_FALLBACK_PLATFORM}` for ARM hosts to run it at all"
+        )
     # A source build is never limited by the last release's platforms.
     build_overlay = (ROOT / "docker-compose.build.yml").read_text(encoding="utf-8")
     if NATIVE_PLATFORM not in build_overlay:
@@ -351,15 +365,18 @@ def check_documented_matrix() -> list[str]:
 
 def main() -> int:
     text = workflow_text()
+    notes: list[str] = []
     failures: list[str] = []
     failures.extend(check_binary_matrix(text))
     failures.extend(check_binary_gates(text))
     failures.extend(check_image_matrix(text))
     failures.extend(check_image_gates(text))
     failures.extend(check_release_success(text))
-    failures.extend(check_compose_platform())
+    failures.extend(check_compose_platform(notes))
     failures.extend(check_no_latest_tag(text))
     failures.extend(check_documented_matrix())
+    for note in notes:
+        print(f"release configuration note: {note}", file=sys.stderr)
     if failures:
         for failure in failures:
             print(f"release configuration check failed: {failure}", file=sys.stderr)

@@ -124,9 +124,12 @@ The Compose quickstart pins a release tag, so it cannot become multi-architectur
 before the release does. Its `platform:` default therefore stays
 `linux/amd64` — overridable through `AXOND_PLATFORM` — while the pinned tag is an
 amd64-only release, so an ARM host keeps running it under emulation instead of
-failing to pull an image with no ARM child. The validator below flips that
-requirement the moment the pinned tag moves past the last amd64-only version, so
-the fallback cannot outlive its reason.
+failing to pull an image with no ARM child. The validator below requires that
+fallback while the pinned tag is amd64-only, and asks for its removal — as a
+note, not a failure — once the tag moves past the last amd64-only version:
+release-please rewrites that tag inside its own release pull request and never
+touches the `platform:` line, so a failure there would block the release itself.
+Dropping the fallback is therefore a documented post-release step.
 
 Because the release matrix is only exercised for real at a tag,
 `ops/check-release-config.py` asserts its shape on every change: the published

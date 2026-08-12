@@ -35,9 +35,12 @@ AXOND_IMAGE=ghcr.io/litvue/axond@sha256:<verified-index-digest> \
 The source-build overlay (`docker-compose.build.yml`) has no fallback to keep: it
 builds natively on either architecture unless `AXOND_PLATFORM` forces one.
 
-The amd64 fallback is temporary by construction —
-`ops/check-release-config.py` fails once the pinned tag is a multi-architecture
-release and the default has not been dropped.
+The amd64 fallback is temporary by construction. `ops/check-release-config.py`
+*requires* it while the pinned tag is amd64-only, and once that tag publishes an
+index it prints a note asking for the default to be dropped — a note rather than
+a failure, because release-please bumps the tag inside its own release pull
+request. Dropping it is a post-release step in
+[releasing.md](../maintainers/releasing.md).
 
 ## Pull-first Tier 0
 
