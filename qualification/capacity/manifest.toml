@@ -1,0 +1,135 @@
+# The committed capacity manifest: every input the capacity harness reads.
+#
+# A run is reproducible from this file plus the committed fixtures and the
+# binary the workspace builds — the driver records the hash of all three in each
+# result artifact (see docs/operations/capacity.md and ADR 0033).
+#
+# Each profile ships two scales. `reduced` runs inside `cargo test` on every
+# change; `heavy` is the same code and the same assertions at a scale that needs
+# a dedicated runner, and only runs from the `capacity` workflow.
+#
+# `thresholds` are the hard failures. They are deliberately restricted to
+# properties that do not move with the machine: how many requests were accepted,
+# whether anything leaked, whether the accounting settled. Throughput, latency,
+# and TTFT are *recorded* and never asserted — a shared CI runner cannot bound
+# them without flaking.
+
+schema_version = 1
+
+# `workload` selects a shape rotation the driver implements: a manifest cannot
+# describe load the harness does not have code for, which is what keeps a result
+# reproducible from the repository alone.
+
+[[profile]]
+id = "buffered"
+workload = "buffered"
+description = "Buffered chat completions from the committed OpenAI fixture."
+
+[profile.reduced]
+concurrency = 8
+requests = 160
+
+[profile.heavy]
+concurrency = 128
+requests = 40000
+
+[profile.thresholds]
+min_accepted_fraction = 1.0
+max_rejections = 0
+max_errors = 0
+max_missing_usage_records = 0
+max_leaked_upstream_streams = 0
+max_rss_growth_kib = 262144
+
+[[profile]]
+id = "streaming"
+workload = "streaming"
+description = "Long-lived SSE streams, paced by the fake upstream, read to completion."
+
+[profile.reduced]
+concurrency = 8
+requests = 48
+
+[profile.heavy]
+concurrency = 300
+requests = 8000
+
+[profile.thresholds]
+min_accepted_fraction = 1.0
+max_rejections = 0
+max_errors = 0
+max_missing_usage_records = 0
+max_leaked_upstream_streams = 0
+max_rss_growth_kib = 262144
+
+[[profile]]
+id = "mixed"
+workload = "mixed"
+description = """
+Rotation over both wire families, four routes, two providers, and a \
+two-credential pool per provider, with buffered and streamed requests \
+interleaved."""
+
+[profile.reduced]
+concurrency = 8
+requests = 120
+
+[profile.heavy]
+concurrency = 128
+requests = 12000
+
+[profile.thresholds]
+min_accepted_fraction = 1.0
+max_rejections = 0
+max_errors = 0
+max_missing_usage_records = 0
+max_leaked_upstream_streams = 0
+max_rss_growth_kib = 262144
+
+[[profile]]
+id = "response-size"
+workload = "response_size"
+description = "Buffered answers rotating over 1 KiB, 32 KiB, and 256 KiB bodies."
+
+[profile.reduced]
+concurrency = 8
+requests = 96
+
+[profile.heavy]
+concurrency = 64
+requests = 6000
+
+[profile.thresholds]
+min_accepted_fraction = 1.0
+max_rejections = 0
+max_errors = 0
+max_missing_usage_records = 0
+max_leaked_upstream_streams = 0
+max_rss_growth_kib = 262144
+
+[[profile]]
+id = "cancellation"
+workload = "cancellation"
+description = """
+Streams where every second caller hangs up mid-answer, which is the shape that \
+leaks an upstream socket or a permit when the cancellation path is wrong."""
+# Every second request hangs up once this many chunks carrying relayed output
+# have arrived, so a cancelled stream always charges a real partial.
+cancel_every = 2
+cancel_after_output_chunks = 2
+
+[profile.reduced]
+concurrency = 8
+requests = 48
+
+[profile.heavy]
+concurrency = 300
+requests = 8000
+
+[profile.thresholds]
+min_accepted_fraction = 1.0
+max_rejections = 0
+max_errors = 0
+max_missing_usage_records = 0
+max_leaked_upstream_streams = 0
+max_rss_growth_kib = 262144

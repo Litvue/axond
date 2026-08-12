@@ -58,7 +58,21 @@ pub mod target {
     /// A stream that keeps producing, slowly, for longer than a short failover
     /// budget: productive, so it must not be cut off.
     pub const LONG_STREAM: &str = "long-stream";
+    /// Buffered OpenAI chat answers of a fixed size, for a response-size sweep.
+    /// Unlike [`HUGE_BODY`] these are well-formed completions carrying usage, so
+    /// the size is the only variable: the request still settles a real charge.
+    pub const SIZED_BODY_SMALL: &str = "sized-body-1k";
+    pub const SIZED_BODY_MEDIUM: &str = "sized-body-32k";
+    pub const SIZED_BODY_LARGE: &str = "sized-body-256k";
 }
+
+/// Answer sizes [`target::SIZED_BODY_SMALL`] and friends serve, in bytes of
+/// completion text.
+pub const SIZED_BODIES: [(&str, usize); 3] = [
+    (target::SIZED_BODY_SMALL, 1024),
+    (target::SIZED_BODY_MEDIUM, 32 * 1024),
+    (target::SIZED_BODY_LARGE, 256 * 1024),
+];
 
 /// Long enough that the bound under test always fires first, short enough that
 /// a leaked task cannot outlive the suite.
@@ -324,6 +338,18 @@ async fn handle(
                 .insert("content-type", "application/json".parse().expect("static"));
             response
         }
+        target::SIZED_BODY_SMALL | target::SIZED_BODY_MEDIUM | target::SIZED_BODY_LARGE => {
+            let text = SIZED_BODIES
+                .iter()
+                .find_map(|(name, bytes)| (*name == model).then_some(*bytes))
+                .expect("a sized target has a size");
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                sized_completion(&model, text),
+            )
+                .into_response()
+        }
         target::HUGE_BODY => (
             StatusCode::OK,
             [("content-type", "application/json")],
@@ -436,7 +462,9 @@ fn split_events(bytes: &Bytes) -> Vec<Bytes> {
 
 /// A long stream of small events in the wire shape the route speaks, ending
 /// cleanly. Used to hold hundreds of streams open at once.
-fn slow_events(anthropic: bool, count: usize) -> Vec<Bytes> {
+/// Public so a test can assert against the bytes a client actually sees rather
+/// than a hand-written approximation of them.
+pub fn slow_events(anthropic: bool, count: usize) -> Vec<Bytes> {
     let mut chunks = Vec::new();
     if anthropic {
         chunks.push(event(
@@ -499,6 +527,28 @@ fn truncated_events(anthropic: bool) -> Vec<Bytes> {
     chunks.truncate(if anthropic { 4 } else { 2 });
     chunks.push(Bytes::from_static(b"data: {\"partial\": tr"));
     chunks
+}
+
+/// A well-formed buffered chat completion whose answer is `text_bytes` long,
+/// reporting usage proportional to the text so the settled charge is non-zero.
+fn sized_completion(model: &str, text_bytes: usize) -> String {
+    json!({
+        "id": "chatcmpl-sized",
+        "object": "chat.completion",
+        "created": 1_750_000_000u64,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "x".repeat(text_bytes) },
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": text_bytes / 4,
+            "total_tokens": 10 + text_bytes / 4,
+        },
+    })
+    .to_string()
 }
 
 fn event(name: &str, data: &Value) -> Bytes {
