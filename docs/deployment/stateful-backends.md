@@ -3,6 +3,14 @@
 Axond is config-only by default. Add Redis or Postgres only when a feature must
 coordinate replicas or survive process replacement.
 
+This guide covers the **stateless** operating mode: TOML owns every resource, and
+a backend below is an opt-in for one capability. "Stateful backend" here does not
+mean the stateful control plane accepted in
+[ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md), which moves
+resource ownership into Postgres behind `/admin/v1` and is not implemented yet.
+Redis is a hot-state backend in both modes and is never a durable store of
+record.
+
 ## Capability matrix
 
 | Need | Backend | Main cost |
@@ -128,4 +136,7 @@ Use `sslmode=require` in production DSNs. Axond uses rustls and webpki roots.
 
 See [Configuration](../configuration.md),
 [Observability](../observability.md), and
-[Upgrades](../operations/upgrades.md) for exact fields and rollout checks.
+[Upgrades](../operations/upgrades.md) for exact fields and rollout checks. For
+the planned separation of control-plane availability from data-plane
+availability, including the per-dependency outage matrix, read
+[ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md).

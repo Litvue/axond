@@ -166,6 +166,12 @@ selected controls exact/durable and therefore become availability and migration
 dependencies. The [stateful guide](./deployment/stateful-backends.md) contains
 the capability matrix, failure policy, and namespace-cap migration sequence.
 
+Every deployment described here runs the stateless operating mode, where TOML is
+the authority. The accepted design for an opt-in, Postgres-backed control plane
+(`/admin/v1`, immutable revisions, one snapshot per request) is
+[ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md); it is not
+implemented, and it changes nothing about the deployments above.
+
 ## Next steps
 
 - [Configuration reference](./configuration.md)
