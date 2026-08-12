@@ -2,7 +2,7 @@ services:
   axond:
     # Pull-first for evaluators. Development and CI add docker-compose.build.yml
     # to build the checked-out tree instead.
-    image: ${AXOND_IMAGE:-ghcr.io/litvue/axond:0.3.9} # x-release-please-version
+    image: ${AXOND_IMAGE:-ghcr.io/litvue/axond:0.3.10} # x-release-please-version
     # The public image and Dockerfile are linux/amd64 today. Declaring it makes
     # pulls and source builds deterministic on Apple Silicon via emulation.
     platform: linux/amd64
