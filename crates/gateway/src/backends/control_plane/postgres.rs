@@ -1895,6 +1895,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_declared_blob_whose_record_is_gone_is_named_not_dropped() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let (first, _, _) = three_revisions(&store).await;
+
+        // The blob record deleted from under the revisions that declare it. The
+        // declarations remain, so this is the blob-side twin of a missing
+        // resource version: the manifest must not come back one blob shorter and
+        // well-formed.
+        store
+            .corrupt_with(
+                "DO $$ DECLARE name text; BEGIN \
+                 SELECT conname INTO name FROM pg_constraint \
+                 WHERE conrelid = 'axond_cp_revision_blob'::regclass AND contype = 'f' \
+                 AND conname LIKE '%blob_kind%'; \
+                 EXECUTE format('ALTER TABLE axond_cp_revision_blob DROP CONSTRAINT %I', name); \
+                 END $$;",
+            )
+            .await;
+        store
+            .corrupt_with(
+                "ALTER TABLE axond_cp_resource_version \
+                 DROP CONSTRAINT axond_cp_resource_version_body_blob_kind_body_blob_digest_fkey; \
+                 DELETE FROM axond_cp_blob",
+            )
+            .await;
+
+        for error in [
+            store
+                .load_manifest(first.id)
+                .await
+                .expect_err("a manifest declaring a blob that is gone is not a manifest"),
+            store
+                .load_revision(first.id)
+                .await
+                .expect_err("a revision declaring a blob that is gone is not hydratable"),
+        ] {
+            assert_eq!(error.category(), FailureCategory::Corrupt);
+            let ControlPlaneError::Corrupt { source, .. } = &error else {
+                panic!("expected corruption, got {error:?}");
+            };
+            let IntegrityError::Unreadable { detail } = &**source else {
+                panic!("expected an unreadable row, got {error:?}");
+            };
+            assert!(detail.contains("no blob record"), "{detail}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_dependency_edge_that_leaves_the_revision_is_refused() {
         let Some((store, _, _)) = journal().await else {
             return;
@@ -2250,6 +2300,29 @@ mod tests {
             );
             assert!(error.to_string().contains(expected), "{error}");
         }
+
+        // The declared-bytes figure is the revision's real total, not however
+        // much of it was counted before the ceiling was crossed: an operator
+        // deciding where to put the bound is told the size they have to clear.
+        let declared = state()
+            .blobs()
+            .map(|blob| blob.size_bytes)
+            .sum::<u64>()
+            .to_string();
+        let bounded = bounded_store(
+            &dsn,
+            &schema,
+            HydrationLimits {
+                max_blob_bytes: 8,
+                ..HydrationLimits::default()
+            },
+        )
+        .await;
+        let error = bounded
+            .load_manifest(first.id)
+            .await
+            .expect_err("a revision past a bound must not hydrate");
+        assert!(error.to_string().contains(&declared), "{error}");
 
         // The candidate bound is the last line: a state that hydrated is still
         // refused if the value itself is larger than this build returns.

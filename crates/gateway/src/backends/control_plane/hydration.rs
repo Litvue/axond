@@ -340,11 +340,16 @@ async fn blob_references(
     limits: &HydrationLimits,
 ) -> Result<Vec<BlobRef>, ControlPlaneError> {
     let corrupt = |error: IntegrityError| ControlPlaneError::corrupt(id, error);
+    // Declarations are read from the revision's own rows and the blob record is
+    // joined onto them, for the reason `entry_references` does the same: an inner
+    // join would answer a revision whose blob record is gone with a *shorter*
+    // manifest, which is a damaged revision reported as a smaller well-formed
+    // one. A missing record is named instead.
     let rows = transaction
         .query(
-            "SELECT b.blob_kind, b.digest, b.size_bytes FROM axond_cp_revision_blob rb \
-             JOIN axond_cp_blob b USING (blob_kind, digest) WHERE rb.revision_id = $1 \
-             ORDER BY b.digest, b.blob_kind LIMIT $2",
+            "SELECT rb.blob_kind, rb.digest, b.size_bytes FROM axond_cp_revision_blob rb \
+             LEFT JOIN axond_cp_blob b USING (blob_kind, digest) WHERE rb.revision_id = $1 \
+             ORDER BY rb.digest, rb.blob_kind LIMIT $2",
             &[&id.to_string(), &HydrationLimits::probe(limits.max_blobs)],
         )
         .await
@@ -363,27 +368,36 @@ async fn blob_references(
     for row in &rows {
         let kind: String = row.get(0);
         let digest: String = row.get(1);
-        let size: i64 = row.get(2);
+        let size: Option<i64> = row.get(2);
+        let size = size.ok_or_else(|| {
+            corrupt(rows::unreadable(format!(
+                "blob {kind}/{digest} is declared by this revision but has no blob record"
+            )))
+        })?;
         let size_bytes = u64::try_from(size).map_err(|_| {
             corrupt(rows::unreadable(format!(
                 "blob {digest} has a negative size"
             )))
         })?;
+        // Summed across every row before comparing, so the figure an operator is
+        // told is the revision's real declared total rather than however much of
+        // it was counted before the ceiling was crossed. The row count is already
+        // bounded above, so summing first costs nothing.
         declared = declared.saturating_add(size_bytes);
-        if declared > limits.max_blob_bytes {
-            return Err(ControlPlaneError::too_large(
-                id,
-                HydrationLimit::BlobBytes {
-                    limit: limits.max_blob_bytes,
-                    observed: declared,
-                },
-            ));
-        }
         blobs.push(BlobRef {
             kind: rows::blob_kind(&kind).map_err(corrupt)?,
             digest: rows::checksum(&digest).map_err(corrupt)?,
             size_bytes,
         });
+    }
+    if declared > limits.max_blob_bytes {
+        return Err(ControlPlaneError::too_large(
+            id,
+            HydrationLimit::BlobBytes {
+                limit: limits.max_blob_bytes,
+                observed: declared,
+            },
+        ));
     }
     blobs.sort_by_key(|blob| blob.digest);
     Ok(blobs)
