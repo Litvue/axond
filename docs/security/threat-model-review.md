@@ -293,9 +293,16 @@ assembles it from child digests that were each smoked and signed already and
 asserts it carries exactly the supported platforms, it is staged under a
 non-operator-facing tag and booted by digest on both architectures, and only then
 is it retagged as `<version>`/`sha-<short>`, signed, attested, and re-verified by
-`ops/verify-image-evidence.sh`. A change that signs or tags the index before that
-boot is the regression this ordering exists to prevent, and
-`ops/check-release-config.py` fails on it. Section 7 of the
+`ops/verify-image-evidence.sh`. Promotion retags the smoked digest itself and
+runs every rejectable check before the first tag, because a registry tag cannot
+be withdrawn by a later failure. Which of the two it is doing is stated by
+`INDEX_MODE`, never inferred: promotion fails if the smoked digest is empty
+instead of degrading into an assemble-then-tag run, and staging refuses the
+operator-facing tags outright. A change that signs or tags the index before
+that boot is the regression this ordering exists to prevent:
+`ops/check-release-config.py` rejects the shape of it, and
+`ops/check-index-promotion.sh` drives the script against a stubbed registry to
+prove no tag is applied when a promotion check fails. Section 7 of the
 [security review](../security-review-2026-08-05.md) states that posture; a PR
 that changes any part of it says which part and why. A new job that needs
 `id-token: write`, `packages: write`, or attestation scopes justifies the scope

@@ -124,9 +124,12 @@ applied last: the index is staged under `sha-<short>-index`, pulled and booted b
 digest on an amd64 and an arm64 runner, and only then retagged, signed, attested,
 and named on the release. Publishing the operator-facing reference first would
 make the tag the documentation points at exist before anything had started the
-index, and a later smoke failure cannot unpublish a tag. The promotion retags the
-same children and asserts the result is the digest that was smoked, so the tags
-never advertise a second, unproven index. The index digest is itself signed and
+index, and a later smoke failure cannot unpublish a tag. The promotion assembles nothing: it
+asserts the smoked digest still holds exactly the release children and then
+retags that digest itself, so the tags cannot advertise a second, unproven index.
+Reassembling from the child tags and comparing digests afterwards would be too
+late — a child tag that moved in between would already have published
+`<version>`, and a registry tag cannot be retracted. The index digest is itself signed and
 carries a provenance attestation, and it is what
 `axond-image-<version>.digest` names on the release. SBOM attestations stay on
 the per-architecture children, where the packages are: an index has no
