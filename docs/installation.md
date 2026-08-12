@@ -26,11 +26,11 @@ and inspect `install.sh` or `install.ps1` first. Both support an explicit
 version and destination:
 
 ```bash
-AXOND_VERSION=0.3.6 AXOND_INSTALL_DIR=/usr/local/bin sh ./install.sh # x-release-please-version
+AXOND_VERSION=0.3.7 AXOND_INSTALL_DIR=/usr/local/bin sh ./install.sh # x-release-please-version
 ```
 
 ```powershell
-.\install.ps1 -Version 0.3.6 -InstallDir C:\Tools\axond # x-release-please-version
+.\install.ps1 -Version 0.3.7 -InstallDir C:\Tools\axond # x-release-please-version
 ```
 
 Supported installer targets match the release matrix: Linux x86-64 (static
@@ -65,7 +65,7 @@ axond --help
 Pin a deployment to an explicit version when reproducibility matters:
 
 ```bash
-AXOND_VERSION=0.3.6 # x-release-please-version
+AXOND_VERSION=0.3.7 # x-release-please-version
 cargo install axond --version "$AXOND_VERSION" --locked
 ```
 
@@ -94,7 +94,7 @@ Release archives are published for:
 Download and verify an archive:
 
 ```bash
-tag=v0.3.6 # x-release-please-version
+tag=v0.3.7 # x-release-please-version
 version="${tag#v}"
 target=x86_64-unknown-linux-musl
 
@@ -116,7 +116,7 @@ manager, and is currently published for `linux/amd64` only. There is no
 `latest` tag.
 
 ```bash
-AXOND_VERSION=0.3.6 # x-release-please-version
+AXOND_VERSION=0.3.7 # x-release-please-version
 image="ghcr.io/litvue/axond:${AXOND_VERSION}"
 docker pull "$image"
 digest="$(docker buildx imagetools inspect "$image" | \
