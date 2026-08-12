@@ -622,6 +622,8 @@ pub enum ModelField {
     KnowledgeCutoff,
     ReleaseDate,
     LastUpdated,
+    /// The offering's own endpoint metadata, when a provider states one.
+    Endpoint,
 }
 
 impl ModelField {
@@ -638,6 +640,7 @@ impl ModelField {
         Self::KnowledgeCutoff,
         Self::ReleaseDate,
         Self::LastUpdated,
+        Self::Endpoint,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -654,6 +657,7 @@ impl ModelField {
             Self::KnowledgeCutoff => "knowledge_cutoff",
             Self::ReleaseDate => "release_date",
             Self::LastUpdated => "last_updated",
+            Self::Endpoint => "endpoint",
         }
     }
 
@@ -867,6 +871,35 @@ impl Canonical for ProviderEndpoint {
     }
 }
 
+/// One field of a provider record, so a change can name what differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProviderField {
+    DisplayName,
+    DocUrl,
+    Endpoint,
+    /// The names of the environment variables the source says hold this
+    /// provider's credentials, in the order it published them.
+    EnvVars,
+}
+
+impl ProviderField {
+    pub const ALL: &'static [Self] = &[
+        Self::DisplayName,
+        Self::DocUrl,
+        Self::Endpoint,
+        Self::EnvVars,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DisplayName => "display_name",
+            Self::DocUrl => "doc_url",
+            Self::Endpoint => "endpoint",
+            Self::EnvVars => "env_vars",
+        }
+    }
+}
+
 /// A provider as the source describes it, without its models.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogProvider {
@@ -876,8 +909,41 @@ pub struct CatalogProvider {
     pub endpoint: ProviderEndpoint,
     /// The environment variables the source says hold this provider's
     /// credentials. Names only — this slice never reads them.
+    ///
+    /// A list rather than a set, and ordered as published, because upstream uses
+    /// the order: `google` lists three interchangeable keys
+    /// (`GOOGLE_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `GEMINI_API_KEY`) in
+    /// the order a client should prefer them, while `amazon-bedrock` lists four
+    /// variables that are read together. Credential discovery is a later slice
+    /// and will need that order, so a reordered `env` is an upstream edit this
+    /// records rather than noise it hides.
     pub env_vars: Vec<String>,
     pub pointer: JsonPointer,
+}
+
+impl CatalogProvider {
+    /// The fields on which two descriptions of the same provider differ.
+    ///
+    /// The same role [`ModelFacts::differences`] plays for models: one
+    /// comparison, so what the identity covers and what the diff reports cannot
+    /// drift apart.
+    pub fn differences(&self, other: &Self) -> Vec<ProviderField> {
+        let mut fields = Vec::new();
+        for (differs, field) in [
+            (
+                self.display_name != other.display_name,
+                ProviderField::DisplayName,
+            ),
+            (self.doc_url != other.doc_url, ProviderField::DocUrl),
+            (self.endpoint != other.endpoint, ProviderField::Endpoint),
+            (self.env_vars != other.env_vars, ProviderField::EnvVars),
+        ] {
+            if differs {
+                fields.push(field);
+            }
+        }
+        fields
+    }
 }
 
 impl Canonical for CatalogProvider {
@@ -1218,6 +1284,16 @@ fn first_duplicate<'a, T: PartialEq>(values: impl Iterator<Item = &'a T> + 'a) -
 /// applied implicitly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogChange {
+    ProviderAdded {
+        provider: ProviderId,
+    },
+    ProviderRemoved {
+        provider: ProviderId,
+    },
+    ProviderChanged {
+        provider: ProviderId,
+        fields: Vec<ProviderField>,
+    },
     ModelAdded {
         model: ModelId,
     },
@@ -1231,6 +1307,22 @@ pub enum CatalogChange {
     OfferingRemoved {
         model: ModelId,
         provider: ProviderId,
+    },
+    /// The provider-neutral record changed, gained values, or lost them.
+    ///
+    /// Reported separately from the offerings: neutral metadata is what an
+    /// offering's overrides are measured against, so an operator seeing an
+    /// override appear needs to know whether the provider moved or the neutral
+    /// record did.
+    NeutralChanged {
+        model: ModelId,
+        fields: Vec<ModelField>,
+    },
+    NeutralDescribed {
+        model: ModelId,
+    },
+    NeutralDropped {
+        model: ModelId,
     },
     LifecycleChanged {
         model: ModelId,
@@ -1259,23 +1351,37 @@ pub enum CatalogChange {
 }
 
 impl CatalogChange {
-    pub fn model(&self) -> &ModelId {
+    /// The model a change is about, or `None` for a provider-record change.
+    pub fn model(&self) -> Option<&ModelId> {
         match self {
+            Self::ProviderAdded { .. }
+            | Self::ProviderRemoved { .. }
+            | Self::ProviderChanged { .. } => None,
             Self::ModelAdded { model }
             | Self::ModelRemoved { model }
+            | Self::NeutralChanged { model, .. }
+            | Self::NeutralDescribed { model }
+            | Self::NeutralDropped { model }
             | Self::OfferingAdded { model, .. }
             | Self::OfferingRemoved { model, .. }
             | Self::LifecycleChanged { model, .. }
             | Self::CapabilitiesChanged { model, .. }
             | Self::MetadataChanged { model, .. }
-            | Self::PriceChanged { model, .. } => model,
+            | Self::PriceChanged { model, .. } => Some(model),
         }
     }
 
     pub fn provider(&self) -> Option<&ProviderId> {
         match self {
-            Self::ModelAdded { .. } | Self::ModelRemoved { .. } => None,
-            Self::OfferingAdded { provider, .. }
+            Self::ModelAdded { .. }
+            | Self::ModelRemoved { .. }
+            | Self::NeutralChanged { .. }
+            | Self::NeutralDescribed { .. }
+            | Self::NeutralDropped { .. } => None,
+            Self::ProviderAdded { provider }
+            | Self::ProviderRemoved { provider }
+            | Self::ProviderChanged { provider, .. }
+            | Self::OfferingAdded { provider, .. }
             | Self::OfferingRemoved { provider, .. }
             | Self::LifecycleChanged { provider, .. }
             | Self::CapabilitiesChanged { provider, .. }
@@ -1288,14 +1394,20 @@ impl CatalogChange {
     /// change kinds rather than of the traversal that produced them.
     const fn rank(&self) -> u8 {
         match self {
-            Self::ModelAdded { .. } => 0,
-            Self::ModelRemoved { .. } => 1,
-            Self::OfferingAdded { .. } => 2,
-            Self::OfferingRemoved { .. } => 3,
-            Self::LifecycleChanged { .. } => 4,
-            Self::CapabilitiesChanged { .. } => 5,
-            Self::MetadataChanged { .. } => 6,
-            Self::PriceChanged { .. } => 7,
+            Self::ProviderAdded { .. } => 0,
+            Self::ProviderRemoved { .. } => 1,
+            Self::ProviderChanged { .. } => 2,
+            Self::ModelAdded { .. } => 3,
+            Self::ModelRemoved { .. } => 4,
+            Self::NeutralDescribed { .. } => 5,
+            Self::NeutralDropped { .. } => 6,
+            Self::NeutralChanged { .. } => 7,
+            Self::OfferingAdded { .. } => 8,
+            Self::OfferingRemoved { .. } => 9,
+            Self::LifecycleChanged { .. } => 10,
+            Self::CapabilitiesChanged { .. } => 11,
+            Self::MetadataChanged { .. } => 12,
+            Self::PriceChanged { .. } => 13,
         }
     }
 }
@@ -1303,10 +1415,14 @@ impl CatalogChange {
 /// How many changes of each class a diff holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CatalogDiffCounts {
+    pub providers_added: usize,
+    pub providers_removed: usize,
+    pub providers_changed: usize,
     pub models_added: usize,
     pub models_removed: usize,
     pub offerings_added: usize,
     pub offerings_removed: usize,
+    pub neutral_changed: usize,
     pub lifecycle_changed: usize,
     pub capabilities_changed: usize,
     pub metadata_changed: usize,
@@ -1315,9 +1431,14 @@ pub struct CatalogDiffCounts {
 
 /// The semantic difference between two catalogues.
 ///
-/// Comparison is per `(model, provider)` over what the *provider* states, not
-/// over the neutral record: neutral values move when a provider is added or
-/// removed, so diffing them would report changes to models nobody touched.
+/// Offerings are compared per `(model, provider)` over what the *provider*
+/// states; provider records and neutral records are compared separately and
+/// reported as their own classes, so an offering is never reported as changed
+/// because something around it moved.
+///
+/// Everything the content identity covers is compared, which is the property
+/// that matters: an [`Admission::Updated`] can never carry an empty diff, so
+/// "the catalogue changed" is always answerable with what changed.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CatalogDiff {
     changes: Vec<CatalogChange>,
@@ -1326,6 +1447,35 @@ pub struct CatalogDiff {
 impl CatalogDiff {
     fn between(previous: &CatalogContent, current: &CatalogContent) -> Self {
         let mut changes = Vec::new();
+        let previous_providers: BTreeMap<&ProviderId, &CatalogProvider> = previous
+            .providers()
+            .iter()
+            .map(|provider| (&provider.id, provider))
+            .collect();
+        for provider in current.providers() {
+            match previous_providers.get(&provider.id) {
+                None => changes.push(CatalogChange::ProviderAdded {
+                    provider: provider.id.clone(),
+                }),
+                Some(before) => {
+                    let fields = provider.differences(before);
+                    if !fields.is_empty() {
+                        changes.push(CatalogChange::ProviderChanged {
+                            provider: provider.id.clone(),
+                            fields,
+                        });
+                    }
+                }
+            }
+        }
+        for provider in previous.providers() {
+            if current.provider(&provider.id).is_none() {
+                changes.push(CatalogChange::ProviderRemoved {
+                    provider: provider.id.clone(),
+                });
+            }
+        }
+
         let previous_models: BTreeMap<&ModelId, &CatalogModelEntry> = previous
             .models()
             .iter()
@@ -1367,6 +1517,24 @@ impl CatalogDiff {
             let Some(before) = previous_models.get(id) else {
                 continue;
             };
+            match (&before.neutral, &model.neutral) {
+                (None, Some(_)) => changes.push(CatalogChange::NeutralDescribed {
+                    model: (*id).clone(),
+                }),
+                (Some(_), None) => changes.push(CatalogChange::NeutralDropped {
+                    model: (*id).clone(),
+                }),
+                (Some(was), Some(now)) => {
+                    let fields = now.differences(was);
+                    if !fields.is_empty() {
+                        changes.push(CatalogChange::NeutralChanged {
+                            model: (*id).clone(),
+                            fields,
+                        });
+                    }
+                }
+                (None, None) => {}
+            }
             for offering in &model.offerings {
                 let Some(previous_offering) = before.offering(&offering.provider) else {
                     changes.push(CatalogChange::OfferingAdded {
@@ -1389,7 +1557,7 @@ impl CatalogDiff {
 
         changes.sort_by(|left, right| {
             left.model()
-                .cmp(right.model())
+                .cmp(&right.model())
                 .then_with(|| left.provider().cmp(&right.provider()))
                 .then_with(|| left.rank().cmp(&right.rank()))
         });
@@ -1408,6 +1576,12 @@ impl CatalogDiff {
         let mut counts = CatalogDiffCounts::default();
         for change in &self.changes {
             match change {
+                CatalogChange::ProviderAdded { .. } => counts.providers_added += 1,
+                CatalogChange::ProviderRemoved { .. } => counts.providers_removed += 1,
+                CatalogChange::ProviderChanged { .. } => counts.providers_changed += 1,
+                CatalogChange::NeutralChanged { .. }
+                | CatalogChange::NeutralDescribed { .. }
+                | CatalogChange::NeutralDropped { .. } => counts.neutral_changed += 1,
                 CatalogChange::ModelAdded { .. } => counts.models_added += 1,
                 CatalogChange::ModelRemoved { .. } => counts.models_removed += 1,
                 CatalogChange::OfferingAdded { .. } => counts.offerings_added += 1,
@@ -1436,7 +1610,10 @@ fn offering_changes(
     current: &ProviderOffering,
 ) -> Vec<CatalogChange> {
     let mut changes = Vec::new();
-    let differences = current.facts.differences(&previous.facts);
+    let mut differences = current.facts.differences(&previous.facts);
+    if previous.endpoint != current.endpoint {
+        differences.push(ModelField::Endpoint);
+    }
     if differences.iter().any(|field| field.lifecycle()) {
         changes.push(CatalogChange::LifecycleChanged {
             model: model.clone(),
@@ -1761,6 +1938,64 @@ mod tests {
         assert_eq!(counts.prices_changed, 0);
     }
 
+    /// A different identity must always come with something to show for it:
+    /// "the catalogue changed" and an empty diff cannot both be true.
+    #[test]
+    fn every_change_the_identity_notices_the_diff_names() {
+        let before = content(vec![offering("openai", "gpt-4o", None)]);
+
+        let mut providers = before.providers().to_vec();
+        providers[0].env_vars.push("OPENAI_BASE_URL".to_owned());
+        let provider_moved = CatalogContent::new(providers, before.models().to_vec())
+            .expect("a provider's own metadata changed");
+
+        let mut neutral = before.models().to_vec();
+        neutral[0].neutral = None;
+        let neutral_dropped = CatalogContent::new(before.providers().to_vec(), neutral)
+            .expect("the neutral record went away");
+
+        let mut endpoint = offering("openai", "gpt-4o", None);
+        endpoint.endpoint = ProviderEndpoint {
+            api_base: Some("https://eu.api.openai.com/v1".to_owned()),
+            ..ProviderEndpoint::default()
+        };
+        let endpoint_moved = content(vec![endpoint]);
+
+        for (case, after, expected) in [
+            (
+                "provider metadata",
+                provider_moved,
+                CatalogChange::ProviderChanged {
+                    provider: ProviderId::parse("openai").expect("fixture id"),
+                    fields: vec![ProviderField::EnvVars],
+                },
+            ),
+            (
+                "the neutral record",
+                neutral_dropped,
+                CatalogChange::NeutralDropped {
+                    model: ModelId::parse("gpt-4o").expect("fixture id"),
+                },
+            ),
+            (
+                "an offering's endpoint",
+                endpoint_moved,
+                CatalogChange::MetadataChanged {
+                    model: ModelId::parse("gpt-4o").expect("fixture id"),
+                    provider: ProviderId::parse("openai").expect("fixture id"),
+                    fields: vec![ModelField::Endpoint],
+                },
+            ),
+        ] {
+            assert_ne!(
+                before.content_id(),
+                after.content_id(),
+                "{case} is part of the identity"
+            );
+            assert_eq!(after.diff(&before).changes(), [expected], "{case}");
+        }
+    }
+
     #[test]
     fn additions_and_removals_name_their_offerings() {
         let before = content(vec![offering("openai", "gpt-4o", None)]);
@@ -1792,12 +2027,12 @@ mod tests {
         ]);
 
         let diff = after.diff(&before);
-        let ordered: Vec<(String, Option<String>, u8)> = diff
+        let ordered: Vec<(Option<String>, Option<String>, u8)> = diff
             .changes()
             .iter()
             .map(|change| {
                 (
-                    change.model().to_string(),
+                    change.model().map(ToString::to_string),
                     change.provider().map(ToString::to_string),
                     change.rank(),
                 )

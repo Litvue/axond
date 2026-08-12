@@ -320,14 +320,24 @@ struct WireModel {
     provider: Option<WireModelProvider>,
 }
 
-/// A capability the upstream states either as a boolean or as an object
-/// describing how the capability is configured (`interleaved`, `experimental`).
+/// A field the upstream states either as a boolean or as an object
+/// (`interleaved`, `experimental`).
 ///
-/// An object means the capability is present, so it reads as stated: the
-/// configuration inside it is provider-specific detail this slice does not model,
-/// and refusing the whole payload over it would reject a fifth of the real
-/// catalogue. Anything that is neither a boolean nor an object is still a type
-/// error.
+/// What the object *means* differs per field, and the difference matters, so
+/// this type only records which form was used and each caller decides:
+///
+/// - `"interleaved": {"field": "reasoning_content"}` configures the capability
+///   it names, so it reads as stated; the configuration is provider-specific
+///   detail this slice does not model. Every object form in the live payload is
+///   this shape, and 688 offerings use it.
+/// - `"experimental": {"modes": {"fast": {…}}}` describes *extra experimental
+///   modes* of an otherwise generally-available offering, so it does not state
+///   that the offering is experimental. All 39 object-valued `experimental`
+///   keys in the live payload are this shape, and none of them state the
+///   boolean; reading them as [`ModelCapability::Experimental`] would mark 39
+///   GA offerings experimental.
+///
+/// Anything that is neither a boolean nor an object is still a type error.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum WireFlag {
@@ -336,10 +346,21 @@ enum WireFlag {
 }
 
 impl WireFlag {
-    const fn stated(&self) -> bool {
+    /// The capability is present, whether stated bare or configured.
+    const fn configurable(&self) -> bool {
         match self {
             Self::Stated(stated) => *stated,
             Self::Configured(_) => true,
+        }
+    }
+
+    /// The capability is present only if the upstream says so outright: an
+    /// object here describes something else (see the type docs), and the
+    /// modelled fields say nothing about it either way.
+    const fn asserted(&self) -> bool {
+        match self {
+            Self::Stated(stated) => *stated,
+            Self::Configured(_) => false,
         }
     }
 }
@@ -628,6 +649,7 @@ fn field_pointer(offering: &JsonPointer, field: ModelField) -> JsonPointer {
         ModelField::KnowledgeCutoff => offering.child("knowledge"),
         ModelField::ReleaseDate => offering.child("release_date"),
         ModelField::LastUpdated => offering.child("last_updated"),
+        ModelField::Endpoint => offering.child("provider"),
     }
 }
 
@@ -671,12 +693,12 @@ fn facts(model: &WireModel, pointer: &JsonPointer) -> Result<ModelFacts, ModelsD
         (model.temperature, ModelCapability::Temperature),
         (model.structured_output, ModelCapability::StructuredOutput),
         (
-            model.interleaved.as_ref().map(WireFlag::stated),
+            model.interleaved.as_ref().map(WireFlag::configurable),
             ModelCapability::Interleaved,
         ),
         (model.open_weights, ModelCapability::OpenWeights),
         (
-            model.experimental.as_ref().map(WireFlag::stated),
+            model.experimental.as_ref().map(WireFlag::asserted),
             ModelCapability::Experimental,
         ),
     ] {
@@ -1742,6 +1764,45 @@ mod tests {
                 PriceTierThreshold::ContextOver { tokens: 200_000 },
                 PriceTierThreshold::ContextOver { tokens: 272_000 },
             ]
+        );
+    }
+
+    /// An object-valued flag says different things for different keys, and the
+    /// seed publishes both shapes: `interleaved` configures the capability it
+    /// names, while `experimental` describes extra modes of an offering that is
+    /// not itself experimental.
+    #[test]
+    fn an_object_valued_flag_states_the_capability_only_where_it_configures_it() {
+        let content = seed_snapshot().content;
+        let configured = content
+            .offering(
+                &ModelId::parse("openai/gpt-5.5").expect("id"),
+                &ProviderId::parse("hpc-ai").expect("id"),
+            )
+            .expect("hpc-ai offers gpt-5.5");
+        assert!(
+            configured
+                .facts
+                .capabilities
+                .contains(&ModelCapability::Interleaved)
+        );
+
+        let modes = content
+            .offering(
+                &ModelId::parse("gpt-5.5").expect("id"),
+                &ProviderId::parse("openai").expect("id"),
+            )
+            .expect("openai offers gpt-5.5");
+        assert!(
+            !modes
+                .facts
+                .capabilities
+                .contains(&ModelCapability::Experimental),
+            "`experimental: {{ modes: … }}` describes modes, not the offering's status"
+        );
+        assert!(
+            !modes.overrides_field(ModelField::Capabilities),
+            "and so it is not an override of the neutral record either"
         );
     }
 
