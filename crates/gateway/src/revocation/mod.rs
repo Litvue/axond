@@ -1,4 +1,10 @@
 //! Optional precise revocation for minted-token JTIs.
+//!
+//! One of the seven responsibility-specific backends catalogued in
+//! [`crate::backends`], with its own error type and `on_unavailable` policy: a
+//! revocation check runs on the request path, so its stance when the store is
+//! unreachable is a request-admission decision, unrelated to how the control
+//! plane behaves during an outage.
 
 mod postgres;
 mod redis;

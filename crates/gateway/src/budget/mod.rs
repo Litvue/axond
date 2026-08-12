@@ -22,6 +22,12 @@
 //! them in one datastore, so a replica set enforces a single cap. When a shared
 //! store is unreachable the default stance is **fail-closed**: admission is
 //! denied rather than silently unenforced.
+//!
+//! One of the seven responsibility-specific backends catalogued in
+//! [`crate::backends`], and deliberately its own seam: this is a *request-path*
+//! contract with a millisecond latency budget and its own `on_unavailable`
+//! policy, which is why it shares no trait with the control-plane contracts even
+//! when both happen to be pointed at Postgres.
 
 mod postgres;
 mod redis;

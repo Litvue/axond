@@ -6,6 +6,11 @@
 //! bounded and per-replica: with N replicas sharing a nominal limit, each
 //! replica admits approximately `limit / N`, rather than enforcing a
 //! fleet-wide ceiling.
+//!
+//! One of the seven responsibility-specific backends catalogued in
+//! [`crate::backends`]. Redis is a permitted implementation here precisely
+//! because a lease is loss-tolerant hot state with expiry semantics — the same
+//! reason it can never implement a durable control-plane contract.
 
 mod redis;
 
