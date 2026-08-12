@@ -49,7 +49,7 @@
 //!
 //! The observed-rate denomination, the three identities and their validator
 //! semantics, and the bundled offline seed are recorded in
-//! [ADR 0033](https://github.com/Litvue/axond/blob/main/docs/adr/0033-catalogue-source-imports.md).
+//! [ADR 0034](https://github.com/Litvue/axond/blob/main/docs/adr/0034-catalogue-source-imports.md).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;

@@ -1,4 +1,4 @@
-# 33. Importing a model catalogue: observed rates, snapshot identity, and an offline seed
+# 34. Importing a model catalogue: observed rates, snapshot identity, and an offline seed
 
 Date: 2026-08-12
 

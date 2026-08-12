@@ -35,7 +35,7 @@
 //!
 //! The decisions this module rests on — the observed-rate unit, the three
 //! identities, and the compiled-in seed — are recorded in
-//! [ADR 0033](https://github.com/Litvue/axond/blob/main/docs/adr/0033-catalogue-source-imports.md).
+//! [ADR 0034](https://github.com/Litvue/axond/blob/main/docs/adr/0034-catalogue-source-imports.md).
 //!
 //! # Strict where a mistake would be silent
 //!
@@ -1308,13 +1308,32 @@ impl From<FetchError> for CatalogError {
     }
 }
 
+/// How much a declared `Content-Length` may reserve up front.
+///
+/// A declaration is unverified until the body arrives, so it buys one allocation
+/// of a size the sender chose. Reserving a page-friendly chunk of it keeps the
+/// common case (a document a few megabytes long) to a handful of growths while
+/// making a dishonest declaration worth nothing.
+pub const DECLARED_RESERVE_BYTES: usize = 1024 * 1024;
+
+/// What a declared length is allowed to allocate before the body is read.
+fn declared_reserve(declared: Option<u64>, limit: usize) -> usize {
+    declared
+        .and_then(|declared| usize::try_from(declared).ok())
+        .unwrap_or_default()
+        .min(limit)
+        .min(DECLARED_RESERVE_BYTES)
+}
+
 /// Read a response body without holding more than `limit` bytes of it.
 ///
 /// Streamed and checked as it arrives rather than afterwards: `Response::bytes`
 /// allocates the whole body before anyone can object, and a declared
 /// `Content-Length` is a claim rather than a bound — so the declaration is
-/// refused early when it is already too large, and the chunks are counted
-/// regardless of what it said.
+/// refused early when it is already too large, the chunks are counted regardless
+/// of what it said, and the declaration only *reserves* up to
+/// [`DECLARED_RESERVE_BYTES`], since a mirror that declares 64 MiB and sends one
+/// byte must not be able to make the gateway allocate 64 MiB per refresh.
 pub async fn bounded_body(
     mut response: reqwest::Response,
     limit: usize,
@@ -1323,12 +1342,7 @@ pub async fn bounded_body(
     if declared.is_some_and(|declared| declared > limit as u64) {
         return Err(FetchError::TooLarge { limit });
     }
-    let mut body = Vec::with_capacity(
-        declared
-            .and_then(|declared| usize::try_from(declared).ok())
-            .unwrap_or_default()
-            .min(limit),
-    );
+    let mut body = Vec::with_capacity(declared_reserve(declared, limit));
     while let Some(chunk) = response
         .chunk()
         .await
@@ -2357,6 +2371,25 @@ mod tests {
                 backend: BACKEND,
                 message: "upstream answered HTTP 403".to_owned(),
             }
+        );
+    }
+
+    /// A declared length is the sender's claim about a body nobody has read yet,
+    /// so it may not be spent as an allocation: a mirror declaring the whole
+    /// ceiling and sending one byte would otherwise cost 64 MiB per refresh.
+    #[test]
+    fn a_declared_length_reserves_no_more_than_a_declaration_is_worth() {
+        assert_eq!(declared_reserve(Some(4096), MAX_PAYLOAD_BYTES), 4096);
+        assert_eq!(declared_reserve(None, MAX_PAYLOAD_BYTES), 0);
+        assert_eq!(
+            declared_reserve(Some(MAX_PAYLOAD_BYTES as u64), MAX_PAYLOAD_BYTES),
+            DECLARED_RESERVE_BYTES,
+            "an honest ceiling-sized declaration still grows into its body"
+        );
+        assert_eq!(
+            declared_reserve(Some(u64::MAX), 512),
+            512,
+            "and a declaration past the ceiling cannot reserve past it either"
         );
     }
 
