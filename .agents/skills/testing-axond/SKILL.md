@@ -234,6 +234,11 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/v1/models
   upstream. To use an already-built binary, run
   `AXOND_BIN=target/debug/axond ops/tier0-gate.sh`. Budget ~4-5s for the gate script
   itself; the cold musl release build dominates (~40s on 8 cores).
+- `just binary-smoke [path]` runs `ops/binary-smoke.py`, the portable subset of the
+  Tier 0 assertions that CI runs for every released target. It needs no musl toolchain
+  and no namespace: it claims a free port, serves the fixtures in-process, and boots
+  any binary you point it at (`just binary-smoke target/debug/axond`, ~2s). Use it as
+  the quickest end-to-end check that a build still serves.
 
 ## Static musl builds (`just build-static`, `just tier0`)
 

@@ -183,6 +183,49 @@ def check_msrv_documented() -> list[str]:
     ]
 
 
+def workflow_job_targets(workflow: str, job: str) -> list[str]:
+    text = (ROOT / ".github/workflows" / workflow).read_text(encoding="utf-8")
+    block = re.search(rf"^  {re.escape(job)}:\n(.*?)(?=^  \S|\Z)", text, re.MULTILINE | re.DOTALL)
+    if block is None:
+        return []
+    return re.findall(r"^\s+target:\s*(\S+)\s*$", block.group(1), re.MULTILINE)
+
+
+def check_smoke_matrix() -> list[str]:
+    """The documented smoke matrix is the one CI actually boots.
+
+    A published target that is only compiled is a weaker promise than one that
+    is booted and served, and the difference is invisible from the documentation
+    unless it is checked: this ties the `binary-smoke` matrix in `ci.yml` to the
+    release `binaries` matrix it claims to cover and to the platform table
+    operators read.
+    """
+    smoked = workflow_job_targets("ci.yml", "binary-smoke")
+    released = workflow_job_targets("release-please.yml", "release-binaries")
+    document = (ROOT / "docs/compatibility.md").read_text(encoding="utf-8")
+    failures: list[str] = []
+    if not smoked:
+        return ["ci.yml: the binary-smoke matrix declares no target"]
+    if not released:
+        return ["release-please.yml: the release-binaries matrix declares no target"]
+    for target in smoked:
+        if target not in released:
+            failures.append(
+                f"ci.yml: binary-smoke covers {target!r}, which the release "
+                "binaries matrix does not publish"
+            )
+        if f"`{target}`" not in document:
+            failures.append(
+                f"docs/compatibility.md: smoke-tested target {target!r} is not documented"
+            )
+    if "binary-smoke" not in document:
+        failures.append(
+            "docs/compatibility.md: the platform matrix does not name the "
+            "`binary-smoke` lane that exercises it"
+        )
+    return failures
+
+
 def check_front_door_size() -> list[str]:
     failures: list[str] = []
     for relative, limit in (("README.md", 260), ("docs/deployment.md", 220)):
@@ -201,6 +244,7 @@ def main() -> int:
     failures.extend(check_stale_claims(files))
     failures.extend(check_route_contract())
     failures.extend(check_msrv_documented())
+    failures.extend(check_smoke_matrix())
     failures.extend(check_front_door_size())
     if failures:
         for failure in failures:

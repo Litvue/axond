@@ -255,13 +255,27 @@ claim here cannot drift from what CI and the release actually do:
 | Matrix | Owner (source of truth) | Exercised by |
 | --- | --- | --- |
 | Supported versions for fixes | [`SECURITY.md`](../SECURITY.md) — latest `0.x` release plus the immediately previous minor, security fixes only | the release/backport process |
-| Release targets | the `binaries` matrix in [`release-please.yml`](../.github/workflows/release-please.yml): `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`, plus the `linux/amd64` image | the release workflow, and the musl static-binary and Docker smoke lanes on every change |
+| Release targets | the `binaries` matrix in [`release-please.yml`](../.github/workflows/release-please.yml): `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`, plus the `linux/amd64` image | the release workflow; on every change the `binary-smoke` matrix boots each target on a runner of its own platform, the musl `static-binary` lane adds the Tier 0 network-denial gate, and `docker-smoke` covers the image |
 | Provider-SDK compatibility | [`tests/compat/requirements.in`](../tests/compat/requirements.in) (exact pins, hash-locked in `requirements.txt`) | the required `sdk-compat` lane against committed fixtures ([ADR 0014](./adr/0014-compatibility-and-soak-harness.md)) |
 | Rust floor and published API | `rust-version` in [`Cargo.toml`](../Cargo.toml); [`ops/api-compat-overrides.toml`](../ops/api-compat-overrides.toml) for accepted breaks | the required `msrv` and `api-compat` lanes |
 
 Adding a target, an SDK, or a supported version means editing the owner file
 above; this document describes the policy and does not restate the values it
-cannot enforce. What is *not* covered: only `x86_64-unknown-linux-musl` boots
-hermetically in CI on every change (the Tier 0 gate), the other three targets are
-built and attested but not smoke-booted, and only the Python SDKs are exercised
-end to end.
+cannot enforce. `ops/check-docs.py` fails if a target the `binary-smoke` matrix
+covers is missing from this document or is not published by the release matrix.
+
+Every release target is booted and served, not merely compiled. On each change
+and again at the tag, for the exact binary that is archived,
+[`ops/binary-smoke.py`](../ops/binary-smoke.py) asserts that `/healthz` and
+`/readyz` answer unauthenticated, that `/v1/models` requires a gateway key and
+lists the configured alias, that an unknown model is refused as `unknown_model`,
+and that one chat completion completes against a local fixture upstream. Linux
+musl is held to more: [`ops/tier0-gate.sh`](../ops/tier0-gate.sh) boots it inside
+a network namespace that denies egress and DNS, which is why a datastore or
+outbound dependency added to the default path fails there first. That gate is
+Linux-only by construction, so macOS and Windows get the portable subset.
+
+What is *not* covered: the hermetic Tier 0 gate applies to
+`x86_64-unknown-linux-musl` alone, the smoke exercises one buffered
+fixture request rather than streaming or a real provider, and only the Python
+SDKs are exercised end to end.

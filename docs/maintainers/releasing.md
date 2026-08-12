@@ -72,7 +72,9 @@ with the existing tag as `release_tag`. The reviewed workflow definition comes
 from `main`, while every artifact lane checks out and verifies the immutable
 tag.
 
-The preflight requires the tag's `Dockerfile` and `ops/docker-smoke.sh`.
+The preflight requires the tag's `Dockerfile`, `ops/docker-smoke.sh`, and
+`ops/binary-smoke.py` — the binary lanes boot what they archive, so a tag
+without the smoke runner cannot be repaired from `main`.
 crates.io publication is enabled only if the tag also contains
 `ops/publish-crates.sh`; older tags skip that lane explicitly.
 
