@@ -36,6 +36,10 @@
 //! adds up ([`IntegrityError`]): the first is a rejected request, the second is
 //! an operator alert.
 
+pub mod postgres;
+mod rows;
+pub mod schema;
+
 use async_trait::async_trait;
 
 use super::{BackendFailure, BackendKind, Capabilities, FailureCategory};
@@ -165,6 +169,13 @@ pub enum ControlPlaneError {
         revision: RevisionId,
         source: Box<IntegrityError>,
     },
+    /// Stored data that belongs to no single revision could not be interpreted:
+    /// the desired-revision pointer, a schema record, an idempotency record. Same
+    /// category as [`ControlPlaneError::Corrupt`] and for the same reason —
+    /// retrying cannot help and an operator has to know — but there is no
+    /// revision to name.
+    #[error("control-plane storage is unreadable: {detail}")]
+    CorruptStorage { detail: String },
 }
 
 impl ControlPlaneError {
@@ -187,7 +198,7 @@ impl BackendFailure for ControlPlaneError {
             | Self::ImmutableResourceVersion { .. }
             | Self::IdempotencyKeyReused { .. } => FailureCategory::Invalid,
             Self::Denied { .. } => FailureCategory::Denied,
-            Self::Corrupt { .. } => FailureCategory::Corrupt,
+            Self::Corrupt { .. } | Self::CorruptStorage { .. } => FailureCategory::Corrupt,
         }
     }
 }
