@@ -48,6 +48,21 @@
 //! gains nothing from projecting tenants, and the sections that would make it
 //! gain something are the later slices'. What exists here is the seam, exercised
 //! end to end through [`RevisionCompiler`](super::compile::RevisionCompiler).
+//!
+//! Two things the runtime slice owns, recorded here because this module is what
+//! creates the need for them:
+//!
+//! - **selecting a default namespace** from desired state, which is why a
+//!   bootstrap without one is refused above rather than given one;
+//! - **`/` in a namespace id.** A qualified id is the first namespace id no
+//!   `axond.toml` could have written, and nothing *consumes* one yet: no config
+//!   rule constrains the charset of a compiled id, and this projection's collision
+//!   refusal is the only guard. Before a projected id reaches a request path, `/`
+//!   has to be checked everywhere an id is used rather than declared — metric and
+//!   trace label values, Redis and Postgres key composition, gateway-key bindings
+//!   — and that is where a config-level charset and uniqueness rule belongs. This
+//!   module keeps the ids it emits distinct and reversible, which is all it can
+//!   promise on its own.
 
 use std::collections::BTreeSet;
 
@@ -144,8 +159,8 @@ mod tests {
         alias, candidate, project, project_id, revision_id, state, tenant, tenant_id,
     };
     use crate::desired_state::{
-        DesiredState, ExpectedRevision, LoadedRevision, ProjectBody, ResourceScope,
-        ResourceVersion, RevisionManifest, Slug,
+        DesiredState, ExpectedRevision, LoadedRevision, ProjectBody, QualifiedProject,
+        ResourceScope, ResourceVersion, RevisionManifest, Slug,
     };
 
     fn namespaces(config: &Config) -> Vec<&str> {
@@ -362,6 +377,54 @@ env = "GW_ADMIN_BREAKGLASS"
         };
         assert_eq!(*reference, moved.reference);
         assert!(detail.contains("declares owner"), "{detail}");
+    }
+
+    /// The two promises this module can keep about the ids it emits on its own.
+    /// Nothing constrains a compiled namespace id's charset, and nothing rejects
+    /// duplicates at the config layer, so a projection that emitted a collision or
+    /// an id it could not decompose would put two tenants' state on one name with
+    /// no later gate to catch it.
+    #[test]
+    fn every_projected_id_is_distinct_and_decomposes_back_into_its_slugs() {
+        let mut state = state();
+        state.insert(tenant(9, "globex")).expect("a distinct id");
+        state
+            .insert(project(&tenant_id(9), 12, "core"))
+            .expect("a distinct reference");
+        state
+            .insert(project(&tenant_id(9), 13, "edge"))
+            .expect("a distinct reference");
+        let config = TenancyProjection
+            .project(&bootstrap(), &state)
+            .expect("projectable");
+
+        let ids = namespaces(&config);
+        assert_eq!(
+            ids.iter().collect::<BTreeSet<_>>().len(),
+            ids.len(),
+            "one name cannot mean two namespaces: {ids:?}"
+        );
+
+        for id in ids.iter().filter(|id| **id != "platform") {
+            let qualified = QualifiedProject::parse(id)
+                .unwrap_or_else(|| panic!("a projected id is reversible, `{id}` is not"));
+            assert_eq!(
+                qualified.to_string(),
+                *id,
+                "and reversing it is lossless: `{id}`"
+            );
+            assert!(
+                !qualified
+                    .tenant
+                    .as_str()
+                    .contains(QualifiedProject::SEPARATOR)
+                    && !qualified
+                        .project
+                        .as_str()
+                        .contains(QualifiedProject::SEPARATOR),
+                "the separator appears once, between the slugs: `{id}`"
+            );
+        }
     }
 
     #[test]

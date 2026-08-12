@@ -175,6 +175,15 @@ tenants' projects out of one budget, one credential pool, and one key binding, a
 way. A projected namespace whose id a bootstrap namespace already claims is
 refused rather than merged.
 
+A qualified id is the first namespace id no `axond.toml` could have written, and
+nothing consumes one yet. Before the runtime slice wires this projection into
+`serve`, `/` has to be checked against every place a namespace id is *used* rather
+than declared — metric and trace label values, Redis and Postgres key composition,
+and gateway-key bindings — and a config-level charset and uniqueness rule for
+namespace ids belongs with that check. Until then the projection's own collision
+refusal is the only guard, which is enough because no request path reads a
+projected id.
+
 What projection does *not* touch is everything the local file owns: listener,
 transport bounds, admission, telemetry, datastore connectivity, and — until their
 own slices land — providers, credentials, models, and prices. The bootstrap's
@@ -280,17 +289,27 @@ What to know about it operationally:
 - **It may be stale.** A replica reports `source = last-known-good` exactly so
   this is visible. Once the control plane returns, the replica converges to
   desired state normally and stops reporting the cache as its source.
-- **A cache is a cache, not a fallback for bad state.** It is consulted only when
-  the control plane is *unreachable*. A desired revision that exists but does not
-  compile is a fatal boot failure — booting an older cached revision instead
-  would silently serve state an operator already replaced.
+- **A cache is a cache, not a fallback for bad state.** It is consulted for the
+  two refusals where cached state is the better answer: the control plane being
+  *unreachable*, and a desired revision this build cannot *read* (`incompatible`,
+  the mixed-version case above). Both leave storage intact and neither is repaired
+  by a replica refusing to start — a replica added mid-rollout that would not boot
+  withdraws capacity exactly when a rollback needs it added. Corruption, a revision
+  past this build's bounds, and a revision that exists but does not compile are all
+  fatal at boot: booting an older cached revision instead would hide damage, or
+  silently serve state an operator already replaced.
+
+  A replica that boots this way reports `source = last-known-good` and keeps
+  reporting `incompatible` for the revision it will not read, so the mixed-version
+  state is visible rather than papered over. Roll it forward, as above.
 - **An unwritable cache is a warning, not an outage.** A replica whose disk is
   full keeps serving and logs once; what it loses is the ability to cold-boot
   during an outage.
 
 Without a cache — or with one that fails its signature — a replica that cannot
-reach the control plane refuses to become ready. It never serves an empty or
-partial configuration while reporting itself healthy.
+reach the control plane, or cannot read the revision it finds, refuses to become
+ready. It never serves an empty or partial configuration while reporting itself
+healthy.
 
 ## Related
 

@@ -18,7 +18,7 @@ use super::compile::testing::{AliasProjection, bootstrap, env};
 use super::lkg::testing::{KEY, cache_path};
 use super::status::testing::ManualClock;
 use super::*;
-use crate::backends::control_plane::ControlPlaneStore;
+use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::budget::NoBudget;
 use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{DesiredState, ExpectedRevision, RevisionId, fixtures};
@@ -634,6 +634,99 @@ async fn a_cold_boot_during_an_outage_restores_the_signed_snapshot() {
     assert_eq!(converged.source, Some(SnapshotSource::ControlPlane));
 
     let _ = std::fs::remove_file(&path);
+}
+
+/// A replica added to a fleet mid-rollout meets a desired revision its build
+/// cannot read, and starts from its signed cache rather than refusing to boot.
+///
+/// Storage is intact here, so there is nothing for an operator to repair, and a
+/// replica that would not start would withdraw capacity during exactly the
+/// rollout or rollback that needs it added. The cache was written by this build,
+/// so it is readable by definition.
+#[tokio::test]
+async fn a_cold_boot_onto_an_unreadable_revision_restores_the_signed_snapshot() {
+    let store = control_plane();
+    let published = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let path = cache_path("cold-boot-incompatible");
+
+    let warm = Replica::with_cache(
+        &store,
+        LastKnownGood::new(&path, KEY).expect("a long enough key"),
+    );
+    warm.reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    assert!(path.exists(), "converging exported the cache");
+
+    // Desired state moves on, and its retained tenant row is one an older writer
+    // left behind: this build cannot read the revision it must converge onto.
+    let second = publish(
+        &store,
+        "second",
+        ExpectedRevision::Exactly(published),
+        fixtures::state_with_renamed_alias(),
+    )
+    .await;
+    store.rewrite_version(fixtures::legacy_tenant(1, "acme"));
+
+    let cold = Replica::with_cache(
+        &store,
+        LastKnownGood::new(&path, KEY).expect("a long enough key"),
+    );
+    let restored = cold
+        .reconciler
+        .bootstrap()
+        .await
+        .expect("an unreadable revision is not a reason to refuse to start");
+
+    assert_eq!(restored, published);
+    let report = cold.report();
+    assert_eq!(report.active, Some(published));
+    assert_eq!(report.source, Some(SnapshotSource::LastKnownGood));
+    assert_eq!(report.generation, 1);
+    assert!(cold.served_aliases().contains(&"fast".to_owned()));
+
+    // The cache is a fallback, not a way to stop reporting refusals: converging
+    // still refuses the revision under its own reason, and keeps serving.
+    let outcome = cold
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Rejected { revision, reason }
+                if revision == Some(second) && reason == "incompatible"
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(cold.report().active, Some(published));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// With no cache to restore, the same unreadable revision refuses the boot: there
+/// is nothing to serve, and serving nothing while reporting healthy is worse.
+#[tokio::test]
+async fn a_cold_boot_onto_an_unreadable_revision_without_a_cache_refuses_to_start() {
+    let store = control_plane();
+    publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    store.rewrite_version(fixtures::legacy_tenant(1, "acme"));
+
+    let error = Replica::serving(&store)
+        .reconciler
+        .bootstrap()
+        .await
+        .expect_err("there is nothing to serve");
+    assert!(
+        matches!(
+            error,
+            BootstrapError::Store {
+                source: ControlPlaneError::Incompatible { .. }
+            }
+        ),
+        "an unreadable revision is named as such, not as an outage: {error}"
+    );
 }
 
 /// Without a cache, a cold boot during an outage refuses to start rather than

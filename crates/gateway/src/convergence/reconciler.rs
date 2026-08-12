@@ -230,6 +230,11 @@ pub enum BootstrapError {
     /// unreadable storage, a refused read, a revision larger than this build
     /// hydrates. Never answered from cache — cached state would mask storage an
     /// operator has to repair.
+    ///
+    /// A desired revision this build simply cannot *read*
+    /// ([`ControlPlaneError::Incompatible`]) is the exception: storage is intact,
+    /// so the cache is consulted first, and this is only reached when there is no
+    /// cache to restore.
     #[error("the control plane refused to yield desired state: {source}")]
     Store {
         #[source]
@@ -308,11 +313,13 @@ impl Reconciler {
     /// Reach a first servable snapshot, or explain why the replica must not
     /// start.
     ///
-    /// The cache is consulted for exactly one failure — the control plane being
-    /// unreachable — because that is the only one where cached state is the
-    /// better answer. A revision that does not compile is fatal here: booting
-    /// from an older cached revision would silently serve state an operator
-    /// already replaced.
+    /// The cache is consulted for the two failures where cached state is the
+    /// better answer: the control plane being unreachable, and a desired revision
+    /// this build cannot read (a newer schema during a rollout). Both leave
+    /// storage intact and neither is repaired by refusing to start. Corruption, a
+    /// revision past this build's bounds, and a revision that does not compile are
+    /// all fatal here: booting from an older cached revision would silently serve
+    /// state an operator already replaced, or hide damage.
     pub async fn bootstrap(&self) -> Result<RevisionId, BootstrapError> {
         let span = telemetry::revision_convergence_span(telemetry::CONVERGENCE_BOOT);
         let result = self.bootstrap_inner().await;
@@ -348,7 +355,19 @@ impl Reconciler {
             Err(error) => {
                 self.record_failure(&error);
                 match error {
-                    AttemptError::Store(source) if source.retryable() => {
+                    // A cache is the answer to "this replica cannot use what the
+                    // control plane holds", and being unable to *read* the desired
+                    // revision is that, not a repair job: during a mixed-version
+                    // rollout a replica on the older build meets a revision the
+                    // newer one published, and a replica that refused to start
+                    // there would withdraw capacity exactly when a rollback needs
+                    // it. Corruption and a revision past this build's bounds still
+                    // refuse the cache, because cached state would mask storage an
+                    // operator has to fix.
+                    AttemptError::Store(source)
+                        if source.retryable()
+                            || matches!(source, ControlPlaneError::Incompatible { .. }) =>
+                    {
                         self.restore_from_cache(source).await
                     }
                     AttemptError::Store(source) => Err(BootstrapError::Store { source }),
@@ -517,19 +536,21 @@ impl Reconciler {
         }
     }
 
-    /// Boot from the signed cache because the control plane is unreachable.
+    /// Boot from the signed cache because desired state is unusable on this
+    /// replica: the control plane is unreachable, or the desired revision is one
+    /// this build cannot read.
     async fn restore_from_cache(
         &self,
         source: ControlPlaneError,
     ) -> Result<RevisionId, BootstrapError> {
         let Some(cache) = &self.cache else {
-            return Err(BootstrapError::Unavailable { source });
+            return Err(Self::uncached(source));
         };
         let restored = cache.load().map_err(|source| BootstrapError::Cache {
             source: Box::new(source),
         })?;
         let Some(revision) = restored else {
-            return Err(BootstrapError::Unavailable { source });
+            return Err(Self::uncached(source));
         };
         let started = self.clock.now();
         let id = self
@@ -541,10 +562,20 @@ impl Reconciler {
         tracing::warn!(
             revision = %id,
             error = %source,
-            "the control plane is unreachable; booted from the signed last-known-good snapshot, \
-             which may be older than desired state"
+            "desired state is not usable on this replica; booted from the signed \
+             last-known-good snapshot, which may be older than desired state"
         );
         Ok(id)
+    }
+
+    /// The refusal when the cache could not answer: an outage the replica may yet
+    /// ride out, or a refusal it cannot.
+    fn uncached(source: ControlPlaneError) -> BootstrapError {
+        if source.retryable() {
+            BootstrapError::Unavailable { source }
+        } else {
+            BootstrapError::Store { source }
+        }
     }
 
     /// Record a refusal and its backoff, and return the reason label.
