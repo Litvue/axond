@@ -162,18 +162,22 @@ pub(super) async fn manifest(
         .map_err(|error| unavailable("read revision", &error))?
         .ok_or(ControlPlaneError::RevisionNotFound(id))?;
 
-    let corrupt = |error: IntegrityError| ControlPlaneError::corrupt(id, error);
+    // Classified in one place rather than assumed to be damage: a row written
+    // under an encoding this build does not read is intact storage on the wrong
+    // build, and `assemble` would report the same situation as an
+    // incompatibility one step later.
+    let classify = |error: IntegrityError| ControlPlaneError::integrity(id, error);
     let parent: Option<String> = revision.get(0);
     let parent = parent
         .map(|text| rows::revision_id(&text))
         .transpose()
-        .map_err(corrupt)?;
+        .map_err(classify)?;
     let mutation_text: String = revision.get(1);
-    let mutation = rows::mutation_id(&mutation_text).map_err(corrupt)?;
+    let mutation = rows::mutation_id(&mutation_text).map_err(classify)?;
     let serializer_text: String = revision.get(2);
-    let serializer = rows::serializer(&serializer_text).map_err(corrupt)?;
+    let serializer = rows::serializer(&serializer_text).map_err(classify)?;
     let checksum_text: String = revision.get(3);
-    let checksum = rows::checksum(&checksum_text).map_err(corrupt)?;
+    let checksum = rows::checksum(&checksum_text).map_err(classify)?;
     let created_at: SystemTime = revision.get(4);
 
     let named = entry_references(transaction, id, limits).await?;
@@ -193,7 +197,7 @@ pub(super) async fn manifest(
         .await
         .map_err(|error| unavailable("read manifest entries", &error))?
     {
-        entries.push(manifest_entry(&row).map_err(corrupt)?);
+        entries.push(manifest_entry(&row).map_err(classify)?);
     }
     // The entry rows are the manifest; the versions they name are a join. A
     // reference that lost its version row is a dangling reference reported as
@@ -201,7 +205,7 @@ pub(super) async fn manifest(
     // reasons that name no row.
     let hydrated: BTreeSet<ResourceRef> = entries.iter().map(|entry| entry.reference).collect();
     if let Some(reference) = named.iter().find(|reference| !hydrated.contains(reference)) {
-        return Err(corrupt(IntegrityError::MissingResource {
+        return Err(classify(IntegrityError::MissingResource {
             reference: *reference,
         }));
     }
@@ -235,7 +239,11 @@ pub(super) async fn revision(
     limits: &HydrationLimits,
 ) -> Result<LoadedRevision, ControlPlaneError> {
     let manifest = manifest(transaction, id, limits).await?;
-    let corrupt = |error: IntegrityError| ControlPlaneError::corrupt(id, error);
+    // One classification for every integrity failure this hydration can produce:
+    // a row from another build is the same "wrong build, intact storage" verdict
+    // `assemble` reaches below, and reporting it as damage in one place and as a
+    // skew in the other is what sends an operator to repair a healthy journal.
+    let classify = |error: IntegrityError| ControlPlaneError::integrity(id, error);
 
     refuse_cross_tenant_edges(transaction, id).await?;
     let dependencies = dependency_edges(transaction, id, limits).await?;
@@ -263,20 +271,16 @@ pub(super) async fn revision(
         .await
         .map_err(|error| unavailable("read resource versions", &error))?
     {
-        let resource = resource_version(&row, &dependencies).map_err(corrupt)?;
+        let resource = resource_version(&row, &dependencies).map_err(classify)?;
         state
             .insert(resource)
-            .map_err(|error| corrupt(error.into()))?;
+            .map_err(|error| classify(error.into()))?;
     }
 
     refuse_deep_dependencies(id, &state, limits)?;
     refuse_oversized_candidate(id, &state, limits)?;
 
-    // Classified rather than reported as corruption: a revision whose bodies this
-    // build cannot read is an incompatibility, and the rows behind it may be
-    // entirely intact.
-    LoadedRevision::assemble(manifest, state)
-        .map_err(|error| ControlPlaneError::integrity(id, error))
+    LoadedRevision::assemble(manifest, state).map_err(classify)
 }
 
 /// The revision the head points at, hydrated in the same read.
@@ -754,6 +758,35 @@ mod tests {
 
     fn revision(seed: u64) -> RevisionId {
         RevisionId::new(Uuid7::from_parts(seed, 0, seed).expect("seed in range"))
+    }
+
+    /// A restored backup can hold rows from two builds, so the encoding is
+    /// checked per row as well as per revision. Both readings are the same
+    /// verdict — intact storage on the wrong build — and reporting one of them as
+    /// damage sends an operator to repair a healthy journal.
+    #[test]
+    fn a_row_from_another_build_is_the_verdict_the_revision_would_get() {
+        let skew = IntegrityError::Serializer {
+            stored: SerializerVersion::default(),
+            current: SerializerVersion::default(),
+        };
+        assert!(skew.is_incompatible());
+        let error = ControlPlaneError::integrity(revision(9), skew);
+        assert!(
+            matches!(error, ControlPlaneError::Incompatible { .. }),
+            "{error:?}"
+        );
+        assert_ne!(error.category(), FailureCategory::Corrupt);
+
+        // And what the same seam calls damage stays damage: nothing about a
+        // release skew removes a row a manifest names.
+        let lost = ControlPlaneError::integrity(
+            revision(9),
+            IntegrityError::MissingResource {
+                reference: alias(&tenant_id(1), 41, "left", &[]).reference,
+            },
+        );
+        assert_eq!(lost.category(), FailureCategory::Corrupt);
     }
 
     #[test]

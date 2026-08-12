@@ -263,8 +263,10 @@ outcomes need different responses:
   damage is investigated.
 - **Incompatible (`stored revision … is not compatible with this build`).** The
   rows add up and this build cannot read them: a body whose schema identifier or
-  field set belongs to a newer release, or a tenant or project body written before
-  those bodies were typed. **This is not corruption, and nothing about the database needs
+  field set belongs to a newer release, a tenant or project body written before
+  those bodies were typed, or a row — or a whole revision — written under an
+  encoding version this build does not canonicalize with, which a restored backup
+  holding rows from two builds produces. **This is not corruption, and nothing about the database needs
   repairing.** It is reported separately for exactly that reason, and convergence
   reports it as reason `incompatible`. The replica keeps serving the revision it
   already holds. Roll the replica onto a build that reads the revision, or publish
