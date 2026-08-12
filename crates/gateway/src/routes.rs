@@ -4991,11 +4991,40 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             assert_eq!(hits_b.load(Ordering::SeqCst), 0);
         }
 
+        // Streaming settlement is detached from the response future. Wait for
+        // the fourth Responses record before issuing chat so the record order
+        // below cannot race the settlement task.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let count = captured.0.lock().unwrap().len();
+            if count >= 4 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "streamed Responses settlement did not arrive before timeout; records={count}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
         // Chat over the same alias still fails over: pinning is scoped to the
         // Responses wire, not to the alias.
         let chat = router(state).oneshot(chat_request()).await.unwrap();
         assert_eq!(chat.status(), StatusCode::OK);
         assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let count = captured.0.lock().unwrap().len();
+            if count >= 5 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "chat settlement did not arrive before timeout; records={count}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         let records = captured.0.lock().unwrap();
         assert_eq!(records.len(), 5);
