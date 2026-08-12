@@ -35,7 +35,7 @@
 //!
 //! The decisions this module rests on — the observed-rate unit, the three
 //! identities, and the compiled-in seed — are recorded in
-//! [ADR 0032](https://github.com/Litvue/axond/blob/main/docs/adr/0032-catalogue-source-imports.md).
+//! [ADR 0033](https://github.com/Litvue/axond/blob/main/docs/adr/0033-catalogue-source-imports.md).
 //!
 //! # Strict where a mistake would be silent
 //!
@@ -962,10 +962,13 @@ const LEGACY_LONG_CONTEXT_TOKENS: u64 = 200_000;
 /// free.
 fn rates(stated: &WireRates<'_>, pointer: &JsonPointer) -> Result<PriceRates, ModelsDevError> {
     let (Some(input), Some(output)) = (stated.input, stated.output) else {
-        let (present, missing) = if stated.input.is_some() {
-            ("input", "output")
-        } else {
-            ("output", "input")
+        let (present, missing) = match (stated.input.is_some(), stated.output.is_some()) {
+            (true, _) => ("input", "output"),
+            (_, true) => ("output", "input"),
+            // A tier or a legacy long-context object may state only optional
+            // rates, and naming one of the base rates as present would point an
+            // operator at a rate the payload never published.
+            _ => ("only optional rates", "input and output"),
         };
         return Err(ModelsDevError::Price {
             pointer: pointer.clone(),
@@ -1474,6 +1477,9 @@ mod tests {
             "price-tiers-without-base" => {
                 include_str!("fixtures/models_dev/drift.price-tiers-without-base.json")
             }
+            "tier-without-base" => {
+                include_str!("fixtures/models_dev/drift.tier-without-base.json")
+            }
             "model-key-ambiguous" => {
                 include_str!("fixtures/models_dev/drift.model-key-ambiguous.json")
             }
@@ -1799,6 +1805,20 @@ mod tests {
                     error,
                     ModelsDevError::Price {
                         reason: PriceRejection::Partial { .. },
+                        ..
+                    }
+                )
+            }),
+            // A tier stating only an optional rate states neither base rate, so
+            // the refusal names neither as published.
+            ("tier-without-base", |error| {
+                matches!(
+                    error,
+                    ModelsDevError::Price {
+                        reason: PriceRejection::Partial {
+                            stated: "only optional rates",
+                            missing: "input and output",
+                        },
                         ..
                     }
                 )
