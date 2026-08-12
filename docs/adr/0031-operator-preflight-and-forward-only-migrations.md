@@ -72,7 +72,8 @@ Their boundaries:
   (`3F000`) or a role that may not create objects (`42501`) — is a refusal too,
   because a rollout gate that retries it loops forever; only the transient
   SQLSTATE classes (connection, rollback, resources, prerequisite state, operator
-  intervention, system) stay outages.
+  intervention, system) stay outages. The boot path classifies the same way, so a
+  replica migrating at boot and an operator running `apply` disagree about nothing.
 - Only the control-plane journal is migrated. The usage, budget, and revocation
   stores have no ledger, so nothing here orchestrates them; preflight still checks
   that their references resolve, because an unset one is a boot failure whichever

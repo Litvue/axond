@@ -376,7 +376,7 @@ impl PostgresControlPlane {
             }
             schema::migrate(&transaction, &status)
                 .await
-                .map_err(|error| unavailable("apply migrations", &error))?;
+                .map_err(|error| migration_refused_or_unavailable(&error))?;
             let migrated = schema::status(&transaction)
                 .await
                 .map_err(|error| unavailable("re-read schema status", &error))?;
@@ -1836,6 +1836,39 @@ mod tests {
             heads.push(store.desired_revision().await.expect("head").is_some());
         }
         assert_eq!(heads, vec![true, true]);
+    }
+
+    /// The boot path classifies a rejected migration the way the operator command
+    /// does: a schema nothing created is an operator's to create, so a replica
+    /// says so rather than reporting an outage a supervisor would retry forever.
+    #[tokio::test]
+    async fn a_boot_migration_the_server_rejects_is_denied_rather_than_an_outage() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let missing = format!(
+            "cp_absent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let error = PostgresControlPlane::connect(
+            &dsn,
+            ControlPlaneSettings {
+                migrate: true,
+                ..settings(&missing)
+            },
+        )
+        .await
+        .expect_err("a schema that does not exist cannot be migrated into");
+        let ControlPlaneError::Denied { message, .. } = &error else {
+            panic!("a rejected statement is not an outage: {error:?}");
+        };
+        assert!(
+            message.contains("schema exists"),
+            "the refusal names what to fix: {message}"
+        );
     }
 
     #[tokio::test]
