@@ -53,7 +53,7 @@ Three commands run *before* replicas do, all with the same grammar —
 
 | Command | Writes? | Answers |
 | --- | --- | --- |
-| `axond check preflight --config PATH` | No | Would a replica boot against this? Config ownership and mode, every reference a boot resolves (control plane, secret-store KEK, breakglass, inbound keys and verifiers, provider credentials, opt-in stores), control-plane reachability, schema compatibility. |
+| `axond check preflight --config PATH` | No | Would a replica boot against this? Config ownership and mode, every reference a boot resolves (control plane, secret-store KEK, breakglass, inbound keys and verifiers, provider credentials, opt-in stores — including a reference a store inherits from the Redis budget), control-plane reachability, schema compatibility. |
 | `axond migrate status --config PATH` | No | What schema does this database have, and what would an apply do? |
 | `axond migrate apply --config PATH` | Yes | Apply the pending migrations, forward only. |
 

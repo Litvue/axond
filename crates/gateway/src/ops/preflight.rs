@@ -361,20 +361,38 @@ fn check_references(report: &mut Report, config: &Config, env: &HashMap<String, 
             ));
         }
     }
+    // A store that is selected but names nothing to read is a failure rather than
+    // a check that quietly does not happen: config validation rejects that shape
+    // today, so this is the belt this gate is for rather than a reachable message.
+    let mut unnamed: Vec<String> = Vec::new();
     for (index, sink) in config.usage_sink.iter().enumerate() {
         if sink.kind != UsageSinkKind::Postgres {
             continue;
         }
-        if let Some(name) = non_empty(sink.dsn_env.as_deref()) {
-            references.push((
+        match non_empty(sink.dsn_env.as_deref()) {
+            Some(name) => references.push((
                 format!("[[usage_sink]] #{} dsn_env", index + 1),
                 Reference::Env(name.to_owned()),
-            ));
+            )),
+            None => unnamed.push(format!(
+                "[[usage_sink]] #{}: a `postgres` sink names no `dsn_env` to connect with",
+                index + 1
+            )),
         }
     }
     // A DSN reference only has to resolve when the backend that reads it is
     // selected: an in-memory budget with a leftover `dsn_env` is not a boot
-    // failure, so it must not be a preflight failure either.
+    // failure, so it must not be a preflight failure either. The inverse is a
+    // failure: a selected backend with no name resolves nothing at boot.
+    //
+    // A Redis rate limiter and a Redis denylist may omit their own reference and
+    // read the Redis budget's, which is how `rate_limit::build` and
+    // `revocation::build` resolve them, so the fallback is followed here too
+    // rather than reported as a missing reference.
+    let budget_redis = match config.budget.backend {
+        BudgetBackend::Redis => non_empty(config.budget.dsn_env.as_deref()),
+        _ => None,
+    };
     let admission = [
         (
             "[budget] dsn_env",
@@ -383,11 +401,13 @@ fn check_references(report: &mut Report, config: &Config, env: &HashMap<String, 
                 BudgetBackend::Redis | BudgetBackend::Postgres
             ),
             config.budget.dsn_env.as_deref(),
+            None,
         ),
         (
             "[rate_limit] dsn_env",
             matches!(config.rate_limit.backend, RateLimitBackend::Redis),
             config.rate_limit.dsn_env.as_deref(),
+            budget_redis,
         ),
         (
             "[revocation] dsn_env",
@@ -396,26 +416,41 @@ fn check_references(report: &mut Report, config: &Config, env: &HashMap<String, 
                 RevocationBackend::Redis | RevocationBackend::Postgres
             ),
             config.revocation.dsn_env.as_deref(),
+            match config.revocation.backend {
+                RevocationBackend::Redis => budget_redis,
+                _ => None,
+            },
         ),
     ];
-    for (key, selected, dsn_env) in admission {
-        if let (true, Some(name)) = (selected, non_empty(dsn_env)) {
-            references.push((key.to_owned(), Reference::Env(name.to_owned())));
+    for (key, selected, dsn_env, inherited) in admission {
+        if !selected {
+            continue;
+        }
+        match (non_empty(dsn_env), inherited) {
+            (Some(name), _) => references.push((key.to_owned(), Reference::Env(name.to_owned()))),
+            (None, Some(name)) => references.push((
+                format!("{key} (inherited from `[budget] dsn_env`)"),
+                Reference::Env(name.to_owned()),
+            )),
+            (None, None) => unnamed.push(format!(
+                "{key}: the selected backend names no environment variable to read a connection \
+                 string from"
+            )),
         }
     }
 
     const NAME: &str = "bootstrap references";
-    if references.is_empty() {
+    if references.is_empty() && unnamed.is_empty() {
         report.skipped(NAME, "this configuration references no secrets");
         return;
     }
-    let unsatisfied: Vec<String> = references
-        .iter()
-        .filter_map(|(key, reference)| {
+    let unsatisfied: Vec<String> = unnamed
+        .into_iter()
+        .chain(references.iter().filter_map(|(key, reference)| {
             reference
                 .unsatisfied(env)
                 .map(|why| format!("{key}: {why}"))
-        })
+        }))
         .collect();
     if unsatisfied.is_empty() {
         report.passed(NAME, format!("{} reference(s) resolve", references.len()));
@@ -660,6 +695,46 @@ mod tests {
         assert!(
             !report.to_string().contains("sk-test"),
             "a resolved value is never reported"
+        );
+    }
+
+    /// A selected store's reference is checked wherever the boot resolves it: a
+    /// Redis limiter and denylist may omit their own and read the Redis budget's,
+    /// and one that names nothing at all is a failure rather than a check that
+    /// silently does not happen.
+    #[tokio::test]
+    async fn a_selected_store_is_checked_by_the_name_its_boot_resolves() {
+        let toml = "[[gateway_key]]\nenv = \"GW_KEY\"\nnamespace = \"platform\"\n\
+             [gateway_token]\naudience = \"axond-test\"\n\
+             [[namespace]]\nid = \"platform\"\ndefault = true\n\
+             [[provider]]\nid = \"openai\"\nkind = \"openai\"\n\
+             base_url = \"https://api.openai.com/v1\"\n\
+             [budget]\nbackend = \"redis\"\nlimit_microdollars = 1\ndsn_env = \"GW_REDIS\"\n\
+             [rate_limit]\nbackend = \"redis\"\n\
+             [revocation]\nbackend = \"redis\"\n";
+        let path = write("axond.toml", toml);
+        let mut config = Config::from_toml_str(toml).expect("valid config");
+        let env = HashMap::from([("GW_KEY".to_owned(), "secret".to_owned())]);
+
+        // The limiter and the denylist name nothing of their own, so the budget's
+        // reference is the one whose absence fails their boot.
+        let rendered = run(&config, &path, &env).await.to_string();
+        assert!(
+            rendered.matches("GW_REDIS").count() >= 3,
+            "each inheriting store is checked by the name it reads: {rendered}"
+        );
+
+        // And a selected backend with no reference anywhere is named as such
+        // rather than passing unchecked. Config validation rejects this shape, so
+        // it is reached by construction here.
+        config.revocation.backend = RevocationBackend::Postgres;
+        config.revocation.dsn_env = None;
+        let report = run(&config, &path, &env).await;
+        let rendered = report.to_string();
+        assert!(!report.is_ok(), "{rendered}");
+        assert!(
+            rendered.contains("[revocation] dsn_env: the selected backend names no environment"),
+            "{rendered}"
         );
     }
 
