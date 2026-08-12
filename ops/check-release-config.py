@@ -38,13 +38,15 @@ UNIX_INSTALLER_TARGETS = {
 }
 WINDOWS_INSTALLER_TARGET = "x86_64-pc-windows-msvc"
 IMAGE_PLATFORMS = {"linux/amd64", "linux/arm64"}
-# The last release published as a single `linux/amd64` image. The Compose
+# The last release published as a single `linux/amd64` image — the release that
+# was current when ARM support landed, so it must be bumped alongside a rebase
+# onto a newer amd64-only release. The Compose
 # quickstart pins a release tag, so while that tag is at or below this version it
 # must keep an explicit `linux/amd64` default: dropping the pin would leave ARM
 # hosts unable to pull an image that has no ARM child yet. The moment
 # release-please bumps the pinned tag past it, the fallback is wrong and this
 # check demands the unpinned form, so the transition cannot be forgotten.
-LAST_AMD64_ONLY_VERSION = (0, 3, 12)
+LAST_AMD64_ONLY_VERSION = (0, 3, 13)
 AMD64_FALLBACK_PLATFORM = "platform: ${AXOND_PLATFORM-linux/amd64}"
 NATIVE_PLATFORM = "platform: ${AXOND_PLATFORM-}"
 # Documentation that must name every target and platform an operator can pick.

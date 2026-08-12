@@ -106,7 +106,7 @@ Other distribution paths:
 cargo install axond --locked
 
 # Pull the current release image. There is intentionally no `latest` tag.
-AXOND_VERSION=0.3.12 # x-release-please-version
+AXOND_VERSION=0.3.13 # x-release-please-version
 docker pull "ghcr.io/litvue/axond:${AXOND_VERSION}"
 ```
 
@@ -197,6 +197,9 @@ start until the control-plane implementation is available.
 Read the [deployment security model](./docs/security/deployment-model.md),
 [minted-token guide](./docs/minted-token-guide.md), and latest
 [security review](./docs/security-review-2026-08-05.md).
+
+To report a vulnerability, follow [`SECURITY.md`](./SECURITY.md) — privately,
+not in an issue. It also states which releases receive fixes.
 
 ## Documentation
 

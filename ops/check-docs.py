@@ -13,7 +13,12 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def markdown_files() -> list[Path]:
-    files = [ROOT / "README.md", ROOT / "RELEASE.md", ROOT / "CONTRIBUTING.md"]
+    files = [
+        ROOT / "README.md",
+        ROOT / "RELEASE.md",
+        ROOT / "CONTRIBUTING.md",
+        ROOT / "SECURITY.md",
+    ]
     files.extend((ROOT / "docs").rglob("*.md"))
     files.extend((ROOT / "crates").rglob("README.md"))
     files.extend((ROOT / "tests").rglob("README.md"))
@@ -145,6 +150,39 @@ def check_operating_mode_contract() -> list[str]:
     return failures
 
 
+def check_msrv_documented() -> list[str]:
+    """The published MSRV policy names the versions the manifests actually pin.
+
+    `ops/msrv-gate.sh` keeps the manifests, the Dockerfile, and the pinned
+    toolchain consistent with each other; this keeps the operator-facing
+    statement of the policy consistent with them.
+    """
+    cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    msrv = re.search(r"^rust-version\s*=\s*\"([^\"]+)\"", cargo, re.MULTILINE)
+    if msrv is None:
+        return ["Cargo.toml: [workspace.package] rust-version is not declared"]
+    pinned = re.search(
+        r"^channel\s*=\s*\"([^\"]+)\"",
+        (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    if pinned is None:
+        return ["rust-toolchain.toml: no [toolchain] channel is pinned"]
+
+    heading = "### The Rust version floor (MSRV)"
+    document = (ROOT / "docs/compatibility.md").read_text(encoding="utf-8")
+    if heading not in document:
+        return [f"docs/compatibility.md: {heading!r} section is missing"]
+    start = document.index(heading)
+    end = document.find("\n### ", start + len(heading))
+    section = document[start : end if end != -1 else len(document)]
+    return [
+        f"docs/compatibility.md: the MSRV section does not mention {value!r}"
+        for value in (msrv.group(1), pinned.group(1))
+        if value not in section
+    ]
+
+
 def check_front_door_size() -> list[str]:
     failures: list[str] = []
     for relative, limit in (("README.md", 260), ("docs/deployment.md", 220)):
@@ -162,6 +200,7 @@ def main() -> int:
     failures.extend(check_operating_mode_contract())
     failures.extend(check_stale_claims(files))
     failures.extend(check_route_contract())
+    failures.extend(check_msrv_documented())
     failures.extend(check_front_door_size())
     if failures:
         for failure in failures:

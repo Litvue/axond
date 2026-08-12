@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.13](https://github.com/Litvue/axond/compare/v0.3.12...v0.3.13) (2026-08-12)
+
+
+### Continuous Integration
+
+* establish SECURITY.md, an MSRV gate, and a public API compatibility gate ([#197](https://github.com/Litvue/axond/issues/197)) ([e9c841a](https://github.com/Litvue/axond/commit/e9c841a5c3c48184ca43db03ec005a6f037423b7))
+
 ## [0.3.12](https://github.com/Litvue/axond/compare/v0.3.11...v0.3.12) (2026-08-12)
 
 
