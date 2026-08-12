@@ -8,14 +8,25 @@ pipeline.
 
 1. Resolve the immutable tag/version/commit.
 2. Require the tagged commit's `CI Success` aggregate.
-3. Build four binary targets with checksums, SPDX SBOMs, and provenance/SBOM
-   attestations.
-4. Build and publish the `linux/amd64` image.
-5. Smoke the published image before signing it.
+3. Build six binary targets with checksums, SPDX SBOMs, and provenance/SBOM
+   attestations, each Linux archive booted through the Tier 0 gate on a runner
+   of its own architecture.
+4. Build and publish the `linux/amd64` and `linux/arm64` images, each on a native
+   runner, under their `<version>-<arch>` and `sha-<short>-<arch>` tags.
+5. Smoke each published single-platform image before signing it.
 6. Generate image SBOM/provenance attestations, sign the digest keylessly, and
-   verify signature plus attestations.
-7. Require every artifact lane.
-8. Publish `gateway-core`, `gateway-transport`, then `axond` to crates.io.
+   verify signature plus attestations, per architecture.
+7. Join the signed child digests into a multi-architecture index, staged under
+   `sha-<short>-index`, and assert every descriptor in it is a supported platform
+   child (or an attestation manifest for one).
+8. Pull that index digest on each architecture and smoke it natively.
+9. Promote the smoked index: retag it as `<version>` and `sha-<short>` —
+   asserting the retag reproduced the digest that was smoked — sign it keylessly,
+   attest its provenance, verify both, and attach it to the release as
+   `axond-image-<version>.digest`. SBOM attestations and SPDX assets stay
+   per-architecture, on the children.
+10. Require every artifact lane.
+11. Publish `gateway-core`, `gateway-transport`, then `axond` to crates.io.
 
 crates.io is last because a published version cannot be replaced. The publish
 script is idempotent: an existing aligned package is skipped, and a partial
@@ -65,6 +76,28 @@ or policy; it will fail at the same PR-creation boundary.
 6. Confirm all three crates are visible and `cargo install axond --locked`
    succeeds.
 
+## After the first multi-architecture release
+
+The quickstart still forces `linux/amd64` so that ARM hosts can run the last
+amd64-only image at all. The first release that publishes a `linux/amd64` +
+`linux/arm64` index makes that fallback obsolete, and
+`ops/check-release-config.py` says so on every subsequent run:
+
+```
+release configuration note: docker-compose.yml: the pinned tag 0.3.17 publishes a
+multi-architecture image, so the amd64 fallback now only forces emulation on ARM
+hosts; switch to `platform: ${AXOND_PLATFORM-}` and bump
+LAST_AMD64_ONLY_VERSION to 0.3.17
+```
+
+It is a note, not a failure, because release-please bumps the pinned tag inside
+its own generated release PR and never rewrites the `platform:` line — failing
+there would block the release. Land the two-line follow-up once that release is
+published: set `platform: ${AXOND_PLATFORM-}` in `docker-compose.yml` and bump
+`LAST_AMD64_ONLY_VERSION` in `ops/check-release-config.py` to the released
+version. `ops/check-compose-platform.sh` then proves native resolution, and the
+note disappears.
+
 ## Repair an existing tag
 
 When a workflow fix lands after a release tag, dispatch **Release** from `main`
@@ -89,6 +122,7 @@ several minutes later inside a lane:
 | --- | --- | --- |
 | `Dockerfile`, `ops/docker-smoke.sh` | the image lane builds and smokes the published image from the tag | the dispatch fails in the preflight |
 | `ops/binary-smoke.py` | each binary lane boots the binary it archived, before attestation, signing, and upload | the dispatch fails in the preflight |
+| `ops/publish-image-index.sh`, `ops/verify-image-evidence.sh` | the image lanes assemble the multi-architecture index from the per-platform child digests and verify the evidence attached to both | the dispatch fails in the preflight |
 | `ops/publish-crates.sh` | crates.io upload | the crates lane is skipped explicitly and the rest of the repair proceeds |
 
 The difference in the last row is deliberate: a skipped optional lane leaves the
@@ -98,7 +132,14 @@ boot gate would attest and attach binaries nobody started — the property the
 
 ### Repairing a tag that predates a required path
 
-A tag cut before `ops/binary-smoke.py` landed cannot be repaired from `main`.
+A tag cut before `ops/binary-smoke.py` or the multi-architecture index scripts
+landed cannot be repaired from `main`. Every tag published before ARM support is
+in that position, so call it out in the release notes for the release that
+introduces it: a maintainer with `--ref main -f release_tag=<older-tag>` in their
+shell history should learn the new form from the changelog rather than from a
+failed dispatch. The preflight failure also prints the remediation itself, so it
+does not depend on this page being read first.
+
 Dispatch the same workflow from the tag instead — the preflight's required-path
 check runs only for `refs/heads/main`, and a tag ref runs that tag's own
 definition and its own gates, which is the only self-consistent way to rebuild an

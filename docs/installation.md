@@ -6,8 +6,8 @@ released artifact in production; build from source when developing Axond.
 ## Prebuilt binary installer
 
 The installer is the shortest path to the released single binary. It detects
-Linux x86-64 or macOS Apple Silicon, downloads the matching GitHub Release
-archive, verifies the published SHA-256 sidecar, and installs into
+Linux x86-64, Linux ARM64, or macOS Apple Silicon, downloads the matching GitHub
+Release archive, verifies the published SHA-256 sidecar, and installs into
 `$HOME/.local/bin` by default:
 
 ```bash
@@ -33,10 +33,11 @@ AXOND_VERSION=0.3.17 AXOND_INSTALL_DIR=/usr/local/bin sh ./install.sh # x-releas
 .\install.ps1 -Version 0.3.17 -InstallDir C:\Tools\axond # x-release-please-version
 ```
 
-Supported installer targets match the release matrix: Linux x86-64 (static
-musl by default, glibc selectable through `AXOND_TARGET`), macOS Apple Silicon,
-and Windows x86-64. Other architectures must build from source until a release
-artifact is added.
+Supported installer targets match the release matrix: Linux x86-64 and Linux
+ARM64 (static musl by default, glibc selectable through `AXOND_TARGET`), macOS
+Apple Silicon, and Windows x86-64. Other architectures must build from source
+until a release artifact is added; the full matrix is in
+[the compatibility contract](./compatibility.md#supported-platforms).
 
 A same-origin checksum detects corruption but is not independent proof of
 provenance. By default, both installers verify that checksum and do not depend
@@ -88,6 +89,8 @@ Release archives are published for:
 | --- | --- |
 | Linux x86_64, glibc | `x86_64-unknown-linux-gnu.tar.gz` |
 | Linux x86_64, static musl | `x86_64-unknown-linux-musl.tar.gz` |
+| Linux aarch64, glibc | `aarch64-unknown-linux-gnu.tar.gz` |
+| Linux aarch64, static musl | `aarch64-unknown-linux-musl.tar.gz` |
 | macOS Apple Silicon | `aarch64-apple-darwin.tar.gz` |
 | Windows x86_64 | `x86_64-pc-windows-msvc.zip` |
 
@@ -107,13 +110,20 @@ tar -xzf "axond-${version}-${target}.tar.gz"
 ./axond --help
 ```
 
-The musl binary is static PIE and is the simplest Linux server installation.
+The musl binary is static PIE and is the simplest Linux server installation, on
+either architecture.
 
 ## OCI image
 
 The public image is distroless, runs as non-root, contains no shell or package
-manager, and is currently published for `linux/amd64` only. There is no
-`latest` tag.
+manager, and is published as a multi-architecture index covering `linux/amd64`
+and `linux/arm64`. There is no `latest` tag.
+
+The index is published from the next release onward. Releases up to and including
+the pinned version below publish a single `linux/amd64` image, so on those tags
+the platform listing has one entry and there is no `-arm64` reference to pull;
+ARM hosts run them under emulation ([architecture
+selection](./deployment/docker-compose.md#architecture-selection)).
 
 ```bash
 AXOND_VERSION=0.3.17 # x-release-please-version
@@ -122,6 +132,19 @@ docker pull "$image"
 digest="$(docker buildx imagetools inspect "$image" | \
   awk '$1 == "Digest:" { print $2 }')"
 test -n "$digest"
+```
+
+That digest is the index: pulling it resolves to the child image for the host's
+architecture, so one pinned digest serves a mixed-architecture fleet. List the
+platforms it contains, or pin a single platform explicitly:
+
+```bash
+docker buildx imagetools inspect "ghcr.io/litvue/axond@${digest}" \
+  --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{.Digest}}
+{{end}}'
+
+# Single-platform tags remain published alongside the index.
+docker pull "ghcr.io/litvue/axond:${AXOND_VERSION}-arm64"
 ```
 
 Verify the keyless signature and GitHub provenance:
@@ -137,8 +160,34 @@ gh attestation verify "oci://ghcr.io/litvue/axond@${digest}" \
   --predicate-type https://slsa.dev/provenance/v1
 ```
 
+Those two commands cover the index digest: it is signed and carries provenance.
+SBOM attestations are on the single-platform children, so to verify the SBOM of
+what you actually run, resolve your platform's child digest and verify that:
+
+```bash
+child="$(docker buildx imagetools inspect "ghcr.io/litvue/axond@${digest}" \
+  --format '{{json .Manifest}}' |
+  jq -r '.manifests[] | select(.platform.architecture == "arm64") | .digest')"
+
+gh attestation verify "oci://ghcr.io/litvue/axond@${child}" \
+  --repo Litvue/axond \
+  --predicate-type https://spdx.dev/Document/v2.3
+```
+
 Deploy `ghcr.io/litvue/axond@${digest}`, not a mutable tag. The release page
-also carries the image digest and SPDX SBOM as assets.
+carries `axond-image-<version>.digest` (the index), the per-architecture
+`axond-image-<version>-amd64.digest` and `-arm64.digest`, and one SPDX SBOM per
+architecture.
+
+### Older releases
+
+Linux ARM64 archives and the multi-architecture image exist from the first
+release that published them; earlier releases carry the x86-64 Linux, macOS, and
+Windows artifacts only. Asking an older release for an ARM64 archive fails with
+an explicit message naming the release and target rather than a transfer error,
+and the Compose quickstart keeps an `AXOND_PLATFORM` default that runs the
+last amd64-only image on ARM hosts under emulation — see [architecture
+selection](./deployment/docker-compose.md#architecture-selection).
 
 ## Build from source
 

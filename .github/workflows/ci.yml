@@ -240,7 +240,29 @@ jobs:
           # ever passes on the committed tree proves nothing.
           python3 ops/check-docs.py --self-test
           python3 ops/check-docs.py
-          shellcheck install.sh
+          python3 ops/check-release-config.py
+          shellcheck install.sh ops/publish-image-index.sh \
+            ops/verify-image-evidence.sh ops/check-compose-platform.sh \
+            ops/check-installer-download.sh
+          # A failed download must name the kind of failure: the older-release
+          # explanation belongs to a 404, and a transport failure must read as
+          # retryable rather than as a missing artifact.
+          bash ops/check-installer-download.sh
+          # Every released Unix target must resolve to its own archive, and a
+          # target outside the release matrix must be refused rather than
+          # producing a download URL for an asset that was never published.
+          for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl \
+            aarch64-unknown-linux-gnu aarch64-unknown-linux-musl \
+            aarch64-apple-darwin; do
+            AXOND_VERSION=0.0.0 AXOND_TARGET="$target" \
+              AXOND_INSTALL_DRY_RUN=1 sh install.sh |
+              grep -F "axond-0.0.0-${target}.tar.gz"
+          done
+          if AXOND_VERSION=0.0.0 AXOND_TARGET=aarch64-unknown-linux-uclibc \
+            AXOND_INSTALL_DRY_RUN=1 sh install.sh; then
+            echo "Unix installer accepted an unpublished target" >&2
+            exit 1
+          fi
           unix_installer_output="$(AXOND_VERSION=0.0.0 \
             AXOND_TARGET=x86_64-unknown-linux-musl \
             AXOND_REQUIRE_ATTESTATION=true \
@@ -274,6 +296,7 @@ jobs:
             docker compose --env-file ops/compose/env.example \
             -f docker-compose.yml -f docker-compose.stateful.yml \
             --profile stateful config --quiet
+          bash ops/check-compose-platform.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
@@ -364,6 +387,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+          # Native ARM64 runners: a cross-compiled aarch64 binary could not be
+          # booted here, and booting it is the whole point of this lane.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
           - os: macos-14
             target: aarch64-apple-darwin
           - os: windows-latest
@@ -381,7 +410,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+        if: endsWith(matrix.target, '-unknown-linux-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       # The release profile is what ships: a debug binary would smoke different
       # code than the archives the installer downloads.
