@@ -103,6 +103,10 @@ binary targets, and the image is published for `linux/arm64` alongside
 runner of its own architecture, so the release never ships an artifact that was
 only cross-compiled and never executed: each Linux archive is booted through the
 Tier 0 gate, and each single-platform image is smoke-tested before it is signed.
+That gate runs with `AXOND_TIER0_ALLOW_NO_NETNS=1` in the release lanes only: a
+runner that forbids namespace creation degrades to boot-and-serve evidence instead
+of failing a valid release, while CI keeps proving the hermetic guarantee
+([ADR 0018](./0018-tier-0-hermetic-boot-gate.md)).
 
 The two signed, attested child images are then joined — by digest, not rebuilt —
 into an OCI index that the existing `<version>` and `sha-<short>` tags point at,

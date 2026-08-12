@@ -10,6 +10,14 @@
 # fake-upstream listeners, catching a datastore or sidecar started in-namespace.
 #
 # Usage: ops/tier0-gate.sh [axond-binary]
+#
+# AXOND_TIER0_ALLOW_NO_NETNS=1 permits a degraded run when the host denies
+# namespace creation outright. Boot and the entire serving path are still
+# asserted; only the two guarantees the namespace itself provides — egress denial
+# and the listener set — are skipped, loudly. It exists for the release lanes,
+# where a sandbox restriction on a hosted runner must not fail an otherwise valid
+# release. CI leaves it unset, so the hermetic guarantee is enforced on every
+# change.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,27 +42,61 @@ if [[ ! -d "$tmpdir" ]]; then
   exit 1
 fi
 
-if [[ -z "${AXOND_TIER0_NETNS:-}" ]]; then
-  if ! command -v unshare >/dev/null 2>&1; then
-    echo "TIER 0 INVARIANT FAILED: unshare is required; refusing to run with networking enabled." >&2
+allow_no_netns=0
+case "${AXOND_TIER0_ALLOW_NO_NETNS:-0}" in
+  1 | true | yes | on) allow_no_netns=1 ;;
+  0 | false | no | off | '') allow_no_netns=0 ;;
+  *)
+    echo "TIER 0 INVARIANT FAILED: AXOND_TIER0_ALLOW_NO_NETNS must be 1/0, true/false, yes/no, or on/off" >&2
+    exit 1
+    ;;
+esac
+
+no_namespace() {
+  # Either refuse — the hermetic guarantee is the point of this gate — or, when
+  # the caller has opted in, keep the boot and serving assertions and drop the
+  # two the namespace was providing.
+  if [[ "$allow_no_netns" != 1 ]]; then
+    echo "TIER 0 INVARIANT FAILED: $1; refusing to run with networking enabled." >&2
+    echo "Set AXOND_TIER0_ALLOW_NO_NETNS=1 to accept a degraded run that still boots and serves but cannot prove egress denial." >&2
     exit 1
   fi
+  echo "TIER 0 DEGRADED: $1; AXOND_TIER0_ALLOW_NO_NETNS=1, so boot and the serving path are still asserted while egress denial and the listener invariant are not." >&2
+}
+
+if [[ -z "${AXOND_TIER0_NETNS:-}" ]]; then
   namespace_body='ip link set lo up || { echo "TIER 0 INVARIANT FAILED: could not enable namespace loopback." >&2; exit 1; }; export AXOND_TIER0_NETNS=1; exec "$@"'
-  if unshare --user --map-root-user --net --fork true >/dev/null 2>&1; then
+  if ! command -v unshare >/dev/null 2>&1; then
+    no_namespace "unshare is not installed"
+    export AXOND_TIER0_DEGRADED=1
+  elif unshare --user --map-root-user --net --fork true >/dev/null 2>&1; then
     exec unshare --user --map-root-user --net --fork bash -c \
       "$namespace_body" bash "$0" "$bin" "$tmpdir"
-  fi
-  echo "unprivileged user/network namespace unavailable; trying passwordless sudo fallback" >&2
-  if ! sudo -n unshare --net --fork true >/dev/null 2>&1; then
-    echo "TIER 0 INVARIANT FAILED: neither unprivileged unshare nor sudo network namespace creation worked; refusing to run with networking enabled." >&2
-    exit 1
-  fi
-  if sudo -n unshare --net --fork bash -c "$namespace_body" bash "$0" "$bin" "$tmpdir"; then
-    exit 0
   else
-    status=$?
-    exit "$status"
+    echo "unprivileged user/network namespace unavailable; trying passwordless sudo fallback" >&2
+    if sudo -n unshare --net --fork true >/dev/null 2>&1; then
+      if sudo -n unshare --net --fork bash -c "$namespace_body" bash "$0" "$bin" "$tmpdir"; then
+        exit 0
+      else
+        status=$?
+        exit "$status"
+      fi
+    fi
+    no_namespace "neither unprivileged unshare nor sudo network namespace creation worked"
+    export AXOND_TIER0_DEGRADED=1
   fi
+fi
+
+degraded="${AXOND_TIER0_DEGRADED:-0}"
+if [[ "$degraded" == 1 ]]; then
+  # Outside a namespace the fixed ports are the host's, so a stale listener would
+  # be mistaken for the gateway or the fake upstream.
+  for port in 18081 18082; do
+    if ss -H -ltn "sport = :$port" | grep -q .; then
+      echo "TIER 0 INVARIANT FAILED: port $port is already in use; a degraded run needs both fixed ports free." >&2
+      exit 1
+    fi
+  done
 fi
 
 config="$repo_root/tests/tier0/axond.tier0.toml"
@@ -103,14 +145,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Tier 0: checking network namespace denial"
-if timeout 2 bash -c '</dev/tcp/1.1.1.1/443' >/dev/null 2>&1; then
-  failure "network namespace permits outbound TCP (sandbox silently degraded to network-enabled; the gate is worthless)"
+if [[ "$degraded" == 1 ]]; then
+  echo "sandbox: DEGRADED, egress denial not checked"
+else
+  echo "Tier 0: checking network namespace denial"
+  if timeout 2 bash -c '</dev/tcp/1.1.1.1/443' >/dev/null 2>&1; then
+    failure "network namespace permits outbound TCP (sandbox silently degraded to network-enabled; the gate is worthless)"
+  fi
+  if getent hosts example.com >/dev/null 2>&1; then
+    failure "network namespace permits public DNS resolution (sandbox silently degraded to network-enabled; the gate is worthless)"
+  fi
+  echo "sandbox: outbound TCP denied; public DNS denied"
 fi
-if getent hosts example.com >/dev/null 2>&1; then
-  failure "network namespace permits public DNS resolution (sandbox silently degraded to network-enabled; the gate is worthless)"
-fi
-echo "sandbox: outbound TCP denied; public DNS denied"
 
 listener_ports() {
   ss -H -ltn | awk '{print $4}' | awk -F: '{print $NF}' | sort -n | uniq
@@ -154,12 +200,18 @@ for _ in $(seq 1 60); do
 done
 [[ "$ready" == 1 ]] || failure "gateway did not serve /healthz; Tier 0 boot is not available"
 
+# The listener set is only an invariant inside the namespace: on a shared host any
+# unrelated service would break it, which is why a degraded run cannot assert it.
 listeners="$(listener_ports)"
 expected_listeners="$(printf '%s\n18081\n18082\n' "$baseline_listeners" | sed '/^$/d' | sort -n | uniq)"
-if [[ "$listeners" != "$expected_listeners" ]]; then
+if [[ "$degraded" == 1 ]]; then
+  echo "listeners: DEGRADED, in-namespace listener invariant not checked"
+elif [[ "$listeners" != "$expected_listeners" ]]; then
   failure "listener invariant violated: namespace must contain its baseline listeners plus only gateway 18081 and fake upstream 18082; unexpected listener set (${listeners//$'\n'/, }), expected (${expected_listeners//$'\n'/, }). This includes any Redis 6379 or Postgres 5432 listener. External datastore dependencies are excluded by the network namespace and would instead appear as boot or serving failure."
 fi
-echo "namespace listeners: baseline (${baseline_listeners//$'\n'/, }) plus gateway 18081 and fake upstream 18082 only; external Redis 6379/Postgres 5432 are excluded by namespace egress denial"
+if [[ "$degraded" != 1 ]]; then
+  echo "namespace listeners: baseline (${baseline_listeners//$'\n'/, }) plus gateway 18081 and fake upstream 18082 only; external Redis 6379/Postgres 5432 are excluded by namespace egress denial"
+fi
 
 health_probe_body="$(mktemp "$tmpdir/axond-tier0-healthz.XXXXXX")"
 health_status="$(curl --silent --show-error --max-time 5 --output "$health_probe_body" \
@@ -248,4 +300,8 @@ echo "auth: unauthenticated /v1/models -> 401"
 echo "errors: unknown model -> 404 unknown_model"
 echo "serving: local fixture upstream -> 200 chat.completion"
 echo "stateful: bootstrap validates with no datastore, then refuses to serve"
-echo "Tier 0 hermetic boot and serve passed"
+if [[ "$degraded" == 1 ]]; then
+  echo "Tier 0 boot and serve passed (DEGRADED: no namespace, so egress denial and the listener invariant were not proven)"
+else
+  echo "Tier 0 hermetic boot and serve passed"
+fi

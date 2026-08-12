@@ -50,6 +50,28 @@ sidecar) inside the namespace by requiring exactly the two listeners the gate
 starts. It does not inspect unrelated host processes, and a datastore on the
 host's loopback is outside this namespace and intentionally irrelevant.
 
+### Amendment: the release lanes reuse the gate, without depending on the sandbox
+
+The release workflow boots every Linux archive it publishes through this same
+gate, which is the point of building ARM archives on ARM runners: the binary that
+ships is executed, not only compiled. But a namespace is a property of the
+*runner*, not of the artifact, so an AppArmor or seccomp restriction on a hosted
+image would turn an otherwise valid release into a failed one.
+
+`AXOND_TIER0_ALLOW_NO_NETNS=1` — set only by `release-binaries` — therefore lets
+the gate degrade rather than refuse when neither unprivileged `unshare` nor
+passwordless `sudo unshare` works. Boot, health, readiness, authentication, typed
+errors, the fixture serving path, and the stateful refusal are all still asserted;
+the two guarantees that came *from* the namespace, egress denial and the listener
+set, are skipped and reported as `DEGRADED` in the log and the final line. A
+degraded run additionally requires both fixed ports to be free, since outside a
+namespace they are the host's. Any other value than a boolean is rejected rather
+than treated as false.
+
+CI leaves the variable unset, and `ops/check-release-config.py` fails if
+`ci.yml` ever sets it, so the hermetic guarantee is still proven on every change —
+the relaxation applies only where the alternative is an unpublishable release.
+
 This extends the static-musl lane instead of adding another job: the qualified
 artifact is already built there, and the namespace gate adds focused runtime
 coverage without multiplying CI scheduling and aggregate status. `CI Success`

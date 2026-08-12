@@ -109,12 +109,23 @@ def check_binary_gates(text: str) -> list[str]:
         "SBOM attestation": "Attest binary SBOM",
         "static-link assertion": "Assert the musl binary is statically linked",
         "boot smoke": "ops/tier0-gate.sh",
+        # The release must not depend on namespace creation being permitted on a
+        # hosted runner: the smoke gate degrades there instead of failing, while
+        # CI keeps proving the hermetic guarantee on every change.
+        "sandbox-restriction tolerance": 'AXOND_TIER0_ALLOW_NO_NETNS: "1"',
     }
-    return [
+    failures = [
         f"release-please.yml: release-binaries lacks a {label} gate ({needle!r})"
         for label, needle in required.items()
         if needle not in block
     ]
+    ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    if "AXOND_TIER0_ALLOW_NO_NETNS" in ci:
+        failures.append(
+            "ci.yml: the CI lanes must not tolerate a missing namespace; the "
+            "hermetic Tier 0 guarantee is what they exist to prove"
+        )
+    return failures
 
 
 def check_image_matrix(text: str) -> list[str]:

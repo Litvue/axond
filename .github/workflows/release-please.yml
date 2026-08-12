@@ -358,9 +358,18 @@ jobs:
           set -euo pipefail
           file release-bin/axond | grep -Eq 'static-pie linked|statically linked'
           ! file release-bin/axond | grep -q 'dynamically linked'
+      # The archive that ships is booted and served here, not merely compiled —
+      # which is the reason ARM archives are built on ARM runners. The hermetic
+      # namespace is a CI guarantee, not a release one: AXOND_TIER0_ALLOW_NO_NETNS
+      # keeps boot and the whole serving path asserted while letting a runner that
+      # forbids namespace creation degrade instead of failing a valid release. The
+      # `static-binary` CI lane leaves it unset, so egress denial is still proven
+      # on every change.
       - name: Smoke the Linux binary that ships
         if: endsWith(matrix.target, '-unknown-linux-gnu') || endsWith(matrix.target, '-unknown-linux-musl')
         shell: bash
+        env:
+          AXOND_TIER0_ALLOW_NO_NETNS: "1"
         run: bash ops/tier0-gate.sh release-bin/axond
       - name: Package the Windows binary
         if: runner.os == 'Windows'
