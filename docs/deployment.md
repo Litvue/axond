@@ -133,8 +133,10 @@ TOML owns structure; scalar overrides are for deployment adaptation.
 | `GET /v1/models` | gateway credential | Namespace-scoped alias catalogue. |
 | `GET /v1/credentials` | gateway credential | Replica-local credential labels and circuit state. |
 
-`/readyz` does not continuously probe providers or stateful backends. Runtime
-dependency health is exposed by typed errors and metrics.
+`/readyz` does not continuously probe providers or stateful backends, and never
+will: dependency state belongs to the authenticated status surface instead
+([ADR 0031](./adr/0031-bounded-status-contract.md)). Runtime dependency health is
+exposed by typed errors and metrics.
 
 Point the load balancer at `/readyz` and liveness at `/healthz`: on `SIGTERM`
 the replica fails readiness first, keeps serving for `shutdown.drain_grace_ms`,

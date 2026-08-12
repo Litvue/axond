@@ -292,7 +292,11 @@ and pass any ceiling. It is enforced at admission time and emitted by
 
 ADR 0016 describes three narrowing claims. `scope` is enforced by route
 capability and can be emitted with repeatable `--scope` flags:
-`chat`, `messages`, `embeddings`, `responses`, `models`, and `credentials`.
+`chat`, `messages`, `embeddings`, `responses`, `models`, `credentials`, and
+`status`. `status` names the authenticated dependency-status view of
+[ADR 0031](./adr/0031-bounded-status-contract.md) and grants nothing else; it is
+the only capability that does not require the namespace to have a model route,
+and its route ships with the stateful slices.
 A minted token cannot reach the all-namespaces credential view
 (`GET /v1/credentials?namespaces=all`) at all: that view follows direct
 operator authority, so use a scope-less static `[[gateway_key]]` in the default

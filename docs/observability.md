@@ -22,6 +22,47 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318   # OTLP/HTTP only
 Logs are always JSON on stdout, filtered by `RUST_LOG` (default
 `info,axond=info`).
 
+## Health surfaces
+
+Three surfaces answer three different questions, and none of them substitutes for
+another ([ADR 0031](./adr/0031-bounded-status-contract.md)):
+
+| Surface | Authentication | Question it answers |
+| --- | --- | --- |
+| `GET /healthz` | none | *Is the process alive?* Answers `ok` throughout, including the shutdown drain. Restart it if this fails. |
+| `GET /readyz` | none | *Should traffic be sent here?* `ready`, or `503 draining` once termination begins. Point the load balancer here. |
+| `GET /admin/v1/status` | gateway credential with the `status` capability | *Which dependencies is this replica talking to?* Cached component states with an observation age. |
+
+Neither `/healthz` nor `/readyz` observes a dependency. A store outage must not
+remove healthy replicas from service, so dependency state lives only on the
+authenticated surface — and that surface answers from a **cache**: a background
+refresher observes each enabled component on its own cadence, and a read takes an
+in-memory snapshot. A status request never probes a backend, never takes a budget
+or rate-limit permit, and cannot slow inference down.
+
+Read the age, not just the state. Each component reports `ok`, `degraded`,
+`unavailable`, or `disabled` (nothing is configured for it) with the age of the
+observation behind it; an observation older than the staleness budget reports
+`degraded` with reason `stale`, because a replica serving a valid snapshot through
+an observation outage is stale rather than down. A component that is enabled but
+has never been observed reports `unavailable`, never `ok`.
+
+Reasons come from a closed list — `unavailable`, `unreachable`, `timeout`,
+`authentication_rejected`, `permission_denied`, `schema_incompatible`,
+`payload_corrupt`, `validation_rejected`, `projection_rejected`,
+`snapshot_rejected`, `secret_unresolved`, `stale`, `not_configured`, `draining`,
+`capacity_exhausted`, `unknown` — and treat an unrecognised one as opaque, since
+codes are added additively. There is deliberately no free-text field: connection
+strings, tokens, raw backend errors, and rejected-revision details are logged for
+the operator and cannot appear in a response. A caller without deployment-wide
+authority additionally sees only the components its own traffic depends on,
+reasons coarsened to `unavailable`, ages rounded to whole seconds, and no revision
+summary.
+
+A stateless replica reports every component `disabled`; that is the correct
+answer, not a degraded one. Probes ship with the stateful slices that own each
+backend.
+
 ## Traces
 
 One `http.server.request` span per request, with one `axond.upstream.attempt`
@@ -83,6 +124,19 @@ metric and a usage row can never disagree.
 | `axond.rate_limit.unavailable_denials` | counter | — | Redis rate-limit admissions denied because the store was unavailable. |
 | `axond.admission.in_flight` | up-down counter | `axond.admission.resource` | Admission capacity held right now, by resource: `request`, `stream`, `tenant`, `queue`. Bounded label set — no tenant, subject, or request identity. |
 | `axond.admission.rejections` | counter | `axond.admission.resource`, `axond.error.type` | Requests shed by admission control, by resource and stable error type. |
+| `axond.status.component_state` | gauge | `axond.status.component` | Last observed dependency state: `0` ok, `1` degraded, `2` unavailable, `3` disabled. Bounded label set — no tenant, subject, or credential identity. |
+| `axond.status.observation_age` | gauge (ms) | `axond.status.component` | Age of the cached observation behind that state; a rising age means the refresher, not the dependency, is the problem. |
+| `axond.status.refreshes` | counter | `axond.status.component`, `axond.status.outcome` | Background refresh attempts and how they ended. |
+
+Every instrument and label above is declared in a catalogue inside the binary,
+and tests fail if the code builds an instrument or records a label the catalogue
+does not declare. Labels are classified: closed vocabularies are enumerated, and
+deployment-defined dimensions such as `axond.namespace` and the model dimensions
+are legitimate only on the instruments listed above — they are refused as default
+labels attached to everything. Tenant, subject, credential id, alias, revision id,
+request id, and jti are refused as metric dimensions outright, so tenancy is never
+readable from a scrape endpoint
+([ADR 0031](./adr/0031-bounded-status-contract.md)).
 
 ### What to alert on
 

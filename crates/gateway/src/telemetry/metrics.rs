@@ -61,6 +61,9 @@ struct Instruments {
     rate_limit_unavailable_denials: Counter<u64>,
     revocation_denials: Counter<u64>,
     revocation_unavailable_denials: Counter<u64>,
+    status_component_state: Gauge<u64>,
+    status_observation_age: Gauge<u64>,
+    status_refreshes: Counter<u64>,
 }
 
 static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
@@ -281,6 +284,22 @@ impl Instruments {
             revocation_unavailable_denials: meter
                 .u64_counter("axond.revocation.unavailable_denials")
                 .with_description("Tokens denied because the revocation store was unavailable.")
+                .build(),
+            status_component_state: meter
+                .u64_gauge("axond.status.component_state")
+                .with_description(
+                    "Last observed dependency state, by component: 0 ok, 1 degraded, \
+                     2 unavailable, 3 disabled.",
+                )
+                .build(),
+            status_observation_age: meter
+                .u64_gauge("axond.status.observation_age")
+                .with_unit("ms")
+                .with_description("Age of the cached observation behind each component's state.")
+                .build(),
+            status_refreshes: meter
+                .u64_counter("axond.status.refreshes")
+                .with_description("Background status refresh attempts, by component and outcome.")
                 .build(),
         }
     }
@@ -633,6 +652,44 @@ pub fn record_revocation_unavailable_denial() {
         return;
     };
     instruments.revocation_unavailable_denials.add(1, &[]);
+}
+
+/// Publish one component's cached status observation.
+///
+/// Component-scoped and nothing else: the status registry observes
+/// deployment-wide dependencies, so a namespace or subject dimension here would
+/// be both unbounded and a leak of the tenancy the redacted status response is
+/// careful not to carry.
+pub fn record_status_component(
+    component: &'static str,
+    state: crate::status::ComponentState,
+    age: std::time::Duration,
+) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    let attributes = [KeyValue::new("axond.status.component", component)];
+    instruments
+        .status_component_state
+        .record(state.gauge_value(), &attributes);
+    instruments.status_observation_age.record(
+        u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+        &attributes,
+    );
+}
+
+/// Count one background refresh attempt.
+pub fn record_status_refresh(component: &'static str, outcome: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.status_refreshes.add(
+        1,
+        &[
+            KeyValue::new("axond.status.component", component),
+            KeyValue::new("axond.status.outcome", outcome),
+        ],
+    );
 }
 
 /// Publish a target's circuit state. Ordered failover (which owns the breaker)

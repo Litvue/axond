@@ -12,6 +12,12 @@
 //! * **Nothing sensitive.** Spans and metrics carry identifiers and counts —
 //!   never credentials, prompts, or completions.
 
+// The canonical metric catalogue (#199): data, plus the validation the
+// dashboards, alert rules, and documentation tables are checked against. Nothing
+// in the request path reads it, so it carries `allow(dead_code)` for the same
+// reason the other contract modules do.
+#[allow(dead_code)]
+pub mod catalog;
 mod exporter;
 pub mod http;
 pub mod metrics;

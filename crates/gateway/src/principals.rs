@@ -37,6 +37,7 @@ define_capabilities!(
     Models,
     Credentials,
     CredentialsAll,
+    Status,
 );
 
 impl Capability {
@@ -49,6 +50,7 @@ impl Capability {
             "models" => Some(Self::Models),
             "credentials" => Some(Self::Credentials),
             "credentials:all" => Some(Self::CredentialsAll),
+            "status" => Some(Self::Status),
             _ => None,
         }
     }
@@ -62,6 +64,7 @@ impl Capability {
             Self::Models => "models",
             Self::Credentials => "credentials",
             Self::CredentialsAll => "credentials:all",
+            Self::Status => "status",
         }
     }
 
@@ -103,6 +106,28 @@ pub struct InboundKey {
     pub max_request_microdollars: Option<u64>,
     pub can_mint: bool,
     pub jti: Option<String>,
+}
+
+impl InboundKey {
+    /// Whether this principal holds the operator's own authority over the whole
+    /// deployment, rather than authority over one namespace.
+    ///
+    /// Only a configured static gateway key in the default namespace does: an
+    /// operator placed that secret there itself. A scope narrows a static key
+    /// rather than widening it, so a scoped one is not treated as unrestricted,
+    /// and every minted token carries delegated authority bounded by minting and
+    /// its verifier — including one that presents an operator-only capability
+    /// from a signer outside `POST /v1/tokens`.
+    ///
+    /// This is the predicate behind the all-namespaces credential view and
+    /// behind [`crate::status::StatusScope::Deployment`]; it lives here because
+    /// authentication is the only place that knows how a principal was
+    /// established.
+    pub fn holds_direct_operator_authority(&self, default_namespace: &str) -> bool {
+        self.authority == PrincipalAuthority::StaticKey
+            && self.scope.is_none()
+            && self.namespace == default_namespace
+    }
 }
 
 pub(crate) struct GatewayKeyEntry {

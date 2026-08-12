@@ -59,9 +59,7 @@ use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target};
 use crate::credentials::{CredentialLease, CredentialPlan, CredentialSource, CredentialStatusView};
 use crate::error::GatewayError;
 use crate::mint::{MintRequest, mint_issued_at, mint_token_at};
-use crate::principals::{
-    Capability, Presented, PrincipalAuthority, PrincipalStoreError, TokenVerificationError,
-};
+use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
 use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::shutdown::Phase;
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
@@ -465,17 +463,11 @@ async fn list_credentials(
 ///
 /// This is deliberately not `caller_can_mint_capability`: that predicate asks
 /// whether a caller may *delegate* a capability to a subject, while this one
-/// asks whether the caller *is* the operator. Only a configured static gateway
-/// key in the default namespace is, because an operator placed that secret there
-/// itself; a scope narrows a static key rather than widening it, so a scoped one
-/// is not treated as unrestricted. Every minted token carries delegated
-/// authority bounded by minting and its verifier, so no token reaches this view,
-/// including one that presents `credentials:all` from a signer outside
-/// `POST /v1/tokens`.
+/// asks whether the caller *is* the operator. The rule itself lives with
+/// authentication ([`InboundKey::holds_direct_operator_authority`]), which is
+/// also what decides an authenticated status caller's scope.
 fn caller_holds_direct_operator_authority(caller: &InboundKey, snapshot: &ConfigSnapshot) -> bool {
-    caller.authority == PrincipalAuthority::StaticKey
-        && caller.scope.is_none()
-        && caller.namespace == snapshot.config.default_namespace()
+    caller.holds_direct_operator_authority(snapshot.config.default_namespace())
 }
 
 fn parse_credential_query(raw_query: Option<&str>) -> Result<Option<String>, GatewayError> {
@@ -678,6 +670,9 @@ fn namespace_allows(snapshot: &ConfigSnapshot, namespace: &str, capability: Capa
         Capability::Responses => Some(Route::Responses),
         Capability::Models => None,
         Capability::Credentials | Capability::CredentialsAll => None,
+        // Status reports on the replica's own dependencies, so it is not
+        // gated on a namespace having a servable model.
+        Capability::Status => None,
     };
     let Some(route) = route else {
         return true;
@@ -2289,6 +2284,7 @@ mod tests {
     use crate::aliases::AliasScope;
     use crate::budget::NoBudget;
     use crate::config::Config;
+    use crate::principals::PrincipalAuthority;
     use crate::rate_limit::{InMemoryRateLimiter, NoLimit, RateLimitKey, RateLimiter};
     use crate::usage::{StdoutSink, UsageFanout, UsageSink};
     use axum::body::Body;

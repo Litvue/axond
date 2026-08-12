@@ -1,0 +1,37 @@
+{
+  "object": "status",
+  "observed": "replica",
+  "scope": "namespace",
+  "phase": "serving",
+  "stale": false,
+  "components": [
+    {
+      "component": "catalogue",
+      "state": "ok",
+      "observed_age_ms": 1000
+    },
+    {
+      "component": "budget_store",
+      "state": "unavailable",
+      "reason": "unavailable",
+      "observed_age_ms": 2000
+    },
+    {
+      "component": "rate_limit_store",
+      "state": "ok",
+      "observed_age_ms": 0
+    },
+    {
+      "component": "revocation_store",
+      "state": "degraded",
+      "reason": "unavailable",
+      "observed_age_ms": 4000
+    },
+    {
+      "component": "provider_credentials",
+      "state": "degraded",
+      "reason": "capacity_exhausted",
+      "observed_age_ms": 1000
+    }
+  ]
+}
