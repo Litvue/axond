@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.16](https://github.com/Litvue/axond/compare/v0.3.15...v0.3.16) (2026-08-12)
+
+
+### Features
+
+* **ops:** add stateful preflight and forward migration commands ([#209](https://github.com/Litvue/axond/issues/209)) ([4bd9349](https://github.com/Litvue/axond/commit/4bd9349fa5145fb1ff3e7ee2a573eccec11bdd0a))
+* **usage:** introduce UUIDv7 event identity and durable UsageJournal contract ([#202](https://github.com/Litvue/axond/issues/202)) ([571b16b](https://github.com/Litvue/axond/commit/571b16b2ec705290b03ebfd53c821a3d587cc2e9))
+
 ## [0.3.15](https://github.com/Litvue/axond/compare/v0.3.14...v0.3.15) (2026-08-12)
 
 
