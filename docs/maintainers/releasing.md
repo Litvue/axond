@@ -290,7 +290,10 @@ just actionlint        # workflow linting; downloads the pinned actionlint
 ```
 
 Everything in that lane is offline except the label check, which needs an
-authenticated `gh` and reports that it skipped when there is none.
+authenticated `gh` and reports that it skipped when there is none. Its
+`--self-test` (also run in the lane) asserts that the label reader stops at the
+end of a `labels:` block, so a second ecosystem entry in the config cannot be
+misread as a label and fail the lane on a name nobody wrote.
 
 If a host has neither a supported release archive nor `docker`, the script says
 so and fails instead of linting with an unpinned version.

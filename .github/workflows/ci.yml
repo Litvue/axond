@@ -376,6 +376,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           shellcheck ops/dependabot-labels.sh
+          ops/dependabot-labels.sh --self-test
           ops/dependabot-labels.sh
       # The runners answer 503 for the actionlint release asset, so the script
       # falls back to the same version as a digest-pinned image.

@@ -63,6 +63,7 @@ api-compat-self-test:
 workflow-policy:
     ops/workflow-policy.py --self-test
     ops/workflow-policy.py
+    ops/dependabot-labels.sh --self-test
     ops/dependabot-labels.sh
 
 actionlint:

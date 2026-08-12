@@ -13,21 +13,60 @@ cd "$(dirname "$0")/.."
 CONFIG=.github/dependabot.yml
 REPOSITORY="${GITHUB_REPOSITORY:-Litvue/axond}"
 
-# The labels are the `- value` entries under a `labels:` key, up to the next key
-# at the same or lower indentation.
-mapfile -t labels < <(
+# The labels are the `- value` entries indented under a `labels:` key. Anything
+# that starts at or left of the key itself ends the block, list items included:
+# the next `- package-ecosystem:` entry is not a label.
+read_labels() {
     awk '
         /^[[:space:]]*labels:[[:space:]]*$/ { indent = match($0, /[^ ]/); inside = 1; next }
+        inside && !/^[[:space:]]*(#|$)/ && match($0, /[^ ]/) <= indent { inside = 0 }
         inside && /^[[:space:]]*-[[:space:]]*/ {
             line = $0
             sub(/^[[:space:]]*-[[:space:]]*/, "", line)
             gsub(/^["'\''"]|["'\''"]$/, "", line)
             print line
-            next
         }
-        inside && /^[[:space:]]*[^[:space:]#-]/ { if (match($0, /[^ ]/) <= indent) inside = 0 }
-    ' "$CONFIG" | sort -u
-)
+    ' "$1" | sort -u
+}
+
+# A parser that reads a neighbouring key as a label would fail the required lane
+# with a nonsense name, so the multi-ecosystem shape is asserted here.
+self_test() {
+    local fixture expected
+    fixture="$(mktemp)"
+    trap 'rm -f "$fixture"' RETURN
+    cat >"$fixture" <<'YAML'
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    labels:
+      - area:operations
+      # a comment inside the block
+      - "quoted:label"
+  - package-ecosystem: docker
+    directory: /
+    labels:
+      - area:operations
+    commit-message:
+      prefix: ci
+YAML
+    expected='area:operations quoted:label'
+    local found
+    found="$(read_labels "$fixture" | tr '\n' ' ')"
+    if [[ ${found% } != "$expected" ]]; then
+        echo "self-test: read '${found% }', expected '$expected'" >&2
+        return 1
+    fi
+    echo "dependabot label parser self-test passed"
+}
+
+if [[ ${1:-} == --self-test ]]; then
+    self_test
+    exit
+fi
+
+mapfile -t labels < <(read_labels "$CONFIG")
 
 if ((${#labels[@]} == 0)); then
     echo "$CONFIG applies no labels; nothing to verify"
