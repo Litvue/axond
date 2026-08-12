@@ -22,7 +22,10 @@ Three things, in the same pull request:
    property and passes with it. The named tests under each trigger are the
    existing floor — extend them or add beside them; do not weaken them to make a
    diff pass. A security-relevant change with no test is not finished, the same
-   rule [`SECURITY.md`](../../SECURITY.md) applies to a fix for a report.
+   rule [`SECURITY.md`](../../SECURITY.md) applies to a fix for a report. The
+   names below are checked mechanically: `ops/check-docs.py` fails if a test this
+   page names no longer exists, so a rename updates the page rather than
+   hollowing it out.
 2. **Threat-model or ADR updates.** Either the reasoning in the security review
    and the deployment security model still holds and you say so in the PR, or it
    does not and you update it. A change to a boundary, an availability stance, or
