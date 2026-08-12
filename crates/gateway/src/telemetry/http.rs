@@ -58,9 +58,9 @@ where
     }
 
     fn call(&mut self, request: Request<ReqBody>) -> Self::Future {
-        let method = request.method().as_str().to_owned();
+        let method = method_of(&request);
         let route = route_of(&request);
-        let span = server_span(&request, &method, &route);
+        let span = server_span(&request, method, &route);
 
         // The clone is the readiness-preserving handoff: the ready `self.inner`
         // drives this request while the fresh clone takes its place.
@@ -75,7 +75,7 @@ where
                 let span = Span::current();
                 span.record("http.response.status_code", status);
                 metrics::record_http(
-                    &method,
+                    method,
                     &route,
                     status,
                     started.elapsed().as_secs_f64() * 1_000.0,
@@ -99,6 +99,26 @@ fn route_of<B>(request: &Request<B>) -> String {
 }
 
 const UNMATCHED_ROUTE: &str = "/{unmatched}";
+
+/// The request method, for the same reason `route_of` collapses unmatched paths:
+/// HTTP allows extension methods, so the raw token is a dimension a caller
+/// chooses. Anything outside the protocol's own list becomes `_OTHER`, the
+/// OpenTelemetry sentinel, and the catalogued vocabulary is therefore a bound
+/// that holds.
+fn method_of<B>(request: &Request<B>) -> &'static str {
+    let method = request.method().as_str();
+    METHODS
+        .iter()
+        .copied()
+        .find(|known| *known == method)
+        .unwrap_or(OTHER_METHOD)
+}
+
+pub(super) const OTHER_METHOD: &str = "_OTHER";
+
+pub(super) const METHODS: &[&str] = &[
+    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT",
+];
 
 /// The per-request server span. Every gateway-specific field is declared
 /// `Empty` here and filled in later from the canonical usage record, so the
@@ -163,6 +183,31 @@ mod tests {
     use tower::util::ServiceExt;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
+
+    /// A method is a token the caller picks, so the recorded dimension has to be
+    /// normalised the way an unmatched path is: a standard method keeps its own
+    /// name, and an invented one becomes the single `_OTHER` bucket instead of a
+    /// new metric series.
+    #[test]
+    fn an_invented_method_collapses_to_one_bucket() {
+        for method in METHODS {
+            let request = axum::http::Request::builder()
+                .method(*method)
+                .uri("/v1/chat/completions")
+                .body(Body::empty())
+                .expect("a request with a standard method");
+            assert_eq!(method_of(&request), *method);
+        }
+
+        for invented in ["WOMBAT", "get", "PROPFIND"] {
+            let request = axum::http::Request::builder()
+                .method(invented)
+                .uri("/v1/chat/completions")
+                .body(Body::empty())
+                .expect("a request with an extension method");
+            assert_eq!(method_of(&request), OTHER_METHOD);
+        }
+    }
 
     const INBOUND_TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
     const INBOUND_SPAN: &str = "00f067aa0ba902b7";

@@ -136,6 +136,39 @@ impl Outcome {
     }
 }
 
+/// Every value the `axond.revision.reason` label can carry: the store
+/// categories [`category_reason`] classifies, and the compile reasons
+/// [`CompileError::reason`] returns. The catalogue enumerates this list rather
+/// than a copy of it, so a new category cannot ship an uncatalogued label.
+pub const REVISION_REASONS: &[&str] = &[
+    "unavailable",
+    "conflict",
+    "not_found",
+    "invalid",
+    "denied",
+    "corrupt",
+    "secret",
+    "projection",
+    "validation",
+    "snapshot",
+];
+
+/// The reason label for a store failure. Exhaustive, so a new
+/// [`FailureCategory`](crate::backends::FailureCategory) fails the build here
+/// rather than emitting a label the
+/// catalogue never declared.
+pub const fn category_reason(category: crate::backends::FailureCategory) -> &'static str {
+    use crate::backends::FailureCategory;
+    match category {
+        FailureCategory::Unavailable => "unavailable",
+        FailureCategory::Conflict => "conflict",
+        FailureCategory::NotFound => "not_found",
+        FailureCategory::Invalid => "invalid",
+        FailureCategory::Denied => "denied",
+        FailureCategory::Corrupt => "corrupt",
+    }
+}
+
 /// Why one attempt did not produce a published snapshot.
 #[derive(Debug, thiserror::Error)]
 enum AttemptError {
@@ -151,14 +184,7 @@ impl AttemptError {
     /// someone) never collapse into one bucket.
     fn reason(&self) -> &'static str {
         match self {
-            Self::Store(error) => match error.category() {
-                crate::backends::FailureCategory::Unavailable => "unavailable",
-                crate::backends::FailureCategory::Conflict => "conflict",
-                crate::backends::FailureCategory::NotFound => "not_found",
-                crate::backends::FailureCategory::Invalid => "invalid",
-                crate::backends::FailureCategory::Denied => "denied",
-                crate::backends::FailureCategory::Corrupt => "corrupt",
-            },
+            Self::Store(error) => category_reason(error.category()),
             Self::Compile(error) => error.reason(),
         }
     }
