@@ -119,6 +119,24 @@ pub(crate) fn credential(tenant: &TenantId, seed: u64, slug: &str) -> ResourceVe
     )
 }
 
+/// An alias inside a project rather than merely inside its tenant.
+pub(crate) fn project_alias(
+    tenant: &TenantId,
+    project: &ProjectId,
+    seed: u64,
+    slug: &str,
+) -> ResourceVersion {
+    ResourceVersion::new(
+        reference(ResourceKind::Alias, seed),
+        ResourceScope::Project {
+            tenant: *tenant,
+            project: *project,
+        },
+        Slug::parse(slug).expect("fixture slug"),
+        inline("wire_family", "openai-chat"),
+    )
+}
+
 pub(crate) fn alias(
     tenant: &TenantId,
     seed: u64,
@@ -236,6 +254,25 @@ pub(crate) fn state_with_legacy_tenant() -> DesiredState {
             ))
         })
         .expect("the envelopes are consistent; only the body is untyped");
+    state
+}
+
+/// A revision shaped the way a build predating typed tenancy could publish one:
+/// tenant- and project-scoped resources with no tenant or project row anywhere.
+///
+/// The exemption in [`Tenancy::of`](super::Tenancy) exists for exactly this
+/// state, so a fixture holds it rather than a comment: nothing here names an
+/// owner that contradicts anything, so there is nothing to refuse, and what the
+/// project scope names is simply unroutable.
+pub(crate) fn state_a_pre_tenancy_build_published() -> DesiredState {
+    let owner = tenant_id(1);
+    let credential = credential(&owner, 3, "primary");
+    let mut state = DesiredState::new();
+    state
+        .insert(credential.clone())
+        .and_then(|state| state.insert(alias(&owner, 4, "fast", &[credential.reference])))
+        .and_then(|state| state.insert(project_alias(&owner, &project_id(2), 6, "inner")))
+        .expect("a revision without its owner rows is valid desired state");
     state
 }
 

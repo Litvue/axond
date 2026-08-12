@@ -360,13 +360,16 @@ impl CanonicalValue {
                     .map(Self::try_from_json)
                     .collect::<Result<_, _>>()?,
             )),
-            serde_json::Value::Object(fields) => Ok(Self::Map(
+            // Through `map` rather than `Map` directly: JSON hands fields over in
+            // its own order, and a record has one, so a body read out of a request
+            // is the same value as that body read back out of storage.
+            serde_json::Value::Object(fields) => Ok(Self::map(
                 fields
                     .iter()
                     .map(|(key, value)| {
                         Self::try_from_json(value).map(|value| (key.clone(), value))
                     })
-                    .collect::<Result<_, _>>()?,
+                    .collect::<Result<Vec<_>, _>>()?,
             )),
         }
     }
@@ -799,6 +802,33 @@ mod tests {
         assert_eq!(
             CanonicalValue::try_from_json(&one).unwrap().checksum(),
             CanonicalValue::try_from_json(&other).unwrap().checksum()
+        );
+    }
+
+    /// A body from a request has to be *equal* to that body read back out of
+    /// storage, not merely hash the same: consumers compare whole resource
+    /// versions. JSON's key order is lexicographic and the encoder's is length
+    /// first, so `display_name`/`tenant_id` is where the two diverge.
+    #[test]
+    fn a_record_from_json_is_the_record_a_decoder_returns() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"display_name":"Acme","tenant_id":"ten_x","schema":"axond.tenant.v1"}"#,
+        )
+        .unwrap();
+        let from_json = CanonicalValue::try_from_json(&body).expect("a record canonicalizes");
+
+        let bytes = from_json.to_canonical_bytes().expect("canonical bytes");
+        let decoded = SerializerVersion::default()
+            .decode(&bytes)
+            .expect("its own round trip");
+        assert_eq!(from_json, decoded);
+        assert_eq!(
+            from_json,
+            CanonicalValue::map([
+                ("tenant_id", CanonicalValue::string("ten_x")),
+                ("schema", CanonicalValue::string("axond.tenant.v1")),
+                ("display_name", CanonicalValue::string("Acme")),
+            ])
         );
     }
 

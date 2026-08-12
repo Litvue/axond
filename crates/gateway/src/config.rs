@@ -2854,22 +2854,28 @@ impl Config {
 
     /// The charset and uniqueness gate for namespace ids a *process* wrote.
     ///
-    /// A file's namespace ids are reviewed by whoever wrote them, and duplicates
-    /// there are deliberately legal (see [`Config::distinct_namespace_count`], and
-    /// the budget key parser that treats a repeated id as one namespace). Compiled
-    /// ids are not written by anyone: a projection derives them from durable
-    /// state, so this is the only place where a generated id is held to the shape
-    /// a namespace id has to have — it ends up in metric label values, in Redis
-    /// and Postgres key composition, and in gateway-key bindings.
+    /// Only those: a file's namespace ids are reviewed by whoever wrote them, and
+    /// duplicates there are deliberately legal (see
+    /// [`Config::distinct_namespace_count`], and the budget key parser that treats
+    /// a repeated id as one namespace). Holding a file's ids here would let a
+    /// configuration boot and then refuse every published revision forever,
+    /// blaming a name boot accepted. Generated ids are written by no one: a
+    /// projection derives them from durable state, and they end up in metric label
+    /// values, in Redis and Postgres key composition, and in gateway-key
+    /// bindings — so [`Namespace::project`] is what marks an id this holds.
     ///
-    /// Two ids therefore have to hold. A namespace id is one slug, or two joined
-    /// by `/` (a project under its tenant, `acme/core`), where a slug is ASCII
-    /// alphanumerics, `-`, and `_`, beginning and ending alphanumeric. And no
-    /// compiled id may repeat: a duplicate would silently merge two tenants'
-    /// budgets, credential pools, and key bindings onto one name.
+    /// Two things have to hold of a generated id. It is one slug, or two joined by
+    /// `/` (a project under its tenant, `acme/core`), where a slug is ASCII
+    /// alphanumerics, `-`, and `_`, beginning and ending alphanumeric. And it is
+    /// claimed by nothing else in the config — another projected namespace or a
+    /// declared one — because sharing a name would put two namespaces' budgets,
+    /// credential pools, and key bindings on it.
     fn validate_namespace_ids(&self) -> Result<(), ConfigError> {
-        let mut seen: HashSet<&str> = HashSet::with_capacity(self.namespace.len());
-        for namespace in &self.namespace {
+        for namespace in self
+            .namespace
+            .iter()
+            .filter(|namespace| namespace.project.is_some())
+        {
             let id = namespace.id.as_str();
             let segments = id.split('/').collect::<Vec<_>>();
             let shaped = matches!(segments.len(), 1 | 2)
@@ -2881,7 +2887,12 @@ impl Config {
                      ASCII letters, digits, `-`, and `_`, beginning and ending alphanumeric"
                 )));
             }
-            if !seen.insert(id) {
+            let claims = self
+                .namespace
+                .iter()
+                .filter(|other| other.id == namespace.id)
+                .count();
+            if claims > 1 {
                 return Err(ConfigError::Invalid(format!(
                     "namespace `{id}` is declared twice; one name cannot key two namespaces' \
                      budgets, credentials, and gateway keys"
@@ -2911,6 +2922,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::desired_state::Uuid7;
 
     const VALID: &str = r#"
 [[namespace]]
@@ -3174,14 +3186,22 @@ audience = "test"
 
     #[test]
     fn a_compiled_namespace_id_is_held_to_a_shape_a_file_never_was() {
+        // A projection's namespaces: what makes one is that a projection made it,
+        // which is exactly what `project` records.
+        let projected = |index: u64| ProjectIdentity {
+            tenant: TenantId::new(Uuid7::from_parts(index, 0, index).expect("seed in range")),
+            project: ProjectId::new(Uuid7::from_parts(index, 0, index + 1).expect("seed in range")),
+        };
         let compiled = |ids: &[&str]| {
             let mut config = Config::from_toml_str(VALID).expect("the fixture is valid");
-            config.namespace.extend(ids.iter().map(|id| Namespace {
-                id: (*id).to_owned(),
-                default: false,
-                allow_platform_fallback: false,
-                project: None,
-            }));
+            config
+                .namespace
+                .extend(ids.iter().enumerate().map(|(index, id)| Namespace {
+                    id: (*id).to_owned(),
+                    default: false,
+                    allow_platform_fallback: false,
+                    project: Some(projected(index as u64 + 1)),
+                }));
             config.validate_compiled()
         };
 
@@ -3217,6 +3237,21 @@ audience = "test"
         assert!(error.to_string().contains("declared twice"), "{error}");
         let error = compiled(&["platform"]).expect_err("including one the file already declared");
         assert!(error.to_string().contains("declared twice"), "{error}");
+
+        // And the file's own ids stay the file's business: a name boot accepted
+        // cannot become a reason a replica converges on nothing forever.
+        let mut declared = Config::from_toml_str(VALID).expect("the fixture is valid");
+        declared
+            .namespace
+            .extend(["team.a", "platform"].iter().map(|id| Namespace {
+                id: (*id).to_owned(),
+                default: false,
+                allow_platform_fallback: false,
+                project: None,
+            }));
+        declared
+            .validate_compiled()
+            .expect("a declared id keeps whatever shape boot accepted");
     }
 
     #[test]
