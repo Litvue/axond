@@ -361,8 +361,8 @@ many may be in flight at once.
 | `max_prompt_tokens` | integer | `1000000` | Largest estimated input size a request may carry. `0` disables. Only binds below `max_request_bytes` / 4 — see below. |
 | `max_output_tokens` | integer | `200000` | Largest output allowance a request may ask for (`max_tokens`, `max_completion_tokens`, or `max_output_tokens`). Refused, not clamped, so the caller is never silently given a different request than it sent. `0` disables. |
 | `max_in_flight` | integer | `1024` | Concurrent requests this replica admits. `0` disables. |
-| `max_in_flight_streams` | integer | `512` | Of those, how many may be streams. A stream holds a socket and a relay task for as long as the answer lasts, so it is the scarcer resource. Must not exceed `max_in_flight` when both are set. `0` disables. |
-| `max_in_flight_per_tenant` | integer | `256` | Concurrent requests one namespace may hold, so one tenant cannot take the whole replica. Must not exceed `max_in_flight` when both are set. `0` disables. In a single-namespace deployment this, not `max_in_flight`, is the effective ceiling — see below. |
+| `max_in_flight_streams` | integer | `512` | Of those, how many may be streams. A stream holds a socket and a relay task for as long as the answer lasts, so it is the scarcer resource. Must not exceed `max_in_flight` when you write both — see below. `0` disables. |
+| `max_in_flight_per_tenant` | integer | `256` | Concurrent requests one namespace may hold, so one tenant cannot take the whole replica. Must not exceed `max_in_flight` when you write both — see below. `0` disables. In a single-namespace deployment this, not `max_in_flight`, is the effective ceiling — see below. |
 | `max_tenants` | integer | `1024` | Distinct namespaces tracked concurrently. Bounds the admission table itself. |
 | `queue_capacity` | integer | `0` | Requests that may wait for capacity instead of being refused. `0` refuses immediately. |
 | `queue_wait_ms` | integer | `0` | How long a queued request waits before it is shed. Must be set together with `queue_capacity`, and queueing requires a finite `max_in_flight`. |
@@ -370,6 +370,23 @@ many may be in flight at once.
 | `max_stream_bytes` | integer | `67108864` | Bytes one stream may relay before it is ended. `0` disables. |
 
 Except for `max_request_bytes`, `0` means "this ceiling is off".
+
+Lowering `max_in_flight` alone is enough. The two sub-ceilings default below the
+shipped global one, so a config that only writes `max_in_flight = 16` would
+otherwise leave a 256-request tenant ceiling above a 16-request process. An unset
+sub-ceiling therefore follows a lowered `max_in_flight`:
+
+- `max_in_flight_streams` is clamped down to it;
+- `max_in_flight_per_tenant` is turned **off**, because a tenant ceiling equal to
+  the global one isolates nothing and would shed at the same point with the wrong
+  verdict — the tenant gate never queues and answers `429`. Shedding then happens
+  at the global gate, which honors `queue_capacity` and answers `503`.
+
+Write the numbers yourself and they are taken literally, including a
+`max_in_flight_per_tenant` below a lowered `max_in_flight` (isolation you asked
+for) and a `0` (the ceiling off). A written sub-ceiling *above* a written
+`max_in_flight` is a boot error, because there is no obvious way to reconcile two
+numbers an operator chose.
 
 The two input bounds are related, and the body bound wins ties. The estimate
 `max_prompt_tokens` is compared against is the serialized request divided by four

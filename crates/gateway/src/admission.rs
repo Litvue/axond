@@ -6,11 +6,12 @@
 //! * a **tenant** ceiling on concurrent requests for one namespace, checked
 //!   first and never queued, so a saturated tenant is refused at its own gate
 //!   rather than occupying the shared queue;
-//! * a **stream** ceiling on concurrent open relays, because a stream holds a
-//!   socket for as long as the model talks;
 //! * a **global** ceiling on concurrent requests, with an optional *bounded*
 //!   queue: a request may wait only while both a queue slot and the configured
-//!   wait remain, and is shed with a typed error otherwise.
+//!   wait remain, and is shed with a typed error otherwise;
+//! * a **stream** ceiling on concurrent open relays, because a stream holds a
+//!   socket for as long as the model talks, taken last so a request still
+//!   waiting for global capacity does not occupy a stream slot.
 //!
 //! This is a separate layer from [`crate::rate_limit`], which bounds one
 //! authenticated *subject*. Admission bounds the process and the tenant; the
@@ -45,6 +46,11 @@ pub const RESOURCE_REQUEST: &str = "request";
 pub const RESOURCE_STREAM: &str = "stream";
 pub const RESOURCE_TENANT: &str = "tenant";
 pub const RESOURCE_QUEUE: &str = "queue";
+
+/// Largest ceiling a semaphore-backed bound may carry. Config validation refuses
+/// anything larger, so an absurd number is a typed boot error rather than an
+/// assertion inside the semaphore.
+pub const MAX_PERMITS: usize = Semaphore::MAX_PERMITS;
 
 /// Whether the request will hold a stream open, which is what the stream
 /// ceiling counts.
@@ -197,7 +203,8 @@ impl AdmissionControl {
 
     /// Admit one request, or shed it with a typed rejection. The tenant gate is
     /// first and never waits: a tenant at its ceiling must not consume the
-    /// shared queue that other tenants are waiting in.
+    /// shared queue that other tenants are waiting in. The stream gate is last,
+    /// so a stream slot is only ever held by a request about to open a stream.
     pub async fn admit(
         &self,
         tenant: &str,
@@ -211,6 +218,13 @@ impl AdmissionControl {
             stream: None,
             tenant: self.tenants.reserve(tenant).map_err(reject)?,
         };
+        if let Some(global) = &self.global {
+            permit.global = Some(self.acquire_global(global).await?);
+            metrics::record_admission_acquired(RESOURCE_REQUEST);
+        }
+        // Taken after the global wait: a request queued for capacity is not
+        // streaming yet, and holding a stream slot while it waits would turn
+        // away a caller that could start streaming now.
         if let (RequestKind::Streamed, Some(streams)) = (kind, &self.streams) {
             permit.stream = Some(
                 Arc::clone(streams)
@@ -218,10 +232,6 @@ impl AdmissionControl {
                     .map_err(|_| reject(AdmissionRejection::Streams))?,
             );
             metrics::record_admission_acquired(RESOURCE_STREAM);
-        }
-        if let Some(global) = &self.global {
-            permit.global = Some(self.acquire_global(global).await?);
-            metrics::record_admission_acquired(RESOURCE_REQUEST);
         }
         Ok(permit)
     }
@@ -507,6 +517,46 @@ mod tests {
             .admit("tenant", RequestKind::Buffered)
             .await
             .expect("a buffered request is not bound by the stream ceiling");
+    }
+
+    /// A request waiting in the queue is not streaming yet, so it must not hold
+    /// a stream slot: otherwise callers are told there is no stream capacity
+    /// while no stream is open.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_request_does_not_occupy_a_stream_slot_while_it_waits() {
+        let control = Arc::new(AdmissionControl::new(AdmissionLimits {
+            max_in_flight: Some(1),
+            max_in_flight_streams: Some(1),
+            max_in_flight_per_tenant: None,
+            queue_capacity: Some(4),
+            queue_wait: Duration::from_secs(30),
+            ..limits()
+        }));
+        let held = control
+            .admit("first", RequestKind::Buffered)
+            .await
+            .expect("admit");
+        let queued = tokio::spawn({
+            let control = Arc::clone(&control);
+            async move { control.admit("second", RequestKind::Streamed).await }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // The waiter is parked on the global ceiling, not on the stream ceiling,
+        // so the slot is still there for whichever request gets capacity first.
+        assert_eq!(
+            control
+                .streams
+                .as_ref()
+                .expect("a stream ceiling")
+                .available_permits(),
+            1,
+            "a request that is only waiting for capacity holds no stream slot"
+        );
+        drop(held);
+        queued
+            .await
+            .expect("task")
+            .expect("the queued stream takes the free slot once it has capacity");
     }
 
     #[tokio::test(start_paused = true)]
