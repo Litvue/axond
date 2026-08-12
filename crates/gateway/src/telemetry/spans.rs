@@ -144,6 +144,64 @@ pub fn finish_config_reload(
     metrics::record_config_reload(trigger, outcome, generation);
 }
 
+/// Convergence triggered by the poll interval — the correctness path.
+pub const CONVERGENCE_POLLED: &str = "polled";
+/// Convergence triggered by a control-plane notification — the latency
+/// optimization. A deployment without notifications never records it.
+pub const CONVERGENCE_NOTIFIED: &str = "notified";
+/// The first convergence attempt of a stateful process.
+pub const CONVERGENCE_BOOT: &str = "boot";
+
+/// A span covering one convergence attempt: reading desired state and, when it
+/// differs, hydrating, compiling, and publishing it.
+///
+/// Rooted like a reload span, and for the same reason: convergence is driven by a
+/// timer or a notification, never by a request.
+pub fn revision_convergence_span(trigger: &'static str) -> Span {
+    tracing::info_span!(
+        target: "axond.revision",
+        "axond.revision.converge",
+        axond.revision.trigger = trigger,
+        axond.revision.outcome = Empty,
+        axond.revision.desired = Empty,
+        axond.revision.active = Empty,
+        axond.revision.lag_ms = Empty,
+        axond.revision.reason = Empty,
+        axond.config.generation = Empty,
+    )
+}
+
+/// Close out a convergence span with the outcome and what the replica now
+/// reports, and count the attempt.
+///
+/// Both the desired and the active revision are recorded on every attempt,
+/// including converged ones: a span that only carried "active" could not
+/// distinguish a replica that is up to date from one whose control plane has
+/// moved on.
+pub fn finish_revision_convergence(
+    span: &Span,
+    trigger: &'static str,
+    outcome: &crate::convergence::Outcome,
+    report: &crate::convergence::RevisionReport,
+) {
+    span.record("axond.revision.outcome", outcome.as_str());
+    if let Some(desired) = report.desired {
+        span.record("axond.revision.desired", tracing::field::display(desired));
+    }
+    if let Some(active) = report.active {
+        span.record("axond.revision.active", tracing::field::display(active));
+    }
+    span.record(
+        "axond.revision.lag_ms",
+        u64::try_from(report.lag.as_millis()).unwrap_or(u64::MAX),
+    );
+    if let Some(rejection) = &report.last_rejection {
+        span.record("axond.revision.reason", rejection.reason);
+    }
+    span.record("axond.config.generation", report.generation);
+    metrics::record_revision_attempt(trigger, outcome.as_str(), report);
+}
+
 /// Fold the canonical usage record into the active server span and the
 /// dimensioned metrics. Called once per terminated request, from the same place
 /// the usage record is emitted, so spans, metrics, and sinks cannot disagree.

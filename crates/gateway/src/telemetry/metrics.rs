@@ -42,6 +42,15 @@ struct Instruments {
     shutdown_abandoned: Counter<u64>,
     config_reloads: Counter<u64>,
     config_generation: Gauge<u64>,
+    revision_attempts: Counter<u64>,
+    revision_rejections: Counter<u64>,
+    revision_lag: Gauge<u64>,
+    revision_converged: Gauge<u64>,
+    revision_desired_at: Gauge<u64>,
+    revision_active_at: Gauge<u64>,
+    revision_convergence: Histogram<f64>,
+    revision_failures: Gauge<u64>,
+    last_known_good: Counter<u64>,
     budget_capacity_denials: Counter<u64>,
     budget_namespace_denials: Counter<u64>,
     budget_retained_subjects: Gauge<u64>,
@@ -161,6 +170,67 @@ impl Instruments {
                 .u64_gauge("axond.config.generation")
                 .with_description(
                     "Config generation this replica is serving: 0 at boot, +1 per applied reload.",
+                )
+                .build(),
+            revision_attempts: meter
+                .u64_counter("axond.revision.attempts")
+                .with_description("Stateful convergence attempts, by trigger and outcome (#142).")
+                .build(),
+            revision_rejections: meter
+                .u64_counter("axond.revision.rejections")
+                .with_description(
+                    "Desired revisions not applied, by reason; the active revision keeps serving.",
+                )
+                .build(),
+            revision_lag: meter
+                .u64_gauge("axond.revision.lag")
+                .with_unit("ms")
+                .with_description(
+                    "How long this replica's active revision has differed from the desired one.",
+                )
+                .build(),
+            revision_converged: meter
+                .u64_gauge("axond.revision.converged")
+                .with_description(
+                    "1 when the active revision equals the desired revision, 0 otherwise.",
+                )
+                .build(),
+            // Revision ids are UUIDv7, so their embedded millisecond timestamp is
+            // the one numeric projection a gauge can carry. It identifies a
+            // revision across replicas (publication order is time order) without
+            // pretending an id is a counter.
+            revision_desired_at: meter
+                .u64_gauge("axond.revision.desired_at")
+                .with_unit("ms")
+                .with_description(
+                    "Publication timestamp embedded in the desired revision's identifier.",
+                )
+                .build(),
+            revision_active_at: meter
+                .u64_gauge("axond.revision.active_at")
+                .with_unit("ms")
+                .with_description(
+                    "Publication timestamp embedded in the active revision's identifier.",
+                )
+                .build(),
+            revision_convergence: meter
+                .f64_histogram("axond.revision.convergence_duration")
+                .with_unit("ms")
+                .with_description(
+                    "Time from observing a desired revision to publishing its snapshot.",
+                )
+                .build(),
+            revision_failures: meter
+                .u64_gauge("axond.revision.consecutive_failures")
+                .with_description(
+                    "Consecutive failed convergence attempts, which set the backoff delay.",
+                )
+                .build(),
+            last_known_good: meter
+                .u64_counter("axond.revision.last_known_good")
+                .with_description(
+                    "Signed last-known-good cache operations, by outcome (exported, \
+                     export_failed, restored).",
                 )
                 .build(),
             budget_capacity_denials: meter
@@ -391,6 +461,77 @@ pub fn record_config_reload(trigger: &'static str, outcome: &'static str, genera
         ],
     );
     instruments.config_generation.record(generation, &[]);
+}
+
+/// Record one convergence attempt and everything the replica now reports about
+/// its revisions.
+///
+/// Emitted from one place so `lag`, `converged`, and the revision gauges cannot
+/// disagree with the attempt that produced them — the failure mode of recording
+/// them separately is a dashboard that shows a converged replica with rising lag.
+pub fn record_revision_attempt(
+    trigger: &'static str,
+    outcome: &'static str,
+    report: &crate::convergence::RevisionReport,
+) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.revision_attempts.add(
+        1,
+        &[
+            KeyValue::new("axond.revision.trigger", trigger),
+            KeyValue::new("axond.revision.outcome", outcome),
+        ],
+    );
+    instruments.revision_lag.record(
+        u64::try_from(report.lag.as_millis()).unwrap_or(u64::MAX),
+        &[],
+    );
+    instruments
+        .revision_converged
+        .record(u64::from(report.converged()), &[]);
+    instruments
+        .revision_failures
+        .record(u64::from(report.consecutive_failures), &[]);
+    if let Some(desired) = report.desired {
+        instruments
+            .revision_desired_at
+            .record(desired.uuid().timestamp_millis(), &[]);
+    }
+    if let Some(active) = report.active {
+        instruments
+            .revision_active_at
+            .record(active.uuid().timestamp_millis(), &[]);
+    }
+    if let Some(took) = report.last_convergence.filter(|_| outcome == "published") {
+        instruments
+            .revision_convergence
+            .record(took.as_secs_f64() * 1_000.0, &[]);
+    }
+    instruments.config_generation.record(report.generation, &[]);
+}
+
+/// Count a desired revision that was not applied, by the stage that refused it.
+pub fn record_revision_rejection(reason: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .revision_rejections
+        .add(1, &[KeyValue::new("axond.revision.reason", reason)]);
+}
+
+/// Count a last-known-good cache operation. `export_failed` is a warning rather
+/// than an outage; `restored` means a replica booted from cached state and may be
+/// serving something older than desired.
+pub fn record_last_known_good(outcome: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .last_known_good
+        .add(1, &[KeyValue::new("axond.revision.outcome", outcome)]);
 }
 
 /// Record an in-memory budget admission denied by the subject bound.

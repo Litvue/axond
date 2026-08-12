@@ -1699,6 +1699,21 @@ impl Config {
     /// configuration that booted before `mode` existed takes exactly this path.
     fn validate_stateless(&self) -> Result<(), ConfigError> {
         self.reject_stateful_bootstrap()?;
+        self.validate_resource_graph()
+    }
+
+    /// The whole-graph gate over resources and policies, independent of which
+    /// authority produced them.
+    ///
+    /// Split out of [`Config::validate_stateless`] so a candidate compiled from a
+    /// durable revision runs *this* gate rather than a second implementation of
+    /// it (#142): an alias pointing at an undefined provider, a wire-family
+    /// mismatch across failover targets, and a credential naming an unknown
+    /// namespace must be rejected identically whether they arrived from TOML or
+    /// from Postgres. The mode-specific section rules are deliberately not here —
+    /// those govern what a *file* may say, and a compiled candidate is not a
+    /// file.
+    fn validate_resource_graph(&self) -> Result<(), ConfigError> {
         let defaults = self.namespace.iter().filter(|n| n.default).count();
         if defaults != 1 {
             return Err(ConfigError::Invalid(format!(
@@ -2728,6 +2743,19 @@ impl Config {
 
     pub fn model(&self, name: &str) -> Option<&Model> {
         self.model.iter().find(|m| m.name == name)
+    }
+
+    /// Run the boot-time resource-graph gate on a config this process compiled
+    /// rather than parsed.
+    ///
+    /// Stateful convergence (#142) builds a candidate by filling the
+    /// control-plane-owned resources into the bootstrap config it booted with, so
+    /// the candidate legitimately carries both `mode = "stateful"` and the
+    /// resource sections [`Config::validate`] refuses to read from a file. What
+    /// must still hold is every whole-graph invariant boot enforces, which is
+    /// exactly what this runs.
+    pub(crate) fn validate_compiled(&self) -> Result<(), ConfigError> {
+        self.validate_resource_graph()
     }
 
     /// Parse + validate from an in-memory TOML string (tests, and the planned
