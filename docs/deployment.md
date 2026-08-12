@@ -128,13 +128,20 @@ TOML owns structure; scalar overrides are for deployment adaptation.
 
 | Endpoint | Authentication | Meaning |
 | --- | --- | --- |
-| `GET /healthz` | none | Process is serving. |
-| `GET /readyz` | none | Process is serving a boot-validated snapshot. |
+| `GET /healthz` | none | Process is alive. Keeps returning `ok` through the shutdown drain. |
+| `GET /readyz` | none | Process is serving a boot-validated snapshot; `503 draining` once termination begins. |
 | `GET /v1/models` | gateway credential | Namespace-scoped alias catalogue. |
 | `GET /v1/credentials` | gateway credential | Replica-local credential labels and circuit state. |
 
 `/readyz` does not continuously probe providers or stateful backends. Runtime
 dependency health is exposed by typed errors and metrics.
+
+Point the load balancer at `/readyz` and liveness at `/healthz`: on `SIGTERM`
+the replica fails readiness first, keeps serving for `shutdown.drain_grace_ms`,
+then refuses new work with `503 draining` while admitted requests finish. Give
+the supervisor a stopping timeout above
+`drain_grace_ms + deadline_ms + flush_timeout_ms` so buffered usage can flush;
+see [Upgrades and rollback](./operations/upgrades.md).
 
 ## Telemetry
 

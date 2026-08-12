@@ -43,6 +43,8 @@ pub enum GatewayError {
     RevocationUnavailable,
     #[error("inbound concurrency limit exceeded")]
     RateLimitExceeded { retry_after_seconds: Option<u64> },
+    #[error("the gateway is shutting down and is no longer accepting requests")]
+    Draining,
     #[error("unauthorized")]
     Unauthorized,
     #[error("token authentication failed: {0}")]
@@ -93,6 +95,9 @@ impl GatewayError {
             Self::ContinuationAffinityUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::RevocationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::RateLimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
+            // Retryable elsewhere immediately: this replica is leaving, not
+            // failing, and readiness has already said so.
+            Self::Draining => StatusCode::SERVICE_UNAVAILABLE,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::TokenUnauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::TokenForbidden(_) => StatusCode::FORBIDDEN,
@@ -136,6 +141,7 @@ impl GatewayError {
             Self::ContinuationAffinityUnavailable { .. } => "continuation_affinity_unavailable",
             Self::RevocationUnavailable => "revocation_unavailable",
             Self::RateLimitExceeded { .. } => "rate_limited",
+            Self::Draining => "draining",
             Self::Unauthorized => "unauthorized",
             Self::TokenUnauthorized(error) | Self::TokenForbidden(error) => error.code(),
             Self::ScopeInsufficient(_) => "token_scope_insufficient",
@@ -164,6 +170,9 @@ impl IntoResponse for GatewayError {
             Self::RateLimitExceeded {
                 retry_after_seconds: Some(seconds),
             } => Some(seconds.to_string()),
+            // A rolling deployment replaces the replica, so "try again" is a
+            // matter of routing rather than of waiting.
+            Self::Draining => Some("0".to_owned()),
             _ => None,
         };
         let message = match &self {
@@ -223,6 +232,21 @@ mod tests {
         let unavailable = GatewayError::RateLimitUnavailable;
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(unavailable.code(), "rate_limit_unavailable");
+    }
+
+    #[test]
+    fn draining_is_a_typed_retryable_unavailable() {
+        let draining = GatewayError::Draining;
+        assert_eq!(draining.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(draining.code(), "draining");
+        let response = draining.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("0")
+        );
     }
 
     #[tokio::test]

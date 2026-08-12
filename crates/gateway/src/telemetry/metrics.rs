@@ -36,6 +36,10 @@ struct Instruments {
     circuit_state: Gauge<u64>,
     usage_written: Counter<u64>,
     usage_dropped: Counter<u64>,
+    usage_flushes: Counter<u64>,
+    shutdown_phase: Gauge<u64>,
+    shutdown_rejections: Counter<u64>,
+    shutdown_abandoned: Counter<u64>,
     config_reloads: Counter<u64>,
     config_generation: Gauge<u64>,
     budget_capacity_denials: Counter<u64>,
@@ -125,6 +129,26 @@ impl Instruments {
                 .u64_counter("axond.usage.records_dropped")
                 .with_description(
                     "Usage records discarded rather than delaying requests, by sink and reason.",
+                )
+                .build(),
+            usage_flushes: meter
+                .u64_counter("axond.usage.flushes")
+                .with_description("Shutdown flushes of a buffered usage sink, by sink and outcome.")
+                .build(),
+            shutdown_phase: meter
+                .u64_gauge("axond.shutdown.phase")
+                .with_description(
+                    "Lifecycle phase of this replica: 0 serving, 1 draining, 2 admission closed.",
+                )
+                .build(),
+            shutdown_rejections: meter
+                .u64_counter("axond.shutdown.rejected_requests")
+                .with_description("Requests refused because admission was closed for shutdown.")
+                .build(),
+            shutdown_abandoned: meter
+                .u64_counter("axond.shutdown.abandoned_requests")
+                .with_description(
+                    "Requests still in flight when the shutdown deadline expired, and dropped.",
                 )
                 .build(),
             config_reloads: meter
@@ -282,6 +306,61 @@ pub fn record_usage_dropped(sink: &'static str, reason: &'static str, count: u64
             KeyValue::new("axond.drop_reason", reason),
         ],
     );
+}
+
+/// Publish the outcome of one sink's shutdown flush. Paired with
+/// `axond.usage.records_dropped`, which carries the count that did not land.
+pub fn record_usage_flush(sink: &'static str, outcome: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.usage_flushes.add(
+        1,
+        &[
+            KeyValue::new("axond.usage_sink", sink),
+            KeyValue::new("axond.flush_outcome", outcome),
+        ],
+    );
+}
+
+/// Publish the lifecycle phase this replica has reached. A gauge rather than a
+/// counter: what an operator watching a rollout needs is "is this replica still
+/// taking work", and the readiness probe alone cannot distinguish a draining
+/// replica from an unhealthy one.
+pub fn record_shutdown_phase(phase: crate::shutdown::Phase) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    let value = match phase {
+        crate::shutdown::Phase::Serving => 0,
+        crate::shutdown::Phase::Draining => 1,
+        crate::shutdown::Phase::Closing => 2,
+    };
+    instruments.shutdown_phase.record(
+        value,
+        &[KeyValue::new("axond.lifecycle_phase", phase.as_str())],
+    );
+}
+
+/// A request refused because admission was already closed. Distinct from a
+/// dependency `503`: nothing is wrong with the replica, it is leaving.
+pub fn record_shutdown_rejection() {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.shutdown_rejections.add(1, &[]);
+}
+
+/// Requests dropped because they were still in flight at the shutdown deadline.
+/// The documented accounting for a long stream cut short: each one settles as
+/// `client_cancelled` in the usage record.
+pub fn record_shutdown_abandoned(count: u64) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    if count > 0 {
+        instruments.shutdown_abandoned.add(count, &[]);
+    }
 }
 
 /// Publish a reload attempt and the generation now serving. A rejected

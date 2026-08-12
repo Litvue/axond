@@ -72,6 +72,10 @@ Before declaring a platform supported, test:
 - OTLP egress and required proxy settings;
 - Redis/Postgres TLS and DNS from the execution environment.
 
-The current binary does not install an application-level SIGTERM drain. Use
-the platform's deregistration/drain period, overlap revisions, and retry-capable
-clients to avoid treating in-flight stream termination as graceful.
+The binary drains on `SIGTERM` within
+`drain_grace_ms + deadline_ms + flush_timeout_ms`. Confirm the platform sends
+`SIGTERM` (not only a network-level revision cutover) and that its stop grace
+period exceeds that sum; where the grace period is fixed and short, lower the
+three bounds to fit rather than losing buffered usage to a `SIGKILL`. Keep
+overlapping revisions and retry-capable clients: streams open at the deadline
+are still cut.

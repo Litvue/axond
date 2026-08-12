@@ -76,10 +76,16 @@ container. Existing file-backed key material can be replaced and reloaded.
 `[server]`, `[[usage_sink]]`, and `[budget]` changes require a restart even when
 other configuration changes can reload atomically.
 
-## Shutdown caveat
+## Shutdown
 
-The current server does not install an application-level SIGTERM drain. A
-container stop therefore terminates in-flight requests according to the
-runtime's signal behavior. Remove the replica from load balancing before
-termination and allow clients to retry interrupted requests. Do not claim
-graceful stream draining until the binary implements it.
+The server drains on `SIGTERM`: `/readyz` fails immediately, admission closes
+after `shutdown.drain_grace_ms`, admitted requests finish within
+`shutdown.deadline_ms`, and usage/telemetry flush within
+`shutdown.flush_timeout_ms`. The container's stop timeout (`docker stop -t`,
+`--stop-timeout`, the platform equivalent) must exceed the sum of those bounds,
+or the runtime `SIGKILL`s the process mid-flush and buffered usage records are
+lost.
+
+Make sure the signal reaches PID 1 unwrapped: an entrypoint shell that does not
+`exec` swallows `SIGTERM` and turns every stop into a kill. Streams still open
+at the deadline are cut, so clients must be able to retry.

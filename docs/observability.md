@@ -68,7 +68,11 @@ metric and a usage row can never disagree.
 | `axond.upstream.timeouts` | counter | `axond.target.provider`, `axond.target.model`, `axond.timeout`, `axond.timeout.bound` | Which phase stalled — `connect`, `response_headers`, `buffered_body`, `stream_idle`, or `overall` (nothing was dispatched) — and whether the `phase` bound or the remaining `walk_budget` ended the wait. |
 | `axond.upstream.circuit_state` | gauge | `axond.target.provider`, `axond.target.model` | `0` closed, `1` half-open, `2` open. |
 | `axond.usage.records_written` | counter | `axond.usage_sink` | Records a sink acknowledged. |
-| `axond.usage.records_dropped` | counter | `axond.usage_sink`, `axond.drop_reason` | Records discarded rather than delaying a request. |
+| `axond.usage.records_dropped` | counter | `axond.usage_sink`, `axond.drop_reason` | Records discarded rather than delaying a request. `shutdown` means the termination flush could not write them. |
+| `axond.usage.flushes` | counter | `axond.usage_sink`, `axond.flush_outcome` | Termination flushes of a buffered sink: `flushed`, `failed`, or `timeout`. |
+| `axond.shutdown.phase` | gauge | — | `0` serving, `1` draining (readiness fails, still admitting), `2` admission closed. |
+| `axond.shutdown.rejected_requests` | counter | — | Requests refused with `503 draining` after admission closed. |
+| `axond.shutdown.abandoned_requests` | counter | — | Requests still in flight when the shutdown deadline cut them. |
 | `axond.config.reloads` | counter | `axond.reload.trigger`, `axond.reload.outcome` | Reload attempts and whether they applied. |
 | `axond.config.generation` | gauge | — | `0` at boot, `+1` per applied reload. |
 | `axond.budget.capacity_denials` | counter | — | In-memory admissions denied because the ledger bound was exhausted. |
@@ -83,6 +87,9 @@ metric and a usage row can never disagree.
 | Alert | Signal | Why |
 | --- | --- | --- |
 | Usage is being lost | `axond.usage.records_dropped` rate > 0, sustained | Spend data is gone and will not come back. Buffer or destination is undersized. |
+| Spend lost at termination | `axond.usage.records_dropped{axond.drop_reason="shutdown"}` > 0, or `axond.usage.flushes{axond.flush_outcome!="flushed"}` > 0 | A replica exited before its buffered records landed. Raise `shutdown.flush_timeout_ms` (and the stopping timeout with it), or check the sink. |
+| Rollouts are cutting streams | `axond.shutdown.abandoned_requests` > 0 per rollout | Callers hold streams longer than `shutdown.deadline_ms`; their responses end mid-stream. |
+| A replica is stuck draining | `axond.shutdown.phase` ≥ 1 for longer than `drain_grace_ms + deadline_ms + flush_timeout_ms` | The orchestrator sent `SIGTERM` but the process is not going away; expect a `SIGKILL` and lost buffered usage. |
 | A target is out | `axond.upstream.circuit_state = 2`, sustained | Every request is failing over (or failing) for that target. |
 | Budget denials | `axond.http.server.requests{status=429}` rising | Tenants are hitting their cap. |
 | Inbound concurrency denials | `axond.rate_limit.denials` rising | Authenticated callers are reaching their per-replica in-flight limit. |
@@ -120,6 +127,7 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | `429` | `budget_exceeded` | The `(namespace, subject)` cap is spent — settled spend plus live holds leaves no room. With `namespace_limit_microdollars` set, the same code and body also cover the namespace-wide cap being spent; `axond.budget.namespace_denials` is what tells them apart. | Raise `limit_microdollars` (or `namespace_limit_microdollars`) or wait. This is the tenant's own cap, not a provider rate limit. |
 | `503` | `budget_unavailable` | The budget store could not be reached and `on_unavailable = "deny"` (the default). | Fix Redis/Postgres. **Distinguish this from `429`:** `429` is the tenant over budget, `503` is *your* dependency down. |
 | `503` | `rate_limit_unavailable` | The Redis rate-limit store could not be reached and `on_unavailable = "deny"` (the default). | Fix Redis or deliberately choose `on_unavailable = "allow"`. |
+| `503` | `draining` | The replica is terminating and has closed admission; `Retry-After: 0`. Expected during a rollout, on the requests that arrive after the readiness drain window. | Nothing on the gateway: the caller (or load balancer) should retry, and another replica should answer. Sustained volume means callers are not honoring readiness — check endpoint removal and `shutdown.drain_grace_ms`. |
 | `503` | `all_provider_circuits_open` | Every target the request could consider has a tripped circuit. That is all of the alias's targets on every route except `/v1/responses`, which considers only its pinned first target — so a Responses request can raise this while the alias's later targets are healthy. | The upstreams are down or the thresholds are too tight; check `axond.upstream.circuit_state`. On `/v1/responses`, read it as *the first target* being down, not the whole alias, and do not alert on it as an alias-wide outage. |
 | `502` | `no_credential` | The namespace has no credential for the resolved provider and no platform fallback. | Add a `[[credential]]`, or set `allow_platform_fallback` deliberately. |
 | `502` | `upstream_transport`, `provider_dependency_failed`, `model_unavailable`, `invalid_stream` | The upstream failed after the failover walk was exhausted. | Check the provider's status and the attempt spans; `attempts` on the usage record says how hard the gateway tried. |

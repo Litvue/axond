@@ -18,6 +18,9 @@ spec:
       labels:
         app.kubernetes.io/name: axond
     spec:
+      # Must exceed shutdown.drain_grace_ms + deadline_ms + flush_timeout_ms
+      # (25s with the shipped defaults). A SIGKILL before the flush finishes
+      # loses buffered usage records; raise both together, never just one.
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
@@ -37,6 +40,10 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+          # Readiness reports the drain: it fails as soon as SIGTERM arrives, so
+          # endpoint removal happens while the Pod is still serving. Liveness
+          # deliberately stays on /healthz, which answers `ok` throughout the
+          # drain — failing it would only turn a clean drain into a SIGKILL.
           readinessProbe:
             httpGet:
               path: /readyz
