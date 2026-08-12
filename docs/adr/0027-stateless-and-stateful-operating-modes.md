@@ -81,6 +81,14 @@ anything else:
 | Postgres control-plane connectivity | DSN *reference* for the control-plane database. |
 | secret-store and KEK settings | Which `SecretStore` implementation, and the key-encryption-key reference used to unwrap tenant secrets. |
 | static breakglass operator credential | The mandatory `/admin/v1` breakglass identity, referenced the way `[[gateway_key]]` already is. |
+| hot-state backend connectivity | DSN *references* for the opt-in Tier 1/Tier 2 budget, rate-limit, and revocation backends a deployment selects. |
+
+Bootstrap owns *connectivity* to the opt-in enforcement backends; the control
+plane owns their *policy values*. So in stateful mode a `[budget]` or
+`[rate_limit]` section may carry only backend selection and DSN references, and
+carrying limits, windows, or scopes there is the same boot error as any other
+stateful-owned resource. Deployments that select no such backend keep the
+process-local behaviour ADR 0017 already defines.
 
 Nothing else. Tenants, projects, identities, providers, provider credentials,
 model catalogues, prices, aliases, and policies are **not** expressible in
@@ -322,6 +330,7 @@ one mode.
 | Aliases and targets | TOML `[[model]] targets` | `ControlPlaneStore` | Postgres revision | No — snapshot |
 | Policies (failover, credential-pool strategy, budget/rate-limit policy values) | TOML `[failover]`, `[credential_pool]`, `[budget]`, `[rate_limit]` | `ControlPlaneStore` | Postgres revision | No — snapshot |
 | Hot enforcement state (budget counters/reservations, rate-limit leases, revocation entries) | Selected backend (Tier 0/1/2) | Selected backend (Tier 0/1/2) | Redis/Postgres, expiry-bounded | **Yes**, when opted in |
+| Hot enforcement backend selection and connectivity | TOML `[budget]`, `[rate_limit]`, `[revocation]` | TOML bootstrap (references only; policy values are control-plane owned) | Process-local file | No (read at boot/reload) |
 | Circuit and credential health | Process memory | Process memory | None (per replica) | Yes, in-process only |
 | Usage records | `UsageSink` | `UsageSink` | stdout/OTLP/Postgres | No — buffered, off path |
 | Audit events | n/a | `ControlPlaneStore`, same transaction as the mutation | Postgres | No |

@@ -60,9 +60,11 @@ second, opt-in **stateful** mode in which tenants, identities, providers,
 credentials, catalogues, prices, aliases, and policies are owned by a durable
 Postgres control plane and administered through `/admin/v1` instead of TOML,
 while ordinary inference still reads one immutable in-memory snapshot. In that
-mode bootstrap TOML shrinks to `[server]`, telemetry, control-plane
-connectivity, and secret-store/KEK settings, and a stateful-owned section
-appearing in TOML is a boot error.
+mode bootstrap TOML shrinks to `mode`, `[server]`, telemetry, control-plane
+connectivity, secret-store/KEK settings, a mandatory static breakglass operator
+credential for `/admin/v1`, and connectivity references for any opt-in
+budget/rate-limit/revocation backend; a stateful-owned section appearing in TOML
+is a boot error.
 
 No key in this reference has changed, and no existing configuration needs one:
 the mode key is optional, omitting it means stateless, and the stateful surface
