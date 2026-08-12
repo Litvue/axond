@@ -25,11 +25,11 @@
 //! - **Ordering is per key, and enforced by the claim.** At most one event per
 //!   [`OrderingKey`] is in flight, so a second concurrent consumer of the same
 //!   journal cannot reorder one caller's events.
-//! - **Capacity is a decision, not an accident.** It bounds everything the
-//!   journal holds, quarantine included, so a destination that rejects every
-//!   event fills the journal and is reported rather than growing it forever. A
-//!   full journal either refuses the append or drops its oldest *non-quarantined*
-//!   event, and the dropped count is reported rather than inferred.
+//! - **Capacity is a decision, not an accident.** It bounds the *undelivered*
+//!   events, quarantine included, so a destination that rejects every event fills
+//!   the journal and is reported rather than growing it forever. A full journal
+//!   either refuses the append or drops its oldest *non-quarantined* event, and the
+//!   dropped count is reported rather than inferred.
 //! - **Retention is what bounds a drained journal.** An event every consumer
 //!   acknowledged is pruned once [`Capacity::retain_acknowledged`] has passed
 //!   since it was observed, so storage does not grow without limit just because
@@ -88,12 +88,17 @@ impl Storage {
         self.entries.iter().find(|entry| entry.position == position)
     }
 
-    /// Positions the journal is still holding, in append order — what capacity
-    /// bounds. An event no consumer has finished with counts, and so does a
+    /// Positions the journal is still holding *undelivered*, in append order — what
+    /// capacity bounds. An event no consumer has finished with counts, and so does a
     /// quarantined one: it is waiting for an operator rather than for a clock, so
     /// nothing else will ever reclaim its space. That is what makes a systematic
     /// poison condition fill the journal and be reported, instead of growing the
     /// store forever.
+    ///
+    /// An event every consumer acknowledged does not count: it is on its way out
+    /// under [`Capacity::retain_acknowledged`], the separate bound on the delivered
+    /// tail, and a journal that is keeping up must not refuse an append because of
+    /// events it has already delivered.
     ///
     /// With no consumer registered every entry counts: a journal nobody reads
     /// still fills up.

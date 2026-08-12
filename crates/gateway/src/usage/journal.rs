@@ -464,14 +464,22 @@ impl CapacityPolicy {
 /// can see the limit next to the depth it is being compared against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capacity {
-    /// Events the journal will hold before its [`policy`](Self::policy) applies.
+    /// Events the journal will hold *undelivered* before its
+    /// [`policy`](Self::policy) applies.
     ///
-    /// It bounds everything the journal is still holding, not just the delivery
-    /// backlog: an event a consumer has not finished with *and* a quarantined one
-    /// waiting for an operator both occupy it. That is what stops a systematic
-    /// poison condition (a destination that rejects every event) from growing the
-    /// store without limit — the quarantine fills the journal, and the journal then
-    /// says so instead of accepting appends forever.
+    /// It counts an event no consumer has finished with **and** a quarantined one
+    /// waiting for an operator — the latter because nothing but an operator will
+    /// ever reclaim its space, so a systematic poison condition (a destination that
+    /// rejects every event) fills the journal and is reported instead of growing
+    /// the store forever.
+    ///
+    /// It does *not* count an event every consumer acknowledged: that one is on its
+    /// way out under [`retain_acknowledged`](Self::retain_acknowledged), which is
+    /// the bound on the delivered tail. The two limits are deliberately separate —
+    /// a journal that is keeping up must not refuse an append because of events it
+    /// has already delivered — so peak storage is `max_events` plus whatever a
+    /// retention window's worth of delivered events amounts to, and an implementation
+    /// sizing its disk has to budget for both.
     pub max_events: u64,
     /// Attempts one event gets before it is quarantined as poison.
     pub max_delivery_attempts: u32,
@@ -547,12 +555,13 @@ pub enum JournalError {
     /// and therefore not a drop candidate. The caller has *not* journaled the
     /// event.
     #[error(
-        "usage journal is at capacity ({pending} events held, limit {}); the event was not journaled",
+        "usage journal is at capacity ({pending} undelivered events, limit {}); the event was not journaled",
         capacity.max_events
     )]
     AtCapacity {
-        /// Events the journal is holding: unfinished deliveries plus quarantined
-        /// events.
+        /// Events the journal is holding undelivered: unfinished deliveries plus
+        /// quarantined events. Acknowledged events awaiting pruning are not
+        /// counted — see [`Capacity::max_events`].
         pending: u64,
         capacity: Capacity,
     },

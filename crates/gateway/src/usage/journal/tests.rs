@@ -627,6 +627,39 @@ async fn a_full_journal_refuses_the_append_and_says_what_it_is_bounded_by() {
     assert!(stats.oldest_pending_age.is_some());
 }
 
+/// The two limits are separate, and stored rows can exceed `max_events` by a
+/// retention window's worth of delivered events: capacity bounds the *undelivered*
+/// backlog, retention bounds the delivered tail. A journal that is keeping up must
+/// not refuse an append because of events it has already delivered.
+#[tokio::test]
+async fn capacity_bounds_the_backlog_while_retention_bounds_the_delivered_tail() {
+    let journal = InMemoryUsageJournal::with_capacity(Capacity {
+        max_events: 1,
+        // Long enough that nothing is pruned during the test.
+        retain_acknowledged: Duration::from_secs(60 * 60),
+        ..Capacity::BILLING_GRADE
+    });
+    let billing = consumer("billing");
+    for subject in ["acme-one", "acme-two", "acme-three"] {
+        let event = event_for(subject);
+        journal
+            .append(&event)
+            .await
+            .expect("a delivered event does not occupy the backlog");
+        let claimed = journal.claim(&billing, claim(1)).await.expect("claim");
+        journal.ack(&claimed[0].id).await.expect("ack");
+    }
+
+    assert_eq!(
+        journal.stored_events(),
+        3,
+        "the delivered tail is retention's to bound, not capacity's"
+    );
+    let stats = journal.stats(&billing).await.expect("stats");
+    assert!(stats.is_drained(), "{stats:?}");
+    assert_eq!(stats.dropped, 0);
+}
+
 /// A verdict from a consumer that never read the journal must not register it.
 /// Retention waits on *every* registered consumer, so one phantom registration
 /// would freeze pruning permanently — the journal would then grow until capacity
