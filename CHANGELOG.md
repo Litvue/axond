@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.3](https://github.com/Litvue/axond/compare/v0.3.2...v0.3.3) (2026-08-12)
+
+
+### Bug Fixes
+
+* **responses:** guarantee continuation affinity across initial and follow-up requests ([#168](https://github.com/Litvue/axond/issues/168)) ([4224c73](https://github.com/Litvue/axond/commit/4224c73f5889fb464b37435297b0b6e75ec78700))
+
+
+### Documentation
+
+* **adr:** accept stateless and stateful operating modes ([#167](https://github.com/Litvue/axond/issues/167)) ([d80813e](https://github.com/Litvue/axond/commit/d80813e31bdd5d04b9d9c746c7fb8f2fcd7d9ba4))
+
 ## [0.3.2](https://github.com/Litvue/axond/compare/v0.3.1...v0.3.2) (2026-08-12)
 
 
