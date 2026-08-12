@@ -264,7 +264,8 @@ above; this document describes the policy and does not restate the values it
 cannot enforce. `ops/check-docs.py` fails if a target the `binary-smoke` matrix
 covers is missing from this document or is not published by the release matrix.
 
-Every release target is booted and served, not merely compiled. On each change
+Every target the `binary-smoke` matrix covers — currently every target the
+release publishes — is booted and served, not merely compiled. On each change
 and again at the tag, for the exact binary that is archived,
 [`ops/binary-smoke.py`](../ops/binary-smoke.py) asserts that `/healthz` and
 `/readyz` answer unauthenticated, that `/v1/models` requires a gateway key and
