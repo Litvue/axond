@@ -37,6 +37,7 @@ define_capabilities!(
     Models,
     Credentials,
     CredentialsAll,
+    Status,
 );
 
 impl Capability {
@@ -49,6 +50,7 @@ impl Capability {
             "models" => Some(Self::Models),
             "credentials" => Some(Self::Credentials),
             "credentials:all" => Some(Self::CredentialsAll),
+            "status" => Some(Self::Status),
             _ => None,
         }
     }
@@ -62,11 +64,23 @@ impl Capability {
             Self::Models => "models",
             Self::Credentials => "credentials",
             Self::CredentialsAll => "credentials:all",
+            Self::Status => "status",
         }
     }
 
     pub(crate) const fn is_operator_only(self) -> bool {
         matches!(self, Self::CredentialsAll)
+    }
+
+    /// Whether a mint request that names no `scope` grants this capability.
+    ///
+    /// Every route capability is: a token minted without a scope is meant to be
+    /// as capable as the key that minted it. `status` is not, because it answers
+    /// a question about the *deployment's* dependencies rather than about the
+    /// caller's own traffic, and a grant that wide should be written down rather
+    /// than inherited. It remains mintable by naming it explicitly.
+    pub(crate) const fn is_granted_without_scope(self) -> bool {
+        !self.is_operator_only() && !matches!(self, Self::Status)
     }
 }
 
@@ -103,6 +117,28 @@ pub struct InboundKey {
     pub max_request_microdollars: Option<u64>,
     pub can_mint: bool,
     pub jti: Option<String>,
+}
+
+impl InboundKey {
+    /// Whether this principal holds the operator's own authority over the whole
+    /// deployment, rather than authority over one namespace.
+    ///
+    /// Only a configured static gateway key in the default namespace does: an
+    /// operator placed that secret there itself. A scope narrows a static key
+    /// rather than widening it, so a scoped one is not treated as unrestricted,
+    /// and every minted token carries delegated authority bounded by minting and
+    /// its verifier — including one that presents an operator-only capability
+    /// from a signer outside `POST /v1/tokens`.
+    ///
+    /// This is the predicate behind the all-namespaces credential view and
+    /// behind [`crate::status::StatusScope::Deployment`]; it lives here because
+    /// authentication is the only place that knows how a principal was
+    /// established.
+    pub fn holds_direct_operator_authority(&self, default_namespace: &str) -> bool {
+        self.authority == PrincipalAuthority::StaticKey
+            && self.scope.is_none()
+            && self.namespace == default_namespace
+    }
 }
 
 pub(crate) struct GatewayKeyEntry {
@@ -1227,6 +1263,25 @@ max_ttl = "15m"
                 TokenVerificationError::Malformed
             ))
         ));
+    }
+
+    /// `status` is the one capability an omitted mint scope must not hand over,
+    /// while every route capability stays inherited (#199).
+    #[test]
+    fn only_status_and_the_operator_view_are_withheld_from_a_scope_less_mint() {
+        assert!(!Capability::Status.is_granted_without_scope());
+        assert!(!Capability::CredentialsAll.is_granted_without_scope());
+        for capability in Capability::ALL
+            .iter()
+            .copied()
+            .filter(|capability| !matches!(capability, Capability::Status))
+        {
+            assert_eq!(
+                capability.is_granted_without_scope(),
+                !capability.is_operator_only(),
+                "`{capability}` must keep its existing scope-less minting behaviour"
+            );
+        }
     }
 
     #[tokio::test]
