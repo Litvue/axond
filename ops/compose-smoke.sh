@@ -30,7 +30,13 @@ chat_file="${probe_dir}/chat"
 # client deadline five seconds beyond it so typed transport errors can surface.
 gateway_overall_timeout_ms=30000
 chat_timeout_seconds=$((gateway_overall_timeout_ms / 1000 + 5))
-compose=(env "AXOND_QUICKSTART_HOST_PORT=127.0.0.1:${smoke_port}" docker compose --project-name "$project_name")
+compose=(
+  env "AXOND_QUICKSTART_HOST_PORT=127.0.0.1:${smoke_port}"
+  docker compose
+  --project-name "$project_name"
+  -f docker-compose.yml
+  -f docker-compose.build.yml
+)
 
 cleanup() {
   "${compose[@]}" down -v >/dev/null 2>&1 || true

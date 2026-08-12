@@ -16,10 +16,11 @@
 bind = "0.0.0.0:8080"
 
 # ── Namespaces ────────────────────────────────────────────────────────────────
-# Exactly one namespace is the default (used when a request has no gateway key,
-# or in open dev mode). BYOK namespaces default to `allow_platform_fallback =
-# false`, so a customer missing a key hard-fails rather than silently spending
-# your platform credits.
+# Exactly one namespace is the default. Authentication always fails closed;
+# "default" identifies the platform/operator namespace and the source of
+# explicitly allowed platform fallback. BYOK namespaces default to
+# `allow_platform_fallback = false`, so a customer missing a key hard-fails
+# rather than silently spending your platform credits.
 
 [[namespace]]
 id = "platform"
@@ -220,10 +221,10 @@ namespace = "acme"
 # `kid` takes effect without a restart. Reload summaries include a short
 # material fingerprint and report the `kid` as changed; fingerprints never
 # reveal material. A new `kid` can still be overlapped for a graceful rotation.
-# Short TTLs, removing a kid, and `min_iat` issuance epochs are the current
-# Tier 0 revocation controls. Precise single-token revocation requires the
-# future Tier 1 `jti` denylist (#68). See
-# docs/minted-token-guide.md for the complete runbook.
+# Short TTLs, removing a kid, and `min_iat` issuance epochs are the Tier 0
+# revocation controls. `[revocation]` adds precise JTI denial through Redis
+# (Tier 1) or Postgres (Tier 2), and `axond revoke` writes to that configured
+# store. See docs/minted-token-guide.md for the complete runbook.
 
 # ── Models (aliases) ──────────────────────────────────────────────────────────
 # Callers send the alias (`gpt-4o`), never `provider/model`. Targets are tried

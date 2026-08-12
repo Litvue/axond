@@ -1,0 +1,31 @@
+[server]
+bind = "0.0.0.0:8080"
+
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "GW_PLATFORM_OPENAI_API_KEY"
+id = "openai-primary"
+
+[[gateway_key]]
+env = "GW_INBOUND_PLATFORM_KEY"
+namespace = "platform"
+
+[[model]]
+name = "gpt-4o"
+targets = [
+  { provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2_500_000, output_microdollars_per_million = 10_000_000 } },
+]
+
+[reload]
+watch = true
+poll_interval_ms = 2_000

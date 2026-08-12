@@ -148,10 +148,20 @@ jobs:
           AXOND_BIN: ${{ github.workspace }}/target/debug/axond
 
   docs:
-    name: Rustdoc
+    name: Documentation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Documentation links, drift, routes, and deployment manifests
+        run: |
+          python3 ops/check-docs.py
+          docker compose --env-file ops/compose/env.example config --quiet
+          docker compose --env-file ops/compose/env.example \
+            -f docker-compose.yml -f docker-compose.build.yml config --quiet
+          AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml \
+            docker compose --env-file ops/compose/env.example \
+            -f docker-compose.yml -f docker-compose.stateful.yml \
+            --profile stateful config --quiet
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
