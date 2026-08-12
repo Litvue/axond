@@ -38,9 +38,26 @@ Boot errors name references and identifiers, not secret values.
 | `503 budget_unavailable` | Shared budget backend failed under fail-closed policy. | Redis/Postgres health and latency. |
 | `503 rate_limit_unavailable` | Redis limiter failed under fail-closed policy. | Redis health, invoke saturation, connection recovery. |
 | `503 revocation_unavailable` | JTI store failed under fail-closed policy. | Redis/Postgres health and configured policy. |
-| `503 continuation_affinity_unavailable` | A Responses continuation cannot safely use its pinned target. | Original target/credential availability; retry later. |
+| `503 continuation_affinity_unavailable` | A request carrying `previous_response_id` cannot safely use its pinned first target or credential. | First-target circuit and first-credential state; retry later. |
 
 All error bodies use `{"error":{"type":...,"message":...}}`.
+
+## A `/v1/responses` request fails while chat on the same alias succeeds
+
+Expected. Every Responses request — initial calls included — uses only the
+alias's first target and first credential, so it neither fails over nor rotates;
+chat on the same alias still walks the remaining targets and keys. This is what
+keeps a response id continuable without gateway state
+([ADR 0023](../adr/0023-openai-responses-passthrough.md)).
+
+An **initial** Responses request reports the ordinary cause —
+`503 all_provider_circuits_open` when the first target's circuit is open,
+`no_credential` when the first credential is missing, or the upstream error
+itself — because nothing was continued. Only a request with a non-empty
+`previous_response_id` reports `continuation_affinity_unavailable`. Check the
+first target and first credential of the alias; do not expect a later target to
+absorb the failure, and do not reorder `targets` or the credential pool to route
+around it, because that strands response ids created under the previous order.
 
 ## Health is green but requests fail
 

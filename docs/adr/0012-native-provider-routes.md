@@ -111,8 +111,9 @@ silent fallback.
 **Superseded for `/v1/responses` by [ADR 0023](./0023-openai-responses-passthrough.md).**
 Responses is now served natively on the shared path. Its provider-side
 statefulness is handled by considering only the alias's first configured target
-and first configured credential for requests with `previous_response_id`, while
-keeping the gateway stateless.
+and first configured credential for *every* Responses request, initial calls
+included, while keeping the gateway stateless. Responses therefore does not use
+the ordered failover walk or credential rotation described above.
 
 **No new dependencies**, so `deny.toml` is untouched and no licence needed
 allowing.

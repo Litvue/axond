@@ -41,9 +41,13 @@ and publishes crates.io last because registry versions are immutable.
   probe providers, Redis, or Postgres.
 - Cross-provider request translation is intentionally not supported. OpenAI and
   Anthropic aliases must use their native wire families.
-- Responses continuations pin to the first configured target. Axond does not
-  persist response-ID-to-target ownership, so it cannot recover affinity for a
-  continuation originally served by a later failover target.
+- Every `/v1/responses` request, initial calls included, pins to the alias's
+  first configured target and first configured credential, so the route has no
+  failover and no credential rotation. This keeps continuations reachable
+  without response-ID-to-target state; the cost is that a first-target outage or
+  exhausted first key is returned to the caller. Changing an alias's target
+  order or credential pool order strands response IDs created under the previous
+  order.
 - The server does not yet install an application-level SIGTERM drain; deployment
   infrastructure must remove replicas from traffic before termination.
 
