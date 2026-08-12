@@ -29,7 +29,9 @@ use super::{Capabilities, Capability};
 /// The audit event the control-plane fixtures publish.
 pub(crate) fn audit(action: &str) -> AuditEvent {
     AuditEvent {
-        actor: Actor::System { component: "test" },
+        actor: Actor::System {
+            component: "test".to_owned(),
+        },
         action: action.to_owned(),
         summary: format!("{action} applied"),
     }

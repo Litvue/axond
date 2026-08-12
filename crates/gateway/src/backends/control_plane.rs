@@ -166,7 +166,10 @@ pub enum Actor {
     /// The static bootstrap breakglass operator.
     Breakglass,
     /// The gateway itself — a background catalogue refresh, for example.
-    System { component: &'static str },
+    ///
+    /// Owned rather than `&'static str` because an audit row read back out of a
+    /// durable store has to produce this without leaking.
+    System { component: String },
 }
 
 /// The audit event a mutation carries.
