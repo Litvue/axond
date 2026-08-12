@@ -43,9 +43,14 @@ def workflows(root: Path) -> list[Path]:
     return sorted(p for p in directory.glob("*.y*ml") if p.is_file())
 
 
-def check_pins(text: str, relative: str) -> tuple[list[str], dict[str, tuple[str, str]]]:
+def check_pins(text: str, relative: str) -> tuple[list[str], list[tuple[str, str, str, str]]]:
+    """Return the failures and every `(action, sha, comment, where)` pin found.
+
+    Every occurrence is kept, not one per action: two steps in the same file
+    disagreeing about an action's pin is the same problem as two files doing so.
+    """
     failures: list[str] = []
-    pins: dict[str, tuple[str, str]] = {}
+    pins: list[tuple[str, str, str, str]] = []
     for number, line in enumerate(text.splitlines(), 1):
         match = USES.match(line)
         if match is None:
@@ -80,7 +85,7 @@ def check_pins(text: str, relative: str) -> tuple[list[str], dict[str, tuple[str
                 "or upstream branch"
             )
         else:
-            pins[action] = (sha, comment)
+            pins.append((action, sha, comment, where))
     return failures, pins
 
 
@@ -101,13 +106,18 @@ def check_permissions(text: str, relative: str) -> list[str]:
 def check_signer_identity(text: str, relative: str) -> list[str]:
     """Keyless verification stays bound to this workflow's own identity."""
     failures: list[str] = []
-    declares_identity = any(ANCHORED_IDENTITY.match(line) for line in text.splitlines())
-    if "SIGNER_IDENTITY:" in text and not declares_identity:
-        failures.append(
-            f"{relative}: SIGNER_IDENTITY must be an anchored regular expression "
-            "(`^…$`), so it cannot match a copy of the workflow on another ref"
-        )
     lines = text.splitlines()
+    # Every declaration is checked, not just the first: a job-level `env:` entry
+    # shadows the workflow-level one, so an unanchored override widens what
+    # `cosign verify` accepts even when an anchored line remains in the file.
+    for number, line in enumerate(lines, 1):
+        if "SIGNER_IDENTITY:" not in line or ANCHORED_IDENTITY.match(line):
+            continue
+        failures.append(
+            f"{relative}:{number}: SIGNER_IDENTITY must be an anchored regular "
+            "expression (`^…$`), so it cannot match a copy of the workflow on "
+            "another ref"
+        )
     for index, line in enumerate(lines):
         if "cosign verify" not in line:
             continue
@@ -134,17 +144,17 @@ def check(root: Path) -> list[str]:
         failures.extend(pin_failures)
         failures.extend(check_permissions(text, relative))
         failures.extend(check_signer_identity(text, relative))
-        for action, (sha, comment) in pins.items():
-            first = seen.setdefault(action, (sha, comment, relative))
+        for action, sha, comment, where in pins:
+            first = seen.setdefault(action, (sha, comment, where))
             if first[0] != sha:
                 failures.append(
-                    f"{relative}: {action} is pinned to {sha[:7]}… here but to "
-                    f"{first[0][:7]}… in {first[2]}; one reviewed pin per action"
+                    f"{where}: {action} is pinned to {sha[:7]}… here but to "
+                    f"{first[0][:7]}… at {first[2]}; one reviewed pin per action"
                 )
             elif first[1] != comment:
                 failures.append(
-                    f"{relative}: {action}@{sha[:7]}… is labelled {comment!r} here "
-                    f"but {first[1]!r} in {first[2]}"
+                    f"{where}: {action}@{sha[:7]}… is labelled {comment!r} here "
+                    f"but {first[1]!r} at {first[2]}"
                 )
     return failures
 
@@ -212,7 +222,21 @@ def self_test() -> list[str]:
         (
             "an unanchored signer identity",
             SELF_TEST_PERMISSIONS + "env:\n  SIGNER_IDENTITY: https://github.com/o/r\n",
-            "anchored regular expression",
+            "anchored regular",
+        ),
+        (
+            "an unanchored signer identity shadowing an anchored one",
+            SELF_TEST_PERMISSIONS
+            + "env:\n  SIGNER_IDENTITY: ^https://github\\.com/o/r@refs/heads/main$\n"
+            "jobs:\n  a:\n    env:\n      SIGNER_IDENTITY: https://github.com/o/r\n",
+            "anchored regular",
+        ),
+        (
+            "one workflow disagreeing with itself about a pin",
+            SELF_TEST_PERMISSIONS + "jobs:\n  a:\n    steps:\n"
+            "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
+            "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0\n",
+            "one reviewed pin per action",
         ),
         (
             "cosign verify without an identity restriction",
