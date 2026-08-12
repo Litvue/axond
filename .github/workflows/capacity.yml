@@ -1,0 +1,54 @@
+name: Capacity
+
+# The heavy capacity profiles: the same driver, manifest, and assertions the
+# `CI` workflow runs at the reduced scale, offered at a scale that wants a runner
+# to itself (ADR 0033). The result artifacts are uploaded so an envelope can be
+# read from evidence rather than from memory.
+#
+# Numbers from a shared runner are indicative, not a contract: every artifact
+# carries the binary, config, fixture, and hardware identity that produced it, so
+# two runs are only comparable when that provenance matches.
+on:
+  workflow_dispatch:
+  schedule:
+    # Sundays, 05:23 UTC — after the soak, so the two do not share a runner.
+    - cron: '23 5 * * 0'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  capacity:
+    name: Heavy capacity profiles
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      # `--test-threads=1`: the reduced tier lives in the same binary, and two
+      # tiers offering load at once would measure each other's contention rather
+      # than the replica.
+      - name: Run the committed capacity profiles
+        run: |
+          cargo test --locked --all-features --test capacity -- \
+            --nocapture --test-threads=1
+        env:
+          AXOND_CAPACITY: '1'
+      - name: Publish the result artifacts
+        # Uploaded even on failure: a run that missed a threshold is the run whose
+        # evidence is worth reading.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: capacity-results
+          path: target/capacity/**/*.json
+          if-no-files-found: error

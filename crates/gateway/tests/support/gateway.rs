@@ -23,6 +23,15 @@ pub const GATEWAY_KEY: &str = "test-inbound-key";
 /// fake upstream's recorded requests.
 pub const OPENAI_KEY: &str = "test-upstream-openai-key";
 pub const ANTHROPIC_KEY: &str = "test-upstream-anthropic-key";
+/// Second keys per provider, exported at boot but referenced by no shipped
+/// config section: a suite that wants a credential *pool* declares the extra
+/// `[[credential]]` entries in its own tuning and gets them from the
+/// environment the process already has.
+pub const OPENAI_KEY_SECONDARY: &str = "test-upstream-openai-key-secondary";
+pub const ANTHROPIC_KEY_SECONDARY: &str = "test-upstream-anthropic-key-secondary";
+/// The environment variables those second keys arrive in.
+pub const OPENAI_SECONDARY_ENV: &str = "GW_FAKE_OPENAI_KEY_SECONDARY";
+pub const ANTHROPIC_SECONDARY_ENV: &str = "GW_FAKE_ANTHROPIC_KEY_SECONDARY";
 
 /// Caller-facing aliases the test config exposes.
 pub mod alias {
@@ -43,6 +52,10 @@ pub mod alias {
     pub const MESSAGES_DROP: &str = "messages-drop";
     pub const EMBEDDINGS: &str = "embeddings-golden";
     pub const RESPONSES: &str = "responses-golden";
+    /// Buffered answers of a fixed size, for a response-size sweep.
+    pub const CHAT_SIZED_SMALL: &str = "chat-sized-small";
+    pub const CHAT_SIZED_MEDIUM: &str = "chat-sized-medium";
+    pub const CHAT_SIZED_LARGE: &str = "chat-sized-large";
 }
 
 /// The `[failover]` and `[transport]` sections every suite gets unless it asks
@@ -67,6 +80,9 @@ const BOOT_ATTEMPTS: u32 = 4;
 
 pub struct Axond {
     pub base_url: String,
+    /// The config the process was booted with, kept so a harness can record
+    /// exactly what it qualified.
+    pub config: String,
     child: Child,
     lines: Arc<Mutex<Vec<String>>>,
 }
@@ -105,14 +121,16 @@ impl Axond {
         std::fs::create_dir_all(&dir).expect("test config directory");
         let addr = free_addr();
         let path = dir.join(format!("axond-{}.toml", addr.port()));
-        std::fs::write(&path, config_toml(addr, upstream_base_url, tuning))
-            .expect("test config is written");
+        let config = config_toml(addr, upstream_base_url, tuning);
+        std::fs::write(&path, &config).expect("test config is written");
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_axond"))
             .env("AXOND_CONFIG", &path)
             .env("GW_INBOUND_KEY", GATEWAY_KEY)
             .env("GW_FAKE_OPENAI_KEY", OPENAI_KEY)
             .env("GW_FAKE_ANTHROPIC_KEY", ANTHROPIC_KEY)
+            .env(OPENAI_SECONDARY_ENV, OPENAI_KEY_SECONDARY)
+            .env(ANTHROPIC_SECONDARY_ENV, ANTHROPIC_KEY_SECONDARY)
             .env("RUST_LOG", "warn")
             .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
             .stdout(Stdio::piped())
@@ -146,6 +164,7 @@ impl Axond {
 
         let mut gateway = Self {
             base_url: format!("http://{addr}"),
+            config,
             child,
             lines,
         };
@@ -354,8 +373,23 @@ namespace = "platform"
 
 {tuning}
 
-{chat}{chat_no_headers}{chat_late_headers}{chat_slow_body}{chat_huge_body}{chat_huge_error}{chat_stall}{chat_stall_after_bytes}{chat_long}{chat_slow}{chat_drop}{chat_fail}{messages}{messages_slow}{messages_drop}{embeddings}{responses}"#,
+{chat}{chat_sized_small}{chat_sized_medium}{chat_sized_large}{chat_no_headers}{chat_late_headers}{chat_slow_body}{chat_huge_body}{chat_huge_error}{chat_stall}{chat_stall_after_bytes}{chat_long}{chat_slow}{chat_drop}{chat_fail}{messages}{messages_slow}{messages_drop}{embeddings}{responses}"#,
         chat = model(alias::CHAT, "fake-openai", target::CHAT),
+        chat_sized_small = model(
+            alias::CHAT_SIZED_SMALL,
+            "fake-openai",
+            target::SIZED_BODY_SMALL
+        ),
+        chat_sized_medium = model(
+            alias::CHAT_SIZED_MEDIUM,
+            "fake-openai",
+            target::SIZED_BODY_MEDIUM
+        ),
+        chat_sized_large = model(
+            alias::CHAT_SIZED_LARGE,
+            "fake-openai",
+            target::SIZED_BODY_LARGE
+        ),
         chat_no_headers = model(alias::CHAT_NO_HEADERS, "fake-openai", target::NO_HEADERS),
         chat_late_headers = model(
             alias::CHAT_LATE_HEADERS,
