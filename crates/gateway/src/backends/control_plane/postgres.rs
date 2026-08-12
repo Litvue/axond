@@ -354,8 +354,15 @@ impl PostgresControlPlane {
     /// serialize here instead of both running the DDL and one of them failing
     /// halfway.
     async fn prepare_schema(&self, client: &mut Client) -> Result<(), ControlPlaneError> {
+        // Read committed explicitly, for the reason `apply_migrations` pins it: the
+        // status is read after the lock is granted and has to be the winner's
+        // committed history. Under `repeatable read` the waiting replica would read
+        // the pre-migration ledger — or, because catalog lookups stay fresh while row
+        // reads do not, an existing table with no visible rows, which is a refusal.
         let transaction = client
-            .transaction()
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+            .start()
             .await
             .map_err(|error| unavailable("begin schema transaction", &error))?;
         transaction
@@ -1868,6 +1875,66 @@ mod tests {
         assert!(
             message.contains("schema exists"),
             "the refusal names what to fix: {message}"
+        );
+    }
+
+    /// Two replicas booting together against one empty database on a server whose
+    /// default isolation is `repeatable read`: the one that waits for the advisory
+    /// lock must read the winner's committed ledger, not the snapshot it took
+    /// before the wait. Reading the stale one either re-runs the DDL or — catalog
+    /// lookups being fresh while row reads are not — finds a ledger table with no
+    /// visible rows, which is a refused boot.
+    #[tokio::test]
+    async fn replicas_booting_together_migrate_once_whatever_the_server_default_is() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let schema = format!(
+            "cp_rr_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let mut config: Config = dsn.parse().expect("test dsn");
+        config.connect_timeout(Duration::from_secs(5));
+        let (client, connection) = config
+            .connect(crate::usage::tls_connector())
+            .await
+            .expect("connect to create the test schema");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .expect("create the test schema");
+
+        // The stricter default is asked for per connection rather than set on the
+        // server, so the rest of the suite is unaffected by this test.
+        let separator = if dsn.contains('?') { "&" } else { "?" };
+        // A space inside a startup option's value is escaped, because the server
+        // splits `options` on unescaped whitespace.
+        let strict = format!(
+            "{dsn}{separator}options=-c%20default_transaction_isolation%3Drepeatable%5C%20read"
+        );
+        let booting = || async {
+            PostgresControlPlane::connect(
+                &strict,
+                ControlPlaneSettings {
+                    migrate: true,
+                    ..settings(&schema)
+                },
+            )
+            .await
+        };
+        let (first, second) = tokio::join!(booting(), booting());
+        let first = first.expect("a replica migrating an empty database boots");
+        second.expect("the replica that waited for the lock boots too");
+
+        assert!(
+            first.schema_status().await.expect("status").is_current(),
+            "one migration, not two"
         );
     }
 

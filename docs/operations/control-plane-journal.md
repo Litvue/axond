@@ -58,7 +58,7 @@ Three commands run *before* replicas do, all with the same grammar —
 | `axond migrate apply --config PATH` | Yes | Apply the pending migrations, forward only. |
 
 The command surface, the forward-only policy, and the refusal to migrate at boot
-are [ADR 0031](../adr/0031-operator-preflight-and-forward-only-migrations.md).
+are [ADR 0032](../adr/0032-operator-preflight-and-forward-only-migrations.md).
 
 `preflight` and `status` cannot change a database, and not merely by convention:
 they open the control plane on a maintenance path that does not prepare a schema,

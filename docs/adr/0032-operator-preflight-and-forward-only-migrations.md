@@ -1,4 +1,4 @@
-# 31. Operator commands: stateful preflight and forward-only migration
+# 32. Operator commands: stateful preflight and forward-only migration
 
 Date: 2026-08-12
 
