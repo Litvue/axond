@@ -2,7 +2,7 @@
 # Install the latest prebuilt Axond binary for supported Unix platforms.
 set -eu
 
-repo="${AXOND_REPOSITORY:-Litvue/axond}"
+repo="Litvue/axond"
 version="${AXOND_VERSION:-}"
 target="${AXOND_TARGET:-}"
 dry_run="${AXOND_INSTALL_DRY_RUN:-0}"

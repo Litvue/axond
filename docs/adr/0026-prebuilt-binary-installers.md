@@ -37,6 +37,8 @@ path while retaining `cargo install axond` as the source-build alternative.
 Installers resolve the latest release through GitHub's public release redirect,
 accept an explicit version and destination for reproducible automation, and
 reject unsupported targets and malformed settings before downloading assets.
+The release repository is fixed to `Litvue/axond`; ambient environment cannot
+redirect an official installer to another publisher.
 
 Every install verifies the release archive's same-origin SHA-256 sidecar. This
 is the availability-oriented default: installation does not require GitHub CLI,

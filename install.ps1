@@ -7,7 +7,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Repository = if ($env:AXOND_REPOSITORY) { $env:AXOND_REPOSITORY } else { "Litvue/axond" }
+$Repository = "Litvue/axond"
 $AttestationSetting = if ($env:AXOND_REQUIRE_ATTESTATION) {
     $env:AXOND_REQUIRE_ATTESTATION.ToLowerInvariant()
 }
@@ -97,11 +97,24 @@ try {
         if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
             throw "GitHub CLI is required by -RequireAttestation or AXOND_REQUIRE_ATTESTATION=1"
         }
-        & gh auth status *> $null
+        $PreviousErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & gh auth status 2>&1 | Out-Null
+        }
+        finally {
+            $ErrorActionPreference = $PreviousErrorActionPreference
+        }
         if ($LASTEXITCODE -ne 0) {
             throw "Authenticated GitHub CLI is required by -RequireAttestation or AXOND_REQUIRE_ATTESTATION=1"
         }
-        & gh attestation --help *> $null
+        $ErrorActionPreference = "Continue"
+        try {
+            & gh attestation --help 2>&1 | Out-Null
+        }
+        finally {
+            $ErrorActionPreference = $PreviousErrorActionPreference
+        }
         if ($LASTEXITCODE -ne 0) {
             throw "GitHub CLI with attestation support is required by -RequireAttestation or AXOND_REQUIRE_ATTESTATION=1"
         }
