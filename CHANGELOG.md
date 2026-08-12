@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.11](https://github.com/Litvue/axond/compare/v0.3.10...v0.3.11) (2026-08-12)
+
+
+### Bug Fixes
+
+* **state:** name a declared blob whose record is gone, and a dependency cycle ([#187](https://github.com/Litvue/axond/issues/187)) ([c79c239](https://github.com/Litvue/axond/commit/c79c23916ff1b7aa08981132b56f76db69c6416d))
+
 ## [0.3.10](https://github.com/Litvue/axond/compare/v0.3.9...v0.3.10) (2026-08-12)
 
 
