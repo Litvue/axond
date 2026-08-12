@@ -627,6 +627,70 @@ async fn a_full_journal_refuses_the_append_and_says_what_it_is_bounded_by() {
     assert!(stats.oldest_pending_age.is_some());
 }
 
+/// Quarantine is exempt from dropping and pruning, so it has to be inside the
+/// capacity bound — otherwise a destination that rejects everything (a schema
+/// mismatch, say) would quietly grow the store without limit, which is the failure
+/// capacity exists to prevent.
+#[tokio::test]
+async fn a_journal_whose_backlog_is_all_poison_fills_up_instead_of_growing() {
+    let journal = InMemoryUsageJournal::with_capacity(Capacity {
+        max_events: 2,
+        max_delivery_attempts: 1,
+        ..Capacity::BILLING_GRADE
+    });
+    let billing = consumer("billing");
+    for subject in ["acme-one", "acme-two"] {
+        journal.append(&event_for(subject)).await.expect("append");
+    }
+
+    // Every event is condemned, by the only consumer there is.
+    for delivery in journal.claim(&billing, claim(10)).await.expect("claim") {
+        journal
+            .quarantine(&delivery.id, PoisonReason::Rejected)
+            .await
+            .expect("quarantine");
+    }
+
+    let stats = journal.stats(&billing).await.expect("stats");
+    assert!(stats.is_drained(), "nothing is waiting for delivery");
+    assert_eq!(stats.quarantined, 2);
+
+    let error = journal
+        .append(&event_for("acme-three"))
+        .await
+        .expect_err("a journal full of poison is still full");
+    assert!(
+        matches!(&error, JournalError::AtCapacity { pending, .. } if *pending == 2),
+        "{error:?}"
+    );
+    assert_eq!(journal.stored_events(), 2);
+}
+
+/// The two verdicts are exclusive in both directions: `ack` cannot release a
+/// quarantine, and a late quarantine cannot retract an acknowledgement — it would
+/// put a delivered event on the poison count and, being exempt from pruning, keep
+/// it there forever.
+#[tokio::test]
+async fn an_acknowledged_event_cannot_be_condemned_afterwards() {
+    let journal = InMemoryUsageJournal::new();
+    let billing = consumer("billing");
+    journal.append(&event()).await.expect("append");
+    let claimed = journal.claim(&billing, claim(1)).await.expect("claim");
+    journal.ack(&claimed[0].id).await.expect("ack");
+
+    let error = journal
+        .quarantine(&claimed[0].id, PoisonReason::Rejected)
+        .await
+        .expect_err("there is no delivery left to condemn");
+    assert!(
+        matches!(&error, JournalError::AlreadyAcknowledged { delivery } if delivery == &claimed[0].id),
+        "{error:?}"
+    );
+    let stats = journal.stats(&billing).await.expect("stats");
+    assert_eq!(stats.quarantined, 0);
+    assert!(stats.is_drained(), "{stats:?}");
+}
+
 /// A lossy policy may drop a backlog; it may not drop the evidence an operator was
 /// asked to look at. When the only room left to make is somebody's quarantine, the
 /// journal refuses instead — the same answer `Refuse` gives, for the same reason.

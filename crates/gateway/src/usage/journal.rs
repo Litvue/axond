@@ -464,7 +464,14 @@ impl CapacityPolicy {
 /// can see the limit next to the depth it is being compared against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capacity {
-    /// Unacknowledged events the journal will hold.
+    /// Events the journal will hold before its [`policy`](Self::policy) applies.
+    ///
+    /// It bounds everything the journal is still holding, not just the delivery
+    /// backlog: an event a consumer has not finished with *and* a quarantined one
+    /// waiting for an operator both occupy it. That is what stops a systematic
+    /// poison condition (a destination that rejects every event) from growing the
+    /// store without limit — the quarantine fills the journal, and the journal then
+    /// says so instead of accepting appends forever.
     pub max_events: u64,
     /// Attempts one event gets before it is quarantined as poison.
     pub max_delivery_attempts: u32,
@@ -535,13 +542,20 @@ impl JournalStats {
 /// and collapsing them into a string would erase the difference.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum JournalError {
-    /// The journal is full and its policy is to refuse. The caller has *not*
-    /// journaled the event.
+    /// The journal is full and cannot make room — either because its policy is
+    /// [`CapacityPolicy::Refuse`], or because everything it holds is quarantined
+    /// and therefore not a drop candidate. The caller has *not* journaled the
+    /// event.
     #[error(
-        "usage journal is at capacity ({pending} unacknowledged events, limit {}); the event was not journaled",
+        "usage journal is at capacity ({pending} events held, limit {}); the event was not journaled",
         capacity.max_events
     )]
-    AtCapacity { pending: u64, capacity: Capacity },
+    AtCapacity {
+        /// Events the journal is holding: unfinished deliveries plus quarantined
+        /// events.
+        pending: u64,
+        capacity: Capacity,
+    },
     /// The same idempotency key was appended with different content. A bug (a
     /// reused id, a mutated record), never a retry, so it is refused instead of
     /// overwriting a fact a consumer may already have delivered.
@@ -568,6 +582,16 @@ pub enum JournalError {
     /// look at.
     #[error("delivery `{delivery}` is quarantined; an operator has to release it")]
     Quarantined { delivery: DeliveryId },
+    /// The event was already acknowledged by this consumer, so there is no
+    /// delivery left to condemn.
+    ///
+    /// The two verdicts are exclusive in both directions: an acknowledgement
+    /// cannot release a quarantine, and a quarantine cannot retract an
+    /// acknowledgement. A late quarantine that overrode an `ack` would put an
+    /// event that was successfully delivered onto the poison count — and, since a
+    /// quarantined event is never pruned, keep it forever.
+    #[error("delivery `{delivery}` was already acknowledged")]
+    AlreadyAcknowledged { delivery: DeliveryId },
     /// The storage engine failed. Operational, and the one variant that carries
     /// only a message.
     #[error("usage journal backend: {0}")]
@@ -636,6 +660,10 @@ pub trait UsageJournal: Send + Sync {
     /// a verdict on an event is only a consumer's to give once the event was
     /// handed to it; quarantining an already quarantined event is `Ok` and keeps
     /// the first reason.
+    ///
+    /// The two verdicts are exclusive, so an event this consumer already
+    /// acknowledged cannot be condemned afterwards
+    /// ([`JournalError::AlreadyAcknowledged`]).
     async fn quarantine(
         &self,
         delivery: &DeliveryId,

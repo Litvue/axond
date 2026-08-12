@@ -22,9 +22,11 @@
 //! - **Ordering is per key, and enforced by the claim.** At most one event per
 //!   [`OrderingKey`] is in flight, so a second concurrent consumer of the same
 //!   journal cannot reorder one caller's events.
-//! - **Capacity is a decision, not an accident.** A full journal either refuses
-//!   the append or drops its oldest unacknowledged event — never a quarantined
-//!   one — and the dropped count is reported rather than inferred.
+//! - **Capacity is a decision, not an accident.** It bounds everything the
+//!   journal holds, quarantine included, so a destination that rejects every
+//!   event fills the journal and is reported rather than growing it forever. A
+//!   full journal either refuses the append or drops its oldest *non-quarantined*
+//!   event, and the dropped count is reported rather than inferred.
 //! - **Retention is what bounds a drained journal.** An event every consumer
 //!   acknowledged is pruned once [`Capacity::retain_acknowledged`] has passed
 //!   since it was observed, so storage does not grow without limit just because
@@ -83,18 +85,26 @@ impl Storage {
         self.entries.iter().find(|entry| entry.position == position)
     }
 
-    /// Positions no consumer has finished with, which is what capacity bounds.
+    /// Positions the journal is still holding, in append order — what capacity
+    /// bounds. An event no consumer has finished with counts, and so does a
+    /// quarantined one: it is waiting for an operator rather than for a clock, so
+    /// nothing else will ever reclaim its space. That is what makes a systematic
+    /// poison condition fill the journal and be reported, instead of growing the
+    /// store forever.
+    ///
     /// With no consumer registered every entry counts: a journal nobody reads
     /// still fills up.
-    fn unacknowledged(&self) -> Vec<u64> {
+    fn held(&self) -> Vec<u64> {
         self.entries
             .iter()
             .map(|entry| entry.position)
             .filter(|position| {
                 self.consumers.is_empty()
-                    || self.consumers.values().any(|state| {
-                        !state.acked.contains(position) && !state.quarantined.contains_key(position)
-                    })
+                    || self.is_quarantined(*position)
+                    || self
+                        .consumers
+                        .values()
+                        .any(|state| !state.acked.contains(position))
             })
             .collect()
     }
@@ -222,7 +232,7 @@ impl UsageJournal for InMemoryUsageJournal {
                 key: event.idempotency_key().clone(),
             });
         }
-        let pending = storage.unacknowledged();
+        let pending = storage.held();
         if pending.len() as u64 >= self.capacity.max_events {
             match self.capacity.policy {
                 CapacityPolicy::Refuse => {
@@ -402,6 +412,15 @@ impl UsageJournal for InMemoryUsageJournal {
         // not a way to remove an event it never saw.
         if state.quarantined.contains_key(&position) {
             return Ok(());
+        }
+        // The two verdicts are exclusive in both directions. A late quarantine that
+        // overrode an acknowledgement would put a successfully delivered event on
+        // the poison count and, since quarantine is exempt from pruning, keep it
+        // there forever.
+        if state.acked.contains(&position) {
+            return Err(JournalError::AlreadyAcknowledged {
+                delivery: delivery.clone(),
+            });
         }
         if !state.attempts.contains_key(&position) {
             return Err(JournalError::NotOutstanding {
