@@ -3,7 +3,46 @@
 Axond ships through crates.io, signed GitHub release archives, and GHCR. Use a
 released artifact in production; build from source when developing Axond.
 
-## crates.io
+## Prebuilt binary installer
+
+The installer is the shortest path to the released single binary. It detects
+Linux x86-64 or macOS Apple Silicon, downloads the matching GitHub Release
+archive, verifies the published SHA-256 sidecar, and installs into
+`$HOME/.local/bin` by default:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://raw.githubusercontent.com/Litvue/axond/main/install.sh | sh
+```
+
+For Windows x86-64 in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Litvue/axond/main/install.ps1 | iex
+```
+
+For environments that prohibit piping downloaded code into a shell, download
+and inspect `install.sh` or `install.ps1` first. Both support an explicit
+version and destination:
+
+```bash
+AXOND_VERSION=0.3.1 AXOND_INSTALL_DIR=/usr/local/bin sh ./install.sh # x-release-please-version
+```
+
+```powershell
+.\install.ps1 -Version 0.3.1 -InstallDir C:\Tools\axond # x-release-please-version
+```
+
+Supported installer targets match the release matrix: Linux x86-64 (static
+musl by default, glibc selectable through `AXOND_TARGET`), macOS Apple Silicon,
+and Windows x86-64. Other architectures must build from source until a release
+artifact is added.
+
+## crates.io source install
+
+Cargo registries distribute source packages, not precompiled executables.
+Consequently, `cargo install` downloads the published crate and compiles it on
+the local machine:
 
 ```bash
 cargo install axond --locked

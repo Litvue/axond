@@ -80,10 +80,29 @@ Compose profile, and SDK examples.
 
 ## Install
 
-Choose one distribution path:
+The recommended path installs the checksum-verified prebuilt binary; it does not
+download the repository or invoke the Rust compiler:
 
 ```bash
-# Build and install the latest published CLI from crates.io.
+# Linux x86-64 or macOS Apple Silicon
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://raw.githubusercontent.com/Litvue/axond/main/install.sh | sh
+```
+
+PowerShell on Windows x86-64:
+
+```powershell
+irm https://raw.githubusercontent.com/Litvue/axond/main/install.ps1 | iex
+```
+
+The installers select the latest release, verify its SHA-256 sidecar, and put
+`axond` under the current user's local application directory. Download and
+inspect either script first if your policy forbids piped installers.
+
+Other distribution paths:
+
+```bash
+# Cargo installs from source and compiles locally by design.
 cargo install axond --locked
 
 # Pull the current release image. There is intentionally no `latest` tag.

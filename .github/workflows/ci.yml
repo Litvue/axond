@@ -132,6 +132,7 @@ jobs:
           mapfile -t pins < <(grep -E '^[A-Za-z0-9_.-]+==' tests/compat/requirements.in || true)
           ((${#pins[@]} > 0)) || { echo "no direct pins found" >&2; exit 1; }
           for pin in "${pins[@]}"; do
+            # shellcheck disable=SC2016 # sed expression is intentionally literal
             escaped_pin="$(printf '%s' "$pin" | sed 's/[.[\*^$()+?{|\\]/\\&/g')"
             grep -Eq "^${escaped_pin}([[:space:];\\]|$)" tests/compat/requirements.txt || {
               echo "missing direct pin in lockfile: $pin" >&2
@@ -155,6 +156,13 @@ jobs:
       - name: Documentation links, drift, routes, and deployment manifests
         run: |
           python3 ops/check-docs.py
+          shellcheck install.sh
+          AXOND_VERSION=0.0.0 \
+            AXOND_TARGET=x86_64-unknown-linux-musl \
+            AXOND_INSTALL_DRY_RUN=1 \
+            sh install.sh | grep -F 'axond-0.0.0-x86_64-unknown-linux-musl.tar.gz'
+          pwsh -NoProfile -File ./install.ps1 \
+            -Version 0.0.0 -Target x86_64-pc-windows-msvc -DryRun
           docker compose --env-file ops/compose/env.example config --quiet
           docker compose --env-file ops/compose/env.example \
             -f docker-compose.yml -f docker-compose.build.yml config --quiet
