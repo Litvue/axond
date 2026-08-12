@@ -104,11 +104,13 @@ cooldown_seconds = 30
 # refused (`upstream_body_too_large`); an oversized ERROR body is truncated
 # instead, so the provider's own status still reaches the caller.
 #
-# Keep the header and body bounds TIGHTER than `failover.overall_timeout_ms`.
-# A phase bound the walk budget can never reach reports every stall as `overall`,
-# which is the gateway's own budget rather than the target's fault, so a target
-# that black-holes requests would never trip its circuit. The gateway warns at
-# boot when that relationship is inverted.
+# The header and body defaults are NOT tighter than the walk budget, on purpose:
+# a non-streamed call gets no headers until the whole completion exists, so those
+# two bounds are the model's thinking time rather than a liveness signal, and a
+# tighter one would refuse answers the walk still had time for. Whichever bound
+# ends a wait, the error names the phase that stalled, so a target that accepts
+# requests and answers nothing still trips its own circuit. Tighten them below
+# the walk budget only to cap a single attempt so later targets get a turn.
 #
 # Every value must be >= 1: zero is not "unbounded", it is a gateway that cannot
 # call anything. `connect_timeout_ms` configures the shared pooled HTTP client,
@@ -116,8 +118,8 @@ cooldown_seconds = 30
 
 [transport]
 connect_timeout_ms = 5000
-response_header_timeout_ms = 10000
-buffered_body_timeout_ms = 15000
+response_header_timeout_ms = 30000
+buffered_body_timeout_ms = 30000
 stream_idle_timeout_ms = 120000
 max_response_bytes = 33554432
 max_error_bytes = 65536

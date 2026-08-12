@@ -61,6 +61,33 @@ stream_idle_timeout_ms = 5000
 const GENEROUS: Duration = Duration::from_secs(10);
 
 #[tokio::test]
+async fn a_slow_completion_is_answered_rather_than_cut_off_by_the_header_bound() {
+    // The shipped `[transport]` defaults, deliberately: a non-streamed provider
+    // call sends no headers until the completion exists, so a header bound below
+    // the walk budget would refuse answers the walk still had time for.
+    let (_upstream, gateway) = boot_with(support::gateway::DEFAULT_TUNING).await;
+    let (elapsed, response) = timed_chat(&gateway, alias::CHAT_LATE_HEADERS, false).await;
+
+    assert_eq!(
+        response.status(),
+        200,
+        "a slow completion must be served: {}",
+        gateway.output()
+    );
+    let body: Value = response.json().await.expect("a JSON body");
+    assert!(
+        body["choices"][0]["message"]["content"].is_string(),
+        "{body}"
+    );
+    assert!(
+        elapsed < GENEROUS,
+        "the upstream answered but the gateway took too long: {elapsed:?}"
+    );
+
+    assert_settled_once(&gateway, "ok").await;
+}
+
+#[tokio::test]
 async fn an_upstream_that_never_sends_headers_ends_on_the_header_bound() {
     let (upstream, gateway) = boot_with(BOUNDS).await;
     let (elapsed, response) = timed_chat(&gateway, alias::CHAT_NO_HEADERS, false).await;
@@ -94,12 +121,17 @@ async fn an_active_attempt_cannot_outlive_the_overall_deadline() {
     assert_eq!(response.status(), 504);
     let body: Value = response.json().await.expect("a JSON body");
     assert_eq!(body["error"]["type"], "upstream_timeout");
+    let message = body["error"]["message"].as_str().expect("a message");
     assert!(
-        body["error"]["message"]
-            .as_str()
-            .expect("a message")
-            .contains("failover budget"),
+        message.contains("failover budget"),
         "the overall deadline must be the verdict: {body}"
+    );
+    // The phase is still named: a target that accepts a request and answers
+    // nothing is the target's failure, whichever bound ran out first, and only
+    // that distinction lets its circuit ever open.
+    assert!(
+        message.contains("response headers"),
+        "the stalled phase must still be named: {body}"
     );
     assert_discreet(&body.to_string(), &upstream);
     assert!(

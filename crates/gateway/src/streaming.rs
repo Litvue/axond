@@ -473,6 +473,9 @@ impl Relay {
                         &self.accounting.ctx.target_provider,
                         &self.accounting.ctx.target_model,
                         kind.label(),
+                        err.timeout_bound()
+                            .map(gateway_transport::TimeoutBound::label)
+                            .unwrap_or_default(),
                     );
                     tracing::warn!(
                         provider = %self.accounting.ctx.target_provider,

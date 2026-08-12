@@ -102,8 +102,8 @@ impl Default for TransportLimits {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_millis(5_000),
-            response_header_timeout: Duration::from_millis(10_000),
-            buffered_body_timeout: Duration::from_millis(15_000),
+            response_header_timeout: Duration::from_millis(30_000),
+            buffered_body_timeout: Duration::from_millis(30_000),
             stream_idle_timeout: Duration::from_millis(120_000),
             max_response_bytes: 32 * 1024 * 1024,
             max_error_bytes: 64 * 1024,
@@ -147,17 +147,24 @@ impl Deadline {
     }
 }
 
-/// Which bound a call exceeded. Distinct values because they mean different
-/// things to an operator: a connect timeout is egress or DNS, no headers is an
-/// overloaded provider, a stalled stream is a half-dead socket, and the overall
-/// bound is the gateway's own failover budget being spent.
+/// Which phase of a call ran out of time. Distinct values because they mean
+/// different things to an operator: a connect timeout is egress or DNS, no
+/// headers is an overloaded provider, a stalled stream is a half-dead socket.
+///
+/// The phase is reported independently of [`TimeoutBound`], which says *whose*
+/// bound elapsed. A stalled phase is always named, even when the walk's
+/// remaining budget rather than the phase's own bound is what cut it off —
+/// otherwise a target that goes silent late in a walk would be indistinguishable
+/// from the gateway giving up before dispatching anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeoutKind {
     Connect,
     ResponseHeaders,
     BufferedBody,
     StreamIdle,
-    /// The caller's overall deadline, which outranks every per-phase bound.
+    /// No phase ran: the walk's budget was already spent, so nothing was
+    /// dispatched. This is the gateway's own bound and says nothing about a
+    /// target.
     Overall,
 }
 
@@ -184,25 +191,75 @@ impl TimeoutKind {
     }
 }
 
+/// Whose bound produced the budget a phase waited out. Orthogonal to
+/// [`TimeoutKind`]: the phase says *what* was waiting, this says *why* the wait
+/// ended, and only the latter decides whether the gateway is looking at its own
+/// exhausted budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutBound {
+    /// The phase's own configured `[transport]` bound.
+    Phase,
+    /// What was left of the walk's overall deadline, which was tighter than the
+    /// phase bound.
+    WalkBudget,
+}
+
+impl TimeoutBound {
+    /// Stable, low-cardinality label for telemetry.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Phase => "phase",
+            Self::WalkBudget => "walk_budget",
+        }
+    }
+}
+
+fn timeout_message(kind: TimeoutKind, bound: TimeoutBound, budget_ms: u64) -> String {
+    match (kind, bound) {
+        (TimeoutKind::Overall, _) => {
+            "the request's failover budget was spent before this attempt was dispatched".to_owned()
+        }
+        (kind, TimeoutBound::WalkBudget) => format!(
+            "{} exceeded the {budget_ms}ms left of the request's failover budget",
+            kind.phase()
+        ),
+        (kind, TimeoutBound::Phase) => {
+            format!("{} exceeded its {budget_ms}ms bound", kind.phase())
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
     #[error("transport: {0}")]
     Http(String),
-    /// A bound was exceeded. The message names the phase and the budget, never
-    /// the upstream URL.
-    #[error("transport: {} exceeded its {budget_ms}ms bound", kind.phase())]
-    Timeout { kind: TimeoutKind, budget_ms: u64 },
+    /// A bound was exceeded. The message names the phase, whose bound it was,
+    /// and the budget — never the upstream URL.
+    #[error("transport: {}", timeout_message(*kind, *bound, *budget_ms))]
+    Timeout {
+        kind: TimeoutKind,
+        bound: TimeoutBound,
+        budget_ms: u64,
+    },
     #[error("transport: provider response body exceeded its {limit_bytes}-byte bound")]
     BodyTooLarge { limit_bytes: u64 },
 }
 
 impl TransportError {
-    /// The bound this failure exceeded, when it is a timeout.
+    /// The phase that ran out of time, when this failure is a timeout.
     pub fn timeout_kind(&self) -> Option<TimeoutKind> {
         match self {
             Self::Timeout { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// Whose bound ended that phase, when this failure is a timeout.
+    pub fn timeout_bound(&self) -> Option<TimeoutBound> {
+        match self {
+            Self::Timeout { bound, .. } => Some(*bound),
             _ => None,
         }
     }
@@ -235,6 +292,7 @@ fn classify(e: &reqwest::Error, limits: &TransportLimits) -> TransportError {
     if e.is_timeout() {
         return TransportError::Timeout {
             kind: TimeoutKind::Connect,
+            bound: TimeoutBound::Phase,
             budget_ms: limits.connect_timeout.as_millis() as u64,
         };
     }
@@ -267,20 +325,22 @@ impl HttpDispatcher {
 
     /// The budget for one phase: its own bound, or what is left of the caller's
     /// overall deadline when that is tighter. A spent deadline is a failure
-    /// before any socket work, since dispatching could only overrun it.
+    /// before any socket work, since dispatching could only overrun it — the one
+    /// case where no phase ever waited and [`TimeoutKind::Overall`] is the whole
+    /// story.
     fn budget(
         &self,
         own: Duration,
-        kind: TimeoutKind,
         deadline: Deadline,
-    ) -> Result<(Duration, TimeoutKind), TransportError> {
+    ) -> Result<(Duration, TimeoutBound), TransportError> {
         match deadline.remaining() {
             Some(remaining) if remaining.is_zero() => Err(TransportError::Timeout {
                 kind: TimeoutKind::Overall,
+                bound: TimeoutBound::WalkBudget,
                 budget_ms: 0,
             }),
-            Some(remaining) if remaining < own => Ok((remaining, TimeoutKind::Overall)),
-            _ => Ok((own, kind)),
+            Some(remaining) if remaining < own => Ok((remaining, TimeoutBound::WalkBudget)),
+            _ => Ok((own, TimeoutBound::Phase)),
         }
     }
 
@@ -291,16 +351,13 @@ impl HttpDispatcher {
         req: reqwest::RequestBuilder,
         deadline: Deadline,
     ) -> Result<reqwest::Response, TransportError> {
-        let (budget, kind) = self.budget(
-            self.limits.response_header_timeout,
-            TimeoutKind::ResponseHeaders,
-            deadline,
-        )?;
+        let (budget, bound) = self.budget(self.limits.response_header_timeout, deadline)?;
         match tokio::time::timeout(budget, req.send()).await {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(e)) => Err(classify(&e, &self.limits)),
             Err(_) => Err(TransportError::Timeout {
-                kind,
+                kind: TimeoutKind::ResponseHeaders,
+                bound,
                 budget_ms: budget.as_millis() as u64,
             }),
         }
@@ -314,16 +371,13 @@ impl HttpDispatcher {
         resp: reqwest::Response,
         deadline: Deadline,
     ) -> Result<String, TransportError> {
-        let (budget, kind) = self.budget(
-            self.limits.buffered_body_timeout,
-            TimeoutKind::BufferedBody,
-            deadline,
-        )?;
+        let (budget, bound) = self.budget(self.limits.buffered_body_timeout, deadline)?;
         let limit = self.limits.max_response_bytes;
         match tokio::time::timeout(budget, read_bounded(resp, limit)).await {
             Ok(result) => result,
             Err(_) => Err(TransportError::Timeout {
-                kind,
+                kind: TimeoutKind::BufferedBody,
+                bound,
                 budget_ms: budget.as_millis() as u64,
             }),
         }
@@ -363,6 +417,7 @@ impl HttpDispatcher {
                     Err(_) => Some((
                         Err(TransportError::Timeout {
                             kind: TimeoutKind::StreamIdle,
+                            bound: TimeoutBound::Phase,
                             budget_ms: idle.as_millis() as u64,
                         }),
                         None,
@@ -634,36 +689,65 @@ mod tests {
         let dispatcher = HttpDispatcher::with_limits(reqwest::Client::new(), limits);
         let phase = limits.response_header_timeout;
 
-        let (budget, kind) = dispatcher
-            .budget(phase, TimeoutKind::ResponseHeaders, Deadline::unbounded())
+        let (budget, bound) = dispatcher
+            .budget(phase, Deadline::unbounded())
             .expect("an unbounded deadline cannot be spent");
-        assert_eq!((budget, kind), (phase, TimeoutKind::ResponseHeaders));
+        assert_eq!((budget, bound), (phase, TimeoutBound::Phase));
 
-        let (budget, kind) = dispatcher
+        let (budget, bound) = dispatcher
             .budget(
                 phase,
-                TimeoutKind::ResponseHeaders,
                 Deadline::at(Instant::now() + Duration::from_millis(50)),
             )
             .expect("time is left");
-        assert_eq!(kind, TimeoutKind::Overall);
+        assert_eq!(bound, TimeoutBound::WalkBudget);
         assert!(budget <= Duration::from_millis(50), "{budget:?}");
 
-        let (budget, kind) = dispatcher
+        let (budget, bound) = dispatcher
             .budget(
                 phase,
-                TimeoutKind::ResponseHeaders,
                 Deadline::at(Instant::now() + Duration::from_secs(60)),
             )
             .expect("time is left");
-        assert_eq!((budget, kind), (phase, TimeoutKind::ResponseHeaders));
+        assert_eq!((budget, bound), (phase, TimeoutBound::Phase));
 
         let spent = Deadline::at(Instant::now() - Duration::from_millis(1));
         assert!(spent.is_expired());
         let error = dispatcher
-            .budget(phase, TimeoutKind::ResponseHeaders, spent)
+            .budget(phase, spent)
             .expect_err("a spent deadline cannot dispatch");
         assert_eq!(error.timeout_kind(), Some(TimeoutKind::Overall));
+    }
+
+    /// The phase that stalled is named even when the walk's remaining budget is
+    /// what cut it off. Only the two together say whether a target went silent
+    /// or the gateway ran out of budget, and the caller of
+    /// [`TransportError::timeout_kind`] decides target health on that basis.
+    #[test]
+    fn a_walk_bounded_wait_still_names_the_phase_that_stalled() {
+        let error = TransportError::Timeout {
+            kind: TimeoutKind::ResponseHeaders,
+            bound: TimeoutBound::WalkBudget,
+            budget_ms: 40,
+        };
+
+        assert_eq!(error.timeout_kind(), Some(TimeoutKind::ResponseHeaders));
+        assert_eq!(error.timeout_bound(), Some(TimeoutBound::WalkBudget));
+        let message = error.to_string();
+        assert!(message.contains("response headers"), "{message}");
+        assert!(message.contains("failover budget"), "{message}");
+
+        // Nothing was dispatched, so no phase can be named.
+        let unattempted = TransportError::Timeout {
+            kind: TimeoutKind::Overall,
+            bound: TimeoutBound::WalkBudget,
+            budget_ms: 0,
+        };
+        assert_eq!(unattempted.timeout_kind(), Some(TimeoutKind::Overall));
+        assert!(
+            unattempted.to_string().contains("before this attempt"),
+            "{unattempted}"
+        );
     }
 
     /// A timeout is the gateway's own verdict, so its message names the phase
@@ -675,10 +759,10 @@ mod tests {
             (TimeoutKind::ResponseHeaders, "response headers"),
             (TimeoutKind::BufferedBody, "response body"),
             (TimeoutKind::StreamIdle, "stream chunk"),
-            (TimeoutKind::Overall, "failover budget"),
         ] {
             let message = TransportError::Timeout {
                 kind,
+                bound: TimeoutBound::Phase,
                 budget_ms: 250,
             }
             .to_string();

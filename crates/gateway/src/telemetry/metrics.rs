@@ -232,10 +232,17 @@ pub(super) fn record_request(record: &UsageRecord, ttft_ms: Option<u64>) {
     }
 }
 
-/// One upstream attempt that exceeded a transport bound. `phase` is the bound
-/// that was hit ([`gateway_transport::TimeoutKind::label`]), which is what
-/// separates "the provider is slow" from "our own failover budget ran out".
-pub fn record_upstream_timeout(target_provider: &str, target_model: &str, phase: &'static str) {
+/// One upstream attempt that exceeded a transport bound. `phase` is what was
+/// waiting ([`gateway_transport::TimeoutKind::label`]) and `bound` whether the
+/// phase's own bound or what was left of the failover budget ended the wait
+/// ([`gateway_transport::TimeoutBound::label`]) — together, what separates "the
+/// provider is slow" from "our own failover budget ran out".
+pub fn record_upstream_timeout(
+    target_provider: &str,
+    target_model: &str,
+    phase: &'static str,
+    bound: &'static str,
+) {
     let Some(instruments) = INSTRUMENTS.get() else {
         return;
     };
@@ -245,6 +252,7 @@ pub fn record_upstream_timeout(target_provider: &str, target_model: &str, phase:
             KeyValue::new("axond.target.provider", target_provider.to_owned()),
             KeyValue::new("axond.target.model", target_model.to_owned()),
             KeyValue::new("axond.timeout", phase),
+            KeyValue::new("axond.timeout.bound", bound),
         ],
     );
 }

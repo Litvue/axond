@@ -64,21 +64,29 @@ Timeouts and body-limit refusals are typed (`Connect`, `ResponseHeaders`,
 `BufferedBody`, `StreamIdle`, `Overall`, and oversized body), surface as
 `504 upstream_timeout` and `502 upstream_body_too_large`, and are attributed on
 the attempt span and the `axond.upstream.timeouts` metric by phase label only —
-never a provider URL or credential. A spent overall deadline is the gateway's
-own budget, not evidence about a target, so it is excluded from the target
-circuit breaker in the same way a pool-wide `429` is (ADR 0006); the per-phase
-timeouts remain target-scoped dependency failures.
+never a provider URL or credential.
 
-That split makes the relationship between the phase bounds and the walk budget
-load-bearing rather than cosmetic: a phase bound at or above
-`failover.overall_timeout_ms` can only ever end on the walk budget, so every
-stall would be reported as `overall` and a target that accepts connections and
-then answers nothing would never trip its circuit. The shipped defaults are
-therefore strictly tighter than the default walk budget (10s headers, 15s
-buffered body against 30s overall), and an inverted configuration is warned about
-at boot rather than rejected, because a deliberately tight walk budget is a
-legitimate choice and the phase bounds still cap a call that starts with a full
-budget.
+The phase that stalled and the bound that ended the wait are separate facts, so
+they are recorded separately: the phase stays `response_headers` (or
+`buffered_body`, …) even when what ran out was the walk's remaining time, and
+`axond.timeout.bound` says whether it was the `phase` bound or the
+`walk_budget`. `Overall` is reserved for the one timeout no target earned — the
+budget was already spent before an attempt was dispatched, so nothing was
+called — and only that case is excluded from the target circuit breaker, in the
+same way a pool-wide `429` is (ADR 0006). A target that accepted a request and
+produced nothing in the time it was given *is* evidence about the target, whether
+that time came from its phase bound or from what was left of the walk, so it
+counts. Blaming the gateway's budget for a late-in-the-walk stall would keep a
+black-holing target's breaker closed forever.
+
+That separation is what makes the defaults safe to set generously where they must
+be. A non-streamed provider call sends no headers until the whole completion
+exists, so `response_header_timeout_ms` and `buffered_body_timeout_ms` bound the
+model's thinking time rather than liveness; the shipped 30s defaults are not
+tighter than the default 30s walk budget, because a tighter one would refuse
+answers the walk still had time for, and `failover.overall_timeout_ms` keeps them
+finite in practice. Only `stream_idle_timeout_ms` is a true liveness bound, since
+it is the only one that applies while output is already flowing.
 
 ### State tier
 

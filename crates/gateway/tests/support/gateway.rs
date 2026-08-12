@@ -28,6 +28,7 @@ pub const ANTHROPIC_KEY: &str = "test-upstream-anthropic-key";
 pub mod alias {
     pub const CHAT: &str = "chat-golden";
     pub const CHAT_NO_HEADERS: &str = "chat-no-headers";
+    pub const CHAT_LATE_HEADERS: &str = "chat-late-headers";
     pub const CHAT_SLOW_BODY: &str = "chat-slow-body";
     pub const CHAT_HUGE_BODY: &str = "chat-huge-body";
     pub const CHAT_HUGE_ERROR: &str = "chat-huge-error";
@@ -275,9 +276,14 @@ namespace = "platform"
 
 {tuning}
 
-{chat}{chat_no_headers}{chat_slow_body}{chat_huge_body}{chat_huge_error}{chat_stall}{chat_stall_after_bytes}{chat_long}{chat_slow}{chat_drop}{chat_fail}{messages}{messages_slow}{messages_drop}{embeddings}{responses}"#,
+{chat}{chat_no_headers}{chat_late_headers}{chat_slow_body}{chat_huge_body}{chat_huge_error}{chat_stall}{chat_stall_after_bytes}{chat_long}{chat_slow}{chat_drop}{chat_fail}{messages}{messages_slow}{messages_drop}{embeddings}{responses}"#,
         chat = model(alias::CHAT, "fake-openai", target::CHAT),
         chat_no_headers = model(alias::CHAT_NO_HEADERS, "fake-openai", target::NO_HEADERS),
+        chat_late_headers = model(
+            alias::CHAT_LATE_HEADERS,
+            "fake-openai",
+            target::LATE_HEADERS
+        ),
         chat_slow_body = model(alias::CHAT_SLOW_BODY, "fake-openai", target::SLOW_BODY),
         chat_huge_body = model(alias::CHAT_HUGE_BODY, "fake-openai", target::HUGE_BODY),
         chat_huge_error = model(alias::CHAT_HUGE_ERROR, "fake-openai", target::HUGE_ERROR),

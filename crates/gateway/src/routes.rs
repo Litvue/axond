@@ -39,7 +39,9 @@ use gateway_core::{
     NativeMessagesDecoder, ProviderError, ProviderRequest, ProviderResponse, ProviderStreamDecoder,
     Surface, Usage,
 };
-use gateway_transport::{AuthScheme, Deadline, NativeCall, TimeoutKind, TransportError, Upstream};
+use gateway_transport::{
+    AuthScheme, Deadline, NativeCall, TimeoutBound, TimeoutKind, TransportError, Upstream,
+};
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -1799,11 +1801,22 @@ fn auth_scheme(kind: ProviderKind) -> AuthScheme {
 /// transport has already kept out of the error.
 fn note_attempt_timeout(span: &tracing::Span, target: &Target, err: &TransportError) {
     if let Some(kind) = err.timeout_kind() {
-        telemetry::record_attempt_timeout(span, &target.provider, &target.model, kind.label());
+        let bound = err
+            .timeout_bound()
+            .map(TimeoutBound::label)
+            .unwrap_or_default();
+        telemetry::record_attempt_timeout(
+            span,
+            &target.provider,
+            &target.model,
+            kind.label(),
+            bound,
+        );
         warn!(
             provider = %target.provider,
             model = %target.model,
             timeout = kind.label(),
+            timeout_bound = bound,
             "upstream attempt exceeded a transport bound"
         );
     }
@@ -1821,8 +1834,9 @@ fn record_target_success(snapshot: &ConfigSnapshot, target: &Target, circuit_key
 /// A target failure trips its circuit only when it reflects on the *target*'s
 /// health. A `429` that exhausted the pool is credential-scoped (ADR 0006) and a
 /// `404` names a missing deployment, not an unhealthy target — both fail over
-/// without opening the target's breaker. A spent failover budget is the
-/// gateway's own bound and belongs in the same category.
+/// without opening the target's breaker. A walk budget spent before this target
+/// was ever dispatched to belongs in the same category; a target that was given
+/// time and stalled does not, however short that time was.
 fn record_target_failure(
     snapshot: &ConfigSnapshot,
     target: &Target,
@@ -1831,7 +1845,7 @@ fn record_target_failure(
 ) {
     if as_provider_error(err).affects_provider_health()
         && !is_credential_exhausted(err)
-        && !is_own_budget_spent(err)
+        && !was_never_dispatched(err)
     {
         snapshot.target_circuits.record_failure(circuit_key);
         telemetry::metrics::record_circuit_state(
@@ -1988,11 +2002,17 @@ fn is_credential_exhausted(err: &TransportError) -> bool {
     matches!(err, TransportError::Provider(error) if error.is_credential_rate_limited())
 }
 
-/// An attempt cut short by `failover.overall_timeout_ms` reports the gateway's
-/// own budget, not the target's health: the remaining budget can be a
-/// millisecond because *earlier* targets spent the walk. Parking a target for
-/// that would let one slow target take a healthy one out of rotation.
-fn is_own_budget_spent(err: &TransportError) -> bool {
+/// `TimeoutKind::Overall` is the one timeout no target earned: the walk's budget
+/// was already spent, so nothing was dispatched and there is no evidence about
+/// this target to record. Parking a target the gateway never called would let
+/// one slow target take healthy ones out of rotation.
+///
+/// Every other timeout names the phase that stalled — including one cut short by
+/// what was left of `failover.overall_timeout_ms` — because a target that
+/// accepted a request and produced nothing in the time it was given *is*
+/// evidence, and treating a late-in-the-walk stall as the gateway's own problem
+/// would keep a black-holing target's breaker closed forever.
+fn was_never_dispatched(err: &TransportError) -> bool {
     err.timeout_kind() == Some(TimeoutKind::Overall)
 }
 
@@ -2128,29 +2148,39 @@ namespace = "platform"
             .collect()
     }
 
-    /// A phase bound is the target's problem; the walk's own spent budget is
-    /// not, so a target slow enough to exhaust it must not park a healthy one.
+    /// A stall is the target's problem whichever bound ended the wait; only a
+    /// budget spent before dispatch is the gateway's, because then no target was
+    /// asked anything.
     #[test]
-    fn a_spent_failover_budget_does_not_reflect_on_a_target() {
+    fn a_stalled_target_is_recorded_even_when_the_walk_budget_ended_the_wait() {
         for kind in [
             TimeoutKind::Connect,
             TimeoutKind::ResponseHeaders,
             TimeoutKind::BufferedBody,
             TimeoutKind::StreamIdle,
         ] {
-            let err = TransportError::Timeout {
-                kind,
-                budget_ms: 100,
-            };
-            assert!(as_provider_error(&err).affects_provider_health());
-            assert!(!is_own_budget_spent(&err), "{}", kind.label());
+            for bound in [TimeoutBound::Phase, TimeoutBound::WalkBudget] {
+                let err = TransportError::Timeout {
+                    kind,
+                    bound,
+                    budget_ms: 100,
+                };
+                assert!(as_provider_error(&err).affects_provider_health());
+                assert!(
+                    !was_never_dispatched(&err),
+                    "{} on {}",
+                    kind.label(),
+                    bound.label()
+                );
+            }
         }
 
-        let spent = TransportError::Timeout {
+        let unattempted = TransportError::Timeout {
             kind: TimeoutKind::Overall,
+            bound: TimeoutBound::WalkBudget,
             budget_ms: 0,
         };
-        assert!(is_own_budget_spent(&spent));
+        assert!(was_never_dispatched(&unattempted));
     }
 
     /// A JSON `POST` that already carries the caller's gateway key.

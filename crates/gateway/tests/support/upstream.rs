@@ -42,6 +42,9 @@ pub mod target {
     pub const FAIL: &str = "fail-500";
     /// Accepts the request and never sends response headers.
     pub const NO_HEADERS: &str = "no-headers";
+    /// Thinks for a while and *then* answers, like a non-streamed completion:
+    /// no headers arrive until the whole answer exists.
+    pub const LATE_HEADERS: &str = "late-headers";
     /// Sends `200` headers immediately, then never finishes the body.
     pub const SLOW_BODY: &str = "slow-body";
     /// A buffered `200` body far larger than a test's byte bound.
@@ -60,6 +63,10 @@ pub mod target {
 /// Long enough that the bound under test always fires first, short enough that
 /// a leaked task cannot outlive the suite.
 const FOREVER: Duration = Duration::from_secs(60);
+
+/// How long [`target::LATE_HEADERS`] withholds its answer. Long enough that a
+/// header bound tightened below it would fail the request.
+const THINKING: Duration = Duration::from_millis(2_000);
 
 /// Filler bytes in the oversized bodies: well above the byte bounds the
 /// transport suite configures, cheap enough to build per request.
@@ -293,6 +300,17 @@ async fn handle(
         target::NO_HEADERS => {
             tokio::time::sleep(FOREVER).await;
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        // A slow *successful* completion: the answer is worth waiting for, and
+        // the header bound must not be what decides it is not.
+        target::LATE_HEADERS => {
+            tokio::time::sleep(THINKING).await;
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                state.fixtures.get("openai/chat_completion.json"),
+            )
+                .into_response()
         }
         // Headers land at once, so only a body bound ends this.
         target::SLOW_BODY => {

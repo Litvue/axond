@@ -120,15 +120,21 @@ the diagnosis:
 | `response_headers` | Time to first byte after dispatch | An overloaded provider or a queued request; long-thinking models legitimately need a wider bound. |
 | `buffered_body` | The rest of a non-streamed body | A provider trickling a large completion. Consider streaming instead. |
 | `stream_idle` | The next chunk of an **open** stream | A half-dead connection or a provider that stopped mid-answer. |
-| `overall` | Any pre-response phase | `failover.overall_timeout_ms` cancelled the in-flight attempt; the walk had no time left. |
+| `overall` | Nothing — no attempt was dispatched | `failover.overall_timeout_ms` was already spent when the walk reached this target. |
 
-If a target that black-holes requests is never taken out of rotation, check that
-`transport.response_header_timeout_ms` and `transport.buffered_body_timeout_ms`
-are still **tighter** than `failover.overall_timeout_ms`. Only the per-phase
-timeouts count against a target's circuit; `overall` is the gateway's own spent
-budget, so a phase bound the walk budget can never reach reports every stall as
-`overall` and leaves the target's circuit closed. The gateway logs a warning at
-boot when that relationship is inverted.
+`axond.timeout.bound` says which bound ended the wait: `phase` for the
+`[transport]` bound, `walk_budget` for what was left of
+`failover.overall_timeout_ms`. A run of `walk_budget` on `response_headers` means
+attempts are being cut short by the walk rather than by the phase bound — widen
+`failover.overall_timeout_ms` or expect fewer targets per walk. The phase is still
+blamed on the target in that case, so a black-holing target does trip its circuit;
+only `overall`, where no target was called at all, is excluded from target health.
+
+Remember that `response_header_timeout_ms` and `buffered_body_timeout_ms` cover a
+non-streamed model's whole thinking time, since no headers arrive until the
+completion exists. Tightening them below `failover.overall_timeout_ms` caps a
+single attempt so later targets get a turn; it also refuses slow completions the
+walk still had time for.
 
 Two consequences are deliberate and not bugs:
 
