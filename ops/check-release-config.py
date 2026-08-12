@@ -192,6 +192,35 @@ def check_image_matrix(text: str) -> list[str]:
             "ops/publish-image-index.sh: PLATFORMS "
             f"{sorted(declared.group(1).split())} does not match {sorted(IMAGE_PLATFORMS)}"
         )
+    # Promotion must retag the smoked digest instead of reassembling the index
+    # from the child tags: a tag, once applied, cannot be retracted by the
+    # assertion that follows it. ops/check-index-promotion.sh proves the ordering
+    # against a stubbed registry; this keeps the shape of it in place.
+    if 'apply_tags "${IMAGE_NAME}@${index_digest}"' not in script:
+        failures.append(
+            "ops/publish-image-index.sh: promotion does not retag the expected "
+            "index digest itself, so it can publish an operator-facing tag before "
+            "the digest is checked"
+        )
+    promotion = script.partition('if [[ -n "${EXPECT_INDEX_DIGEST:-}" ]]; then')[2]
+    promotion = promotion.partition("\nelse\n")[0]
+    if not promotion:
+        failures.append("ops/publish-image-index.sh: no promotion branch found")
+    else:
+        assertion = promotion.find('assert_index_contents "$index_digest"')
+        tagging = promotion.find("apply_tags ")
+        if assertion < 0 or tagging < 0 or assertion > tagging:
+            failures.append(
+                "ops/publish-image-index.sh: promotion applies tags before "
+                "asserting the index contents; a registry tag cannot be retracted "
+                "by a later failure"
+            )
+    if "${child_refs[@]}" in promotion:
+        failures.append(
+            "ops/publish-image-index.sh: promotion reassembles the index from the "
+            "child references; if a child tag moved since staging, the release "
+            "tags would point at an index no smoke lane booted"
+        )
     # Descriptors without a platform must be classified, not skipped: an ignored
     # descriptor is an unreviewed manifest inside the deployed reference.
     for label, needle in {
