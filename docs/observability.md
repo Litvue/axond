@@ -121,6 +121,13 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | `503` | `all_provider_circuits_open` | Every target for the alias has a tripped circuit. | The upstreams are down or the thresholds are too tight; check `axond.upstream.circuit_state`. |
 | `502` | `no_credential` | The namespace has no credential for the resolved provider and no platform fallback. | Add a `[[credential]]`, or set `allow_platform_fallback` deliberately. |
 | `502` | `upstream_transport`, `provider_dependency_failed`, `model_unavailable`, `invalid_stream` | The upstream failed after the failover walk was exhausted. | Check the provider's status and the attempt spans; `attempts` on the usage record says how hard the gateway tried. |
+| `503` | `continuation_affinity_unavailable` | A request carrying `previous_response_id` could not use the alias's pinned first target or credential, and continuity forbids substituting another. | Restore the first target/credential; retry later. An *initial* Responses request in the same state reports the ordinary error above instead. |
+
+`/v1/responses` records exactly one upstream attempt per request: it is pinned to
+the alias's first target and first credential whether or not it continues a
+stored response, so `attempts` is always `1` and no rotation lease appears
+([ADR 0023](./adr/0023-openai-responses-passthrough.md)). A Responses request
+failing while chat on the same alias succeeds is that pin, not a routing bug.
 
 Mid-stream failures are different by construction. Native passthrough streams
 and OpenAI-normalized streams that have already queued downstream bytes remain

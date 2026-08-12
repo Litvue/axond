@@ -93,6 +93,13 @@ Each target:
 Pricing is mandatory because budgets are denominated in currency: an unpriced
 target could not be charged, so it fails to parse.
 
+`/v1/responses` does not use the target order at all: every Responses request,
+initial or continuation, is served only by the **first** target so a
+provider-stored response id stays reachable without gateway state. An alias
+whose first target is low-availability is a poor Responses alias, and reordering
+`targets` strands response ids created under the previous order
+([ADR 0023](./adr/0023-openai-responses-passthrough.md)).
+
 An alias cannot fail over between OpenAI-shaped and Anthropic targets because no
 single route can serve both wires. Such a cross-family alias is rejected at boot
 and on reload; a request that uses an alias from one family on the wrong route
@@ -133,6 +140,10 @@ credential.
 | `failure_threshold` | integer | `2` | Consecutive credential-scoped failures (429 / quota) that park one credential. Must be ≥ 1. |
 | `cooldown_seconds` | integer | `30` | How long a parked credential waits before a single half-open probe. Must be ≥ 1. |
 
+`/v1/responses` is exempt: every Responses request uses the **first** configured
+credential of the pool regardless of `strategy` or parked state, because a
+response id is scoped to the key that created it (ADR 0023).
+
 Parking is per credential, never per target: a rate-limited key is skipped while
 the same target keeps serving every other key. This applies to streamed opens;
 an OpenAI-normalized stream can rotate on an explicit rate-limit event before
@@ -149,6 +160,10 @@ The outer loop around pool dispatch: an alias's targets, in order
 | `overall_timeout_ms` | integer | `30000` | Wall-clock budget for the whole walk. No further target is attempted once spent. Must be ≥ 1. |
 | `failure_threshold` | integer | `3` | Consecutive target-scoped failures that trip a target's circuit. Distinct from the credential threshold. Must be ≥ 1. |
 | `cooldown_seconds` | integer | `30` | How long a tripped target is skipped before a half-open probe. Must be ≥ 1. |
+
+`max_attempts` does not apply to `/v1/responses`, which always attempts exactly
+one target. Its circuit is still recorded and observed: a tripped first target
+makes Responses requests fail rather than move on.
 
 Circuits are in-memory and per replica, consistent with running stateless
 ([ADR 0002](./adr/0002-stateless-by-default-stateful-by-opt-in.md)).
