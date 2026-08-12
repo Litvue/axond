@@ -128,29 +128,39 @@ ledger row for DDL it did not run:
   disagrees with this build — adoption reconciles an unrecorded history and never
   repairs a recorded one. A ledger that already records a history is reported and
   left alone, so `adopt` is idempotent and a stray one in a rollout is not an edit.
-- **It records only what the database accounts for.** The baseline is the longest
-  run of shipped migrations from v1 whose every declared table is present, read
-  from each migration's own embedded SQL rather than from a hand-maintained list
-  — so a migration that adds a table cannot ship without adoption looking for it.
-  No object present is a refusal (nothing was applied: drop the ledger and
-  `apply`); a partly-present migration is a refusal naming the missing tables
-  (neither applied nor unapplied is true). The probe is qualified to
-  `current_schema()` — the schema an `apply` would create these tables in — rather
+- **It records only what the database accounts for, statement by statement.** The
+  baseline is the longest run of shipped migrations from v1 whose *every* statement
+  is confirmed, parsed from each migration's own embedded SQL rather than from a
+  hand-maintained list — so a statement cannot ship without adoption accounting for
+  it. Three statement forms are confirmable: `CREATE TABLE` and `CREATE INDEX` by
+  the relation being present, and `INSERT ... ON CONFLICT DO NOTHING` by the target
+  table not being empty (idempotent by construction, which is what makes a row
+  usable as evidence). Nothing confirmed is a refusal (nothing was applied: drop the
+  ledger and `apply`); a partly-confirmed migration is a refusal naming what is
+  missing (neither applied nor unapplied is true). Every probe is qualified to
+  `current_schema()` — the schema an `apply` would create these objects in — rather
   than resolved down the DSN's `search_path`, so a second install's journal in
   `public` is not read as evidence about this one.
-- **A migration that declares no table blocks adoption of the database entirely,**
-  wherever in the shipped history it sits, including the versions below it. That is
-  fail-closed on purpose, and it is the position this decision commits to: adopting
-  only the prefix underneath would leave the ledger reporting the unobservable
-  version as *pending*, so the next `apply` would run it — over a schema that may
-  already have had it applied out of band. An `ALTER`-only or backfill migration is
-  both the one whose effect the catalogue cannot report *and* the one whose rerun is
-  destructive, so there is no ledger row that accounts for the objects and also
-  keeps `apply` away from it. Shipping such a migration therefore withdraws `adopt`,
-  and stating that history stays the operator's own `INSERT`; the refusal says so.
-  A shipped migration that declares no table is asserted against in
-  `a_migrations_declared_tables_are_read_out_of_the_shipped_ddl`, so this arrives as
-  a deliberate release decision rather than a surprise in the field.
+- **A migration containing one statement adoption cannot confirm blocks adoption of
+  the database entirely,** wherever in the shipped history it sits, including the
+  versions below it. That is fail-closed in both directions, and it is the position
+  this decision commits to. Recording such a version on the strength of the objects
+  it *does* create would launder a guess: a `psql -f` outside a transaction can
+  abort between a file's `CREATE TABLE x` and its following `ALTER TABLE y`, leaving
+  precisely the catalogue a table-only check would call applied, and `apply` would
+  then never run the remainder. Recording only the prefix underneath is no better:
+  the ledger would report the unconfirmable version as *pending*, so the next
+  `apply` would run it over a schema that may already have had it applied out of
+  band. An `ALTER`, a backfill, a `DROP`, or a non-idempotent `INSERT` is both the
+  statement whose effect nothing can be asked about *and* the one whose rerun is
+  destructive, so no ledger row both accounts for the objects and keeps `apply`
+  away. Shipping such a migration therefore withdraws `adopt`, and stating that
+  history stays the operator's own `INSERT`; the refusal says so, naming the
+  version. `a_migrations_declared_tables_are_read_out_of_the_shipped_ddl` asserts
+  every shipped statement is confirmable, so this arrives as a deliberate release
+  decision rather than a surprise in the field, and
+  `a_statement_whose_effect_cannot_be_confirmed_makes_its_migration_unadoptable`
+  pins the mixed create-and-alter shape specifically.
 - **It executes no migration SQL at all**, which is what makes it safe against a
   database that already has the objects, whether or not the shipped statements are
   idempotent — the property the hand-`INSERT` path shared but the drop-and-replay

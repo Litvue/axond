@@ -49,22 +49,145 @@ impl Migration {
     /// for is derived from the file adoption claims was applied.
     pub fn relations(&self) -> Vec<&'static str> {
         let mut relations = Vec::new();
-        for tail in self.sql.split("CREATE TABLE").skip(1) {
-            let rest = tail.trim_start();
-            let rest = rest
-                .strip_prefix("IF NOT EXISTS")
-                .unwrap_or(rest)
-                .trim_start();
-            let name = rest
-                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
-                .next()
-                .unwrap_or_default();
-            if !name.is_empty() && !relations.contains(&name) {
-                relations.push(name);
+        for statement in statements(self.sql) {
+            if let Some(Statement::Table(name)) = statement_kind(statement) {
+                if !relations.contains(&name) {
+                    relations.push(name);
+                }
             }
         }
         relations
     }
+}
+
+/// What one statement of a migration did, when that is something a later
+/// connection can be asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Statement {
+    Table(&'static str),
+    Index(&'static str),
+    /// An `INSERT ... ON CONFLICT DO NOTHING`: a seed row, whose presence is
+    /// checked by the target table not being empty. Idempotent by construction,
+    /// which is what makes it checkable at all.
+    Seed(&'static str),
+}
+
+/// The migration's text as statements, with comments and string literals ignored
+/// while looking for the separators.
+///
+/// A `;` inside `'...'` is not a statement boundary and `--` starts a comment, so
+/// a plain `split(';')` would both cut statements in half and find keywords in
+/// prose. The slices point into the embedded SQL, so every name parsed out of one
+/// is `'static`.
+fn statements(sql: &'static str) -> Vec<&'static str> {
+    let mut statements = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut commented = false;
+    let bytes = sql.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'\n' if commented => commented = false,
+            _ if commented => {}
+            b'\'' => quoted = !quoted,
+            _ if quoted => {}
+            b'-' if bytes.get(index + 1) == Some(&b'-') => commented = true,
+            b';' => {
+                let statement = sql[start..index].trim();
+                if !statement.is_empty() {
+                    statements.push(statement);
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = sql[start..].trim();
+    if !tail.is_empty() {
+        statements.push(tail);
+    }
+    statements
+}
+
+/// The words of a statement, with comments and string literals skipped.
+fn words(statement: &'static str) -> Vec<&'static str> {
+    let mut words = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut quoted = false;
+    let mut commented = false;
+    let bytes = statement.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        let word = byte.is_ascii_alphanumeric() || *byte == b'_';
+        match byte {
+            b'\n' if commented => commented = false,
+            _ if commented => {}
+            b'\'' => {
+                quoted = !quoted;
+                start = None;
+            }
+            _ if quoted => {}
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                commented = true;
+                start = None;
+            }
+            _ if word => start = start.or(Some(index)),
+            _ => {
+                if let Some(from) = start.take() {
+                    words.push(&statement[from..index]);
+                }
+            }
+        }
+    }
+    if let Some(from) = start {
+        words.push(&statement[from..]);
+    }
+    words
+}
+
+/// What a statement created, or `None` for one whose effect the catalogue cannot
+/// be asked about — an `ALTER`, an `UPDATE`, a backfill, a non-idempotent
+/// `INSERT`, a `DROP`.
+fn statement_kind(statement: &'static str) -> Option<Statement> {
+    let words = words(statement);
+    let keyword = |position: usize, expected: &str| {
+        words
+            .get(position)
+            .is_some_and(|word| word.eq_ignore_ascii_case(expected))
+    };
+    /// Past `IF NOT EXISTS` and `CONCURRENTLY`, to the object's own name.
+    fn name(words: &[&'static str], mut at: usize) -> Option<&'static str> {
+        for skipped in ["CONCURRENTLY", "IF", "NOT", "EXISTS"] {
+            if words
+                .get(at)
+                .is_some_and(|word| word.eq_ignore_ascii_case(skipped))
+            {
+                at += 1;
+            }
+        }
+        words.get(at).copied()
+    }
+    if keyword(0, "CREATE") && keyword(1, "TABLE") {
+        return name(&words, 2).map(Statement::Table);
+    }
+    if keyword(0, "CREATE") && keyword(1, "INDEX") {
+        return name(&words, 2).map(Statement::Index);
+    }
+    if keyword(0, "CREATE") && keyword(1, "UNIQUE") && keyword(2, "INDEX") {
+        return name(&words, 3).map(Statement::Index);
+    }
+    if keyword(0, "INSERT") && keyword(1, "INTO") {
+        // Only the idempotent form: a plain `INSERT` cannot be told apart from
+        // one that never ran, and re-running it would double the rows.
+        let idempotent = words.windows(2).any(|pair| {
+            pair[0].eq_ignore_ascii_case("DO") && pair[1].eq_ignore_ascii_case("NOTHING")
+        });
+        return words
+            .get(2)
+            .copied()
+            .filter(|_| idempotent)
+            .map(Statement::Seed);
+    }
+    None
 }
 
 /// Every migration this build ships, in application order.
@@ -498,98 +621,139 @@ pub enum Baseline {
     Inconsistent { message: String },
 }
 
-/// The tables whose presence says something about whether a migration ran.
-///
-/// Everything the migration declares except the ledger itself: adoption only runs
-/// against a database whose ledger table exists, so that table's presence is the
-/// precondition rather than evidence. Counting it would make a bare ledger beside
-/// no other object look like a half-applied migration rather than an untouched
-/// database.
-fn observable_relations(migration: &Migration) -> Vec<&'static str> {
-    migration
-        .relations()
-        .into_iter()
-        .filter(|relation| *relation != MIGRATION_TABLE)
-        .collect()
+/// One thing a migration did that a later connection can be asked to confirm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Evidence {
+    /// A table or index the migration creates, present in this schema.
+    Relation(&'static str),
+    /// A seed row an idempotent `INSERT ... ON CONFLICT DO NOTHING` writes,
+    /// confirmed by the target table not being empty. A migration whose tables
+    /// exist and whose seed row does not is a `psql` run that stopped in the
+    /// middle, which is why the row counts as evidence rather than as detail.
+    Seed(&'static str),
 }
 
-/// Reconcile an empty ledger against the objects the database holds.
+/// Everything a migration must be able to show for itself to be adoptable, or
+/// `None` when the file contains a statement whose effect cannot be confirmed.
+///
+/// Derived from the migration's own text, so a statement cannot ship without
+/// adoption accounting for it — and the accounting is deliberately total: an
+/// `ALTER`, a backfill, a `DROP`, or a plain `INSERT` makes the whole migration
+/// unconfirmable rather than being passed over, because "every table is there"
+/// says nothing about a column or a row.
+///
+/// The ledger table is excluded: adoption only runs against a database whose
+/// ledger exists, so its presence is the precondition rather than evidence.
+/// Counting it would make a bare ledger look half-applied rather than untouched.
+fn evidence(migration: &Migration) -> Option<Vec<Evidence>> {
+    let mut evidence = Vec::new();
+    for statement in statements(migration.sql) {
+        let item = match statement_kind(statement)? {
+            Statement::Table(name) | Statement::Index(name) => Evidence::Relation(name),
+            Statement::Seed(name) => Evidence::Seed(name),
+        };
+        if item == Evidence::Relation(MIGRATION_TABLE) || evidence.contains(&item) {
+            continue;
+        }
+        evidence.push(item);
+    }
+    Some(evidence)
+}
+
+/// Reconcile an empty ledger against what the database can show.
 ///
 /// Read-only: this is evidence gathering, and the caller decides what to do with
-/// it. The prefix is deliberately strict — a version is adoptable only when
-/// *every* table it declares is present, and a version whose tables are present
-/// after one whose tables are not is a refusal rather than a hole to paper over.
+/// it. Deliberately strict — a version is adoptable only when *everything* it
+/// declares is confirmed, and a version confirmed after one that is not is a
+/// refusal rather than a hole to paper over.
 pub(super) async fn baseline(
     transaction: &Transaction<'_>,
 ) -> Result<Baseline, tokio_postgres::Error> {
-    let mut present: HashSet<&'static str> = HashSet::new();
-    for relation in MIGRATIONS.iter().flat_map(observable_relations) {
-        // Qualified to the one schema this connection writes in — the schema
-        // `[control_plane] schema` selected, or the first on the DSN's own search
-        // path, which is where `apply` would have created these tables. An
-        // unqualified probe would resolve down the whole search path, so another
-        // install's journal sitting in `public` would be read as evidence that
-        // *this* schema's DDL was applied, and adoption would record a baseline
-        // for objects it cannot see.
-        let found: bool = transaction
-            .query_one(
-                "SELECT EXISTS (\
-                   SELECT 1 FROM pg_catalog.pg_class class \
-                     JOIN pg_catalog.pg_namespace namespace ON namespace.oid = class.relnamespace \
-                    WHERE class.relname = $1 \
-                      AND class.relkind IN ('r', 'p') \
-                      AND namespace.nspname = current_schema())",
-                &[&relation],
-            )
-            .await?
-            .get(0);
+    let mut confirmed: HashSet<Evidence> = HashSet::new();
+    for item in MIGRATIONS.iter().filter_map(evidence).flatten() {
+        // Every probe is qualified to the one schema this connection writes in —
+        // the schema `[control_plane] schema` selected, or the first on the DSN's
+        // own search path, which is where `apply` would have created these
+        // objects. An unqualified probe would resolve down the whole search path,
+        // so another install's journal sitting in `public` would be read as
+        // evidence that *this* schema's DDL was applied.
+        let found: bool = match item {
+            Evidence::Relation(name) => transaction
+                .query_one(
+                    "SELECT EXISTS (\
+                       SELECT 1 FROM pg_catalog.pg_class class \
+                         JOIN pg_catalog.pg_namespace namespace \
+                           ON namespace.oid = class.relnamespace \
+                        WHERE class.relname = $1 \
+                          AND class.relkind IN ('r', 'p', 'i', 'I') \
+                          AND namespace.nspname = current_schema())",
+                    &[&name],
+                )
+                .await?
+                .get(0),
+            // The table is confirmed by its own `Relation` probe first, and a
+            // table in `current_schema()` shadows one of the same name further
+            // down the path, so the row this finds is this schema's. No table
+            // means no seed row either.
+            Evidence::Seed(name) => {
+                if !confirmed.contains(&Evidence::Relation(name)) {
+                    false
+                } else {
+                    transaction
+                        .query_one(&format!("SELECT EXISTS (SELECT 1 FROM {name})"), &[])
+                        .await?
+                        .get(0)
+                }
+            }
+        };
         if found {
-            present.insert(relation);
+            confirmed.insert(item);
         }
     }
-    Ok(reconcile(MIGRATIONS, &present))
+    Ok(reconcile(MIGRATIONS, &confirmed))
 }
 
-/// The prefix a set of present tables accounts for, and nothing more.
+/// The prefix a set of confirmed objects and rows accounts for, and nothing more.
 ///
 /// Separated from the probing so the shape of the history — a whole version, a
-/// half-applied one, a hole, a version whose effect no table reports — is decided
-/// by a function that can be examined directly.
-fn reconcile(migrations: &[Migration], present: &HashSet<&'static str>) -> Baseline {
+/// half-applied one, a hole, a version nothing can confirm — is decided by a
+/// function that can be examined directly.
+fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baseline {
     let mut adoptable: Vec<i32> = Vec::new();
     let mut absent: Option<i32> = None;
     for migration in migrations {
-        let declared = observable_relations(migration);
-        // A migration that creates no table leaves nothing to observe — an
-        // `ALTER TABLE` or a backfill is exactly the migration whose effect the
-        // catalogue cannot report — and it blocks adoption of this database
-        // wherever in the history it sits, including the versions below it.
+        // A migration containing a statement whose effect nothing can be asked
+        // about — an `ALTER TABLE`, a backfill, a `DROP`, a non-idempotent
+        // `INSERT` — blocks adoption of this database wherever in the history it
+        // sits, including the versions below it.
         //
-        // Fail-closed on purpose. Adopting only the prefix underneath would look
-        // safe and would not be: the ledger would then say the opaque version is
-        // pending, so the next `apply` would run it — over a database that may
-        // already have had it applied out of band. That rerun is precisely the
-        // non-idempotent replay adoption exists to prevent, and no ledger row can
-        // be written that both accounts for the objects and keeps `apply` from
-        // reaching it.
-        if declared.is_empty() {
+        // Fail-closed on purpose, in both directions. Recording it on the strength
+        // of the objects it happens to create would claim a column or a row that
+        // may never have been written; recording only the prefix underneath would
+        // have the ledger call it pending, so the next `apply` would run it over a
+        // database that may already have had it applied out of band. That rerun is
+        // precisely the non-idempotent replay adoption exists to prevent, and no
+        // ledger row both accounts for the objects and keeps `apply` away.
+        let Some(declared) = evidence(migration).filter(|declared| !declared.is_empty()) else {
             return Baseline::Inconsistent {
                 message: format!(
-                    "v{} `{}` creates no table, so whether it was applied is not something this \
-                     database can be asked, and recording a baseline below it would leave `axond \
-                     migrate apply` to re-run it over a schema that may already have it. No \
-                     baseline is adoptable while it ships unrecorded: state the history with \
-                     `INSERT INTO {MIGRATION_TABLE} (version, name, checksum)` if you own the \
-                     change that applied it, or drop the empty ledger and apply from zero if \
-                     nothing was.",
+                    "v{} `{}` contains a statement whose effect this database cannot be asked \
+                     about, so whether it was applied is not something adoption can confirm — and \
+                     recording a baseline below it would leave `axond migrate apply` to re-run it \
+                     over a schema that may already have it. No baseline is adoptable while it \
+                     ships unrecorded: state the history with `INSERT INTO {MIGRATION_TABLE} \
+                     (version, name, checksum)` if you own the change that applied it, or drop the \
+                     empty ledger and apply from zero if nothing was.",
                     migration.version, migration.name,
                 ),
             };
-        }
+        };
         let missing: Vec<&'static str> = declared
             .iter()
-            .copied()
-            .filter(|relation| !present.contains(relation))
+            .filter(|item| !confirmed.contains(item))
+            .map(|item| match item {
+                Evidence::Relation(name) | Evidence::Seed(name) => *name,
+            })
             .collect();
         if !missing.is_empty() && missing.len() < declared.len() {
             return Baseline::Inconsistent {
@@ -613,9 +777,9 @@ fn reconcile(migrations: &[Migration], present: &HashSet<&'static str>) -> Basel
             (true, Some(hole)) => {
                 return Baseline::Inconsistent {
                     message: format!(
-                        "v{} `{}` declares tables that are present while v{hole} declares tables \
-                         that are not; the objects in this database are not a prefix of the \
-                         shipped migration history, so no baseline describes it",
+                        "v{} `{}` declares objects that are present while v{hole} declares objects \
+                         that are not; this database is not a prefix of the shipped migration \
+                         history, so no baseline describes it",
                         migration.version, migration.name,
                     ),
                 };
@@ -932,18 +1096,84 @@ mod tests {
             ],
             "the tables adoption looks for are the ones the shipped file creates"
         );
-        // The ledger is the precondition for an adoption rather than evidence for
-        // one, so what is left after excluding it is what a baseline rests on. Every
-        // shipped migration still declaring a table is also what keeps adoption
-        // available at all: the first one that does not blocks it outright, which is
-        // a release decision rather than something to discover from a refusal.
+        // Every statement of the shipped file is accounted for — its indexes and
+        // its one idempotent seed row as well as its tables — and the ledger is
+        // excluded, being an adoption's precondition rather than evidence for it.
+        // A statement adoption cannot confirm withdraws `adopt` outright, so this
+        // assertion is where that release decision surfaces.
+        assert_eq!(
+            evidence(&MIGRATIONS[0]),
+            Some(vec![
+                Evidence::Relation("axond_cp_blob"),
+                Evidence::Relation("axond_cp_resource_version"),
+                Evidence::Relation("axond_cp_resource_version_tenant_idx"),
+                Evidence::Relation("axond_cp_resource_dependency"),
+                Evidence::Relation("axond_cp_mutation"),
+                Evidence::Relation("axond_cp_revision"),
+                Evidence::Relation("axond_cp_revision_single_root_idx"),
+                Evidence::Relation("axond_cp_revision_entry"),
+                Evidence::Relation("axond_cp_revision_blob"),
+                Evidence::Relation("axond_cp_audit_event"),
+                Evidence::Relation("axond_cp_audit_event_revision_idx"),
+                Evidence::Relation("axond_cp_idempotency"),
+                Evidence::Relation("axond_cp_idempotency_expires_at_idx"),
+                Evidence::Relation("axond_cp_head"),
+                Evidence::Seed("axond_cp_head"),
+            ]),
+            "every statement of the shipped file has to be something adoption confirms"
+        );
         for migration in MIGRATIONS.iter() {
             assert!(
-                !observable_relations(migration).contains(&MIGRATION_TABLE)
-                    && !observable_relations(migration).is_empty(),
-                "v{} leaves adoption nothing to verify it by, so no database can be adopted while \
-                 it ships",
+                evidence(migration).is_some_and(|declared| !declared.is_empty()),
+                "v{} contains a statement adoption cannot confirm, so no database can be adopted \
+                 while it ships",
                 migration.version
+            );
+        }
+    }
+
+    /// Statement kinds, and what each one leaves for adoption to check. The mixed
+    /// case is the one worth pinning: a migration that creates a table *and* alters
+    /// another must not be adoptable on the strength of the table, because a `psql`
+    /// run that stopped between the two leaves exactly that catalogue.
+    #[test]
+    fn a_statement_whose_effect_cannot_be_confirmed_makes_its_migration_unadoptable() {
+        const CONFIRMABLE: Migration = Migration {
+            version: 1,
+            name: "confirmable",
+            sql: "CREATE TABLE IF NOT EXISTS first (id integer);\n\
+                  -- A comment mentioning ALTER TABLE and a ';' should not matter.\n\
+                  CREATE UNIQUE INDEX IF NOT EXISTS first_id ON first ((id IS NULL));\n\
+                  INSERT INTO first (id) VALUES (1) ON CONFLICT (id) DO NOTHING;\n",
+        };
+        assert_eq!(
+            evidence(&CONFIRMABLE),
+            Some(vec![
+                Evidence::Relation("first"),
+                Evidence::Relation("first_id"),
+                Evidence::Seed("first"),
+            ])
+        );
+
+        for sql in [
+            // A table beside an `ALTER`: the reviewed mixed case.
+            "CREATE TABLE IF NOT EXISTS first (id integer);\nALTER TABLE second ADD COLUMN n text;\n",
+            // A backfill beside a table.
+            "CREATE TABLE IF NOT EXISTS first (id integer);\nUPDATE second SET n = 1;\n",
+            // An `INSERT` that is not idempotent: indistinguishable from one that
+            // never ran, and doubling on a rerun.
+            "CREATE TABLE IF NOT EXISTS first (id integer);\nINSERT INTO first (id) VALUES (1);\n",
+            "DROP TABLE second;\n",
+        ] {
+            let migration = Migration {
+                version: 2,
+                name: "mixed",
+                sql,
+            };
+            assert_eq!(
+                evidence(&migration),
+                None,
+                "a statement whose effect nothing can confirm must void the whole migration: {sql}"
             );
         }
     }
@@ -992,20 +1222,23 @@ mod tests {
             sql: "CREATE TABLE IF NOT EXISTS three (id integer);\n",
         };
         let shipped = &[V1, V2, V3];
+        let one = Evidence::Relation("one");
+        let three = Evidence::Relation("three");
 
         // Every state of such a database refuses, including the one where the
         // prefix below the opaque migration is entirely accounted for.
-        for present in [
-            HashSet::from(["one"]),
-            HashSet::from(["one", "three"]),
-            HashSet::from(["three"]),
+        for confirmed in [
+            HashSet::from([one]),
+            HashSet::from([one, three]),
+            HashSet::from([three]),
             HashSet::new(),
         ] {
-            let Baseline::Inconsistent { message } = reconcile(shipped, &present) else {
-                panic!("a history with an unobservable migration has no adoptable baseline");
+            let Baseline::Inconsistent { message } = reconcile(shipped, &confirmed) else {
+                panic!("a history with an unconfirmable migration has no adoptable baseline");
             };
             assert!(
-                message.contains("v2 `backfill` creates no table") && message.contains("re-run it"),
+                message.contains("v2 `backfill` contains a statement")
+                    && message.contains("re-run it"),
                 "the refusal has to name the version and why nothing under it is safe: {message}"
             );
         }
@@ -1013,13 +1246,13 @@ mod tests {
         // The same reconciliation without that migration still adopts the prefix
         // its objects prove, so the refusals above are the opaque version's doing
         // rather than a blanket one.
-        let observable = &[V1, V3];
+        let confirmable = &[V1, V3];
         assert_eq!(
-            reconcile(observable, &HashSet::from(["one"])),
+            reconcile(confirmable, &HashSet::from([one])),
             Baseline::Applied { versions: vec![1] }
         );
-        assert_eq!(reconcile(observable, &HashSet::new()), Baseline::Nothing);
-        let Baseline::Inconsistent { message } = reconcile(observable, &HashSet::from(["three"]))
+        assert_eq!(reconcile(confirmable, &HashSet::new()), Baseline::Nothing);
+        let Baseline::Inconsistent { message } = reconcile(confirmable, &HashSet::from([three]))
         else {
             panic!("a hole in the applied prefix is not a baseline");
         };

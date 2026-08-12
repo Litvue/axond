@@ -289,30 +289,38 @@ or constraint change would not, and it would corrupt a database rather than fail
 
 `axond migrate adopt` is how that state is resolved deliberately. It writes ledger
 rows and never DDL, and it records only what the database itself accounts for: the
-longest run of shipped migrations, starting at v1, whose every declared table is
-present in the schema this configuration writes to (the one `[control_plane]
-schema` names, or the first on the DSN's own search path — a second install's
-journal further down that path is not evidence about this one). What it does
-instead of recording:
+longest run of shipped migrations, starting at v1, whose every statement is
+confirmed — each table and index present, and each idempotent seed row written — in
+the schema this configuration writes to (the one `[control_plane] schema` names, or
+the first on the DSN's own search path; a second install's journal further down that
+path is not evidence about this one). What it does instead of recording:
 
 - **No object present.** Nothing was applied out of band, so there is no baseline.
   Refused, naming the way forward — drop the empty `axond_cp_schema_migration`
   table and run `axond migrate apply`.
-- **A migration only partly applied.** Some of the tables one file declares are
-  there and some are not, so neither "applied" nor "not applied" is true. Refused,
-  naming the missing tables; finish or undo that file by hand first.
+- **A migration only partly applied.** Some of what one file declares is there and
+  some is not — a table, an index, or the seed row the shipped file ends with, which
+  a `psql -f` outside a transaction can stop just short of. Neither "applied" nor
+  "not applied" is true, so it is refused, naming what is missing; finish or undo
+  that file by hand first.
 - **A ledger that already records a history.** Nothing to adopt: the history is
   reported and nothing is written, so a stray `adopt` in a rollout is not a ledger
   edit.
-- **A shipped migration that creates no table.** An `ALTER`-only or backfill
-  migration is the one whose application no catalogue can report on, and also the
-  one whose rerun is destructive. Adopting the versions below it would leave the
-  ledger calling it *pending*, so the next `apply` would run it over a schema that
-  may already have it. So a release that ships one refuses every adoption while it
-  is unrecorded — the whole history, not just that version — and the baseline goes
-  back to being an `INSERT INTO axond_cp_schema_migration (version, name,
-  checksum)` you write because you own the change that applied it. The refusal
-  names the version and says this.
+- **A shipped migration containing a statement adoption cannot confirm.** Adoption
+  confirms three statement forms: `CREATE TABLE` and `CREATE INDEX` by the object
+  being present, and `INSERT ... ON CONFLICT DO NOTHING` by the target table not
+  being empty. Anything else — an `ALTER`, a backfill, a `DROP`, a non-idempotent
+  `INSERT` — is both what no catalogue can report on and what a rerun would damage,
+  and one such statement makes its whole migration unadoptable. That holds even when
+  the same file also creates a table: `psql -f` without a wrapping transaction can
+  abort between `CREATE TABLE x` and a following `ALTER TABLE y`, and "x exists" is
+  then not evidence the file finished. Adopting the versions below it is no better —
+  the ledger would call it *pending*, so the next `apply` would run it over a schema
+  that may already have it. So a release that ships one refuses every adoption while
+  it is unrecorded — the whole history, not just that version — and the baseline
+  goes back to being an `INSERT INTO axond_cp_schema_migration (version, name,
+  checksum)` you write because you own the change that applied it. The refusal names
+  the version and says this.
 
 It is one transaction under the same advisory lock `apply` takes, so a refusal
 leaves no partial baseline and two simultaneous adoptions are one adoption.

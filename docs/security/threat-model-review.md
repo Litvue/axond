@@ -366,10 +366,12 @@ gated too: `an_empty_ledger_is_refused_rather_than_migrated_from_zero`,
 `adoption_refuses_every_schema_that_is_not_an_empty_ledger`,
 `concurrent_adoptions_record_the_baseline_once`,
 `objects_in_another_schema_on_the_path_are_not_evidence_of_an_applied_baseline`,
-and `a_migration_no_object_can_account_for_blocks_adoption_of_the_whole_history` —
-a baseline may only be recorded for migrations whose objects are present in this
-schema, never by executing shipped DDL over a database that already has it, and
-never at all once a migration no object can account for ships.
+`a_hand_applied_schema_missing_its_seed_row_is_refused_rather_than_adopted`,
+`a_statement_whose_effect_cannot_be_confirmed_makes_its_migration_unadoptable`, and
+`a_migration_no_object_can_account_for_blocks_adoption_of_the_whole_history` — a
+baseline may only be recorded for migrations whose every statement is confirmed in
+this schema, never by executing shipped DDL over a database that already has it,
+and never at all once a migration ships a statement adoption cannot confirm.
 
 **Threat model and ADRs.** [ADR 0007](../adr/0007-telemetry-model.md),
 [ADR 0009](../adr/0009-durable-usage-sinks.md),

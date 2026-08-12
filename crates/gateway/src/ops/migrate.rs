@@ -244,8 +244,9 @@ pub async fn apply(config: &Config, env: &HashMap<String, String>) -> Result<Rep
 /// ledger is the only record of what ran, so this build will neither serve that
 /// database nor migrate it from zero. `adopt` is how an operator says "this DDL
 /// was applied" — and it is checked rather than believed. The baseline recorded is
-/// the longest prefix of shipped migrations whose declared tables are *all*
-/// present; a prefix that is empty, interrupted, or not a prefix is refused with
+/// the longest prefix of shipped migrations whose statements are *all* confirmed
+/// — tables and indexes present, idempotent seed rows written; a prefix that is
+/// empty, interrupted, or not a prefix is refused with
 /// [`OpsError::Refused`] and writes nothing.
 ///
 /// It executes no migration SQL, so it can never double-apply a file. It is
@@ -819,6 +820,45 @@ mod tests {
                 version: schema::required_version()
             }),
             "{adopted}"
+        );
+    }
+
+    /// A `psql -f` that stopped one statement short of the end.
+    ///
+    /// The shipped file ends by seeding the singleton head row, and `psql` without
+    /// a wrapping transaction can abort before it: every table present, no head
+    /// row. Adoption records what it confirmed, and a seed row is part of what a
+    /// migration did, so this is the partly-applied refusal rather than a baseline
+    /// — otherwise the ledger would call v1 applied and the next `apply` would
+    /// never write the anchor publication needs.
+    #[tokio::test]
+    async fn a_hand_applied_schema_missing_its_seed_row_is_refused_rather_than_adopted() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        fixture.hand_applied().await;
+        fixture
+            .observe()
+            .await
+            .batch_execute("DELETE FROM axond_cp_head")
+            .await
+            .expect("undo the seed the shipped file ends with");
+
+        let error = adopt(&fixture.config, &fixture.env)
+            .await
+            .expect_err("a migration that did not finish is not a baseline");
+        assert!(
+            matches!(error, OpsError::Refused { .. }) && !error.is_retryable(),
+            "an operator decision, not an outage: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("only partly applied")
+                && error.to_string().contains("axond_cp_head"),
+            "the refusal has to name what is not there: {error}"
+        );
+        assert!(
+            fixture.ledger().await.is_empty(),
+            "a refused adoption must not record a baseline"
         );
     }
 

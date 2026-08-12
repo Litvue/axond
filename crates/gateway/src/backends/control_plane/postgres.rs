@@ -323,11 +323,12 @@ impl PostgresControlPlane {
     ///
     /// The one write that exists for a [`SchemaStatus::Unrecorded`] database, and
     /// the only one anywhere that inserts a ledger row for DDL it did not run.
-    /// It writes what the database's own objects account for and nothing else: the
-    /// longest prefix of shipped migrations whose every declared table is present
+    /// It writes what the database itself accounts for and nothing else: the
+    /// longest prefix of shipped migrations whose every statement is confirmed —
+    /// tables and indexes present, idempotent seed rows written
     /// ([`schema::baseline`]). A prefix that is empty, one interrupted by a
     /// half-applied migration, one that is not a prefix at all, and any history
-    /// containing a migration that creates no table are refused with
+    /// containing a statement whose effect cannot be confirmed are refused with
     /// [`ControlPlaneError::Denied`] rather than recorded, because a recorded
     /// version is afterwards indistinguishable from an applied one — an adoption
     /// that guessed would launder a guess into the history every later decision
