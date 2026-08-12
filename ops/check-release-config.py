@@ -192,6 +192,54 @@ def check_image_matrix(text: str) -> list[str]:
             "ops/publish-image-index.sh: PLATFORMS "
             f"{sorted(declared.group(1).split())} does not match {sorted(IMAGE_PLATFORMS)}"
         )
+    # Promotion must retag the smoked digest instead of reassembling the index
+    # from the child tags: a tag, once applied, cannot be retracted by the
+    # assertion that follows it. ops/check-index-promotion.sh proves the ordering
+    # against a stubbed registry; this keeps the shape of it in place.
+    if 'apply_tags "${IMAGE_NAME}@${index_digest}"' not in script:
+        failures.append(
+            "ops/publish-image-index.sh: promotion does not retag the expected "
+            "index digest itself, so it can publish an operator-facing tag before "
+            "the digest is checked"
+        )
+    # The mode must be explicit. Inferring promotion from a non-empty
+    # EXPECT_INDEX_DIGEST means an empty job output silently becomes a staging run
+    # that publishes the operator-facing tags before asserting anything.
+    if '"${INDEX_MODE:?' not in script:
+        failures.append(
+            "ops/publish-image-index.sh: INDEX_MODE is not required, so the mode "
+            "can be inferred from a possibly-empty variable"
+        )
+    if 'INDEX_MODE=promote requires EXPECT_INDEX_DIGEST' not in script:
+        failures.append(
+            "ops/publish-image-index.sh: promotion does not fail on an empty "
+            "EXPECT_INDEX_DIGEST"
+        )
+    if "cannot apply the operator-facing tag" not in script:
+        failures.append(
+            "ops/publish-image-index.sh: staging does not refuse the "
+            "operator-facing tags, so a mislabelled run can publish them before "
+            "the index is asserted"
+        )
+    promotion = script.partition('if [[ "$INDEX_MODE" == promote ]]; then')[2]
+    promotion = promotion.partition("\nelse\n")[0]
+    if not promotion:
+        failures.append("ops/publish-image-index.sh: no promotion branch found")
+    else:
+        assertion = promotion.find('assert_index_contents "$index_digest"')
+        tagging = promotion.find("apply_tags ")
+        if assertion < 0 or tagging < 0 or assertion > tagging:
+            failures.append(
+                "ops/publish-image-index.sh: promotion applies tags before "
+                "asserting the index contents; a registry tag cannot be retracted "
+                "by a later failure"
+            )
+    if "${child_refs[@]}" in promotion:
+        failures.append(
+            "ops/publish-image-index.sh: promotion reassembles the index from the "
+            "child references; if a child tag moved since staging, the release "
+            "tags would point at an index no smoke lane booted"
+        )
     # Descriptors without a platform must be classified, not skipped: an ignored
     # descriptor is an unreviewed manifest inside the deployed reference.
     for label, needle in {
@@ -259,7 +307,14 @@ def check_image_gates(text: str) -> list[str]:
                 f"({needle!r}) before the index is smoked; that belongs to "
                 "release-image-index-promote"
             )
+    # Each job must name its own mode: the script refuses to guess, and a job that
+    # omits it fails at the tag rather than in the registry.
+    if "INDEX_MODE: stage" not in index:
+        failures.append(
+            "release-please.yml: release-image-index does not set INDEX_MODE: stage"
+        )
     for label, needle in {
+        "explicit promotion mode": "INDEX_MODE: promote",
         "index retag from the smoked digest": "ops/publish-image-index.sh",
         "smoked-digest assertion": "EXPECT_INDEX_DIGEST",
         "keyless signature": "cosign sign --yes",

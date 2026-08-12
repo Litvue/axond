@@ -28,7 +28,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: axond
-          image: ghcr.io/litvue/axond:0.3.17 # x-release-please-version
+          image: ghcr.io/litvue/axond:0.3.18 # x-release-please-version
           imagePullPolicy: IfNotPresent
           env:
             - name: AXOND_CONFIG

@@ -598,6 +598,7 @@ jobs:
         id: index
         env:
           GH_TOKEN: ${{ github.token }}
+          INDEX_MODE: stage
           INDEX_TAGS: sha-${{ needs['release-metadata'].outputs.short_sha }}-index
         run: bash ops/publish-image-index.sh
 
@@ -703,6 +704,7 @@ jobs:
       - name: Promote the smoked index to the release tags
         env:
           GH_TOKEN: ${{ github.token }}
+          INDEX_MODE: promote
           INDEX_TAGS: ${{ needs['release-metadata'].outputs.version }} sha-${{ needs['release-metadata'].outputs.short_sha }}
           EXPECT_INDEX_DIGEST: ${{ needs['release-image-index'].outputs.digest }}
         run: bash ops/publish-image-index.sh

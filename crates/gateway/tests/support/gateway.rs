@@ -177,13 +177,23 @@ impl Axond {
         let client = reqwest::Client::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
+            // A lost bind is decided by this child's own output, not by whether
+            // the port answers: when a sibling wins the port, that sibling's
+            // gateway answers `/healthz` while this child is exiting, and taking
+            // the probe as readiness would run the test against a process
+            // configured for someone else.
+            if self.lost_the_port() {
+                return false;
+            }
             if let Ok(response) = client
                 .get(format!("{}/healthz", self.base_url))
                 .send()
                 .await
                 && response.status().is_success()
             {
-                return true;
+                // The probe only proves something serves the port. Anything this
+                // child logged about the bind, and its own exit, decide whose.
+                return !self.lost_the_port() && matches!(self.child.try_wait(), Ok(None));
             }
             if let Ok(Some(_)) = self.child.try_wait() {
                 // The process is gone. A refused config is a test bug rather
@@ -199,6 +209,14 @@ impl Axond {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         false
+    }
+
+    /// Whether this child reported that its listener address was taken. The
+    /// ephemeral port `free_addr` picked is released before the binary binds it,
+    /// so a sibling test process can win it in between; that is the allocator's
+    /// race, and a lost boot is retried on a fresh port.
+    fn lost_the_port(&self) -> bool {
+        self.output().contains("Address already in use")
     }
 
     pub fn url(&self, path: &str) -> String {
