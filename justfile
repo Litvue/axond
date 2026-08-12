@@ -25,6 +25,8 @@ docs:
 # Validate documentation links, release markers, route coverage, and Compose variants.
 docs-check:
     python3 ops/check-docs.py
+    sh -n install.sh
+    AXOND_VERSION=0.0.0 AXOND_TARGET=x86_64-unknown-linux-musl AXOND_INSTALL_DRY_RUN=1 sh install.sh | grep -F 'axond-0.0.0-x86_64-unknown-linux-musl.tar.gz'
     docker compose --env-file ops/compose/env.example config --quiet
     docker compose --env-file ops/compose/env.example -f docker-compose.yml -f docker-compose.build.yml config --quiet
     AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml docker compose --env-file ops/compose/env.example -f docker-compose.yml -f docker-compose.stateful.yml --profile stateful config --quiet

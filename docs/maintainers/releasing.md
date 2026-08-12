@@ -33,6 +33,24 @@ release resumes at the first missing crate.
 
 The crates.io token owner must have a verified email address.
 
+The `GITHUB_TOKEN` fallback can create the release PR only when organization or
+enterprise policy permits Actions-created pull requests. If that policy is
+disabled, use the GitHub App path for full automation. The workflow still
+updates the conventional release branch and synchronizes `Cargo.lock` after a
+denied PR creation, so a maintainer can open the prepared branch manually:
+
+```bash
+gh api repos/Litvue/axond/git/matching-refs/heads/release-please--branches--main \
+  --jq '.[].ref'
+gh pr create --repo Litvue/axond \
+  --base main \
+  --head <generated-branch> \
+  --title "chore(main): release <version>"
+```
+
+Do not repeatedly rerun a denied release-please job without changing the token
+or policy; it will fail at the same PR-creation boundary.
+
 ## Normal release
 
 1. Ensure the release PR is current and green.

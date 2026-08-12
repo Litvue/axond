@@ -132,6 +132,7 @@ jobs:
           mapfile -t pins < <(grep -E '^[A-Za-z0-9_.-]+==' tests/compat/requirements.in || true)
           ((${#pins[@]} > 0)) || { echo "no direct pins found" >&2; exit 1; }
           for pin in "${pins[@]}"; do
+            # shellcheck disable=SC2016 # sed expression is intentionally literal
             escaped_pin="$(printf '%s' "$pin" | sed 's/[.[\*^$()+?{|\\]/\\&/g')"
             grep -Eq "^${escaped_pin}([[:space:];\\]|$)" tests/compat/requirements.txt || {
               echo "missing direct pin in lockfile: $pin" >&2
@@ -155,6 +156,33 @@ jobs:
       - name: Documentation links, drift, routes, and deployment manifests
         run: |
           python3 ops/check-docs.py
+          shellcheck install.sh
+          unix_installer_output="$(AXOND_VERSION=0.0.0 \
+            AXOND_TARGET=x86_64-unknown-linux-musl \
+            AXOND_REQUIRE_ATTESTATION=true \
+            AXOND_REPOSITORY=attacker/example \
+            AXOND_INSTALL_DRY_RUN=1 \
+            sh install.sh)"
+          grep -F 'axond-0.0.0-x86_64-unknown-linux-musl.tar.gz' \
+            <<<"$unix_installer_output"
+          grep -F 'require_attestation=1' <<<"$unix_installer_output"
+          grep -F 'github.com/Litvue/axond/' <<<"$unix_installer_output"
+          if AXOND_VERSION=0.0.0 AXOND_REQUIRE_ATTESTATION=maybe \
+            AXOND_INSTALL_DRY_RUN=1 sh install.sh; then
+            echo "Unix installer accepted an invalid attestation setting" >&2
+            exit 1
+          fi
+          windows_installer_output="$(AXOND_REQUIRE_ATTESTATION=true \
+            AXOND_REPOSITORY=attacker/example \
+            pwsh -NoProfile -File ./install.ps1 \
+            -Version 0.0.0 -Target x86_64-pc-windows-msvc -DryRun)"
+          grep -F 'require_attestation=True' <<<"$windows_installer_output"
+          grep -F 'github.com/Litvue/axond/' <<<"$windows_installer_output"
+          if AXOND_REQUIRE_ATTESTATION=maybe pwsh -NoProfile -File ./install.ps1 \
+            -Version 0.0.0 -Target x86_64-pc-windows-msvc -DryRun; then
+            echo "Windows installer accepted an invalid attestation setting" >&2
+            exit 1
+          fi
           docker compose --env-file ops/compose/env.example config --quiet
           docker compose --env-file ops/compose/env.example \
             -f docker-compose.yml -f docker-compose.build.yml config --quiet
