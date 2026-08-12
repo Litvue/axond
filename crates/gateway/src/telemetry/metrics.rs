@@ -15,7 +15,7 @@
 use std::sync::OnceLock;
 
 use gateway_core::CircuitState;
-use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
 use opentelemetry::{KeyValue, global};
 
 use crate::usage::UsageRecord;
@@ -45,6 +45,8 @@ struct Instruments {
     budget_capacity_denials: Counter<u64>,
     budget_namespace_denials: Counter<u64>,
     budget_retained_subjects: Gauge<u64>,
+    admission_in_flight: UpDownCounter<i64>,
+    admission_rejections: Counter<u64>,
     rate_limit_denials: Counter<u64>,
     rate_limit_capacity_denials: Counter<u64>,
     rate_limit_unavailable_denials: Counter<u64>,
@@ -178,6 +180,17 @@ impl Instruments {
                 .with_description(
                     "In-memory budget ledgers retained after capacity-pressure pruning.",
                 )
+                .build(),
+            admission_in_flight: meter
+                .i64_up_down_counter("axond.admission.in_flight")
+                .with_description(
+                    "Admission capacity held right now, by resource: requests, open streams, \
+                     tenant slots, and queued requests.",
+                )
+                .build(),
+            admission_rejections: meter
+                .u64_counter("axond.admission.rejections")
+                .with_description("Requests shed by admission control, by resource and error type.")
                 .build(),
             rate_limit_denials: meter
                 .u64_counter("axond.rate_limit.denials")
@@ -406,6 +419,44 @@ pub fn record_budget_retained_subjects(subjects: usize) {
     instruments
         .budget_retained_subjects
         .record(subjects as u64, &[]);
+}
+
+/// Admission capacity taken. `resource` is the closed vocabulary in
+/// [`crate::admission`], so saturation is observable without a tenant, subject,
+/// or request dimension — the gauge's cardinality is fixed at build time.
+pub fn record_admission_acquired(resource: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .admission_in_flight
+        .add(1, &[KeyValue::new("axond.admission.resource", resource)]);
+}
+
+/// Admission capacity returned. Called from the permit's `Drop`, so it pairs
+/// with [`record_admission_acquired`] on every exit path.
+pub fn record_admission_released(resource: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .admission_in_flight
+        .add(-1, &[KeyValue::new("axond.admission.resource", resource)]);
+}
+
+/// One request shed by admission control. `code` is the same stable error type
+/// the caller was answered with, so a dashboard and a caller's logs agree.
+pub fn record_admission_rejection(resource: &'static str, code: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.admission_rejections.add(
+        1,
+        &[
+            KeyValue::new("axond.admission.resource", resource),
+            KeyValue::new("axond.error.type", code),
+        ],
+    );
 }
 
 pub fn record_rate_limit_denial() {

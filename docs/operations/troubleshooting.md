@@ -33,6 +33,14 @@ Boot errors name references and identifiers, not secret values.
 | `400 bad_request` | Invalid request or query shape. | Error message; repeated/invalid `namespaces` values are rejected deliberately. |
 | `429 budget_exceeded` | Subject or namespace spend cap cannot admit the estimate. | Budget metrics and namespace-denial metric. |
 | `429 rate_limit_exceeded` | In-flight concurrency cap reached. | Caller concurrency and limiter metrics. |
+| `429 tenant_concurrency_exceeded` | The caller's namespace is at `admission.max_in_flight_per_tenant` on this replica. | `axond.admission.in_flight`; whether the tenant's own concurrency, not the replica, is the cause. |
+| `413 request_too_large` / `413 prompt_too_large` | Body over `admission.max_request_bytes`, or estimated input over `admission.max_prompt_tokens`. | The caller's payload size; raise the bound only if the workload genuinely needs it. |
+| `200` + SSE `error` typed `upstream_stream_error` | A stream hit `admission.max_stream_duration_ms` or `admission.max_stream_bytes`; the bounds cannot change a status already sent. | The event's message names the bound; the usage record settles with what was relayed. |
+| `415 unsupported_media_type` | The request did not declare `content-type: application/json`. | The caller's `Content-Type` header. |
+| `400 output_limit_exceeded` | The request asked for more output tokens than `admission.max_output_tokens`. | The request's `max_tokens`/`max_completion_tokens`/`max_output_tokens`. |
+| `503 gateway_overloaded` / `503 stream_capacity_exhausted` | The replica is at `admission.max_in_flight` or `max_in_flight_streams`. | `axond.admission.rejections` by resource, replica count, and whether the ceilings match what one process can hold. |
+| `503 admission_queue_full` / `503 admission_queue_timeout` | Queueing is enabled and the queue is full, or a queued request outlived `admission.queue_wait_ms`. | Whether queueing is helping at all: sustained shedding here means the replica is under-provisioned, not bursty. |
+| `503 admission_tenant_capacity_exhausted` | More distinct namespaces in flight than `admission.max_tenants`. | Namespace count in the deployment; retrying will not clear it, so no `Retry-After` is sent. |
 | `502 upstream_transport` | Axond could not establish/complete the provider transport. | Provider URL, DNS, TLS, egress, proxy, timeout. |
 | `504 upstream_timeout` | A transport bound fired before a response could be served. | `axond.timeout` on the attempt span names the phase: `connect`, `response_headers`, `buffered_body`, `stream_idle`, or `overall`. Tune that `[transport]` bound, or `failover.overall_timeout_ms` for `overall`. |
 | `502 upstream_body_too_large` | A buffered provider body exceeded `transport.max_response_bytes`. | Whether the workload really returns bodies that size; otherwise treat the target as misbehaving. |

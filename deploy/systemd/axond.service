@@ -19,7 +19,21 @@ RestartSec=5s
 # the shipped defaults); a SIGKILL before the flush finishes loses buffered
 # usage records.
 TimeoutStopSec=30s
+
+# One in-flight request costs a socket to the caller and one upstream, so the
+# descriptor limit must exceed 2 x admission.max_in_flight with room for the
+# listener, the config watch, and the store connections.
 LimitNOFILE=65536
+# A ceiling the kernel enforces if a bound is ever misconfigured: axond's own
+# `[admission]` bounds are what should refuse work, and this is what keeps a
+# breach of them from taking the host down with it. Size it above
+# admission.max_in_flight x admission.max_request_bytes plus the process's
+# steady-state footprint — with the shipped defaults (1024 x 2 MiB) that product
+# is already 2 GiB, so this is deliberately headroom above it. Lower it only
+# together with an explicit, smaller `[admission]` section, so that admission
+# still sheds before the cgroup killer fires.
+MemoryMax=6G
+TasksMax=4096
 
 NoNewPrivileges=true
 PrivateDevices=true

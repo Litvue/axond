@@ -14,6 +14,7 @@
 //! `[reload] watch` is on, a change to the config file) re-runs this same load +
 //! validate path and swaps the result in atomically (ADR 0011).
 
+mod admission;
 mod aliases;
 // Contracts only: the durable implementations land in #141/#142, so nothing
 // here is constructed by `serve` yet and the runtime stays stateless.

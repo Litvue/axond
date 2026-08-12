@@ -19,6 +19,12 @@ Use this checklist before exposing Axond beyond a local development network.
 - [ ] Idle and total request timeouts allow expected model-generation duration.
 - [ ] A real streamed request has been tested through production ingress.
 - [ ] Clients retry transport failures without blindly replaying committed streams.
+- [ ] `[admission]` ceilings are set deliberately, not left at defaults, and sized to what one replica's memory and descriptor limits can hold.
+- [ ] `admission.max_request_bytes` matches the largest legitimate caller payload, and the proxy in front does not accept more than the gateway will.
+- [ ] The container/unit memory limit exceeds `max_in_flight` x `max_request_bytes` plus steady-state footprint.
+- [ ] Queueing is off (`queue_capacity = 0`) unless bursty traffic has been measured, and `queue_wait_ms` is set whenever it is on.
+- [ ] Callers handle `429 tenant_concurrency_exceeded` and `503 gateway_overloaded` with backoff, honoring `Retry-After`.
+- [ ] Shedding metrics (`axond.admission.rejections`, `axond.admission.in_flight`) are dashboarded and alerted on.
 
 ## Configuration and secrets
 
@@ -41,6 +47,7 @@ Use this checklist before exposing Axond beyond a local development network.
 - [ ] Redis key prefixes and Postgres tables are isolated between environments.
 - [ ] Backup and restore procedures include schema/layout metadata and have been tested.
 - [ ] Autoscaling does not accidentally multiply an in-memory budget or rate limit.
+- [ ] Per-replica `[admission]` ceilings x replica count is the concurrency the providers and the fleet can actually absorb.
 
 ## Rollout and shutdown
 

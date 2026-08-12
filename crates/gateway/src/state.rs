@@ -22,6 +22,7 @@ use gateway_core::{
 use gateway_transport::{HttpDispatcher, build_client};
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::admission::AdmissionControl;
 use crate::aliases::AliasScope;
 use crate::budget::BudgetStore;
 use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind};
@@ -48,6 +49,9 @@ pub struct Inner {
     pub dispatcher: HttpDispatcher,
     pub usage: UsageFanout,
     pub budget: Box<dyn BudgetStore>,
+    /// Process-level ceilings. Like the HTTP client's bounds these own state
+    /// built at boot, so a reloaded `[admission]` section applies on restart.
+    pub admission: AdmissionControl,
     pub rate_limiter: Box<dyn RateLimiter>,
     pub revocation: Box<dyn RevocationStore>,
     /// Drain state and the in-flight count. Process-level, like the sinks: a
@@ -426,6 +430,7 @@ impl AppState {
         // once here: a reload validates a change and reports that it needs a
         // restart rather than swapping the pool under in-flight requests.
         let limits = config.transport.limits();
+        let admission = AdmissionControl::from_config(&config.admission);
         let snapshot = ConfigSnapshot::build(config, env, 0)?;
         Ok(AppState(Arc::new(Inner {
             dispatcher: HttpDispatcher::with_limits(
@@ -434,6 +439,7 @@ impl AppState {
             ),
             usage,
             budget,
+            admission,
             rate_limiter,
             revocation,
             lifecycle: Arc::new(Lifecycle::new()),

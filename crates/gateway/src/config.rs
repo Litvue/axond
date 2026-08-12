@@ -99,6 +99,10 @@ pub struct Config {
     /// Inbound per-caller concurrency enforcement. Defaults to no limit.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Bounds on what one request may consume, plus the global and per-tenant
+    /// admission ceilings that shed load before it reaches a provider.
+    #[serde(default)]
+    pub admission: AdmissionConfig,
     /// Precise minted-token revocation. Defaults to no denylist.
     #[serde(default)]
     pub revocation: RevocationConfig,
@@ -139,7 +143,7 @@ impl Mode {
 /// reference to resolve, and figment's resulting type error would carry the
 /// secret into the load diagnostic. Kept in step with `Config` by
 /// `the_override_key_list_matches_every_config_field`.
-const OVERRIDE_KEYS: [&str; 23] = [
+const OVERRIDE_KEYS: [&str; 24] = [
     "mode",
     "server",
     "control_plane",
@@ -162,6 +166,7 @@ const OVERRIDE_KEYS: [&str; 23] = [
     "usage_sink",
     "budget",
     "rate_limit",
+    "admission",
     "revocation",
 ];
 
@@ -579,6 +584,166 @@ fn default_stream_idle_timeout_ms() -> u64 {
 
 fn default_max_response_bytes() -> u64 {
     32 * 1024 * 1024
+}
+
+/// Inbound resource bounds and load shedding (see [`crate::admission`]).
+///
+/// These are the *inbound* half of the bounds `[transport]` sets on upstream
+/// calls: how large a request may be, how many may be in flight at once for the
+/// process and for one tenant, how long one may wait for capacity, and how long
+/// a stream may stay open. Every ceiling is explicit here rather than inherited
+/// from a library default, and `0` means "this ceiling is off" — never
+/// "unbounded by accident".
+///
+/// The ceilings are process-level: they own semaphores built at boot, so a
+/// change is validated on reload but takes effect on restart, exactly like
+/// `[transport]`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AdmissionConfig {
+    /// Largest inbound request body that will be buffered and parsed. A larger
+    /// one is refused with `413` before it is read into memory, which is what
+    /// bounds the prompt a caller can send.
+    #[serde(default = "default_max_request_bytes")]
+    pub max_request_bytes: usize,
+    /// Concurrent requests this replica will serve on the provider-dispatching
+    /// routes. `0` disables the ceiling.
+    #[serde(default = "default_max_in_flight")]
+    pub max_in_flight: usize,
+    /// Concurrent open streams, counted separately because a stream holds a
+    /// socket for as long as the model talks. `0` disables the ceiling.
+    #[serde(default = "default_max_in_flight_streams")]
+    pub max_in_flight_streams: usize,
+    /// Concurrent requests one namespace may hold. Keep it below
+    /// `max_in_flight` so no single tenant can take the whole replica. `0`
+    /// disables the ceiling.
+    ///
+    /// In a deployment with one namespace this, not `max_in_flight`, is the
+    /// ceiling traffic meets — and it answers `429`, which reads as the caller's
+    /// fault. Raise it to `max_in_flight`, or disable it, when one namespace is
+    /// the whole deployment.
+    #[serde(default = "default_max_in_flight_per_tenant")]
+    pub max_in_flight_per_tenant: usize,
+    /// Tenants tracked concurrently by the per-tenant ceiling. Entries exist
+    /// only while a tenant has work in flight; a new tenant beyond this bound is
+    /// refused rather than admitted without a ceiling.
+    #[serde(default = "default_max_tenants")]
+    pub max_tenants: usize,
+    /// Requests that may wait for global capacity. `0` — the default — rejects
+    /// immediately instead of queueing, which is the bounded behavior.
+    #[serde(default = "default_queue_capacity")]
+    pub queue_capacity: usize,
+    /// How long a queued request waits before it is shed. Required with, and
+    /// only meaningful with, `queue_capacity`.
+    #[serde(default = "default_queue_wait_ms")]
+    pub queue_wait_ms: u64,
+    /// Total lifetime of one open stream, as opposed to
+    /// `transport.stream_idle_timeout_ms`, which resets on every chunk. This is
+    /// what bounds a socket held open by an endless answer. `0` disables it.
+    ///
+    /// Evaluated as the relay is polled, so it bounds a stream the caller is
+    /// draining: a client that stops reading applies write backpressure, the
+    /// relay stops being polled, and the deadline cannot fire. A proxy's
+    /// write/response timeout is the bound for that case.
+    #[serde(default = "default_max_stream_duration_ms")]
+    pub max_stream_duration_ms: u64,
+    /// Largest prompt, in the gateway's pre-dispatch token estimate, that a
+    /// request may carry. Bounds the input a caller can send more meaningfully
+    /// than `max_request_bytes` alone, which cannot tell a large body from a
+    /// large prompt. `0` disables it.
+    #[serde(default = "default_max_prompt_tokens")]
+    pub max_prompt_tokens: u64,
+    /// Largest output allowance a request may *ask* for (`max_tokens` and its
+    /// per-surface spellings). A request asking for more is refused rather than
+    /// silently clamped, so a caller is never billed for a bound it did not
+    /// choose. `0` disables it.
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u64,
+    /// Bytes one stream may relay before it is ended. Bounds the output of a
+    /// model that never stops talking, which neither the idle timeout nor the
+    /// token allowance can (a provider need not honor `max_tokens`). `0`
+    /// disables it.
+    #[serde(default = "default_max_stream_bytes")]
+    pub max_stream_bytes: u64,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self {
+            max_request_bytes: default_max_request_bytes(),
+            max_in_flight: default_max_in_flight(),
+            max_in_flight_streams: default_max_in_flight_streams(),
+            max_in_flight_per_tenant: default_max_in_flight_per_tenant(),
+            max_tenants: default_max_tenants(),
+            queue_capacity: default_queue_capacity(),
+            queue_wait_ms: default_queue_wait_ms(),
+            max_stream_duration_ms: default_max_stream_duration_ms(),
+            max_prompt_tokens: default_max_prompt_tokens(),
+            max_output_tokens: default_max_output_tokens(),
+            max_stream_bytes: default_max_stream_bytes(),
+        }
+    }
+}
+
+/// Two mebibytes: large enough for a long conversation with inlined context,
+/// small enough that a burst of oversized requests cannot exhaust memory.
+fn default_max_request_bytes() -> usize {
+    2 * 1024 * 1024
+}
+
+fn default_max_in_flight() -> usize {
+    1_024
+}
+
+fn default_max_in_flight_streams() -> usize {
+    512
+}
+
+/// A quarter of the global ceiling, so four saturated tenants are needed to
+/// fill the replica and a fifth still gets served.
+fn default_max_in_flight_per_tenant() -> usize {
+    256
+}
+
+fn default_max_tenants() -> usize {
+    1_024
+}
+
+/// Immediate rejection by default: a queue that is not tuned for a deployment's
+/// traffic converts saturation into latency the caller cannot see.
+fn default_queue_capacity() -> usize {
+    0
+}
+
+fn default_queue_wait_ms() -> u64 {
+    0
+}
+
+/// An hour. Long enough for any legitimate completion, short enough that a
+/// forgotten stream cannot hold a socket for the process's lifetime.
+fn default_max_stream_duration_ms() -> u64 {
+    60 * 60 * 1_000
+}
+
+/// Roughly the largest context the current frontier models accept, so the bound
+/// refuses what no provider would serve rather than second-guessing a model.
+///
+/// It is deliberately above what [`default_max_request_bytes`] admits: the
+/// estimate is four bytes per token, so with the default body ceiling the body
+/// bound refuses first, at roughly 525k estimated tokens. An operator who wants
+/// a prompt-shaped refusal lowers this below `max_request_bytes / 4`; one who
+/// raises the body ceiling gets this one back.
+fn default_max_prompt_tokens() -> u64 {
+    1_000_000
+}
+
+fn default_max_output_tokens() -> u64 {
+    200_000
+}
+
+/// Sixty-four mebibytes of relayed bytes: orders of magnitude above a real
+/// completion, and still a bound.
+fn default_max_stream_bytes() -> u64 {
+    64 * 1024 * 1024
 }
 
 fn default_max_error_bytes() -> u64 {
@@ -1595,10 +1760,12 @@ impl Config {
     }
 
     /// Bounds the process applies to itself, in both modes: per-phase upstream
-    /// limits, how often the file is re-read, and how long termination may take.
-    /// They are process-local serving parameters rather than durable resources,
-    /// so the control plane does not own them.
+    /// limits, the inbound admission ceilings, how often the file is re-read,
+    /// and how long termination may take. They are process-local serving
+    /// parameters rather than durable resources, so the control plane does not
+    /// own them.
     fn validate_process_local_bounds(&self) -> Result<(), ConfigError> {
+        self.validate_admission()?;
         for (field, value) in [
             ("connect_timeout_ms", self.transport.connect_timeout_ms),
             (
@@ -2286,6 +2453,59 @@ impl Config {
                         .into(),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// The admission bounds only mean anything as a set: a per-tenant ceiling
+    /// above the global one cannot isolate a tenant, and a queue is either sized
+    /// and time-bounded or absent.
+    fn validate_admission(&self) -> Result<(), ConfigError> {
+        let admission = &self.admission;
+        if admission.max_request_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "admission.max_request_bytes must be at least 1".into(),
+            ));
+        }
+        if admission.max_in_flight_per_tenant > 0 && admission.max_tenants == 0 {
+            return Err(ConfigError::Invalid(
+                "admission.max_tenants must be at least 1 when max_in_flight_per_tenant is set"
+                    .into(),
+            ));
+        }
+        if admission.max_in_flight > 0
+            && admission.max_in_flight_per_tenant > admission.max_in_flight
+        {
+            return Err(ConfigError::Invalid(format!(
+                "admission.max_in_flight_per_tenant ({}) must not exceed admission.max_in_flight \
+                 ({}): a per-tenant ceiling above the global one cannot isolate a tenant",
+                admission.max_in_flight_per_tenant, admission.max_in_flight
+            )));
+        }
+        if admission.max_in_flight > 0
+            && admission.max_in_flight_streams > 0
+            && admission.max_in_flight_streams > admission.max_in_flight
+        {
+            return Err(ConfigError::Invalid(format!(
+                "admission.max_in_flight_streams ({}) must not exceed admission.max_in_flight \
+                 ({}): a stream is an in-flight request",
+                admission.max_in_flight_streams, admission.max_in_flight
+            )));
+        }
+        if (admission.queue_capacity == 0) != (admission.queue_wait_ms == 0) {
+            return Err(ConfigError::Invalid(
+                "admission.queue_capacity and admission.queue_wait_ms must be set together: a \
+                 queue without a wait bound is unbounded latency, and a wait without a queue is \
+                 never used"
+                    .into(),
+            ));
+        }
+        if admission.queue_capacity > 0 && admission.max_in_flight == 0 {
+            return Err(ConfigError::Invalid(
+                "admission.queue_capacity requires admission.max_in_flight: nothing queues when \
+                 the global ceiling is off"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -3562,6 +3782,27 @@ env = "GW_ADMIN_BREAKGLASS"
                 .and_then(SecretStore::kek_reference),
             Some(("kek_env", "GW_SECRET_STORE_KEK"))
         );
+    }
+
+    /// `[admission]` bounds the process, not a durable resource, so the control
+    /// plane never owns it and a stateful replica must refuse a nonsensical
+    /// ceiling for the same reason a stateless one does: the alternative is a
+    /// gateway that boots and then refuses every request.
+    #[test]
+    fn stateful_mode_validates_the_process_local_admission_bounds() {
+        for (snippet, expected) in [
+            ("max_request_bytes = 0", "admission.max_request_bytes"),
+            (
+                "max_in_flight = 4\nmax_in_flight_per_tenant = 8",
+                "admission.max_in_flight_per_tenant",
+            ),
+            ("queue_capacity = 4", "admission.queue_wait_ms"),
+        ] {
+            let toml = format!("{STATEFUL}\n[admission]\n{snippet}\n");
+            let error = Config::from_toml_str(&toml)
+                .expect_err("a stateful replica refuses an invalid ceiling too");
+            assert!(error.to_string().contains(expected), "{snippet} => {error}");
+        }
     }
 
     /// The property ADR 0027 keeps from ADR 0017: one authority per resource

@@ -81,6 +81,8 @@ metric and a usage row can never disagree.
 | `axond.rate_limit.denials` | counter | — | Inbound concurrency admissions rejected. |
 | `axond.rate_limit.capacity_denials` | counter | — | In-memory admissions rejected because the bounded subject map is full. |
 | `axond.rate_limit.unavailable_denials` | counter | — | Redis rate-limit admissions denied because the store was unavailable. |
+| `axond.admission.in_flight` | up-down counter | `axond.admission.resource` | Admission capacity held right now, by resource: `request`, `stream`, `tenant`, `queue`. Bounded label set — no tenant, subject, or request identity. |
+| `axond.admission.rejections` | counter | `axond.admission.resource`, `axond.error.type` | Requests shed by admission control, by resource and stable error type. |
 
 ### What to alert on
 
@@ -93,6 +95,8 @@ metric and a usage row can never disagree.
 | A target is out | `axond.upstream.circuit_state = 2`, sustained | Every request is failing over (or failing) for that target. |
 | Budget denials | `axond.http.server.requests{status=429}` rising | Tenants are hitting their cap. |
 | Inbound concurrency denials | `axond.rate_limit.denials` rising | Authenticated callers are reaching their per-replica in-flight limit. |
+| Load shedding | `axond.admission.rejections` rising | Split by `axond.admission.resource`: `request` means the replica's own ceiling (scale out or raise it), `tenant` means one namespace's ceiling (the tenant's own traffic), `queue` means queueing is absorbing more than a burst. |
+| Admission saturation | `axond.admission.in_flight{axond.admission.resource="request"}` near `admission.max_in_flight` | Leading indicator of shedding; watch it before the rejections start. |
 | Budget store down | `axond.http.server.requests{status=503}` rising | Fail-closed denial: fix the store, or the whole tenant is refused. |
 | Config drift across the fleet | `axond.config.generation` differs between replicas | A replica missed a reload and is serving stale routing or keys. |
 | Rejected reloads | `axond.config.reloads{outcome="rejected"}` > 0 | Someone edited the config into an invalid state; the old one is still serving. |
@@ -133,6 +137,13 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | `502` | `upstream_transport`, `provider_dependency_failed`, `model_unavailable`, `invalid_stream` | The upstream failed after the failover walk was exhausted. | Check the provider's status and the attempt spans; `attempts` on the usage record says how hard the gateway tried. |
 | `504` | `upstream_timeout` | A transport bound fired before a response could be served: connecting, waiting for headers, reading a buffered body, waiting for the next chunk of an open stream, or the walk's budget running out. | `axond.upstream.timeouts{axond.timeout}` and the attempt span's `axond.timeout` name the phase; `axond.timeout.bound` names the bound. Tune the matching `[transport]` bound, or `overall_timeout_ms` when the bound is `walk_budget`. |
 | `502` | `upstream_body_too_large` | A buffered provider response exceeded `transport.max_response_bytes`, so it was refused instead of held in memory. | Raise `max_response_bytes` if the workload legitimately returns bodies that size; otherwise treat it as a misbehaving target. |
+| `429` | `tenant_concurrency_exceeded` | The caller's namespace is at `admission.max_in_flight_per_tenant` on this replica. The caller's own concurrency is the cause, so it is a `429` rather than a `503`. | Raise the per-tenant ceiling, or have the caller lower its concurrency. Carries `Retry-After: 1`. |
+| `503` | `gateway_overloaded`, `stream_capacity_exhausted` | The replica is at `admission.max_in_flight` (or `max_in_flight_streams`). Raised after authentication and before the rate-limit store, the budget reservation, and the provider, so a shed request costs nothing. | Scale out, or raise the ceilings to what one process can actually hold. `axond.admission.in_flight` says which resource ran out. |
+| `503` | `admission_queue_full`, `admission_queue_timeout` | Queueing is enabled and the queue is full, or a queued request outlived `admission.queue_wait_ms`. | Sustained shedding here means under-provisioning rather than burstiness; queueing only helps short bursts. |
+| `503` | `admission_tenant_capacity_exhausted` | More distinct namespaces were in flight than `admission.max_tenants`, so the admission table itself is full. | Raise `max_tenants`. No `Retry-After` is sent: waiting will not change it. |
+| `413` | `request_too_large`, `prompt_too_large` | The body exceeded `admission.max_request_bytes` (refused by the router before it was buffered), or the estimated input exceeded `admission.max_prompt_tokens`. | Caller-side fix, or raise the bound if the workload needs it. Neither message echoes the request. |
+| `415` | `unsupported_media_type` | The request did not declare `content-type: application/json`. Unchanged in status from earlier releases; only the body is now the typed JSON envelope. | Caller-side fix: send a JSON content type. |
+| `400` | `output_limit_exceeded` | The request asked for more output tokens than `admission.max_output_tokens`. Refused rather than clamped. | Lower the caller's output allowance or raise the ceiling. |
 | `503` | `continuation_affinity_unavailable` | A request carrying `previous_response_id` could not use the alias's pinned first target or credential, and continuity forbids substituting another. | Restore the first target/credential; retry later. An *initial* Responses request in the same state reports the ordinary error above instead. |
 
 `/v1/responses` records exactly one upstream attempt per request: it is pinned to
@@ -144,7 +155,12 @@ failing while chat on the same alias succeeds is that pin, not a routing bug.
 Mid-stream failures are different by construction. Native passthrough streams
 and OpenAI-normalized streams that have already queued downstream bytes remain
 terminal: the relay emits an SSE `error` event on the already-`200` response,
-and the usage record settles as `partial` or `upstream_error`. An
+and the usage record settles as `partial` or `upstream_error`. A stream ended by
+`admission.max_stream_duration_ms` or `admission.max_stream_bytes` arrives the
+same way — an already-`200` response, an SSE `error` event typed
+`upstream_stream_error` naming the bound, and a settled usage record — because
+its first bytes were committed before the bound fired. Alert on that event's
+type rather than on a status code. An
 OpenAI-normalized stream may instead rotate to the next pooled credential when
 an explicit upstream rate-limit event arrives before anything is queued
 downstream; the additional lease span remains under the original upstream

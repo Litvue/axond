@@ -30,6 +30,7 @@ egress: upstream provider calls still use the network at Tier 0.
 | `[server]`, `[[namespace]]`, `[[provider]]`, `[[model]]`, `[[credential]]` | Tier 0: config-only. |
 | `[credential_pool]`, `[failover]` | Tier 0: in-memory, per replica. |
 | `[transport]` | Tier 0: process-level bounds on provider egress. |
+| `[admission]` | Tier 0: in-memory per-replica request bounds and load shedding. |
 | `[[gateway_key]]`, `[gateway_token]`, `[[gateway_verifier]]`, `[[gateway_token_epoch]]`, offline `keygen`/`mint` | Tier 0: config, referenced files, and environment only. |
 | `[reload]` | Tier 0: reload reads the config file, referenced key-material files, and process environment. |
 | `[[usage_sink]]` omitted or `kind = "stdout"` | Tier 0: one JSON line on stdout. |
@@ -81,8 +82,8 @@ matrices before planning a deployment.
 ### Stateful bootstrap
 
 The whole file a stateful replica reads is `mode`, `[server]`, `[transport]`,
-`[reload]`, telemetry (`[[usage_sink]]`, plus the environment-only OTLP
-settings), the three sections below, and *backend selection with DSN references*
+`[admission]`, `[reload]`, telemetry (`[[usage_sink]]`, plus the environment-only
+OTLP settings), the three sections below, and *backend selection with DSN references*
 for the opt-in `[budget]`, `[rate_limit]`, and `[revocation]` backends.
 [`axond.stateful.example.toml`](../axond.stateful.example.toml) is that file with
 prose.
@@ -348,6 +349,111 @@ later targets get a turn.
 section is read at boot: a reload validates a changed `[transport]` and warns
 that a restart is needed to apply it, exactly as `[server] bind` behaves.
 
+## `[admission]` — request bounds and load shedding, Tier 0
+
+`[transport]` bounds what a provider may do to the gateway; this section bounds
+what callers may do to it. Two questions: how large one request may be, and how
+many may be in flight at once.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `max_request_bytes` | integer | `2097152` | Largest inbound request body accepted. Enforced by the router before the body is buffered, so an oversized request is refused rather than read. Must be ≥ 1. |
+| `max_prompt_tokens` | integer | `1000000` | Largest estimated input size a request may carry. `0` disables. Only binds below `max_request_bytes` / 4 — see below. |
+| `max_output_tokens` | integer | `200000` | Largest output allowance a request may ask for (`max_tokens`, `max_completion_tokens`, or `max_output_tokens`). Refused, not clamped, so the caller is never silently given a different request than it sent. `0` disables. |
+| `max_in_flight` | integer | `1024` | Concurrent requests this replica admits. `0` disables. |
+| `max_in_flight_streams` | integer | `512` | Of those, how many may be streams. A stream holds a socket and a relay task for as long as the answer lasts, so it is the scarcer resource. Must not exceed `max_in_flight` when both are set. `0` disables. |
+| `max_in_flight_per_tenant` | integer | `256` | Concurrent requests one namespace may hold, so one tenant cannot take the whole replica. Must not exceed `max_in_flight` when both are set. `0` disables. In a single-namespace deployment this, not `max_in_flight`, is the effective ceiling — see below. |
+| `max_tenants` | integer | `1024` | Distinct namespaces tracked concurrently. Bounds the admission table itself. |
+| `queue_capacity` | integer | `0` | Requests that may wait for capacity instead of being refused. `0` refuses immediately. |
+| `queue_wait_ms` | integer | `0` | How long a queued request waits before it is shed. Must be set together with `queue_capacity`, and queueing requires a finite `max_in_flight`. |
+| `max_stream_duration_ms` | integer | `3600000` | Total lifetime of one stream, however productive. Distinct from `transport.stream_idle_timeout_ms`, which bounds silence: this is the bound on a stream that never stops talking. Applies to a stream the caller is draining — see below. `0` disables. |
+| `max_stream_bytes` | integer | `67108864` | Bytes one stream may relay before it is ended. `0` disables. |
+
+Except for `max_request_bytes`, `0` means "this ceiling is off".
+
+The two input bounds are related, and the body bound wins ties. The estimate
+`max_prompt_tokens` is compared against is the serialized request divided by four
+bytes per token, and the router has already refused anything over
+`max_request_bytes`, so a prompt ceiling above `max_request_bytes` / 4 can never
+be reached: at the shipped defaults `max_request_bytes` alone refuses at roughly
+525 000 estimated tokens, well under the `1000000` ceiling. That pairing is
+deliberate — the shipped prompt ceiling refuses what no provider would serve,
+and the body ceiling is the operative input bound. Lower `max_prompt_tokens`
+below `max_request_bytes` / 4 if you want a prompt-shaped refusal
+(`413 prompt_too_large`) rather than a size-shaped one (`413 request_too_large`),
+or raise `max_request_bytes` to make the token ceiling the binding one.
+
+Three limits of these bounds are worth knowing before you tune them:
+
+- **A single-namespace deployment sheds at `max_in_flight_per_tenant`, not at
+  `max_in_flight`.** With one namespace serving all traffic the per-tenant
+  ceiling is the operative one, and it answers `429 tenant_concurrency_exceeded`
+  — which reads as a caller problem. Raise it to `max_in_flight`, or set it to
+  `0`, when one namespace is the whole deployment.
+- **`max_stream_duration_ms` and `max_stream_bytes` bound a stream the caller is
+  draining.** They are evaluated as the relay is polled, and a caller that stops
+  reading stops the polling, so a deliberately non-reading client can hold a
+  stream slot past its lifetime. Front axond with a proxy that enforces a
+  write/response timeout if untrusted clients can do that.
+- **`max_in_flight` bounds requests reaching a provider, not bodies in memory.**
+  Shedding happens after the body has been read and parsed, so
+  `max_request_bytes` is what bounds the pre-admission phase. Size the process's
+  memory against `max_request_bytes` times the connection concurrency your
+  ingress allows, not against `max_in_flight` alone.
+
+### Where shedding happens
+
+Admission is taken *after* authentication and *before* the rate-limit store, the
+budget reservation, and the provider call. Unauthenticated traffic therefore
+cannot consume capacity (authentication stays fail-closed), and an overloaded
+replica spends no round trips to say no. Each answer is typed and stable:
+
+| Status | `error.type` | Cause |
+| --- | --- | --- |
+| `429` | `tenant_concurrency_exceeded` | The caller's namespace is at `max_in_flight_per_tenant`. The caller's own traffic is the cause, so it is a `429`. |
+| `503` | `gateway_overloaded` | The replica is at `max_in_flight`. |
+| `503` | `stream_capacity_exhausted` | No stream slot free. |
+| `503` | `admission_queue_full` | The queue is at `queue_capacity`. |
+| `503` | `admission_queue_timeout` | Queued, then `queue_wait_ms` elapsed. |
+| `503` | `admission_tenant_capacity_exhausted` | More distinct namespaces in flight than `max_tenants`. |
+| `413` | `request_too_large` / `prompt_too_large` | A per-request size bound. |
+| `400` | `output_limit_exceeded` | A requested output allowance above the ceiling. |
+
+Shed classes that a retry can plausibly clear carry `Retry-After: 1`, an honest
+lower bound rather than a guess at when capacity returns. Tenant-table
+exhaustion does not: nothing the caller can wait for will change it.
+
+A tenant refused at its own ceiling never takes a global slot or a queue slot, so
+a saturated tenant cannot crowd out a quiet one. Permits are released
+synchronously on drop, which covers a returned handler, a provider failure, a
+cancelled request, an abandoned queue waiter, and — because the permit is moved
+into the relay's accounting — a stream that completes, is cancelled mid-answer,
+or is cut off by its own duration or byte bound.
+
+### Queueing or refusing
+
+`queue_capacity = 0` is the default: a saturated replica answers immediately,
+which is something a caller can act on. Queueing trades that for latency the
+caller cannot see, and is worth it only for short bursts where a brief wait beats
+a retry. Set `queue_capacity` and `queue_wait_ms` together; a queue with no wait
+bound is a queue that hides an outage.
+
+### Sizing across replicas
+
+Every ceiling here is per replica and in process memory. The gateway is stateless
+(Tier 0), so a fleet of *N* replicas admits *N* × `max_in_flight` requests, and a
+tenant behind a round-robin load balancer gets *N* × `max_in_flight_per_tenant`.
+Size these from what one process can hold — sockets, relay tasks, buffered bodies
+— and use the shared-store `[rate_limit]` for the fleet-wide bound on a subject's
+request *rate*, which is a different question from concurrency. Fleet-wide
+admission policy is left to the stateful-policy work in #150; this section is the
+per-replica floor it will build on.
+
+The ceilings own semaphores built at boot, so a reload validates a changed
+`[admission]` and warns that a restart is needed to apply it, exactly as
+`[transport]` behaves
+([ADR 0030](./adr/0030-request-bounds-and-load-shedding.md)).
+
 ## `[[gateway_key]]` — inbound authentication (required, Tier 0)
 
 | Key | Type | Default | Meaning |
@@ -512,8 +618,8 @@ or via an atomic rename is therefore reload-reachable without a process
 restart. `[[namespace]]` changes are reloadable and appear in the reported
 namespace delta, but the namespace count used for in-memory budget retention
 floors is captured at boot and does not resize until restart. `[server] bind`,
-`[transport]`, `[[usage_sink]]`, `[budget]`, `[rate_limit]`, and `[revocation]`
-changes warn and are ignored until restart; this includes
+`[transport]`, `[admission]`, `[[usage_sink]]`, `[budget]`, `[rate_limit]`, and
+`[revocation]` changes warn and are ignored until restart; this includes
 `limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
 
 ## `[[usage_sink]]` — Tier 0 by default; Tier 2 for `postgres`

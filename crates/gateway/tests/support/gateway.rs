@@ -62,6 +62,9 @@ pub const OUTPUT_PRICE: u64 = 10_000_000;
 /// process, so differently tuned boots cannot share a file.
 static CONFIGS: AtomicU64 = AtomicU64::new(0);
 
+/// How many ephemeral ports a boot may lose before the suite gives up.
+const BOOT_ATTEMPTS: u32 = 4;
+
 pub struct Axond {
     pub base_url: String,
     child: Child,
@@ -77,6 +80,23 @@ impl Axond {
     /// Boot with `tuning` — TOML replacing the default `[failover]` section and
     /// carrying any `[transport]` bounds the suite wants to exercise.
     pub async fn start_with(upstream_base_url: &str, tuning: &str) -> Self {
+        // `free_addr` closes its listener before the binary binds it, so a
+        // sibling test process can take the port in between. That race is the
+        // ephemeral-port allocator's, not the gateway's, so a lost boot is
+        // retried on a fresh port rather than failing the suite.
+        for _ in 1..BOOT_ATTEMPTS {
+            if let Some(gateway) = Self::try_start(upstream_base_url, tuning).await {
+                return gateway;
+            }
+        }
+        Self::try_start(upstream_base_url, tuning)
+            .await
+            .expect("axond becomes healthy on a free port")
+    }
+
+    /// One boot attempt: `None` when the process never became healthy, which on
+    /// a loopback port means someone else won the bind.
+    async fn try_start(upstream_base_url: &str, tuning: &str) -> Option<Self> {
         let dir = std::env::temp_dir().join(format!(
             "axond-compat-{}-{}",
             std::process::id(),
@@ -124,16 +144,17 @@ impl Axond {
             });
         }
 
-        let gateway = Self {
+        let mut gateway = Self {
             base_url: format!("http://{addr}"),
             child,
             lines,
         };
-        gateway.await_ready().await;
-        gateway
+        gateway.await_ready().await.then_some(gateway)
     }
 
-    async fn await_ready(&self) {
+    /// Whether the process is serving. A boot that loses its port is reported
+    /// rather than panicked on, so the caller can retry it.
+    async fn await_ready(&mut self) -> bool {
         let client = reqwest::Client::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
@@ -143,11 +164,22 @@ impl Axond {
                 .await
                 && response.status().is_success()
             {
-                return;
+                return true;
+            }
+            if let Ok(Some(_)) = self.child.try_wait() {
+                // The process is gone. A refused config is a test bug rather
+                // than a lost race, so that fails loudly; anything else (a
+                // sibling taking the port) is the caller's to retry.
+                let output = self.output();
+                assert!(
+                    !output.contains("invalid config"),
+                    "axond refused the test config:\n{output}"
+                );
+                return false;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        panic!("axond did not become healthy:\n{}", self.output());
+        false
     }
 
     pub fn url(&self, path: &str) -> String {

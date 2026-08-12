@@ -72,7 +72,8 @@ remain replica-local unless a shared backend is selected:
 - credential and target circuit state;
 - round-robin/weighted cursors;
 - in-memory budgets;
-- in-memory rate limits.
+- in-memory rate limits;
+- `[admission]` request bounds and load shedding.
 
 Use Redis or Postgres when a control must be exact across replicas. See
 [Stateful backends](./stateful-backends.md).
@@ -80,6 +81,23 @@ Use Redis or Postgres when a control must be exact across replicas. See
 Do not add an HPA blindly. Base it on measured concurrency or request metrics,
 then verify that scale-out does not change the semantics of any intentionally
 in-memory control.
+
+Admission is the sharpest case of that. `[admission]` ceilings are per replica,
+so a fleet of *N* Pods admits *N* x `max_in_flight`, and one tenant behind the
+Service gets *N* x `max_in_flight_per_tenant`. Size them from what a single Pod
+can hold — `resources.limits.memory` against several times `max_in_flight` x
+`max_request_bytes`, since a buffered body also costs a parsed JSON value, a
+re-serialization for the usage estimate, and a clone per failover attempt, and
+the node's descriptor budget against the sockets an in-flight stream holds — and
+treat `axond.admission.rejections` rising as either a saturation signal for the
+HPA or a ceiling set below what the Pod can serve.
+The base overlay sets these explicitly for its own 512Mi limit rather than
+inheriting the built-in defaults — a 1 MiB body ceiling and 32 in-flight
+requests, so worst-case bodies stay a small fraction of the limit; change them
+together. It also leaves `max_in_flight_per_tenant` at `0`, because the manifest
+declares a single namespace: a per-tenant ceiling below `max_in_flight` would be
+the ceiling all traffic meets, and it would answer `429` where the Pod's own
+saturation should answer `503`. Set it when a second namespace exists.
 
 ## Ingress and streaming
 
