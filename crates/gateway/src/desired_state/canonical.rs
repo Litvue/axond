@@ -258,7 +258,13 @@ impl CanonicalValue {
                         Ok((key.as_str(), bytes))
                     })
                     .collect::<Result<Vec<_>, CanonicalError>>()?;
-                encoded.sort_unstable_by(|left, right| left.0.cmp(right.0));
+                // By encoded key bytes — length first, then content — not by the
+                // key string, so the rule another encoder has to reproduce is
+                // "sort the bytes you just wrote" rather than a locale- or
+                // collation-shaped comparison of strings.
+                encoded.sort_unstable_by(|left, right| {
+                    (left.0.len(), left.0).cmp(&(right.0.len(), right.0))
+                });
                 if let Some(pair) = encoded.windows(2).find(|pair| pair[0].0 == pair[1].0) {
                     return Err(CanonicalError::DuplicateKey {
                         key: pair[0].0.to_owned(),
@@ -347,23 +353,38 @@ impl Checksum {
         &self.0
     }
 
+    /// Parse the text form. Total on arbitrary input: the alphabet is checked
+    /// before any indexing, so operator- or storage-supplied text is refused
+    /// rather than able to panic a parsing task, and there is no second spelling
+    /// of a digest — no uppercase, no sign, no shorter or longer form.
     pub fn parse(text: &str) -> Result<Self, InvalidChecksum> {
         let digits = text
             .strip_prefix(CHECKSUM_ALGORITHM)
             .and_then(|rest| rest.strip_prefix(':'))
             .ok_or_else(|| InvalidChecksum::Algorithm(text.to_owned()))?;
-        if digits.len() != 64 {
+        // Lowercase hex only, checked over bytes before anything is indexed:
+        // uppercase would be a second spelling of one digest, and a length check
+        // alone would let a multi-byte character be sliced mid-codepoint.
+        let digits = digits.as_bytes();
+        if digits.len() != 64 || !digits.iter().all(|digit| nibble(*digit).is_some()) {
             return Err(InvalidChecksum::Digits(text.to_owned()));
         }
         let mut bytes = [0u8; 32];
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&digits[index * 2..index * 2 + 2], 16)
-                .map_err(|_| InvalidChecksum::Digits(text.to_owned()))?;
-        }
-        if digits.chars().any(|c| c.is_ascii_uppercase()) {
-            return Err(InvalidChecksum::Digits(text.to_owned()));
+        for (byte, pair) in bytes.iter_mut().zip(digits.chunks_exact(2)) {
+            let high = nibble(pair[0]).expect("checked above");
+            let low = nibble(pair[1]).expect("checked above");
+            *byte = (high << 4) | low;
         }
         Ok(Self(bytes))
+    }
+}
+
+/// One lowercase hex digit's value, or `None` for anything else.
+const fn nibble(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        _ => None,
     }
 }
 
@@ -435,6 +456,30 @@ mod tests {
             first.to_canonical_bytes().unwrap(),
             flipped.to_canonical_bytes().unwrap()
         );
+    }
+
+    #[test]
+    fn map_keys_are_ordered_by_their_encoded_bytes() {
+        // Length first, then content: the rule a second encoder reproduces is
+        // "sort the bytes you just wrote", which for length-prefixed keys puts
+        // `b` before `ab` even though `"ab" < "b"` as strings.
+        let value = map(&[
+            ("ab", CanonicalValue::Bool(true)),
+            ("b", CanonicalValue::Bool(false)),
+        ]);
+        let bytes = value.to_canonical_bytes().unwrap();
+        let short = CanonicalValue::string("b").to_canonical_bytes().unwrap();
+        let long = CanonicalValue::string("ab").to_canonical_bytes().unwrap();
+        let prefix = SerializerVersion::MAGIC.len() + 1;
+        let first = bytes
+            .windows(short.len() - prefix)
+            .position(|window| window == &short[prefix..])
+            .expect("the shorter key is encoded");
+        let second = bytes
+            .windows(long.len() - prefix)
+            .position(|window| window == &long[prefix..])
+            .expect("the longer key is encoded");
+        assert!(first < second);
     }
 
     #[test]
@@ -605,6 +650,23 @@ mod tests {
             ),
             "one text form only, so equality never depends on hex case"
         );
+        // Parsing is total on arbitrary text: 64 *bytes* of multi-byte
+        // characters must be refused rather than sliced mid-codepoint, and a
+        // sign must not smuggle in a second spelling of a digest.
+        let multibyte = format!("sha256:{}{}", "\u{20ac}".repeat(21), "0");
+        assert_eq!(multibyte.len() - "sha256:".len(), 64);
+        assert!(matches!(
+            Checksum::parse(&multibyte),
+            Err(InvalidChecksum::Digits(_))
+        ));
+        assert!(matches!(
+            Checksum::parse(&format!("sha256:+f{}", "0".repeat(62))),
+            Err(InvalidChecksum::Digits(_))
+        ));
+        assert!(matches!(
+            Checksum::parse("sha256:"),
+            Err(InvalidChecksum::Digits(_))
+        ));
         assert_eq!(
             Checksum::from_bytes(*checksum.as_bytes()),
             checksum,
