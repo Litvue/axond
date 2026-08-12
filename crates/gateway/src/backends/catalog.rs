@@ -1750,6 +1750,28 @@ pub enum Admission {
 /// [`LastKnownGoodCatalog::admit_result`]; there is no other way to make content
 /// active, so "a malformed payload cannot replace the active catalogue" is a
 /// property of the type rather than of each caller remembering to check.
+///
+/// # Staleness must not be silent
+///
+/// A refusal is durable by design — the previously admitted content stays active
+/// — which means a *persistent* refusal is a catalogue that has stopped
+/// advancing. Nothing in this slice can raise that alarm, because refresh is not
+/// scheduled here: the source is
+/// [`BackendPath::Background`](super::BackendPath::Background) and is driven by a
+/// caller that does not exist yet. So the contract is placed on that caller,
+/// and this type is built to make it keepable rather than optional:
+/// [`LastKnownGoodCatalog::admit_result`] hands back the typed error *and* the
+/// snapshot that stayed active, so a scheduler cannot observe a refusal without
+/// also holding the thing that went stale, and every rejection carries a JSON
+/// Pointer to the location that caused it.
+///
+/// Whoever schedules refresh must therefore ship, with it: a refusal counter
+/// labelled by reason, the active snapshot's
+/// [`SourceSnapshot::fetched_at`] exported as an age, and an alert when refusals
+/// persist across more than one interval — tracked in
+/// [#241](https://github.com/Litvue/axond/issues/241). Staleness degrades
+/// metadata quality only: no enablement, admission, or billing decision reads
+/// this snapshot, so a stale catalogue is never an outage.
 #[derive(Debug, Default)]
 pub struct LastKnownGoodCatalog {
     active: Option<CatalogSnapshot>,

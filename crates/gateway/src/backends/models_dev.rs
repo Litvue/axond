@@ -1948,15 +1948,21 @@ mod tests {
             "price-precision",
             "empty",
             "control-character",
+            "model-key-ambiguous",
         ] {
             let (error, active) = catalogue
                 .admit_result(parse(drift(name)))
                 .expect_err("a drifted payload is refused");
             assert!(!error.to_string().is_empty());
+            let active = active.expect("the refusal hands back what stayed active");
             assert_eq!(
-                active.map(|snapshot| snapshot.source.content_id),
-                Some(content_id),
+                active.source.content_id, content_id,
                 "`{name}` must not disturb the active catalogue"
+            );
+            assert!(
+                active.source.fetched_at <= SystemTime::now(),
+                "`{name}`'s refusal must expose how old the catalogue it kept is, \
+                 so a scheduler cannot report a refusal without its staleness"
             );
         }
         assert_eq!(

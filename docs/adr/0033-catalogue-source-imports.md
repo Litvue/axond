@@ -125,6 +125,22 @@ operational signal and a refusal has to be visible to an operator. Fields the
 adapter does not model are ignored, so an upstream *addition* never has that
 effect.
 
+That visibility cannot be built here, because this slice does not schedule
+anything: the source is background-only and has no caller yet. The contract is
+therefore stated for the slice that will drive it, and the domain is shaped to
+make it keepable — `admit_result` returns the typed rejection *together with* the
+snapshot that stayed active, so a refusal cannot be observed without the stale
+thing in hand, and every rejection names a JSON Pointer. Scheduled refresh must
+ship with a refusal counter labelled by reason, the active snapshot's
+`fetched_at` exported as an age, and an alert when refusals persist across more
+than one interval; that work is [issue #241][241]. Until then no catalogue is
+refreshed automatically at all, so there is no unattended staleness to miss:
+without a configured source the compiled-in seed is the catalogue, and because
+metadata is never an entitlement or admission input, a stale catalogue degrades
+metadata quality rather than availability.
+
+[241]: https://github.com/Litvue/axond/issues/241
+
 The compiled-in seed adds bytes to the binary and one more thing to keep
 plausible as the upstream evolves. It is what makes the catalogue testable
 hermetically and available with no network at all, and because it is parsed by
