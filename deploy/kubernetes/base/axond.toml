@@ -36,11 +36,17 @@ targets = [
 # limit headroom for the runtime instead of racing it. Raise these together with
 # `resources.limits.memory`, and use the shared-store `[rate_limit]` for
 # fleet-wide limits on one subject.
+#
+# The per-tenant ceiling is off because this manifest declares one namespace: a
+# per-tenant ceiling below `max_in_flight` would be the ceiling all traffic
+# meets, and it would answer `429 tenant_concurrency_exceeded` — pointing an
+# operator at the caller rather than at the pod. Set it once a second namespace
+# exists and one tenant must not take the whole replica.
 [admission]
 max_request_bytes = 1_048_576
 max_in_flight = 32
 max_in_flight_streams = 16
-max_in_flight_per_tenant = 8
+max_in_flight_per_tenant = 0
 max_tenants = 256
 queue_capacity = 0
 queue_wait_ms = 0

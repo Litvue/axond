@@ -90,7 +90,10 @@ HPA or a ceiling set below what the Pod can serve.
 The base overlay sets these explicitly for its own 512Mi limit rather than
 inheriting the built-in defaults — a 1 MiB body ceiling and 32 in-flight
 requests, so worst-case bodies stay a small fraction of the limit; change them
-together.
+together. It also leaves `max_in_flight_per_tenant` at `0`, because the manifest
+declares a single namespace: a per-tenant ceiling below `max_in_flight` would be
+the ceiling all traffic meets, and it would answer `429` where the Pod's own
+saturation should answer `503`. Set it when a second namespace exists.
 
 ## Ingress and streaming
 
