@@ -479,6 +479,23 @@ mod tests {
                 .expose(),
             "sk-live-2"
         );
+
+        // Rotating again from the *old* reference is a stale request, not a
+        // second rotation: version 2 already exists, and overwriting it would
+        // change what a credential body already pinning it resolves to.
+        let error = store
+            .rotate(owner(), &first, SecretMaterial::new("sk-live-3".to_owned()))
+            .await
+            .expect_err("a version is immutable once it is stored");
+        assert_eq!(error.category(), FailureCategory::Invalid);
+        assert_eq!(
+            store
+                .resolve(owner(), &second.reference)
+                .await
+                .unwrap()
+                .expose(),
+            "sk-live-2"
+        );
     }
 
     #[tokio::test]

@@ -224,6 +224,12 @@ impl SecretStore for InMemorySecrets {
             });
         }
         let rotated = reference.rotated();
+        // A version is immutable, so rotating twice from one base reference is a
+        // stale request rather than a second rotation: overwriting would change
+        // what a credential body already pinning `rotated` resolves to.
+        if entries.contains_key(&rotated) {
+            return Err(SecretError::Invalid(format!("{rotated} already exists")));
+        }
         let kek = self.kek.lock().expect("not poisoned").clone();
         entries.insert(
             rotated,
