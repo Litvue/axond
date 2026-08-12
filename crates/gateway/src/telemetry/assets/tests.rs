@@ -299,6 +299,53 @@ fn grouping_by_a_label_the_instrument_does_not_declare_is_refused() {
     );
 }
 
+/// The grouping label belongs to the arm that aggregates it, not to the
+/// expression. A ratio whose numerator can carry the breakdown does not license
+/// the denominator, which cannot.
+#[test]
+fn a_compound_expression_is_judged_arm_by_arm() {
+    let failures = dashboard_failures(
+        "sum by (axond_namespace) (rate(axond_request_count[5m])) / sum by (axond_namespace) (rate(axond_status_refreshes[5m]))",
+    );
+    assert!(
+        matches!(
+            failures.as_slice(),
+            [AssetError::Catalog {
+                source: catalog::CatalogError::UndeclaredLabel { metric, key },
+                ..
+            }] if metric == "axond.status.refreshes" && key == "axond_namespace"
+        ),
+        "{failures:?}"
+    );
+    // The same two instruments, with the breakdown only on the arm that declares
+    // it: the ungrouped arm is not asked to carry a label it never groups by.
+    assert_eq!(
+        dashboard_failures(
+            "sum by (axond_namespace) (rate(axond_request_count[5m])) / sum(rate(axond_status_refreshes[5m]))"
+        ),
+        Vec::new()
+    );
+}
+
+/// A grouping label over series we do not catalogue — a recording rule, a
+/// `vector(0)` guard — is not ours to judge, and must not be refused as drift.
+/// The expression is still refused for naming nothing of ours, which is the
+/// separate check.
+#[test]
+fn grouping_over_series_we_do_not_catalogue_is_not_drift() {
+    assert!(matches!(
+        dashboard_failures("sum by (namespace) (job:axond_requests:rate5m) or vector(0)")
+            .as_slice(),
+        [AssetError::NoMetricReference { .. }]
+    ));
+    assert_eq!(
+        dashboard_failures(
+            "sum by (axond_status_component) (rate(axond_status_refreshes[5m])) or on() vector(0)"
+        ),
+        Vec::new()
+    );
+}
+
 #[test]
 fn a_panel_that_queries_nothing_of_ours_is_refused() {
     assert!(matches!(
@@ -419,7 +466,14 @@ fn the_lexer_separates_metrics_from_grouping_labels_and_functions() {
             .collect::<Vec<_>>(),
         vec!["axond_request_duration_bucket"]
     );
-    assert_eq!(found.grouping, vec!["le", "axond_namespace"]);
+    assert_eq!(
+        found
+            .grouping
+            .iter()
+            .map(|grouping| (grouping.label.as_str(), grouping.selectors.as_slice()))
+            .collect::<Vec<_>>(),
+        vec![("le", &[0usize][..]), ("axond_namespace", &[0usize][..])]
+    );
     assert_eq!(
         found.selectors[0].matchers,
         vec![Matcher {

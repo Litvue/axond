@@ -173,12 +173,32 @@ struct Selector {
 }
 
 /// What an expression names: the series it selects, and the labels it aggregates
-/// by. Both drift, and a grouping label no selected instrument declares collapses
-/// a panel into one meaningless series rather than failing.
+/// by. Both drift, and a grouping label the aggregated instrument does not
+/// declare collapses a panel into one meaningless series rather than failing.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Expression {
     selectors: Vec<Selector>,
-    grouping: Vec<String>,
+    grouping: Vec<Grouping>,
+}
+
+/// One label in an aggregation modifier, bound to the selectors that aggregation
+/// actually applies to. A compound expression aggregates each of its arms
+/// separately — `sum by (a) (x) / sum(y)` groups `x` and not `y` — so a grouping
+/// label is only answerable against the arm it modifies.
+#[derive(Debug, PartialEq, Eq)]
+struct Grouping {
+    label: String,
+    /// Indexes into [`Expression::selectors`].
+    selectors: Vec<usize>,
+}
+
+/// An open aggregation body: the labels its modifier named, and the selectors
+/// found inside it so far.
+#[derive(Debug)]
+struct Scope {
+    labels: Vec<String>,
+    body_depth: usize,
+    selectors: Vec<usize>,
 }
 
 /// The histogram bucket boundary: carried by every histogram, declared by none.
@@ -207,6 +227,11 @@ fn selectors(expr: &str) -> Result<Expression, String> {
     // Set when the previous identifier was an aggregation modifier, so the
     // identifiers in the parenthesised list that follows are label keys.
     let mut grouping_depth: Option<usize> = None;
+    // The labels of the modifier list being read, then of a closed list waiting
+    // for the body it modifies.
+    let mut reading: Vec<String> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    let mut open: Vec<Scope> = Vec::new();
     let mut depth = 0usize;
 
     while index < bytes.len() {
@@ -214,12 +239,23 @@ fn selectors(expr: &str) -> Result<Expression, String> {
         match character {
             '(' => {
                 depth += 1;
+                if !pending.is_empty() {
+                    open.push(Scope {
+                        labels: std::mem::take(&mut pending),
+                        body_depth: depth,
+                        selectors: Vec::new(),
+                    });
+                }
                 index += 1;
             }
             ')' => {
                 depth = depth.saturating_sub(1);
                 if grouping_depth == Some(depth + 1) {
                     grouping_depth = None;
+                    pending = std::mem::take(&mut reading);
+                }
+                while open.last().is_some_and(|scope| scope.body_depth > depth) {
+                    close_scope(&mut open, &mut found.grouping);
                 }
                 index += 1;
             }
@@ -268,21 +304,54 @@ fn selectors(expr: &str) -> Result<Expression, String> {
                     continue;
                 }
                 if grouping_depth.is_some() {
-                    found.grouping.push(word);
+                    reading.push(word);
                     continue;
                 }
                 if KEYWORDS.contains(&word.as_str()) {
                     continue;
                 }
+                let position = found.selectors.len();
                 found.selectors.push(Selector {
                     family: word,
                     matchers: Vec::new(),
                 });
+                for scope in &mut open {
+                    scope.selectors.push(position);
+                }
             }
             _ => index += 1,
         }
     }
+    while !open.is_empty() {
+        close_scope(&mut open, &mut found.grouping);
+    }
+    // A trailing modifier — `sum(x) by (a)` — names its labels after the body it
+    // modifies, so there is no scope left to bind them to. Bind them to every
+    // selector in the expression, which is the strictest reading available.
+    if !pending.is_empty() {
+        let every = (0..found.selectors.len()).collect::<Vec<_>>();
+        for label in pending {
+            found.grouping.push(Grouping {
+                label,
+                selectors: every.clone(),
+            });
+        }
+    }
     Ok(found)
+}
+
+/// Retire the innermost open aggregation body, recording one [`Grouping`] per
+/// label it named.
+fn close_scope(open: &mut Vec<Scope>, grouping: &mut Vec<Grouping>) {
+    let Some(scope) = open.pop() else {
+        return;
+    };
+    for label in scope.labels {
+        grouping.push(Grouping {
+            label,
+            selectors: scope.selectors.clone(),
+        });
+    }
 }
 
 /// Whether an identifier is a function or aggregation name rather than a metric
@@ -359,8 +428,10 @@ pub fn validate_expression(asset: &str, expr: &str) -> Vec<AssetError> {
         Err(message) => return vec![AssetError::malformed(asset, message)],
     };
     let mut spelled_like_ours = 0usize;
-    let mut selected: Vec<&'static MetricSpec> = Vec::new();
-    for selector in &found.selectors {
+    // Position in `found.selectors` to the instrument it resolved to, so a
+    // grouping label can be asked of the series it actually aggregates.
+    let mut selected: BTreeMap<usize, &'static MetricSpec> = BTreeMap::new();
+    for (position, selector) in found.selectors.iter().enumerate() {
         if !selector.family.starts_with("axond") {
             // Recording rules, `vector(0)` arguments, and a scrape's own labels
             // are not ours to catalogue. Anything spelled like one of our
@@ -376,7 +447,7 @@ pub fn validate_expression(asset: &str, expr: &str) -> Vec<AssetError> {
             });
             continue;
         };
-        selected.push(spec);
+        selected.insert(position, spec);
         for matcher in &selector.matchers {
             let Some(canonical) = canonical_label(spec, &matcher.key) else {
                 failures.push(AssetError::Catalog {
@@ -398,31 +469,30 @@ pub fn validate_expression(asset: &str, expr: &str) -> Vec<AssetError> {
             }
         }
     }
-    // A grouping label has to be declared by something the expression selects,
-    // or the aggregation silently produces one series where the panel promised a
-    // breakdown.
-    for label in &found.grouping {
-        if IMPLICIT_LABELS.contains(&label.as_str()) {
+    // Every instrument the aggregation groups has to declare the grouping label.
+    // Asking only that *some* instrument in the expression declares it would
+    // pass a compound expression whose grouped arm cannot carry the breakdown,
+    // which silently produces one series where the panel promised a split.
+    for grouping in &found.grouping {
+        if IMPLICIT_LABELS.contains(&grouping.label.as_str()) {
             continue;
         }
-        if selected.is_empty()
-            || selected
-                .iter()
-                .any(|spec| canonical_label(spec, label).is_some())
-        {
-            continue;
+        for position in &grouping.selectors {
+            let Some(spec) = selected.get(position) else {
+                // Not one of ours, or already refused as an unknown family.
+                continue;
+            };
+            if canonical_label(spec, &grouping.label).is_some() {
+                continue;
+            }
+            failures.push(AssetError::Catalog {
+                asset: asset.to_owned(),
+                source: catalog::CatalogError::UndeclaredLabel {
+                    metric: spec.name.to_owned(),
+                    key: grouping.label.clone(),
+                },
+            });
         }
-        failures.push(AssetError::Catalog {
-            asset: asset.to_owned(),
-            source: catalog::CatalogError::UndeclaredLabel {
-                metric: selected
-                    .iter()
-                    .map(|spec| spec.name)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                key: label.clone(),
-            },
-        });
     }
     if spelled_like_ours == 0 {
         failures.push(AssetError::NoMetricReference {
