@@ -169,12 +169,14 @@ never overridden by a datastore. See the
 [stateful deployment guide](./docs/deployment/stateful-backends.md) and
 [ADR 0017](./docs/adr/0017-state-tiers-and-optional-backends.md).
 
-Tiers describe dependencies; *operating modes* describe ownership. Axond runs the
-stateless mode today, where TOML is the authority. The accepted design for an
-opt-in stateful mode — durable resources in Postgres, `/admin/v1` administration,
-and inference still served from one immutable in-memory snapshot — is
-[ADR 0027](./docs/adr/0027-stateless-and-stateful-operating-modes.md). It is not
-implemented, and stateless remains the default.
+Tiers describe dependencies; *operating modes* describe ownership. Stateful
+bootstrap configuration is shipped, but the durable control plane is not.
+Stateless remains the default, where TOML is the authority. The accepted design
+for an opt-in stateful mode — durable resources in Postgres, `/admin/v1`
+administration, and inference still served from one immutable in-memory
+snapshot — is [ADR 0027](./docs/adr/0027-stateless-and-stateful-operating-modes.md).
+The stateful bootstrap currently validates its references and then refuses to
+start until the control-plane implementation is available.
 
 ## Security model
 
