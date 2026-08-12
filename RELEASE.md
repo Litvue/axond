@@ -1,6 +1,6 @@
 # Public beta release status
 
-Axond `v0.3.1` is publicly released. This file records the current release
+Axond `v0.3.2` is publicly released. <!-- x-release-please-version --> This file records the current release
 evidence and known limitations; the reusable process lives in the
 [maintainer release runbook](./docs/maintainers/releasing.md).
 
@@ -10,19 +10,20 @@ evidence and known limitations; the reusable process lives in the
 | --- | --- | --- |
 | Required routes, failover, credential pools, identity, controls, telemetry, and durable usage are implemented | Met | Compatibility contract, ADRs, unit/integration tests, SDK compatibility, stateful tests, Tier 0 gate, and stream soak. |
 | Public source repository | Met | `https://github.com/Litvue/axond`. |
-| Cross-platform release archives | Met | `v0.3.1` release contains Linux GNU/musl, Apple Silicon macOS, and Windows archives, checksums, SBOMs, and provenance. |
-| Public OCI image | Met | `ghcr.io/litvue/axond:0.3.1` is public, smoke-tested, signed keylessly, and carries provenance/SBOM attestations. |
-| crates.io workspace | Met | `gateway-core`, `gateway-transport`, and `axond` `0.3.1` were published in dependency order. |
+| Cross-platform release archives | Met | `v0.3.2` release contains Linux GNU/musl, Apple Silicon macOS, and Windows archives, checksums, SBOMs, and provenance. <!-- x-release-please-version --> |
+| Public OCI image | Met | `ghcr.io/litvue/axond:0.3.2` is public, smoke-tested, signed keylessly, and carries provenance/SBOM attestations. <!-- x-release-please-version --> |
+| crates.io workspace | Met | `gateway-core`, `gateway-transport`, and `axond` `0.3.2` were published in dependency order. <!-- x-release-please-version --> |
 | Deployment/configuration/operator documentation | Met | Task-oriented documentation index, executable examples, references, and runbooks under `docs/`. |
 
-The successful release repair run is
-<https://github.com/Litvue/axond/actions/runs/31547811397>.
+Current artifacts and workflow evidence are available from the
+[GitHub release](https://github.com/Litvue/axond/releases/latest) and
+[Release workflow history](https://github.com/Litvue/axond/actions/workflows/release-please.yml).
 
 ## Verify as an adopter
 
 ```bash
-cargo install axond --version 0.3.1 --locked
-cargo add gateway-core@0.3.1 gateway-transport@0.3.1
+cargo install axond --version 0.3.2 --locked # x-release-please-version
+cargo add gateway-core@0.3.2 gateway-transport@0.3.2 # x-release-please-version
 ```
 
 Verify binaries and the OCI image with the commands in

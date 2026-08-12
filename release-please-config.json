@@ -33,6 +33,10 @@
         },
         {
           "type": "generic",
+          "path": "RELEASE.md"
+        },
+        {
+          "type": "generic",
           "path": "docs/installation.md"
         },
         {
