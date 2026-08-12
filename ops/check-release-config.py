@@ -46,7 +46,7 @@ IMAGE_PLATFORMS = {"linux/amd64", "linux/arm64"}
 # hosts unable to pull an image that has no ARM child yet. The moment
 # release-please bumps the pinned tag past it, the fallback is wrong and this
 # check demands the unpinned form, so the transition cannot be forgotten.
-LAST_AMD64_ONLY_VERSION = (0, 3, 15)
+LAST_AMD64_ONLY_VERSION = (0, 3, 16)
 # Paths the repair dispatch needs in the tag it rebuilds. A tag lacking any of
 # them cannot publish or verify the image index, so the preflight refuses.
 REPAIR_REQUIRED_PATHS = (

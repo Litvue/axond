@@ -82,10 +82,10 @@ amd64-only image at all. The first release that publishes a `linux/amd64` +
 `ops/check-release-config.py` says so on every subsequent run:
 
 ```
-release configuration note: docker-compose.yml: the pinned tag 0.3.16 publishes a
+release configuration note: docker-compose.yml: the pinned tag 0.3.17 publishes a
 multi-architecture image, so the amd64 fallback now only forces emulation on ARM
 hosts; switch to `platform: ${AXOND_PLATFORM-}` and bump
-LAST_AMD64_ONLY_VERSION to 0.3.16
+LAST_AMD64_ONLY_VERSION to 0.3.17
 ```
 
 It is a note, not a failure, because release-please bumps the pinned tag inside
