@@ -29,6 +29,7 @@ egress: upstream provider calls still use the network at Tier 0.
 | --- | --- |
 | `[server]`, `[[namespace]]`, `[[provider]]`, `[[model]]`, `[[credential]]` | Tier 0: config-only. |
 | `[credential_pool]`, `[failover]` | Tier 0: in-memory, per replica. |
+| `[transport]` | Tier 0: process-level bounds on provider egress. |
 | `[[gateway_key]]`, `[gateway_token]`, `[[gateway_verifier]]`, `[[gateway_token_epoch]]`, offline `keygen`/`mint` | Tier 0: config, referenced files, and environment only. |
 | `[reload]` | Tier 0: reload reads the config file, referenced key-material files, and process environment. |
 | `[[usage_sink]]` omitted or `kind = "stdout"` | Tier 0: one JSON line on stdout. |
@@ -152,6 +153,39 @@ The outer loop around pool dispatch: an alias's targets, in order
 
 Circuits are in-memory and per replica, consistent with running stateless
 ([ADR 0002](./adr/0002-stateless-by-default-stateful-by-opt-in.md)).
+
+`overall_timeout_ms` is authoritative for everything that happens *before* a
+response is being served: connecting, waiting for response headers, reading a
+buffered body, and opening a stream — including a credential rotation's open. An
+in-flight attempt is cancelled when it is spent, so a request cannot outlive the
+budget by having started just inside it. Once a stream is open the budget stops
+applying, because a long answer is not a stalled one: from there
+`transport.stream_idle_timeout_ms` governs each wait for the next chunk.
+
+## `[transport]` — per-phase upstream bounds, Tier 0
+
+Bounds on one upstream call. Each phase is separate because they fail for
+different reasons: connecting is egress or DNS, no headers is an overloaded
+provider, a silent open socket is a half-dead connection. Every bound must be
+≥ 1 — zero is not "unbounded", it is a gateway that cannot call anything.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `connect_timeout_ms` | integer | `5000` | Bound on establishing the TCP + TLS connection to a provider. |
+| `response_header_timeout_ms` | integer | `30000` | Bound on waiting for response headers (time to first byte) after dispatch. |
+| `buffered_body_timeout_ms` | integer | `30000` | Bound on reading a whole buffered response body once headers arrived. |
+| `stream_idle_timeout_ms` | integer | `120000` | Bound on waiting for the *next* chunk of an already-open stream. Not a stream lifetime: a productive stream may run for as long as it keeps producing. |
+| `max_response_bytes` | integer | `33554432` | Largest buffered response body that will be read. A larger one is refused as `upstream_body_too_large` rather than buffered. |
+| `max_error_bytes` | integer | `65536` | Largest provider *error* body read for diagnostics. A larger one is truncated, so the provider's own status still reaches the caller. Must not exceed `max_response_bytes`. |
+
+The tighter of a phase bound and the remaining `failover.overall_timeout_ms`
+governs each phase, and the caller-visible error names which one fired:
+`upstream_timeout` (`504`) for a bound, `upstream_body_too_large` (`502`) for a
+byte bound. Neither message names the provider endpoint.
+
+`connect_timeout_ms` configures the shared pooled HTTP client, so the whole
+section is read at boot: a reload validates a changed `[transport]` and warns
+that a restart is needed to apply it, exactly as `[server] bind` behaves.
 
 ## `[[gateway_key]]` — inbound authentication (required, Tier 0)
 
@@ -317,7 +351,7 @@ or via an atomic rename is therefore reload-reachable without a process
 restart. `[[namespace]]` changes are reloadable and appear in the reported
 namespace delta, but the namespace count used for in-memory budget retention
 floors is captured at boot and does not resize until restart. `[server] bind`,
-`[[usage_sink]]`, `[budget]`, `[rate_limit]`, and `[revocation]`
+`[transport]`, `[[usage_sink]]`, `[budget]`, `[rate_limit]`, and `[revocation]`
 changes warn and are ignored until restart; this includes
 `limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
 

@@ -33,7 +33,7 @@ parked credential.
 | Span | Key attributes |
 | --- | --- |
 | `http.server.request` | `http.request.method`, `http.route`, `http.response.status_code`, `axond.request_id`, `axond.namespace`, `axond.subject`, `gen_ai.request.model`, `axond.target.*`, `axond.credential_source`, `axond.status`, `axond.retry_count`, `gen_ai.usage.*`, `axond.cost_microdollars`, `axond.latency_ms`, `axond.ttft_ms` |
-| `axond.upstream.attempt` | `axond.attempt` (zero-based), `axond.target.provider`, `axond.target.model`, `axond.credential_source`, `axond.status`, `axond.latency_ms`, `axond.ttft_ms` |
+| `axond.upstream.attempt` | `axond.attempt` (zero-based), `axond.target.provider`, `axond.target.model`, `axond.credential_source`, `axond.status`, `axond.latency_ms`, `axond.ttft_ms`, `axond.timeout` (which transport bound fired, when one did) |
 | `axond.credential.lease` | `axond.credential.id`, `axond.credential_source`, `axond.credential.index`, `axond.status` (`served`, `rate_limited`, `error`, `parked`) |
 | `axond.config.reload` | `axond.reload.trigger`, `axond.reload.outcome`, `axond.config.generation` |
 
@@ -65,6 +65,7 @@ metric and a usage row can never disagree.
 | `axond.tokens.output` | counter | same | Completion token volume. |
 | `axond.cost.microdollars` | counter (µUSD) | same | Spend, priced from the target catalogue. |
 | `axond.upstream.errors` | counter | same | Upstream failure rate by target. |
+| `axond.upstream.timeouts` | counter | `axond.target.provider`, `axond.target.model`, `axond.timeout` | Which transport bound is being hit: `connect`, `response_headers`, `buffered_body`, `stream_idle`, or `overall`. |
 | `axond.upstream.circuit_state` | gauge | `axond.target.provider`, `axond.target.model` | `0` closed, `1` half-open, `2` open. |
 | `axond.usage.records_written` | counter | `axond.usage_sink` | Records a sink acknowledged. |
 | `axond.usage.records_dropped` | counter | `axond.usage_sink`, `axond.drop_reason` | Records discarded rather than delaying a request. |
@@ -92,6 +93,7 @@ metric and a usage row can never disagree.
 | Budget ledger pressure | `axond.budget.retained_subjects` near configured `max_subjects` | Leading indicator that the bound is approaching; watch it before capacity denials occur. |
 | Namespace budget exhausted | `axond.budget.namespace_denials` > 0 | The whole namespace is out of budget, so *every* subject in it is being denied — not one noisy caller. Raise `namespace_limit_microdollars` or investigate what is spending. |
 | TTFT regression | `axond.request.time_to_first_token` p95 | Provider degradation shows here before total latency moves. |
+| Upstream stalls | `axond.upstream.timeouts` rising | Split by `axond.timeout`: `connect` is egress or DNS, `response_headers` is an overloaded provider, `stream_idle` is a half-dead connection, and `overall` means the failover budget is too tight for how slow the target became. |
 
 ## Usage records
 
@@ -121,6 +123,8 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | `503` | `all_provider_circuits_open` | Every target for the alias has a tripped circuit. | The upstreams are down or the thresholds are too tight; check `axond.upstream.circuit_state`. |
 | `502` | `no_credential` | The namespace has no credential for the resolved provider and no platform fallback. | Add a `[[credential]]`, or set `allow_platform_fallback` deliberately. |
 | `502` | `upstream_transport`, `provider_dependency_failed`, `model_unavailable`, `invalid_stream` | The upstream failed after the failover walk was exhausted. | Check the provider's status and the attempt spans; `attempts` on the usage record says how hard the gateway tried. |
+| `504` | `upstream_timeout` | A transport bound fired before a response could be served: connecting, waiting for headers, reading a buffered body, waiting for the next chunk of an open stream, or `failover.overall_timeout_ms` cancelling the in-flight attempt. | `axond.upstream.timeouts{axond.timeout}` and the attempt span's `axond.timeout` name the phase. Tune the matching `[transport]` bound, or `overall_timeout_ms` when the phase is `overall`. |
+| `502` | `upstream_body_too_large` | A buffered provider response exceeded `transport.max_response_bytes`, so it was refused instead of held in memory. | Raise `max_response_bytes` if the workload legitimately returns bodies that size; otherwise treat it as a misbehaving target. |
 
 Mid-stream failures are different by construction. Native passthrough streams
 and OpenAI-normalized streams that have already queued downstream bytes remain
@@ -137,6 +141,14 @@ Rotation uses the same `failover.overall_timeout_ms` deadline as target
 failover. A long time-to-first-token stream can therefore remain terminal
 instead of rotating once that deadline expires; the attempt span is closed
 with the target's terminal status and no later lease span is emitted.
+
+An open stream is bounded by `transport.stream_idle_timeout_ms` rather than by
+the failover deadline: a stream that keeps producing runs to completion however
+long it takes, while one that goes silent for longer than the idle bound is
+terminated in band on the already-`200` response. Nothing is retried there, and
+no second completion is spliced in — the usage record settles once, as `partial`
+or `upstream_error`, and `axond.upstream.timeouts{axond.timeout="stream_idle"}`
+is what distinguishes a stalled provider from one that ended early.
 
 ### Boot failures
 

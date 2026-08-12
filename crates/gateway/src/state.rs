@@ -19,7 +19,7 @@ use arc_swap::ArcSwap;
 use gateway_core::{
     AnthropicAdapter, CircuitBreaker, OpenAiCompatibleAdapter, OpenAiFlavor, ProviderAdapter,
 };
-use gateway_transport::HttpDispatcher;
+use gateway_transport::{HttpDispatcher, build_client};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::aliases::AliasScope;
@@ -417,9 +417,16 @@ impl AppState {
         rate_limiter: Box<dyn RateLimiter>,
         revocation: Box<dyn RevocationStore>,
     ) -> Result<Self, SnapshotError> {
+        // The transport bounds configure the shared client, so they are read
+        // once here: a reload validates a change and reports that it needs a
+        // restart rather than swapping the pool under in-flight requests.
+        let limits = config.transport.limits();
         let snapshot = ConfigSnapshot::build(config, env, 0)?;
         Ok(AppState(Arc::new(Inner {
-            dispatcher: HttpDispatcher::new(reqwest::Client::new()),
+            dispatcher: HttpDispatcher::with_limits(
+                build_client(&limits).expect("the upstream HTTP client builds"),
+                limits,
+            ),
             usage,
             budget,
             rate_limiter,

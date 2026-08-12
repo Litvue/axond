@@ -8,6 +8,7 @@
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,13 @@ pub const ANTHROPIC_KEY: &str = "test-upstream-anthropic-key";
 /// Caller-facing aliases the test config exposes.
 pub mod alias {
     pub const CHAT: &str = "chat-golden";
+    pub const CHAT_NO_HEADERS: &str = "chat-no-headers";
+    pub const CHAT_SLOW_BODY: &str = "chat-slow-body";
+    pub const CHAT_HUGE_BODY: &str = "chat-huge-body";
+    pub const CHAT_HUGE_ERROR: &str = "chat-huge-error";
+    pub const CHAT_STALL: &str = "chat-stall";
+    pub const CHAT_STALL_AFTER_BYTES: &str = "chat-stall-after-bytes";
+    pub const CHAT_LONG: &str = "chat-long";
     pub const CHAT_SLOW: &str = "chat-slow";
     pub const CHAT_DROP: &str = "chat-drop";
     pub const CHAT_FAIL: &str = "chat-fail";
@@ -36,10 +44,22 @@ pub mod alias {
     pub const RESPONSES: &str = "responses-golden";
 }
 
+/// The `[failover]` and `[transport]` sections every suite gets unless it asks
+/// for its own: bounds high enough that no golden-path test races them.
+pub const DEFAULT_TUNING: &str = r#"
+[failover]
+max_attempts = 1
+overall_timeout_ms = 30000
+"#;
+
 /// Micro-dollars per million tokens every test target is priced at, so an
 /// expected charge can be computed from the tokens a fixture reports.
 pub const INPUT_PRICE: u64 = 2_500_000;
 pub const OUTPUT_PRICE: u64 = 10_000_000;
+
+/// Distinguishes the config directories of gateways booted by the same test
+/// process, so differently tuned boots cannot share a file.
+static CONFIGS: AtomicU64 = AtomicU64::new(0);
 
 pub struct Axond {
     pub base_url: String,
@@ -50,11 +70,21 @@ pub struct Axond {
 impl Axond {
     /// Boot the binary against `upstream_base_url` and wait until it serves.
     pub async fn start(upstream_base_url: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("axond-compat-{}", std::process::id()));
+        Self::start_with(upstream_base_url, DEFAULT_TUNING).await
+    }
+
+    /// Boot with `tuning` — TOML replacing the default `[failover]` section and
+    /// carrying any `[transport]` bounds the suite wants to exercise.
+    pub async fn start_with(upstream_base_url: &str, tuning: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "axond-compat-{}-{}",
+            std::process::id(),
+            CONFIGS.fetch_add(1, Ordering::SeqCst)
+        ));
         std::fs::create_dir_all(&dir).expect("test config directory");
         let addr = free_addr();
         let path = dir.join(format!("axond-{}.toml", addr.port()));
-        std::fs::write(&path, config_toml(addr, upstream_base_url))
+        std::fs::write(&path, config_toml(addr, upstream_base_url, tuning))
             .expect("test config is written");
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_axond"))
@@ -199,7 +229,7 @@ fn free_addr() -> SocketAddr {
     listener.local_addr().expect("a bound address")
 }
 
-fn config_toml(bind: SocketAddr, upstream: &str) -> String {
+fn config_toml(bind: SocketAddr, upstream: &str, tuning: &str) -> String {
     let price = format!(
         "{{ input_microdollars_per_million = {INPUT_PRICE}, output_microdollars_per_million = {OUTPUT_PRICE} }}"
     );
@@ -243,12 +273,21 @@ id = "fake-anthropic-primary"
 env = "GW_INBOUND_KEY"
 namespace = "platform"
 
-[failover]
-max_attempts = 1
-overall_timeout_ms = 30000
+{tuning}
 
-{chat}{chat_slow}{chat_drop}{chat_fail}{messages}{messages_slow}{messages_drop}{embeddings}{responses}"#,
+{chat}{chat_no_headers}{chat_slow_body}{chat_huge_body}{chat_huge_error}{chat_stall}{chat_stall_after_bytes}{chat_long}{chat_slow}{chat_drop}{chat_fail}{messages}{messages_slow}{messages_drop}{embeddings}{responses}"#,
         chat = model(alias::CHAT, "fake-openai", target::CHAT),
+        chat_no_headers = model(alias::CHAT_NO_HEADERS, "fake-openai", target::NO_HEADERS),
+        chat_slow_body = model(alias::CHAT_SLOW_BODY, "fake-openai", target::SLOW_BODY),
+        chat_huge_body = model(alias::CHAT_HUGE_BODY, "fake-openai", target::HUGE_BODY),
+        chat_huge_error = model(alias::CHAT_HUGE_ERROR, "fake-openai", target::HUGE_ERROR),
+        chat_stall = model(alias::CHAT_STALL, "fake-openai", target::STALL_STREAM),
+        chat_stall_after_bytes = model(
+            alias::CHAT_STALL_AFTER_BYTES,
+            "fake-openai",
+            target::STALL_AFTER_BYTES
+        ),
+        chat_long = model(alias::CHAT_LONG, "fake-openai", target::LONG_STREAM),
         chat_slow = model(alias::CHAT_SLOW, "fake-openai", target::SLOW_STREAM),
         chat_drop = model(alias::CHAT_DROP, "fake-openai", target::DROP_STREAM),
         chat_fail = model(alias::CHAT_FAIL, "fake-openai", target::FAIL),

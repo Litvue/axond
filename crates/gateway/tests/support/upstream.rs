@@ -40,6 +40,49 @@ pub mod target {
     pub const DROP_STREAM: &str = "drop-stream";
     /// An upstream that answers `500` before any byte is relayed.
     pub const FAIL: &str = "fail-500";
+    /// Accepts the request and never sends response headers.
+    pub const NO_HEADERS: &str = "no-headers";
+    /// Sends `200` headers immediately, then never finishes the body.
+    pub const SLOW_BODY: &str = "slow-body";
+    /// A buffered `200` body far larger than a test's byte bound.
+    pub const HUGE_BODY: &str = "huge-body";
+    /// A `500` whose *error* body is far larger than a test's byte bound.
+    pub const HUGE_ERROR: &str = "huge-error";
+    /// Opens an SSE stream and then goes silent before any event.
+    pub const STALL_STREAM: &str = "stall-stream";
+    /// Relays a few events and then goes silent, with bytes already committed.
+    pub const STALL_AFTER_BYTES: &str = "stall-after-bytes";
+    /// A stream that keeps producing, slowly, for longer than a short failover
+    /// budget: productive, so it must not be cut off.
+    pub const LONG_STREAM: &str = "long-stream";
+}
+
+/// Long enough that the bound under test always fires first, short enough that
+/// a leaked task cannot outlive the suite.
+const FOREVER: Duration = Duration::from_secs(60);
+
+/// Filler bytes in the oversized bodies: well above the byte bounds the
+/// transport suite configures, cheap enough to build per request.
+const OVERSIZED: usize = 512 * 1024;
+
+/// How a scripted stream is paced between chunks.
+#[derive(Clone, Copy)]
+enum Pace {
+    None,
+    /// Soak pacing: many streams, small gaps.
+    Fast,
+    /// Slower than a short failover budget, so a productive stream outlives it.
+    Slow,
+}
+
+impl Pace {
+    fn gap(self) -> Option<Duration> {
+        match self {
+            Self::None => None,
+            Self::Fast => Some(Duration::from_millis(5)),
+            Self::Slow => Some(Duration::from_millis(60)),
+        }
+    }
 }
 
 /// One upstream request as the fake saw it.
@@ -237,8 +280,45 @@ async fn handle(
                 .to_string(),
         )
             .into_response(),
-        target::SLOW_STREAM => sse(state.clone(), slow_events(anthropic, 40), true),
-        target::DROP_STREAM => sse(state.clone(), truncated_events(anthropic), false),
+        target::SLOW_STREAM => sse(state.clone(), slow_events(anthropic, 40), Pace::Fast),
+        target::DROP_STREAM => sse(state.clone(), truncated_events(anthropic), Pace::None),
+        target::LONG_STREAM => sse(state.clone(), slow_events(anthropic, 20), Pace::Slow),
+        target::STALL_STREAM => stalling_sse(state.clone(), Vec::new()),
+        target::STALL_AFTER_BYTES => {
+            let mut events = slow_events(anthropic, 2);
+            events.truncate(if anthropic { 4 } else { 2 });
+            stalling_sse(state.clone(), events)
+        }
+        // Accepts the request and never answers: only a header bound ends this.
+        target::NO_HEADERS => {
+            tokio::time::sleep(FOREVER).await;
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        // Headers land at once, so only a body bound ends this.
+        target::SLOW_BODY => {
+            let stream = futures::stream::unfold((), |()| async {
+                tokio::time::sleep(FOREVER).await;
+                Some((Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{}")), ()))
+            });
+            let mut response = Response::new(Body::from_stream(stream));
+            response
+                .headers_mut()
+                .insert("content-type", "application/json".parse().expect("static"));
+            response
+        }
+        target::HUGE_BODY => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            json!({ "filler": "x".repeat(OVERSIZED) }).to_string(),
+        )
+            .into_response(),
+        target::HUGE_ERROR => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [("content-type", "application/json")],
+            json!({ "error": { "type": "server_error", "message": "x".repeat(OVERSIZED) } })
+                .to_string(),
+        )
+            .into_response(),
         _ if streamed => {
             let name = if anthropic {
                 "anthropic/message_thinking_tool_use.sse"
@@ -250,7 +330,7 @@ async fn handle(
             sse(
                 state.clone(),
                 split_events(&state.fixtures.get(name)),
-                false,
+                Pace::None,
             )
         }
         _ => {
@@ -272,21 +352,49 @@ async fn handle(
 
 /// Serve a scripted event sequence as a real chunked SSE response, one chunk
 /// per element, holding the open-stream guard for the body's whole life.
-fn sse(state: Arc<UpstreamState>, chunks: Vec<Bytes>, paced: bool) -> Response {
-    state.counters.open.fetch_add(1, Ordering::SeqCst);
-    state.counters.opened.fetch_add(1, Ordering::SeqCst);
-    let guard = ConnGuard(state);
+fn sse(state: Arc<UpstreamState>, chunks: Vec<Bytes>, pace: Pace) -> Response {
+    let guard = open_guard(state);
     let stream = futures::stream::unfold(
         (chunks.into_iter(), guard),
         move |(mut chunks, guard)| async move {
             let chunk = chunks.next()?;
-            if paced {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+            if let Some(gap) = pace.gap() {
+                tokio::time::sleep(gap).await;
             }
             Some((Ok::<Bytes, std::io::Error>(chunk), (chunks, guard)))
         },
     );
-    let mut response = Response::new(Body::from_stream(stream));
+    event_stream(Body::from_stream(stream))
+}
+
+/// Serve `chunks` and then go silent with the body still open: an idle stream,
+/// which is what a stream-idle bound exists for. The open-stream guard is held
+/// until the gateway drops the connection, so cleanup stays observable.
+fn stalling_sse(state: Arc<UpstreamState>, chunks: Vec<Bytes>) -> Response {
+    let guard = open_guard(state);
+    let stream = futures::stream::unfold(
+        (chunks.into_iter(), guard),
+        move |(mut chunks, guard)| async move {
+            match chunks.next() {
+                Some(chunk) => Some((Ok::<Bytes, std::io::Error>(chunk), (chunks, guard))),
+                None => {
+                    tokio::time::sleep(FOREVER).await;
+                    None
+                }
+            }
+        },
+    );
+    event_stream(Body::from_stream(stream))
+}
+
+fn open_guard(state: Arc<UpstreamState>) -> ConnGuard {
+    state.counters.open.fetch_add(1, Ordering::SeqCst);
+    state.counters.opened.fetch_add(1, Ordering::SeqCst);
+    ConnGuard(state)
+}
+
+fn event_stream(body: Body) -> Response {
+    let mut response = Response::new(body);
     response
         .headers_mut()
         .insert("content-type", "text/event-stream".parse().expect("static"));

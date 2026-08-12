@@ -55,7 +55,21 @@ pub fn upstream_attempt_span(
         axond.status = Empty,
         axond.latency_ms = Empty,
         axond.ttft_ms = Empty,
+        axond.timeout = Empty,
     )
+}
+
+/// Which transport bound an attempt exceeded, as a stable low-cardinality
+/// label. Recorded alongside the attempt's `error` status rather than replacing
+/// it, so "failed" queries keep working and "timed out how" becomes answerable.
+pub fn record_attempt_timeout(
+    span: &Span,
+    target_provider: &str,
+    target_model: &str,
+    phase: &'static str,
+) {
+    span.record("axond.timeout", phase);
+    super::metrics::record_upstream_timeout(target_provider, target_model, phase);
 }
 
 /// Close out an attempt span with its outcome. `ttft_ms` is the time to the

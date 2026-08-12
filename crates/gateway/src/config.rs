@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use gateway_core::ModelPrice;
+use gateway_transport::TransportLimits;
 use serde::{Deserialize, Deserializer};
 
 use crate::aliases::AliasScope;
@@ -42,6 +43,10 @@ pub struct Config {
     /// Ordered failover across an alias's targets and per-target circuit health.
     #[serde(default)]
     pub failover: Failover,
+    /// Per-phase bounds on every upstream call: connecting, waiting for headers,
+    /// reading a buffered body, and waiting for the next chunk of an open stream.
+    #[serde(default)]
+    pub transport: Transport,
     /// How the running config is replaced without a restart.
     #[serde(default)]
     pub reload: Reload,
@@ -262,6 +267,96 @@ impl Default for Failover {
             cooldown_seconds: default_target_cooldown_seconds(),
         }
     }
+}
+
+/// Bounds on one upstream call, per phase (ADR 0008's walk budget is the outer
+/// bound; these are the inner ones).
+///
+/// `failover.overall_timeout_ms` stays authoritative for everything before a
+/// response is being usefully consumed — connecting, waiting for headers,
+/// reading a buffered body, and rotating credentials — and the tighter of it and
+/// the phase bound below governs each phase. `stream_idle_timeout_ms` is the one
+/// bound that applies *after* a stream opens, because a long answer is not a
+/// stalled one: only silence between chunks is.
+///
+/// These are process-level (they configure the shared HTTP client), so a change
+/// is validated on reload but takes effect on restart.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Transport {
+    /// Bound on establishing the TCP + TLS connection to a provider.
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// Bound on waiting for a provider's response headers (time to first byte).
+    #[serde(default = "default_response_header_timeout_ms")]
+    pub response_header_timeout_ms: u64,
+    /// Bound on reading a whole buffered response body once headers arrived.
+    #[serde(default = "default_buffered_body_timeout_ms")]
+    pub buffered_body_timeout_ms: u64,
+    /// Bound on waiting for the next chunk of an already-open stream. Not a
+    /// total stream lifetime: it resets on every chunk.
+    #[serde(default = "default_stream_idle_timeout_ms")]
+    pub stream_idle_timeout_ms: u64,
+    /// Largest buffered response body that will be read. A larger one is
+    /// refused rather than buffered.
+    #[serde(default = "default_max_response_bytes")]
+    pub max_response_bytes: u64,
+    /// Largest provider *error* body that will be read; the remainder is
+    /// discarded, since an error body is diagnostic rather than the answer.
+    #[serde(default = "default_max_error_bytes")]
+    pub max_error_bytes: u64,
+}
+
+impl Default for Transport {
+    fn default() -> Self {
+        Self {
+            connect_timeout_ms: default_connect_timeout_ms(),
+            response_header_timeout_ms: default_response_header_timeout_ms(),
+            buffered_body_timeout_ms: default_buffered_body_timeout_ms(),
+            stream_idle_timeout_ms: default_stream_idle_timeout_ms(),
+            max_response_bytes: default_max_response_bytes(),
+            max_error_bytes: default_max_error_bytes(),
+        }
+    }
+}
+
+impl Transport {
+    /// The transport's own view of these bounds.
+    pub fn limits(&self) -> TransportLimits {
+        TransportLimits {
+            connect_timeout: Duration::from_millis(self.connect_timeout_ms),
+            response_header_timeout: Duration::from_millis(self.response_header_timeout_ms),
+            buffered_body_timeout: Duration::from_millis(self.buffered_body_timeout_ms),
+            stream_idle_timeout: Duration::from_millis(self.stream_idle_timeout_ms),
+            max_response_bytes: self.max_response_bytes,
+            max_error_bytes: self.max_error_bytes,
+        }
+    }
+}
+
+fn default_connect_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_response_header_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_buffered_body_timeout_ms() -> u64 {
+    30_000
+}
+
+/// Generous by design: a reasoning model can think for a long time between
+/// tokens, and cutting that off looks like a gateway bug to a caller.
+fn default_stream_idle_timeout_ms() -> u64 {
+    120_000
+}
+
+fn default_max_response_bytes() -> u64 {
+    32 * 1024 * 1024
+}
+
+fn default_max_error_bytes() -> u64 {
+    64 * 1024
 }
 
 /// Config hot-reload (ADR 0011). `SIGHUP` always reloads; watching the config
@@ -1137,6 +1232,36 @@ impl Config {
         if self.failover.cooldown_seconds == 0 {
             return Err(ConfigError::Invalid(
                 "failover.cooldown_seconds must be at least 1".into(),
+            ));
+        }
+        for (field, value) in [
+            ("connect_timeout_ms", self.transport.connect_timeout_ms),
+            (
+                "response_header_timeout_ms",
+                self.transport.response_header_timeout_ms,
+            ),
+            (
+                "buffered_body_timeout_ms",
+                self.transport.buffered_body_timeout_ms,
+            ),
+            (
+                "stream_idle_timeout_ms",
+                self.transport.stream_idle_timeout_ms,
+            ),
+            ("max_response_bytes", self.transport.max_response_bytes),
+            ("max_error_bytes", self.transport.max_error_bytes),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "transport.{field} must be at least 1"
+                )));
+            }
+        }
+        if self.transport.max_error_bytes > self.transport.max_response_bytes {
+            return Err(ConfigError::Invalid(
+                "transport.max_error_bytes must not exceed transport.max_response_bytes: an error \
+                 body is a response body"
+                    .into(),
             ));
         }
         if self.reload.poll_interval_ms < MIN_RELOAD_POLL_INTERVAL_MS {
@@ -2271,6 +2396,55 @@ dsn_env = "AXOND_BUDGET_REDIS_URL"
                 "expected an Invalid error mentioning `{field}`",
             );
         }
+    }
+
+    /// The defaults are the shipped bounds: generous enough that no legitimate
+    /// provider call is cut off, finite so nothing waits forever.
+    #[test]
+    fn transport_bounds_default_to_finite_values() {
+        let cfg = Config::from_toml_str(VALID).expect("valid config");
+        assert_eq!(cfg.transport.connect_timeout_ms, 5_000);
+        assert_eq!(cfg.transport.response_header_timeout_ms, 30_000);
+        assert_eq!(cfg.transport.buffered_body_timeout_ms, 30_000);
+        assert_eq!(cfg.transport.stream_idle_timeout_ms, 120_000);
+        assert_eq!(cfg.transport.max_response_bytes, 32 * 1024 * 1024);
+        assert_eq!(cfg.transport.max_error_bytes, 64 * 1024);
+
+        let limits = cfg.transport.limits();
+        assert_eq!(limits.connect_timeout, Duration::from_millis(5_000));
+        assert_eq!(limits.stream_idle_timeout, Duration::from_millis(120_000));
+        assert_eq!(limits.max_error_bytes, 64 * 1024);
+    }
+
+    /// Zero is not "no bound" here; it is a gateway that cannot call anything.
+    #[test]
+    fn rejects_transport_bounds_that_disable_a_phase() {
+        for field in [
+            "connect_timeout_ms",
+            "response_header_timeout_ms",
+            "buffered_body_timeout_ms",
+            "stream_idle_timeout_ms",
+            "max_response_bytes",
+            "max_error_bytes",
+        ] {
+            let toml = format!("{VALID}\n[transport]\n{field} = 0\n");
+            let err = Config::from_toml_str(&toml).expect_err("zero must be rejected");
+            assert!(
+                matches!(err, ConfigError::Invalid(msg) if msg.contains(field)),
+                "expected an Invalid error mentioning `{field}`",
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_an_error_bound_wider_than_the_body_bound() {
+        let toml =
+            format!("{VALID}\n[transport]\nmax_response_bytes = 1024\nmax_error_bytes = 2048\n");
+        let err = Config::from_toml_str(&toml).expect_err("an error body is a response body");
+        assert!(
+            matches!(err, ConfigError::Invalid(msg) if msg.contains("max_error_bytes")),
+            "expected an Invalid error mentioning `max_error_bytes`",
+        );
     }
 
     #[test]

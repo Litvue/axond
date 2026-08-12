@@ -118,6 +118,10 @@ impl GatewayError {
             },
             Self::Transport(TransportError::Provider(_)) => StatusCode::BAD_GATEWAY,
             Self::Transport(TransportError::Http(_)) => StatusCode::BAD_GATEWAY,
+            // A bound the gateway itself imposed, not a provider verdict: the
+            // upstream never answered in time, which is what 504 means.
+            Self::Transport(TransportError::Timeout { .. }) => StatusCode::GATEWAY_TIMEOUT,
+            Self::Transport(TransportError::BodyTooLarge { .. }) => StatusCode::BAD_GATEWAY,
         }
     }
 
@@ -144,6 +148,10 @@ impl GatewayError {
             Self::Provider(e) => e.code(),
             Self::Transport(TransportError::Provider(e)) => e.code(),
             Self::Transport(TransportError::Http(_)) => "upstream_transport",
+            // One code for every phase: the phase is in the message and on the
+            // attempt span, so callers get a stable type to match on.
+            Self::Transport(TransportError::Timeout { .. }) => "upstream_timeout",
+            Self::Transport(TransportError::BodyTooLarge { .. }) => "upstream_body_too_large",
         }
     }
 }

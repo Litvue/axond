@@ -34,6 +34,8 @@ Boot errors name references and identifiers, not secret values.
 | `429 budget_exceeded` | Subject or namespace spend cap cannot admit the estimate. | Budget metrics and namespace-denial metric. |
 | `429 rate_limit_exceeded` | In-flight concurrency cap reached. | Caller concurrency and limiter metrics. |
 | `502 upstream_transport` | Axond could not establish/complete the provider transport. | Provider URL, DNS, TLS, egress, proxy, timeout. |
+| `504 upstream_timeout` | A transport bound fired before a response could be served. | `axond.timeout` on the attempt span names the phase: `connect`, `response_headers`, `buffered_body`, `stream_idle`, or `overall`. Tune that `[transport]` bound, or `failover.overall_timeout_ms` for `overall`. |
+| `502 upstream_body_too_large` | A buffered provider body exceeded `transport.max_response_bytes`. | Whether the workload really returns bodies that size; otherwise treat the target as misbehaving. |
 | `502 invalid_request` | Provider returned a non-retryable request/auth error. | Provider credential, model deployment, and provider body. |
 | `503 budget_unavailable` | Shared budget backend failed under fail-closed policy. | Redis/Postgres health and latency. |
 | `503 rate_limit_unavailable` | Redis limiter failed under fail-closed policy. | Redis health, invoke saturation, connection recovery. |
@@ -83,9 +85,34 @@ A rejected candidate leaves the old snapshot serving. Look for
 
 - A new environment variable cannot be injected into a running process.
 - File-backed key material can be replaced and re-read.
-- `[server]`, `[[usage_sink]]`, and `[budget]` changes require restart.
+- `[server]`, `[transport]`, `[[usage_sink]]`, and `[budget]` changes require
+  restart; a changed `[transport]` is validated and warned about, because the
+  upstream HTTP client is already pooled.
 - ConfigMap/projected-volume updates require `[reload] watch = true` or an
   explicit `SIGHUP`.
+
+## A request hangs, or ends sooner than expected
+
+Every upstream phase is bounded, so a hang is a bound that is too wide and an
+early `504` is one that is too tight. Read `axond.timeout` first — the phase is
+the diagnosis:
+
+| Phase | What was waiting | Usual cause |
+| --- | --- | --- |
+| `connect` | TCP + TLS to the provider | Egress policy, DNS, or a proxy swallowing the connection. |
+| `response_headers` | Time to first byte after dispatch | An overloaded provider or a queued request; long-thinking models legitimately need a wider bound. |
+| `buffered_body` | The rest of a non-streamed body | A provider trickling a large completion. Consider streaming instead. |
+| `stream_idle` | The next chunk of an **open** stream | A half-dead connection or a provider that stopped mid-answer. |
+| `overall` | Any pre-response phase | `failover.overall_timeout_ms` cancelled the in-flight attempt; the walk had no time left. |
+
+Two consequences are deliberate and not bugs:
+
+- A slow *productive* stream is never cut off by `failover.overall_timeout_ms`.
+  Only silence longer than `stream_idle_timeout_ms` ends it.
+- A stream that stalls after bytes were already relayed terminates in band on
+  the already-`200` response and is **not** retried; retrying would splice a
+  second completion into one answer. The usage record still settles exactly
+  once.
 
 ## Streams fail through a proxy
 

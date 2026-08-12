@@ -12,8 +12,18 @@
 //! the provider's own path and returns its response untouched, for a caller that
 //! already speaks the target's wire. Both have a streamed twin that hands back
 //! undecoded bytes, since decoding is `gateway-core`'s job.
+//!
+//! Every call is bounded. [`TransportLimits`] carries the per-phase bounds —
+//! connecting, waiting for response headers, reading a buffered body, and
+//! waiting for the next chunk of an open stream — and every dispatch also takes
+//! the caller's [`Deadline`], the authoritative wall-clock budget for the whole
+//! failover walk. The tighter of the two governs each phase, so an in-flight
+//! call cannot outlive the walk that started it. Once a stream has opened the
+//! deadline stops applying: a long answer is not a stalled one, and the stream
+//! is governed by the idle bound instead.
 
 use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -61,12 +71,141 @@ pub struct NativeCall {
     pub headers: Vec<(&'static str, String)>,
 }
 
+/// Per-phase bounds on one upstream call.
+///
+/// Wall-clock bounds are separate on purpose: connecting, waiting for headers,
+/// and reading a body fail for different reasons and are tuned differently, and
+/// the stream idle bound must not be confused with a total stream lifetime —
+/// a long answer is legitimate, a silent socket is not. Byte bounds exist so a
+/// provider (or something impersonating one) cannot make the gateway hold an
+/// unbounded body in memory.
+#[derive(Debug, Clone, Copy)]
+pub struct TransportLimits {
+    /// Bound on establishing the TCP + TLS connection.
+    pub connect_timeout: Duration,
+    /// Bound on waiting for the upstream's response headers (time to first
+    /// byte), measured from the moment the request is dispatched.
+    pub response_header_timeout: Duration,
+    /// Bound on reading a whole buffered response body once headers arrived.
+    pub buffered_body_timeout: Duration,
+    /// Bound on waiting for the next chunk of an already-open stream.
+    pub stream_idle_timeout: Duration,
+    /// Largest buffered success body that will be read.
+    pub max_response_bytes: u64,
+    /// Largest provider error body that will be read before it is truncated.
+    /// Error bodies are diagnostic, so they are bounded harder than success
+    /// bodies and truncated rather than rejected.
+    pub max_error_bytes: u64,
+}
+
+impl Default for TransportLimits {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_millis(5_000),
+            response_header_timeout: Duration::from_millis(30_000),
+            buffered_body_timeout: Duration::from_millis(30_000),
+            stream_idle_timeout: Duration::from_millis(120_000),
+            max_response_bytes: 32 * 1024 * 1024,
+            max_error_bytes: 64 * 1024,
+        }
+    }
+}
+
+/// The shared client the limits describe. Only the connect bound belongs to the
+/// client itself; the rest are applied per call, where the caller's deadline can
+/// tighten them.
+pub fn build_client(limits: &TransportLimits) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(limits.connect_timeout)
+        .build()
+}
+
+/// The authoritative wall-clock budget for the work a call belongs to — the
+/// failover walk's overall deadline. [`Deadline::unbounded`] is for callers that
+/// have none (an already-open stream's idle waits, and tests).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Deadline(Option<Instant>);
+
+impl Deadline {
+    pub fn at(instant: Instant) -> Self {
+        Self(Some(instant))
+    }
+
+    pub const fn unbounded() -> Self {
+        Self(None)
+    }
+
+    /// Time left, or `None` when the deadline is unbounded. A spent deadline
+    /// reports `Duration::ZERO` rather than underflowing.
+    pub fn remaining(self) -> Option<Duration> {
+        self.0
+            .map(|at| at.saturating_duration_since(Instant::now()))
+    }
+
+    pub fn is_expired(self) -> bool {
+        self.remaining() == Some(Duration::ZERO)
+    }
+}
+
+/// Which bound a call exceeded. Distinct values because they mean different
+/// things to an operator: a connect timeout is egress or DNS, no headers is an
+/// overloaded provider, a stalled stream is a half-dead socket, and the overall
+/// bound is the gateway's own failover budget being spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutKind {
+    Connect,
+    ResponseHeaders,
+    BufferedBody,
+    StreamIdle,
+    /// The caller's overall deadline, which outranks every per-phase bound.
+    Overall,
+}
+
+impl TimeoutKind {
+    /// Stable, low-cardinality label for telemetry.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::ResponseHeaders => "response_headers",
+            Self::BufferedBody => "buffered_body",
+            Self::StreamIdle => "stream_idle",
+            Self::Overall => "overall",
+        }
+    }
+
+    fn phase(self) -> &'static str {
+        match self {
+            Self::Connect => "connecting to the provider",
+            Self::ResponseHeaders => "waiting for provider response headers",
+            Self::BufferedBody => "reading the provider response body",
+            Self::StreamIdle => "waiting for the next provider stream chunk",
+            Self::Overall => "the request's failover budget",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
     #[error("transport: {0}")]
     Http(String),
+    /// A bound was exceeded. The message names the phase and the budget, never
+    /// the upstream URL.
+    #[error("transport: {} exceeded its {budget_ms}ms bound", kind.phase())]
+    Timeout { kind: TimeoutKind, budget_ms: u64 },
+    #[error("transport: provider response body exceeded its {limit_bytes}-byte bound")]
+    BodyTooLarge { limit_bytes: u64 },
+}
+
+impl TransportError {
+    /// The bound this failure exceeded, when it is a timeout.
+    pub fn timeout_kind(&self) -> Option<TimeoutKind> {
+        match self {
+            Self::Timeout { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
 }
 
 /// A transport failure, described without the upstream URL's credential-bearing
@@ -89,17 +228,153 @@ fn redact_url(message: String, url: Option<&reqwest::Url>) -> String {
     message.replace(url.as_str(), redacted.as_str())
 }
 
+/// Classify a `reqwest` failure. A timeout raised by the client itself is the
+/// connect bound (the only one the client owns); everything else is described
+/// without the URL's credential-bearing parts.
+fn classify(e: &reqwest::Error, limits: &TransportLimits) -> TransportError {
+    if e.is_timeout() {
+        return TransportError::Timeout {
+            kind: TimeoutKind::Connect,
+            budget_ms: limits.connect_timeout.as_millis() as u64,
+        };
+    }
+    transport_failure(e)
+}
+
 /// A pooled HTTP client that drives a `gateway-core` adapter against an
 /// upstream. Construct once and share (`Clone` is cheap — `reqwest::Client`
 /// is an `Arc` internally).
 #[derive(Clone)]
 pub struct HttpDispatcher {
     client: reqwest::Client,
+    limits: TransportLimits,
 }
 
 impl HttpDispatcher {
+    /// A dispatcher on the default bounds. Prefer [`Self::with_limits`], which
+    /// takes the operator's configured ones.
     pub fn new(client: reqwest::Client) -> Self {
-        Self { client }
+        Self::with_limits(client, TransportLimits::default())
+    }
+
+    pub fn with_limits(client: reqwest::Client, limits: TransportLimits) -> Self {
+        Self { client, limits }
+    }
+
+    pub fn limits(&self) -> &TransportLimits {
+        &self.limits
+    }
+
+    /// The budget for one phase: its own bound, or what is left of the caller's
+    /// overall deadline when that is tighter. A spent deadline is a failure
+    /// before any socket work, since dispatching could only overrun it.
+    fn budget(
+        &self,
+        own: Duration,
+        kind: TimeoutKind,
+        deadline: Deadline,
+    ) -> Result<(Duration, TimeoutKind), TransportError> {
+        match deadline.remaining() {
+            Some(remaining) if remaining.is_zero() => Err(TransportError::Timeout {
+                kind: TimeoutKind::Overall,
+                budget_ms: 0,
+            }),
+            Some(remaining) if remaining < own => Ok((remaining, TimeoutKind::Overall)),
+            _ => Ok((own, kind)),
+        }
+    }
+
+    /// Dispatch and wait for response headers under the tighter of the header
+    /// bound and the caller's deadline.
+    async fn send_bounded(
+        &self,
+        req: reqwest::RequestBuilder,
+        deadline: Deadline,
+    ) -> Result<reqwest::Response, TransportError> {
+        let (budget, kind) = self.budget(
+            self.limits.response_header_timeout,
+            TimeoutKind::ResponseHeaders,
+            deadline,
+        )?;
+        match tokio::time::timeout(budget, req.send()).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => Err(classify(&e, &self.limits)),
+            Err(_) => Err(TransportError::Timeout {
+                kind,
+                budget_ms: budget.as_millis() as u64,
+            }),
+        }
+    }
+
+    /// Read a whole buffered body under the tighter of the body bound and the
+    /// caller's deadline, refusing one that exceeds the byte bound rather than
+    /// buffering it.
+    async fn buffered_body(
+        &self,
+        resp: reqwest::Response,
+        deadline: Deadline,
+    ) -> Result<String, TransportError> {
+        let (budget, kind) = self.budget(
+            self.limits.buffered_body_timeout,
+            TimeoutKind::BufferedBody,
+            deadline,
+        )?;
+        let limit = self.limits.max_response_bytes;
+        match tokio::time::timeout(budget, read_bounded(resp, limit)).await {
+            Ok(result) => result,
+            Err(_) => Err(TransportError::Timeout {
+                kind,
+                budget_ms: budget.as_millis() as u64,
+            }),
+        }
+    }
+
+    /// Read as much of a provider error body as the bounds allow. Best-effort by
+    /// design: the status is already known, so a slow or oversized error body
+    /// yields a truncated (or empty) message rather than replacing the
+    /// provider's own failure with a transport one.
+    async fn error_body(&self, resp: reqwest::Response, deadline: Deadline) -> String {
+        let budget = deadline
+            .remaining()
+            .unwrap_or(self.limits.buffered_body_timeout)
+            .min(self.limits.buffered_body_timeout);
+        tokio::time::timeout(budget, read_truncated(resp, self.limits.max_error_bytes))
+            .await
+            .unwrap_or_default()
+    }
+
+    /// The upstream byte stream, with every wait for a chunk bounded by the idle
+    /// bound. The caller's overall deadline deliberately does not apply: the
+    /// stream is open and being useful, and cutting a long answer off at the
+    /// failover budget would truncate a working response.
+    fn idle_bounded_stream(&self, resp: reqwest::Response) -> ByteStream {
+        let idle = self.limits.stream_idle_timeout;
+        let limits = self.limits;
+        let upstream = resp
+            .bytes_stream()
+            .map(move |chunk| chunk.map_err(|e| classify(&e, &limits)));
+        Box::pin(futures::stream::unfold(
+            Some(Box::pin(upstream)),
+            move |state| async move {
+                let mut upstream = state?;
+                match tokio::time::timeout(idle, upstream.next()).await {
+                    // Dropping the upstream stream here is what cancels the
+                    // stalled request instead of leaking the connection.
+                    Err(_) => Some((
+                        Err(TransportError::Timeout {
+                            kind: TimeoutKind::StreamIdle,
+                            budget_ms: idle.as_millis() as u64,
+                        }),
+                        None,
+                    )),
+                    Ok(None) => None,
+                    Ok(Some(item)) => {
+                        let failed = item.is_err();
+                        Some((item, (!failed).then_some(upstream)))
+                    }
+                }
+            },
+        ))
     }
 
     /// Non-streaming dispatch: encode via the adapter, POST, decode the
@@ -110,6 +385,7 @@ impl HttpDispatcher {
         upstream: &Upstream,
         surface: Surface,
         request: ProviderRequest,
+        deadline: Deadline,
     ) -> Result<ProviderResponse, TransportError> {
         let body = adapter.encode_request(surface, request)?;
         let url = format!(
@@ -123,19 +399,17 @@ impl HttpDispatcher {
             AuthScheme::Header(name) => req.header(*name, upstream.api_key.expose_secret()),
         };
 
-        let resp = req
-            .headers(trace_context_headers())
-            .send()
-            .await
-            .map_err(|e| transport_failure(&e))?;
+        let resp = self
+            .send_bounded(req.headers(trace_context_headers()), deadline)
+            .await?;
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| transport_failure(&e))?;
-
         if !status.is_success() {
+            let text = self.error_body(resp, deadline).await;
             return Err(
                 ProviderError::from_upstream(adapter.name(), status.as_u16(), &text).into(),
             );
         }
+        let text = self.buffered_body(resp, deadline).await?;
 
         let json: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| TransportError::Http(format!("decode upstream body: {e}")))?;
@@ -150,17 +424,17 @@ impl HttpDispatcher {
         &self,
         upstream: &Upstream,
         call: &NativeCall,
+        deadline: Deadline,
     ) -> Result<serde_json::Value, TransportError> {
         let resp = self
-            .native_request(upstream, call, false)
-            .send()
-            .await
-            .map_err(|e| transport_failure(&e))?;
+            .send_bounded(self.native_request(upstream, call, false), deadline)
+            .await?;
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| transport_failure(&e))?;
         if !status.is_success() {
+            let text = self.error_body(resp, deadline).await;
             return Err(ProviderError::from_upstream(call.provider, status.as_u16(), &text).into());
         }
+        let text = self.buffered_body(resp, deadline).await?;
         serde_json::from_str(&text)
             .map_err(|e| TransportError::Http(format!("decode upstream body: {e}")))
     }
@@ -172,21 +446,17 @@ impl HttpDispatcher {
         &self,
         upstream: &Upstream,
         call: &NativeCall,
+        deadline: Deadline,
     ) -> Result<ByteStream, TransportError> {
         let resp = self
-            .native_request(upstream, call, true)
-            .send()
-            .await
-            .map_err(|e| transport_failure(&e))?;
+            .send_bounded(self.native_request(upstream, call, true), deadline)
+            .await?;
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+            let text = self.error_body(resp, deadline).await;
             return Err(ProviderError::from_upstream(call.provider, status.as_u16(), &text).into());
         }
-        Ok(Box::pin(
-            resp.bytes_stream()
-                .map(|chunk| chunk.map_err(|e| transport_failure(&e))),
-        ))
+        Ok(self.idle_bounded_stream(resp))
     }
 
     fn native_request(
@@ -227,6 +497,7 @@ impl HttpDispatcher {
         upstream: &Upstream,
         surface: Surface,
         request: ProviderRequest,
+        deadline: Deadline,
     ) -> Result<ByteStream, TransportError> {
         let mut body = adapter.encode_request(surface, request)?;
         if let Some(object) = body.as_object_mut() {
@@ -243,20 +514,48 @@ impl HttpDispatcher {
             AuthScheme::Header(name) => req.header(*name, upstream.api_key.expose_secret()),
         };
 
-        let resp = req.send().await.map_err(|e| transport_failure(&e))?;
+        let resp = self.send_bounded(req, deadline).await?;
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+            let text = self.error_body(resp, deadline).await;
             return Err(
                 ProviderError::from_upstream(adapter.name(), status.as_u16(), &text).into(),
             );
         }
 
-        Ok(Box::pin(
-            resp.bytes_stream()
-                .map(|chunk| chunk.map_err(|e| transport_failure(&e))),
-        ))
+        Ok(self.idle_bounded_stream(resp))
     }
+}
+
+/// Read a whole body, refusing one that would exceed `limit`. The bound is
+/// checked before each chunk is appended, so an oversized body is never fully
+/// buffered to discover its size.
+async fn read_bounded(mut resp: reqwest::Response, limit: u64) -> Result<String, TransportError> {
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| transport_failure(&e))? {
+        if body.len() as u64 + chunk.len() as u64 > limit {
+            return Err(TransportError::BodyTooLarge { limit_bytes: limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Read up to `limit` bytes and stop, for a body that is diagnostic rather than
+/// the answer.
+async fn read_truncated(mut resp: reqwest::Response, limit: u64) -> String {
+    let limit = limit as usize;
+    let mut body: Vec<u8> = Vec::new();
+    while body.len() < limit {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = limit - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
 }
 
 /// Inject the active span's W3C context (`traceparent`/`tracestate`) into the
@@ -317,6 +616,72 @@ mod tests {
         );
         for leaked in ["secret", "api-key", "frag"] {
             assert!(!message.contains(leaked), "{message} leaked `{leaked}`");
+        }
+    }
+
+    /// The overall deadline outranks the phase bounds, and a spent one is a
+    /// failure before any socket work: dispatching could only overrun it.
+    #[test]
+    fn the_tighter_of_the_phase_bound_and_the_deadline_governs() {
+        let limits = TransportLimits {
+            response_header_timeout: Duration::from_millis(5_000),
+            ..TransportLimits::default()
+        };
+        let dispatcher = HttpDispatcher::with_limits(reqwest::Client::new(), limits);
+        let phase = limits.response_header_timeout;
+
+        let (budget, kind) = dispatcher
+            .budget(phase, TimeoutKind::ResponseHeaders, Deadline::unbounded())
+            .expect("an unbounded deadline cannot be spent");
+        assert_eq!((budget, kind), (phase, TimeoutKind::ResponseHeaders));
+
+        let (budget, kind) = dispatcher
+            .budget(
+                phase,
+                TimeoutKind::ResponseHeaders,
+                Deadline::at(Instant::now() + Duration::from_millis(50)),
+            )
+            .expect("time is left");
+        assert_eq!(kind, TimeoutKind::Overall);
+        assert!(budget <= Duration::from_millis(50), "{budget:?}");
+
+        let (budget, kind) = dispatcher
+            .budget(
+                phase,
+                TimeoutKind::ResponseHeaders,
+                Deadline::at(Instant::now() + Duration::from_secs(60)),
+            )
+            .expect("time is left");
+        assert_eq!((budget, kind), (phase, TimeoutKind::ResponseHeaders));
+
+        let spent = Deadline::at(Instant::now() - Duration::from_millis(1));
+        assert!(spent.is_expired());
+        let error = dispatcher
+            .budget(phase, TimeoutKind::ResponseHeaders, spent)
+            .expect_err("a spent deadline cannot dispatch");
+        assert_eq!(error.timeout_kind(), Some(TimeoutKind::Overall));
+    }
+
+    /// A timeout is the gateway's own verdict, so its message names the phase
+    /// and the budget — and nothing about the endpoint it was waiting on.
+    #[test]
+    fn a_timeout_message_names_its_phase_and_no_endpoint() {
+        for (kind, phrase) in [
+            (TimeoutKind::Connect, "connecting"),
+            (TimeoutKind::ResponseHeaders, "response headers"),
+            (TimeoutKind::BufferedBody, "response body"),
+            (TimeoutKind::StreamIdle, "stream chunk"),
+            (TimeoutKind::Overall, "failover budget"),
+        ] {
+            let message = TransportError::Timeout {
+                kind,
+                budget_ms: 250,
+            }
+            .to_string();
+            assert!(message.contains(phrase), "{message}");
+            assert!(message.contains("250ms"), "{message}");
+            assert!(!message.contains("http"), "{message}");
+            assert!(!kind.label().contains(' '), "{}", kind.label());
         }
     }
 

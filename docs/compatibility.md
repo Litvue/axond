@@ -124,7 +124,13 @@ interface — read it at your own risk.
 - Status codes for the documented failure modes (see the
   [runbook](./observability.md#failure-modes)) are part of the contract:
   notably `429 budget_exceeded` (the tenant is over cap) versus
-  `503 budget_unavailable` (the gateway's own dependency is down).
+  `503 budget_unavailable` (the gateway's own dependency is down), and
+  `504 upstream_timeout` (a transport bound fired before anything could be
+  served) versus `502 upstream_body_too_large` (a buffered provider body was
+  refused rather than held in memory). Both are new `type` values under the
+  additive rule above: a call that previously hung until the caller gave up now
+  terminates at a bound, which is a behaviour change rather than a status
+  change, since there was no earlier response to reclassify.
 
 ### Telemetry
 
