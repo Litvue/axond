@@ -147,7 +147,12 @@ failing while chat on the same alias succeeds is that pin, not a routing bug.
 Mid-stream failures are different by construction. Native passthrough streams
 and OpenAI-normalized streams that have already queued downstream bytes remain
 terminal: the relay emits an SSE `error` event on the already-`200` response,
-and the usage record settles as `partial` or `upstream_error`. An
+and the usage record settles as `partial` or `upstream_error`. A stream ended by
+`admission.max_stream_duration_ms` or `admission.max_stream_bytes` arrives the
+same way — an already-`200` response, an SSE `error` event typed
+`upstream_stream_error` naming the bound, and a settled usage record — because
+its first bytes were committed before the bound fired. Alert on that event's
+type rather than on a status code. An
 OpenAI-normalized stream may instead rotate to the next pooled credential when
 an explicit upstream rate-limit event arrives before anything is queued
 downstream; the additional lease span remains under the original upstream
