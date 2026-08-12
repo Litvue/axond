@@ -576,16 +576,16 @@ jobs:
       RELEASE_SHORT_SHA: ${{ needs['release-metadata'].outputs.short_sha }}
       RELEASE_COMMIT_SHA: ${{ needs['release-metadata'].outputs.commit_sha }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs['release-metadata'].outputs.tag_name }}
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       # Staging tag only: `<version>` and `sha-<short>` are applied by the
       # promotion job, after the smoke lanes have booted this digest.
       - name: Stage and verify the index
@@ -628,11 +628,11 @@ jobs:
       INDEX_DIGEST: ${{ needs['release-image-index'].outputs.digest }}
       EXPECTED_ARCH: ${{ matrix.arch }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs['release-metadata'].outputs.tag_name }}
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -685,16 +685,16 @@ jobs:
       RELEASE_COMMIT_SHA: ${{ needs['release-metadata'].outputs.commit_sha }}
       INDEX_DIGEST: ${{ needs['release-image-index'].outputs.digest }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs['release-metadata'].outputs.tag_name }}
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: Promote the smoked index to the release tags
         env:
           GH_TOKEN: ${{ github.token }}
@@ -702,7 +702,7 @@ jobs:
           INDEX_TAGS: ${{ needs['release-metadata'].outputs.version }} sha-${{ needs['release-metadata'].outputs.short_sha }}
           EXPECT_INDEX_DIGEST: ${{ needs['release-image-index'].outputs.digest }}
         run: bash ops/publish-image-index.sh
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
       - name: Sign the index digest keylessly
         run: cosign sign --yes "${IMAGE_NAME}@${INDEX_DIGEST}"
       # Provenance, signature, and platform assertions apply to the index; SBOM
@@ -711,7 +711,7 @@ jobs:
       # under a subject it does not describe. docs/compatibility.md documents
       # where to fetch the SBOM of the child you actually run.
       - name: Attest index provenance
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE_NAME }}
           subject-digest: ${{ needs['release-image-index'].outputs.digest }}
