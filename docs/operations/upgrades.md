@@ -31,11 +31,17 @@ a load balancer:
 
 1. Start a new replica and wait for `/readyz`.
 2. Add it to service.
-3. Remove one old replica from service and allow the external drain window.
-4. Stop it and continue.
+3. Send `SIGTERM` to one old replica. Its `/readyz` starts failing at once, so a
+   load balancer that watches readiness removes it without operator action.
+4. Wait for it to exit — bounded by
+   `drain_grace_ms + deadline_ms + flush_timeout_ms` — and continue.
 
-The current binary does not implement application-level SIGTERM draining.
-Endpoint removal and client retry behavior are therefore part of the rollout.
+The replica serves through the readiness drain, refuses new work afterwards with
+a typed `503` (`draining`), cuts streams still open at the deadline while still
+recording their partial spend, and flushes usage and telemetry before exiting.
+Stopping timeouts (`terminationGracePeriodSeconds`, `TimeoutStopSec`) must stay
+above that sum so no replica is killed mid-flush. Clients should retry requests
+that end before response commitment.
 
 Replica-local circuits and credential health start empty on replacement. Shared
 budgets, rate limits, revocation, and durable usage retain backend state.

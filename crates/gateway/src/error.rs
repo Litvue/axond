@@ -71,6 +71,8 @@ pub enum GatewayError {
         requested_tokens: u64,
         limit_tokens: u64,
     },
+    #[error("the gateway is shutting down and is no longer accepting requests")]
+    Draining,
     #[error("unauthorized")]
     Unauthorized,
     #[error("token authentication failed: {0}")]
@@ -131,6 +133,9 @@ impl GatewayError {
             Self::RequestTooLarge | Self::PromptTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::OutputLimitExceeded { .. } => StatusCode::BAD_REQUEST,
+            // Retryable elsewhere immediately: this replica is leaving, not
+            // failing, and readiness has already said so.
+            Self::Draining => StatusCode::SERVICE_UNAVAILABLE,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::TokenUnauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::TokenForbidden(_) => StatusCode::FORBIDDEN,
@@ -179,6 +184,7 @@ impl GatewayError {
             Self::UnsupportedMediaType => "unsupported_media_type",
             Self::PromptTooLarge { .. } => "prompt_too_large",
             Self::OutputLimitExceeded { .. } => "output_limit_exceeded",
+            Self::Draining => "draining",
             Self::Unauthorized => "unauthorized",
             Self::TokenUnauthorized(error) | Self::TokenForbidden(error) => error.code(),
             Self::ScopeInsufficient(_) => "token_scope_insufficient",
@@ -210,6 +216,9 @@ impl IntoResponse for GatewayError {
             Self::Overloaded(rejection) => rejection
                 .retry_after_seconds()
                 .map(|seconds| seconds.to_string()),
+            // A rolling deployment replaces the replica, so "try again" is a
+            // matter of routing rather than of waiting.
+            Self::Draining => Some("0".to_owned()),
             _ => None,
         };
         let message = match &self {
@@ -269,6 +278,21 @@ mod tests {
         let unavailable = GatewayError::RateLimitUnavailable;
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(unavailable.code(), "rate_limit_unavailable");
+    }
+
+    #[test]
+    fn draining_is_a_typed_retryable_unavailable() {
+        let draining = GatewayError::Draining;
+        assert_eq!(draining.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(draining.code(), "draining");
+        let response = draining.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("0")
+        );
     }
 
     #[tokio::test]

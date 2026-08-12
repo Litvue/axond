@@ -1,4 +1,4 @@
-# 29. Request bounds and per-replica load shedding
+# 30. Request bounds and per-replica load shedding
 
 Date: 2026-08-12
 

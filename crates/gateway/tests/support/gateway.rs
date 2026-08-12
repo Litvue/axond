@@ -228,6 +228,52 @@ impl Axond {
         self.child.id()
     }
 
+    /// Send `SIGTERM`, exactly as an orchestrator does when it takes a replica
+    /// out of a rolling deployment. Spawning `kill(1)` keeps the harness free of
+    /// an `unsafe` signal call for the sake of one line.
+    pub fn terminate(&self) {
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(self.pid().to_string())
+            .status()
+            .expect("kill(1) runs");
+        assert!(status.success(), "SIGTERM was delivered");
+    }
+
+    /// Wait for the process to exit, up to `within`. `None` means it was still
+    /// running — the failure mode a bounded shutdown exists to prevent.
+    pub async fn await_exit(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + within;
+        loop {
+            match self.child.try_wait().expect("the child can be polled") {
+                Some(status) => return Some(status),
+                None if Instant::now() >= deadline => return None,
+                None => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    }
+
+    /// Wait for `/readyz` to report the drain, up to `within`. Returns the last
+    /// status seen, so a test can distinguish "still ready" from "gone".
+    pub async fn await_not_ready(&self, within: Duration) -> Option<reqwest::StatusCode> {
+        let client = reqwest::Client::new();
+        let deadline = Instant::now() + within;
+        let mut last = None;
+        while Instant::now() < deadline {
+            last = client
+                .get(self.url("/readyz"))
+                .send()
+                .await
+                .ok()
+                .map(|response| response.status());
+            if last.is_some_and(|status| status == reqwest::StatusCode::SERVICE_UNAVAILABLE) {
+                return last;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        last
+    }
+
     /// Resident set size of the gateway process, in kibibytes. Used to assert
     /// a soak does not buffer stream bodies.
     pub fn resident_kib(&self) -> Option<u64> {

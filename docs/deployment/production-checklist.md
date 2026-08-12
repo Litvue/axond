@@ -53,8 +53,10 @@ Use this checklist before exposing Axond beyond a local development network.
 
 - [ ] New replicas pass boot validation before receiving traffic.
 - [ ] Rollout keeps enough replicas for current concurrency and disruption policy.
-- [ ] Load balancer removes an instance before termination.
-- [ ] Operators understand that application-level SIGTERM draining is not implemented yet.
+- [ ] Load balancer drains on `/readyz` failure, or `shutdown.drain_grace_ms` covers its polling interval.
+- [ ] `terminationGracePeriodSeconds` / `TimeoutStopSec` exceed `drain_grace_ms + deadline_ms + flush_timeout_ms`.
+- [ ] `shutdown.deadline_ms` reflects how long callers are allowed to hold a stream, since streams open at the deadline are cut.
+- [ ] `axond.usage.records_dropped{axond.drop_reason="shutdown"}` is alerted on: it means records were lost at termination.
 - [ ] Mixed-version restrictions in the release's migration notes are respected.
 
 ## Observability
@@ -69,7 +71,7 @@ Use this checklist before exposing Axond beyond a local development network.
 ## Acceptance test
 
 - [ ] `/healthz` returns `ok` without authentication.
-- [ ] `/readyz` returns `ready` without authentication.
+- [ ] `/readyz` returns `ready` without authentication, and `503 draining` after `SIGTERM` while `/healthz` still returns `ok`.
 - [ ] `/v1/models` returns `401` without a key.
 - [ ] `/v1/models` returns the expected namespace-scoped aliases with a key.
 - [ ] A real buffered request succeeds through the production ingress.

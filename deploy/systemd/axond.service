@@ -15,6 +15,9 @@ ExecStart=/usr/local/bin/axond
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
+# Must exceed shutdown.drain_grace_ms + deadline_ms + flush_timeout_ms (25s with
+# the shipped defaults); a SIGKILL before the flush finishes loses buffered
+# usage records.
 TimeoutStopSec=30s
 
 # One in-flight request costs a socket to the caller and one upstream, so the

@@ -37,6 +37,7 @@ use crate::principals::{
 use crate::rate_limit::NoLimit;
 use crate::rate_limit::RateLimiter;
 use crate::revocation::RevocationStore;
+use crate::shutdown::Lifecycle;
 use crate::usage::UsageFanout;
 
 pub use crate::principals::InboundKey;
@@ -53,6 +54,10 @@ pub struct Inner {
     pub admission: AdmissionControl,
     pub rate_limiter: Box<dyn RateLimiter>,
     pub revocation: Box<dyn RevocationStore>,
+    /// Drain state and the in-flight count. Process-level, like the sinks: a
+    /// reload replaces what a request is served *with*, never whether the
+    /// process is still accepting requests at all.
+    pub lifecycle: Arc<Lifecycle>,
     config: ArcSwap<ConfigSnapshot>,
 }
 
@@ -437,8 +442,14 @@ impl AppState {
             admission,
             rate_limiter,
             revocation,
+            lifecycle: Arc::new(Lifecycle::new()),
             config: ArcSwap::from_pointee(snapshot),
         })))
+    }
+
+    /// The process lifecycle: what readiness reports and what admission checks.
+    pub fn lifecycle(&self) -> &Arc<Lifecycle> {
+        &self.0.lifecycle
     }
 
     /// The config snapshot a request runs against. Taken once per request and
