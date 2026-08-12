@@ -340,11 +340,16 @@ async fn blob_references(
     limits: &HydrationLimits,
 ) -> Result<Vec<BlobRef>, ControlPlaneError> {
     let corrupt = |error: IntegrityError| ControlPlaneError::corrupt(id, error);
+    // Declarations are read from the revision's own rows and the blob record is
+    // joined onto them, for the reason `entry_references` does the same: an inner
+    // join would answer a revision whose blob record is gone with a *shorter*
+    // manifest, which is a damaged revision reported as a smaller well-formed
+    // one. A missing record is named instead.
     let rows = transaction
         .query(
-            "SELECT b.blob_kind, b.digest, b.size_bytes FROM axond_cp_revision_blob rb \
-             JOIN axond_cp_blob b USING (blob_kind, digest) WHERE rb.revision_id = $1 \
-             ORDER BY b.digest, b.blob_kind LIMIT $2",
+            "SELECT rb.blob_kind, rb.digest, b.size_bytes FROM axond_cp_revision_blob rb \
+             LEFT JOIN axond_cp_blob b USING (blob_kind, digest) WHERE rb.revision_id = $1 \
+             ORDER BY rb.digest, rb.blob_kind LIMIT $2",
             &[&id.to_string(), &HydrationLimits::probe(limits.max_blobs)],
         )
         .await
@@ -363,27 +368,36 @@ async fn blob_references(
     for row in &rows {
         let kind: String = row.get(0);
         let digest: String = row.get(1);
-        let size: i64 = row.get(2);
+        let size: Option<i64> = row.get(2);
+        let size = size.ok_or_else(|| {
+            corrupt(rows::unreadable(format!(
+                "blob {kind}/{digest} is declared by this revision but has no blob record"
+            )))
+        })?;
         let size_bytes = u64::try_from(size).map_err(|_| {
             corrupt(rows::unreadable(format!(
                 "blob {digest} has a negative size"
             )))
         })?;
+        // Summed across every row before comparing, so the figure an operator is
+        // told is the revision's real declared total rather than however much of
+        // it was counted before the ceiling was crossed. The row count is already
+        // bounded above, so summing first costs nothing.
         declared = declared.saturating_add(size_bytes);
-        if declared > limits.max_blob_bytes {
-            return Err(ControlPlaneError::too_large(
-                id,
-                HydrationLimit::BlobBytes {
-                    limit: limits.max_blob_bytes,
-                    observed: declared,
-                },
-            ));
-        }
         blobs.push(BlobRef {
             kind: rows::blob_kind(&kind).map_err(corrupt)?,
             digest: rows::checksum(&digest).map_err(corrupt)?,
             size_bytes,
         });
+    }
+    if declared > limits.max_blob_bytes {
+        return Err(ControlPlaneError::too_large(
+            id,
+            HydrationLimit::BlobBytes {
+                limit: limits.max_blob_bytes,
+                observed: declared,
+            },
+        ));
     }
     blobs.sort_by_key(|blob| blob.digest);
     Ok(blobs)
@@ -553,13 +567,18 @@ enum Step {
     Leave(ResourceRef),
 }
 
-/// Bound how deeply a revision's dependencies nest, and terminate on a cycle.
+/// Bound how deeply a revision's dependencies nest, and refuse a cycle.
 ///
 /// Memoized: each version's depth is computed once, so a diamond costs one visit
-/// per edge instead of one per path. A version that is re-entered while it is
-/// still on the current path is a cycle, which storage can hold — the domain
-/// refuses one at publication, a restored backup does not — and which is
-/// reported as the depth bound it cannot satisfy rather than followed.
+/// per edge instead of one per path.
+///
+/// The two refusals are deliberately different answers. Nesting past the bound is
+/// a bound: the graph is well-formed and this build declines to walk that far, so
+/// an operator can raise the bound. A version re-entered while it is still on the
+/// current path is a *cycle*, which no bound can ever clear — the domain refuses
+/// one at publication, so its presence means something wrote outside the gateway
+/// or a restore was partial — and it is corruption naming the edge that closes
+/// it.
 fn refuse_deep_dependencies(
     id: RevisionId,
     state: &DesiredState,
@@ -574,6 +593,14 @@ fn refuse_deep_dependencies(
             },
         )
     };
+    let cycle = |from: ResourceRef, to: ResourceRef| {
+        ControlPlaneError::corrupt(
+            id,
+            rows::unreadable(format!(
+                "{from} depends on {to}, which closes a dependency cycle"
+            )),
+        )
+    };
     // How deeply each version's own dependencies nest below it.
     let mut depth: BTreeMap<ResourceRef, usize> = BTreeMap::new();
     let mut on_path: BTreeSet<ResourceRef> = BTreeSet::new();
@@ -586,7 +613,7 @@ fn refuse_deep_dependencies(
                         continue;
                     }
                     if !on_path.insert(current) {
-                        return Err(too_deep(current));
+                        return Err(cycle(current, current));
                     }
                     pending.push(Step::Leave(current));
                     // A version the state does not contain is a dangling edge,
@@ -595,7 +622,7 @@ fn refuse_deep_dependencies(
                     if let Some(resource) = state.get(&current) {
                         for dependency in &resource.depends_on {
                             if on_path.contains(dependency) {
-                                return Err(too_deep(*dependency));
+                                return Err(cycle(current, *dependency));
                             }
                             if !depth.contains_key(dependency) {
                                 pending.push(Step::Enter(*dependency));
@@ -816,15 +843,27 @@ mod tests {
         );
         let error = refuse_deep_dependencies(revision(4), &state, &HydrationLimits::default())
             .expect_err("a cycle is not hydratable");
-        assert!(
-            matches!(
-                error,
-                ControlPlaneError::TooLarge {
-                    limit: HydrationLimit::DependencyDepth { .. },
-                    ..
-                }
-            ),
-            "{error:?}"
+        // Corruption, not a bound: no ceiling an operator could raise will ever
+        // make a cycle walkable, and the writer cannot produce one.
+        assert_eq!(error.category(), FailureCategory::Corrupt);
+        let ControlPlaneError::Corrupt { source, .. } = &error else {
+            panic!("expected corruption, got {error:?}");
+        };
+        let IntegrityError::Unreadable { detail } = &**source else {
+            panic!("expected an unreadable graph, got {error:?}");
+        };
+        assert!(detail.contains("closes a dependency cycle"), "{detail}");
+
+        // And a bound cannot be raised into hydrating it either.
+        let generous = HydrationLimits {
+            max_dependency_depth: usize::MAX,
+            ..HydrationLimits::default()
+        };
+        assert_eq!(
+            refuse_deep_dependencies(revision(4), &state, &generous)
+                .expect_err("raising the bound must not make a cycle walkable")
+                .category(),
+            FailureCategory::Corrupt
         );
     }
 }
