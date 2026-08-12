@@ -87,6 +87,20 @@ config requires no datastore and reports the control-plane checks as skipped;
 already selected it, so this decision does not raise the tier of any existing
 deployment.
 
+### Security review trigger
+
+Trigger 5, [persistence, migrations, telemetry, and
+usage](../security/threat-model-review.md#5-persistence-migrations-telemetry-and-usage),
+fires: the journal's migration history gains a stricter classification, a command
+applies its DDL, and `[control_plane] schema` reaches `SET search_path`. No
+shipped SQL file changes, so the byte-identity gates hold unchanged; the schema
+name must be one unqualified identifier; every message and report names
+`$GW_CONTROL_PLANE_DSN` rather than a connection string. No threat-model update
+is owed — no new state tier, store dependency, emitted field, or request-path
+query — and the operator-visible release impact is the three optional
+`[control_plane]` keys plus the refusal of an empty ledger, which an operator who
+applied the DDL by hand resolves by dropping the table or recording the baseline.
+
 ## Consequences
 
 A schema disagreement, an unset reference, or an unreachable database becomes a
