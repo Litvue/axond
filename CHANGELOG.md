@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.10](https://github.com/Litvue/axond/compare/v0.3.9...v0.3.10) (2026-08-12)
+
+
+### Features
+
+* **state:** hydrate retained Postgres revisions deterministically ([#185](https://github.com/Litvue/axond/issues/185)) ([ba1e086](https://github.com/Litvue/axond/commit/ba1e086613c7e3cbc55634592fdaa7b8f0914195))
+
 ## [0.3.9](https://github.com/Litvue/axond/compare/v0.3.8...v0.3.9) (2026-08-12)
 
 
