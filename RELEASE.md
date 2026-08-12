@@ -75,4 +75,7 @@ The required CI aggregate covers:
 
 Release jobs add archive/image SBOMs, provenance attestations, cosign signing,
 the same binary smoke against the exact archived binary, published-image smoke,
-and crates.io upload.
+and crates.io upload. Repairing an existing tag runs those gates against that
+tag's artifacts; which paths the tag must contain, and how to repair a tag that
+predates one of them, are in the
+[runbook](./docs/maintainers/releasing.md#repair-an-existing-tag).
