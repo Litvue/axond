@@ -24,6 +24,7 @@ docs:
 
 # Validate documentation links, release markers, route coverage, and Compose variants.
 docs-check:
+    python3 ops/check-docs.py --self-test
     python3 ops/check-docs.py
     sh -n install.sh
     AXOND_VERSION=0.0.0 AXOND_TARGET=x86_64-unknown-linux-musl AXOND_INSTALL_DRY_RUN=1 sh install.sh | grep -F 'axond-0.0.0-x86_64-unknown-linux-musl.tar.gz'

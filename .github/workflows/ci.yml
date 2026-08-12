@@ -199,6 +199,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Documentation links, drift, routes, and deployment manifests
         run: |
+          # The smoke-matrix gate's own regressions run first: a gate that only
+          # ever passes on the committed tree proves nothing.
+          python3 ops/check-docs.py --self-test
           python3 ops/check-docs.py
           shellcheck install.sh
           unix_installer_output="$(AXOND_VERSION=0.0.0 \

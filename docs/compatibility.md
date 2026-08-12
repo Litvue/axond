@@ -261,11 +261,12 @@ claim here cannot drift from what CI and the release actually do:
 
 Adding a target, an SDK, or a supported version means editing the owner file
 above; this document describes the policy and does not restate the values it
-cannot enforce. `ops/check-docs.py` fails if a target the `binary-smoke` matrix
-covers is missing from this document or is not published by the release matrix.
+cannot enforce. It does enforce that the three lists agree: `ops/check-docs.py`
+fails if a released target has no `binary-smoke` lane, if a smoked target is not
+published, or if either is missing from this document. So a new target arrives
+with its smoke coverage or not at all.
 
-Every target the `binary-smoke` matrix covers — currently every target the
-release publishes — is booted and served, not merely compiled. On each change
+Every released target is booted and served, not merely compiled. On each change
 and again at the tag, for the exact binary that is archived,
 [`ops/binary-smoke.py`](../ops/binary-smoke.py) asserts that `/healthz` and
 `/readyz` answer unauthenticated, that `/v1/models` requires a gateway key and
