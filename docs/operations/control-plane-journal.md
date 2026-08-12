@@ -129,6 +129,35 @@ So a partially published revision is not a state the journal can be in, and
   `retry-1` neither replays nor blocks another's, and expiry closes a retry
   window without touching the revision or audit trail the record points at.
 
+## When a revision will not load
+
+Loading a revision reads its manifest, resolves every resource version it pins,
+and verifies the result against the checksums recorded at publication. It either
+returns the whole revision or fails; there is no partially loaded revision to
+inspect or repair, and a failed load never becomes state a replica serves. Three
+outcomes need different responses:
+
+- **Unreadable (`stored revision … is unreadable`).** The rows no longer add up:
+  a missing resource version, a dependency that leaves the revision, a body this
+  build cannot decode, a checksum that no longer matches, or a reference that
+  crosses a tenant boundary. The message names the resource. This is corruption,
+  not an outage — retrying will not clear it — and it means something wrote to the
+  journal outside the gateway, or a restore was partial. Compare against a backup;
+  a healthy older revision still loads, so serving can continue from one while the
+  damage is investigated.
+- **Too large (`exceeds what hydration reads`).** The revision is intact but
+  larger than this build's read bounds (resource versions, blobs, blob bytes,
+  dependency edges or nesting, inline body bytes, or total candidate size); the
+  message names which bound and, where useful, what was observed. Nothing is
+  truncated to fit. Either raise that bound deliberately or split the change into
+  smaller revisions.
+- **Unavailable.** Postgres is unreachable. Retryable, and covered by
+  [During a Postgres outage](#during-a-postgres-outage).
+
+A revision that loads once loads forever: revisions are immutable, so a
+successful load is repeatable, and history stays answerable after any number of
+newer publications.
+
 ## Backup and retention
 
 Back the journal up like any store of record; it is the authority on what the

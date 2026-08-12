@@ -36,9 +36,12 @@
 //! adds up ([`IntegrityError`]): the first is a rejected request, the second is
 //! an operator alert.
 
+pub mod hydration;
 pub mod postgres;
 mod rows;
 pub mod schema;
+
+use hydration::HydrationLimit;
 
 use async_trait::async_trait;
 
@@ -176,6 +179,19 @@ pub enum ControlPlaneError {
     /// revision to name.
     #[error("control-plane storage is unreadable: {detail}")]
     CorruptStorage { detail: String },
+    /// A retained revision is larger than this build reads. Not corruption — the
+    /// rows may be perfectly consistent — and not an outage: it is a refusal to
+    /// spend unbounded memory hydrating storage, and it needs an operator who can
+    /// either raise the bound deliberately or split the revision.
+    ///
+    /// Nothing hydrated so far is returned with it. A bound that yielded the part
+    /// it managed to read would be a partial candidate, which is the outcome
+    /// [`hydration`] exists to make unrepresentable.
+    #[error("stored revision {revision} exceeds what hydration reads: {limit}")]
+    TooLarge {
+        revision: RevisionId,
+        limit: HydrationLimit,
+    },
 }
 
 impl ControlPlaneError {
@@ -185,6 +201,11 @@ impl ControlPlaneError {
             revision,
             source: Box::new(source),
         }
+    }
+
+    /// Refuse a retained revision that exceeds a hydration bound.
+    pub fn too_large(revision: RevisionId, limit: HydrationLimit) -> Self {
+        Self::TooLarge { revision, limit }
     }
 }
 
@@ -197,7 +218,8 @@ impl BackendFailure for ControlPlaneError {
             Self::Invalid(_)
             | Self::ImmutableResourceVersion { .. }
             | Self::IdempotencyKeyReused { .. } => FailureCategory::Invalid,
-            Self::Denied { .. } => FailureCategory::Denied,
+            // A bound is policy, and policy is a refusal a retry cannot clear.
+            Self::Denied { .. } | Self::TooLarge { .. } => FailureCategory::Denied,
             Self::Corrupt { .. } | Self::CorruptStorage { .. } => FailureCategory::Corrupt,
         }
     }
@@ -248,6 +270,27 @@ pub trait ControlPlaneStore: Send + Sync {
     /// repeatable and cacheable forever; a load that does not verify is
     /// [`ControlPlaneError::Corrupt`], never an outage.
     async fn load_revision(&self, id: RevisionId) -> Result<LoadedRevision, ControlPlaneError>;
+
+    /// The desired revision, hydrated — the seam #142 loads from.
+    ///
+    /// Provided rather than required, because "the head, hydrated" is
+    /// [`desired_revision`](Self::desired_revision) followed by
+    /// [`load_revision`](Self::load_revision) for any store. A store that can
+    /// answer both in one consistent read should override it and do so: a head
+    /// read that is not consistent with the hydration following it can report
+    /// convergence onto a revision that was never the head, and
+    /// [`PostgresControlPlane`] therefore answers this in a single transaction.
+    ///
+    /// `None` means no revision has been published, which is distinct from a
+    /// revision that fails to hydrate: that is an error, never an empty answer.
+    ///
+    /// [`PostgresControlPlane`]: postgres::PostgresControlPlane
+    async fn load_desired_revision(&self) -> Result<Option<LoadedRevision>, ControlPlaneError> {
+        match self.desired_revision().await? {
+            Some(id) => self.load_revision(id).await.map(Some),
+            None => Ok(None),
+        }
+    }
 
     /// Publish a candidate as the new newest revision.
     ///
