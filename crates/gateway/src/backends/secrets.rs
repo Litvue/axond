@@ -23,8 +23,8 @@
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 
-use super::control_plane::ResourceId;
 use super::{BackendFailure, BackendKind, Capabilities, FailureCategory};
+use crate::desired_state::ResourceId;
 
 /// The implementations a deployment may select for secret material.
 ///
@@ -78,7 +78,7 @@ pub struct SecretRef {
 
 impl std::fmt::Display for SecretRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "secret:{}@{}", self.id.0, self.version)
+        write!(f, "secret:{}@{}", self.id, self.version)
     }
 }
 
@@ -199,6 +199,7 @@ pub trait SecretStore: Send + Sync {
 mod tests {
     use super::super::{Capability, fakes::InMemorySecrets};
     use super::*;
+    use crate::desired_state::fixtures::resource_id;
 
     #[test]
     fn material_is_not_debuggable() {
@@ -218,20 +219,18 @@ mod tests {
 
     #[test]
     fn references_are_opaque_and_versioned() {
-        let reference = SecretRef {
-            id: ResourceId("0191f0a1-credential".to_owned()),
-            version: 3,
-        };
+        let id = resource_id(1);
+        let reference = SecretRef { id, version: 3 };
         let rendered = reference.to_string();
-        assert_eq!(rendered, "secret:0191f0a1-credential@3");
-        assert!(format!("{reference:?}").contains("0191f0a1-credential"));
+        assert_eq!(rendered, format!("secret:{id}@3"));
+        assert!(format!("{reference:?}").contains(&id.uuid().to_string()));
         assert!(!rendered.contains("sk-"));
     }
 
     #[test]
     fn error_messages_never_carry_material() {
         let reference = SecretRef {
-            id: ResourceId("cred".to_owned()),
+            id: resource_id(2),
             version: 1,
         };
         let errors = [
@@ -310,7 +309,7 @@ mod tests {
     async fn a_missing_reference_is_distinguishable_from_an_outage() {
         let store = InMemorySecrets::new();
         let unknown = SecretRef {
-            id: ResourceId("absent".to_owned()),
+            id: resource_id(3),
             version: 1,
         };
         assert_eq!(

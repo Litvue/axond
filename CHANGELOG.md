@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.7](https://github.com/Litvue/axond/compare/v0.3.6...v0.3.7) (2026-08-12)
+
+
+### Features
+
+* **state:** define the desired-state and immutable revision contract ([#178](https://github.com/Litvue/axond/issues/178)) ([2c99804](https://github.com/Litvue/axond/commit/2c99804e62c05d58116d9400a69a5d2f39a303c1))
+
+## [0.3.6](https://github.com/Litvue/axond/compare/v0.3.5...v0.3.6) (2026-08-12)
+
+
+### Features
+
+* **admission:** bound request resources and shed load per replica ([#175](https://github.com/Litvue/axond/issues/175)) ([d824143](https://github.com/Litvue/axond/commit/d82414321c5e1c0c3ccc3cb161e41cbaf88f21a7))
+* **shutdown:** bounded drain, readiness signal, and sink flushing ([#176](https://github.com/Litvue/axond/issues/176)) ([f728e70](https://github.com/Litvue/axond/commit/f728e7077818485d2b327a2bf43e8fe25215c367))
+
 ## [0.3.5](https://github.com/Litvue/axond/compare/v0.3.4...v0.3.5) (2026-08-12)
 
 

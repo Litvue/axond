@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.5"
+version = "0.3.7"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0 OR MIT"
@@ -21,8 +21,8 @@ readme = "README.md"
 # single workspace version; release-please rewrites both here and in
 # `[workspace.package]` from `release-please-config.json`.
 [workspace.dependencies]
-gateway-core = { path = "crates/gateway-core", version = "0.3.5" }
-gateway-transport = { path = "crates/gateway-transport", version = "0.3.5" }
+gateway-core = { path = "crates/gateway-core", version = "0.3.7" }
+gateway-transport = { path = "crates/gateway-transport", version = "0.3.7" }
 
 anyhow = "1"
 arc-swap = "1.7"
