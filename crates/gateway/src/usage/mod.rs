@@ -11,6 +11,12 @@
 //! already installed). The durability contract is deliberate and documented in
 //! ADR 0009: a slow or failing sink **drops**, counted on
 //! `axond.usage.records_dropped`, rather than delaying a request.
+//!
+//! This seam stays independent of every other backend: it is one of the seven
+//! responsibilities catalogued in [`crate::backends`], and there is no universal
+//! state backend that a Postgres sink and a Postgres control plane would share.
+//! Its drop-rather-than-delay durability contract is exactly the kind of
+//! per-seam policy a shared trait would have had to flatten.
 
 mod batch;
 mod otlp;

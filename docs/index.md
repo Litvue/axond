@@ -71,6 +71,9 @@ and operate it.
 ## Develop and maintain
 
 - [Contributing](../CONTRIBUTING.md) — local checks and dependency-lock policy.
+- [Backend responsibility boundaries](./maintainers/backend-contracts.md) — the
+  seven responsibility-specific backend contracts, which paths they may be
+  called from, and why there is no universal state backend.
 - [Release runbook](./maintainers/releasing.md) — release-please, artifact
   repair, crates.io ordering, and verification.
 - [Release readiness](../RELEASE.md) — current public-beta evidence and known

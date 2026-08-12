@@ -318,7 +318,9 @@ responsibility's `on_unavailable` policy independently reviewable.
 
 The contracts stay internal to the gateway crate in this phase: no new
 published workspace crate, and no public trait in `gateway-core` or
-`gateway-transport` until an implementation has proven the shape.
+`gateway-transport` until an implementation has proven the shape. Their scaffolded
+shapes, path declarations, capability set, and error categories are documented in
+[backend responsibility boundaries](../maintainers/backend-contracts.md).
 
 ### State tier
 
