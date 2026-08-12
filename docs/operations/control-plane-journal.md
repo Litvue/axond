@@ -45,40 +45,152 @@ Secret material is never in the journal. A credential resource's body carries an
 opaque secret *reference*; plaintext stays in the secret store, and no body value
 is logged.
 
-## Applying migrations
+## Operator commands
+
+Three commands run *before* replicas do, all with the same grammar —
+`axond <command> <action> --config PATH`. `--config` may be omitted when
+`AXOND_CONFIG` is set.
+
+| Command | Writes? | Answers |
+| --- | --- | --- |
+| `axond check preflight --config PATH` | No | Would a replica boot against this? Config ownership and mode, every reference a boot resolves (control plane, secret-store KEK, breakglass, inbound keys and verifiers, provider credentials, opt-in stores — including a reference a store inherits from the Redis budget), control-plane reachability, schema compatibility. |
+| `axond migrate status --config PATH` | No | What schema does this database have, and what would an apply do? |
+| `axond migrate apply --config PATH` | Yes | Apply the pending migrations, forward only. |
+
+The command surface, the forward-only policy, and the refusal to migrate at boot
+are [ADR 0032](../adr/0032-operator-preflight-and-forward-only-migrations.md).
+
+`preflight` and `status` cannot change a database, and not merely by convention:
+they open the control plane on a maintenance path that does not prepare a schema,
+with migration permission forced off, and read the ledger inside a `READ ONLY`
+transaction, so the *server* rejects a write. `apply` is the only mutation, and it
+is explicit.
+
+Exit codes make these usable as deployment gates: `preflight` exits non-zero if
+any check failed, `status` exits non-zero while a migration is outstanding or the
+schema is refused, and `apply` exits non-zero if the schema was refused. Output
+names environment variables, never DSNs.
+
+`apply` against a database that is already current is a no-op rather than a
+re-run: it reports the current version and rolls its transaction back without
+executing a migration file.
+
+In stateless mode there is no control plane, so `preflight` reports the database
+checks as skipped and `migrate` has nothing to do. Neither command requires
+PostgreSQL to exist.
+
+Until stateful serving is wired up, a stateful `preflight` **fails** on a
+`serving` line and exits non-zero: `axond serve` still refuses
+`mode = "stateful"` outright because the durable control plane is not wired to the
+runtime yet, so no replica can boot against that config and a zero exit would
+promise one that cannot. Every other check still runs and is still printed, so the
+report is the same description of the database it would otherwise be — and
+`axond migrate status` / `axond migrate apply` are separate commands with their own
+exit codes, so preparing the database is not blocked by the serving refusal. The
+line is printed from the refusal `serve` itself raises, not from a second copy of
+the rule, so it disappears when that refusal does rather than outliving it.
+
+Only the control-plane journal is migrated by these commands. It is the only store
+with a ledger — recorded version, file name, checksum — so it is the only one where
+"what has been applied?" is a question the database itself can answer. The usage,
+budget, and revocation stores are applied by hand from `ops/postgres/`, as
+[stateful backends](../deployment/stateful-backends.md#postgres) describes.
+
+### Fresh install
+
+The database must exist and the role must be able to create objects in the target
+schema; the commands create neither the database nor the schema. A missing schema
+or a role that may not create objects is reported as a refusal naming the SQLSTATE
+rather than as an outage, so an automated gate stops instead of retrying.
+
+```bash
+export GW_CONTROL_PLANE_DSN='postgres://axond@db/axond?sslmode=require'
+
+axond migrate apply --config /etc/axond/axond.toml   # applies 0001 and onwards
+axond check preflight --config /etc/axond/axond.toml # then verify a replica would boot
+```
+
+Then start replicas. Run `apply` once from one place; it is safe if that
+accidentally becomes twice, or two places at once.
+
+While stateful serving is unwired, that `preflight` exits non-zero on its
+`serving` line even when the database is ready; read the rest of the
+report, and gate the rollout on `axond migrate status` until the refusal is gone.
+
+### Upgrade
+
+```bash
+axond migrate status --config /etc/axond/axond.toml  # with the NEW binary
+axond migrate apply  --config /etc/axond/axond.toml  # fleet still on the old binary
+axond check preflight --config /etc/axond/axond.toml
+# roll replicas onto the new binary
+```
+
+Order matters in one direction only: migrations are additive and forward-only, so
+the *new* binary's `apply` runs before the new binary serves, and the old binary
+keeps running against the migrated schema until it is replaced. Never apply from
+an older binary than the one you are deploying, and never roll a binary onto a
+schema its own `status` reports as *Ahead*.
 
 Migrations are forward-only and versioned. An applied file is never edited and
 never renumbered: a schema change is a new
-`ops/postgres/control_plane_<NNNN>_<name>.sql`.
+`ops/postgres/control_plane_<NNNN>_<name>.sql`, applied on top. Every object is
+created in the current schema, so a journal that lives beside other tables works
+with `[control_plane] schema` (or a DSN that sets `search_path`).
 
-Apply migration 0001 by hand before pointing a gateway at a new database:
+`apply` runs the whole read-and-write in one transaction under a PostgreSQL
+advisory lock, so it is safe to run while replicas are starting and two
+simultaneous applies are one migration. A replica configured with
+`[control_plane] migrate = true` does the same thing at boot; the default is off,
+because one apply before a rollout is the order that cannot have replicas
+migrating a database their peers are reading.
+
+Applying the DDL with `psql` still works and stays supported for operators who
+own schema changes out of band:
 
 ```bash
-psql "$AXOND_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0001_initial.sql
+psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0001_initial.sql
 ```
 
-Every object is created in the current schema, so a journal that must live beside
-other tables can be applied after `SET search_path`.
+That path does not write the ledger row, so the journal is then reported as
+*Unrecorded* — a ledger table that exists and records nothing — and both `status`
+and `apply` refuse it. An empty ledger is indistinguishable from an untouched
+database, and the ledger is the only record of what was applied, so migrating from
+zero would replay every shipped file over objects that may already be there;
+that survives only while every statement is `IF NOT EXISTS`. Either drop the
+empty `axond_cp_schema_migration` table if nothing was applied, or state the
+baseline the DDL corresponds to:
 
-A gateway configured to migrate does the same thing at boot, under a PostgreSQL
-advisory lock held for the whole check-and-apply transaction, so a fleet starting
-together against an empty database applies the DDL once rather than N times.
+```bash
+psql "$GW_CONTROL_PLANE_DSN" -c "INSERT INTO axond_cp_schema_migration (version, name, checksum)
+  VALUES (1, 'control_plane_0001_initial', '<checksum>')"
+```
+
+The refusal prints the exact statement, checksum included, for every migration
+this build ships. Prefer `axond migrate apply`, which records what it applied and
+never leaves this state behind.
 
 ## Schema status, and what each state means
 
-Boot compares what the database has applied against what the build requires and
-refuses to serve anything it does not recognise.
+`axond migrate status` reports these, and boot refuses to serve anything but
+*Current*. Each state is separate because each implies something different to do —
+"the schema is wrong" would leave an operator to find out which of these it is.
 
 | Status | Meaning | What to do |
 | --- | --- | --- |
 | Current | The applied history is exactly the required one | Nothing |
-| Behind | Migrations are missing | Apply them, or allow the gateway to |
-| Ahead | The database has a migration this build does not know | Deploy the newer build; do not downgrade the schema |
-| Drifted | An applied migration's text no longer matches its recorded checksum | Restore the file, or add a new migration — never edit in place |
+| Behind | Migrations are missing | `axond migrate apply` |
+| Unrecorded | The ledger table exists and records nothing: the DDL was applied out of band, or every row was deleted | Drop the empty ledger if nothing was applied, or record the baseline the database corresponds to (the refusal prints the statement); never migrate it from zero |
+| Ahead | The database records a migration this build does not know | Deploy the newer build; do not downgrade the schema |
+| Drifted | An applied migration's recorded checksum is not this build's file | Restore the file, or add a new migration — never edit in place |
+| Incomplete | The applied versions are not a complete prefix (`v3` without `v2`, or a deleted ledger row) | Find out what applied out of order or removed the row; the maximum version alone is not evidence the history is intact |
+| Renamed | A version is recorded under a name this build does not ship it as | A migration was renumbered or renamed rather than added; restore the shipped numbering |
+| Malformed | The ledger is not the one this build writes: a missing column, a version below 1, a duplicate version, another table under that name | Something else owns `axond_cp_schema_migration`, or a restore was partial |
 
-*Ahead* and *Drifted* are refusals, not warnings, and they are refusals a retry
-cannot clear: a replica that served against a schema it did not write would be
-writing rows a newer build defined differently.
+Only *Behind* (and a database with no journal table at all) is migratable. Everything
+else is a refusal a retry cannot clear, and `apply` refuses it rather than writing
+more DDL over a history it cannot account for: a replica that served against a
+schema it did not write would be writing rows a newer build defined differently.
 
 Drift is also checked without a database. The packaged copy under
 `crates/gateway/sql/` must be byte-identical to `ops/postgres/`

@@ -64,10 +64,27 @@ pub fn required_version() -> i32 {
 pub const MINIMUM_SERVER_VERSION_NUM: i32 = 140_000;
 
 /// What a database holds relative to what this build requires.
+///
+/// The variants are the decision, so they are as fine-grained as the decisions
+/// are: an operator told "the schema is wrong" has to go find out *how*, whereas
+/// an operator told a version prefix has a hole in it knows a migration was
+/// applied out of order or a row was deleted, and one told a name does not match
+/// knows a file was renumbered rather than edited.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaStatus {
     /// No journal at all: the migration bookkeeping table does not exist.
     Absent,
+    /// The ledger exists and records nothing.
+    ///
+    /// Not migratable, and not the same thing as [`SchemaStatus::Absent`]: an
+    /// empty ledger is indistinguishable from a database whose objects were
+    /// created by hand — the ledger is the only record of what was applied, so
+    /// with no rows this build cannot tell an untouched database from a fully
+    /// populated one. Migrating from 0 would re-run every shipped file over
+    /// objects that may already exist, which survives only as long as every
+    /// statement is `IF NOT EXISTS`; the first `ALTER TABLE` or backfill would
+    /// double-apply. The baseline has to be stated by the operator instead.
+    Unrecorded,
     Current {
         version: i32,
     },
@@ -86,6 +103,27 @@ pub enum SchemaStatus {
         expected: Checksum,
         found: Checksum,
     },
+    /// The applied versions do not form a complete prefix: something applied
+    /// v3 without v2, or a ledger row was deleted. Never migratable, because
+    /// "apply everything after the maximum" would leave the hole behind.
+    Incomplete {
+        applied: i32,
+        missing: Vec<i32>,
+    },
+    /// A version is recorded under a name this build does not ship it as. The
+    /// checksum may still match — a renumbered or renamed file is the usual
+    /// cause — so it is reported separately from drift.
+    Renamed {
+        version: i32,
+        expected: &'static str,
+        found: String,
+    },
+    /// The ledger exists but is not the ledger this build writes: a column is
+    /// missing, a version is not a version, or the rows cannot be read as the
+    /// journal's own bookkeeping.
+    Malformed {
+        message: String,
+    },
 }
 
 impl SchemaStatus {
@@ -96,9 +134,10 @@ impl SchemaStatus {
 
     /// Whether applying this build's migrations would make it current.
     ///
-    /// False for [`SchemaStatus::Ahead`] and [`SchemaStatus::Drifted`]: both mean
-    /// the database is not this schema's history, and writing more DDL over it
-    /// would make that worse rather than better.
+    /// True only for [`SchemaStatus::Absent`] and [`SchemaStatus::Behind`], both
+    /// of which say what the database already contains: nothing, or a recorded
+    /// prefix. Every other status means the database is not this schema's history, and
+    /// writing more DDL over it would make that worse rather than better.
     pub fn is_migratable(&self) -> bool {
         matches!(self, Self::Absent | Self::Behind { .. })
     }
@@ -109,14 +148,33 @@ impl fmt::Display for SchemaStatus {
         match self {
             Self::Absent => write!(
                 f,
-                "the control-plane schema is not present; apply \
-                 ops/postgres/control_plane_0001_initial.sql"
+                "the control-plane schema is not present; run `axond migrate apply` (or apply \
+                 ops/postgres/control_plane_0001_initial.sql)"
+            ),
+            Self::Unrecorded => write!(
+                f,
+                "`{MIGRATION_TABLE}` exists but records no migrations, so this build cannot tell \
+                 whether the schema it describes was ever applied and will not migrate from \
+                 zero over objects that may already exist; if nothing was applied, drop the empty \
+                 `{MIGRATION_TABLE}` table and run `axond migrate apply`, and if the DDL was \
+                 applied by hand, record the baseline it corresponds to ({}) and re-run",
+                MIGRATIONS
+                    .iter()
+                    .map(|migration| format!(
+                        "INSERT INTO {MIGRATION_TABLE} (version, name, checksum) VALUES ({}, '{}', \
+                         '{}')",
+                        migration.version,
+                        migration.name,
+                        migration.checksum()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ),
             Self::Current { version } => write!(f, "control-plane schema v{version} is current"),
             Self::Behind { applied, required } => write!(
                 f,
-                "control-plane schema is v{applied}, but this build requires v{required}; \
-                 apply the pending migrations in ops/postgres/"
+                "control-plane schema is v{applied}, but this build requires v{required}; run \
+                 `axond migrate apply` before starting replicas"
             ),
             Self::Ahead { applied, required } => write!(
                 f,
@@ -131,6 +189,30 @@ impl fmt::Display for SchemaStatus {
                 f,
                 "control-plane migration v{version} was applied as {found}, but this build ships \
                  {expected}; an applied migration was edited in place"
+            ),
+            Self::Incomplete { applied, missing } => write!(
+                f,
+                "control-plane schema records v{applied} but is missing {}; the applied versions \
+                 are not a complete history, so this build cannot tell what the database contains",
+                missing
+                    .iter()
+                    .map(|version| format!("v{version}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::Renamed {
+                version,
+                expected,
+                found,
+            } => write!(
+                f,
+                "control-plane migration v{version} is recorded as `{found}`, but this build ships \
+                 v{version} as `{expected}`; a migration was renumbered or renamed rather than \
+                 added"
+            ),
+            Self::Malformed { message } => write!(
+                f,
+                "the control-plane migration ledger is not the one this build writes: {message}"
             ),
         }
     }
@@ -154,54 +236,181 @@ pub(super) async fn status(
     if present.is_none() {
         return Ok(SchemaStatus::Absent);
     }
-    let recorded: Vec<(i32, String)> = transaction
+    // A ledger table that will not answer the ledger's own query is a
+    // [`SchemaStatus::Malformed`] rather than an error: the table exists, so this
+    // is a schema disagreement an operator has to resolve, not a database that
+    // could not be reached. Something else owns that name.
+    //
+    // Only errors that say *that*, though. Every server-reported error carries a
+    // SQLSTATE, including `57014 query_canceled` and `40001 serialization_failure`,
+    // and calling a cancelled statement a broken schema would tell an operator to
+    // go and fix a history that is fine — and would strip the retryable
+    // classification the error type exists to carry. Class 42 (syntax and access
+    // rules: undefined table, undefined column, insufficient privilege) is the
+    // class that means the name is not this build's ledger.
+    let rows = match transaction
         .query(
-            &format!("SELECT version, checksum FROM {MIGRATION_TABLE} ORDER BY version"),
+            &format!("SELECT version, name, checksum FROM {MIGRATION_TABLE} ORDER BY version"),
             &[],
         )
-        .await?
-        .iter()
-        .map(|row| (row.get(0), row.get(1)))
-        .collect();
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) if is_schema_disagreement(&error) => {
+            return Ok(SchemaStatus::Malformed {
+                message: format!(
+                    "reading `{MIGRATION_TABLE}` as (version, name, checksum) failed: {error}"
+                ),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    // Decoded fallibly for the same reason: a table that answers to those three
+    // column *names* with other types (`version text`, `checksum bytea`) makes the
+    // query succeed, and `Row::get` would panic on it. That is the documented
+    // `Malformed` case — a version that is not a version — not a crash.
+    let mut recorded = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let decoded = row
+            .try_get(0)
+            .and_then(|version| {
+                Ok(Recorded {
+                    version,
+                    name: row.try_get(1)?,
+                    checksum: row.try_get(2)?,
+                })
+            })
+            .map_err(|error| format!("`{MIGRATION_TABLE}` holds a row this build cannot read as (version integer, name text, checksum text): {error}"));
+        match decoded {
+            Ok(row) => recorded.push(row),
+            Err(message) => return Ok(SchemaStatus::Malformed { message }),
+        }
+    }
     Ok(classify(&recorded))
 }
 
-/// The status a set of recorded `(version, checksum)` rows implies.
+/// Whether a failed ledger read means the table is not this build's ledger, as
+/// opposed to a database that had a bad moment.
+///
+/// SQLSTATE class 42 is "syntax error or access rule violation": `42P01`
+/// undefined table, `42703` undefined column, `42501` insufficient privilege.
+/// Anything else — a cancelled statement, a serialization failure, a deadlock —
+/// stays an error, so it keeps its retryable classification.
+fn is_schema_disagreement(error: &tokio_postgres::Error) -> bool {
+    error
+        .code()
+        .is_some_and(|code| code.code().starts_with("42"))
+}
+
+/// One row of the migration ledger, as the database holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recorded {
+    pub version: i32,
+    pub name: String,
+    pub checksum: String,
+}
+
+/// The status a set of ledger rows implies.
 ///
 /// Separated from the query so the decision table is testable without a database:
-/// it is the part that has to be right.
-fn classify(recorded: &[(i32, String)]) -> SchemaStatus {
+/// it is the part that has to be right. The checks are ordered by how much they
+/// tell an operator — an unknown version outranks a name mismatch, which outranks
+/// a checksum mismatch — and the prefix check comes last because it is only
+/// meaningful once every recorded row is one this build recognises.
+fn classify(recorded: &[Recorded]) -> SchemaStatus {
     let required = required_version();
-    let applied = recorded.iter().map(|(version, _)| *version).max();
-    let Some(applied) = applied else {
-        return SchemaStatus::Behind {
-            applied: 0,
-            required,
+    if let Some(row) = recorded.iter().find(|row| row.version < 1) {
+        return SchemaStatus::Malformed {
+            message: format!(
+                "v{} is recorded, but migration versions start at 1",
+                row.version
+            ),
         };
+    }
+    let mut versions: Vec<i32> = recorded.iter().map(|row| row.version).collect();
+    versions.sort_unstable();
+    versions.dedup();
+    if versions.len() != recorded.len() {
+        return SchemaStatus::Malformed {
+            message: "a version is recorded more than once, so the ledger's primary key is not \
+                      the one this build writes"
+                .to_owned(),
+        };
+    }
+    let Some(applied) = versions.last().copied() else {
+        // The table exists and is empty, which is not the same question as
+        // "has anything been applied?". It is what a database whose DDL was
+        // applied by hand looks like, and also what a database with a
+        // hand-created ledger and nothing else looks like, and the ledger is
+        // the only thing that could tell them apart. Migrating from 0 would
+        // replay every file over whatever is there.
+        return SchemaStatus::Unrecorded;
     };
-    for (version, checksum) in recorded {
-        let Some(migration) = MIGRATIONS.iter().find(|m| m.version == *version) else {
+    for row in recorded {
+        let Some(migration) = MIGRATIONS.iter().find(|m| m.version == row.version) else {
             // A version this build has never heard of: the database's history is
             // longer than ours, whatever the maximum happens to be.
             return SchemaStatus::Ahead {
-                applied: *version,
+                applied: row.version,
                 required,
             };
         };
-        let expected = migration.checksum();
-        if checksum != &expected.to_string() {
-            return SchemaStatus::Drifted {
-                version: *version,
-                expected,
-                found: Checksum::parse(checksum).unwrap_or(expected),
+        if row.name != migration.name {
+            return SchemaStatus::Renamed {
+                version: row.version,
+                expected: migration.name,
+                found: row.name.clone(),
             };
         }
+        let expected = migration.checksum();
+        if row.checksum != expected.to_string() {
+            return SchemaStatus::Drifted {
+                version: row.version,
+                expected,
+                found: Checksum::parse(&row.checksum).unwrap_or(expected),
+            };
+        }
+    }
+    // Versions are gapless by construction, so the applied set must be the whole
+    // prefix `1..=applied`. A hole means a migration was skipped or a row was
+    // deleted, and "apply everything above the maximum" would silently keep it.
+    let missing: Vec<i32> = (1..=applied)
+        .filter(|version| !versions.contains(version))
+        .collect();
+    if !missing.is_empty() {
+        return SchemaStatus::Incomplete { applied, missing };
     }
     match applied.cmp(&required) {
         std::cmp::Ordering::Equal => SchemaStatus::Current { version: applied },
         std::cmp::Ordering::Less => SchemaStatus::Behind { applied, required },
         std::cmp::Ordering::Greater => SchemaStatus::Ahead { applied, required },
     }
+}
+
+/// The versions [`migrate`] would apply from this status, in application order.
+///
+/// Empty for a status that is already current, and empty for one that must be
+/// refused: an operator asking "what would `apply` do?" gets the same answer the
+/// apply itself would act on rather than a separately computed guess.
+pub fn pending(from: &SchemaStatus) -> Vec<i32> {
+    let applied = match from {
+        SchemaStatus::Absent => 0,
+        SchemaStatus::Behind { applied, .. } => *applied,
+        // Everything else is either done or a refusal, and a refusal has no
+        // pending set: what an operator has to do about it is not "apply files".
+        SchemaStatus::Current { .. }
+        | SchemaStatus::Unrecorded
+        | SchemaStatus::Ahead { .. }
+        | SchemaStatus::Drifted { .. }
+        | SchemaStatus::Incomplete { .. }
+        | SchemaStatus::Renamed { .. }
+        | SchemaStatus::Malformed { .. } => return Vec::new(),
+    };
+    MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version > applied)
+        .map(|migration| migration.version)
+        .collect()
 }
 
 /// Apply every migration the database is missing, recording each one.
@@ -239,12 +448,26 @@ pub(super) async fn migrate(
 mod tests {
     use super::*;
 
-    fn recorded(version: i32) -> (i32, String) {
+    fn recorded(version: i32) -> Recorded {
         let migration = MIGRATIONS
             .iter()
             .find(|m| m.version == version)
             .expect("shipped migration");
-        (version, migration.checksum().to_string())
+        Recorded {
+            version,
+            name: migration.name.to_owned(),
+            checksum: migration.checksum().to_string(),
+        }
+    }
+
+    /// A row nothing shipped wrote: the ledger as a restored backup, a manual
+    /// `INSERT`, or a newer build left it.
+    fn foreign(version: i32, name: &str, checksum: &str) -> Recorded {
+        Recorded {
+            version,
+            name: name.to_owned(),
+            checksum: checksum.to_owned(),
+        }
     }
 
     #[test]
@@ -265,14 +488,8 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_or_partial_history_is_behind_and_a_complete_one_is_current() {
-        assert_eq!(
-            classify(&[]),
-            SchemaStatus::Behind {
-                applied: 0,
-                required: required_version()
-            }
-        );
+    fn an_unrecorded_or_partial_history_is_not_current_and_a_complete_one_is() {
+        assert_eq!(classify(&[]), SchemaStatus::Unrecorded);
         let complete: Vec<_> = MIGRATIONS.iter().map(|m| recorded(m.version)).collect();
         assert_eq!(
             classify(&complete),
@@ -285,7 +502,14 @@ mod tests {
 
     #[test]
     fn an_unknown_version_is_ahead_and_never_migratable() {
-        let status = classify(&[recorded(1), (99, Checksum::of(b"newer").to_string())]);
+        let status = classify(&[
+            recorded(1),
+            foreign(
+                99,
+                "control_plane_0099_future",
+                &Checksum::of(b"newer").to_string(),
+            ),
+        ]);
         assert_eq!(
             status,
             SchemaStatus::Ahead {
@@ -299,7 +523,11 @@ mod tests {
 
     #[test]
     fn an_edited_applied_migration_is_drift_rather_than_a_matching_version() {
-        let status = classify(&[(1, Checksum::of(b"edited in place").to_string())]);
+        let status = classify(&[foreign(
+            1,
+            MIGRATIONS[0].name,
+            &Checksum::of(b"edited in place").to_string(),
+        )]);
         let SchemaStatus::Drifted {
             version,
             expected,
@@ -313,6 +541,129 @@ mod tests {
         assert_eq!(found, Checksum::of(b"edited in place"));
         assert!(!status.is_migratable());
         assert!(!status.is_current());
+    }
+
+    #[test]
+    fn a_renamed_migration_is_reported_as_a_rename_even_when_its_text_matches() {
+        let mut row = recorded(1);
+        row.name = "control_plane_0001_initial_v2".to_owned();
+        let status = classify(&[row]);
+        assert_eq!(
+            status,
+            SchemaStatus::Renamed {
+                version: 1,
+                expected: MIGRATIONS[0].name,
+                found: "control_plane_0001_initial_v2".to_owned(),
+            }
+        );
+        assert!(
+            !status.is_migratable(),
+            "a version this build ships under another name is not a history it can extend"
+        );
+        assert!(status.to_string().contains("renumbered or renamed"));
+    }
+
+    /// A hole in the prefix is the failure `max(version)` alone cannot see: the
+    /// maximum is right, so a version-count check would call the database current.
+    #[test]
+    fn a_hole_in_the_applied_prefix_is_incomplete_rather_than_current_or_behind() {
+        let status = classify(&[foreign(
+            2,
+            "control_plane_0002_later",
+            &Checksum::of(b"later").to_string(),
+        )]);
+        assert_eq!(
+            status,
+            SchemaStatus::Ahead {
+                applied: 2,
+                required: required_version()
+            },
+            "this build ships one migration, so v2 is a future version before it is a hole"
+        );
+
+        // With v2 shipped, the same ledger is a hole: v1 is missing.
+        let versions = [2];
+        let missing: Vec<i32> = (1..=2)
+            .filter(|version| !versions.contains(version))
+            .collect();
+        let status = SchemaStatus::Incomplete {
+            applied: 2,
+            missing,
+        };
+        assert!(!status.is_migratable());
+        assert!(!status.is_current());
+        assert!(status.to_string().contains("missing v1"), "{status}");
+    }
+
+    #[test]
+    fn a_ledger_that_is_not_this_ledger_is_malformed_rather_than_behind() {
+        let duplicated = classify(&[recorded(1), recorded(1)]);
+        assert!(
+            matches!(duplicated, SchemaStatus::Malformed { .. }),
+            "two rows for one version is not a history: {duplicated:?}"
+        );
+        assert!(!duplicated.is_migratable());
+        let zeroed = classify(&[foreign(0, "control_plane_0000", "sha256:0")]);
+        assert!(
+            matches!(zeroed, SchemaStatus::Malformed { .. }),
+            "versions start at 1: {zeroed:?}"
+        );
+        assert!(
+            zeroed.to_string().contains("not the one this build writes"),
+            "{zeroed}"
+        );
+    }
+
+    /// An empty ledger is not "apply everything": the files it would replay may
+    /// already be in the database, and the ledger is the only thing that could
+    /// have said so. An *absent* ledger is "apply everything" — nothing has run.
+    #[test]
+    fn an_empty_ledger_is_refused_while_an_absent_one_pends_every_shipped_version() {
+        let empty = classify(&[]);
+        assert_eq!(empty, SchemaStatus::Unrecorded);
+        assert!(
+            !empty.is_migratable() && !empty.is_current(),
+            "an empty ledger must not be migrated from zero: {empty:?}"
+        );
+        assert!(
+            pending(&empty).is_empty(),
+            "nothing is pending against an empty ledger, or an apply would replay every file"
+        );
+        let rendered = empty.to_string();
+        for expected in [
+            "records no migrations",
+            "drop the empty",
+            "INSERT INTO axond_cp_schema_migration",
+            &MIGRATIONS[0].checksum().to_string(),
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "the refusal has to name the action to take, missing `{expected}`: {rendered}"
+            );
+        }
+
+        assert_eq!(
+            pending(&SchemaStatus::Absent),
+            MIGRATIONS.iter().map(|m| m.version).collect::<Vec<_>>()
+        );
+        for refused in [
+            SchemaStatus::Unrecorded,
+            SchemaStatus::Ahead {
+                applied: 9,
+                required: 1,
+            },
+            SchemaStatus::Drifted {
+                version: 1,
+                expected: MIGRATIONS[0].checksum(),
+                found: Checksum::of(b"edited"),
+            },
+            SchemaStatus::Current { version: 1 },
+        ] {
+            assert!(
+                pending(&refused).is_empty(),
+                "nothing is pending against {refused:?}: an apply must not write there"
+            );
+        }
     }
 
     #[test]
