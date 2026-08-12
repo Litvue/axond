@@ -357,6 +357,17 @@ def self_test() -> int:
         (records / "0032-renumbered.md").write_text("# 31. First\n", encoding="utf-8")
         heading = check_adr_numbering(records)
         assert len(heading) == 1 and "does not start with" in heading[0], heading
+        # A malformed name or an empty record is reported, not raised: a gate that
+        # tracebacks tells a contributor nothing about what to rename.
+        (records / "0032-renumbered.md").unlink()
+        (records / "003-short.md").write_text("# 3. Short\n", encoding="utf-8")
+        short = check_adr_numbering(records)
+        assert len(short) == 1 and "four-digit ADR number" in short[0], short
+        (records / "003-short.md").unlink()
+        (records / "0032-empty.md").write_text("", encoding="utf-8")
+        empty_record = check_adr_numbering(records)
+        assert len(empty_record) == 1, empty_record
+        assert "does not start with" in empty_record[0], empty_record
 
     print("check-docs: release-path gate self-test passed")
     return 0
@@ -423,13 +434,20 @@ def check_adr_numbering(directory: Path | None = None) -> list[str]:
     by_number: dict[str, Path] = {}
     for record in sorted((directory or ROOT / "docs/adr").glob("[0-9]*.md")):
         number = record.name[:4]
+        if not number.isdigit():
+            failures.append(
+                f"docs/adr/{record.name}: the filename must start with a "
+                "four-digit ADR number"
+            )
+            continue
         first = by_number.setdefault(number, record)
         if first is not record:
             failures.append(
                 f"docs/adr/{record.name}: ADR {number} is already "
                 f"{first.name}; renumber one of them"
             )
-        heading = record.read_text(encoding="utf-8").splitlines()[0]
+        lines = record.read_text(encoding="utf-8").splitlines()
+        heading = lines[0] if lines else ""
         if not heading.startswith(f"# {int(number)}. "):
             failures.append(
                 f"docs/adr/{record.name}: heading {heading!r} does not start with "
