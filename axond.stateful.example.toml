@@ -32,7 +32,7 @@ bind = "0.0.0.0:8080"
 # does not degrade inference.
 
 [control_plane]
-dsn_env = "AXOND_CONTROL_PLANE_DSN"
+dsn_env = "GW_CONTROL_PLANE_DSN"
 connect_timeout_ms = 5000
 
 # ── Secret store and KEK ─────────────────────────────────────────────────────
@@ -46,8 +46,8 @@ connect_timeout_ms = 5000
 
 [secret_store]
 backend = "postgres"
-# dsn_env = "AXOND_SECRET_STORE_DSN"
-kek_env = "AXOND_SECRET_STORE_KEK"
+# dsn_env = "GW_SECRET_STORE_DSN"
+kek_env = "GW_SECRET_STORE_KEK"
 # kek_file = "/run/secrets/axond-kek"
 
 # ── Breakglass operator credential ───────────────────────────────────────────
@@ -56,7 +56,7 @@ kek_env = "AXOND_SECRET_STORE_KEK"
 # change. Exactly one is required, referenced the way `[[gateway_key]]` is.
 
 [[admin_breakglass]]
-env = "AXOND_ADMIN_BREAKGLASS"
+env = "GW_ADMIN_BREAKGLASS"
 # file = "/run/secrets/axond-breakglass"
 id = "breakglass"
 

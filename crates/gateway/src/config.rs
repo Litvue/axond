@@ -127,6 +127,56 @@ impl Mode {
     }
 }
 
+/// The top-level keys the `AXOND_` environment layer can address, since
+/// [`Config::load`] merges `Env::prefixed("AXOND_")` over the file.
+///
+/// A *secret-bearing* variable must not be named after one of them: the
+/// override layer would merge its value as that key instead of leaving it for a
+/// reference to resolve, and figment's resulting type error would carry the
+/// secret into the load diagnostic. Kept in step with `Config` by
+/// `the_override_key_list_matches_every_config_field`.
+const OVERRIDE_KEYS: [&str; 22] = [
+    "mode",
+    "server",
+    "control_plane",
+    "secret_store",
+    "admin_breakglass",
+    "namespace",
+    "provider",
+    "model",
+    "credential",
+    "credential_pool",
+    "failover",
+    "transport",
+    "reload",
+    "gateway_key",
+    "gateway_verifier",
+    "gateway_minting",
+    "gateway_token_epoch",
+    "gateway_token",
+    "usage_sink",
+    "budget",
+    "rate_limit",
+    "revocation",
+];
+
+/// A reference is only a reference if the environment layer leaves it alone.
+fn reject_env_override_collision(key: &str, name: &str) -> Result<(), ConfigError> {
+    let Some(field) = name.strip_prefix("AXOND_") else {
+        return Ok(());
+    };
+    let field = field.to_ascii_lowercase();
+    if !OVERRIDE_KEYS.contains(&field.as_str()) {
+        return Ok(());
+    }
+    Err(ConfigError::Invalid(format!(
+        "`{key}` names the env var `{name}`, which the `AXOND_` override layer reads as the \
+         `{field}` config key rather than as a reference: exporting it would fail config load and \
+         put its value in the error. Name the variable outside the `AXOND_<section>` shape — the \
+         examples use `GW_`"
+    )))
+}
+
 /// Connectivity to the durable control plane. A DSN is a secret, so — like
 /// every other DSN in this file — it is named rather than inlined.
 ///
@@ -1674,6 +1724,10 @@ impl Config {
                 "`[control_plane] connect_timeout_ms` must be at least 1".into(),
             ));
         }
+        reject_env_override_collision(
+            "[control_plane] dsn_env",
+            control_plane.dsn_env.as_deref().unwrap_or_default().trim(),
+        )?;
         Ok(())
     }
 
@@ -1707,6 +1761,15 @@ impl Config {
             .and_then(|control_plane| control_plane.dsn_env.as_deref())
             .map(str::trim)
             .filter(|dsn_env| !dsn_env.is_empty());
+        let (kek_key, kek_reference) = secret_store
+            .kek_reference()
+            .expect("a missing KEK reference is rejected above");
+        if kek_key == "kek_env" {
+            reject_env_override_collision("[secret_store] kek_env", kek_reference)?;
+        }
+        if let Some(dsn_env) = own_dsn {
+            reject_env_override_collision("[secret_store] dsn_env", dsn_env)?;
+        }
         if own_dsn.is_none() && inherited_dsn.is_none() {
             return Err(ConfigError::Invalid(format!(
                 "`[secret_store] dsn_env` must name the env var holding the `{}` secret-store \
@@ -1740,11 +1803,14 @@ impl Config {
             }
         }
         let breakglass = &self.admin_breakglass[0];
-        if breakglass.source().is_none() {
+        let Some((source, reference)) = breakglass.source() else {
             return Err(ConfigError::Invalid(format!(
                 "admin_breakglass `{}` must declare exactly one non-empty source (`env` or `file`)",
                 breakglass.label()
             )));
+        };
+        if source == "env" {
+            reject_env_override_collision("[[admin_breakglass]] env", reference)?;
         }
         Ok(())
     }
@@ -3343,13 +3409,13 @@ max_batch = 100000
 mode = "stateful"
 
 [control_plane]
-dsn_env = "AXOND_CONTROL_PLANE_DSN"
+dsn_env = "GW_CONTROL_PLANE_DSN"
 
 [secret_store]
-kek_env = "AXOND_SECRET_STORE_KEK"
+kek_env = "GW_SECRET_STORE_KEK"
 
 [[admin_breakglass]]
-env = "AXOND_ADMIN_BREAKGLASS"
+env = "GW_ADMIN_BREAKGLASS"
 "#;
 
     fn repository_file(relative: &str) -> String {
@@ -3389,15 +3455,15 @@ env = "AXOND_ADMIN_BREAKGLASS"
         for (section, snippet) in [
             (
                 "`[control_plane]`",
-                "[control_plane]\ndsn_env = \"AXOND_CONTROL_PLANE_DSN\"",
+                "[control_plane]\ndsn_env = \"GW_CONTROL_PLANE_DSN\"",
             ),
             (
                 "`[secret_store]`",
-                "[secret_store]\nkek_env = \"AXOND_SECRET_STORE_KEK\"",
+                "[secret_store]\nkek_env = \"GW_SECRET_STORE_KEK\"",
             ),
             (
                 "`[[admin_breakglass]]`",
-                "[[admin_breakglass]]\nenv = \"AXOND_ADMIN_BREAKGLASS\"",
+                "[[admin_breakglass]]\nenv = \"GW_ADMIN_BREAKGLASS\"",
             ),
         ] {
             let error = Config::from_toml_str(&format!("{VALID}\n{snippet}"))
@@ -3418,14 +3484,14 @@ env = "AXOND_ADMIN_BREAKGLASS"
                 .control_plane
                 .as_ref()
                 .and_then(|cp| cp.dsn_env.as_deref()),
-            Some("AXOND_CONTROL_PLANE_DSN")
+            Some("GW_CONTROL_PLANE_DSN")
         );
         assert_eq!(
             config
                 .secret_store
                 .as_ref()
                 .and_then(SecretStore::kek_reference),
-            Some(("kek_env", "AXOND_SECRET_STORE_KEK"))
+            Some(("kek_env", "GW_SECRET_STORE_KEK"))
         );
     }
 
@@ -3676,17 +3742,105 @@ dsn_env = "AXOND_REDIS_URL"
             config.control_plane, config.secret_store, config.admin_breakglass
         );
         for reference in [
-            "AXOND_CONTROL_PLANE_DSN",
-            "AXOND_SECRET_STORE_KEK",
-            "AXOND_ADMIN_BREAKGLASS",
+            "GW_CONTROL_PLANE_DSN",
+            "GW_SECRET_STORE_KEK",
+            "GW_ADMIN_BREAKGLASS",
         ] {
             assert!(rendered.contains(reference), "{reference} missing");
         }
         assert_eq!(
             config.admin_breakglass[0].label(),
-            "AXOND_ADMIN_BREAKGLASS",
+            "GW_ADMIN_BREAKGLASS",
             "an unlabelled credential is attributed by its reference"
         );
+    }
+
+    /// A secret-bearing variable named after a config key is merged by the
+    /// `AXOND_` override layer instead of being left for the reference to
+    /// resolve, and figment's type error would then carry the credential into
+    /// the load diagnostic. Every such reference is refused by name.
+    #[test]
+    fn a_bootstrap_reference_that_the_env_override_layer_would_claim_is_rejected() {
+        for (key, toml) in [
+            (
+                "[[admin_breakglass]] env",
+                "mode = \"stateful\"\n[control_plane]\ndsn_env = \"GW_DSN\"\n[secret_store]\nkek_env = \"GW_KEK\"\n[[admin_breakglass]]\nenv = \"AXOND_ADMIN_BREAKGLASS\"",
+            ),
+            (
+                "[control_plane] dsn_env",
+                "mode = \"stateful\"\n[control_plane]\ndsn_env = \"AXOND_CONTROL_PLANE\"\n[secret_store]\nkek_env = \"GW_KEK\"\n[[admin_breakglass]]\nenv = \"GW_BG\"",
+            ),
+            (
+                "[secret_store] kek_env",
+                "mode = \"stateful\"\n[control_plane]\ndsn_env = \"GW_DSN\"\n[secret_store]\nkek_env = \"AXOND_SECRET_STORE\"\n[[admin_breakglass]]\nenv = \"GW_BG\"",
+            ),
+        ] {
+            let error = Config::from_toml_str(toml)
+                .expect_err("the override layer would claim this variable");
+            let ConfigError::Invalid(message) = error else {
+                panic!("{key}: expected a validation error");
+            };
+            assert!(message.contains(key), "{key}: {message}");
+            assert!(
+                message.contains("`AXOND_` override layer"),
+                "{key}: {message}"
+            );
+        }
+    }
+
+    /// A file path cannot be claimed by the environment layer, so the same name
+    /// shape is fine there — and a variable outside the override shape is fine
+    /// anywhere.
+    #[test]
+    fn a_reference_outside_the_override_shape_is_accepted() {
+        let toml = "mode = \"stateful\"\n[control_plane]\ndsn_env = \"AXOND_CONTROL_PLANE_DSN\"\n[secret_store]\nkek_file = \"/run/secrets/AXOND_SECRET_STORE\"\n[[admin_breakglass]]\nfile = \"/run/secrets/breakglass\"";
+        Config::from_toml_str(toml)
+            .expect("`AXOND_CONTROL_PLANE_DSN` is not a config key, and paths are never merged");
+    }
+
+    /// The override-key list only protects references if it still matches the
+    /// keys the environment layer can actually address.
+    #[test]
+    fn the_override_key_list_matches_every_config_field() {
+        let source = repository_file("crates/gateway/src/config.rs");
+        let (_, rest) = source
+            .split_once("pub struct Config {")
+            .expect("Config struct");
+        let (body, _) = rest.split_once("\n}").expect("Config struct body");
+        let fields: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("pub "))
+            .filter_map(|line| line.split_once(':'))
+            .map(|(field, _)| field)
+            .collect();
+        assert_eq!(fields, OVERRIDE_KEYS, "OVERRIDE_KEYS drifted from `Config`");
+    }
+
+    /// The shipped configurations and fixtures must themselves name variables
+    /// the override layer leaves alone, since an operator copies them verbatim.
+    #[test]
+    fn no_shipped_configuration_references_a_claimable_variable() {
+        for relative in [
+            "axond.stateful.example.toml",
+            "axond.example.toml",
+            "tests/tier0/axond.stateful-bootstrap.toml",
+            "tests/tier0/axond.tier0.toml",
+        ] {
+            for line in repository_file(relative).lines() {
+                let line = line.trim_start_matches('#').trim();
+                let Some((key, value)) = line.split_once(" = ") else {
+                    continue;
+                };
+                if !matches!(key, "env" | "dsn_env" | "kek_env") {
+                    continue;
+                }
+                let reference = value.trim().trim_matches('"');
+                assert!(
+                    reject_env_override_collision(key, reference).is_ok(),
+                    "{relative}: `{key} = \"{reference}\"` would be claimed by the override layer"
+                );
+            }
+        }
     }
 
     /// The shipped stateful example is the operator-facing copy of the approved

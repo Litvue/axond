@@ -12,10 +12,10 @@ mode = "stateful"
 bind = "127.0.0.1:18083"
 
 [control_plane]
-dsn_env = "AXOND_TIER0_CONTROL_PLANE_DSN"
+dsn_env = "GW_TIER0_CONTROL_PLANE_DSN"
 
 [secret_store]
-kek_env = "AXOND_TIER0_SECRET_STORE_KEK"
+kek_env = "GW_TIER0_SECRET_STORE_KEK"
 
 [[admin_breakglass]]
-env = "AXOND_TIER0_ADMIN_BREAKGLASS"
+env = "GW_TIER0_ADMIN_BREAKGLASS"

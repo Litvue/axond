@@ -100,8 +100,18 @@ Practically: the config that boots on `0.x.y` boots on `0.x.(y+1)`.
 owns durable resources ([ADR 0027]): the default `stateless` is TOML as it is
 documented today, and the opt-in `stateful` bootstrap points at a Postgres
 control plane. Adding the key was additive under the rules above — nothing is
-renamed or removed, no default changed, and stateless validation was not
-tightened, so omitting `mode` still means exactly what it always meant.
+renamed or removed and no default changed, so omitting `mode` still means exactly
+what it always meant.
+
+With one deliberate exception, stated rather than glossed: a stateless file that
+already contained `[control_plane]`, `[secret_store]`, or `[[admin_breakglass]]`
+used to boot, because unknown sections are tolerated, and is now a boot error.
+That is a tightening under the rules above. It is accepted because those names
+had no meaning before this release, so such a file was either hand-written
+against an unimplemented surface or a `mode = "stateful"` line short of what its
+author intended — and silently ignoring a control-plane reference is exactly the
+ambiguity the mode boundary exists to remove. The diagnostic names the section
+and the missing `mode`. No key that ever had a meaning became stricter.
 
 Stateful mode is a deliberate operator choice with its own bootstrap surface,
 and configuration valid in one mode is *not* expected to be valid in the other:

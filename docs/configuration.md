@@ -105,6 +105,14 @@ Every value below is a *reference*: an environment-variable name or a file path.
 Nothing here connects to Postgres, reads a key, or resolves a DSN, and
 diagnostics name the reference rather than its value.
 
+A referenced env var must also stay clear of the `AXOND_<section>` shape, because
+`AXOND_`-prefixed variables are the override layer described at the top of this
+reference: `AXOND_ADMIN_BREAKGLASS` would be merged as the `admin_breakglass`
+*key* rather than resolved as a reference, so exporting it would fail config load
+and put the credential in the error. Such a name is rejected at validation,
+naming the variable and the key it collides with. The examples use the `GW_`
+prefix for secret-bearing variables.
+
 #### `[control_plane]`
 
 Required in stateful mode. Initial cold boot needs the control plane: a replica

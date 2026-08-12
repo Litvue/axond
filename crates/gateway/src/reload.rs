@@ -976,13 +976,13 @@ scope = ["chat", "models"]
 mode = "stateful"
 
 [control_plane]
-dsn_env = "AXOND_CONTROL_PLANE_DSN"
+dsn_env = "GW_CONTROL_PLANE_DSN"
 
 [secret_store]
-kek_env = "AXOND_SECRET_STORE_KEK"
+kek_env = "GW_SECRET_STORE_KEK"
 
 [[admin_breakglass]]
-env = "AXOND_ADMIN_BREAKGLASS"
+env = "GW_ADMIN_BREAKGLASS"
 "#,
         );
         let error = reloader

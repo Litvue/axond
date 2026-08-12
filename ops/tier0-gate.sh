@@ -80,6 +80,10 @@ failure() {
   cat "$gateway_log" >&2 || true
   echo "--- fake-upstream log ($upstream_log) ---" >&2
   cat "$upstream_log" >&2 || true
+  if [[ -n "$stateful_log" ]]; then
+    echo "--- stateful bootstrap log ($stateful_log) ---" >&2
+    cat "$stateful_log" >&2 || true
+  fi
   exit 1
 }
 
@@ -221,18 +225,18 @@ rm -f "$fixture_body"
 stateful_log="$(mktemp "$tmpdir/axond-tier0-stateful.XXXXXX.log")"
 stateful_status=0
 env -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
-  -u AXOND_TIER0_CONTROL_PLANE_DSN -u AXOND_TIER0_SECRET_STORE_KEK \
-  -u AXOND_TIER0_ADMIN_BREAKGLASS \
+  -u GW_TIER0_CONTROL_PLANE_DSN -u GW_TIER0_SECRET_STORE_KEK \
+  -u GW_TIER0_ADMIN_BREAKGLASS \
   AXOND_CONFIG="$stateful_config" RUST_LOG=warn \
   timeout 10 "$bin" >"$stateful_log" 2>&1 || stateful_status=$?
 [[ "$stateful_status" != 0 ]] ||
   failure "a stateful process started while the control plane is unimplemented; it must refuse rather than serve an empty snapshot"
 [[ "$stateful_status" != 124 ]] ||
-  failure "a stateful process kept running instead of refusing at boot (see $stateful_log)"
+  failure "a stateful process kept running instead of refusing at boot"
 grep -q 'stateful' "$stateful_log" ||
-  failure "stateful refusal did not explain the mode (see $stateful_log)"
+  failure "stateful refusal did not explain the mode"
 if grep -Eq 'postgres(ql)?://|dbname=' "$stateful_log"; then
-  failure "stateful diagnostics must name references, never a resolved DSN (see $stateful_log)"
+  failure "stateful diagnostics must name references, never a resolved DSN"
 fi
 rm -f "$stateful_log"
 stateful_log=""
