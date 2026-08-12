@@ -88,11 +88,39 @@ if [[ -z "${AXOND_TIER0_NETNS:-}" ]]; then
 fi
 
 degraded="${AXOND_TIER0_DEGRADED:-0}"
-if [[ "$degraded" == 1 ]]; then
+
+# Every tool the gate needs is named here rather than discovered halfway through a
+# run. `curl` is not negotiable: without it nothing can be probed at all. `ss` and
+# `python3` each back one assertion, so when the caller has accepted a degraded run
+# that assertion is skipped rather than failing an otherwise valid release.
+missing_tool() {
+  if [[ "$allow_no_netns" != 1 ]]; then
+    echo "TIER 0 INVARIANT FAILED: $1 is required by the Tier 0 gate." >&2
+    exit 1
+  fi
+  echo "TIER 0 DEGRADED: $1 is unavailable, so $2 is not checked." >&2
+  return 1
+}
+command -v curl >/dev/null 2>&1 || {
+  echo "TIER 0 INVARIANT FAILED: curl is required by the Tier 0 gate; nothing can be probed without it." >&2
+  exit 1
+}
+check_listeners=1
+command -v ss >/dev/null 2>&1 ||
+  missing_tool ss "the listener invariant" ||
+  check_listeners=0
+check_serving=1
+command -v python3 >/dev/null 2>&1 ||
+  missing_tool python3 "the fixture serving path" ||
+  check_serving=0
+# Outside a namespace the listener set is the host's, so it is not an invariant.
+[[ "$degraded" != 1 ]] || check_listeners=0
+
+if [[ "$degraded" == 1 && "$check_serving" == 1 ]]; then
   # Outside a namespace the fixed ports are the host's, so a stale listener would
   # be mistaken for the gateway or the fake upstream.
   for port in 18081 18082; do
-    if ss -H -ltn "sport = :$port" | grep -q .; then
+    if ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .; then
       echo "TIER 0 INVARIANT FAILED: port $port is already in use; a degraded run needs both fixed ports free." >&2
       exit 1
     fi
@@ -161,21 +189,26 @@ fi
 listener_ports() {
   ss -H -ltn | awk '{print $4}' | awk -F: '{print $NF}' | sort -n | uniq
 }
-baseline_listeners="$(listener_ports)"
+baseline_listeners=""
+if [[ "$check_listeners" == 1 ]]; then
+  baseline_listeners="$(listener_ports)"
+fi
 
-python3 "$upstream" --port 18082 >"$upstream_log" 2>&1 &
-upstream_pid=$!
+if [[ "$check_serving" == 1 ]]; then
+  python3 "$upstream" --port 18082 >"$upstream_log" 2>&1 &
+  upstream_pid=$!
 
-for _ in $(seq 1 30); do
-  upstream_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
-    --max-time 1 "http://127.0.0.1:18082/" || true)"
-  if [[ "$upstream_status" != 000 ]]; then
-    break
-  fi
-  sleep 0.1
-done
-[[ "${upstream_status:-000}" != 000 ]] ||
-  failure "local fake-upstream did not bind; Tier 0 serving-path check cannot proceed"
+  for _ in $(seq 1 30); do
+    upstream_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+      --max-time 1 "http://127.0.0.1:18082/" || true)"
+    if [[ "$upstream_status" != 000 ]]; then
+      break
+    fi
+    sleep 0.1
+  done
+  [[ "${upstream_status:-000}" != 000 ]] ||
+    failure "local fake-upstream did not bind; Tier 0 serving-path check cannot proceed"
+fi
 
 env -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
 AXOND_CONFIG="$config" \
@@ -202,14 +235,14 @@ done
 
 # The listener set is only an invariant inside the namespace: on a shared host any
 # unrelated service would break it, which is why a degraded run cannot assert it.
-listeners="$(listener_ports)"
-expected_listeners="$(printf '%s\n18081\n18082\n' "$baseline_listeners" | sed '/^$/d' | sort -n | uniq)"
-if [[ "$degraded" == 1 ]]; then
+if [[ "$check_listeners" != 1 ]]; then
   echo "listeners: DEGRADED, in-namespace listener invariant not checked"
-elif [[ "$listeners" != "$expected_listeners" ]]; then
-  failure "listener invariant violated: namespace must contain its baseline listeners plus only gateway 18081 and fake upstream 18082; unexpected listener set (${listeners//$'\n'/, }), expected (${expected_listeners//$'\n'/, }). This includes any Redis 6379 or Postgres 5432 listener. External datastore dependencies are excluded by the network namespace and would instead appear as boot or serving failure."
-fi
-if [[ "$degraded" != 1 ]]; then
+else
+  listeners="$(listener_ports)"
+  expected_listeners="$(printf '%s\n18081\n18082\n' "$baseline_listeners" | sed '/^$/d' | sort -n | uniq)"
+  if [[ "$listeners" != "$expected_listeners" ]]; then
+    failure "listener invariant violated: namespace must contain its baseline listeners plus only gateway 18081 and fake upstream 18082; unexpected listener set (${listeners//$'\n'/, }), expected (${expected_listeners//$'\n'/, }). This includes any Redis 6379 or Postgres 5432 listener. External datastore dependencies are excluded by the network namespace and would instead appear as boot or serving failure."
+  fi
   echo "namespace listeners: baseline (${baseline_listeners//$'\n'/, }) plus gateway 18081 and fake upstream 18082 only; external Redis 6379/Postgres 5432 are excluded by namespace egress denial"
 fi
 
@@ -258,16 +291,19 @@ unknown_status="$(curl --silent --max-time 5 --output "$unknown_body" \
 grep -q '"type":"unknown_model"' "$unknown_body" || failure "unknown model response lacked typed unknown_model error"
 rm -f "$unknown_body"
 
-fixture_body="$(mktemp "$tmpdir/axond-tier0-fixture.XXXXXX")"
-fixture_status="$(curl --silent --max-time 5 --output "$fixture_body" \
-  --write-out '%{http_code}' \
-  -H 'Authorization: Bearer tier0-gateway-key' -H 'content-type: application/json' \
-  -d '{"model":"fixture-chat","messages":[{"role":"user","content":"What is the capital of France?"}]}' \
-  "$base_url/v1/chat/completions" || true)"
-[[ "$fixture_status" == 200 ]] || failure "local fake-upstream request returned $fixture_status instead of 200"
-grep -Eq '"object"[[:space:]]*:[[:space:]]*"chat.completion"' "$fixture_body" ||
-  failure "fake-upstream response was not fixture-shaped"
-rm -f "$fixture_body"
+if [[ "$check_serving" == 1 ]]; then
+  fixture_body="$(mktemp "$tmpdir/axond-tier0-fixture.XXXXXX")"
+  fixture_status="$(curl --silent --max-time 5 --output "$fixture_body" \
+    --write-out '%{http_code}' \
+    -H 'Authorization: Bearer tier0-gateway-key' -H 'content-type: application/json' \
+    -d '{"model":"fixture-chat","messages":[{"role":"user","content":"What is the capital of France?"}]}' \
+    "$base_url/v1/chat/completions" || true)"
+  [[ "$fixture_status" == 200 ]] || failure "local fake-upstream request returned $fixture_status instead of 200"
+  grep -Eq '"object"[[:space:]]*:[[:space:]]*"chat.completion"' "$fixture_body" ||
+    failure "fake-upstream response was not fixture-shaped"
+  rm -f "$fixture_body"
+  fixture_body=""
+fi
 
 # Stateful bootstrap validates without a database: the same namespace that
 # denies egress is where a config-parse connection attempt would fail, so a
@@ -298,10 +334,14 @@ echo "readyz: $ready_body"
 echo "models: fixture-chat"
 echo "auth: unauthenticated /v1/models -> 401"
 echo "errors: unknown model -> 404 unknown_model"
-echo "serving: local fixture upstream -> 200 chat.completion"
+if [[ "$check_serving" == 1 ]]; then
+  echo "serving: local fixture upstream -> 200 chat.completion"
+else
+  echo "serving: DEGRADED, fixture upstream path not checked"
+fi
 echo "stateful: bootstrap validates with no datastore, then refuses to serve"
-if [[ "$degraded" == 1 ]]; then
-  echo "Tier 0 boot and serve passed (DEGRADED: no namespace, so egress denial and the listener invariant were not proven)"
+if [[ "$degraded" == 1 || "$check_listeners" != 1 || "$check_serving" != 1 ]]; then
+  echo "Tier 0 boot and serve passed (DEGRADED: a runner prerequisite was unavailable, so the assertions marked DEGRADED above were not proven)"
 else
   echo "Tier 0 hermetic boot and serve passed"
 fi

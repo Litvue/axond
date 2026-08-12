@@ -68,6 +68,13 @@ degraded run additionally requires both fixed ports to be free, since outside a
 namespace they are the host's. Any other value than a boolean is rejected rather
 than treated as false.
 
+The same rule covers the gate's tool prerequisites, which are now named up front
+rather than discovered mid-run. `curl` is unconditional — nothing can be probed
+without it, so its absence fails in either mode. `ss` backs only the listener
+invariant and `python3` only the fixture upstream, so under the release opt-in each
+missing tool skips exactly its own assertion and everything else still runs. The
+final line says `DEGRADED` whenever any assertion was skipped, for any reason.
+
 CI leaves the variable unset, and `ops/check-release-config.py` fails if
 `ci.yml` ever sets it, so the hermetic guarantee is still proven on every change —
 the relaxation applies only where the alternative is an unpublishable release.
