@@ -9,9 +9,18 @@
 # release failure, not a surprise for whoever pulls it on the other
 # architecture. There is deliberately no `latest` tag.
 #
+# The tags are an input because the operator-facing ones are applied last. The
+# index is first published under a staging tag and booted on both architectures
+# by digest; only then is this script run again with `<version>` and
+# `sha-<short>`, so the reference the documentation tells people to deploy never
+# exists before something has actually started it. Re-running with the same
+# children yields the same index, which EXPECT_INDEX_DIGEST asserts: promotion
+# retags a proven digest rather than publishing a second, unsmoked artifact.
+#
 # Inputs (environment): IMAGE_NAME, RELEASE_VERSION, RELEASE_SHORT_SHA,
-# RELEASE_COMMIT_SHA, GITHUB_REPOSITORY. Writes `digest=<index-digest>` to
-# GITHUB_OUTPUT when it is set.
+# RELEASE_COMMIT_SHA, GITHUB_REPOSITORY, INDEX_TAGS (space-separated), and
+# optionally EXPECT_INDEX_DIGEST. Writes `digest=<index-digest>` to GITHUB_OUTPUT
+# when it is set.
 set -euo pipefail
 
 : "${IMAGE_NAME:?IMAGE_NAME must be set}"
@@ -19,10 +28,17 @@ set -euo pipefail
 : "${RELEASE_SHORT_SHA:?RELEASE_SHORT_SHA must be set}"
 : "${RELEASE_COMMIT_SHA:?RELEASE_COMMIT_SHA must be set}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}"
+: "${INDEX_TAGS:?INDEX_TAGS must be set}"
 
 # The supported platforms, as `<os>/<arch>`. ops/check-release-config.py keeps
 # this list, the release workflow's image matrix, and the documentation in step.
 PLATFORMS=(linux/amd64 linux/arm64)
+
+read -r -a index_tags <<<"$INDEX_TAGS"
+[[ "${#index_tags[@]}" -gt 0 ]] || {
+  echo "INDEX_TAGS names no tag" >&2
+  exit 1
+}
 
 child_refs=()
 declare -A child_digests=()
@@ -48,22 +64,34 @@ for platform in "${PLATFORMS[@]}"; do
   echo "$platform child: $digest"
 done
 
+tag_args=()
+for tag in "${index_tags[@]}"; do
+  tag_args+=(--tag "${IMAGE_NAME}:${tag}")
+done
+
 docker buildx imagetools create \
   --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
   --annotation "index:org.opencontainers.image.revision=${RELEASE_COMMIT_SHA}" \
   --annotation "index:org.opencontainers.image.version=${RELEASE_VERSION}" \
-  --tag "${IMAGE_NAME}:${RELEASE_VERSION}" \
-  --tag "${IMAGE_NAME}:sha-${RELEASE_SHORT_SHA}" \
+  "${tag_args[@]}" \
   "${child_refs[@]}"
 
 index_digest="$(
-  docker buildx imagetools inspect "${IMAGE_NAME}:${RELEASE_VERSION}" \
+  docker buildx imagetools inspect "${IMAGE_NAME}:${index_tags[0]}" \
     --format '{{json .Manifest}}' | jq -r '.digest'
 )"
 [[ "$index_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
   echo "could not resolve the index digest: ${index_digest:-none}" >&2
   exit 1
 }
+
+# Promotion must retag the digest that was smoked, not publish a new one: if the
+# same children produced a different index, the tags would advertise something
+# nothing has booted.
+if [[ -n "${EXPECT_INDEX_DIGEST:-}" && "$index_digest" != "$EXPECT_INDEX_DIGEST" ]]; then
+  echo "index is $index_digest, not the smoked index $EXPECT_INDEX_DIGEST" >&2
+  exit 1
+fi
 
 index="$(docker buildx imagetools inspect --raw "${IMAGE_NAME}@${index_digest}")"
 index_media_type="$(jq -r '.mediaType' <<<"$index")"
@@ -127,15 +155,18 @@ if [[ "$actual" != "$expected" ]]; then
   exit 1
 fi
 
-# The tag the short SHA advertises must be the same index, not a stale pointer.
-sha_tag_digest="$(
-  docker buildx imagetools inspect "${IMAGE_NAME}:sha-${RELEASE_SHORT_SHA}" \
-    --format '{{json .Manifest}}' | jq -r '.digest'
-)"
-if [[ "$sha_tag_digest" != "$index_digest" ]]; then
-  echo "sha-${RELEASE_SHORT_SHA} points at $sha_tag_digest, not the index $index_digest" >&2
-  exit 1
-fi
+# Every tag this run applied must advertise this index, not a stale pointer.
+for tag in "${index_tags[@]}"; do
+  tag_digest="$(
+    docker buildx imagetools inspect "${IMAGE_NAME}:${tag}" \
+      --format '{{json .Manifest}}' | jq -r '.digest'
+  )"
+  if [[ "$tag_digest" != "$index_digest" ]]; then
+    echo "$tag points at $tag_digest, not the index $index_digest" >&2
+    exit 1
+  fi
+  echo "$tag points at the index $index_digest"
+done
 
 printf 'multi-architecture index %s contains:\n%s\n' "$index_digest" "$actual"
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then

@@ -16,15 +16,17 @@ pipeline.
 5. Smoke each published single-platform image before signing it.
 6. Generate image SBOM/provenance attestations, sign the digest keylessly, and
    verify signature plus attestations, per architecture.
-7. Join the signed child digests into the multi-architecture index that
-   `<version>` and `sha-<short>` point at, assert every descriptor in it is a
-   supported platform child (or an attestation manifest for one), sign the index
-   digest, attest its provenance, and attach it to the release as
+7. Join the signed child digests into a multi-architecture index, staged under
+   `sha-<short>-index`, and assert every descriptor in it is a supported platform
+   child (or an attestation manifest for one).
+8. Pull that index digest on each architecture and smoke it natively.
+9. Promote the smoked index: retag it as `<version>` and `sha-<short>` —
+   asserting the retag reproduced the digest that was smoked — sign it keylessly,
+   attest its provenance, verify both, and attach it to the release as
    `axond-image-<version>.digest`. SBOM attestations and SPDX assets stay
    per-architecture, on the children.
-8. Pull that index digest on each architecture and smoke it natively.
-9. Require every artifact lane.
-10. Publish `gateway-core`, `gateway-transport`, then `axond` to crates.io.
+10. Require every artifact lane.
+11. Publish `gateway-core`, `gateway-transport`, then `axond` to crates.io.
 
 crates.io is last because a published version cannot be replaced. The publish
 script is idempotent: an existing aligned package is skipped, and a partial

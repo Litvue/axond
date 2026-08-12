@@ -119,6 +119,12 @@ The public image is distroless, runs as non-root, contains no shell or package
 manager, and is published as a multi-architecture index covering `linux/amd64`
 and `linux/arm64`. There is no `latest` tag.
 
+The index is published from the next release onward. Releases up to and including
+the pinned version below publish a single `linux/amd64` image, so on those tags
+the platform listing has one entry and there is no `-arm64` reference to pull;
+ARM hosts run them under emulation ([architecture
+selection](./deployment/docker-compose.md#architecture-selection)).
+
 ```bash
 AXOND_VERSION=0.3.16 # x-release-please-version
 image="ghcr.io/litvue/axond:${AXOND_VERSION}"

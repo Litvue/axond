@@ -119,8 +119,15 @@ of failing a valid release, while CI keeps proving the hermetic guarantee
 
 The two signed, attested child images are then joined — by digest, not rebuilt —
 into an OCI index that the existing `<version>` and `sha-<short>` tags point at,
-so a digest-pinned deployment resolves on either architecture. The index digest
-is itself signed and carries a provenance attestation, and it is what
+so a digest-pinned deployment resolves on either architecture. Those two tags are
+applied last: the index is staged under `sha-<short>-index`, pulled and booted by
+digest on an amd64 and an arm64 runner, and only then retagged, signed, attested,
+and named on the release. Publishing the operator-facing reference first would
+make the tag the documentation points at exist before anything had started the
+index, and a later smoke failure cannot unpublish a tag. The promotion retags the
+same children and asserts the result is the digest that was smoked, so the tags
+never advertise a second, unproven index. The index digest is itself signed and
+carries a provenance attestation, and it is what
 `axond-image-<version>.digest` names on the release. SBOM attestations stay on
 the per-architecture children, where the packages are: an index has no
 filesystem, so an "index SBOM" could only be one child's document under a

@@ -112,8 +112,10 @@ docker pull "ghcr.io/litvue/axond:${AXOND_VERSION}"
 
 Checksummed, attested prebuilt archives are published for Linux (`x86_64` and `aarch64`, GNU and
 static musl each), macOS (`aarch64`), and Windows (`x86_64`). The OCI image is a
-multi-architecture index covering `linux/amd64` and `linux/arm64`. Production
-deployments should verify the attestations and pin an image digest. See
+multi-architecture index covering `linux/amd64` and `linux/arm64`, published
+from the next release onward — releases up to and including the pinned tag above
+publish a single `linux/amd64` image. Production deployments should verify the
+attestations and pin an image digest. See
 [Installation and verification](./docs/installation.md).
 
 ## Point a client at Axond
@@ -241,7 +243,8 @@ guidance.
 
 Release-please maintains the changelog and workspace version. A release builds
 six binary targets, publishes the `linux/amd64` and `linux/arm64` images plus the
-multi-architecture index they form, signs and attests artifacts, and publishes
+multi-architecture index they form — booted on both architectures before it takes
+the `<version>` tag — signs and attests artifacts, and publishes
 `gateway-core`, `gateway-transport`, and `axond` to crates.io in dependency
 order. Maintainer procedures are in the
 [release runbook](./docs/maintainers/releasing.md).

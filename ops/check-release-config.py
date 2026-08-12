@@ -55,6 +55,17 @@ REPAIR_REQUIRED_PATHS = (
     "ops/publish-image-index.sh",
     "ops/verify-image-evidence.sh",
 )
+INDEX_TRANSITION_PHRASE = "from the next release onward"
+# The operator-facing pages that promise the index; each must date that promise
+# while the newest published release is still amd64-only.
+INDEX_TRANSITION_PAGES = (
+    "README.md",
+    "docs/installation.md",
+    "docs/compatibility.md",
+    "docs/deployment.md",
+    "docs/deployment/container.md",
+    "docs/deployment/docker-compose.md",
+)
 AMD64_FALLBACK_PLATFORM = "platform: ${AXOND_PLATFORM-linux/amd64}"
 NATIVE_PLATFORM = "platform: ${AXOND_PLATFORM-}"
 # Documentation that must name every target and platform an operator can pick.
@@ -200,7 +211,8 @@ def check_image_gates(text: str) -> list[str]:
     per_platform = job_block(text, "release-image")
     index = job_block(text, "release-image-index")
     smoke = job_block(text, "release-image-index-smoke")
-    if per_platform is None or index is None or smoke is None:
+    promote = job_block(text, "release-image-index-promote")
+    if per_platform is None or index is None or smoke is None or promote is None:
         return ["release-please.yml: an OCI image job is missing"]
     for label, needle in {
         "published-image smoke": "ops/docker-smoke.sh",
@@ -215,16 +227,59 @@ def check_image_gates(text: str) -> list[str]:
             failures.append(
                 f"release-please.yml: release-image lacks a {label} gate ({needle!r})"
             )
+    if "ops/publish-image-index.sh" not in index:
+        failures.append(
+            "release-please.yml: release-image-index lacks the index assembly and "
+            "platform assertion gate ('ops/publish-image-index.sh')"
+        )
+    # Staging must not publish an operator-facing reference, and must not sign,
+    # attest, or advertise one: those belong after the smoke lanes, or the tags
+    # the documentation names would exist before anything booted the index.
+    staged_tags = re.search(r"INDEX_TAGS: (.+)", index)
+    if staged_tags is None:
+        failures.append(
+            "release-please.yml: release-image-index does not say which tag it stages"
+        )
+    else:
+        staged = staged_tags.group(1)
+        if "version" in staged or staged.strip().startswith("${{"):
+            failures.append(
+                "release-please.yml: release-image-index stages the index under "
+                f"{staged!r}, which is the operator-facing reference; stage it "
+                "under a separate tag and promote after the smoke lanes"
+            )
     for label, needle in {
-        "index assembly and platform assertion": "ops/publish-image-index.sh",
+        "keyless signature": "cosign sign --yes",
+        "provenance attestation": "Attest index provenance",
+        "release digest asset": '"axond-image-${RELEASE_VERSION}.digest"',
+    }.items():
+        if needle in index:
+            failures.append(
+                f"release-please.yml: release-image-index applies the {label} "
+                f"({needle!r}) before the index is smoked; that belongs to "
+                "release-image-index-promote"
+            )
+    for label, needle in {
+        "index retag from the smoked digest": "ops/publish-image-index.sh",
+        "smoked-digest assertion": "EXPECT_INDEX_DIGEST",
         "keyless signature": "cosign sign --yes",
         "provenance attestation": "Attest index provenance",
         "evidence verification": "ops/verify-image-evidence.sh",
         "index digest asset": '"axond-image-${RELEASE_VERSION}.digest"',
     }.items():
-        if needle not in index:
+        if needle not in promote:
             failures.append(
-                f"release-please.yml: release-image-index lacks a {label} gate ({needle!r})"
+                "release-please.yml: release-image-index-promote lacks a "
+                f"{label} gate ({needle!r})"
+            )
+    # Promotion is what makes the index operator-facing, so it may only run after
+    # the native boot lanes succeeded.
+    for needle in ("- release-image-index-smoke\n", "needs['release-image-index-smoke'].result == 'success'"):
+        if needle not in promote:
+            failures.append(
+                "release-please.yml: release-image-index-promote does not depend on "
+                f"release-image-index-smoke ({needle!r}); the release tags would be "
+                "published before either architecture booted the index"
             )
     if "ops/docker-smoke.sh" not in smoke:
         failures.append(
@@ -238,7 +293,8 @@ def check_image_gates(text: str) -> list[str]:
     # no filesystem, so an index SBOM would be a child's document under a subject
     # it does not describe. Publishing one anyway is allowed, but only together
     # with the documentation that tells operators where SBOMs live.
-    if "anchore/sbom-action" in index:
+    index_lanes = index + promote
+    if "anchore/sbom-action" in index_lanes:
         compatibility = (ROOT / "docs/compatibility.md").read_text(encoding="utf-8")
         if "SBOM attestations are per-architecture" in compatibility:
             failures.append(
@@ -246,7 +302,7 @@ def check_image_gates(text: str) -> list[str]:
                 "docs/compatibility.md and ADR 0004 still say SBOMs are "
                 "per-architecture only; update both together"
             )
-    elif any(claim in index for claim in ("Attest index SBOM", "SBOM_PATH", ".spdx.json")):
+    elif any(claim in index_lanes for claim in ("Attest index SBOM", "SBOM_PATH", ".spdx.json")):
         failures.append(
             "release-please.yml: release-image-index attests or names an SBOM it "
             "does not generate; the index carries signature and provenance only"
@@ -264,6 +320,7 @@ def check_release_success(text: str) -> list[str]:
         "release-image",
         "release-image-index",
         "release-image-index-smoke",
+        "release-image-index-promote",
     ):
         if f"- {lane}\n" not in block:
             failures.append(f"release-please.yml: release-success does not need {lane}")
@@ -321,6 +378,31 @@ def check_compose_platform(notes: list[str]) -> list[str]:
         failures.append(
             "docs/deployment/docker-compose.md: AXOND_PLATFORM is not documented"
         )
+    # Every page that promises an index must say when it starts existing: these
+    # pages are on main from the moment the change merges, while the newest
+    # published release is still amd64-only, and a reader who pins `:<version>`
+    # or pulls `-arm64` on that tag gets nothing. Once the pinned tag is an
+    # index the caveat is stale instead, so it is reported for removal with the
+    # Compose fallback rather than left to rot.
+    for page in INDEX_TRANSITION_PAGES:
+        # Prose wraps, so the phrase is matched against a single-spaced copy.
+        text = " ".join((ROOT / page).read_text(encoding="utf-8").split())
+        if "multi-architecture index" not in text and "arm64` index" not in text:
+            continue
+        if version > LAST_AMD64_ONLY_VERSION:
+            if INDEX_TRANSITION_PHRASE in text:
+                notes.append(
+                    f"{page}: the pinned tag {pinned.group(1)} is a "
+                    "multi-architecture index, so drop the "
+                    f"\"{INDEX_TRANSITION_PHRASE}\" caveat"
+                )
+        elif INDEX_TRANSITION_PHRASE not in text:
+            failures.append(
+                f"{page}: promises a multi-architecture index without saying it "
+                f"starts \"{INDEX_TRANSITION_PHRASE}\"; the newest release "
+                f"({pinned.group(1)}) is amd64-only, so a reader pinning that tag "
+                "finds one platform and no -arm64 reference"
+            )
     return failures
 
 

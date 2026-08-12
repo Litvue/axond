@@ -98,14 +98,20 @@ table has a `binary-smoke` lane on a runner of its own platform.
 
 `ghcr.io/litvue/axond:<version>` and `:sha-<short>` resolve to a
 multi-architecture index containing `linux/amd64` and `linux/arm64`, so one
-pinned digest deploys on either architecture. Single-platform references remain
+pinned digest deploys on either architecture. That index is published from the
+next release onward; every release up to and including the current quickstart tag
+published a single `linux/amd64` image, and ARM hosts run those under emulation
+([architecture
+selection](./deployment/docker-compose.md#architecture-selection)). Single-platform references remain
 available as `:<version>-amd64` and `:<version>-arm64`. There is no `latest`
 tag, and adding one is not planned.
 
 Every archive carries a SHA-256 sidecar, an SPDX SBOM, and provenance/SBOM
 attestations. Every published image manifest — each single-platform image and
-the multi-architecture index — is smoke-tested on its own architecture, signed
-keylessly, and carries a provenance attestation.
+the multi-architecture index — is smoke-tested on its own architecture before it
+is signed, and carries a keyless signature and a provenance attestation. The
+index reaches its `<version>` and `sha-<short>` tags only after being booted by
+digest on both architectures.
 
 SBOM attestations are per-architecture, on the single-platform children: an
 index has no filesystem of its own, so its SBOM would only ever be one child's

@@ -548,6 +548,12 @@ jobs:
   # deployment then works on either architecture without the operator choosing a
   # per-arch reference. The index is assembled from the already-signed child
   # digests rather than rebuilt, so nothing it points at is unattested.
+  #
+  # It is staged under `sha-<short>-index` first and only promoted to the
+  # operator-facing tags after both architectures have booted it, so the
+  # reference the documentation names never resolves to an index nothing has
+  # started. Signing, provenance, and the release digest asset belong to the
+  # promotion, for the same reason.
   release-image-index:
     name: Multi-architecture image index
     needs:
@@ -560,11 +566,8 @@ jobs:
       needs['release-metadata'].outputs.release_created == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       packages: write
-      id-token: write
-      attestations: write
-      artifact-metadata: write
     outputs:
       digest: ${{ steps.index.outputs.digest }}
     env:
@@ -583,40 +586,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - uses: docker/setup-buildx-action@v3
-      - name: Create and verify the index
+      # Staging tag only: `<version>` and `sha-<short>` are applied by the
+      # promotion job, after the smoke lanes have booted this digest.
+      - name: Stage and verify the index
         id: index
         env:
           GH_TOKEN: ${{ github.token }}
+          INDEX_TAGS: sha-${{ needs['release-metadata'].outputs.short_sha }}-index
         run: bash ops/publish-image-index.sh
-      - uses: sigstore/cosign-installer@v3
-      - name: Sign the index digest keylessly
-        run: cosign sign --yes "${IMAGE_NAME}@${{ steps.index.outputs.digest }}"
-      # Provenance, signature, and platform assertions apply to the index; SBOM
-      # attestations deliberately stay on the per-architecture children, since an
-      # index has no filesystem and an "index SBOM" would be one child's document
-      # under a subject it does not describe. docs/compatibility.md documents
-      # where to fetch the SBOM of the child you actually run.
-      - name: Attest index provenance
-        uses: actions/attest@v4
-        with:
-          subject-name: ${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.index.outputs.digest }}
-          push-to-registry: true
-      - name: Verify the index signature and attestations
-        env:
-          GH_TOKEN: ${{ github.token }}
-          DIGEST: ${{ steps.index.outputs.digest }}
-        run: bash ops/verify-image-evidence.sh "${IMAGE_NAME}@${DIGEST}"
-      - name: Attach the index digest to the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          DIGEST: ${{ steps.index.outputs.digest }}
-        run: |
-          set -euo pipefail
-          printf '%s\n' "${IMAGE_NAME}@${DIGEST}" > "axond-image-${RELEASE_VERSION}.digest"
-          gh release upload "$RELEASE_TAG" \
-            "axond-image-${RELEASE_VERSION}.digest" \
-            --clobber
 
   # The per-platform lanes smoke the image they built; this smokes the *index*
   # digest on each architecture, which is the reference the documentation tells
@@ -675,6 +652,83 @@ jobs:
       - name: Smoke the index digest natively
         run: bash ops/docker-smoke.sh "${IMAGE_NAME}@${INDEX_DIGEST}"
 
+  # Promotion is the first moment `<version>` and `sha-<short>` exist, and it
+  # happens only after both smoke lanes booted this exact digest. The same
+  # children are retagged, and EXPECT_INDEX_DIGEST fails the release if that
+  # produced anything other than the index that was smoked — so the tags, the
+  # signature, the provenance, and the digest asset on the release all describe
+  # an index something has actually started.
+  release-image-index-promote:
+    name: Promote the multi-architecture index
+    needs:
+      - release-metadata
+      - release-image-index
+      - release-image-index-smoke
+    if: >-
+      !cancelled() &&
+      needs['release-metadata'].result == 'success' &&
+      needs['release-image-index'].result == 'success' &&
+      needs['release-image-index-smoke'].result == 'success' &&
+      needs['release-metadata'].outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      RELEASE_TAG: ${{ needs['release-metadata'].outputs.tag_name }}
+      RELEASE_VERSION: ${{ needs['release-metadata'].outputs.version }}
+      RELEASE_SHORT_SHA: ${{ needs['release-metadata'].outputs.short_sha }}
+      RELEASE_COMMIT_SHA: ${{ needs['release-metadata'].outputs.commit_sha }}
+      INDEX_DIGEST: ${{ needs['release-image-index'].outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs['release-metadata'].outputs.tag_name }}
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Promote the smoked index to the release tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INDEX_TAGS: ${{ needs['release-metadata'].outputs.version }} sha-${{ needs['release-metadata'].outputs.short_sha }}
+          EXPECT_INDEX_DIGEST: ${{ needs['release-image-index'].outputs.digest }}
+        run: bash ops/publish-image-index.sh
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the index digest keylessly
+        run: cosign sign --yes "${IMAGE_NAME}@${INDEX_DIGEST}"
+      # Provenance, signature, and platform assertions apply to the index; SBOM
+      # attestations deliberately stay on the per-architecture children, since an
+      # index has no filesystem and an "index SBOM" would be one child's document
+      # under a subject it does not describe. docs/compatibility.md documents
+      # where to fetch the SBOM of the child you actually run.
+      - name: Attest index provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ needs['release-image-index'].outputs.digest }}
+          push-to-registry: true
+      - name: Verify the index signature and attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash ops/verify-image-evidence.sh "${IMAGE_NAME}@${INDEX_DIGEST}"
+      - name: Attach the index digest to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${IMAGE_NAME}@${INDEX_DIGEST}" \
+            > "axond-image-${RELEASE_VERSION}.digest"
+          gh release upload "$RELEASE_TAG" \
+            "axond-image-${RELEASE_VERSION}.digest" \
+            --clobber
+
   release-success:
     name: Release artifacts success
     needs:
@@ -683,6 +737,7 @@ jobs:
       - release-image
       - release-image-index
       - release-image-index-smoke
+      - release-image-index-promote
     if: >-
       always() &&
       (needs['release-metadata'].result != 'success' ||
@@ -697,6 +752,7 @@ jobs:
           test "${{ needs['release-image'].result }}" = success
           test "${{ needs['release-image-index'].result }}" = success
           test "${{ needs['release-image-index-smoke'].result }}" = success
+          test "${{ needs['release-image-index-promote'].result }}" = success
 
   # crates.io is the one irreversible lane: a published version can be yanked
   # but never replaced or removed. So it runs last, only after the tagged
