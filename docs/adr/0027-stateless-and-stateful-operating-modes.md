@@ -61,13 +61,22 @@ while others are database-owned within the same process.
 
 **Stateless mode is the backward-compatible default.** Omitting `mode` selects
 it. TOML plus the environment variables and files it references remains the
-single authority for every resource, exactly as documented in
+authority for every resource, exactly as documented in
 [configuration.md](../configuration.md) and reloaded under
 [ADR 0011](./0011-config-hot-reload.md). ADR 0017's tiers still describe the
 optional Redis/Postgres backends a stateless deployment may select for budgets,
 rate limiting, revocation, and durable usage; selecting them does not make the
-deployment stateful in the sense of this ADR. **Stateless mode is unchanged by
-this ADR**, including its Tier 0 hermetic guarantee.
+deployment stateful in the sense of this ADR.
+
+The one carve-out ADR 0017 already grants stands: a Tier 2 store-backed
+principal layer may own *caller and key lifecycle* for the credential shapes it
+declares, under the shape-ownership, TTL-cache, and fail-closed rules of
+[ADR 0016](./0016-minted-inbound-identity-and-principal-stores.md). That is caller/key lifecycle
+only — namespaces, providers, aliases, prices, and provider credentials stay
+config-owned in stateless mode — and it is a different mechanism from stateful
+mode, where identities are compiled into the snapshot instead of resolved per
+request. **Stateless mode is otherwise unchanged by this ADR**, including its
+Tier 0 hermetic guarantee.
 
 **Stateful mode moves durable-resource ownership to the control plane.**
 Bootstrap TOML shrinks to the things a process needs before it can read
@@ -149,6 +158,7 @@ the implementation slices, not an undocumented extension of it.
 | Exact fleet-wide in-flight rate-limit lease | Redis | Both | Existing, opt-in (ADR 0017) |
 | Precise minted-token `jti` revocation check | Redis or Postgres | Both | Existing, opt-in (ADR 0017 amendment) |
 | Durable usage row write | Postgres | Both | Existing, opt-in, **off** the request path (buffered sink) |
+| Store-backed caller/key principal resolution for a declared credential shape | Redis or Postgres | **Stateless only** | Permitted but unimplemented (ADR 0016/0017); cached, fail-closed. Stateful mode resolves identities from the snapshot instead |
 
 Explicitly **not** on the request path in stateful mode:
 
@@ -310,6 +320,14 @@ The contracts stay internal to the gateway crate in this phase: no new
 published workspace crate, and no public trait in `gateway-core` or
 `gateway-transport` until an implementation has proven the shape.
 
+### State tier
+
+Stateless mode is unchanged: **Tier 0** by default, with Tier 1/Tier 2 opt-ins
+exactly as ADR 0017 describes. Stateful mode is **Tier 2**: Postgres is a
+control-plane and cold-boot dependency, and the secret store is required for
+snapshot compilation. Selecting stateful mode is the operator's explicit act, so
+no existing deployment's tier is raised.
+
 ## State ownership matrix
 
 "Stateless" is today's behavior. "Stateful" is what this ADR settles. Authority
@@ -321,7 +339,7 @@ one mode.
 | Bootstrap (`mode`, `[server]`, telemetry, control-plane DSN reference, secret-store/KEK settings, static breakglass credential) | TOML + env/files | TOML + env/files | Process-local file | No (read at boot/reload) |
 | Tenants and projects | TOML `[[namespace]]` | `ControlPlaneStore` | Postgres revision | No — resolved from snapshot |
 | Human/administrative identities | n/a (no admin API) | OIDC issuer + `ControlPlaneStore` bindings; static breakglass in bootstrap | Postgres + IdP | No — `/admin/v1` only |
-| Inference identities (static keys, minted signing/verification policy, epochs) | TOML `[[gateway_key]]`, `[gateway_minting]`, `[gateway_token]`, `[[gateway_verifier]]`, `[[gateway_token_epoch]]` | `ControlPlaneStore` (static breakglass stays in bootstrap) | Postgres revision | No — snapshot; opt-in `RevocationStore` check is separate |
+| Inference identities (static keys, minted signing/verification policy, epochs) | TOML `[[gateway_key]]`, `[gateway_minting]`, `[gateway_token]`, `[[gateway_verifier]]`, `[[gateway_token_epoch]]` (plus an optional ADR 0016 store-backed layer for caller/key lifecycle) | `ControlPlaneStore` (static breakglass stays in bootstrap) | Postgres revision | Stateless: yes, if a store-backed principal layer is selected. Stateful: no — snapshot; opt-in `RevocationStore` check is separate |
 | Providers and endpoints | TOML `[[provider]]` | `ControlPlaneStore` | Postgres revision | No — snapshot |
 | Provider credentials (BYOK) | TOML `[[credential]]` → env var | `ControlPlaneStore` reference + `SecretStore` material | Postgres revision + wrapped secret | No — resolved into snapshot before publication |
 | Model catalogue metadata | TOML `[[model]]` | `CatalogSource` ingestion into `ControlPlaneStore` | Postgres | No — background refresh |
@@ -414,14 +432,6 @@ shapes within the approved bootstrap set (#162); precise error and capability
 enum variants (#163); DDL, index, and concurrency-control details (#141);
 polling interval, notification use, and convergence targets (#142); and the
 signed offline last-known-good format (#142).
-
-## State tier
-
-Stateless mode is unchanged: **Tier 0** by default, with Tier 1/Tier 2 opt-ins
-exactly as ADR 0017 describes. Stateful mode is **Tier 2**: Postgres is a
-control-plane and cold-boot dependency, and the secret store is required for
-snapshot compilation. Selecting stateful mode is the operator's explicit act, so
-no existing deployment's tier is raised.
 
 ## Consequences
 
