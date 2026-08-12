@@ -266,12 +266,12 @@ pub(crate) fn state_with_legacy_tenant() -> DesiredState {
 /// project scope names is simply unroutable.
 pub(crate) fn state_a_pre_tenancy_build_published() -> DesiredState {
     let owner = tenant_id(1);
-    let credential = credential(&owner, 3, "primary");
+    let credential = credential(&owner, 23, "legacy-primary");
     let mut state = DesiredState::new();
     state
         .insert(credential.clone())
-        .and_then(|state| state.insert(alias(&owner, 4, "fast", &[credential.reference])))
-        .and_then(|state| state.insert(project_alias(&owner, &project_id(2), 6, "inner")))
+        .and_then(|state| state.insert(alias(&owner, 24, "legacy-fast", &[credential.reference])))
+        .and_then(|state| state.insert(project_alias(&owner, &project_id(2), 26, "legacy-inner")))
         .expect("a revision without its owner rows is valid desired state");
     state
 }
