@@ -53,7 +53,7 @@ Three commands run *before* replicas do, all with the same grammar —
 
 | Command | Writes? | Answers |
 | --- | --- | --- |
-| `axond check preflight --config PATH` | No | Would a replica boot against this? Config ownership and mode, bootstrap references, control-plane reachability, schema compatibility. |
+| `axond check preflight --config PATH` | No | Would a replica boot against this? Config ownership and mode, every reference a boot resolves (control plane, secret-store KEK, breakglass, inbound keys and verifiers, provider credentials, opt-in stores), control-plane reachability, schema compatibility. |
 | `axond migrate status --config PATH` | No | What schema does this database have, and what would an apply do? |
 | `axond migrate apply --config PATH` | Yes | Apply the pending migrations, forward only. |
 
@@ -68,9 +68,19 @@ any check failed, `status` exits non-zero while a migration is outstanding or th
 schema is refused, and `apply` exits non-zero if the schema was refused. Output
 names environment variables, never DSNs.
 
+`apply` against a database that is already current is a no-op rather than a
+re-run: it reports the current version and rolls its transaction back without
+executing a migration file.
+
 In stateless mode there is no control plane, so `preflight` reports the database
 checks as skipped and `migrate` has nothing to do. Neither command requires
 PostgreSQL to exist.
+
+One thing `preflight` cannot rehearse in stateful mode, and says so as a skipped
+`stateful serving` line: `axond serve` still refuses `mode = "stateful"` outright,
+because the durable control plane is not wired to the runtime yet. A stateful
+preflight with every other check green describes the *database*, not a replica
+that can start.
 
 Only the control-plane journal is migrated by these commands. It is the only store
 with a ledger — recorded version, file name, checksum — so it is the only one where

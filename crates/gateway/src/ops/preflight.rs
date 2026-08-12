@@ -148,6 +148,21 @@ pub async fn run(config: &Config, config_path: &Path, env: &HashMap<String, Stri
             }
         ),
     );
+    // Reported rather than assumed: every other check here answers "would a
+    // replica boot?", and in stateful mode there is currently one answer none of
+    // them can reach. `serve` refuses `mode = "stateful"` outright until the
+    // runtime is wired to the control plane, so an operator gating a rollout on
+    // this command has to be told that from the command rather than from a crash
+    // loop. Skipped rather than failed: the database checks below are still the
+    // useful answer, and they are what `axond migrate` is gated on.
+    if config.mode == Mode::Stateful {
+        report.skipped(
+            "stateful serving",
+            "`serve` still refuses `mode = \"stateful\"`: the durable control plane is not wired \
+             to the runtime yet, so the checks below describe the database rather than a replica \
+             that can start",
+        );
+    }
     check_file_ownership(&mut report, config_path);
     check_references(&mut report, config, env);
     check_control_plane(&mut report, config, env).await;
@@ -186,10 +201,16 @@ fn check_file_ownership(report: &mut Report, path: &Path) {
     // control of the identity that is about to act on them. Only checked where
     // the process' own uid can be established without writing anything — this
     // command is read-only, so it does not create a probe file to find out.
+    //
+    // Root is exempt as the *reader* as well as the owner: `root` running a
+    // migration hook against a config owned by the service account is a normal
+    // layout, and root can read the file whoever owns it, so the comparison would
+    // fail a deployment for who typed the command rather than for anything about
+    // the file.
     match process_uid() {
-        Some(effective) if owner != effective && owner != 0 => problems.push(format!(
-            "owner uid {owner} is neither this process (uid {effective}) nor root"
-        )),
+        Some(effective) if effective != 0 && owner != effective && owner != 0 => problems.push(
+            format!("owner uid {owner} is neither this process (uid {effective}) nor root"),
+        ),
         _ => {}
     }
     if problems.is_empty() {
@@ -241,10 +262,12 @@ fn check_file_ownership(report: &mut Report, path: &Path) {
 /// filesystem.
 ///
 /// A reference is a name, not a value: the check is that something answers to the
-/// name, and no resolved value is ever reported. This covers the stateful
-/// bootstrap set (control plane, secret store KEK, breakglass credential) and the
-/// opt-in stores, because an unset `dsn_env` fails a boot whichever section it is
-/// in.
+/// name, and no resolved value is ever reported. Every reference a boot resolves
+/// is here — the stateful bootstrap set (control plane, secret store KEK,
+/// breakglass credential), the inbound keys and verifiers, the stateless provider
+/// credentials, and the opt-in stores — because an unset name fails a boot
+/// whichever section it is in, and a preflight that passed on one of those would
+/// be the failure this command exists to catch.
 fn check_references(report: &mut Report, config: &Config, env: &HashMap<String, String>) {
     let mut references: Vec<(String, Reference)> = Vec::new();
     if let Some(control_plane) = config.control_plane.as_ref() {
@@ -288,6 +311,29 @@ fn check_references(report: &mut Report, config: &Config, env: &HashMap<String, 
             references.push((label, Reference::Env(name.to_owned())));
         } else if let Some(path) = non_empty(key.file.as_deref()) {
             references.push((label, Reference::File(path.to_owned())));
+        }
+    }
+    for verifier in &config.gateway_verifier {
+        let label = format!("[[gateway_verifier]] `{}`", verifier.kid);
+        if let Some(name) = non_empty(verifier.env.as_deref()) {
+            references.push((label, Reference::Env(name.to_owned())));
+        } else if let Some(path) = non_empty(verifier.file.as_deref()) {
+            references.push((label, Reference::File(path.to_owned())));
+        }
+    }
+    // Provider credentials are the references a stateless replica fails to boot
+    // on most often, and `env` is mandatory rather than optional there.
+    for credential in &config.credential {
+        if let Some(name) = non_empty(Some(credential.env.as_str())) {
+            references.push((
+                format!(
+                    "[[credential]] {}/{} `{}`",
+                    credential.namespace,
+                    credential.provider,
+                    credential.label()
+                ),
+                Reference::Env(name.to_owned()),
+            ));
         }
     }
     for (index, sink) in config.usage_sink.iter().enumerate() {
@@ -551,6 +597,79 @@ mod tests {
         assert!(
             matches!(references.outcome, Outcome::Passed(_)),
             "every reference is satisfied here: {references}"
+        );
+    }
+
+    /// A stateless replica fails to boot on an unset provider credential or
+    /// verifier key, so a preflight that passed on one would be exactly the
+    /// failure this command exists to catch.
+    #[tokio::test]
+    async fn provider_credentials_and_verifier_keys_are_references_too() {
+        let toml = "[[gateway_key]]\nenv = \"GW_KEY\"\nnamespace = \"platform\"\n\
+             [gateway_token]\naudience = \"axond-test\"\n\
+             [[gateway_verifier]]\nkid = \"acme-1\"\nalg = \"EdDSA\"\n\
+             env = \"GW_VERIFY_ACME\"\nnamespaces = [\"platform\"]\nmax_ttl = \"15m\"\n\
+             [[namespace]]\nid = \"platform\"\ndefault = true\n\
+             [[provider]]\nid = \"openai\"\nkind = \"openai\"\n\
+             base_url = \"https://api.openai.com/v1\"\n\
+             [[credential]]\nnamespace = \"platform\"\nprovider = \"openai\"\n\
+             env = \"GW_OPENAI_KEY\"\nid = \"openai-primary\"\n";
+        let path = write("axond.toml", toml);
+        let config = Config::from_toml_str(toml).expect("valid stateless config");
+        let mut env = HashMap::from([("GW_KEY".to_owned(), "secret".to_owned())]);
+
+        let report = run(&config, &path, &env).await;
+        let rendered = report.to_string();
+        assert!(!report.is_ok(), "unset references must fail: {rendered}");
+        assert!(rendered.contains("GW_VERIFY_ACME"), "{rendered}");
+        assert!(rendered.contains("GW_OPENAI_KEY"), "{rendered}");
+        assert!(
+            rendered.contains("openai-primary"),
+            "the credential's label locates it in the file: {rendered}"
+        );
+
+        env.insert("GW_VERIFY_ACME".to_owned(), "verifier".to_owned());
+        env.insert("GW_OPENAI_KEY".to_owned(), "sk-test".to_owned());
+        let report = run(&config, &path, &env).await;
+        assert!(report.is_ok(), "{report}");
+        assert!(
+            !report.to_string().contains("sk-test"),
+            "a resolved value is never reported"
+        );
+    }
+
+    /// `serve` still refuses `mode = "stateful"`. An operator gating a rollout on
+    /// preflight has to learn that here rather than from a crash loop, so the
+    /// refusal is a reported line — and a skipped one, because the database
+    /// checks it accompanies are still the useful answer.
+    #[tokio::test]
+    async fn a_stateful_preflight_names_the_serving_refusal_it_cannot_rehearse() {
+        let path = write("axond.toml", stateful_toml());
+        let config = Config::from_toml_str(stateful_toml()).expect("valid stateful config");
+        let report = run(&config, &path, &HashMap::new()).await;
+        let refusal = report
+            .checks
+            .iter()
+            .find(|check| check.name == "stateful serving")
+            .expect("a stateful preflight must name the refusal");
+        assert!(
+            matches!(refusal.outcome, Outcome::Skipped(_)),
+            "the refusal is reported, not counted as a failure: {refusal}"
+        );
+
+        let stateless = Config::from_toml_str(stateless_toml()).expect("valid stateless config");
+        let report = run(
+            &stateless,
+            &write("axond.toml", stateless_toml()),
+            &HashMap::new(),
+        )
+        .await;
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|check| check.name == "stateful serving"),
+            "stateless mode has no such refusal to report: {report}"
         );
     }
 

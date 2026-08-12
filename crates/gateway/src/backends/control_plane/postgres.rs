@@ -247,7 +247,17 @@ impl PostgresControlPlane {
                 let status = schema::status(&transaction)
                     .await
                     .map_err(|error| unavailable("read schema status", &error))?;
-                if !status.is_migratable() && !status.is_current() {
+                // A database that is already current is left alone rather than
+                // handed to the runner: `migrate` starts from the recorded prefix
+                // of a `Behind` status, so a `Current` one would re-run every
+                // shipped file from v1. That happens to be harmless while every
+                // statement is `IF NOT EXISTS`, and would not survive the first
+                // `ALTER TABLE` or backfill. Returning here also rolls the
+                // transaction back, so a repeated apply writes nothing at all.
+                if status.is_current() {
+                    return Ok(Vec::new());
+                }
+                if !status.is_migratable() {
                     return Err(denied(status.to_string()));
                 }
                 let pending = schema::pending(&status);

@@ -552,6 +552,55 @@ mod tests {
         assert!(status.is_ok() && status.is_settled(), "{status}");
     }
 
+    /// Idempotence as *not executing the SQL again*, rather than as an unchanged
+    /// ledger. The shipped v1 file is written with `IF NOT EXISTS` throughout, so
+    /// a re-run leaves the same ledger and the same tables and no assertion on
+    /// either can tell the difference — while the first `ALTER TABLE` or backfill
+    /// to ship would corrupt a current database. A table the migration creates is
+    /// dropped behind the ledger's back, which makes execution observable: if the
+    /// second apply runs the file, the table comes back.
+    #[tokio::test]
+    async fn a_current_database_is_not_migrated_again() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        apply(&fixture.config, &fixture.env)
+            .await
+            .expect("the first apply migrates");
+        fixture
+            .observe()
+            .await
+            .batch_execute("DROP TABLE axond_cp_idempotency CASCADE")
+            .await
+            .expect("drop a table the migration creates");
+
+        let second = apply(&fixture.config, &fixture.env)
+            .await
+            .expect("a current database is a no-op, not a failure");
+        assert_eq!(
+            second.state(),
+            Some(&State::Current {
+                version: schema::required_version()
+            }),
+            "{second}"
+        );
+        let recreated = fixture
+            .observe()
+            .await
+            .query_one(
+                "SELECT to_regclass($1)::text",
+                &[&format!("{}.axond_cp_idempotency", fixture.schema)],
+            )
+            .await
+            .expect("probe the dropped table")
+            .get::<_, Option<String>>(0)
+            .is_some();
+        assert!(
+            !recreated,
+            "applying to a current schema re-executed the shipped migration SQL"
+        );
+    }
+
     /// Safe before replicas start includes safe *while another operator is doing
     /// the same thing*: the advisory lock is what makes two applies one migration.
     #[tokio::test]
