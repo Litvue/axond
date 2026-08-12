@@ -29,7 +29,16 @@ pub struct ProcessSample {
     pub sockets: u64,
 }
 
-/// Sample a process, or `None` off a `/proc` platform.
+/// Whether this host has a `/proc` to sample at all. Distinguishing the platform
+/// from a failed read matters: absent resource fields on a `/proc` host mean the
+/// sampler lost its subject, not that the measurement was never possible, and
+/// the difference is what keeps the memory gate from passing vacuously.
+pub fn procfs() -> bool {
+    std::path::Path::new("/proc/self/status").exists()
+}
+
+/// Sample a process, or `None` off a `/proc` platform — or when the process is
+/// gone.
 pub fn sample(pid: u32) -> Option<ProcessSample> {
     Some(ProcessSample {
         rss_kib: rss_kib(pid)?,
@@ -80,9 +89,13 @@ fn sockets(pid: u32) -> Option<u64> {
 /// The resource story of one run, all of it observed from outside the process.
 #[derive(Debug, Clone, Serialize)]
 pub struct ResourceReport {
-    /// `null` off a `/proc` platform, where the run still qualifies every other
-    /// property rather than being skipped.
+    /// Whether the measurements below were taken. Off a `/proc` platform the run
+    /// still qualifies every other property rather than being skipped; on one, a
+    /// `false` here is itself a hard failure (`resource_sampling`), because a
+    /// missing measurement and a passing one must not read alike.
     pub sampled: bool,
+    /// Whether this host could have been sampled at all.
+    pub procfs: bool,
     pub samples: u64,
     pub rss_kib: Option<Span>,
     pub sockets: Option<Span>,
@@ -167,6 +180,7 @@ impl Sampler {
         let (Some(baseline), Some(settled)) = (self.baseline, settled) else {
             return ResourceReport {
                 sampled: false,
+                procfs: procfs(),
                 samples,
                 rss_kib: None,
                 sockets: None,
@@ -179,6 +193,7 @@ impl Sampler {
         let cpu_seconds = ticks as f64 / USER_HZ;
         ResourceReport {
             sampled: true,
+            procfs: procfs(),
             samples,
             rss_kib: Some(Span {
                 baseline: baseline.rss_kib,

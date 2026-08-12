@@ -58,11 +58,11 @@ Platinum 8175M @ 2.50 GHz, 31 GiB RAM, Linux 5.15, rustc 1.97.1, no queueing
 
 | Profile | Concurrency | Requests | Accepted req/s | p50 | p95 | p99 | TTFT p95 | Peak RSS | Peak sockets | CPU cores used |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `buffered` | 128 | 40 000 | 3 726 | 33.1 ms | 51.2 ms | 62.8 ms | — | 44 MiB | 342 | 4.2 |
-| `streaming` | 300 | 8 000 | 522 | 562 ms | 681 ms | 1 054 ms | 165 ms | 52 MiB | 743 | 4.2 |
-| `mixed` | 128 | 12 000 | 1 001 | 15.5 ms | 371 ms | 389 ms | 71 ms | 39 MiB | 294 | 3.7 |
-| `response-size` | 64 | 6 000 | 362 | 165 ms | 294 ms | 352 ms | — | 68 MiB | 154 | 3.5 |
-| `cancellation` | 300 | 8 000 | 705 | 422 ms | 839 ms | 1 002 ms | 211 ms | 58 MiB | 728 | 3.8 |
+| `buffered` | 128 | 40 000 | 4 498 | 27.6 ms | 42.0 ms | 50.4 ms | — | 43 MiB | 315 | 4.6 |
+| `streaming` | 300 | 8 000 | 637 | 459 ms | 521 ms | 837 ms | 129 ms | 51 MiB | 753 | 4.8 |
+| `mixed` | 128 | 12 000 | 1 190 | 8.2 ms | 313 ms | 326 ms | 58 ms | 38 MiB | 279 | 4.0 |
+| `response-size` | 64 | 6 000 | 460 | 131 ms | 226 ms | 271 ms | — | 66 MiB | 151 | 4.1 |
+| `cancellation` | 300 | 8 000 | 893 | 370 ms | 621 ms | 784 ms | 151 ms | 57 MiB | 726 | 4.4 |
 
 Throughput and latency move 10–25% between runs on a shared host, while the
 socket and memory columns barely move: read the first two as an order of
@@ -128,8 +128,11 @@ therefore shows up as a moved number between two artifacts with matching
 provenance — compare heavy-tier runs, not CI runs.
 
 Off Linux there is no `/proc`, so RSS, CPU, and sockets are recorded as absent
-and the memory-growth threshold is not evaluated; every other property still
-gates.
+(`resources.procfs = false`) and the memory-growth threshold is not evaluated;
+every other property still gates. On a Linux host the same absence means the
+sampler lost its subject rather than never having one, and the run fails the
+`resource_sampling` verdict — a measurement that could not be taken must not read
+like one that passed.
 
 ## Reading an artifact
 

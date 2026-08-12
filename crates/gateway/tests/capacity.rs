@@ -22,7 +22,7 @@
 
 mod support;
 
-use support::capacity::{self, CapacityResult, Gauges, Tier, Workload};
+use support::capacity::{self, CapacityResult, Gauges, ResourceReport, Span, Tier, Workload};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_reduced_capacity_profiles_qualify_and_publish_their_evidence() {
@@ -168,6 +168,73 @@ fn a_stream_waits_in_the_first_byte_gauge_until_its_first_relayed_chunk() {
     gauges.leave(headers);
     gauges.leave(chunk);
     assert_eq!(gauges.awaiting(), 0);
+}
+
+/// Output events are counted over the relayed text, not per transport read: a
+/// starved reader takes several events in one read, and a marker can straddle a
+/// chunk boundary. Counting reads instead would let a busy machine miss the
+/// hang-up and fail the cadence assertion with nothing wrong.
+#[test]
+fn output_events_are_counted_however_the_transport_frames_them() {
+    let openai = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n";
+    let anthropic = "event: content_block_delta\ndata: {}\n\n";
+
+    assert_eq!(capacity::output_events(openai), 1);
+    assert_eq!(capacity::output_events(anthropic), 1);
+    // Several events coalesced into one read still count as several.
+    assert_eq!(capacity::output_events(&openai.repeat(4)), 4);
+    assert_eq!(
+        capacity::output_events(&format!("{openai}{anthropic}{openai}")),
+        3
+    );
+    // A preamble carries no output, and neither does the terminator.
+    assert_eq!(
+        capacity::output_events("event: message_start\ndata: {}\n\ndata: [DONE]\n\n"),
+        0
+    );
+    // A marker split across two reads counts once when the text is accumulated,
+    // which is why the driver accumulates it.
+    let (head, tail) = openai.split_at(openai.find("content").expect("a marker") + 3);
+    assert_eq!(capacity::output_events(head), 0);
+    assert_eq!(capacity::output_events(&format!("{head}{tail}")), 1);
+}
+
+/// An absent memory measurement means two different things, and they must not
+/// look alike: a platform with no `/proc` had no evidence to give, while a
+/// `/proc` host that produced none lost its subject mid-run. The second is a
+/// failure; treating it as the first makes the memory gate pass vacuously.
+#[test]
+fn a_lost_resource_sample_fails_rather_than_skipping_the_memory_gate() {
+    let report = |procfs: bool, rss: Option<Span>| ResourceReport {
+        sampled: rss.is_some(),
+        procfs,
+        samples: 0,
+        rss_kib: rss,
+        sockets: None,
+        cpu_seconds: None,
+        cpu_utilization: None,
+        user_hz: 100.0,
+    };
+    let span = Span {
+        baseline: 1_000,
+        peak: 1_400,
+        settled: 1_100,
+    };
+
+    // 400 KiB of growth, against the manifest's 256 MiB bound.
+    let bound = 256 * 1024;
+    let measured = capacity::memory_verdict(&report(true, Some(span)), bound).expect("a verdict");
+    assert_eq!(measured.threshold, "max_rss_growth_kib");
+    assert!(measured.passed, "{measured:?}");
+
+    let lost = capacity::memory_verdict(&report(true, None), bound).expect("a verdict");
+    assert_eq!(lost.threshold, "resource_sampling");
+    assert!(!lost.passed, "a /proc host that measured nothing must fail");
+
+    assert!(
+        capacity::memory_verdict(&report(false, None), bound).is_none(),
+        "off a /proc platform there is nothing to assert"
+    );
 }
 
 /// Both tiers live in one test binary, so the harness that runs the heavy tier

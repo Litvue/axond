@@ -11,5 +11,6 @@ pub mod result;
 pub mod run;
 
 pub use manifest::{Manifest, Profile, Tier, Workload};
+pub use probe::{ResourceReport, Span};
 pub use result::CapacityResult;
-pub use run::{Gauges, cancels, expected_cancellations, run};
+pub use run::{Gauges, cancels, expected_cancellations, memory_verdict, output_events, run};

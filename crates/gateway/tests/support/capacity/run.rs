@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use super::manifest::{Profile, RESULT_SCHEMA_VERSION, Tier, Workload};
-use super::probe::Sampler;
+use super::probe::{ResourceReport, Sampler};
 use super::result::{
     CapacityResult, Environment, Occupancy, Outcomes, Percentiles, ProfileEcho, RunMeta,
     Throughput, Upstream, UsageRecords, Verdict,
@@ -434,16 +434,30 @@ fn verdicts(result: &CapacityResult) -> Vec<Verdict> {
             thresholds.max_leaked_upstream_streams as f64,
         ),
     ];
-    // Off a `/proc` platform there is no memory evidence, so there is nothing to
-    // assert rather than a threshold that passes vacuously.
-    if let Some(rss) = result.resources.rss_kib {
-        verdicts.push(Verdict::at_most(
+    verdicts.extend(memory_verdict(
+        &result.resources,
+        thresholds.max_rss_growth_kib,
+    ));
+    verdicts
+}
+
+/// What a run's resource sampling is worth as a gate.
+///
+/// Off a `/proc` platform there is no memory evidence, so there is nothing to
+/// assert rather than a threshold that would pass vacuously. On a `/proc` host an
+/// absent measurement is a different thing: the sampler lost its subject — the
+/// process exited, or its `/proc` entries could not be read — and a run that
+/// cannot say what memory did must not read like one that measured and passed.
+pub fn memory_verdict(resources: &ResourceReport, max_growth_kib: u64) -> Option<Verdict> {
+    match resources.rss_kib {
+        Some(rss) => Some(Verdict::at_most(
             "max_rss_growth_kib",
             rss.growth() as f64,
-            thresholds.max_rss_growth_kib as f64,
-        ));
+            max_growth_kib as f64,
+        )),
+        None if resources.procfs => Some(Verdict::at_most("resource_sampling", 1.0, 0.0)),
+        None => None,
     }
-    verdicts
 }
 
 /// Offer one request and measure it.
@@ -526,7 +540,10 @@ async fn attempt(
     // is what happens after that.
     let mut stream = response.bytes_stream();
     let mut first_byte: Option<Duration> = None;
-    let mut output_chunks = 0;
+    // Relayed output *events*, not transport chunks: the two do not map
+    // one-to-one, and a starved reader can take several events in one read. The
+    // text is accumulated because a marker can also straddle a chunk boundary.
+    let mut relayed = String::new();
     let mut cancelled = false;
     let mut torn = false;
     while let Some(chunk) = stream.next().await {
@@ -536,13 +553,13 @@ async fn attempt(
         };
         first_byte.get_or_insert_with(|| started.elapsed());
         gauges.first_byte(waiting);
-        // Relayed model output, rather than a transport chunk: the two do not
-        // map one-to-one, and only output makes a cancellation charge real.
-        let text = String::from_utf8_lossy(&chunk);
-        if text.contains("\"content\":") || text.contains("content_block_delta") {
-            output_chunks += 1;
-        }
-        if cancel_after_output_chunks.is_some_and(|after| output_chunks >= after) {
+        let Some(after) = cancel_after_output_chunks else {
+            continue;
+        };
+        relayed.push_str(&String::from_utf8_lossy(&chunk));
+        // Only relayed output makes a cancellation charge real, so the hang-up
+        // waits for it rather than for the stream's preamble.
+        if output_events(&relayed) >= after {
             cancelled = true;
             break;
         }
@@ -592,6 +609,13 @@ async fn await_closed_upstreams(upstream: &FakeUpstream) -> i64 {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// Relayed model-output events in a stream read so far, over both wire families.
+/// Counted over the accumulated text rather than per transport chunk: a starved
+/// reader takes several events in one read, and a marker can straddle a boundary.
+pub fn output_events(relayed: &str) -> usize {
+    relayed.matches("\"content\":").count() + relayed.matches("content_block_delta").count()
 }
 
 fn millis(duration: Duration) -> f64 {
