@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.2](https://github.com/Litvue/axond/compare/v0.3.1...v0.3.2) (2026-08-12)
+
+
+### Features
+
+* **install:** add prebuilt binary installers ([#139](https://github.com/Litvue/axond/issues/139)) ([261fbb5](https://github.com/Litvue/axond/commit/261fbb587e743a9571baec5fd750d75b924a41c1))
+
+
+### Bug Fixes
+
+* **release:** allow main workflow repair of existing tags ([#136](https://github.com/Litvue/axond/issues/136)) ([67da1e8](https://github.com/Litvue/axond/commit/67da1e8f41b513391c8c7d5d31008ba15244f792))
+
+
+### Documentation
+
+* rebuild onboarding and deployment guides ([#137](https://github.com/Litvue/axond/issues/137)) ([8ee96f7](https://github.com/Litvue/axond/commit/8ee96f7811383d120984738be9567d5ab851ee7c))
+
 ## [0.3.1](https://github.com/Litvue/axond/compare/v0.3.0...v0.3.1) (2026-08-11)
 
 
