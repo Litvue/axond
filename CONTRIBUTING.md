@@ -3,14 +3,23 @@
 Thanks for your interest. Axond is early — the architecture is settling, so
 opening an issue to discuss a change before a large PR is appreciated.
 
+Found a vulnerability? Do not open an issue or a pull request — follow
+[`SECURITY.md`](./SECURITY.md) and report it privately.
+
 ## Development
 
 Requires the toolchain pinned in [`rust-toolchain.toml`](./rust-toolchain.toml).
+That pin is newer than the project's minimum supported Rust version, which is
+`rust-version` in [`Cargo.toml`](./Cargo.toml); `just msrv` builds the workspace
+on that floor the way CI does.
 
 ```bash
-just check      # fmt --check, clippy -D warnings, tests — the CI gates
+just check      # fmt --check, clippy -D warnings, tests, docs, supply chain,
+                # packaging, MSRV, and public-API compatibility — the CI gates
 just run        # run against ./axond.toml
 just compat     # run the Python SDK compatibility lane
+just msrv       # build on the declared minimum supported Rust version
+just api-compat # semver-check the published library crates against crates.io
 ```
 
 Or without `just`:
@@ -42,9 +51,34 @@ published less than seven days ago. The refresh requires
 [`uv`](https://docs.astral.sh/uv/getting-started/installation/) on `PATH`.
 Review the generated diff, then run `just compat`.
 
+Changing anything public in `gateway-core` or `gateway-transport`? Run the
+compatibility gate, which compares the crates against the versions on crates.io
+(needs [`cargo-semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks)
+and network access):
+
+```bash
+cargo install cargo-semver-checks --locked
+just api-compat
+```
+
+The gate itself runs on `python3` 3.10 or newer, so `just api-compat-self-test`
+works offline and without `cargo-semver-checks`; `just msrv` needs `rustup`, and
+fails rather than measuring the floor with a newer compiler.
+
+A break fails CI. If it is intentional, add a reviewed entry to
+[`ops/api-compat-overrides.toml`](./ops/api-compat-overrides.toml) in the same PR
+and follow
+[the release runbook](./docs/maintainers/releasing.md#public-api-compatibility);
+raising the MSRV follows
+[the same runbook](./docs/maintainers/releasing.md#rust-version-floor).
+
 ## Conventions
 
 - **Warnings are errors.** CI runs clippy with `-D warnings`; keep it clean.
+- **Public API breaks and MSRV bumps are minor releases.** Both are covered by
+  [the compatibility contract](./docs/compatibility.md) and gated in CI; neither
+  is a patch.
+- **Report vulnerabilities privately.** See [`SECURITY.md`](./SECURITY.md).
 - **Never commit secrets.** Credentials are referenced by env-var name in
   config; real keys and `axond.toml` are gitignored.
 - **Keep `gateway-core` I/O-free.** No HTTP client, no runtime, no config, no

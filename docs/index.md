@@ -73,10 +73,15 @@ and operate it.
   the signed last-known-good cache.
 - [Deployment security model](./security/deployment-model.md) — trust
   boundaries, TLS termination, secret delivery, and image verification.
+- [Security policy](../SECURITY.md) — private vulnerability reporting, the
+  supported-version window, response targets, and how a fix and advisory ship.
 
 ## Develop and maintain
 
 - [Contributing](../CONTRIBUTING.md) — local checks and dependency-lock policy.
+- [Compatibility gates](./compatibility.md#the-published-rust-api) — the MSRV
+  floor, the published-crate API check, and the reviewed override for an
+  intentional break.
 - [Backend responsibility boundaries](./maintainers/backend-contracts.md) — the
   seven responsibility-specific backend contracts, which paths they may be
   called from, and why there is no universal state backend.
