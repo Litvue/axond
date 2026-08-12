@@ -336,9 +336,11 @@ impl StatusReason {
             "unavailable" => Self::Unreachable,
             "corrupt" => Self::PayloadCorrupt,
             "projection" => Self::ProjectionRejected,
-            "validation" => Self::ValidationRejected,
+            "validation" | "invalid" => Self::ValidationRejected,
             "secret" => Self::SecretUnresolved,
             "snapshot" => Self::SnapshotRejected,
+            "not_found" => Self::NotConfigured,
+            "denied" => Self::PermissionDenied,
             _ => Self::Unknown,
         }
     }

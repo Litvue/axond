@@ -248,16 +248,31 @@ const TARGET_PROVIDER: Label = Label::open("axond.target.provider", LabelClass::
 const TARGET_MODEL: Label = Label::open("axond.target.model", LabelClass::Configured);
 const STATUS_COMPONENT: Label = Label::closed("axond.status.component", crate::status::COMPONENTS);
 
-/// Every HTTP request, including the ones that never reach a provider. The
-/// method is bounded by the protocol rather than by the routes this gateway
-/// registers, because an unroutable request is still counted.
+/// The method vocabulary, which is a bound rather than an assumption: HTTP
+/// permits extension methods, so [`http`](super::http) maps anything outside
+/// this list to `_OTHER` before recording it, exactly as it collapses an
+/// unmatched path to one route label.
+///
+/// A test asserts this is exactly [`super::http::METHODS`] plus
+/// [`super::http::OTHER_METHOD`], since a slice cannot be extended in a const.
+const HTTP_METHODS: &[&str] = &[
+    "GET",
+    "HEAD",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+    "OPTIONS",
+    "TRACE",
+    "CONNECT",
+    super::http::OTHER_METHOD,
+];
+
+/// Every HTTP request, including the ones that never reach a provider: an
+/// unroutable request is still counted, which is why the method vocabulary is
+/// the protocol's rather than the route table's.
 const HTTP_LABELS: &[Label] = &[
-    Label::closed(
-        "http.request.method",
-        &[
-            "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT",
-        ],
-    ),
+    Label::closed("http.request.method", HTTP_METHODS),
     Label::open("http.route", LabelClass::Route),
     Label::open("http.response.status_code", LabelClass::Numeric),
 ];
@@ -482,14 +497,7 @@ pub const CATALOG: &[MetricSpec] = &[
         unit: None,
         labels: &[Label::closed(
             "axond.revision.reason",
-            &[
-                "unavailable",
-                "corrupt",
-                "projection",
-                "validation",
-                "secret",
-                "snapshot",
-            ],
+            crate::convergence::reconciler::REVISION_REASONS,
         )],
     },
     MetricSpec {
@@ -829,6 +837,48 @@ pub fn validate_catalog() -> Vec<CatalogError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The catalogued method vocabulary is the list the recorder normalises
+    /// against, plus the bucket it normalises into. A client that invents a
+    /// method therefore cannot mint a series, which is what `Closed` claims.
+    #[test]
+    fn the_method_vocabulary_is_exactly_what_the_recorder_can_emit() {
+        let recorded: Vec<&str> = super::super::http::METHODS
+            .iter()
+            .copied()
+            .chain(std::iter::once(super::super::http::OTHER_METHOD))
+            .collect();
+        assert_eq!(HTTP_METHODS, recorded.as_slice());
+        for method in recorded {
+            validate_label_value("axond.http.server.requests", "http.request.method", method)
+                .expect("every recordable method is catalogued");
+        }
+    }
+
+    /// The reconciler labels a rejection with a store category or a compile
+    /// reason, and every one of those has to be a value the catalogue accepts —
+    /// otherwise an alert on a real rejection is refused as invalid.
+    #[test]
+    fn every_revision_rejection_reason_is_catalogued() {
+        for reason in crate::convergence::reconciler::REVISION_REASONS {
+            validate_label_value("axond.revision.rejections", "axond.revision.reason", reason)
+                .expect("every emitted rejection reason is catalogued");
+        }
+        for category in [
+            crate::backends::FailureCategory::Unavailable,
+            crate::backends::FailureCategory::Conflict,
+            crate::backends::FailureCategory::NotFound,
+            crate::backends::FailureCategory::Invalid,
+            crate::backends::FailureCategory::Denied,
+            crate::backends::FailureCategory::Corrupt,
+        ] {
+            let reason = crate::convergence::reconciler::category_reason(category);
+            assert!(
+                crate::convergence::reconciler::REVISION_REASONS.contains(&reason),
+                "`{reason}` is a label a store failure produces"
+            );
+        }
+    }
 
     /// Every instrument built in `metrics.rs`, read from the source itself: the
     /// catalogue is only a contract if drift between it and the instruments is a

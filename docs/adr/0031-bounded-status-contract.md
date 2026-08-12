@@ -57,8 +57,12 @@ route, because a namespace's dependency health is a legitimate question even whe
 it can invoke nothing. It is also the first capability a scope-less mint request
 does **not** confer: `POST /v1/tokens` without a `scope` grants the caller's route
 capabilities, and granting the deployment's dependency view along with them would
-make monitoring reach a side effect of minting an inference token. A `status`
-grant is named or it does not exist.
+make monitoring reach a side effect of minting an inference token. That exclusion
+is a property of the minting route, which writes a concrete claim; it is not a
+change to ADR 0019's rule that a token carrying no `scope` claim at all is
+unrestricted, so an offline `axond mint` without `--scope` still satisfies
+`status` exactly as it satisfies `chat`. From the minting route, a `status` grant
+is named or it does not exist.
 
 **Reads are cache reads.** `CachedStatusRegistry::view` is synchronous, takes an
 in-memory lock, and has no `async` in its signature — a handler *cannot* probe a

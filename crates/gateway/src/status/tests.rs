@@ -548,18 +548,36 @@ fn backend_and_revision_failures_map_to_bounded_codes() {
         let reason = StatusReason::from_failure(category);
         assert!(StatusReason::ALL.contains(&reason));
     }
-    for (label, expected) in [
+    let revision_reasons = [
         ("unavailable", StatusReason::Unreachable),
         ("corrupt", StatusReason::PayloadCorrupt),
         ("projection", StatusReason::ProjectionRejected),
         ("validation", StatusReason::ValidationRejected),
         ("secret", StatusReason::SecretUnresolved),
         ("snapshot", StatusReason::SnapshotRejected),
+        ("invalid", StatusReason::ValidationRejected),
+        ("not_found", StatusReason::NotConfigured),
+        ("denied", StatusReason::PermissionDenied),
+        // A lost write says nothing about a component's health, so it stays
+        // deliberately opaque rather than borrowing a code that means something
+        // else.
+        ("conflict", StatusReason::Unknown),
         // A label this vocabulary does not know degrades to a safe code rather
         // than becoming a new response value.
         ("some_new_reason", StatusReason::Unknown),
-    ] {
+    ];
+    for (label, expected) in revision_reasons {
         assert_eq!(StatusReason::from_revision_reason(label), expected);
+    }
+
+    // Every reason the reconciler can emit is one this mapping decided about,
+    // so the two vocabularies cannot drift silently.
+    for reason in crate::convergence::reconciler::REVISION_REASONS {
+        assert!(
+            revision_reasons.iter().any(|(label, _)| label == reason)
+                && StatusReason::ALL.contains(&StatusReason::from_revision_reason(reason)),
+            "`{reason}` is a reason the reconciler emits"
+        );
     }
 }
 
