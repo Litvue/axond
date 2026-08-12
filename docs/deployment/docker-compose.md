@@ -12,35 +12,31 @@ Configuration lives in `ops/compose/*.toml`; secrets and DSNs live in `.env`.
 
 ## Architecture selection
 
-The quickstart's pinned image tag is still an amd64-only release, so
-`platform:` defaults to `linux/amd64` and an ARM host runs it through emulation
-instead of failing to pull. Multi-architecture images are published from the
-next release onward ([supported
-platforms](../compatibility.md#supported-platforms)), and `AXOND_PLATFORM`
-selects what to do with them:
+The quickstart's pinned image tag is a multi-architecture index ([supported
+platforms](../compatibility.md#supported-platforms)), so `platform:` carries no
+default and Docker resolves the native child on either architecture.
+`AXOND_PLATFORM` overrides that:
 
 | `AXOND_PLATFORM` | Effect |
 | --- | --- |
-| unset | `linux/amd64` — the documented fallback for the amd64-only pinned tag |
-| set and empty (`AXOND_PLATFORM=`) | No pin: Docker resolves the native child of a multi-architecture image |
+| unset or empty | No pin: Docker resolves the native child of the image index |
 | `linux/arm64` or `linux/amd64` | Forces that platform, emulating it if the host differs |
 
-So an ARM host on a multi-architecture tag runs natively with:
+So an ARM host runs natively with nothing to set:
 
 ```bash
 AXOND_IMAGE=ghcr.io/litvue/axond@sha256:<verified-index-digest> \
-  AXOND_PLATFORM= docker compose up -d
+  docker compose up -d
 ```
 
-The source-build overlay (`docker-compose.build.yml`) has no fallback to keep: it
+The source-build overlay (`docker-compose.build.yml`) behaves the same way: it
 builds natively on either architecture unless `AXOND_PLATFORM` forces one.
 
-The amd64 fallback is temporary by construction. `ops/check-release-config.py`
-*requires* it while the pinned tag is amd64-only, and once that tag publishes an
-index it prints a note asking for the default to be dropped — a note rather than
-a failure, because release-please bumps the tag inside its own release pull
-request. Dropping it is a post-release step in
-[releasing.md](../maintainers/releasing.md).
+The `linux/amd64` fallback this file used to default to was scoped to the
+amd64-only releases (up to 0.3.17), where dropping the pin would have left an ARM
+host unable to pull at all. `ops/check-release-config.py` still *requires* it
+whenever the pinned tag is at or below `LAST_AMD64_ONLY_VERSION`, so a rebase
+onto an older release cannot silently break ARM.
 
 ## Pull-first Tier 0
 

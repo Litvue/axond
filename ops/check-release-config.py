@@ -407,8 +407,10 @@ def check_compose_platform(notes: list[str]) -> list[str]:
             notes.append(
                 f"docker-compose.yml: the pinned tag {pinned.group(1)} publishes a "
                 "multi-architecture image, so the amd64 fallback now only forces "
-                f"emulation on ARM hosts; switch to `{NATIVE_PLATFORM}` and bump "
-                f"LAST_AMD64_ONLY_VERSION to {pinned.group(1)}"
+                f"emulation on ARM hosts; switch to `{NATIVE_PLATFORM}`. Leave "
+                "LAST_AMD64_ONLY_VERSION alone: it names the last amd64-only "
+                "release, and raising it to this tag re-asserts the fallback "
+                "this note asks to drop"
             )
         elif NATIVE_PLATFORM not in compose:
             failures.append(
