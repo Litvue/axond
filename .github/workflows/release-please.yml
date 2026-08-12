@@ -64,6 +64,9 @@ jobs:
         with:
           app-id: ${{ vars.RELEASE_PLEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: googleapis/release-please-action@v5
         id: release
         with:
@@ -85,12 +88,13 @@ jobs:
         env:
           RELEASE_PR: ${{ steps.release.outputs.pr }}
           RELEASE_OUTCOME: ${{ steps.release.outcome }}
+          RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
         run: |
           set -euo pipefail
           if [[ -n "${RELEASE_PR:-}" && "$RELEASE_PR" != "null" ]]; then
             release_branch="$(jq -r '.headBranchName' <<<"$RELEASE_PR")"
             [[ -n "$release_branch" && "$release_branch" != "null" ]]
-          elif [[ "$RELEASE_OUTCOME" == "failure" ]]; then
+          elif [[ "$RELEASE_CREATED" != "true" ]]; then
             branch_prefix="release-please--branches--${GITHUB_REF_NAME}"
             mapfile -t release_branches < <(
               git ls-remote --heads \
@@ -103,6 +107,10 @@ jobs:
               exit 0
             fi
             if (( ${#release_branches[@]} != 1 )); then
+              if [[ "$RELEASE_OUTCOME" != "failure" ]]; then
+                echo "release-please produced no current PR; ignoring ambiguous stale branches"
+                exit 0
+              fi
               printf 'release-please recovery is ambiguous; matching branches:\n%s\n' \
                 "${release_branches[*]}" >&2
               exit 1
@@ -112,10 +120,14 @@ jobs:
               "+refs/heads/${release_branch}:refs/remotes/origin/${release_branch}"
             if ! git merge-base --is-ancestor \
               "$GITHUB_SHA" "refs/remotes/origin/${release_branch}"; then
+              if [[ "$RELEASE_OUTCOME" != "failure" ]]; then
+                echo "no current release PR; ignoring stale branch $release_branch"
+                exit 0
+              fi
               echo "refusing to recover stale release branch $release_branch: it does not contain $GITHUB_SHA" >&2
               exit 1
             fi
-            echo "release-please PR creation failed; recovering $release_branch for a manual PR"
+            echo "release-please produced no PR output; recovering $release_branch for a manual PR"
           else
             echo "release-please produced no release PR"
             exit 0

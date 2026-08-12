@@ -32,16 +32,25 @@ else {
 }
 
 if (-not $Version) {
-    $LatestRequest = [Net.WebRequest]::Create("https://github.com/$Repository/releases/latest")
-    $LatestRequest.Method = "HEAD"
-    $LatestRequest.AllowAutoRedirect = $true
-    $LatestRequest.UserAgent = "axond-installer"
-    $LatestResponse = $LatestRequest.GetResponse()
+    Add-Type -AssemblyName System.Net.Http
+    $LatestHandler = [Net.Http.HttpClientHandler]::new()
+    $LatestHandler.AllowAutoRedirect = $true
+    $LatestClient = [Net.Http.HttpClient]::new($LatestHandler)
+    $LatestRequest = [Net.Http.HttpRequestMessage]::new(
+        [Net.Http.HttpMethod]::Head,
+        "https://github.com/$Repository/releases/latest"
+    )
+    $LatestRequest.Headers.UserAgent.ParseAdd("axond-installer")
     try {
-        $LatestUrl = $LatestResponse.ResponseUri.AbsoluteUri
+        $LatestResponse = $LatestClient.SendAsync($LatestRequest).GetAwaiter().GetResult()
+        $LatestResponse.EnsureSuccessStatusCode() | Out-Null
+        $LatestUrl = $LatestResponse.RequestMessage.RequestUri.AbsoluteUri
     }
     finally {
-        $LatestResponse.Close()
+        if ($LatestResponse) { $LatestResponse.Dispose() }
+        $LatestRequest.Dispose()
+        $LatestClient.Dispose()
+        $LatestHandler.Dispose()
     }
     $Version = ($LatestUrl.TrimEnd('/') -split '/')[-1] -replace '^v', ''
 }

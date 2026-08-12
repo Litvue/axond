@@ -28,7 +28,7 @@ case "$require_attestation" in
 esac
 
 if [ -z "$version" ]; then
-  latest_url="$(curl --proto '=https' --tlsv1.2 -LsS -o /dev/null \
+  latest_url="$(curl --proto '=https' --tlsv1.2 -fLsS -o /dev/null \
     -w '%{url_effective}' "https://github.com/${repo}/releases/latest")"
   version="${latest_url##*/}"
   version="${version#v}"
