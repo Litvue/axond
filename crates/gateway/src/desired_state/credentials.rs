@@ -168,9 +168,7 @@ pub enum CredentialError {
     /// One secret, two owners. The reference is opaque, so nothing about the
     /// material itself would reveal that a tenant had been handed another
     /// tenant's key — this is the rule that refuses it.
-    #[error(
-        "{reference} claims secret {secret}, which {conflicting} claims for a different owner"
-    )]
+    #[error("{reference} claims secret {secret}, which {conflicting} claims for a different owner")]
     SecretOwnerConflict {
         reference: ResourceRef,
         secret: SecretId,
