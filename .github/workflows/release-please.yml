@@ -230,7 +230,8 @@ jobs:
                 ;;
             esac
             if [[ "$GITHUB_REF" == refs/heads/main ]]; then
-              for required_path in Dockerfile ops/docker-smoke.sh; do
+              for required_path in Dockerfile ops/docker-smoke.sh \
+                ops/binary-smoke.py; do
                 required_probe="$RUNNER_TEMP/repair-${required_path//\//-}"
                 if gh api --include "/repos/${GITHUB_REPOSITORY}/contents/${required_path}?ref=${tag_name}" >"$required_probe" 2>&1; then
                   echo "$tag_name contains required repair path $required_path"
@@ -320,6 +321,11 @@ jobs:
         with:
           toolchain: 1.97.1
           targets: ${{ matrix.target }}
+      # The smoke below runs on the standard library alone, but not on whatever
+      # interpreter a runner image happens to ship.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - name: Install musl tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -350,6 +356,12 @@ jobs:
           Compress-Archive -Path release-bin/axond.exe -DestinationPath "dist/$asset"
           $hash = (Get-FileHash "dist/$asset" -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $asset" | Set-Content "dist/$asset.sha256" -Encoding ascii
+      # Every runner in this matrix is native to the target it builds, so the
+      # exact binary that goes into the archive is booted and served here —
+      # before it is attested, signed for, and attached to the release.
+      - name: Smoke the packaged binary
+        shell: bash
+        run: python ops/binary-smoke.py release-bin/axond
       - name: Generate binary SBOM
         uses: anchore/sbom-action@v0
         with:
