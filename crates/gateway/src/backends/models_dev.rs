@@ -35,7 +35,7 @@
 //!
 //! The decisions this module rests on — the observed-rate unit, the three
 //! identities, and the compiled-in seed — are recorded in
-//! [ADR 0031](https://github.com/Litvue/axond/blob/main/docs/adr/0031-catalogue-source-imports.md).
+//! [ADR 0032](https://github.com/Litvue/axond/blob/main/docs/adr/0032-catalogue-source-imports.md).
 //!
 //! # Strict where a mistake would be silent
 //!
@@ -1020,7 +1020,15 @@ fn nano_dollars_per_million(text: &str) -> Result<ObservedRate, PriceRejection> 
     const NANO_DOLLARS_PER_DOLLAR: i32 = 9;
 
     let decimal = parse_decimal(text)?;
-    let shift = decimal.exponent + NANO_DOLLARS_PER_DOLLAR;
+    // JSON's number grammar bounds neither exponent, and a rate whose exponent
+    // does not fit the shift is an unusable observation: refusing it costs an
+    // import, where overflowing costs the task holding it.
+    let shift = decimal
+        .exponent
+        .checked_add(NANO_DOLLARS_PER_DOLLAR)
+        .ok_or_else(|| PriceRejection::Overflow {
+            value: text.to_owned(),
+        })?;
     let nanos = if shift >= 0 {
         let factor = 10u128
             .checked_pow(u32::try_from(shift).map_err(|_| PriceRejection::Overflow {
@@ -1091,11 +1099,24 @@ fn parse_decimal(text: &str) -> Result<Decimal, PriceRejection> {
 
     let (mantissa, exponent) = match text.split_once(['e', 'E']) {
         Some((mantissa, exponent)) => {
-            let exponent = exponent
-                .strip_prefix('+')
-                .unwrap_or(exponent)
-                .parse::<i32>()
-                .map_err(|_| not_a_number())?;
+            let stated = exponent.strip_prefix('+').unwrap_or(exponent);
+            let exponent = stated.parse::<i32>().map_err(|_| {
+                // An exponent JSON allows but no integer holds: a well-formed
+                // number, and a rate out of range in whichever direction it
+                // points.
+                match stated.strip_prefix('-') {
+                    Some(magnitude) if all_digits(magnitude) && !magnitude.is_empty() => {
+                        PriceRejection::ExcessPrecision {
+                            value: text.to_owned(),
+                        }
+                    }
+                    Some(_) => not_a_number(),
+                    None if all_digits(stated) && !stated.is_empty() => PriceRejection::Overflow {
+                        value: text.to_owned(),
+                    },
+                    None => not_a_number(),
+                }
+            })?;
             (mantissa, exponent)
         }
         None => (text, 0),
@@ -1124,7 +1145,13 @@ fn parse_decimal(text: &str) -> Result<Decimal, PriceRejection> {
     })?;
     Ok(Decimal {
         digits,
-        exponent: exponent - fraction_length,
+        // An exponent this far below zero states a rate below any nano-dollar,
+        // whatever its digits are.
+        exponent: exponent.checked_sub(fraction_length).ok_or_else(|| {
+            PriceRejection::ExcessPrecision {
+                value: text.to_owned(),
+            }
+        })?,
     })
 }
 
@@ -1662,7 +1689,29 @@ mod tests {
                 value: "1e30".to_owned()
             })
         );
-        for malformed in ["", "\"10\"", "+1", "1.", ".5", "1.2.3", "abc", "null"] {
+        // Exponents JSON's grammar allows and no rate can hold: refused as out
+        // of range, never by overflowing the arithmetic that reads them.
+        for enormous in ["1e2147483647", "1e2147483648", "1E999999999999999999"] {
+            assert_eq!(
+                nano_dollars_per_million(enormous),
+                Err(PriceRejection::Overflow {
+                    value: enormous.to_owned()
+                }),
+                "`{enormous}` states more dollars than a rate holds"
+            );
+        }
+        for minuscule in ["1.5e-2147483648", "1e-2147483649", "1e-999999999999999999"] {
+            assert_eq!(
+                nano_dollars_per_million(minuscule),
+                Err(PriceRejection::ExcessPrecision {
+                    value: minuscule.to_owned()
+                }),
+                "`{minuscule}` states a rate below any nano-dollar"
+            );
+        }
+        for malformed in [
+            "", "\"10\"", "+1", "1.", ".5", "1.2.3", "abc", "null", "1e", "1e-",
+        ] {
             assert!(
                 matches!(
                     nano_dollars_per_million(malformed),
