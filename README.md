@@ -169,6 +169,13 @@ never overridden by a datastore. See the
 [stateful deployment guide](./docs/deployment/stateful-backends.md) and
 [ADR 0017](./docs/adr/0017-state-tiers-and-optional-backends.md).
 
+Tiers describe dependencies; *operating modes* describe ownership. Axond runs the
+stateless mode today, where TOML is the authority. The accepted design for an
+opt-in stateful mode — durable resources in Postgres, `/admin/v1` administration,
+and inference still served from one immutable in-memory snapshot — is
+[ADR 0027](./docs/adr/0027-stateless-and-stateful-operating-modes.md). It is not
+implemented, and stateless remains the default.
+
 ## Security model
 
 - Every route except `/healthz` and `/readyz` requires an Axond credential.
