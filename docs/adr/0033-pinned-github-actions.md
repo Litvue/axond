@@ -68,6 +68,21 @@ together. Cargo stays out of Dependabot: `deny.toml`, the `dependency-policy`
 lane, and `dependency-audit.yml` already cover it, and a lockfile bump belongs to
 `cargo update` and the full matrix rather than a per-crate PR.
 
+A bump cannot quietly trade immutability for convenience. Dependabot's
+github-actions updater rewrites a SHA-pinned `uses:` to another SHA and edits the
+trailing version comment to match — it updates comments *only* for pins that are
+already SHA refs, and it never replaces a SHA with a tag ref
+([`dependabot-core#5951`](https://github.com/dependabot/dependabot-core/pull/5951),
+[changelog](https://github.blog/changelog/2022-10-31-dependabot-now-updates-comments-in-github-actions-workflows-referencing-action-versions/)).
+The pin for `dtolnay/rust-toolchain`, whose SHA comes from the `stable` branch
+rather than a release tag, may therefore be proposed as the SHA of the upstream
+`v1` tag with the comment rewritten to `# v1`: still an immutable SHA, but now
+following a different upstream ref. That is a reviewer's decision on a diff, and
+the property that matters holds either way — the gate rejects any `uses:` that is
+not a full SHA, and `--self-test` asserts that rejection with both a tag fixture
+(`actions/checkout@v7`) and a branch fixture (`dtolnay/rust-toolchain@stable`), so
+no update path can put a movable ref back into a workflow.
+
 Container base images are out of scope here; they are pinned by tag in
 `Dockerfile` and tracked separately.
 

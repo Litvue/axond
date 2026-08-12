@@ -289,11 +289,21 @@ just workflow-policy   # pins, permissions, signer restrictions, Dependabot labe
 just actionlint        # workflow linting; downloads the pinned actionlint
 ```
 
-Everything in that lane is offline except the label check, which needs an
-authenticated `gh` and reports that it skipped when there is none. Its
-`--self-test` (also run in the lane) asserts that the label reader stops at the
-end of a `labels:` block, so a second ecosystem entry in the config cannot be
-misread as a label and fail the lane on a name nobody wrote.
+Everything in that lane is offline except the label check
+([`ops/dependabot-labels.sh`](../../ops/dependabot-labels.sh)), which needs an
+authenticated `gh` and reports that it skipped when there is none. On CI it uses
+the job's own `github.token` for a read-only label query and prints what it
+verified, so the lane carries its own evidence:
+
+```
+dependabot labels exist on Litvue/axond (area:operations)
+```
+
+Its `--self-test` (also run in the lane) covers the ways the check could pass
+while verifying nothing: a neighbouring `- package-ecosystem:` entry read as a
+label, a config that moved or was renamed, and a `labels:` key written in a shape
+the reader cannot see (an inline `[…]` list). All three fail rather than report
+success.
 
 If a host has neither a supported release archive nor `docker`, the script says
 so and fails instead of linting with an unpinned version.
@@ -312,7 +322,13 @@ Bumping a pin by hand follows the same rule: resolve the tag to its SHA, write
 both, and let the lane confirm the format. Where an action publishes no usable
 release tag the comment names the upstream branch the SHA was taken from
 (`dtolnay/rust-toolchain@… # stable`), which is also the pin most likely to need
-a manual refresh. A proposed *major* bump is not a pin change: read the upstream
+a manual refresh. Dependabot only ever rewrites a SHA pin to another SHA and
+edits the comment to match — it cannot turn a pin into a `@v1` tag ref, and the
+lane would reject one if it did — but for that branch pin it may propose the SHA
+behind the upstream `v1` tag with the comment rewritten to `# v1`. That is still
+immutable, and it is a deliberate change of which upstream ref the pin follows:
+take it only if tracking the tag is what you want, and keep `# stable` otherwise.
+A proposed *major* bump is not a pin change: read the upstream
 release notes for renamed inputs and changed defaults before taking it, because
 the pinned SHA is what CI will run until someone changes it again.
 
