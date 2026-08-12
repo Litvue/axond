@@ -23,6 +23,11 @@ mod backends;
 mod budget;
 mod config;
 mod credentials;
+// The desired-state domain the durable contracts are expressed in. Contract
+// only, for the same reason `backends` is: no revision is loaded or published on
+// the request path yet.
+#[allow(dead_code)]
+mod desired_state;
 mod error;
 mod key_material;
 mod mint;

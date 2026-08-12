@@ -19,23 +19,30 @@
 //!   variant, and parsing rejects `redis` with a typed error instead of falling
 //!   back, so "Redis is hot state only" is a compile- and boot-time property.
 //!
-//! ## Scope boundary with #164
+//! ## What this module owns, and what the domain owns
 //!
-//! This is the *store* contract: identity of a revision, how a candidate is
-//! published, and how conflicts and audit are expressed. The desired-state
-//! domain itself — UUIDv7 typed ids, tenant-scoped slug rules, canonical
-//! serialization and checksum rules, resource envelopes, content-addressed
-//! blobs — is #164's, and the types here are deliberately thin placeholders
-//! that #164 refines rather than replaces: [`ResourceVersionRef`] carries an id,
-//! a slug, and a version and says nothing about a resource's schema, and
-//! [`RevisionCandidate`] carries the payload as references plus a checksum
-//! rather than embedding resource bodies.
-
-use std::time::SystemTime;
+//! This is the *store* contract: which durable implementations exist, how a
+//! candidate is published, how conflicts and outages are expressed, and how a
+//! retained revision is read back. Everything a revision is *made of* —
+//! [`Uuid7`](crate::desired_state::Uuid7)-based typed ids, tenant-scoped slug
+//! rules, the canonical serializer and its checksums, resource envelopes,
+//! content-addressed blobs, validation — lives in [`crate::desired_state`] and is
+//! database-agnostic by construction.
+//!
+//! The split matters because the two evolve differently: a second durable
+//! backend changes this module and nothing in the domain, while a new resource
+//! schema changes neither. It is also why the trait's error type distinguishes a
+//! caller's invalid candidate ([`ValidationError`]) from storage that no longer
+//! adds up ([`IntegrityError`]): the first is a rejected request, the second is
+//! an operator alert.
 
 use async_trait::async_trait;
 
 use super::{BackendFailure, BackendKind, Capabilities, FailureCategory};
+use crate::desired_state::{
+    AuditEvent, ExpectedRevision, IdempotencyKey, IntegrityError, LoadedRevision, ResourceRef,
+    RevisionCandidate, RevisionId, RevisionManifest, ValidationError,
+};
 
 /// The durable implementations a deployment may select for the control plane.
 ///
@@ -106,132 +113,6 @@ pub enum UnsupportedControlPlaneBackend {
     Unknown { name: String },
 }
 
-/// A published revision's identity. Monotonic per deployment, so a replica can
-/// report desired, loaded, and active revisions as comparable numbers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RevisionId(pub u64);
-
-impl std::fmt::Display for RevisionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "r{}", self.0)
-    }
-}
-
-/// A durable resource's stable internal identifier. #164 replaces the inner
-/// representation with a UUIDv7 type; callers only ever compare and carry it.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ResourceId(pub String);
-
-/// The classes of durable resource a manifest may reference. Extended by later
-/// slices; a store implementation must not interpret the variants beyond
-/// storing and returning them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ResourceKind {
-    Tenant,
-    Project,
-    Identity,
-    Provider,
-    ProviderCredential,
-    CatalogModel,
-    ModelEnablement,
-    Price,
-    Alias,
-    Policy,
-}
-
-/// A manifest entry: one immutable version of one resource.
-///
-/// The slug is the tenant-scoped human-readable name; it may be renamed without
-/// invalidating this reference, which is why the id is what a manifest joins on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResourceVersionRef {
-    pub kind: ResourceKind,
-    pub id: ResourceId,
-    pub slug: String,
-    pub version: u64,
-}
-
-/// A checksum over a candidate's canonically serialized desired state.
-///
-/// The canonicalization rules are #164's. The store treats this as an opaque
-/// equality token: it persists it, returns it, and never recomputes it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RevisionChecksum(pub String);
-
-/// Who performed a mutation, for the audit trail.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Actor {
-    /// An OIDC-authenticated human, identified by issuer-scoped subject.
-    Human { issuer: String, subject: String },
-    /// The static bootstrap breakglass operator.
-    Breakglass,
-    /// The gateway itself — a background catalogue refresh, for example.
-    ///
-    /// Owned rather than `&'static str` because an audit row read back out of a
-    /// durable store has to produce this without leaking.
-    System { component: String },
-}
-
-/// The audit event a mutation carries.
-///
-/// It is part of the candidate rather than a separate call because it must be
-/// written in the mutation's own transaction: an audit trail that can be
-/// half-written is not an audit trail.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuditEvent {
-    pub actor: Actor,
-    pub action: String,
-    pub summary: String,
-}
-
-/// A caller-supplied deduplication token. A retry carrying the same key *and*
-/// the same desired state must return the original outcome rather than
-/// publishing a second revision; the same key with different desired state is
-/// [`ControlPlaneError::IdempotencyKeyReused`], never a silent replay of the
-/// revision the caller did not describe.
-///
-/// The token carries no scope of its own, so a durable implementation must
-/// dedupe within the *authenticated caller's* scope and expire records rather
-/// than retaining them forever: a global, immortal namespace would let one
-/// administrator's `retry-1` replay or block another's. Two callers submitting
-/// the same string are two independent writes. The in-memory fake deliberately
-/// does neither — it is a single-tenant test double, not the scoping decision.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct IdempotencyKey(pub String);
-
-/// The revision a writer believes is current.
-///
-/// Explicit rather than "whatever is current" so two administrators editing
-/// concurrently get a typed [`ControlPlaneError::Conflict`] instead of a
-/// silent last-write-wins.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExpectedRevision {
-    /// The store has never published a revision.
-    Empty,
-    /// This exact revision must still be the newest.
-    Exactly(RevisionId),
-}
-
-/// A revision offered for publication.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RevisionCandidate {
-    pub expected: ExpectedRevision,
-    pub resources: Vec<ResourceVersionRef>,
-    pub checksum: RevisionChecksum,
-    pub audit: AuditEvent,
-    pub idempotency_key: IdempotencyKey,
-}
-
-/// A published, immutable revision.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RevisionManifest {
-    pub id: RevisionId,
-    pub parent: Option<RevisionId>,
-    pub created_at: SystemTime,
-    pub resources: Vec<ResourceVersionRef>,
-    pub checksum: RevisionChecksum,
-}
-
 /// Why a control-plane operation failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ControlPlaneError {
@@ -242,21 +123,28 @@ pub enum ControlPlaneError {
     },
     /// Another writer published first. The caller re-reads and rebuilds; it does
     /// not replay the same candidate.
-    #[error("expected revision {expected:?} but the newest is {actual:?}")]
+    #[error("expected {expected} to be current, but the newest is {actual:?}")]
     Conflict {
         expected: ExpectedRevision,
         actual: Option<RevisionId>,
     },
     #[error("revision {0} is not retained")]
     RevisionNotFound(RevisionId),
+    /// The candidate is not valid desired state. Typed, because "invalid" is the
+    /// answer an administrator has to act on: the variant names the resource and
+    /// the rule.
     #[error("invalid candidate revision: {0}")]
-    Invalid(String),
+    Invalid(#[from] ValidationError),
+    /// A resource version already exists with different content. Versions are
+    /// immutable, so the caller must publish a new version rather than redefine
+    /// one an earlier revision still pins.
+    #[error("{reference} is already published with different content; publish a new version")]
+    ImmutableResourceVersion { reference: ResourceRef },
     /// The key was already used to publish *different* desired state. Replaying
     /// the earlier revision would tell the caller their change was applied when
     /// it never was, so the write is refused instead.
     #[error(
-        "idempotency key `{}` already published revision {published} with different desired state",
-        key.0
+        "idempotency key `{key}` already published revision {published} with different desired state"
     )]
     IdempotencyKeyReused {
         key: IdempotencyKey,
@@ -269,11 +157,24 @@ pub enum ControlPlaneError {
     },
     /// A retained revision could not be interpreted. Never masked as
     /// "unavailable": an operator has to know that stored state is unreadable.
-    #[error("stored revision {revision} is unreadable: {message}")]
+    ///
+    /// The cause is boxed so the rare unreadable-storage arm does not widen every
+    /// `Result` on this trait; [`ControlPlaneError::corrupt`] is the constructor.
+    #[error("stored revision {revision} is unreadable: {source}")]
     Corrupt {
         revision: RevisionId,
-        message: String,
+        source: Box<IntegrityError>,
     },
+}
+
+impl ControlPlaneError {
+    /// Report a retained revision that does not add up.
+    pub fn corrupt(revision: RevisionId, source: IntegrityError) -> Self {
+        Self::Corrupt {
+            revision,
+            source: Box::new(source),
+        }
+    }
 }
 
 impl BackendFailure for ControlPlaneError {
@@ -282,7 +183,9 @@ impl BackendFailure for ControlPlaneError {
             Self::Unavailable { .. } => FailureCategory::Unavailable,
             Self::Conflict { .. } => FailureCategory::Conflict,
             Self::RevisionNotFound(_) => FailureCategory::NotFound,
-            Self::Invalid(_) | Self::IdempotencyKeyReused { .. } => FailureCategory::Invalid,
+            Self::Invalid(_)
+            | Self::ImmutableResourceVersion { .. }
+            | Self::IdempotencyKeyReused { .. } => FailureCategory::Invalid,
             Self::Denied { .. } => FailureCategory::Denied,
             Self::Corrupt { .. } => FailureCategory::Corrupt,
         }
@@ -293,14 +196,15 @@ impl BackendFailure for ControlPlaneError {
 ///
 /// An implementation must provide [`Capability::TransactionalWrites`],
 /// [`Capability::OptimisticConcurrency`], [`Capability::IdempotentWrites`], and
-/// [`Capability::TransactionalAudit`]; [`Capability::ChangeNotification`] is
-/// optional and only decides whether convergence polls.
+/// [`Capability::TransactionalAudit`]; [`ChangeNotification`] is optional and
+/// only decides whether convergence polls.
+///
+/// [`ChangeNotification`]: super::Capability::ChangeNotification
 ///
 /// [`Capability::TransactionalWrites`]: super::Capability::TransactionalWrites
 /// [`Capability::OptimisticConcurrency`]: super::Capability::OptimisticConcurrency
 /// [`Capability::IdempotentWrites`]: super::Capability::IdempotentWrites
 /// [`Capability::TransactionalAudit`]: super::Capability::TransactionalAudit
-/// [`Capability::ChangeNotification`]: super::Capability::ChangeNotification
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync {
     fn name(&self) -> &'static str;
@@ -316,22 +220,38 @@ pub trait ControlPlaneStore: Send + Sync {
     /// The newest published revision, or `None` before the first publication.
     async fn desired_revision(&self) -> Result<Option<RevisionId>, ControlPlaneError>;
 
-    /// Load a retained revision. A revision is immutable, so a successful load
-    /// is repeatable and cacheable forever.
-    async fn load_revision(&self, id: RevisionId) -> Result<RevisionManifest, ControlPlaneError>;
+    /// A retained revision's manifest: identity, parentage, entries, and
+    /// checksum, without hydrating the resource bodies.
+    ///
+    /// This is the cheap read — "what is desired, and is it what I already
+    /// hold?" — that convergence polls with.
+    async fn load_manifest(&self, id: RevisionId) -> Result<RevisionManifest, ControlPlaneError>;
+
+    /// Hydrate a retained revision into a complete, verified candidate.
+    ///
+    /// This is the seam #142 compiles a snapshot from, and the reason it returns
+    /// [`LoadedRevision`] rather than a manifest plus a bag of rows: that type
+    /// cannot be constructed without passing integrity verification, so a caller
+    /// cannot accidentally publish a snapshot compiled from a partially
+    /// hydrated revision. A revision is immutable, so a successful load is
+    /// repeatable and cacheable forever; a load that does not verify is
+    /// [`ControlPlaneError::Corrupt`], never an outage.
+    async fn load_revision(&self, id: RevisionId) -> Result<LoadedRevision, ControlPlaneError>;
 
     /// Publish a candidate as the new newest revision.
     ///
     /// Atomic with its audit event, conditioned on
-    /// [`RevisionCandidate::expected`], and idempotent under
-    /// [`RevisionCandidate::idempotency_key`]: a repeat of the same key carrying
-    /// the same [`RevisionCandidate::checksum`] returns the revision the first
-    /// call published, and a repeat carrying a different checksum is refused with
+    /// [`RevisionCandidate::expected`], and idempotent under the candidate's
+    /// [`IdempotencyKey`]: a repeat of the same key carrying the same desired
+    /// state returns the revision the first call published, and a repeat carrying
+    /// different state is refused with
     /// [`ControlPlaneError::IdempotencyKeyReused`] rather than replaying an
-    /// outcome the caller did not ask for. Publication does not validate
-    /// desired state into a snapshot — compilation and rejection are the
-    /// replica's job (#142); the store's job is to make the transition
-    /// all-or-nothing.
+    /// outcome the caller did not ask for.
+    ///
+    /// The store validates the candidate as desired state — that is a domain
+    /// rule, and #165's DDL is not where it belongs — but it does not compile a
+    /// snapshot: compiling and rejecting routing state is the replica's job
+    /// (#142). The store's job is to make the transition all-or-nothing.
     async fn publish_revision(
         &self,
         candidate: RevisionCandidate,
@@ -343,7 +263,6 @@ pub trait ControlPlaneStore: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::super::fakes::{InMemoryControlPlane, audit, candidate};
     use super::*;
 
     #[test]
@@ -395,204 +314,29 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn publication_is_a_chain_of_immutable_revisions() {
-        let store = InMemoryControlPlane::new();
-        assert_eq!(store.desired_revision().await.unwrap(), None);
+    #[test]
+    fn a_callers_mistake_and_unreadable_storage_are_different_categories() {
+        // The distinction the trait's error type exists to keep: an invalid
+        // candidate is a rejected request, unreadable storage is an alert.
+        let invalid = ControlPlaneError::Invalid(ValidationError::Empty);
+        assert_eq!(invalid.category(), FailureCategory::Invalid);
+        assert!(!invalid.retryable());
 
-        let first = store
-            .publish_revision(candidate(ExpectedRevision::Empty, "first", "a"))
-            .await
-            .expect("first publication");
-        assert_eq!(first.parent, None);
-        assert_eq!(store.desired_revision().await.unwrap(), Some(first.id));
-
-        let second = store
-            .publish_revision(candidate(
-                ExpectedRevision::Exactly(first.id),
-                "second",
-                "b",
-            ))
-            .await
-            .expect("second publication");
-        assert_eq!(second.parent, Some(first.id));
-        assert!(second.id > first.id);
-
-        // The earlier revision is unchanged by the later one.
-        assert_eq!(store.load_revision(first.id).await.unwrap(), first);
-    }
-
-    #[tokio::test]
-    async fn a_stale_expected_revision_conflicts_instead_of_overwriting() {
-        let store = InMemoryControlPlane::new();
-        let first = store
-            .publish_revision(candidate(ExpectedRevision::Empty, "first", "a"))
-            .await
-            .unwrap();
-
-        let error = store
-            .publish_revision(candidate(ExpectedRevision::Empty, "racing", "c"))
-            .await
-            .expect_err("a stale expectation must not publish");
-        assert_eq!(
-            error,
-            ControlPlaneError::Conflict {
-                expected: ExpectedRevision::Empty,
-                actual: Some(first.id),
-            }
+        let corrupt = ControlPlaneError::corrupt(
+            crate::desired_state::RevisionId::new(
+                crate::desired_state::Uuid7::from_parts(1, 0, 1).unwrap(),
+            ),
+            IntegrityError::Invalid(ValidationError::Empty),
         );
-        assert_eq!(error.category(), FailureCategory::Conflict);
-        assert!(!error.retryable());
-        assert_eq!(store.desired_revision().await.unwrap(), Some(first.id));
-    }
+        assert_eq!(corrupt.category(), FailureCategory::Corrupt);
+        assert!(!corrupt.retryable());
+        assert!(corrupt.to_string().contains("unreadable"));
 
-    #[tokio::test]
-    async fn a_retried_publication_applies_once() {
-        let store = InMemoryControlPlane::new();
-        let candidate = candidate(ExpectedRevision::Empty, "first", "a");
-        let first = store.publish_revision(candidate.clone()).await.unwrap();
-        let retried = store
-            .publish_revision(candidate)
-            .await
-            .expect("a retry replays the original outcome");
-        assert_eq!(first, retried);
-        assert_eq!(store.published_revisions(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_reused_key_carrying_different_state_is_refused() {
-        let store = InMemoryControlPlane::new();
-        let first = store
-            .publish_revision(candidate(ExpectedRevision::Empty, "first", "a"))
-            .await
-            .unwrap();
-
-        // Same key, different desired state: replaying `first` would report a
-        // change that was never published.
-        let mut reused = candidate(ExpectedRevision::Exactly(first.id), "second", "a");
-        reused.checksum = RevisionChecksum("sha256:b".to_owned());
-        let error = store
-            .publish_revision(reused)
-            .await
-            .expect_err("a reused key must not replay a different revision");
-        assert_eq!(
-            error,
-            ControlPlaneError::IdempotencyKeyReused {
-                key: IdempotencyKey("a".to_owned()),
-                published: first.id,
-            }
-        );
-        assert_eq!(error.category(), FailureCategory::Invalid);
-        assert!(!error.retryable());
-        assert_eq!(store.published_revisions(), 1);
-        assert_eq!(store.desired_revision().await.unwrap(), Some(first.id));
-    }
-
-    #[tokio::test]
-    async fn a_replay_survives_a_moved_expectation() {
-        let store = InMemoryControlPlane::new();
-        let first = store
-            .publish_revision(candidate(ExpectedRevision::Empty, "first", "a"))
-            .await
-            .unwrap();
-        store
-            .publish_revision(candidate(
-                ExpectedRevision::Exactly(first.id),
-                "second",
-                "b",
-            ))
-            .await
-            .unwrap();
-
-        // The original candidate's expectation is now stale, but its key and
-        // desired state are unchanged: a retry replays rather than conflicts.
-        let replayed = store
-            .publish_revision(candidate(ExpectedRevision::Empty, "first", "a"))
-            .await
-            .expect("an unchanged retry replays its own outcome");
-        assert_eq!(replayed, first);
-        assert_eq!(store.published_revisions(), 2);
-    }
-
-    #[tokio::test]
-    async fn audit_is_written_with_the_mutation() {
-        let store = InMemoryControlPlane::new();
-        let revision = store
-            .publish_revision(candidate(ExpectedRevision::Empty, "first", "a"))
-            .await
-            .unwrap();
-        assert_eq!(
-            store.audit_trail(revision.id).await.unwrap(),
-            vec![audit("first")]
-        );
-    }
-
-    #[tokio::test]
-    async fn an_audit_actor_round_trips_from_owned_data() {
-        let store = InMemoryControlPlane::new();
-        // What a durable store has when it reads an audit row back: owned bytes
-        // with no static lifetime available to borrow from.
-        let read_back = |column: &str| Actor::System {
-            component: column.to_string(),
+        let outage = ControlPlaneError::Unavailable {
+            backend: "postgres",
+            message: "connection refused".to_owned(),
         };
-        let mut candidate = candidate(ExpectedRevision::Empty, "refresh", "a");
-        candidate.audit.actor = read_back(&String::from("catalog-refresh"));
-
-        let revision = store.publish_revision(candidate).await.unwrap();
-        let trail = store.audit_trail(revision.id).await.unwrap();
-        assert_eq!(trail[0].actor, read_back("catalog-refresh"));
-        assert_ne!(trail[0].actor, read_back("someone-else"));
-    }
-
-    #[tokio::test]
-    async fn a_rejected_candidate_leaves_no_trace() {
-        let store = InMemoryControlPlane::new();
-        let mut invalid = candidate(ExpectedRevision::Empty, "invalid", "a");
-        invalid.resources.clear();
-        let error = store
-            .publish_revision(invalid)
-            .await
-            .expect_err("an empty candidate is invalid");
-        assert_eq!(error.category(), FailureCategory::Invalid);
-        assert_eq!(store.desired_revision().await.unwrap(), None);
-        assert_eq!(store.published_revisions(), 0);
-    }
-
-    #[tokio::test]
-    async fn unknown_revisions_and_outages_are_distinguishable() {
-        let store = InMemoryControlPlane::new();
-        let missing = store
-            .load_revision(RevisionId(7))
-            .await
-            .expect_err("unpublished revision");
-        assert_eq!(missing.category(), FailureCategory::NotFound);
-        assert!(!missing.retryable());
-
-        store.set_unavailable(true);
-        let outage = store
-            .desired_revision()
-            .await
-            .expect_err("an unreachable store must not report an empty control plane");
         assert_eq!(outage.category(), FailureCategory::Unavailable);
         assert!(outage.retryable());
-    }
-
-    #[tokio::test]
-    async fn the_store_declares_the_capabilities_publication_relies_on() {
-        use super::super::Capability;
-
-        let store = InMemoryControlPlane::new();
-        for capability in [
-            Capability::TransactionalWrites,
-            Capability::OptimisticConcurrency,
-            Capability::IdempotentWrites,
-            Capability::TransactionalAudit,
-        ] {
-            assert!(
-                store.capabilities().has(capability),
-                "{capability:?} is required of every ControlPlaneStore"
-            );
-        }
-        store.health().await.expect("a healthy fake");
     }
 }

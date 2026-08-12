@@ -1,16 +1,16 @@
 //! In-memory fakes the contract tests run against.
 //!
-//! They exist so the contracts are exercised — publication ordering, conflict
-//! detection, idempotent retries, redaction, refresh semantics — without a
-//! datastore, keeping the Tier 0 hermetic gate hermetic. They are test-only by
-//! construction: a fake `ControlPlaneStore` is not a selectable implementation,
-//! because [`ControlPlaneBackend`](super::control_plane::ControlPlaneBackend)
-//! has no in-memory variant.
+//! They exist so the contracts are exercised — redaction, refresh semantics,
+//! rotation — without a datastore, keeping the Tier 0 hermetic gate hermetic.
+//!
+//! The `ControlPlaneStore` oracle lives with the domain it publishes, in
+//! [`crate::desired_state::oracle`], because its behaviour is defined in terms of
+//! revisions and validation rather than of this module's fixtures.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 
@@ -18,220 +18,16 @@ use super::catalog::{
     CatalogError, CatalogModelMetadata, CatalogPrice, CatalogRefresh, CatalogSnapshot,
     CatalogSource, CatalogVersion,
 };
-use super::control_plane::{
-    Actor, AuditEvent, ControlPlaneError, ControlPlaneStore, ExpectedRevision, IdempotencyKey,
-    ResourceId, ResourceKind, ResourceVersionRef, RevisionCandidate, RevisionChecksum, RevisionId,
-    RevisionManifest,
-};
 use super::secrets::{KekRef, SecretError, SecretMaterial, SecretRef, SecretStore};
 use super::{Capabilities, Capability};
-
-/// The audit event the control-plane fixtures publish.
-pub(crate) fn audit(action: &str) -> AuditEvent {
-    AuditEvent {
-        actor: Actor::System {
-            component: "test".to_owned(),
-        },
-        action: action.to_owned(),
-        summary: format!("{action} applied"),
-    }
-}
-
-/// A one-resource candidate. `key` is both the idempotency key and the checksum
-/// input, so two fixtures differ exactly when their desired state does.
-pub(crate) fn candidate(expected: ExpectedRevision, action: &str, key: &str) -> RevisionCandidate {
-    RevisionCandidate {
-        expected,
-        resources: vec![ResourceVersionRef {
-            kind: ResourceKind::Tenant,
-            id: ResourceId(format!("tenant-{key}")),
-            slug: format!("tenant-{key}"),
-            version: 1,
-        }],
-        checksum: RevisionChecksum(format!("sha256:{key}")),
-        audit: audit(action),
-        idempotency_key: IdempotencyKey(key.to_owned()),
-    }
-}
-
-#[derive(Default)]
-struct ControlPlaneState {
-    revisions: Vec<RevisionManifest>,
-    audit: HashMap<RevisionId, Vec<AuditEvent>>,
-    /// The revision a key published, plus the desired state it published, so a
-    /// reused key can be told apart from a retried one.
-    ///
-    /// One unscoped, never-expiring namespace, which is adequate for a
-    /// single-caller test double and is *not* the contract: per-caller scoping
-    /// and expiry are required of a durable store, per
-    /// [`IdempotencyKey`](super::control_plane::IdempotencyKey).
-    applied: HashMap<IdempotencyKey, (RevisionId, RevisionChecksum)>,
-}
-
-/// A `ControlPlaneStore` whose transaction is a mutex.
-pub(crate) struct InMemoryControlPlane {
-    state: Mutex<ControlPlaneState>,
-    unavailable: AtomicBool,
-}
-
-impl InMemoryControlPlane {
-    pub(crate) fn new() -> Self {
-        Self {
-            state: Mutex::new(ControlPlaneState::default()),
-            unavailable: AtomicBool::new(false),
-        }
-    }
-
-    pub(crate) fn set_unavailable(&self, unavailable: bool) {
-        self.unavailable.store(unavailable, Ordering::Relaxed);
-    }
-
-    pub(crate) fn published_revisions(&self) -> usize {
-        self.state.lock().expect("not poisoned").revisions.len()
-    }
-
-    fn outage(&self) -> Option<ControlPlaneError> {
-        self.unavailable
-            .load(Ordering::Relaxed)
-            .then(|| ControlPlaneError::Unavailable {
-                backend: "in-memory",
-                message: "fake control plane is unavailable".to_owned(),
-            })
-    }
-}
-
-#[async_trait]
-impl ControlPlaneStore for InMemoryControlPlane {
-    fn name(&self) -> &'static str {
-        "in-memory"
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        Capabilities::new(&[
-            Capability::TransactionalWrites,
-            Capability::OptimisticConcurrency,
-            Capability::IdempotentWrites,
-            Capability::TransactionalAudit,
-        ])
-    }
-
-    async fn health(&self) -> Result<(), ControlPlaneError> {
-        match self.outage() {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
-    async fn desired_revision(&self) -> Result<Option<RevisionId>, ControlPlaneError> {
-        if let Some(error) = self.outage() {
-            return Err(error);
-        }
-        Ok(self
-            .state
-            .lock()
-            .expect("not poisoned")
-            .revisions
-            .last()
-            .map(|revision| revision.id))
-    }
-
-    async fn load_revision(&self, id: RevisionId) -> Result<RevisionManifest, ControlPlaneError> {
-        if let Some(error) = self.outage() {
-            return Err(error);
-        }
-        self.state
-            .lock()
-            .expect("not poisoned")
-            .revisions
-            .iter()
-            .find(|revision| revision.id == id)
-            .cloned()
-            .ok_or(ControlPlaneError::RevisionNotFound(id))
-    }
-
-    async fn publish_revision(
-        &self,
-        candidate: RevisionCandidate,
-    ) -> Result<RevisionManifest, ControlPlaneError> {
-        if let Some(error) = self.outage() {
-            return Err(error);
-        }
-        if candidate.resources.is_empty() {
-            return Err(ControlPlaneError::Invalid(
-                "a revision must reference at least one resource".to_owned(),
-            ));
-        }
-
-        let mut state = self.state.lock().expect("not poisoned");
-
-        if let Some((existing, published)) = state.applied.get(&candidate.idempotency_key).cloned()
-        {
-            if published != candidate.checksum {
-                return Err(ControlPlaneError::IdempotencyKeyReused {
-                    key: candidate.idempotency_key,
-                    published: existing,
-                });
-            }
-            let manifest = state
-                .revisions
-                .iter()
-                .find(|revision| revision.id == existing)
-                .cloned()
-                .ok_or(ControlPlaneError::RevisionNotFound(existing))?;
-            return Ok(manifest);
-        }
-
-        let newest = state.revisions.last().map(|revision| revision.id);
-        let expected_matches = match (candidate.expected, newest) {
-            (ExpectedRevision::Empty, None) => true,
-            (ExpectedRevision::Exactly(expected), Some(actual)) => expected == actual,
-            _ => false,
-        };
-        if !expected_matches {
-            return Err(ControlPlaneError::Conflict {
-                expected: candidate.expected,
-                actual: newest,
-            });
-        }
-
-        let id = RevisionId(newest.map_or(1, |RevisionId(n)| n + 1));
-        let manifest = RevisionManifest {
-            id,
-            parent: newest,
-            created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(id.0),
-            resources: candidate.resources,
-            checksum: candidate.checksum,
-        };
-        // One critical section: manifest, audit, and the idempotency record are
-        // visible together or not at all.
-        state.revisions.push(manifest.clone());
-        state.audit.insert(id, vec![candidate.audit]);
-        state
-            .applied
-            .insert(candidate.idempotency_key, (id, manifest.checksum.clone()));
-        Ok(manifest)
-    }
-
-    async fn audit_trail(&self, id: RevisionId) -> Result<Vec<AuditEvent>, ControlPlaneError> {
-        if let Some(error) = self.outage() {
-            return Err(error);
-        }
-        self.state
-            .lock()
-            .expect("not poisoned")
-            .audit
-            .get(&id)
-            .cloned()
-            .ok_or(ControlPlaneError::RevisionNotFound(id))
-    }
-}
+use crate::desired_state::{ResourceId, Uuid7Generator};
 
 /// A `SecretStore` that "wraps" material by keeping a KEK label beside it, so a
 /// wrong KEK is an unwrap failure rather than a missing row.
 pub(crate) struct InMemorySecrets {
     entries: Mutex<HashMap<SecretRef, (String, KekRef)>>,
     kek: Mutex<KekRef>,
-    next_id: AtomicUsize,
+    ids: Uuid7Generator,
     unavailable: AtomicBool,
 }
 
@@ -240,7 +36,7 @@ impl InMemorySecrets {
         Self {
             entries: Mutex::new(HashMap::new()),
             kek: Mutex::new(KekRef("AXOND_KEK".to_owned())),
-            next_id: AtomicUsize::new(1),
+            ids: Uuid7Generator::new(),
             unavailable: AtomicBool::new(false),
         }
     }
@@ -283,10 +79,7 @@ impl SecretStore for InMemorySecrets {
             return Err(SecretError::Invalid("material is empty".to_owned()));
         }
         let reference = SecretRef {
-            id: ResourceId(format!(
-                "secret-{}",
-                self.next_id.fetch_add(1, Ordering::Relaxed)
-            )),
+            id: ResourceId::new(self.ids.next()),
             version: 1,
         };
         let kek = self.kek.lock().expect("not poisoned").clone();
@@ -313,7 +106,7 @@ impl SecretStore for InMemorySecrets {
             return Err(SecretError::NotFound(reference.clone()));
         }
         let rotated = SecretRef {
-            id: reference.id.clone(),
+            id: reference.id,
             version: reference.version + 1,
         };
         let kek = self.kek.lock().expect("not poisoned").clone();
