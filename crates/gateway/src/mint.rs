@@ -717,6 +717,59 @@ max_ttl = "15m"
         assert_eq!(principal.max_request_microdollars, Some(123));
     }
 
+    /// The offline command is the operator's own key, so it keeps ADR 0019's
+    /// scope-less semantics: no `--scope` writes no `scope` claim, and an
+    /// unscoped token is unrestricted — `status` included. Only `POST /v1/tokens`
+    /// synthesises a scope, which is why the exclusion of `status` from a
+    /// scope-less mint is a property of that route and not of this command.
+    #[tokio::test]
+    async fn an_offline_mint_without_a_scope_stays_unscoped_and_unrestricted() {
+        let config = verifier_config("hs-kid", "HS256", "HS_SECRET", "15m");
+        let secret = "01234567890123456789012345678901";
+        let env = HashMap::from([
+            ("STATIC".to_owned(), "static".to_owned()),
+            ("HS_SECRET".to_owned(), secret.to_owned()),
+        ]);
+        let verifier = TokenVerifier::build(&config, &env).unwrap().unwrap();
+        let base = [
+            "--kid",
+            "hs-kid",
+            "--key-env",
+            "HS_SECRET",
+            "--namespace",
+            "acme",
+            "--subject",
+            "caller",
+            "--ttl",
+            "1s",
+            "--audience",
+            "configured-audience",
+        ];
+
+        let token = mint_from_args(&mint_args(&base), Some(config.clone()), secret).unwrap();
+        let principal = verifier
+            .resolve(&Presented { credential: &token })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            principal.scope.is_none(),
+            "an omitted --scope must leave the claim off rather than synthesise a ceiling"
+        );
+
+        let mut named = base.to_vec();
+        named.extend(["--scope", "status"]);
+        let token = mint_from_args(&mint_args(&named), Some(config), secret).unwrap();
+        let principal = verifier
+            .resolve(&Presented { credential: &token })
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = principal.scope.expect("a named scope claim");
+        assert!(scope.contains(&Capability::Status));
+        assert_eq!(scope.len(), 1);
+    }
+
     #[tokio::test]
     async fn hs256_preserves_secret_whitespace() {
         let config = verifier_config("hs-kid", "HS256", "HS_SECRET", "15m");

@@ -193,6 +193,47 @@ def check_front_door_size() -> list[str]:
     return failures
 
 
+def check_review_trigger_tests() -> list[str]:
+    """Every test the threat-model trigger page names still exists.
+
+    The page is only useful if its named tests are the *real* floor, and a
+    documented test name rots silently: a rename in the crates leaves the page
+    pointing at coverage nobody has. Every backticked lowercase identifier with
+    three or more underscores in it is treated as a test function and must be
+    declared somewhere under `crates/`. Shorter identifiers are configuration
+    keys and field names (`allow_platform_fallback`, `credential_source`), which
+    other checks and the configuration reference already cover.
+    """
+    page = ROOT / "docs/security/threat-model-review.md"
+    if not page.is_file():
+        return [
+            "docs/security/threat-model-review.md: the trigger page is missing; "
+            "the security, deployment, contributor, and release docs link to it"
+        ]
+    text = page.read_text(encoding="utf-8")
+    declared = set()
+    for source in (ROOT / "crates").rglob("*.rs"):
+        declared.update(
+            re.findall(r"\bfn\s+([a-z0-9_]+)", source.read_text(encoding="utf-8"))
+        )
+    named = {
+        candidate
+        for candidate in re.findall(r"`([a-z0-9_]+)`", text)
+        if candidate.count("_") >= 3
+    }
+    failures = [
+        f"docs/security/threat-model-review.md: named test {name!r} does not exist under crates/"
+        for name in sorted(named - declared)
+    ]
+    if len(named) < 40:
+        failures.append(
+            "docs/security/threat-model-review.md: only "
+            f"{len(named)} named tests remain; the triggers are meant to name the "
+            "existing floor for each area"
+        )
+    return failures
+
+
 def main() -> int:
     files = markdown_files()
     failures = []
@@ -202,6 +243,7 @@ def main() -> int:
     failures.extend(check_stale_claims(files))
     failures.extend(check_route_contract())
     failures.extend(check_msrv_documented())
+    failures.extend(check_review_trigger_tests())
     failures.extend(check_front_door_size())
     if failures:
         for failure in failures:

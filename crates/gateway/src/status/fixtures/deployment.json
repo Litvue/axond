@@ -1,0 +1,62 @@
+{
+  "object": "status",
+  "observed": "replica",
+  "scope": "deployment",
+  "phase": "serving",
+  "stale": true,
+  "components": [
+    {
+      "component": "control_plane",
+      "state": "degraded",
+      "reason": "stale",
+      "observed_age_ms": 45000
+    },
+    {
+      "component": "catalogue",
+      "state": "ok",
+      "observed_age_ms": 1500
+    },
+    {
+      "component": "secret_store",
+      "state": "unavailable",
+      "reason": "secret_unresolved",
+      "observed_age_ms": 3200
+    },
+    {
+      "component": "budget_store",
+      "state": "unavailable",
+      "reason": "unreachable",
+      "observed_age_ms": 2100
+    },
+    {
+      "component": "rate_limit_store",
+      "state": "ok",
+      "observed_age_ms": 900
+    },
+    {
+      "component": "revocation_store",
+      "state": "degraded",
+      "reason": "timeout",
+      "observed_age_ms": 4400
+    },
+    {
+      "component": "usage_sink",
+      "state": "ok",
+      "observed_age_ms": 1100
+    },
+    {
+      "component": "provider_credentials",
+      "state": "degraded",
+      "reason": "capacity_exhausted",
+      "observed_age_ms": 1750
+    }
+  ],
+  "revision": {
+    "converged": false,
+    "lag_ms": 9000,
+    "generation": 7,
+    "consecutive_failures": 2,
+    "source": "control-plane",
+    "reason": "validation_rejected"
+  }
+}

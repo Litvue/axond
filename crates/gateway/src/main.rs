@@ -44,6 +44,11 @@ mod revocation;
 mod routes;
 mod shutdown;
 mod state;
+// The authenticated status contract (#199). Contract only, like `backends` and
+// `convergence`: the dependencies it reports on are not constructed by `serve`
+// yet, and `/healthz` and `/readyz` keep answering from process state alone.
+#[allow(dead_code)]
+mod status;
 mod streaming;
 mod telemetry;
 #[cfg(test)]

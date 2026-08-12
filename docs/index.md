@@ -81,6 +81,9 @@ and operate it.
 ## Develop and maintain
 
 - [Contributing](../CONTRIBUTING.md) — local checks and dependency-lock policy.
+- [Threat-model review triggers](./security/threat-model-review.md) — which
+  changes require a security review, and the regression tests, threat-model or
+  ADR updates, and release-impact statement each one owes.
 - [Compatibility gates](./compatibility.md#the-published-rust-api) — the MSRV
   floor, the published-crate API check, and the reviewed override for an
   intentional break.
