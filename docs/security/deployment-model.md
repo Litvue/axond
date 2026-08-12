@@ -2,7 +2,9 @@
 
 This guide summarizes the security boundary an operator must preserve. The
 dated [security review](../security-review-2026-08-05.md) records the detailed
-code audit and findings.
+code audit and findings, and the
+[threat-model review triggers](./threat-model-review.md) say which changes to
+Axond require that reasoning to be re-examined.
 
 ## Trust boundaries
 
