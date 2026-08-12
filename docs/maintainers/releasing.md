@@ -244,6 +244,53 @@ only the pinned developer toolchain, bump `rust-toolchain.toml` and the workflow
 pins and leave `rust-version` alone; the `msrv` lane then keeps proving the older
 floor still builds.
 
+## Workflow Action pins
+
+The release jobs can reach the release GitHub App token, `CARGO_REGISTRY_TOKEN`,
+and the keyless signing identity, so a third-party Action running there is as
+privileged as this runbook. `owner/action@v3` is a pointer the upstream owner can
+move, so every `uses:` in `.github/workflows` names a full commit SHA with the
+version in a trailing comment:
+
+```yaml
+- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+```
+
+The required `workflow-policy` lane runs
+[`ops/workflow-policy.py`](../../ops/workflow-policy.py), which rejects a tag or
+branch ref, a short SHA, a pin with no readable version comment, a workflow with
+no `permissions:` block, `permissions: write-all`, an unanchored
+`SIGNER_IDENTITY`, and a `cosign verify` that does not restrict the certificate
+identity and issuer. It also requires one reviewed pin per action across all
+workflows, so two lanes cannot silently run different builds of the same Action.
+The lane proves it still rejects those with `ops/workflow-policy.py --self-test`
+before it checks the repository, and then lints the workflows with
+[`ops/actionlint.sh`](../../ops/actionlint.sh), which downloads a pinned,
+checksum-verified `actionlint`. Locally:
+
+```bash
+just workflow-policy   # pins, permissions, signer restrictions (offline)
+just actionlint        # workflow linting; downloads the pinned actionlint
+```
+
+[`.github/dependabot.yml`](../../.github/dependabot.yml) opens one grouped
+`ci(deps):` pull request a week that moves the pins and their comments forward
+together. Reviewing a pin bump — Dependabot's or your own — means checking that
+the SHA is the commit the claimed tag points at in the upstream repository, not
+just that the comment reads plausibly:
+
+```bash
+gh api repos/actions/checkout/commits/v7.0.1 --jq .sha
+```
+
+Bumping a pin by hand follows the same rule: resolve the tag to its SHA, write
+both, and let the lane confirm the format. Where an action publishes no usable
+release tag the comment names the upstream branch the SHA was taken from
+(`dtolnay/rust-toolchain@… # stable`), which is also the pin most likely to need
+a manual refresh. A proposed *major* bump is not a pin change: read the upstream
+release notes for renamed inputs and changed defaults before taking it, because
+the pinned SHA is what CI will run until someone changes it again.
+
 ## Security releases
 
 Before the release, the changes it carries should already have been reviewed

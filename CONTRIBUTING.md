@@ -21,12 +21,16 @@ on that floor the way CI does.
 
 ```bash
 just check      # fmt --check, clippy -D warnings, tests, docs, supply chain,
-                # packaging, MSRV, and public-API compatibility — the CI gates
+                # packaging, MSRV, public-API compatibility, and workflow
+                # policy — the CI gates
 just run        # run against ./axond.toml
 just compat     # run the Python SDK compatibility lane
 just compat-ts  # run the TypeScript SDK compatibility lane
 just msrv       # build on the declared minimum supported Rust version
 just api-compat # semver-check the published library crates against crates.io
+just workflow-policy
+                # check the Action pins, workflow permissions, and the release
+                # signer restriction
 ```
 
 Or without `just`:
@@ -92,6 +96,10 @@ raising the MSRV follows
   [the compatibility contract](./docs/compatibility.md) and gated in CI; neither
   is a patch.
 - **Report vulnerabilities privately.** See [`SECURITY.md`](./SECURITY.md).
+- **Workflow steps are pinned to commit SHAs.** Every `uses:` names a full commit
+  SHA with the version in a trailing comment; a tag or branch ref fails the
+  `workflow-policy` lane. Dependabot proposes the bumps — see
+  [the runbook](./docs/maintainers/releasing.md#workflow-action-pins).
 - **Never commit secrets.** Credentials are referenced by env-var name in
   config; real keys and `axond.toml` are gitignored.
 - **Keep `gateway-core` I/O-free.** No HTTP client, no runtime, no config, no
