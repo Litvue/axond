@@ -1670,7 +1670,6 @@ impl Config {
         self.validate_usage_sinks()?;
         self.validate_budget()?;
         self.validate_rate_limit()?;
-        self.validate_admission()?;
         self.validate_revocation()?;
         Ok(())
     }
@@ -1694,10 +1693,11 @@ impl Config {
     }
 
     /// Bounds the process applies to itself, in both modes: per-phase upstream
-    /// limits and how often the file is re-read. They are process-local serving
-    /// parameters rather than durable resources, so the control plane does not
-    /// own them.
+    /// limits, the inbound admission ceilings, and how often the file is
+    /// re-read. They are process-local serving parameters rather than durable
+    /// resources, so the control plane does not own them.
     fn validate_process_local_bounds(&self) -> Result<(), ConfigError> {
+        self.validate_admission()?;
         for (field, value) in [
             ("connect_timeout_ms", self.transport.connect_timeout_ms),
             (
@@ -3702,6 +3702,27 @@ env = "GW_ADMIN_BREAKGLASS"
                 .and_then(SecretStore::kek_reference),
             Some(("kek_env", "GW_SECRET_STORE_KEK"))
         );
+    }
+
+    /// `[admission]` bounds the process, not a durable resource, so the control
+    /// plane never owns it and a stateful replica must refuse a nonsensical
+    /// ceiling for the same reason a stateless one does: the alternative is a
+    /// gateway that boots and then refuses every request.
+    #[test]
+    fn stateful_mode_validates_the_process_local_admission_bounds() {
+        for (snippet, expected) in [
+            ("max_request_bytes = 0", "admission.max_request_bytes"),
+            (
+                "max_in_flight = 4\nmax_in_flight_per_tenant = 8",
+                "admission.max_in_flight_per_tenant",
+            ),
+            ("queue_capacity = 4", "admission.queue_wait_ms"),
+        ] {
+            let toml = format!("{STATEFUL}\n[admission]\n{snippet}\n");
+            let error = Config::from_toml_str(&toml)
+                .expect_err("a stateful replica refuses an invalid ceiling too");
+            assert!(error.to_string().contains(expected), "{snippet} => {error}");
+        }
     }
 
     /// The property ADR 0027 keeps from ADR 0017: one authority per resource
