@@ -320,6 +320,11 @@ fn derivations(seed: &[u8]) -> Vec<(String, Vec<u8>)> {
 
 fn main() {
     let started = Instant::now();
+    // Before anything asserts on a refusal, prove the verifier refuses for a
+    // reason: a stubbed signature check would make every token assertion below
+    // vacuous.
+    axond_fuzz::assert_signature_verification_is_real();
+    println!("token_verify: signature verification is live (minted accepted, tampered refused)");
     let mut inputs = 0_usize;
     for target in TARGETS {
         let mut target_inputs = 0_usize;

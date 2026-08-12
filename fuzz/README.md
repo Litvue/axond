@@ -30,8 +30,20 @@ material, so nothing here opens a socket, reads a file, or holds a real secret.
   generated and ignored.
 
 This is deliberately its own Cargo workspace: the targets need nightly and a
-sanitizer runtime, and they depend on `axond` with a `fuzzing` feature no other
-consumer may enable. Nothing at the repository root builds or lints it.
+sanitizer runtime, and they reach `axond`'s parsers through a seam only
+`--cfg fuzzing` compiles, which no other consumer can switch on. Nothing at the
+repository root builds it, so this project runs its own `cargo fmt --check` and
+`cargo clippy -- -D warnings` in the same CI lane as the smoke.
+[ADR 0033](../docs/adr/0033-fuzzing-the-untrusted-input-parsers.md) records the
+decision and what it costs.
+
+That flag reaches every dependency rather than just `axond` — Cargo has no
+per-crate rustflags, and it is what `cargo fuzz` sets anyway. Since a crate is
+allowed to weaken cryptography under it, the smoke's first act is
+`assert_signature_verification_is_real`: the seam mints a token, verifies it, and
+must then refuse that token with a bit flipped in each of its three JWS segments.
+That is the durable check; [`.cargo/config.toml`](./.cargo/config.toml) records
+the lockfile audit behind it.
 
 ## The smoke (stable, bounded, on every pull request)
 
@@ -39,12 +51,12 @@ consumer may enable. Nothing at the repository root builds or lints it.
 just fuzz-smoke
 ```
 
-Replays every seed plus fixed derivations — truncations, single-byte flips, one
-oversized repetition — and a set of tokens minted at replay time, then fails on
-a panic, on an input slower than its budget, or on an allocation past a hard cap
-enforced by the binary's own global allocator. It also fails if the corpus stops
-reaching a spread of outcome classes, so the lane cannot go green by refusing
-everything at the door.
+Proves signature verification is live, then replays every seed plus fixed
+derivations — truncations, single-byte flips, one oversized repetition — and a set
+of tokens minted at replay time. It fails on a panic, on an input slower than its
+budget, or on an allocation past a hard cap enforced by the binary's own global
+allocator. It also fails if the corpus stops reaching a spread of outcome
+classes, so the lane cannot go green by refusing everything at the door.
 
 ## Coverage-guided runs (nightly toolchain)
 

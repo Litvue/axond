@@ -88,6 +88,18 @@ target on nightly with a wall-clock budget and libFuzzer's own RSS and
 malloc limits, restores and saves the accumulated corpus, and retains the corpus
 and any reproducer as artifacts on success and failure alike.
 
+### The cfg is graph-wide, so verification is proven rather than assumed
+
+Cargo has no per-crate rustflags, so `--cfg fuzzing` reaches every dependency —
+exactly as it does under `cargo fuzz`. A crate is allowed to change behaviour
+under that cfg, and some weaken cryptography deliberately to help fuzzers, which
+would make every `token_verify` assertion vacuous. An audit of `fuzz/Cargo.lock`
+says none of ours do, and an audit is not a gate: the required smoke therefore
+begins with `assert_signature_verification_is_real`, which mints a token through
+the seam, verifies it, and requires a refusal for the same token with a bit
+flipped in each of its three JWS segments. A dependency bump that stubbed the
+verifier fails the lane rather than quietly hollowing it out.
+
 ### Hermetic, with synthetic material
 
 The seam's verifiers come from a configuration compiled into the target with

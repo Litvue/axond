@@ -246,6 +246,64 @@ fn check_verification(credential: &str, minted_audience: Option<&str>) -> &'stat
     }
 }
 
+/// Prove the seam verifies signatures for real before any target trusts it.
+///
+/// Every `token_verify` assertion is worthless against a stubbed verifier, and
+/// the fuzz workspace compiles its whole dependency graph with `--cfg fuzzing`
+/// (see `.cargo/config.toml`) — a flag some crates use to weaken cryptography on
+/// purpose. Rather than trust an audit of the lockfile to stay true across
+/// dependency bumps, the required smoke starts here: a token the seam minted
+/// verifies, and the same token with one bit flipped in each of its three
+/// segments does not.
+///
+/// # Panics
+///
+/// If a signature check is not actually happening.
+pub fn assert_signature_verification_is_real() {
+    let token = axond::mint_hs256_token(
+        axond::NAMESPACES[0],
+        "signature-check",
+        axond::AUDIENCE,
+        300,
+        None,
+        None,
+        None,
+    )
+    .expect("the seam mints its own token");
+    assert!(
+        matches!(axond::verify_token(&token), Ok(Some(_))),
+        "the seam cannot verify a token it just minted"
+    );
+
+    let body = token
+        .strip_prefix("axt1.")
+        .expect("a minted token carries the axt1 prefix");
+    let segments: Vec<&str> = body.split('.').collect();
+    assert_eq!(segments.len(), 3, "a JWS has three segments: {body:?}");
+    for segment in 0..3 {
+        let mut tampered: Vec<String> = segments.iter().map(|part| (*part).to_owned()).collect();
+        // The *first* character, because it carries the leading six bits of the
+        // segment's first byte: rewriting a trailing character can land in
+        // padding bits that decode to the same bytes.
+        let mut characters: Vec<char> = tampered[segment].chars().collect();
+        assert!(
+            !characters.is_empty(),
+            "segment {segment} of a minted token is empty"
+        );
+        characters[0] = if characters[0] == 'A' { 'B' } else { 'A' };
+        tampered[segment] = characters.into_iter().collect();
+        let credential = format!("axt1.{}", tampered.join("."));
+        let outcome = axond::verify_token(&credential);
+        assert!(
+            matches!(
+                outcome,
+                Err(Rejection::Unauthenticated(_) | Rejection::Unauthorized(_))
+            ),
+            "tampering with segment {segment} of a minted token still verified: {outcome:?}"
+        );
+    }
+}
+
 fn assert_accepted(verified: &VerifiedToken) {
     assert!(
         axond::NAMESPACES.contains(&verified.namespace.as_str()),
