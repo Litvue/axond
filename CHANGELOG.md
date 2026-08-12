@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.8](https://github.com/Litvue/axond/compare/v0.3.7...v0.3.8) (2026-08-12)
+
+
+### Bug Fixes
+
+* **admission:** follow a lowered global ceiling, defer the stream gate, bound permits ([#181](https://github.com/Litvue/axond/issues/181)) ([7dd6a2c](https://github.com/Litvue/axond/commit/7dd6a2cc53ad1ab55ab472fdc4be8ffe05dbfe74))
+
 ## [0.3.7](https://github.com/Litvue/axond/compare/v0.3.6...v0.3.7) (2026-08-12)
 
 
