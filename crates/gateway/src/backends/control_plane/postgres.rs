@@ -1029,7 +1029,7 @@ mod tests {
     use crate::backends::{BackendFailure, FailureCategory};
     use crate::desired_state::fixtures::{
         DESIRED_STATE_RESOURCES, candidate, reference, state, state_with_renamed_alias,
-        state_with_second_tenant, tenant,
+        state_with_second_tenant, state_with_two_blobs, tenant,
     };
     use crate::desired_state::{
         Actor, AuditEventId, DesiredState, ExpectedRevision, MutationId, ResourceKind, Uuid7,
@@ -2244,7 +2244,7 @@ mod tests {
         let Some((store, dsn, schema)) = journal().await else {
             return;
         };
-        let (first, _, _) = three_revisions(&store).await;
+        let (first, _, third) = three_revisions(&store).await;
 
         // Each bound, stated against the same five-resource revision. Every one
         // of them is a refusal: not a truncated manifest, not the resources that
@@ -2304,11 +2304,22 @@ mod tests {
         // The declared-bytes figure is the revision's real total, not however
         // much of it was counted before the ceiling was crossed: an operator
         // deciding where to put the bound is told the size they have to clear.
-        let declared = state()
-            .blobs()
-            .map(|blob| blob.size_bytes)
-            .sum::<u64>()
-            .to_string();
+        //
+        // Stated against a revision declaring *two* blobs, because with one the
+        // partial sum and the total are the same number and the assertion would
+        // hold under the short-circuiting this pins.
+        let two_blobs = state_with_two_blobs();
+        let fourth = store
+            .publish_revision(candidate(
+                ExpectedRevision::Exactly(third.id),
+                "fourth",
+                two_blobs.clone(),
+            ))
+            .await
+            .expect("fourth publication");
+        let sizes: Vec<u64> = two_blobs.blobs().map(|blob| blob.size_bytes).collect();
+        assert_eq!(sizes.len(), 2, "the fixture must declare two blobs");
+        let total = sizes.iter().sum::<u64>();
         let bounded = bounded_store(
             &dsn,
             &schema,
@@ -2319,10 +2330,18 @@ mod tests {
         )
         .await;
         let error = bounded
-            .load_manifest(first.id)
+            .load_manifest(fourth.id)
             .await
             .expect_err("a revision past a bound must not hydrate");
-        assert!(error.to_string().contains(&declared), "{error}");
+        assert!(error.to_string().contains(&total.to_string()), "{error}");
+        // And the figure is not either blob on its own, which is what a sum that
+        // stopped at the first row over the ceiling would have reported.
+        for size in sizes {
+            assert!(
+                !error.to_string().contains(&size.to_string()),
+                "reported a partial sum: {error}"
+            );
+        }
 
         // The candidate bound is the last line: a state that hydrated is still
         // refused if the value itself is larger than this build returns.

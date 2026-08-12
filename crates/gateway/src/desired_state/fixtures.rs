@@ -121,6 +121,33 @@ pub(crate) fn blob_backed_catalog(seed: u64) -> ResourceVersion {
     )
 }
 
+/// A second content-addressed catalogue snapshot, with its own digest.
+///
+/// Exists so a test can distinguish a *total* over declared blobs from a partial
+/// one: with a single blob the two are equal, and an assertion on the total
+/// proves nothing.
+pub(crate) fn second_blob_backed_catalog(seed: u64) -> ResourceVersion {
+    ResourceVersion::new(
+        reference(ResourceKind::CatalogModel, seed),
+        ResourceScope::Deployment,
+        Slug::parse("embeddings-dev").expect("fixture slug"),
+        ResourceBody::Blob(BlobRef::of(
+            BlobKind::CatalogSnapshot,
+            &catalog_payload(b"embeddings"),
+        )),
+    )
+}
+
+/// [`state`] plus a second blob-backed catalogue, so the state declares two
+/// blobs of different sizes.
+pub(crate) fn state_with_two_blobs() -> DesiredState {
+    let catalog = second_blob_backed_catalog(6);
+    let mut state = state();
+    state.declare_blob(*catalog.body.blob().expect("a blob body"));
+    state.insert(catalog).expect("a distinct reference");
+    state
+}
+
 /// A complete, valid desired state: one tenant, a project, a credential, a
 /// blob-backed catalogue snapshot, and an alias depending on both the credential
 /// and the catalogue.
