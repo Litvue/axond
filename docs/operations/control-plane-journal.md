@@ -273,7 +273,9 @@ outcomes need different responses:
   a revision the deployed build reads — which for a legacy tenant or project means
   republishing it from a build that writes typed bodies. Revisions older than that
   upgrade stay unreadable to this build by design and remain in the journal as
-  history.
+  history. A body that *declares* a schema this build reads and then is not one —
+  a field gone, a field whose type changed — is not this outcome; that is
+  unreadable, above, because no version skew produces it.
 - **Too large (`exceeds what hydration reads`).** The revision is intact but
   larger than this build's read bounds (resource versions, blobs, blob bytes,
   dependency edges or nesting, inline body bytes, or total candidate size); the

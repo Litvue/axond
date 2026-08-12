@@ -202,29 +202,47 @@ impl TenancyError {
     /// [`MissingResource`], not this — so what reaches this case is a revision
     /// that was published that way.
     ///
-    /// An identity or ownership *contradiction* is not a compatibility refusal:
-    /// those rows were readable, this build understands both of them, and they
-    /// disagree. That is corruption an operator has to repair.
+    /// Two kinds of refusal are *not* compatibility failures:
+    ///
+    /// - an identity or ownership contradiction: those rows were readable, this
+    ///   build understands both of them, and they disagree;
+    /// - a field missing, mistyped, or unparseable *inside a body whose schema
+    ///   this build reads*. Reading takes the schema identifier first, so anything
+    ///   past that point declared `axond.tenant.v1` and then failed to be one, and
+    ///   a schema identifier is only reused for one field set (see the module
+    ///   docs). The likely cause is a body rewritten underneath the gateway, not a
+    ///   release skew, so it must not be reported as intact storage. A missing
+    ///   `schema` field is the legacy case and stays a compatibility refusal.
+    ///
+    /// The one exception is a display name, whose *rules* can tighten within one
+    /// schema — this build refuses a byte-order mark an earlier one accepted — so
+    /// a name this build will not take is a skew rather than damage.
+    ///
+    /// Either way an operator has real repair work; only the compatibility cases
+    /// are told the database is fine.
     ///
     /// [`IntegrityError`](super::revision::IntegrityError) carries the
     /// distinction into hydration, and convergence reports it as its own refusal
     /// reason.
     ///
     /// [`MissingResource`]: super::revision::IntegrityError::MissingResource
-    pub const fn is_incompatible(&self) -> bool {
+    pub fn is_incompatible(&self) -> bool {
         match self {
             Self::Kind { .. }
             | Self::NotInline { .. }
             | Self::NotARecord { .. }
             | Self::Schema { .. }
-            | Self::MissingField { .. }
             | Self::UnknownField { .. }
-            | Self::FieldType { .. }
-            | Self::MalformedId { .. }
             | Self::MalformedDisplayName { .. }
             | Self::UnknownTenant { .. }
             | Self::UnknownProject { .. } => true,
-            Self::IdentityMismatch { .. }
+            // Only the schema identifier itself: its absence is a body written
+            // before tenancy had one at all.
+            Self::MissingField { field, .. } | Self::FieldType { field, .. } => {
+                *field == SCHEMA_FIELD
+            }
+            Self::MalformedId { .. }
+            | Self::IdentityMismatch { .. }
             | Self::OwnerMismatch { .. }
             | Self::ProjectOwnerMismatch { .. } => false,
         }
@@ -1317,6 +1335,50 @@ mod tests {
                 scoped: Some(tenant_id(1)),
             }
             .is_incompatible()
+        );
+
+        // Nor is a body that declares a schema this build *does* read and then is
+        // not one: the identifier is read first, so past that point the field set
+        // is known, and a field that has gone missing or changed type is a rewrite
+        // rather than a release skew. Telling that operator the database is fine
+        // would point them away from the only place to look.
+        let mut damaged = DesiredState::new();
+        let losing_a_field = with_fields(&tenant_resource(), |fields| {
+            fields.retain(|(name, _)| name != DISPLAY_NAME_FIELD);
+        });
+        damaged.insert(losing_a_field).expect("a fresh state");
+        let error = damaged
+            .validate()
+            .expect_err("a v1 body without a v1 field is not a v1 body");
+        assert_eq!(
+            error,
+            ValidationError::Tenancy(TenancyError::MissingField {
+                reference: tenant_resource().reference,
+                field: DISPLAY_NAME_FIELD,
+            })
+        );
+        let ValidationError::Tenancy(tenancy) = &error else {
+            panic!("expected a tenancy refusal, got {error:?}");
+        };
+        assert!(
+            !tenancy.is_incompatible(),
+            "a field lost from a schema this build reads is damage, not a skew"
+        );
+        assert!(
+            !TenancyError::FieldType {
+                reference: tenant_resource().reference,
+                field: TENANT_ID_FIELD,
+            }
+            .is_incompatible(),
+            "and so is a field whose type changed underneath the gateway"
+        );
+        assert!(
+            TenancyError::MissingField {
+                reference: tenant_resource().reference,
+                field: SCHEMA_FIELD,
+            }
+            .is_incompatible(),
+            "only the identifier's own absence is the legacy shape"
         );
     }
 

@@ -120,7 +120,7 @@ scope, and slug. Two schemas exist today:
 | `axond.tenant.v1` | a deployment tenant | `schema`, `tenant_id`, `display_name` |
 | `axond.project.v1` | a tenant-owned project | `schema`, `project_id`, `tenant_id`, `display_name` |
 
-Four rules hold for every body schema, present and future:
+Five rules hold for every body schema, present and future:
 
 - **The identifier is inside the checksummed body.** A replica reads the schema
   before it reads anything else, so a revision cannot be interpreted under a
@@ -141,6 +141,14 @@ Four rules hold for every body schema, present and future:
   affected tenants and projects from a build that writes typed bodies, and the
   fleet converges onto the new revision. Older revisions in the journal stay
   unreadable to this build by design; they remain in the journal as history.
+- **A body that declares a schema this build reads, and then is not one, is
+  damage.** Past the identifier the field set is known, so a `v1` body missing a
+  `v1` field, or carrying one whose type changed, is reported as `corrupt` and not
+  as `incompatible`: nothing about a release skew can produce it, and the operator
+  is pointed at storage rather than away from it. (A *display name* this build will
+  not take is the exception, and is `incompatible`: validation rules can tighten
+  within one schema — this build refuses an invisible byte-order mark an earlier
+  one accepted.)
 - **A change to a field's presence or meaning is a new identifier.** `v1` bodies
   never change shape, so a checksum computed by one release is computed the same
   way by every release that accepts it. Adding a field, renaming one, or changing
@@ -217,7 +225,8 @@ The refusal reason is the triage key.
   nothing to repair, so this is an upgrade or a republication, never a database
   investigation. The replica keeps serving its last known good revision and does
   not retry into a different answer. During a rolling upgrade, expect it on
-  replicas still running the older build.
+  replicas still running the older build. A body that *declares* a schema this
+  build reads and then is not one is `corrupt` instead — see the rules above.
 - **`corrupt`** / **`not_found`** — the journal itself does not add up. Retrying
   will not clear it; see
   [when a revision will not load](./control-plane-journal.md#when-a-revision-will-not-load).
