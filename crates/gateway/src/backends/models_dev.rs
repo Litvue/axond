@@ -40,7 +40,12 @@
 //! - a key that disagrees with the `id` inside it, or an id containing something
 //!   no provider id contains, since both make one model two or two models one;
 //! - a price that is negative, finer than a nano-dollar, out of range, partially
-//!   stated, or tiered on an unknown threshold.
+//!   stated, tiered on an unknown threshold, or tiered without the base pair its
+//!   tiers qualify — an empty `cost` object is the only one read as unpublished;
+//! - text a canonical form cannot hold, since content that cannot be
+//!   checksummed has no identity to admit it under. Whitespace is normalized
+//!   first (see [`text`]), because upstream publishes trailing tabs and those
+//!   carry no meaning.
 //!
 //! # Prices are parsed exactly, never through a float
 //!
@@ -458,6 +463,18 @@ struct WireRates<'a> {
 }
 
 impl WireCost {
+    /// Whether the object states nothing beyond the base rates, so an absent
+    /// base pair means an absent price rather than a dropped one.
+    fn states_only_base_rates(&self) -> bool {
+        self.cache_read.is_none()
+            && self.cache_write.is_none()
+            && self.reasoning.is_none()
+            && self.input_audio.is_none()
+            && self.output_audio.is_none()
+            && self.tiers.is_empty()
+            && self.context_over_200k.is_none()
+    }
+
     fn rates(&self) -> WireRates<'_> {
         WireRates {
             input: self.input.as_deref(),
@@ -733,9 +750,21 @@ fn price(
     let pointer = pointer.child("cost");
     let stated = cost.rates();
     if stated.input.is_none() && stated.output.is_none() {
-        // A `cost` object stating no base rate is an offering whose price the
-        // upstream has not published, not a free one.
-        return Ok(None);
+        if cost.states_only_base_rates() {
+            // An empty `cost` object is an offering whose price the upstream has
+            // not published, not a free one.
+            return Ok(None);
+        }
+        // Tiers or optional rates without the base pair they qualify: reading
+        // this as "no published price" would discard rates the payload does
+        // state, which is the one thing this adapter never does silently.
+        return Err(ModelsDevError::Price {
+            pointer,
+            reason: PriceRejection::Partial {
+                stated: "tiered or optional rates",
+                missing: "input and output",
+            },
+        });
     }
     let base = rates(&stated, &pointer)?;
 
@@ -1055,7 +1084,7 @@ impl CatalogSource for SeedCatalogSource {
         if since == Some(&validators) {
             return Ok(CatalogRefresh::Unchanged { validators });
         }
-        Ok(CatalogRefresh::Updated(seed_snapshot()))
+        Ok(CatalogRefresh::Updated(Box::new(seed_snapshot())))
     }
 }
 
@@ -1070,6 +1099,16 @@ pub enum FetchResponse {
         validators: SourceValidators,
     },
 }
+
+/// The largest payload a refresh will hold.
+///
+/// The real document is a few megabytes, so this is generous by an order of
+/// magnitude and still bounded: the source URL is operator-configurable, and a
+/// mirror that answers with an endless body must cost a refused refresh rather
+/// than the process's memory. Enforced twice on purpose — a [`CatalogFetch`]
+/// stops reading at the ceiling, and [`ModelsDevSource`] re-checks what it was
+/// handed, so an implementation that forgets cannot make the source unbounded.
+pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// Why a fetch did not produce a payload.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1097,12 +1136,52 @@ impl From<FetchError> for CatalogError {
     }
 }
 
+/// Read a response body without holding more than `limit` bytes of it.
+///
+/// Streamed and checked as it arrives rather than afterwards: `Response::bytes`
+/// allocates the whole body before anyone can object, and a declared
+/// `Content-Length` is a claim rather than a bound — so the declaration is
+/// refused early when it is already too large, and the chunks are counted
+/// regardless of what it said.
+pub async fn bounded_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, FetchError> {
+    let declared = response.content_length();
+    if declared.is_some_and(|declared| declared > limit as u64) {
+        return Err(FetchError::TooLarge { limit });
+    }
+    let mut body = Vec::with_capacity(
+        declared
+            .and_then(|declared| usize::try_from(declared).ok())
+            .unwrap_or_default()
+            .min(limit),
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| FetchError::Transport {
+            message: error.to_string(),
+        })?
+    {
+        if body.len() + chunk.len() > limit {
+            return Err(FetchError::TooLarge { limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// How a payload is retrieved.
 ///
 /// Injected rather than hard-wired so the source's conditional-request behaviour
 /// is testable against a local server, and so scheduling, backoff, and staleness
 /// reporting — which are a later slice — have a seam to attach to instead of a
 /// reason to rewrite this one.
+///
+/// An implementation is expected to stop reading at the ceiling it was given
+/// ([`bounded_body`] does); [`ModelsDevSource`] re-checks what it was handed, so
+/// one that does not cannot make the source unbounded.
 #[async_trait]
 pub trait CatalogFetch: Send + Sync {
     async fn get(
@@ -1120,11 +1199,23 @@ pub trait CatalogFetch: Send + Sync {
 pub struct ModelsDevSource<F> {
     adapter: ModelsDevAdapter,
     fetch: F,
+    payload_limit: usize,
 }
 
 impl<F: CatalogFetch> ModelsDevSource<F> {
-    pub fn new(adapter: ModelsDevAdapter, fetch: F) -> Self {
-        Self { adapter, fetch }
+    pub const fn new(adapter: ModelsDevAdapter, fetch: F) -> Self {
+        Self {
+            adapter,
+            fetch,
+            payload_limit: MAX_PAYLOAD_BYTES,
+        }
+    }
+
+    /// Hold less than the default ceiling.
+    #[must_use]
+    pub const fn with_payload_limit(mut self, limit: usize) -> Self {
+        self.payload_limit = limit;
+        self
     }
 }
 
@@ -1146,9 +1237,19 @@ impl<F: CatalogFetch> CatalogSource for ModelsDevSource<F> {
             FetchResponse::NotModified { validators } => {
                 Ok(CatalogRefresh::Unchanged { validators })
             }
-            FetchResponse::Payload { bytes, validators } => Ok(CatalogRefresh::Updated(
-                self.adapter.parse(&bytes, validators, SystemTime::now())?,
-            )),
+            FetchResponse::Payload { bytes, validators } => {
+                if bytes.len() > self.payload_limit {
+                    return Err(FetchError::TooLarge {
+                        limit: self.payload_limit,
+                    }
+                    .into());
+                }
+                Ok(CatalogRefresh::Updated(Box::new(self.adapter.parse(
+                    &bytes,
+                    validators,
+                    SystemTime::now(),
+                )?)))
+            }
         }
     }
 }
@@ -1205,6 +1306,12 @@ mod tests {
             "top-level-array" => include_str!("fixtures/models_dev/drift.top-level-array.json"),
             "empty" => include_str!("fixtures/models_dev/drift.empty.json"),
             "not-json" => include_str!("fixtures/models_dev/drift.not-json.json"),
+            "control-character" => {
+                include_str!("fixtures/models_dev/drift.control-character.json")
+            }
+            "price-tiers-without-base" => {
+                include_str!("fixtures/models_dev/drift.price-tiers-without-base.json")
+            }
             other => panic!("no drift fixture named `{other}`"),
         }
     }
@@ -1486,6 +1593,20 @@ mod tests {
                     }
                 )
             }),
+            // Tiers with no base pair are refused rather than read as "no
+            // published price", which would drop the rates the payload states.
+            ("price-tiers-without-base", |error| {
+                matches!(
+                    error,
+                    ModelsDevError::Price {
+                        reason: PriceRejection::Partial {
+                            stated: "tiered or optional rates",
+                            ..
+                        },
+                        ..
+                    }
+                )
+            }),
             ("price-partial", |error| {
                 matches!(
                     error,
@@ -1524,6 +1645,17 @@ mod tests {
                     }
                 )
             }),
+            // Text a canonical form cannot hold is refused, not asserted about:
+            // the content would otherwise have no identity, and an import that
+            // cannot be identified cannot be admitted.
+            ("control-character", |error| {
+                matches!(
+                    error,
+                    ModelsDevError::Content {
+                        source: CatalogContentError::Uncanonicalizable { .. }
+                    }
+                )
+            }),
         ];
         for (name, expected) in expectations {
             let error = parse(drift(name)).expect_err("a drifted payload is refused");
@@ -1541,7 +1673,13 @@ mod tests {
         let content_id = good.source.content_id;
         assert_eq!(catalogue.admit(good), Admission::Initial { content_id });
 
-        for name in ["not-json", "unknown-status", "price-precision", "empty"] {
+        for name in [
+            "not-json",
+            "unknown-status",
+            "price-precision",
+            "empty",
+            "control-character",
+        ] {
             let (error, active) = catalogue
                 .admit_result(parse(drift(name)))
                 .expect_err("a drifted payload is refused");
@@ -1682,6 +1820,21 @@ mod tests {
     /// The minimal `reqwest` fetch the test drives the source through.
     struct HttpFetch {
         client: reqwest::Client,
+        limit: usize,
+    }
+
+    impl HttpFetch {
+        fn new() -> Self {
+            Self {
+                client: reqwest::Client::new(),
+                limit: MAX_PAYLOAD_BYTES,
+            }
+        }
+
+        const fn holding_at_most(mut self, limit: usize) -> Self {
+            self.limit = limit;
+            self
+        }
     }
 
     #[async_trait]
@@ -1721,13 +1874,7 @@ mod tests {
             match response.status().as_u16() {
                 304 => Ok(FetchResponse::NotModified { validators }),
                 200 => Ok(FetchResponse::Payload {
-                    bytes: response
-                        .bytes()
-                        .await
-                        .map_err(|error| FetchError::Transport {
-                            message: error.to_string(),
-                        })?
-                        .to_vec(),
+                    bytes: bounded_body(response, self.limit).await?,
                     validators,
                 }),
                 status => Err(FetchError::Status { status }),
@@ -1735,17 +1882,16 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_conditional_refresh_transfers_nothing_when_the_upstream_is_unchanged() {
+    /// Serve `payload` from a local `catalog.json`, and count the transfers.
+    async fn upstream(payload: &'static str) -> (ModelsDevAdapter, Arc<AtomicUsize>) {
         let transfers = Arc::new(AtomicUsize::new(0));
-        let upstream = Upstream {
-            etag: "\"identity-1\"".to_owned(),
-            payload: IDENTITY,
-            transfers: Arc::clone(&transfers),
-        };
         let router = axum::Router::new()
             .route("/catalog.json", get(serve))
-            .with_state(upstream);
+            .with_state(Upstream {
+                etag: "\"identity-1\"".to_owned(),
+                payload,
+                transfers: Arc::clone(&transfers),
+            });
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
             .expect("a free port");
@@ -1753,15 +1899,15 @@ mod tests {
         tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
-
         let adapter = ModelsDevAdapter::new(format!("http://{address}/catalog.json"))
             .expect("a catalog.json URL");
-        let source = ModelsDevSource::new(
-            adapter,
-            HttpFetch {
-                client: reqwest::Client::new(),
-            },
-        );
+        (adapter, transfers)
+    }
+
+    #[tokio::test]
+    async fn a_conditional_refresh_transfers_nothing_when_the_upstream_is_unchanged() {
+        let (adapter, transfers) = upstream(IDENTITY).await;
+        let source = ModelsDevSource::new(adapter, HttpFetch::new());
         let mut catalogue = LastKnownGoodCatalog::new();
 
         let CatalogRefresh::Updated(snapshot) = source.refresh(None).await.expect("first refresh")
@@ -1774,7 +1920,7 @@ mod tests {
         );
         assert!(snapshot.source.validators.last_modified.is_some());
         let content_id = snapshot.source.content_id;
-        catalogue.admit(snapshot);
+        catalogue.admit(*snapshot);
         assert_eq!(transfers.load(Ordering::Relaxed), 1);
 
         let refreshed = source
@@ -1820,6 +1966,60 @@ mod tests {
             CatalogError::Denied {
                 backend: BACKEND,
                 message: "upstream answered HTTP 403".to_owned(),
+            }
+        );
+    }
+
+    /// A configured mirror is not a trusted one: an endless or merely enormous
+    /// body has to cost a refused refresh, not the process.
+    #[tokio::test]
+    async fn an_oversized_payload_is_refused_rather_than_held() {
+        let ceiling = IDENTITY.len() - 1;
+        let (adapter, transfers) = upstream(IDENTITY).await;
+        let source = ModelsDevSource::new(adapter, HttpFetch::new().holding_at_most(ceiling));
+
+        let error = source
+            .refresh(None)
+            .await
+            .expect_err("an oversized payload");
+        assert_eq!(
+            error,
+            CatalogError::Unavailable {
+                backend: BACKEND,
+                message: format!("payload exceeds the {ceiling}-byte ceiling"),
+            }
+        );
+        assert_eq!(
+            transfers.load(Ordering::Relaxed),
+            1,
+            "the body was served; the point is that it was not kept"
+        );
+
+        // And a fetch that ignores the ceiling it was given cannot make the
+        // source unbounded: what it hands back is measured too.
+        struct Unbounded;
+
+        #[async_trait]
+        impl CatalogFetch for Unbounded {
+            async fn get(
+                &self,
+                _url: &str,
+                _validators: Option<&SourceValidators>,
+            ) -> Result<FetchResponse, FetchError> {
+                Ok(FetchResponse::Payload {
+                    bytes: IDENTITY.as_bytes().to_vec(),
+                    validators: SourceValidators::default(),
+                })
+            }
+        }
+
+        let source = ModelsDevSource::new(ModelsDevAdapter::default(), Unbounded)
+            .with_payload_limit(ceiling);
+        assert_eq!(
+            source.refresh(None).await.expect_err("too large to parse"),
+            CatalogError::Unavailable {
+                backend: BACKEND,
+                message: format!("payload exceeds the {ceiling}-byte ceiling"),
             }
         );
     }

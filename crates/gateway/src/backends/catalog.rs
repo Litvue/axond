@@ -53,7 +53,9 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 
 use super::{BackendFailure, BackendKind, Capabilities, FailureCategory};
-use crate::desired_state::{BlobKind, BlobRef, Canonical, CanonicalValue, Checksum};
+use crate::desired_state::{
+    BlobKind, BlobRef, Canonical, CanonicalError, CanonicalValue, Checksum,
+};
 
 /// The sources a deployment may select for catalogue metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
@@ -175,8 +177,12 @@ pub struct CatalogSnapshot {
 /// no models" — the second would silently retire every model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogRefresh {
-    Unchanged { validators: SourceValidators },
-    Updated(CatalogSnapshot),
+    Unchanged {
+        validators: SourceValidators,
+    },
+    /// Boxed because a snapshot is a whole catalogue and `Unchanged` — the
+    /// common answer — is two optional header values.
+    Updated(Box<CatalogSnapshot>),
 }
 
 /// Why a refresh failed.
@@ -1035,6 +1041,16 @@ pub enum CatalogContentError {
     },
     #[error("the payload describes no models")]
     Empty,
+    /// Text a canonical form cannot hold, so the content has no identity.
+    ///
+    /// A rejection rather than a panic: upstream free text is upstream's to
+    /// choose, and a stray control character must cost an import, not the task
+    /// running it.
+    #[error("the catalogue has no canonical form: {source}")]
+    Uncanonicalizable {
+        #[source]
+        source: CanonicalError,
+    },
 }
 
 /// A normalized catalogue: providers, and models with their offerings.
@@ -1048,6 +1064,10 @@ pub enum CatalogContentError {
 pub struct CatalogContent {
     providers: Vec<CatalogProvider>,
     models: Vec<CatalogModelEntry>,
+    /// Computed once, at construction, because that is the only place the
+    /// canonical form can fail: a value in hand therefore has an identity, and
+    /// asking for it cannot fail.
+    content_id: CatalogContentId,
 }
 
 impl CatalogContent {
@@ -1102,7 +1122,16 @@ impl CatalogContent {
                 }
             }
         }
-        Ok(Self { providers, models })
+        let content_id = CatalogContentId(
+            canonical_content(&providers, &models)
+                .checksum()
+                .map_err(|source| CatalogContentError::Uncanonicalizable { source })?,
+        );
+        Ok(Self {
+            providers,
+            models,
+            content_id,
+        })
     }
 
     pub fn providers(&self) -> &[CatalogProvider] {
@@ -1134,11 +1163,8 @@ impl CatalogContent {
     ///
     /// Over the content only: no URL, no fetch time, no validators, so identical
     /// catalogue data imported twice is one identity.
-    pub fn content_id(&self) -> CatalogContentId {
-        CatalogContentId(
-            self.checksum()
-                .expect("normalized catalogue content is canonicalizable"),
-        )
+    pub const fn content_id(&self) -> CatalogContentId {
+        self.content_id
     }
 
     /// The semantic change from `previous` to `self`.
@@ -1149,17 +1175,28 @@ impl CatalogContent {
 
 impl Canonical for CatalogContent {
     fn canonical(&self) -> CanonicalValue {
-        CanonicalValue::map([
-            (
-                "providers",
-                CanonicalValue::List(self.providers.iter().map(Canonical::canonical).collect()),
-            ),
-            (
-                "models",
-                CanonicalValue::List(self.models.iter().map(Canonical::canonical).collect()),
-            ),
-        ])
+        canonical_content(&self.providers, &self.models)
     }
+}
+
+/// The canonical form of a catalogue's parts.
+///
+/// A free function so [`CatalogContent::new`] can canonicalize before it has a
+/// `CatalogContent` to ask.
+fn canonical_content(
+    providers: &[CatalogProvider],
+    models: &[CatalogModelEntry],
+) -> CanonicalValue {
+    CanonicalValue::map([
+        (
+            "providers",
+            CanonicalValue::List(providers.iter().map(Canonical::canonical).collect()),
+        ),
+        (
+            "models",
+            CanonicalValue::List(models.iter().map(Canonical::canonical).collect()),
+        ),
+    ])
 }
 
 fn first_duplicate<'a, T: PartialEq>(values: impl Iterator<Item = &'a T> + 'a) -> Option<&'a T> {

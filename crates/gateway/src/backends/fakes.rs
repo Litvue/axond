@@ -432,9 +432,9 @@ impl CatalogSource for InMemoryCatalog {
             self.validators.clone(),
             SystemTime::UNIX_EPOCH,
         );
-        Ok(CatalogRefresh::Updated(CatalogSnapshot {
+        Ok(CatalogRefresh::Updated(Box::new(CatalogSnapshot {
             source,
             content: self.content.clone(),
-        }))
+        })))
     }
 }
