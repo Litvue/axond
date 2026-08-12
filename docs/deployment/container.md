@@ -46,9 +46,13 @@ The version and short-SHA tags resolve to the multi-architecture index, so the
 digest they name deploys unchanged on both architectures — pin that index digest
 rather than a per-architecture one unless a platform must be forced. When it
 must, `:<version>-amd64` and `:<version>-arm64` name the single-platform images
-directly, and each carries its own signature, provenance, and SBOM attestation.
-Both architectures are booted and probed in the release pipeline, natively, from
-the index digest that ships.
+directly. Both architectures are booted and probed in the release pipeline,
+natively, from the index digest that ships.
+
+The index digest carries a keyless signature and a provenance attestation. SBOM
+attestations live on the single-platform children, one per architecture, because
+that is where the packages actually are; resolve the child digest for your
+platform to verify the SBOM of what you run.
 
 ## Health and dependency semantics
 

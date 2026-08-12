@@ -567,6 +567,11 @@ jobs:
       - uses: sigstore/cosign-installer@v3
       - name: Sign the index digest keylessly
         run: cosign sign --yes "${IMAGE_NAME}@${{ steps.index.outputs.digest }}"
+      # Provenance, signature, and platform assertions apply to the index; SBOM
+      # attestations deliberately stay on the per-architecture children, since an
+      # index has no filesystem and an "index SBOM" would be one child's document
+      # under a subject it does not describe. docs/compatibility.md documents
+      # where to fetch the SBOM of the child you actually run.
       - name: Attest index provenance
         uses: actions/attest@v4
         with:

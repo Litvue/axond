@@ -107,8 +107,11 @@ Tier 0 gate, and each single-platform image is smoke-tested before it is signed.
 The two signed, attested child images are then joined — by digest, not rebuilt —
 into an OCI index that the existing `<version>` and `sha-<short>` tags point at,
 so a digest-pinned deployment resolves on either architecture. The index digest
-is itself signed and attested, and it is what `axond-image-<version>.digest`
-names on the release. Single-platform references remain first-class as
+is itself signed and carries a provenance attestation, and it is what
+`axond-image-<version>.digest` names on the release. SBOM attestations stay on
+the per-architecture children, where the packages are: an index has no
+filesystem, so an "index SBOM" could only be one child's document under a
+subject it does not describe. Single-platform references remain first-class as
 `<version>-<arch>` and `sha-<short>-<arch>`; per-architecture SBOM and digest
 assets are attached per architecture, since their contents genuinely differ.
 Still no `latest` tag.

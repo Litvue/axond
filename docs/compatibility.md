@@ -100,11 +100,19 @@ available as `:<version>-amd64` and `:<version>-arm64`. There is no `latest`
 tag, and adding one is not planned.
 
 Every archive carries a SHA-256 sidecar, an SPDX SBOM, and provenance/SBOM
-attestations; every published image manifest — each single-platform image and
-the index — is smoke-tested on its own architecture, signed keylessly, and
-attested. Archive signing is deliberately not part of this: archives are
-verified through their checksum and GitHub attestations, and keyless signatures
-are an image-only mechanism here.
+attestations. Every published image manifest — each single-platform image and
+the multi-architecture index — is smoke-tested on its own architecture, signed
+keylessly, and carries a provenance attestation.
+
+SBOM attestations are per-architecture, on the single-platform children: an
+index has no filesystem of its own, so its SBOM would only ever be one child's
+relabelled. To audit what you run, resolve the child digest for your platform
+from the index and verify that digest's SBOM attestation, or use the
+per-architecture SPDX asset on the release.
+
+Archive signing is deliberately not part of this: archives are verified through
+their checksum and GitHub attestations, and keyless signatures are an image-only
+mechanism here.
 
 Dropping a supported platform is a minor-release, changelog-listed act under the
 same rules as the config surface below.

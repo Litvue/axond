@@ -75,15 +75,47 @@ case "$index_media_type" in
     ;;
 esac
 
-# Attestation manifests are carried as extra children by some builders; only
-# real platform children are compared, and an unknown platform is refused.
-actual="$(
-  jq -r '.manifests[]
-         | select((.platform.os // "unknown") != "unknown")
-         | select((.platform.architecture // "unknown") != "unknown")
-         | "\(.platform.os)/\(.platform.architecture)=\(.digest)"' <<<"$index" |
-    sort
-)"
+# Every descriptor is classified, and anything that is neither an expected
+# platform child nor an attestation manifest attached to one is a failure. A
+# silent skip here would let an unrelated or unattested manifest ride along
+# inside the reference operators deploy.
+platform_children=()
+while IFS= read -r descriptor; do
+  [[ -n "$descriptor" ]] || continue
+  digest="$(jq -r '.digest' <<<"$descriptor")"
+  os="$(jq -r '.platform.os // ""' <<<"$descriptor")"
+  architecture="$(jq -r '.platform.architecture // ""' <<<"$descriptor")"
+  if [[ "$os" == unknown || "$architecture" == unknown || -z "$os" || -z "$architecture" ]]; then
+    # Buildx marks attestation manifests with the unknown/unknown platform and
+    # names the manifest they describe. Accept exactly that, referring to a
+    # child this script itself resolved.
+    reference_type="$(
+      jq -r '.annotations["vnd.docker.reference.type"] // ""' <<<"$descriptor"
+    )"
+    referenced="$(
+      jq -r '.annotations["vnd.docker.reference.digest"] // ""' <<<"$descriptor"
+    )"
+    if [[ "$reference_type" != attestation-manifest ]]; then
+      echo "index descriptor $digest has no platform and is not an attestation manifest" >&2
+      exit 1
+    fi
+    matched=0
+    for platform in "${PLATFORMS[@]}"; do
+      if [[ "${child_digests[$platform]}" == "$referenced" ]]; then
+        matched=1
+      fi
+    done
+    if [[ "$matched" != 1 ]]; then
+      echo "index attestation $digest describes ${referenced:-nothing}, which is not a release child" >&2
+      exit 1
+    fi
+    echo "attestation descriptor $digest for $referenced"
+    continue
+  fi
+  platform_children+=("$os/$architecture=$digest")
+done < <(jq -c '.manifests[]' <<<"$index")
+
+actual="$(printf '%s\n' ${platform_children[@]+"${platform_children[@]}"} | sort)"
 expected="$(
   for platform in "${PLATFORMS[@]}"; do
     printf '%s=%s\n' "$platform" "${child_digests[$platform]}"

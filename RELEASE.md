@@ -11,7 +11,7 @@ evidence and known limitations; the reusable process lives in the
 | Required routes, failover, credential pools, identity, controls, telemetry, and durable usage are implemented | Met | Compatibility contract, ADRs, unit/integration tests, SDK compatibility, stateful tests, Tier 0 gate, and stream soak. |
 | Public source repository | Met | `https://github.com/Litvue/axond`. |
 | Cross-platform release archives | Met | The [latest GitHub release](https://github.com/Litvue/axond/releases/latest) contains Linux x86-64 and ARM64 GNU/musl, Apple Silicon macOS, and Windows archives, checksums, SBOMs, and provenance. |
-| Public OCI image | Met | The versioned `ghcr.io/litvue/axond` image for each release is public, published as a `linux/amd64` + `linux/arm64` index, smoke-tested per architecture, signed keylessly, and carries provenance/SBOM attestations. |
+| Public OCI image | Met | The versioned `ghcr.io/litvue/axond` image for each release is public, published as a `linux/amd64` + `linux/arm64` index, smoke-tested per architecture, signed keylessly, and attested: provenance on every manifest including the index, SBOM on the per-architecture children. |
 | crates.io workspace | Met | [`gateway-core`](https://crates.io/crates/gateway-core), [`gateway-transport`](https://crates.io/crates/gateway-transport), and [`axond`](https://crates.io/crates/axond) are published in dependency order. |
 | Deployment/configuration/operator documentation | Met | Task-oriented documentation index, executable examples, references, and runbooks under `docs/`. |
 

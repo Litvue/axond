@@ -160,6 +160,17 @@ def check_image_matrix(text: str) -> list[str]:
             "ops/publish-image-index.sh: PLATFORMS "
             f"{sorted(declared.group(1).split())} does not match {sorted(IMAGE_PLATFORMS)}"
         )
+    # Descriptors without a platform must be classified, not skipped: an ignored
+    # descriptor is an unreviewed manifest inside the deployed reference.
+    for label, needle in {
+        "attestation descriptors": "attestation-manifest",
+        "rejection of unclassified descriptors": "is not an attestation manifest",
+        "attestation subject check": "vnd.docker.reference.digest",
+    }.items():
+        if needle not in script:
+            failures.append(
+                f"ops/publish-image-index.sh: no explicit handling of {label} ({needle!r})"
+            )
     return failures
 
 
@@ -201,6 +212,23 @@ def check_image_gates(text: str) -> list[str]:
     if "docker image inspect" not in smoke:
         failures.append(
             "release-please.yml: release-image-index-smoke does not assert the resolved architecture"
+        )
+    # SBOM attestations are per-architecture by decision (ADR 0004): an index has
+    # no filesystem, so an index SBOM would be a child's document under a subject
+    # it does not describe. Publishing one anyway is allowed, but only together
+    # with the documentation that tells operators where SBOMs live.
+    if "anchore/sbom-action" in index:
+        compatibility = (ROOT / "docs/compatibility.md").read_text(encoding="utf-8")
+        if "SBOM attestations are per-architecture" in compatibility:
+            failures.append(
+                "release-please.yml: release-image-index now generates an SBOM, but "
+                "docs/compatibility.md and ADR 0004 still say SBOMs are "
+                "per-architecture only; update both together"
+            )
+    elif any(claim in index for claim in ("Attest index SBOM", "SBOM_PATH", ".spdx.json")):
+        failures.append(
+            "release-please.yml: release-image-index attests or names an SBOM it "
+            "does not generate; the index carries signature and provenance only"
         )
     return failures
 

@@ -17,9 +17,11 @@ pipeline.
 6. Generate image SBOM/provenance attestations, sign the digest keylessly, and
    verify signature plus attestations, per architecture.
 7. Join the signed child digests into the multi-architecture index that
-   `<version>` and `sha-<short>` point at, assert it contains exactly the
-   supported platforms, sign and attest the index digest, and attach it to the
-   release as `axond-image-<version>.digest`.
+   `<version>` and `sha-<short>` point at, assert every descriptor in it is a
+   supported platform child (or an attestation manifest for one), sign the index
+   digest, attest its provenance, and attach it to the release as
+   `axond-image-<version>.digest`. SBOM attestations and SPDX assets stay
+   per-architecture, on the children.
 8. Pull that index digest on each architecture and smoke it natively.
 9. Require every artifact lane.
 10. Publish `gateway-core`, `gateway-transport`, then `axond` to crates.io.

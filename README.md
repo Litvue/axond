@@ -25,7 +25,7 @@ aliases, failover, usage metering, budgets, rate limits, and telemetry.
 | Inbound identity | Required static gateway keys, scoped minted tokens, optional in-gateway minting, issuance epochs, and precise JTI revocation. |
 | Controls | Per-subject budgets, exact namespace-wide Redis/Postgres caps, and local or Redis-backed in-flight rate limits. |
 | Operations | Atomic config reload, replica-local credential status, JSON logs, OTLP traces/metrics/logs, and durable Postgres usage. |
-| Distribution | crates.io packages, signed release binaries, and a public signed and attested OCI image. |
+| Distribution | crates.io packages, checksummed and attested release binaries, and public keyless-signed, attested OCI images. |
 
 Axond is passthrough-first: it rewrites only `model`, then forwards the caller's
 native wire. It does not translate OpenAI payloads into Anthropic payloads or
@@ -110,7 +110,7 @@ AXOND_VERSION=0.3.12 # x-release-please-version
 docker pull "ghcr.io/litvue/axond:${AXOND_VERSION}"
 ```
 
-Signed prebuilt archives are published for Linux (`x86_64` and `aarch64`, GNU and
+Checksummed, attested prebuilt archives are published for Linux (`x86_64` and `aarch64`, GNU and
 static musl each), macOS (`aarch64`), and Windows (`x86_64`). The OCI image is a
 multi-architecture index covering `linux/amd64` and `linux/arm64`. Production
 deployments should verify the attestations and pin an image digest. See
@@ -188,8 +188,11 @@ start until the control-plane implementation is available.
 - At least one static gateway key is mandatory as a breakglass path even when
   minted-token verification is enabled.
 - Configuration and dependencies are validated before the listener binds.
-- Release binaries and the OCI image carry provenance and SBOM attestations;
-  the image is signed keylessly and verified in the release workflow.
+- Release binaries carry checksums plus provenance and SBOM attestations; the
+  per-architecture images add SBOM attestations, and every published manifest
+  (children and the multi-architecture index) is signed keylessly, attested for
+  provenance, and verified in the release workflow. Archives are not
+  cosign-signed.
 
 Read the [deployment security model](./docs/security/deployment-model.md),
 [minted-token guide](./docs/minted-token-guide.md), and latest

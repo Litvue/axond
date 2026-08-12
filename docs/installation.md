@@ -154,8 +154,19 @@ gh attestation verify "oci://ghcr.io/litvue/axond@${digest}" \
   --predicate-type https://slsa.dev/provenance/v1
 ```
 
-The same commands verify a single-platform child digest, which carries its own
-signature, provenance, and SBOM attestation.
+Those two commands cover the index digest: it is signed and carries provenance.
+SBOM attestations are on the single-platform children, so to verify the SBOM of
+what you actually run, resolve your platform's child digest and verify that:
+
+```bash
+child="$(docker buildx imagetools inspect "ghcr.io/litvue/axond@${digest}" \
+  --format '{{json .Manifest}}' |
+  jq -r '.manifests[] | select(.platform.architecture == "arm64") | .digest')"
+
+gh attestation verify "oci://ghcr.io/litvue/axond@${child}" \
+  --repo Litvue/axond \
+  --predicate-type https://spdx.dev/Document/v2.3
+```
 
 Deploy `ghcr.io/litvue/axond@${digest}`, not a mutable tag. The release page
 carries `axond-image-<version>.digest` (the index), the per-architecture
