@@ -642,6 +642,13 @@ pub trait UsageJournal: Send + Sync {
     /// between the destination write and the acknowledgement must be recoverable
     /// by repeating the acknowledgement.
     ///
+    /// A consumer is registered by [`claim`](Self::claim), and nothing else: an
+    /// acknowledgement from a consumer that never claimed is
+    /// [`JournalError::NotOutstanding`] and must not create delivery state for it.
+    /// Since only an event *every* registered consumer has finished with is
+    /// prunable, a consumer conjured up by one stray acknowledgement would hold
+    /// retention open forever.
+    ///
     /// The recovery ack is honoured even if the lease expired and the event was
     /// redelivered meanwhile: the attempt number in the delivery id is not part of
     /// the condition. A store must therefore *not* gate its `UPDATE` on the lease

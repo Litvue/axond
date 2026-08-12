@@ -627,6 +627,47 @@ async fn a_full_journal_refuses_the_append_and_says_what_it_is_bounded_by() {
     assert!(stats.oldest_pending_age.is_some());
 }
 
+/// A verdict from a consumer that never read the journal must not register it.
+/// Retention waits on *every* registered consumer, so one phantom registration
+/// would freeze pruning permanently — the journal would then grow until capacity
+/// refused appends, for a consumer that never existed.
+#[tokio::test]
+async fn a_stray_verdict_does_not_register_the_consumer_that_sent_it() {
+    let journal = InMemoryUsageJournal::with_capacity(Capacity {
+        retain_acknowledged: Duration::ZERO,
+        ..Capacity::BILLING_GRADE
+    });
+    let billing = consumer("billing");
+    journal.append(&event()).await.expect("append");
+    let claimed = journal.claim(&billing, claim(1)).await.expect("claim");
+
+    // A mistyped consumer name, or a worker pointed at the wrong journal.
+    let stray = DeliveryId {
+        consumer: consumer("typo"),
+        ..claimed[0].id.clone()
+    };
+    for error in [
+        journal.ack(&stray).await.expect_err("never claimed"),
+        journal
+            .quarantine(&stray, PoisonReason::Malformed)
+            .await
+            .expect_err("never claimed"),
+    ] {
+        assert!(
+            matches!(&error, JournalError::NotOutstanding { delivery } if delivery == &stray),
+            "{error:?}"
+        );
+    }
+
+    journal.ack(&claimed[0].id).await.expect("ack");
+    journal.append(&event_for("other")).await.expect("append");
+    assert_eq!(
+        journal.stored_events(),
+        1,
+        "retention still prunes: the stray verdict registered nothing to wait for"
+    );
+}
+
 /// Quarantine is exempt from dropping and pruning, so it has to be inside the
 /// capacity bound — otherwise a destination that rejects everything (a schema
 /// mismatch, say) would quietly grow the store without limit, which is the failure

@@ -12,6 +12,9 @@
 //!   re-appending identical content recognises the existing row
 //!   ([`Appended::AlreadyPresent`]) and re-appending different content under the
 //!   same key is refused ([`JournalError::Conflict`]) rather than updating it.
+//! - **A consumer is registered by claiming.** Nothing else creates its delivery
+//!   state, so a stray acknowledgement from a consumer that never read the journal
+//!   cannot add a row that retention then waits on forever.
 //! - **Delivery state is per consumer, and durable.** Acknowledgements,
 //!   quarantines, and attempt counts survive a restart; that is what makes a
 //!   crash between a destination write and an acknowledgement recoverable by
@@ -358,10 +361,15 @@ impl UsageJournal for InMemoryUsageJournal {
                 delivery: delivery.clone(),
             });
         };
-        let state = storage
-            .consumers
-            .entry(delivery.consumer.clone())
-            .or_default();
+        // Read-only: a consumer is registered by claiming, not by talking about a
+        // delivery. Creating its row here would let one spurious acknowledgement
+        // register a phantom consumer, and since only an event *every* registered
+        // consumer acked is prunable, that phantom would freeze retention for good.
+        let Some(state) = storage.consumers.get_mut(&delivery.consumer) else {
+            return Err(JournalError::NotOutstanding {
+                delivery: delivery.clone(),
+            });
+        };
         // Idempotent, and deliberately not conditional on the attempt number: a
         // consumer that crashed after writing its destination row repeats the
         // acknowledgement, and a store that insisted on the attempt it last
@@ -403,10 +411,13 @@ impl UsageJournal for InMemoryUsageJournal {
                 delivery: delivery.clone(),
             });
         };
-        let state = storage
-            .consumers
-            .entry(delivery.consumer.clone())
-            .or_default();
+        // Read-only for the same reason as [`ack`]: a verdict from a consumer that
+        // never claimed anything must not register it.
+        let Some(state) = storage.consumers.get_mut(&delivery.consumer) else {
+            return Err(JournalError::NotOutstanding {
+                delivery: delivery.clone(),
+            });
+        };
         // Idempotent, and gated on the same "was it ever handed out?" test as
         // `ack`: quarantining is a verdict on a delivery this consumer attempted,
         // not a way to remove an event it never saw.
