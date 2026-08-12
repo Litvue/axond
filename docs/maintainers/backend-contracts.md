@@ -135,6 +135,50 @@ mutation. `CatalogRefresh::Unchanged` is a first-class answer so "the upstream
 has nothing new" cannot be confused with "the upstream now lists no models",
 which would retire every model.
 
+## The desired-state domain the control plane stores
+
+`ControlPlaneStore` is expressed in `crates/gateway/src/desired_state/`, which
+holds the domain itself: what a revision *is*, independent of any database. No
+SQL type, connection, or Postgres representation appears in it, because #165
+(schema and transactions), #166 (hydration), and #142 (runtime publication) all
+have to agree on the same rules, and rules half-expressed in DDL cannot be
+shared by a second store or a test double.
+
+| Module | Answers |
+| --- | --- |
+| `ids` | who is who: UUIDv7 typed ids per entity, with `Slug` names kept separate from identity |
+| `canonical` | what state hashes to: one versioned encoding, deterministic bytes, SHA-256 |
+| `resource` | what a resource is: a generic envelope, versioned references, content-addressed blobs |
+| `mutation` | who changed it, under what expectation, and what the audit trail records |
+| `revision` | the complete state, the candidate proposing it, the manifest recording it, and the integrity checks a replica verifies |
+
+Three properties the rest depends on:
+
+- **Identity is not a name.** A rename changes a `Slug`; ids, manifests, audit
+  rows, and references are untouched. Ids are typed per entity, so a `TenantId`
+  cannot stand in for a `ProjectId` even though both are 16 bytes, and their text
+  forms carry distinct prefixes (`ten_`, `prj_`, `res_`, `rev_`, `mut_`, `aud_`).
+- **Revisions are immutable and complete.** Publishing creates new resource
+  versions and a new `RevisionManifest`; nothing is edited in place. A revision
+  names the whole desired state rather than a diff, so hydration is one load and
+  rollback is republication rather than reverse-application. Large immutable
+  payloads — a catalogue snapshot — are `BlobRef`s addressed by their SHA-256
+  digest, so revisions share one copy instead of duplicating it per manifest.
+- **State has exactly one canonical form.** `SerializerVersion` is written into
+  the bytes, integers are width- and sign-normalized, floating point has no
+  representation at all, and set-like collections are sorted while
+  order-significant lists are preserved. Two replicas, two releases, and two
+  backends therefore compute the same `Checksum` for the same state, which is
+  what makes a checksum comparison a decision rather than a hint.
+
+`LoadedRevision::assemble` is the seam #142 consumes: a manifest and a state are
+only paired after the whole-state checksum, every resource's content checksum,
+the serializer version, and the blob declarations agree — so a truncated,
+partially written, or tampered revision fails to load instead of being published
+to the runtime. `desired_state::oracle` is the test-only in-memory
+`ControlPlaneStore` that states these behaviours executably; like the other
+fakes, it is not a selectable backend.
+
 ## What is not here yet
 
 These are contracts. Nothing in `backends` is constructed by `serve`, so the
@@ -144,9 +188,5 @@ in-memory fakes (`backends::fakes`), which keeps the Tier 0 hermetic gate
 hermetic and is why a fake is test-only — an in-memory control plane is not a
 selectable backend.
 
-The desired-state domain (UUIDv7 typed ids, tenant-scoped slug rules, canonical
-serialization and checksums, resource envelopes, content-addressed blobs) is
-defined separately, and the types in `control_plane` are thin placeholders it
-refines: a manifest carries resource references and an opaque checksum, and the
-store never interprets either. The durable Postgres implementation and revision
-reconciliation follow after that.
+The durable Postgres implementation, deterministic hydration, and revision
+reconciliation follow.
