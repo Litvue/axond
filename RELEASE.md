@@ -74,8 +74,15 @@ The required CI aggregate covers:
 - dependency and license policy;
 - crates.io package/publish dry runs;
 - static musl build and hermetic Tier 0 boot;
+- a boot-and-serve smoke of every released binary target, on a runner of that
+  target's own platform;
 - Docker image and Compose quickstart smoke tests.
 
 Release jobs add archive/image SBOMs, provenance attestations, cosign signing,
-native per-architecture archive and published-image smoke, multi-architecture
-index platform assertions, and crates.io upload.
+native per-architecture archive smoke — the same binary smoke against the exact
+archived binary, on a runner of that archive's own platform — published-image
+smoke, multi-architecture index platform assertions, and crates.io upload.
+Repairing an existing tag runs those gates against that tag's artifacts; which
+paths the tag must contain, and how to repair a tag that predates one of them,
+are in the
+[runbook](./docs/maintainers/releasing.md#repair-an-existing-tag).

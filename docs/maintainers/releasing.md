@@ -103,29 +103,60 @@ with the existing tag as `release_tag`. The reviewed workflow definition comes
 from `main`, while every artifact lane checks out and verifies the immutable
 tag.
 
-The preflight requires the tag's `Dockerfile`, `ops/docker-smoke.sh`,
-`ops/publish-image-index.sh`, and `ops/verify-image-evidence.sh`: the image lanes
-publish a multi-architecture index and verify its evidence, and neither can be
-done with a tag that does not carry those scripts. So a tag cut before ARM support
-cannot be repaired through this dispatch path — dispatch the workflow **from that
-tag** instead, where its own definition and scripts are used. The preflight
-failure prints that remediation itself, so it does not depend on this page being
-read first, and it is a refusal rather than a partial release: nothing is
-published for a tag whose tree cannot produce and verify the index.
-
-Every tag published before ARM support is in that position, so call it out in the
-release notes for the release that introduces it — a maintainer with
-`--ref main -f release_tag=<older-tag>` in their shell history needs to learn the
-new form from the changelog, not from a failed dispatch. crates.io
-publication is enabled only if the tag also contains `ops/publish-crates.sh`;
-older tags skip that lane explicitly.
-
 ```bash
 gh workflow run .github/workflows/release-please.yml \
   --repo Litvue/axond --ref main -f release_tag=<existing-tag>
 ```
 
-Do not retag or publish artifacts from a mutated checkout.
+### What a repair from `main` requires of the tag
+
+Repairing from `main` mixes two refs on purpose — the workflow definition from
+`main`, the artifacts from the tag — so it only works where the tag can satisfy
+the definition. Every artifact lane runs *the tag's own copy* of the scripts it
+invokes, so the preflight refuses up front, naming the path, rather than failing
+several minutes later inside a lane:
+
+| Path required at the tag | Why | Missing at the tag |
+| --- | --- | --- |
+| `Dockerfile`, `ops/docker-smoke.sh` | the image lane builds and smokes the published image from the tag | the dispatch fails in the preflight |
+| `ops/binary-smoke.py` | each binary lane boots the binary it archived, before attestation, signing, and upload | the dispatch fails in the preflight |
+| `ops/publish-image-index.sh`, `ops/verify-image-evidence.sh` | the image lanes assemble the multi-architecture index from the per-platform child digests and verify the evidence attached to both | the dispatch fails in the preflight |
+| `ops/publish-crates.sh` | crates.io upload | the crates lane is skipped explicitly and the rest of the repair proceeds |
+
+The difference in the last row is deliberate: a skipped optional lane leaves the
+release incomplete but every published artifact still gated, while skipping a
+boot gate would attest and attach binaries nobody started — the property the
+`binary-smoke` lanes exist to hold. A gate is not allowed to degrade quietly.
+
+### Repairing a tag that predates a required path
+
+A tag cut before `ops/binary-smoke.py` or the multi-architecture index scripts
+landed cannot be repaired from `main`. Every tag published before ARM support is
+in that position, so call it out in the release notes for the release that
+introduces it: a maintainer with `--ref main -f release_tag=<older-tag>` in their
+shell history should learn the new form from the changelog rather than from a
+failed dispatch. The preflight failure also prints the remediation itself, so it
+does not depend on this page being read first.
+
+Dispatch the same workflow from the tag instead — the preflight's required-path
+check runs only for `refs/heads/main`, and a tag ref runs that tag's own
+definition and its own gates, which is the only self-consistent way to rebuild an
+older release:
+
+```bash
+gh workflow run .github/workflows/release-please.yml \
+  --repo Litvue/axond --ref refs/tags/<existing-tag> \
+  -f release_tag=<existing-tag>
+```
+
+The dispatch is rejected from any other ref, and when dispatched from a tag ref
+the preflight also verifies that the ref's commit is the tag's commit.
+
+If the repair needs the *fix* on `main` — a workflow bug that the tag's own
+definition still has — the answer is a new patch release, not a mixed-ref
+dispatch: cut a release from `main` so the artifacts and the definition that
+produced them are the same reviewed tree. Do not retag, and do not publish
+artifacts from a mutated checkout.
 
 ## Partial crates.io failure
 

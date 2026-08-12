@@ -274,7 +274,9 @@ change, not an implementation detail.
 ## 6. Actions, release permissions, attestations, and signing
 
 **Fires on** any change under `.github/workflows/`, to `ops/publish-crates.sh`,
-`ops/docker-smoke.sh`, `ops/msrv-gate.sh`, `ops/api-compat.py`, `install.sh`,
+`ops/docker-smoke.sh`, `ops/binary-smoke.py`, `ops/tier0-gate.sh`,
+`ops/publish-image-index.sh`, `ops/verify-image-evidence.sh`,
+`ops/msrv-gate.sh`, `ops/api-compat.py`, `install.sh`,
 `install.ps1`, the `Dockerfile`, or `deny.toml`; a new workflow, job permission,
 secret, or environment; a new or bumped third-party action; and any change to
 what is attested, signed, or verified.
@@ -284,7 +286,13 @@ per job only, no long-lived registry or signing secret (GHCR login uses
 `github.token`; signing is keyless through the job's OIDC identity), the
 narrowly anchored `SIGNER_IDENTITY`, `cosign verify` plus
 `gh attestation verify` after signing, and signing only after
-`ops/docker-smoke.sh` has exercised the published image. Section 7 of the
+`ops/docker-smoke.sh` has exercised the published image, and attesting a binary
+only after `ops/binary-smoke.py` has booted the exact archived file. The
+multi-architecture index inherits the same order: `ops/publish-image-index.sh`
+assembles it from child digests that were each smoked and signed already and
+asserts it carries exactly the supported platforms, then it is signed, and
+`ops/verify-image-evidence.sh` re-verifies the signature and provenance of both
+the children and the index afterwards. Section 7 of the
 [security review](../security-review-2026-08-05.md) states that posture; a PR
 that changes any part of it says which part and why. A new job that needs
 `id-token: write`, `packages: write`, or attestation scopes justifies the scope
@@ -294,9 +302,13 @@ input is an ADR-level decision, not a workflow tweak.
 **Regression tests.** The release path is exercised on every change rather than
 at the tag: `publish-dry-run` packages each crate from its own tarball in
 dependency order, `docker-smoke` and `quickstart-smoke` boot what is shipped,
-`static-binary` proves the musl build and runs `ops/tier0-gate.sh`, the `docs`
+`static-binary` proves the musl build and runs `ops/tier0-gate.sh`, the
+`binary-smoke` lanes boot and serve every released target on a runner of its own
+platform and the release lanes repeat that against the archived binary, the `docs`
 lane drives both installers in dry-run with `AXOND_REQUIRE_ATTESTATION` — including
 a deliberately wrong `AXOND_REPOSITORY` and an invalid setting that must fail —
+and `ops/check-installer-download.sh` holds the installer's failure diagnostics
+apart, so a transport failure is never reported as a missing release asset —
 `dependency-policy` runs `cargo deny` with no ignore entries, and `api-compat`
 and `msrv` hold the published surface and the floor. Keep the installer
 verification paths covered: an installer that can be made to skip attestation

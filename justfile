@@ -25,6 +25,7 @@ docs:
 # Validate documentation links, release markers, route coverage, the release
 # artifact matrix, and Compose variants.
 docs-check:
+    python3 ops/check-docs.py --self-test
     python3 ops/check-docs.py
     python3 ops/check-release-config.py
     sh -n install.sh
@@ -92,6 +93,11 @@ build-static:
 tier0:
     cargo build --release --target x86_64-unknown-linux-musl -p axond
     ops/tier0-gate.sh target/x86_64-unknown-linux-musl/release/axond
+
+# Boot a release binary and prove it serves, the way CI does for every released
+# target. Defaults to $AXOND_BIN, then a release build, then a debug build.
+binary-smoke *binary:
+    python3 ops/binary-smoke.py {{ binary }}
 
 # Build the distroless container image.
 docker:

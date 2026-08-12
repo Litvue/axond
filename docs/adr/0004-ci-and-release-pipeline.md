@@ -33,8 +33,9 @@ lockfile sync re-bases onto the remote branch tip with a bounded retry instead
 of force-pushing.
 
 **CI is one job per concern** (`fmt`, `clippy`, `build`, `tests`,
-`stateful-tests`, `docs`, `dependency-policy`, `static-binary`, `docker-smoke`,
-and `publish-dry-run` per [ADR 0025](./0025-crates-io-publication.md))
+`stateful-tests`, `docs`, `dependency-policy`, `static-binary`, `binary-smoke`,
+`docker-smoke`, and `publish-dry-run` per
+[ADR 0025](./0025-crates-io-publication.md))
 behind a single required `CI-Success` gate. The hermetic `tests` lane remains
 service-free; `stateful-tests` runs the gated Redis/Postgres tests in pinned
 service containers with `AXOND_TEST_REQUIRE_SERVICES=1`, so a missing service
@@ -43,12 +44,20 @@ are `--locked`; the toolchain is pinned to the `rust-toolchain.toml` channel.
 The `static-binary` lane asserts the musl build is actually static (accepting
 `static-pie linked`, the modern musl default, as well as `statically linked`),
 and `docker-smoke` boots the image against the example config and probes
-`/healthz` + `/v1/models`.
+`/healthz` + `/v1/models`. `binary-smoke` runs one job per released target on a
+runner of that target's own platform, so no published binary reaches a user
+without having been booted: `ops/binary-smoke.py` is the portable subset of the
+Tier 0 assertions (liveness, authenticated catalogue, typed `unknown_model`
+refusal, one fixture completion) written against the Python standard library,
+because the namespace gate the musl lane uses has no macOS or Windows
+equivalent. The release workflow runs the same script on the exact binary it
+archives, before that binary is attested and attached.
 
 **Release artifacts, per tagged commit:**
 
 - Cross-platform binaries (`x86_64` gnu + static musl Linux, `aarch64` macOS,
-  `x86_64` Windows), each with a SHA-256 checksum and an SPDX SBOM.
+  `x86_64` Windows), each smoke-booted on its own platform before it is attested,
+  and each with a SHA-256 checksum and an SPDX SBOM.
 - A single-arch OCI image at `ghcr.io/litvue/axond`, tagged by version and short
   SHA (no `latest`).
 - SLSA build provenance and SBOM **attestations** for every binary and for the

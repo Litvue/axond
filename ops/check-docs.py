@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Fast, dependency-free documentation drift checks."""
+"""Fast, dependency-free documentation drift checks.
+
+Usage:
+    ops/check-docs.py              # every drift check against the committed tree
+    ops/check-docs.py --self-test  # only the release-path gates' own regressions
+"""
 
 from __future__ import annotations
 
@@ -183,6 +188,160 @@ def check_msrv_documented() -> list[str]:
     ]
 
 
+def workflow_job_targets(workflow: str, job: str) -> list[str]:
+    text = (ROOT / ".github/workflows" / workflow).read_text(encoding="utf-8")
+    return matrix_targets(text, job)
+
+
+def matrix_targets(workflow_text: str, job: str) -> list[str]:
+    block = re.search(
+        rf"^  {re.escape(job)}:\n(.*?)(?=^  \S|\Z)",
+        workflow_text,
+        re.MULTILINE | re.DOTALL,
+    )
+    if block is None:
+        return []
+    return re.findall(r"^\s+target:\s*(\S+)\s*$", block.group(1), re.MULTILINE)
+
+
+def smoke_matrix_failures(
+    smoked: list[str], released: list[str], document: str
+) -> list[str]:
+    """The published, the booted, and the documented target sets are one set.
+
+    A published target that is only compiled is a weaker promise than one that is
+    booted and served, and the difference is invisible from the documentation
+    unless it is checked. So the release `binaries` matrix, the `binary-smoke`
+    matrix, and the platform table must name the same targets: adding a target to
+    the release without a smoke lane fails here, exactly like smoking a target
+    that is never published.
+    """
+    if not smoked:
+        return ["ci.yml: the binary-smoke matrix declares no target"]
+    if not released:
+        return ["release-please.yml: the release-binaries matrix declares no target"]
+    failures: list[str] = []
+    for target in smoked:
+        if target not in released:
+            failures.append(
+                f"ci.yml: binary-smoke covers {target!r}, which the release "
+                "binaries matrix does not publish"
+            )
+    for target in released:
+        if target not in smoked:
+            failures.append(
+                f"release-please.yml: released target {target!r} has no "
+                "binary-smoke lane in ci.yml; a published binary that is never "
+                "booted is not covered by the documented smoke matrix"
+            )
+    for target in sorted(set(smoked) | set(released)):
+        if f"`{target}`" not in document:
+            failures.append(
+                f"docs/compatibility.md: release target {target!r} is not documented"
+            )
+    if "binary-smoke" not in document:
+        failures.append(
+            "docs/compatibility.md: the platform matrix does not name the "
+            "`binary-smoke` lane that exercises it"
+        )
+    return failures
+
+
+def check_smoke_matrix() -> list[str]:
+    return smoke_matrix_failures(
+        workflow_job_targets("ci.yml", "binary-smoke"),
+        workflow_job_targets("release-please.yml", "release-binaries"),
+        (ROOT / "docs/compatibility.md").read_text(encoding="utf-8"),
+    )
+
+
+def release_script_trigger_failures(workflow_text: str, page: str) -> list[str]:
+    """Every script the release path runs is named by the trigger that owns it.
+
+    Trigger 6 is what tells a contributor that touching the release path owes a
+    review, and it can only do that if it names the scripts that path runs: a
+    script the release workflow invokes but the page omits is load-bearing for
+    what gets signed while looking like an ordinary file.
+    """
+    return [
+        f"docs/security/threat-model-review.md: {script!r} runs in the release "
+        "workflow but trigger 6 does not name it"
+        for script in sorted(set(re.findall(r"ops/[\w.-]+\.(?:py|sh)", workflow_text)))
+        if f"`{script}`" not in page
+    ]
+
+
+def check_release_script_triggers() -> list[str]:
+    return release_script_trigger_failures(
+        (ROOT / ".github/workflows/release-please.yml").read_text(encoding="utf-8"),
+        (ROOT / "docs/security/threat-model-review.md").read_text(encoding="utf-8"),
+    )
+
+
+def self_test() -> int:
+    """Prove the release-path gates fail when they should, not only pass.
+
+    The gate's whole value is that it fails; a check that only ever passes on the
+    committed tree would be indistinguishable from no check at all.
+    """
+    workflow = (
+        "jobs:\n"
+        "  binary-smoke:\n"
+        "    strategy:\n"
+        "      matrix:\n"
+        "        include:\n"
+        "          - os: ubuntu-latest\n"
+        "            target: gnu\n"
+        "          - os: macos-14\n"
+        "            target: mac\n"
+        "  other-job:\n"
+        "    steps:\n"
+        "      - run: cargo build --target not-a-matrix-entry\n"
+    )
+    assert matrix_targets(workflow, "binary-smoke") == ["gnu", "mac"]
+    assert matrix_targets(workflow, "absent-job") == []
+
+    document = "`gnu` and `mac` are released and the `binary-smoke` lane boots them"
+    assert smoke_matrix_failures(["gnu", "mac"], ["gnu", "mac"], document) == []
+
+    # A released target with no smoke lane: the finding this gate exists for.
+    unsmoked = smoke_matrix_failures(["gnu"], ["gnu", "mac"], document)
+    assert len(unsmoked) == 1, unsmoked
+    assert "released target 'mac' has no binary-smoke lane" in unsmoked[0], unsmoked
+
+    # And the converse, plus an undocumented target, still fail.
+    unpublished = smoke_matrix_failures(["gnu", "mac"], ["gnu"], document)
+    assert len(unpublished) == 1, unpublished
+    assert "does not publish" in unpublished[0], unpublished
+    undocumented = smoke_matrix_failures(["gnu"], ["gnu"], "`binary-smoke`")
+    assert undocumented == [
+        "docs/compatibility.md: release target 'gnu' is not documented"
+    ], undocumented
+    unnamed_lane = smoke_matrix_failures(["gnu"], ["gnu"], "`gnu`")
+    assert len(unnamed_lane) == 1 and "binary-smoke` lane" in unnamed_lane[0]
+
+    for empty in (
+        smoke_matrix_failures([], ["gnu"], document),
+        smoke_matrix_failures(["gnu"], [], document),
+    ):
+        assert len(empty) == 1 and "declares no target" in empty[0], empty
+
+    named = release_script_trigger_failures(
+        "run: ops/docker-smoke.sh\nrun: python ops/binary-smoke.py x\n",
+        "trigger 6 fires on `ops/docker-smoke.sh` and `ops/binary-smoke.py`",
+    )
+    assert named == [], named
+    omitted = release_script_trigger_failures(
+        "run: python ops/binary-smoke.py release-bin/axond\n",
+        "trigger 6 fires on `ops/docker-smoke.sh`",
+    )
+    assert len(omitted) == 1, omitted
+    assert "'ops/binary-smoke.py' runs in the release workflow" in omitted[0], omitted
+
+    print("check-docs: release-path gate self-test passed")
+    return 0
+
+
 def check_front_door_size() -> list[str]:
     failures: list[str] = []
     for relative, limit in (("README.md", 260), ("docs/deployment.md", 220)):
@@ -233,7 +392,14 @@ def check_review_trigger_tests() -> list[str]:
     return failures
 
 
-def main() -> int:
+def main(argv: list[str]) -> int:
+    if argv == ["--self-test"]:
+        return self_test()
+    if argv:
+        raise SystemExit(f"usage: check-docs.py [--self-test], not {' '.join(argv)}")
+    # Every run proves the gate still fails when it should, so a refactor that
+    # neuters it is caught by the same lane that relies on it.
+    self_test()
     files = markdown_files()
     failures = []
     failures.extend(check_relative_links(files))
@@ -242,6 +408,8 @@ def main() -> int:
     failures.extend(check_stale_claims(files))
     failures.extend(check_route_contract())
     failures.extend(check_msrv_documented())
+    failures.extend(check_smoke_matrix())
+    failures.extend(check_release_script_triggers())
     failures.extend(check_review_trigger_tests())
     failures.extend(check_front_door_size())
     if failures:
@@ -253,4 +421,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
