@@ -436,6 +436,12 @@ pub enum CapacityPolicy {
     /// Drop the oldest unacknowledged event to make room. Bounded storage at the
     /// cost of losing the events that were waiting longest — telemetry-grade
     /// behaviour, chosen deliberately rather than by accident.
+    ///
+    /// A quarantined event is never a drop candidate: it is evidence an operator
+    /// was asked to look at, so deleting it to make room would destroy the one
+    /// thing the quarantine was for. A journal whose entire backlog is poison
+    /// therefore behaves like [`Refuse`](Self::Refuse) — the honest answer, since
+    /// the only room left to make is somebody else's evidence.
     DropOldest,
 }
 

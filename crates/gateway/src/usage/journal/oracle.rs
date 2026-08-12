@@ -23,8 +23,8 @@
 //!   [`OrderingKey`] is in flight, so a second concurrent consumer of the same
 //!   journal cannot reorder one caller's events.
 //! - **Capacity is a decision, not an accident.** A full journal either refuses
-//!   the append or drops its oldest unacknowledged event, and the dropped count
-//!   is reported rather than inferred.
+//!   the append or drops its oldest unacknowledged event — never a quarantined
+//!   one — and the dropped count is reported rather than inferred.
 //! - **Retention is what bounds a drained journal.** An event every consumer
 //!   acknowledged is pruned once [`Capacity::retain_acknowledged`] has passed
 //!   since it was observed, so storage does not grow without limit just because
@@ -99,6 +99,15 @@ impl Storage {
             .collect()
     }
 
+    /// Whether any consumer has this position set aside as poison. Such an event
+    /// is evidence somebody was asked to look at, so it is exempt from both
+    /// retention pruning and a capacity drop.
+    fn is_quarantined(&self, position: u64) -> bool {
+        self.consumers
+            .values()
+            .any(|state| state.quarantined.contains_key(&position))
+    }
+
     /// Drop events every registered consumer has acknowledged and whose retention
     /// window has passed, measured from the event's own observation time — the
     /// `recorded_at` a store already has, so this is one `DELETE ... WHERE` and
@@ -115,11 +124,11 @@ impl Storage {
             .entries
             .iter()
             .filter(|entry| entry.event.observed_at() + retain <= now)
+            .filter(|entry| !self.is_quarantined(entry.position))
             .filter(|entry| {
-                self.consumers.values().all(|state| {
-                    state.acked.contains(&entry.position)
-                        && !state.quarantined.contains_key(&entry.position)
-                })
+                self.consumers
+                    .values()
+                    .all(|state| state.acked.contains(&entry.position))
             })
             .map(|entry| entry.position)
             .collect();
@@ -223,7 +232,21 @@ impl UsageJournal for InMemoryUsageJournal {
                     });
                 }
                 CapacityPolicy::DropOldest => {
-                    let oldest = *pending.first().expect("capacity is at least one event");
+                    // A quarantined event is not a drop candidate: it is waiting
+                    // for an operator, and deleting it to make room would destroy
+                    // the record they were asked to look at. A journal whose whole
+                    // backlog is poison therefore refuses — the honest answer, since
+                    // the only room left to make is somebody else's evidence.
+                    let Some(oldest) = pending
+                        .iter()
+                        .copied()
+                        .find(|position| !storage.is_quarantined(*position))
+                    else {
+                        return Err(JournalError::AtCapacity {
+                            pending: pending.len() as u64,
+                            capacity: self.capacity,
+                        });
+                    };
                     let dropped = storage
                         .entries
                         .iter()

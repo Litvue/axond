@@ -627,6 +627,52 @@ async fn a_full_journal_refuses_the_append_and_says_what_it_is_bounded_by() {
     assert!(stats.oldest_pending_age.is_some());
 }
 
+/// A lossy policy may drop a backlog; it may not drop the evidence an operator was
+/// asked to look at. When the only room left to make is somebody's quarantine, the
+/// journal refuses instead — the same answer `Refuse` gives, for the same reason.
+#[tokio::test]
+async fn drop_oldest_will_not_make_room_by_deleting_a_quarantined_event() {
+    let capacity = Capacity {
+        max_events: 1,
+        policy: CapacityPolicy::DropOldest,
+        ..Capacity::BILLING_GRADE
+    };
+    let journal = InMemoryUsageJournal::with_capacity(capacity);
+    let billing = consumer("billing");
+    let warehouse = consumer("warehouse");
+    let poison = event_for("acme-one");
+    journal.append(&poison).await.expect("append");
+
+    // Two consumers, disagreeing about the event: billing has condemned it, the
+    // warehouse has not finished with it, so it is still counted as a backlog.
+    let claimed = journal.claim(&billing, claim(10)).await.expect("claim");
+    journal
+        .quarantine(&claimed[0].id, PoisonReason::Malformed)
+        .await
+        .expect("quarantine");
+    journal.claim(&warehouse, claim(10)).await.expect("claim");
+
+    let error = journal
+        .append(&event_for("acme-two"))
+        .await
+        .expect_err("the only droppable event is somebody's evidence");
+    assert!(
+        matches!(&error, JournalError::AtCapacity { pending, .. } if *pending == 1),
+        "{error:?}"
+    );
+    assert_eq!(journal.stored_events(), 1);
+    assert_eq!(
+        journal.stats(&billing).await.expect("stats").quarantined,
+        1,
+        "the poison count an operator is watching must not be decremented by a drop"
+    );
+    assert_eq!(
+        journal.stats(&billing).await.expect("stats").dropped,
+        0,
+        "nothing was lost"
+    );
+}
+
 #[tokio::test]
 async fn drop_oldest_bounds_storage_and_counts_what_it_lost() {
     let capacity = Capacity {
