@@ -232,6 +232,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Documentation links, drift, routes, and deployment manifests
         run: |
+          # The smoke-matrix gate's own regressions run first: a gate that only
+          # ever passes on the committed tree proves nothing.
+          python3 ops/check-docs.py --self-test
           python3 ops/check-docs.py
           shellcheck install.sh
           unix_installer_output="$(AXOND_VERSION=0.0.0 \
@@ -340,6 +343,50 @@ jobs:
       - name: Tier-0 hermetic boot and serve
         run: ops/tier0-gate.sh target/x86_64-unknown-linux-musl/release/axond
 
+  # Every target in the release `binaries` matrix, booted and served through the
+  # portable runner on a runner of its own platform — a cross-compiled binary
+  # that never ran is not evidence that it ships working. The musl entry keeps
+  # the stronger `static-binary` gate above (kernel-enforced network denial,
+  # which has no macOS or Windows equivalent) and adds the portable assertions
+  # on top, so all four targets are judged against the same serving contract.
+  binary-smoke:
+    name: Binary smoke ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # The release profile is what ships: a debug binary would smoke different
+      # code than the archives the installer downloads.
+      - name: Build the release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p axond
+      - name: Boot the release binary and probe the serving contract
+        shell: bash
+        run: python ops/binary-smoke.py "target/${{ matrix.target }}/release/axond"
+
   docker-smoke:
     name: Docker smoke
     runs-on: ubuntu-latest
@@ -377,6 +424,7 @@ jobs:
       - publish-dry-run
       - dependency-policy
       - static-binary
+      - binary-smoke
       - docker-smoke
       - quickstart-smoke
     runs-on: ubuntu-latest
@@ -396,5 +444,6 @@ jobs:
           test "${{ needs.publish-dry-run.result }}" = success
           test "${{ needs.dependency-policy.result }}" = success
           test "${{ needs.static-binary.result }}" = success
+          test "${{ needs.binary-smoke.result }}" = success
           test "${{ needs.docker-smoke.result }}" = success
           test "${{ needs.quickstart-smoke.result }}" = success
