@@ -233,10 +233,10 @@ fn output_events_are_counted_however_the_transport_frames_them() {
 /// failure; treating it as the first makes the memory gate pass vacuously.
 #[test]
 fn a_lost_resource_sample_fails_rather_than_skipping_the_memory_gate() {
-    let report = |procfs: bool, rss: Option<Span>| ResourceReport {
+    let report = |procfs: bool, samples: u64, rss: Option<Span>| ResourceReport {
         sampled: rss.is_some(),
         procfs,
-        samples: 0,
+        samples,
         rss_kib: rss,
         sockets: None,
         cpu_seconds: None,
@@ -251,17 +251,53 @@ fn a_lost_resource_sample_fails_rather_than_skipping_the_memory_gate() {
 
     // 400 KiB of growth, against the manifest's 256 MiB bound.
     let bound = 256 * 1024;
-    let measured = capacity::memory_verdict(&report(true, Some(span)), bound).expect("a verdict");
+    let measured =
+        capacity::memory_verdict(&report(true, 42, Some(span)), bound).expect("a verdict");
     assert_eq!(measured.threshold, "max_rss_growth_kib");
     assert!(measured.passed, "{measured:?}");
 
-    let lost = capacity::memory_verdict(&report(true, None), bound).expect("a verdict");
+    let lost = capacity::memory_verdict(&report(true, 42, None), bound).expect("a verdict");
     assert_eq!(lost.threshold, "resource_sampling");
     assert!(!lost.passed, "a /proc host that measured nothing must fail");
 
+    // A sampler starved by the load it was measuring reports a span made only of
+    // the baseline it seeded. That is not a measurement of the run either.
+    let starved = capacity::memory_verdict(&report(true, 0, Some(span)), bound).expect("a verdict");
+    assert_eq!(starved.threshold, "resource_sampling");
     assert!(
-        capacity::memory_verdict(&report(false, None), bound).is_none(),
+        !starved.passed,
+        "a span with no samples behind it must not pass the memory gate"
+    );
+
+    assert!(
+        capacity::memory_verdict(&report(false, 0, None), bound).is_none(),
         "off a /proc platform there is nothing to assert"
+    );
+}
+
+/// Growth counts the settled reading as well as the sampled peak: the settled
+/// value is taken after the sampler stops, so memory that grew between the last
+/// sample and the end of the run would otherwise go unseen.
+#[test]
+fn growth_after_the_last_sample_still_counts() {
+    assert_eq!(
+        Span {
+            baseline: 1_000,
+            peak: 1_200,
+            settled: 9_000,
+        }
+        .growth(),
+        8_000
+    );
+    assert_eq!(
+        Span {
+            baseline: 1_000,
+            peak: 4_000,
+            settled: 1_050,
+        }
+        .growth(),
+        3_000,
+        "a transient peak is still the peak"
     );
 }
 

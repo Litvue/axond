@@ -115,8 +115,11 @@ pub struct Span {
 }
 
 impl Span {
+    /// Growth over the run. The settled reading counts too: it is taken after the
+    /// sampler stops, so growth that lands between the last sample and the end of
+    /// the run would otherwise go unseen.
     pub fn growth(&self) -> u64 {
-        self.peak.saturating_sub(self.baseline)
+        self.peak.max(self.settled).saturating_sub(self.baseline)
     }
 }
 

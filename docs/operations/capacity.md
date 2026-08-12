@@ -119,7 +119,9 @@ depends on how fast the runner was:
   cancelled streams settling as `client_cancelled`,
 - no upstream response body still open once every client is gone
   (`max_leaked_upstream_streams`),
-- bounded resident-memory growth over the run (`max_rss_growth_kib`).
+- bounded resident-memory growth over the run (`max_rss_growth_kib`), measured
+  from the baseline to whichever is higher of the sampled peak and the settled
+  reading taken after the load stops.
 
 Recorded and **never** asserted: throughput, latency percentiles, TTFT, stream
 lifetime, CPU, socket counts. A shared CI runner cannot bound them without
@@ -132,7 +134,9 @@ Off Linux there is no `/proc`, so RSS, CPU, and sockets are recorded as absent
 every other property still gates. On a Linux host the same absence means the
 sampler lost its subject rather than never having one, and the run fails the
 `resource_sampling` verdict — a measurement that could not be taken must not read
-like one that passed.
+like one that passed. A run whose sampler never got a turn (`resources.samples =
+0`) fails the same verdict: a span made only of its seeded baseline says nothing
+about what the load cost.
 
 ## Reading an artifact
 

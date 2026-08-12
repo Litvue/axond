@@ -448,7 +448,12 @@ fn verdicts(result: &CapacityResult) -> Vec<Verdict> {
 /// absent measurement is a different thing: the sampler lost its subject — the
 /// process exited, or its `/proc` entries could not be read — and a run that
 /// cannot say what memory did must not read like one that measured and passed.
+/// A run whose sampler never got a turn is the same case: the baseline it seeded
+/// the peak from is not a measurement of the load.
 pub fn memory_verdict(resources: &ResourceReport, max_growth_kib: u64) -> Option<Verdict> {
+    if resources.procfs && resources.samples == 0 {
+        return Some(Verdict::at_most("resource_sampling", 1.0, 0.0));
+    }
     match resources.rss_kib {
         Some(rss) => Some(Verdict::at_most(
             "max_rss_growth_kib",
