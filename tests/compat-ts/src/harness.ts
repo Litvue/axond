@@ -36,12 +36,21 @@ const ALIASES: ReadonlyArray<readonly [alias: string, provider: string, target: 
 /** The alias catalogue `GET /v1/models` must report. */
 export const ALIAS_NAMES: readonly string[] = ALIASES.map(([alias]) => alias);
 
+/** How long a gateway has to answer `/healthz`, and each probe of it. */
+const READY_TIMEOUT_MS = 30_000;
+const PROBE_TIMEOUT_MS = 1_000;
+
 /** A booted gateway and the upstream it forwards to. */
 export interface Harness {
   /** The gateway's base URL, without the `/v1` prefix. */
   readonly baseUrl: string;
   readonly upstream: FakeUpstream;
   stop(): Promise<void>;
+}
+
+export interface StartOptions {
+  /** Shortened by the harness's own tests, which assert on giving up. */
+  readonly readyTimeoutMs?: number;
 }
 
 function binary(): string {
@@ -102,13 +111,13 @@ ${models}`;
 }
 
 /** Boot the fake upstream and a real gateway pointed at it. */
-export async function start(): Promise<Harness> {
+export async function start(options: StartOptions = {}): Promise<Harness> {
   // Before anything with a handle on the event loop: a missing binary must fail
   // the run, and a listening socket nobody closes keeps `node --test` alive.
   const program = binary();
   const upstream = await FakeUpstream.start();
   try {
-    return await boot(program, upstream);
+    return await boot(program, upstream, options.readyTimeoutMs ?? READY_TIMEOUT_MS);
   } catch (error) {
     // The upstream holds a listening socket, and `node --test` does not exit
     // while one is open, so a failed boot must not leave it behind.
@@ -117,7 +126,11 @@ export async function start(): Promise<Harness> {
   }
 }
 
-async function boot(program: string, upstream: FakeUpstream): Promise<Harness> {
+async function boot(
+  program: string,
+  upstream: FakeUpstream,
+  readyTimeoutMs: number,
+): Promise<Harness> {
   const bind = `127.0.0.1:${await freePort()}`;
   const directory = await mkdtemp(join(tmpdir(), "axond-compat-ts-"));
   const configPath = join(directory, "axond.toml");
@@ -147,7 +160,7 @@ async function boot(program: string, upstream: FakeUpstream): Promise<Harness> {
     },
   };
   try {
-    await awaitReady(child, baseUrl);
+    await awaitReady(child, baseUrl, readyTimeoutMs);
   } catch (error) {
     // The upstream is the caller's to close, which is what keeps this path from
     // stopping it twice.
@@ -162,20 +175,29 @@ function dead(child: ChildProcess): boolean {
   return child.exitCode !== null || child.signalCode !== null;
 }
 
-async function awaitReady(child: ChildProcess, baseUrl: string): Promise<void> {
-  const deadline = Date.now() + 30_000;
+async function awaitReady(
+  child: ChildProcess,
+  baseUrl: string,
+  readyTimeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + readyTimeoutMs;
   while (Date.now() < deadline) {
     if (dead(child)) {
       throw new Error(`axond exited with ${child.exitCode ?? child.signalCode}`);
     }
     try {
-      const response = await fetch(`${baseUrl}/healthz`);
+      // Each probe is bounded: an accepted connection that is never answered
+      // would otherwise outlast the deadline it is supposed to be checked against.
+      const response = await fetch(`${baseUrl}/healthz`, {
+        signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+      });
       if (response.ok) {
         await response.text();
         return;
       }
+      await response.body?.cancel();
     } catch {
-      // Not listening yet.
+      // Not listening yet, or too slow to answer.
     }
     await new Promise((wake) => setTimeout(wake, 50));
   }

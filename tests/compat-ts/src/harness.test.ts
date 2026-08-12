@@ -5,9 +5,11 @@
  * that reads only `exitCode` sees a healthy process forever: readiness spins out
  * its whole deadline and shutdown then waits on an `exit` event that already
  * fired. A boot that throws before the fake upstream is closed leaves a
- * listening socket, and `node --test` does not exit while one is open. Both turn
- * a fast, legible failure into a CI job that hangs until the workflow times out,
- * which is exactly the report a broken gateway must not produce.
+ * listening socket, and `node --test` does not exit while one is open. A gateway
+ * that accepts the readiness probe and never answers it outlasts the deadline the
+ * probe is checked against. Each turns a fast, legible failure into a CI job that
+ * hangs until the workflow times out, which is exactly the report a broken
+ * gateway must not produce.
  */
 
 import assert from "node:assert/strict";
@@ -18,13 +20,29 @@ import { test } from "node:test";
 
 import { start } from "./harness.js";
 
-/** An "axond" that kills itself the way a crashing process would. */
-async function suicidalBinary(): Promise<string> {
-  const directory = await mkdtemp(join(tmpdir(), "axond-compat-ts-crash-"));
+/** An executable "axond" that runs `body` instead of serving. */
+async function stubBinary(body: string): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "axond-compat-ts-stub-"));
   const path = join(directory, "axond");
-  await writeFile(path, "#!/usr/bin/env node\nprocess.kill(process.pid, 'SIGKILL');\n", "utf8");
+  await writeFile(path, `#!/usr/bin/env node\n${body}\n`, "utf8");
   await chmod(path, 0o755);
   return path;
+}
+
+/** An "axond" that kills itself the way a crashing process would. */
+function suicidalBinary(): Promise<string> {
+  return stubBinary("process.kill(process.pid, 'SIGKILL');");
+}
+
+/** An "axond" that accepts the probe's connection and never answers it. */
+function muteBinary(): Promise<string> {
+  return stubBinary(`
+const { readFileSync } = require('node:fs');
+const { createServer } = require('node:net');
+const bind = /bind = "([^"]+)"/.exec(readFileSync(process.env.AXOND_CONFIG, 'utf8'))[1];
+const [host, port] = bind.split(':');
+createServer(() => {}).listen(Number(port), host);
+`);
 }
 
 /** Run `body` with `AXOND_BIN` pointed elsewhere, then put it back. */
@@ -74,5 +92,21 @@ test(
       assert.ok(Date.now() - started < 10_000, "the crash was not noticed promptly");
     });
     assert.equal(listeningSockets(), before, "the fake upstream outlived a crashed gateway");
+  },
+);
+
+test(
+  "a gateway that never answers the probe gives up on the readiness deadline",
+  { timeout: 20_000 },
+  async () => {
+    const before = listeningSockets();
+    await withBinary(await muteBinary(), async () => {
+      const started = Date.now();
+      // The probe is bounded, so the deadline governs; an unbounded probe would
+      // sit on the accepted connection forever and never look at it again.
+      await assert.rejects(start({ readyTimeoutMs: 3_000 }), /did not become healthy/);
+      assert.ok(Date.now() - started < 10_000, "the deadline did not govern");
+    });
+    assert.equal(listeningSockets(), before, "the fake upstream outlived an unready gateway");
   },
 );

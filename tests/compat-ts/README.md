@@ -35,10 +35,10 @@ cannot see:
 - **The SDK's types.** The lane is compiled with `tsc --strict` before it runs,
   so a shape the SDK's own type definitions no longer describe fails the build
   rather than passing as `any`.
-- **Its own crash path.** A gateway killed by a signal leaves `exitCode` null, so
-  `harness.test.ts` boots a binary that kills itself and asserts the run fails
-  promptly. A broken gateway must report as a failed test, never as a CI job that
-  hangs until the workflow times out.
+- **Its own failure paths.** `harness.test.ts` boots stub gateways that crash,
+  are missing, or accept the readiness probe without answering it, and asserts
+  each fails promptly and leaves nothing listening. A broken gateway must report
+  as a failed test, never as a CI job that hangs until the workflow times out.
 
 ## Pins
 
