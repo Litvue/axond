@@ -81,9 +81,15 @@ def check_stale_claims(files: list[Path]) -> list[str]:
         "the upload itself is untested": "crates.io publication has shipped",
         "no version has been published yet": "crates.io publication has shipped",
         "`POST /v1/responses`), `400 unsupported_wire`": "Responses is implemented",
+        "the stateful surface is not implemented yet": "stateful mode parsing and bootstrap validation have shipped",
+        "no stateful mode, `/admin/v1` route, or durable schema ships yet": "stateful bootstrap configuration ships; the control plane does not",
     }
     failures: list[str] = []
-    for source in files + [ROOT / "axond.example.toml", ROOT / ".agents/skills/testing-axond/SKILL.md"]:
+    for source in files + [
+        ROOT / "axond.example.toml",
+        ROOT / "axond.stateful.example.toml",
+        ROOT / ".agents/skills/testing-axond/SKILL.md",
+    ]:
         text = source.read_text(encoding="utf-8")
         for phrase, reason in forbidden.items():
             if phrase in text:
@@ -104,6 +110,41 @@ def check_route_contract() -> list[str]:
     ]
 
 
+def check_operating_mode_contract() -> list[str]:
+    """Every stateful bootstrap key the parser accepts is documented and shown.
+
+    Bootstrap is the only surface a stateful operator can edit, so an
+    undocumented key there is worse than an undocumented inference key: there is
+    no `/admin/v1` alternative for it.
+    """
+    source = (ROOT / "crates/gateway/src/config.rs").read_text(encoding="utf-8")
+    reference = (ROOT / "docs/configuration.md").read_text(encoding="utf-8")
+    example = (ROOT / "axond.stateful.example.toml").read_text(encoding="utf-8")
+    failures: list[str] = []
+    sections = (
+        ("[control_plane]", "ControlPlane"),
+        ("[secret_store]", "SecretStore"),
+        ("[[admin_breakglass]]", "AdminBreakglass"),
+    )
+    for section, struct in sections:
+        body = re.search(rf"pub struct {struct} \{{(.*?)\n\}}", source, re.DOTALL)
+        if body is None:
+            failures.append(f"crates/gateway/src/config.rs: {struct} not found")
+            continue
+        for field in re.findall(r"\n    pub (\w+):", body.group(1)):
+            if f"`{field}`" not in reference:
+                failures.append(
+                    f"docs/configuration.md: {section} key {field!r} is not documented"
+                )
+        for path, text in (("docs/configuration.md", reference), ("axond.stateful.example.toml", example)):
+            if section not in text:
+                failures.append(f"{path}: stateful bootstrap section {section} is missing")
+    for mode in ("stateless", "stateful"):
+        if f'mode = "{mode}"' not in reference:
+            failures.append(f"docs/configuration.md: `mode = \"{mode}\"` is not documented")
+    return failures
+
+
 def check_front_door_size() -> list[str]:
     failures: list[str] = []
     for relative, limit in (("README.md", 260), ("docs/deployment.md", 220)):
@@ -118,6 +159,7 @@ def main() -> int:
     failures = []
     failures.extend(check_relative_links(files))
     failures.extend(check_release_markers())
+    failures.extend(check_operating_mode_contract())
     failures.extend(check_stale_claims(files))
     failures.extend(check_route_contract())
     failures.extend(check_front_door_size())
