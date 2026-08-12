@@ -92,9 +92,13 @@ pub enum LastKnownGoodError {
     Encoding(#[from] CanonicalError),
     #[error("last-known-good cache does not decode as canonical bytes: {0}")]
     Decode(#[from] CanonicalDecodeError),
-    /// The record was authentic but did not describe a consistent revision. An
-    /// operator alert, exactly as the same failure from Postgres is.
-    #[error("last-known-good cache holds a revision that does not add up: {0}")]
+    /// The record was authentic but this build did not accept the revision it
+    /// describes: either the rows do not add up, or they describe a revision this
+    /// build cannot read. The inner error says which, in the same words hydration
+    /// from Postgres uses, because the operator response differs — repair a cache
+    /// that is inconsistent, and expect an incompatible one on a replica that was
+    /// rolled back onto an older build.
+    #[error("last-known-good cache holds a revision this build did not accept: {0}")]
     Integrity(#[from] IntegrityError),
 }
 

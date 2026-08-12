@@ -76,6 +76,25 @@ pub(crate) fn tenant(seed: u64, slug: &str) -> ResourceVersion {
     tenant_body(seed, &capitalize(slug)).version(Slug::parse(slug).expect("fixture slug"))
 }
 
+/// The tenant `tenant` builds, as a build that predates typed tenancy bodies
+/// would have written it: same envelope, an untyped body carrying no schema.
+///
+/// What a legacy row in a long-lived deployment looks like, so a test can assert
+/// that this build refuses it as an *incompatibility* rather than reading it as a
+/// typed tenant or reporting it as corruption.
+pub(crate) fn legacy_tenant(seed: u64, slug: &str) -> ResourceVersion {
+    ResourceVersion::new(
+        ResourceRef::new(
+            ResourceKind::Tenant,
+            ResourceId::new(tenant_id(seed).uuid()),
+            ResourceVersionNumber::FIRST,
+        ),
+        ResourceScope::Deployment,
+        Slug::parse(slug).expect("fixture slug"),
+        inline("display_name", &capitalize(slug)),
+    )
+}
+
 pub(crate) fn project(tenant: &TenantId, seed: u64, slug: &str) -> ResourceVersion {
     ProjectBody::new(project_id(seed), *tenant, display_name(&capitalize(slug)))
         .version(Slug::parse(slug).expect("fixture slug"))

@@ -83,7 +83,8 @@ Alongside them:
 - **lag** — how long `desired` has differed from `active`. This is the alerting
   signal. One second of lag is convergence working; ten minutes is an incident.
 - **reason** — the stage that refused the last candidate: `unavailable`,
-  `corrupt`, `not_found`, `projection`, `validation`, `secret`, or `snapshot`.
+  `incompatible`, `corrupt`, `not_found`, `projection`, `validation`, `secret`,
+  or `snapshot`.
 - **source** — `control-plane` or `last-known-good`. A replica reporting
   `last-known-good` booted from its cache and may be serving something older
   than desired.
@@ -119,17 +120,27 @@ scope, and slug. Two schemas exist today:
 | `axond.tenant.v1` | a deployment tenant | `schema`, `tenant_id`, `display_name` |
 | `axond.project.v1` | a tenant-owned project | `schema`, `project_id`, `tenant_id`, `display_name` |
 
-Three rules hold for every body schema, present and future:
+Four rules hold for every body schema, present and future:
 
 - **The identifier is inside the checksummed body.** A replica reads the schema
   before it reads anything else, so a revision cannot be interpreted under a
   schema it did not declare.
 - **An unknown schema, or an unknown field, is a refusal.** A body declaring
-  `axond.tenant.v2`, or an extra field a newer release added, is rejected with
-  reason `projection` rather than being read partially. An older replica keeps
+  `axond.tenant.v2`, or an extra field a newer release added, is rejected rather
+  than read partially — as `projection` when a *candidate* is compiled, and as
+  `incompatible` when a *stored* revision is hydrated. An older replica keeps
   serving the revision it already had instead of serving a half-understood newer
   one. Roll the replica forward, or publish a revision the deployed version
   understands.
+- **A body written before its schema was typed is the same refusal, not
+  corruption.** Revisions published before `axond.tenant.v1` and
+  `axond.project.v1` existed carry tenant and project bodies with no `schema`
+  field. This build does not read them, and it does not guess: hydrating one is
+  `incompatible`, and nothing untyped is ever accepted *as* a typed tenancy
+  resource. Storage is intact, so there is nothing to repair — republish the
+  affected tenants and projects from a build that writes typed bodies, and the
+  fleet converges onto the new revision. Older revisions in the journal stay
+  unreadable to this build by design; they remain in the journal as history.
 - **A change to a field's presence or meaning is a new identifier.** `v1` bodies
   never change shape, so a checksum computed by one release is computed the same
   way by every release that accepts it. Adding a field, renaming one, or changing
@@ -162,6 +173,17 @@ own slices land — providers, credentials, models, and prices. The bootstrap's
 default namespace stays the default, and a projected project starts with no
 platform fallback: it borrows no other namespace's credentials.
 
+**No published project is ever made the deployment default.** A request that names
+no namespace is served by whatever the file made default, and publishing a project
+does not move that target — promoting one, even when it is the only one, would let
+an unrelated publication silently redirect unnamed traffic. A bootstrap that
+declares no default namespace is therefore refused with reason `projection`, and
+the message says so. Since `[[namespace]]` is a control-plane-owned section that a
+stateful file may not declare, that is the shape a stateful bootstrap has today:
+**stateful serving stays gated until the runtime slice that selects a default from
+desired state lands.** Nothing in `serve` constructs this projection yet, so the
+refusal is a design boundary rather than an outage.
+
 A stateless deployment is unaffected by all of this. Tenants and projects are
 published, never declared in `axond.toml`, and a stateless config's namespace ids
 are exactly the ids the file wrote.
@@ -185,9 +207,17 @@ The refusal reason is the triage key.
   a secret the store does not hold. Messages name the *reference*, never the
   value. Frequently replica-specific — one replica missing an environment
   variable while its siblings converge looks exactly like this.
-- **`projection`** — a resource body this build cannot read, usually a revision
-  published by a newer version. Roll the replica forward, or publish a revision
-  the deployed version understands.
+- **`projection`** — a candidate this build cannot project: a resource body it
+  does not read, or a bootstrap that is missing something projection may not
+  supply for it (today, a default namespace). Roll the replica forward, publish a
+  revision the deployed version understands, or fix the bootstrap file.
+- **`incompatible`** — a *stored* revision this build cannot read: a schema from a
+  newer release, an unknown field, or a body written before that resource's schema
+  was typed. Distinct from `corrupt` on purpose — storage is intact and there is
+  nothing to repair, so this is an upgrade or a republication, never a database
+  investigation. The replica keeps serving its last known good revision and does
+  not retry into a different answer. During a rolling upgrade, expect it on
+  replicas still running the older build.
 - **`corrupt`** / **`not_found`** — the journal itself does not add up. Retrying
   will not clear it; see
   [when a revision will not load](./control-plane-journal.md#when-a-revision-will-not-load).

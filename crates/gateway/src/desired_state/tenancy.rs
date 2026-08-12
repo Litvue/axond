@@ -49,6 +49,17 @@
 //!
 //! [`SerializerVersion`]: super::canonical::SerializerVersion
 //!
+//! Strictness and *classification* are separate questions, and only the second
+//! one is about blame. A body this build cannot read is refused either way, but
+//! it is refused as an incompatibility — see [`TenancyError::is_incompatible`] —
+//! and never as storage corruption. That covers both directions of a rolling
+//! upgrade: a revision published by a newer release, and a revision published
+//! before tenancy bodies were typed at all, whose `Tenant` row carries whatever
+//! untyped body the writer of the day put there. Neither is silently coerced into
+//! a typed tenancy resource, and neither pages someone to go repair a database
+//! that is perfectly intact; both say *this replica cannot read this revision*,
+//! and both leave the revision the replica already holds serving.
+//!
 //! # Where these rules are enforced
 //!
 //! [`Tenancy::of`] reads every tenancy body in a [`DesiredState`] and resolves
@@ -173,6 +184,52 @@ pub enum TenancyError {
 }
 
 impl TenancyError {
+    /// Whether this refusal means *this build cannot read the body*, rather than
+    /// *these rows do not agree with each other*.
+    ///
+    /// The two call for opposite operator actions, so they must not arrive as one
+    /// label. A body whose schema identifier, form, or field set is not the one
+    /// this release reads — a revision published by a newer build, or a legacy
+    /// row written before tenancy bodies were typed — is a *compatibility*
+    /// refusal: storage is intact, and the fix is to run a build that reads it or
+    /// to publish a revision this one does.
+    ///
+    /// A tenant or project a revision never declared is the same class, for a
+    /// less obvious reason: requiring the *owner* to be present in the revision is
+    /// a rule this build added, and a revision published before it existed could
+    /// satisfy every rule of its day and still omit that row. A restore that lost
+    /// a row does not arrive here — a manifest entry without its row is
+    /// [`MissingResource`], not this — so what reaches this case is a revision
+    /// that was published that way.
+    ///
+    /// An identity or ownership *contradiction* is not a compatibility refusal:
+    /// those rows were readable, this build understands both of them, and they
+    /// disagree. That is corruption an operator has to repair.
+    ///
+    /// [`IntegrityError`](super::revision::IntegrityError) carries the
+    /// distinction into hydration, and convergence reports it as its own refusal
+    /// reason.
+    ///
+    /// [`MissingResource`]: super::revision::IntegrityError::MissingResource
+    pub const fn is_incompatible(&self) -> bool {
+        match self {
+            Self::Kind { .. }
+            | Self::NotInline { .. }
+            | Self::NotARecord { .. }
+            | Self::Schema { .. }
+            | Self::MissingField { .. }
+            | Self::UnknownField { .. }
+            | Self::FieldType { .. }
+            | Self::MalformedId { .. }
+            | Self::MalformedDisplayName { .. }
+            | Self::UnknownTenant { .. }
+            | Self::UnknownProject { .. } => true,
+            Self::IdentityMismatch { .. }
+            | Self::OwnerMismatch { .. }
+            | Self::ProjectOwnerMismatch { .. } => false,
+        }
+    }
+
     /// The resource this refusal is about.
     ///
     /// Projection reports failures per resource ([`ProjectionError::Body`]), so
@@ -208,6 +265,8 @@ pub enum InvalidDisplayName {
     TooLong { length: usize, max: usize },
     #[error("a display name may not contain the control character {codepoint:#06x}")]
     ControlCharacter { codepoint: u32 },
+    #[error("a display name may not contain a byte-order mark")]
+    ByteOrderMark,
     #[error("a display name may not begin or end with whitespace")]
     Untrimmed,
 }
@@ -216,7 +275,8 @@ pub enum InvalidDisplayName {
 ///
 /// Normalized on the way in rather than at every comparison: leading and
 /// trailing whitespace are refused instead of trimmed, so a name has one
-/// spelling and one checksum. Control characters are refused here too, so an
+/// spelling and one checksum. Everything the canonical encoder cannot represent —
+/// control characters and byte-order marks alike — is refused here too, so an
 /// unencodable body is a validation error at the admin edge rather than a
 /// [`CanonicalError`](super::canonical::CanonicalError) at publication time.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -239,10 +299,17 @@ impl DisplayName {
                 max: Self::MAX_LEN,
             });
         }
-        if let Some(control) = input.chars().find(|c| c.is_control()) {
-            return Err(InvalidDisplayName::ControlCharacter {
-                codepoint: control as u32,
-            });
+        for character in input.chars() {
+            // Exactly what the canonical encoder refuses, and refused here so an
+            // unencodable name fails validation instead of publication.
+            if character == '\u{feff}' {
+                return Err(InvalidDisplayName::ByteOrderMark);
+            }
+            if character.is_control() {
+                return Err(InvalidDisplayName::ControlCharacter {
+                    codepoint: u32::from(character),
+                });
+            }
         }
         Ok(Self(input.to_owned()))
     }
@@ -1151,6 +1218,108 @@ mod tests {
         );
     }
 
+    /// The two refusals hydration must not conflate. Both are strict; only one is
+    /// a reason to go looking at storage.
+    #[test]
+    fn a_body_this_build_cannot_read_hydrates_as_an_incompatibility_not_corruption() {
+        let candidate = candidate(ExpectedRevision::Empty, "hydrate", state());
+        let manifest = RevisionManifest::of(
+            super::super::fixtures::revision_id(1),
+            None,
+            SystemTime::UNIX_EPOCH,
+            &candidate,
+        )
+        .expect("the fixture state is publishable");
+
+        // A revision retained from before tenancy bodies were typed: the row is
+        // intact, and this build simply does not read it.
+        let mut legacy = DesiredState::new();
+        for resource in candidate.state.resources() {
+            let resource = if resource.reference.kind == ResourceKind::Tenant {
+                super::super::fixtures::legacy_tenant(1, "acme")
+            } else {
+                resource.clone()
+            };
+            legacy.insert(resource).expect("distinct references");
+        }
+        for blob in candidate.state.blobs() {
+            legacy.declare_blob(*blob);
+        }
+        let error = LoadedRevision::assemble(manifest.clone(), legacy)
+            .expect_err("an untyped tenancy body must not hydrate");
+        assert_eq!(
+            error,
+            IntegrityError::Incompatible(TenancyError::MissingField {
+                reference: tenant_resource().reference,
+                field: "schema"
+            }),
+            "a legacy body is a compatibility refusal, and it names the row"
+        );
+        assert!(error.is_incompatible());
+        assert!(
+            !error.to_string().contains("unreadable"),
+            "intact storage must not be described as unreadable: {error}"
+        );
+
+        // A schema identifier from a future release is the same class of refusal,
+        // arriving from the other direction.
+        let mut newer = DesiredState::new();
+        for resource in candidate.state.resources() {
+            let resource = if resource.reference.kind == ResourceKind::Tenant {
+                with_fields(resource, |fields| {
+                    set(fields, "schema", CanonicalValue::string("axond.tenant.v2"));
+                })
+            } else {
+                resource.clone()
+            };
+            newer.insert(resource).expect("distinct references");
+        }
+        for blob in candidate.state.blobs() {
+            newer.declare_blob(*blob);
+        }
+        let error =
+            LoadedRevision::assemble(manifest, newer).expect_err("a newer schema must not hydrate");
+        assert!(
+            matches!(
+                error,
+                IntegrityError::Incompatible(TenancyError::Schema { .. })
+            ),
+            "{error}"
+        );
+
+        // A revision that never declared the tenant its resources are scoped to
+        // is the third shape of the same problem: requiring the owner row is a
+        // rule this build added, so a revision published before it existed is
+        // refused as an incompatibility and not as a missing row.
+        let mut ownerless = DesiredState::new();
+        ownerless
+            .insert(alias(&tenant_id(1), 4, "fast", &[]))
+            .expect("a fresh state");
+        assert!(
+            TenancyError::UnknownTenant {
+                reference: alias(&tenant_id(1), 4, "fast", &[]).reference,
+                tenant: tenant_id(1),
+            }
+            .is_incompatible(),
+            "an owner row a revision never carried is an upgrade, not a repair"
+        );
+        assert!(matches!(
+            ownerless.validate(),
+            Err(ValidationError::Tenancy(TenancyError::UnknownTenant { .. }))
+        ));
+
+        // And an ownership contradiction is not: those rows were readable and
+        // disagree, which is the case that means storage.
+        assert!(
+            !TenancyError::OwnerMismatch {
+                reference: project_resource().reference,
+                declared: tenant_id(9),
+                scoped: Some(tenant_id(1)),
+            }
+            .is_incompatible()
+        );
+    }
+
     #[test]
     fn a_project_needs_a_tenant_this_revision_declares() {
         let mut orphaned = DesiredState::new();
@@ -1316,6 +1485,31 @@ mod tests {
                 .to_canonical_bytes()
                 .is_ok(),
             "a validated body always has canonical bytes"
+        );
+    }
+
+    /// A byte-order mark is not a control character, so it needs its own rule to
+    /// stay in step with the canonical encoder — which refuses it. Without one,
+    /// `DisplayName::parse` would accept a name whose body then has no canonical
+    /// bytes, turning a validation error into a publication-time encoding failure.
+    #[test]
+    fn a_display_name_refuses_a_byte_order_mark_exactly_as_the_encoder_does() {
+        for name in ["\u{feff}Acme", "Ac\u{feff}me", "Acme\u{feff}"] {
+            assert_eq!(
+                DisplayName::parse(name),
+                Err(InvalidDisplayName::ByteOrderMark),
+                "a mark anywhere in `{name}` is refused, not only a leading one"
+            );
+            // The same string, encoded: what validation is standing in front of.
+            assert_eq!(
+                CanonicalValue::string(name).to_canonical_bytes(),
+                Err(super::super::canonical::CanonicalError::ByteOrderMark),
+                "the two layers agree about `{name}`"
+            );
+        }
+        assert!(
+            !'\u{feff}'.is_control(),
+            "a mark is refused by its own rule, not by the control-character check"
         );
     }
 

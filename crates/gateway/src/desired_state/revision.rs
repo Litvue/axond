@@ -434,12 +434,49 @@ pub enum IntegrityError {
     UnexpectedBlob { digest: Checksum },
     #[error("stored revision is not valid desired state: {0}")]
     Invalid(#[from] ValidationError),
+    /// A retained revision this build cannot interpret, because a body declares a
+    /// schema, form, or field set that belongs to a different release: a revision
+    /// published by a newer build, or one published before that body was typed.
+    ///
+    /// Deliberately *not* an [`IntegrityError::Invalid`] and not corruption. The
+    /// rows may be entirely self-consistent; what is wrong is this build's ability
+    /// to read them, and the actions differ — roll the replica forward, or publish
+    /// a revision the deployed version understands, rather than repair storage.
+    /// The replica keeps serving what it already holds either way.
+    #[error("stored revision is not compatible with this build: {0}")]
+    Incompatible(TenancyError),
     /// A stored record could not be interpreted at all: an id, checksum, kind,
     /// scope, or canonical body that is not the value it was written as. Distinct
     /// from the mismatch arms above, which compare two things that were both
     /// readable.
     #[error("stored revision is unreadable: {detail}")]
     Unreadable { detail: String },
+}
+
+impl IntegrityError {
+    /// Classify a validation failure on *stored* state as an incompatibility or
+    /// as corruption.
+    ///
+    /// Hydration re-validates what storage returned, so this is where "a body
+    /// this build cannot read" stops being indistinguishable from "these rows
+    /// contradict each other". See [`TenancyError::is_incompatible`].
+    fn classify(error: ValidationError) -> Self {
+        match error {
+            ValidationError::Tenancy(tenancy) if tenancy.is_incompatible() => {
+                Self::Incompatible(tenancy)
+            }
+            other => Self::Invalid(other),
+        }
+    }
+
+    /// Whether this is a compatibility refusal rather than unreadable storage.
+    ///
+    /// The store and convergence both classify by this rather than by matching
+    /// arms of their own, so one revision cannot be reported as an incompatibility
+    /// at one layer and as corruption at the next.
+    pub const fn is_incompatible(&self) -> bool {
+        matches!(self, Self::Incompatible(_) | Self::Serializer { .. })
+    }
 }
 
 /// A retained revision, hydrated and proven complete: the seam #142 publishes a
@@ -476,7 +513,7 @@ impl LoadedRevision {
                 current,
             });
         }
-        state.validate()?;
+        state.validate().map_err(IntegrityError::classify)?;
 
         for entry in &manifest.entries {
             let Some(resource) = state.get(&entry.reference) else {

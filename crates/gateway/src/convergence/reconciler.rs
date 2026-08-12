@@ -182,8 +182,14 @@ impl AttemptError {
     /// The low-cardinality reason label. Store failures are classified by the
     /// backend's own category, so "unavailable" (retry) and "corrupt" (page
     /// someone) never collapse into one bucket.
+    ///
+    /// An incompatible revision gets its own label ahead of the category mapping:
+    /// its category is a refusal a retry cannot clear, like a bound, but the
+    /// action it calls for is a deployment, and reporting it as `denied` or
+    /// `corrupt` would send an operator looking for the wrong thing.
     fn reason(&self) -> &'static str {
         match self {
+            Self::Store(ControlPlaneError::Incompatible { .. }) => "incompatible",
             Self::Store(error) => category_reason(error.category()),
             Self::Compile(error) => error.reason(),
         }
@@ -192,6 +198,7 @@ impl AttemptError {
     fn revision(&self) -> Option<RevisionId> {
         match self {
             Self::Store(ControlPlaneError::Corrupt { revision, .. })
+            | Self::Store(ControlPlaneError::Incompatible { revision, .. })
             | Self::Store(ControlPlaneError::RevisionNotFound(revision))
             | Self::Store(ControlPlaneError::TooLarge { revision, .. }) => Some(*revision),
             Self::Store(_) => None,

@@ -272,7 +272,11 @@ pub(super) async fn revision(
     refuse_deep_dependencies(id, &state, limits)?;
     refuse_oversized_candidate(id, &state, limits)?;
 
-    LoadedRevision::assemble(manifest, state).map_err(corrupt)
+    // Classified rather than reported as corruption: a revision whose bodies this
+    // build cannot read is an incompatibility, and the rows behind it may be
+    // entirely intact.
+    LoadedRevision::assemble(manifest, state)
+        .map_err(|error| ControlPlaneError::integrity(id, error))
 }
 
 /// The revision the head points at, hydrated in the same read.

@@ -32,7 +32,14 @@
 //!   reason;
 //! - a projected namespace whose id a bootstrap namespace already claims
 //!   ([`ProjectionError::Incomplete`]): merging them would put durable state and
-//!   file-owned state on one name, and dropping either silently is worse.
+//!   file-owned state on one name, and dropping either silently is worse;
+//! - a bootstrap configuration that declares no default namespace
+//!   ([`ProjectionError::Incomplete`] again): a projected project is never
+//!   promoted to the deployment default, so there would be nothing to serve a
+//!   request that names no namespace. Which project a deployment defaults to is a
+//!   decision the later runtime slice makes from desired state; until then a
+//!   stateful bootstrap declares its own default, and a refusal that says so is
+//!   worth more than a config that fails the boot gate one step later.
 //!
 //! # Still not wired to `serve`
 //!
@@ -64,6 +71,29 @@ impl RevisionProjection for TenancyProjection {
             detail: error.to_string(),
         })?;
         let mut config = bootstrap.clone();
+        // Refused deliberately, and *before* any project is projected: a
+        // deployment needs one namespace to serve a request that names none, and
+        // this projection has no authority to nominate one. Promoting a project —
+        // the first, the lowest id, the only one — would make an unrelated
+        // publication silently move where unnamed traffic lands. Selecting a
+        // default from desired state is the later runtime slice's job, so until it
+        // exists a stateful bootstrap that declares no default is refused here,
+        // naming the missing section, rather than passed on to fail the boot gate
+        // as a generic invalid configuration.
+        if !bootstrap
+            .namespace
+            .iter()
+            .any(|namespace| namespace.default)
+        {
+            return Err(ProjectionError::Incomplete {
+                detail: "the bootstrap configuration declares no default namespace, and \
+                         projecting a project cannot make one the default: a published project \
+                         must not silently become where unnamed traffic lands. Declare a \
+                         default `[[namespace]]` in the bootstrap configuration; selecting a \
+                         default from desired state is not part of this slice"
+                    .to_owned(),
+            });
+        }
         let declared: BTreeSet<String> = bootstrap
             .namespace
             .iter()
@@ -247,6 +277,58 @@ namespace = "acme/core"
             "{error}"
         );
         assert!(error.to_string().contains("acme/core"), "{error}");
+    }
+
+    /// The stateful bootstrap shape: `[[namespace]]` is a control-plane-owned
+    /// section, so a stateful file declares none and therefore declares no
+    /// default. The refusal has to be deliberate and say what is missing —
+    /// promoting a project would let an unrelated publication move where unnamed
+    /// traffic lands, and projecting anyway would surface as the boot gate's
+    /// generic "exactly one namespace must set `default = true`" one stage later,
+    /// naming no cause an operator can act on.
+    #[test]
+    fn a_bootstrap_with_no_default_namespace_is_refused_rather_than_given_one() {
+        let bootstrap = Config::from_toml_str(
+            r#"
+mode = "stateful"
+
+[control_plane]
+dsn_env = "GW_CONTROL_PLANE_DSN"
+
+[secret_store]
+kek_env = "GW_SECRET_STORE_KEK"
+
+[[admin_breakglass]]
+env = "GW_ADMIN_BREAKGLASS"
+"#,
+        )
+        .expect("the minimum a stateful replica boots with");
+        assert!(
+            bootstrap.namespace.is_empty(),
+            "a stateful file declares no namespace at all"
+        );
+
+        let error = TenancyProjection
+            .project(&bootstrap, &state())
+            .expect_err("a projection may not nominate a default namespace");
+        let ProjectionError::Incomplete { detail } = &error else {
+            panic!("expected a deliberate incompleteness, got {error:?}");
+        };
+        assert!(detail.contains("default namespace"), "{detail}");
+        assert!(
+            detail.contains("not part of this slice"),
+            "the refusal says default selection is still gated: {detail}"
+        );
+
+        // Compiled, it is a `projection` refusal naming the missing default,
+        // rather than a `validation` one from the graph gate after the fact.
+        let Err(error) =
+            RevisionCompiler::new(bootstrap, env(), TenancyProjection).compile(&revision(), 1)
+        else {
+            panic!("an incomplete bootstrap does not compile");
+        };
+        assert_eq!(error.reason(), "projection");
+        assert!(error.to_string().contains("default namespace"), "{error}");
     }
 
     #[test]

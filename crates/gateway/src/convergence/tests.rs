@@ -346,6 +346,62 @@ async fn a_revision_that_fails_the_boot_gate_publishes_nothing() {
     assert_eq!(replica.served_aliases(), before);
 }
 
+/// A revision this build cannot read — here a tenant body written before tenancy
+/// bodies were typed — is refused as an *incompatibility*, under its own reason,
+/// while the replica keeps serving the revision it already converged onto.
+///
+/// The distinction is operational: `corrupt` sends someone to repair storage,
+/// which is exactly the wrong response to a fleet mid-upgrade.
+#[tokio::test]
+async fn a_revision_this_build_cannot_read_is_refused_as_an_incompatibility() {
+    let store = control_plane();
+    let first = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let replica = Replica::serving(&store);
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    let serving = replica.served_aliases();
+
+    let second = publish(
+        &store,
+        "second",
+        ExpectedRevision::Exactly(first),
+        fixtures::state_with_renamed_alias(),
+    )
+    .await;
+    // The retained tenant row, as an older writer left it.
+    store.rewrite_version(fixtures::legacy_tenant(1, "acme"));
+
+    let outcome = replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Rejected { revision, reason }
+                if revision == Some(second) && reason == "incompatible"
+        ),
+        "{outcome:?}"
+    );
+    let report = replica.report();
+    let rejection = report.last_rejection.expect("a reason is reported");
+    assert_eq!(rejection.reason, "incompatible");
+    assert!(
+        rejection.detail.contains("not compatible with this build"),
+        "{}",
+        rejection.detail
+    );
+
+    // Last known good is retained in the only sense that matters: the replica is
+    // still serving the revision it converged onto, at the same generation.
+    assert_eq!(report.active, Some(first));
+    assert_eq!(report.desired, Some(second));
+    assert_eq!(replica.generation(), 1);
+    assert_eq!(replica.served_aliases(), serving);
+}
+
 /// A control-plane outage degrades to staleness: the replica keeps serving the
 /// revision it already has, reports growing lag, and converges when Postgres
 /// comes back.
