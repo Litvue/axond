@@ -116,13 +116,16 @@ jobs:
       - run: cargo test --workspace --all-features --locked
       # The reduced capacity profiles run inside the suite above; their result
       # artifacts are kept so an envelope has evidence behind it (ADR 0033).
+      # `warn`: an earlier target failing stops the suite before the capacity
+      # binary runs, and that lane's finding is the failing test, not a missing
+      # artifact. The `Capacity` workflow runs the binary alone and insists.
       - name: Publish the reduced capacity results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: capacity-results-reduced
           path: target/capacity/**/*.json
-          if-no-files-found: error
+          if-no-files-found: warn
 
   stateful-tests:
     name: Stateful tests
