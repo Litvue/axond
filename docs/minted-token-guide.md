@@ -296,7 +296,10 @@ capability and can be emitted with repeatable `--scope` flags:
 `status`. `status` names the authenticated dependency-status view of
 [ADR 0031](./adr/0031-bounded-status-contract.md) and grants nothing else; it is
 the only capability that does not require the namespace to have a model route,
-and its route ships with the stateful slices.
+and its route ships with the stateful slices. It is also the only capability a
+scope-less mint request does **not** grant: a token minted without `--scope`
+carries every route capability but not `status`, so a monitoring grant has to be
+named (`--scope status`) rather than inherited.
 A minted token cannot reach the all-namespaces credential view
 (`GET /v1/credentials?namespaces=all`) at all: that view follows direct
 operator authority, so use a scope-less static `[[gateway_key]]` in the default

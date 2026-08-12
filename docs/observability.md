@@ -25,13 +25,15 @@ Logs are always JSON on stdout, filtered by `RUST_LOG` (default
 ## Health surfaces
 
 Three surfaces answer three different questions, and none of them substitutes for
-another ([ADR 0031](./adr/0031-bounded-status-contract.md)):
+another ([ADR 0031](./adr/0031-bounded-status-contract.md)). Two of them ship
+today; the third is a fixed contract whose route arrives with the stateful
+slices, so treat its row as the shape to expect rather than something to curl:
 
 | Surface | Authentication | Question it answers |
 | --- | --- | --- |
 | `GET /healthz` | none | *Is the process alive?* Answers `ok` throughout, including the shutdown drain. Restart it if this fails. |
 | `GET /readyz` | none | *Should traffic be sent here?* `ready`, or `503 draining` once termination begins. Point the load balancer here. |
-| `GET /admin/v1/status` | gateway credential with the `status` capability | *Which dependencies is this replica talking to?* Cached component states with an observation age. |
+| `GET /admin/v1/status` **(not registered yet)** | gateway credential with the `status` capability | *Which dependencies is this replica talking to?* Cached component states with an observation age. |
 
 Neither `/healthz` nor `/readyz` observes a dependency. A store outage must not
 remove healthy replicas from service, so dependency state lives only on the
@@ -60,8 +62,9 @@ reasons coarsened to `unavailable`, ages rounded to whole seconds, and no revisi
 summary.
 
 A stateless replica reports every component `disabled`; that is the correct
-answer, not a degraded one. Probes ship with the stateful slices that own each
-backend.
+answer, not a degraded one. No route serves this yet, and no component is probed:
+the contract, its redaction, and its metrics ship first, and each stateful slice
+adds the probe for the backend it owns behind them.
 
 ## Traces
 
@@ -124,7 +127,7 @@ metric and a usage row can never disagree.
 | `axond.rate_limit.unavailable_denials` | counter | — | Redis rate-limit admissions denied because the store was unavailable. |
 | `axond.admission.in_flight` | up-down counter | `axond.admission.resource` | Admission capacity held right now, by resource: `request`, `stream`, `tenant`, `queue`. Bounded label set — no tenant, subject, or request identity. |
 | `axond.admission.rejections` | counter | `axond.admission.resource`, `axond.error.type` | Requests shed by admission control, by resource and stable error type. |
-| `axond.status.component_state` | gauge | `axond.status.component` | Last observed dependency state: `0` ok, `1` degraded, `2` unavailable, `3` disabled. Bounded label set — no tenant, subject, or credential identity. |
+| `axond.status.component_state` | gauge | `axond.status.component` | Last observed dependency state: `0` disabled, `1` ok, `2` degraded, `3` unavailable — a severity ladder, so `>= 2` is trouble and the stateless posture (`disabled` everywhere) sits below `ok` rather than above `unavailable`. Bounded label set — no tenant, subject, or credential identity. |
 | `axond.status.observation_age` | gauge (ms) | `axond.status.component` | Age of the cached observation behind that state; a rising age means the refresher, not the dependency, is the problem. |
 | `axond.status.refreshes` | counter | `axond.status.component`, `axond.status.outcome` | Background refresh attempts and how they ended. |
 

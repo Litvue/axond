@@ -288,8 +288,8 @@ impl Instruments {
             status_component_state: meter
                 .u64_gauge("axond.status.component_state")
                 .with_description(
-                    "Last observed dependency state, by component: 0 ok, 1 degraded, \
-                     2 unavailable, 3 disabled.",
+                    "Last observed dependency state, by component: 0 disabled, 1 ok, \
+                     2 degraded, 3 unavailable.",
                 )
                 .build(),
             status_observation_age: meter

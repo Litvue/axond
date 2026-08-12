@@ -175,15 +175,21 @@ impl ComponentState {
         }
     }
 
-    /// The `axond.status.component_state` gauge value. Ordered by severity so an
-    /// alert can threshold it: `0` ok, `1` degraded, `2` unavailable, `3`
-    /// disabled.
+    /// The `axond.status.component_state` gauge value: `0` disabled, `1` ok, `2`
+    /// degraded, `3` unavailable.
+    ///
+    /// A severity ladder that an alert can threshold — `>= 2` is trouble — with
+    /// `disabled` deliberately *below* `ok` rather than above `unavailable`. It
+    /// is the absence of an observation, not the worst one, and it is what every
+    /// component reports in the default stateless posture: ranking it as most
+    /// severe would make the obvious alert fire permanently on the most common
+    /// deployment.
     pub const fn gauge_value(self) -> u64 {
         match self {
-            Self::Ok => 0,
-            Self::Degraded => 1,
-            Self::Unavailable => 2,
-            Self::Disabled => 3,
+            Self::Disabled => 0,
+            Self::Ok => 1,
+            Self::Degraded => 2,
+            Self::Unavailable => 3,
         }
     }
 }

@@ -254,7 +254,7 @@ async fn mint_tokens(
                     Capability::ALL
                         .iter()
                         .copied()
-                        .filter(|capability| !capability.is_operator_only())
+                        .filter(|capability| capability.is_granted_without_scope())
                         .collect()
                 }),
         ),
@@ -2624,6 +2624,35 @@ max_request_microdollars = 1000
         let response =
             scoped_route_request(state, "/v1/credentials?namespaces=all", "mint-key").await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A mint request that names no scope inherits the caller's route
+    /// capabilities, but never `status`: the dependency-status view is a grant an
+    /// operator writes down, not one a subject inherits (#199).
+    #[tokio::test]
+    async fn a_scope_less_mint_grants_route_capabilities_but_not_status() {
+        let state = minting_state_without_scope();
+        let (status, body) = mint_request(state.clone(), json!({"sub": "agent"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let token = body["token"].as_str().expect("minted token").to_owned();
+        let snapshot = state.config();
+        let headers = HeaderMap::from_iter([(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        )]);
+        let caller = authenticate(&snapshot, &headers)
+            .await
+            .expect("the minted token authenticates");
+        let scope = caller
+            .scope
+            .expect("an omitted scope is still written down");
+        assert!(scope.contains(&Capability::Chat));
+        assert!(scope.contains(&Capability::Models));
+        assert!(!scope.contains(&Capability::Status));
+        assert!(!scope.contains(&Capability::CredentialsAll));
+
+        let (status, _) = mint_request(state, json!({"sub": "agent", "scope": ["status"]})).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]

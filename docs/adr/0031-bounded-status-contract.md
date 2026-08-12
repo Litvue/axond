@@ -54,7 +54,11 @@ capability — not `models`, not `credentials`, and not operator-only, so a
 deployment can grant it to a monitoring principal without granting anything else.
 `status` is the first capability that is not tied to a namespace having a model
 route, because a namespace's dependency health is a legitimate question even when
-it can invoke nothing.
+it can invoke nothing. It is also the first capability a scope-less mint request
+does **not** confer: `POST /v1/tokens` without a `scope` grants the caller's route
+capabilities, and granting the deployment's dependency view along with them would
+make monitoring reach a side effect of minting an inference token. A `status`
+grant is named or it does not exist.
 
 **Reads are cache reads.** `CachedStatusRegistry::view` is synchronous, takes an
 in-memory lock, and has no `async` in its signature — a handler *cannot* probe a
@@ -95,6 +99,17 @@ message, detail, prompt, or completion. Tests parse `metrics.rs` and fail if an
 instrument is built that the catalogue does not declare, if a recorded label is
 not declared for the instrument recording it, or if a closed vocabulary is missing
 a value the code can emit — so the catalogue cannot drift into documentation.
+
+### State tier
+
+Tier 0. The contract adds no backend: the registry is an in-memory map behind an
+`RwLock`, the refresher is a plain task, and a stateless deployment enables no
+component and therefore probes nothing — every component reports `disabled`,
+which is the Tier 0 default. At Tier 1 and Tier 2 the same registry is filled by
+the probes the store-backed slices bring with them, and the read path does not
+change: a probe observes the store on the refresher's cadence, never on a
+request. No deployment's tier is raised, and no configuration is required to keep
+a config-only deployment at Tier 0.
 
 ## Alternatives considered
 

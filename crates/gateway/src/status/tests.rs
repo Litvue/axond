@@ -563,6 +563,26 @@ fn backend_and_revision_failures_map_to_bounded_codes() {
     }
 }
 
+/// An alert thresholds `axond.status.component_state`, so the ladder has to put
+/// the default stateless posture *below* the healthy state: `disabled` is an
+/// absent observation, and ranking it worst would fire every severity alert on
+/// the most common deployment forever.
+#[test]
+fn the_state_gauge_ranks_disabled_below_ok_and_severity_above_it() {
+    assert!(ComponentState::Disabled.gauge_value() < ComponentState::Ok.gauge_value());
+    assert!(ComponentState::Ok.gauge_value() < ComponentState::Degraded.gauge_value());
+    assert!(ComponentState::Degraded.gauge_value() < ComponentState::Unavailable.gauge_value());
+
+    // The stateless default: nothing is configured, so no `>= degraded` alert
+    // may be able to see it.
+    let stateless = CachedStatusRegistry::stateless();
+    let degraded = ComponentState::Degraded.gauge_value();
+    for observed in stateless.view().components {
+        assert_eq!(observed.state, ComponentState::Disabled);
+        assert!(observed.state.gauge_value() < degraded);
+    }
+}
+
 #[test]
 fn component_names_match_the_metric_label_vocabulary() {
     assert_eq!(COMPONENTS.len(), Component::ALL.len());

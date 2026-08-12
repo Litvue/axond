@@ -71,6 +71,17 @@ impl Capability {
     pub(crate) const fn is_operator_only(self) -> bool {
         matches!(self, Self::CredentialsAll)
     }
+
+    /// Whether a mint request that names no `scope` grants this capability.
+    ///
+    /// Every route capability is: a token minted without a scope is meant to be
+    /// as capable as the key that minted it. `status` is not, because it answers
+    /// a question about the *deployment's* dependencies rather than about the
+    /// caller's own traffic, and a grant that wide should be written down rather
+    /// than inherited. It remains mintable by naming it explicitly.
+    pub(crate) const fn is_granted_without_scope(self) -> bool {
+        !self.is_operator_only() && !matches!(self, Self::Status)
+    }
 }
 
 impl std::fmt::Display for Capability {
@@ -1252,6 +1263,25 @@ max_ttl = "15m"
                 TokenVerificationError::Malformed
             ))
         ));
+    }
+
+    /// `status` is the one capability an omitted mint scope must not hand over,
+    /// while every route capability stays inherited (#199).
+    #[test]
+    fn only_status_and_the_operator_view_are_withheld_from_a_scope_less_mint() {
+        assert!(!Capability::Status.is_granted_without_scope());
+        assert!(!Capability::CredentialsAll.is_granted_without_scope());
+        for capability in Capability::ALL
+            .iter()
+            .copied()
+            .filter(|capability| !matches!(capability, Capability::Status))
+        {
+            assert_eq!(
+                capability.is_granted_without_scope(),
+                !capability.is_operator_only(),
+                "`{capability}` must keep its existing scope-less minting behaviour"
+            );
+        }
     }
 
     #[tokio::test]
