@@ -12,6 +12,9 @@ and operate it.
   wires, client behavior, and the `0.x` stability policy.
 - [State tiers](./configuration.md#state-tiers) — decide whether a deployment
   needs Redis, Postgres, or neither.
+- [Operating modes](./adr/0027-stateless-and-stateful-operating-modes.md) —
+  the accepted stateless/stateful ownership, failure, and request-path design
+  (stateless is today's behavior and the default).
 
 ## Install
 
@@ -73,3 +76,6 @@ and operate it.
 - [Release readiness](../RELEASE.md) — current public-beta evidence and known
   limitations.
 - [Architecture decisions](./adr) — accepted design decisions and consequences.
+- [ADR 0027: stateless and stateful operating modes](./adr/0027-stateless-and-stateful-operating-modes.md)
+  — state ownership matrix, failure/outage matrix, request-path database rules,
+  and the dependency map for the control-plane implementation slices.

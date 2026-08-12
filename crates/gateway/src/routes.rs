@@ -673,20 +673,31 @@ impl Route {
         self != Self::Embeddings
     }
 
-    /// A stored Responses id only resolves on the provider that stored it;
-    /// failing over would turn a continuity error into a confusing upstream
-    /// 404, so stateful continuations consider only the first configured
-    /// target. Null and empty values are ordinary non-continuation requests.
-    fn is_pinned(self, body: &Value) -> bool {
+    /// A stored Responses id only resolves on the provider — and under the
+    /// credential — that stored it, so *every* Responses request, initial ones
+    /// included, uses only the first configured target and credential. That is
+    /// what lets a later continuation recover the same affinity without any
+    /// durable state: had the initial call failed over, its response id would
+    /// live on an upstream no continuation can reach.
+    fn pins_affinity(self) -> bool {
         self == Self::Responses
+    }
+
+    /// Whether this request continues a provider-stored response. Only these
+    /// carry continuity that can be lost, so only these report
+    /// `continuation_affinity_unavailable`; a pinned *initial* request that
+    /// cannot use its target reports the ordinary routing or credential error.
+    /// Null and empty values are ordinary non-continuation requests.
+    fn is_continuation(self, body: &Value) -> bool {
+        self.pins_affinity()
             && body
                 .get("previous_response_id")
                 .and_then(Value::as_str)
                 .is_some_and(|id| !id.is_empty())
     }
 
-    fn max_attempts(self, body: &Value, configured: u32) -> u32 {
-        if self.is_pinned(body) { 1 } else { configured }
+    fn max_attempts(self, configured: u32) -> u32 {
+        if self.pins_affinity() { 1 } else { configured }
     }
 
     fn framing(self) -> Framing {
@@ -1072,8 +1083,9 @@ async fn dispatch_with_failover(
     let cfg = &snapshot.config;
     let policy = FailoverPolicy;
     let deadline = Instant::now() + Duration::from_millis(cfg.failover.overall_timeout_ms);
-    let max_attempts = wire.route.max_attempts(body, cfg.failover.max_attempts);
-    let pinned = wire.route.is_pinned(body);
+    let max_attempts = wire.route.max_attempts(cfg.failover.max_attempts);
+    let pinned = wire.route.pins_affinity();
+    let continuation = wire.route.is_continuation(body);
 
     let mut walk = FailoverWalk::new(caller, model.targets.len());
     for (index, target) in model.targets.iter().enumerate() {
@@ -1084,7 +1096,7 @@ async fn dispatch_with_failover(
             break;
         }
         let Some(provider) = cfg.provider(&target.provider) else {
-            if pinned {
+            if continuation {
                 return Err(GatewayError::ContinuationAffinityUnavailable {
                     provider: target.provider.clone(),
                     model: target.model.clone(),
@@ -1094,7 +1106,7 @@ async fn dispatch_with_failover(
         };
         let circuit_key = target_key(target);
         if let CircuitDecision::Skip = snapshot.target_circuits.allow(&circuit_key) {
-            if pinned {
+            if continuation {
                 return Err(GatewayError::ContinuationAffinityUnavailable {
                     provider: target.provider.clone(),
                     model: target.model.clone(),
@@ -1112,7 +1124,7 @@ async fn dispatch_with_failover(
                 .credentials
                 .plan(cfg, &caller.namespace, &provider.id)
         }) else {
-            if pinned {
+            if continuation {
                 return Err(GatewayError::ContinuationAffinityUnavailable {
                     provider: target.provider.clone(),
                     model: target.model.clone(),
@@ -1348,8 +1360,9 @@ async fn stream_with_failover(
     let cfg = &snapshot.config;
     let policy = FailoverPolicy;
     let deadline = Instant::now() + Duration::from_millis(cfg.failover.overall_timeout_ms);
-    let max_attempts = wire.route.max_attempts(&body, cfg.failover.max_attempts);
-    let pinned = wire.route.is_pinned(&body);
+    let max_attempts = wire.route.max_attempts(cfg.failover.max_attempts);
+    let pinned = wire.route.pins_affinity();
+    let continuation = wire.route.is_continuation(&body);
 
     let mut walk = FailoverWalk::new(caller, model.targets.len());
     let mut last_ctx: Option<(StreamContext, Instant)> = None;
@@ -1361,7 +1374,7 @@ async fn stream_with_failover(
             break;
         }
         let Some(provider) = cfg.provider(&target.provider) else {
-            if pinned {
+            if continuation {
                 return Err(GatewayError::ContinuationAffinityUnavailable {
                     provider: target.provider.clone(),
                     model: target.model.clone(),
@@ -1371,7 +1384,7 @@ async fn stream_with_failover(
         };
         let circuit_key = target_key(target);
         if let CircuitDecision::Skip = snapshot.target_circuits.allow(&circuit_key) {
-            if pinned {
+            if continuation {
                 return Err(GatewayError::ContinuationAffinityUnavailable {
                     provider: target.provider.clone(),
                     model: target.model.clone(),
@@ -1389,7 +1402,7 @@ async fn stream_with_failover(
                 .credentials
                 .plan(cfg, &caller.namespace, &provider.id)
         }) else {
-            if pinned {
+            if continuation {
                 return Err(GatewayError::ContinuationAffinityUnavailable {
                     provider: target.provider.clone(),
                     model: target.model.clone(),
@@ -4484,13 +4497,11 @@ targets = [
             .unwrap()
     }
 
-    fn streaming_responses_request(previous_response_id: &str) -> Request<Body> {
-        let body = json!({
-            "model": "gpt-4o",
-            "input": "hello",
-            "stream": true,
-            "previous_response_id": previous_response_id
-        });
+    fn streaming_responses_request(previous_response_id: Option<&str>) -> Request<Body> {
+        let mut body = json!({"model": "gpt-4o", "input": "hello", "stream": true});
+        if let Some(id) = previous_response_id {
+            body["previous_response_id"] = json!(id);
+        }
         authorized("/v1/responses")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
@@ -5020,8 +5031,11 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(records[0].attempts, 2);
     }
 
+    /// Affinity a continuation can recover requires the *initial* call to have
+    /// used the first target too, so no Responses request fails over — not even
+    /// one with no `previous_response_id` to lose.
     #[tokio::test]
-    async fn a_responses_previous_id_pins_the_first_target_without_failover() {
+    async fn every_responses_request_uses_the_first_target_without_failover() {
         let (url_a, hits_a) = controllable_upstream(
             Arc::new(AtomicBool::new(false)),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -5030,36 +5044,82 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         let (url_b, hits_b) =
             controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
         let captured = CapturingSink::default();
-        let state = two_target_state(&url_a, &url_b, "", captured.clone());
+        let state = two_target_state(
+            &url_a,
+            &url_b,
+            "[failover]\nmax_attempts = 3\nfailure_threshold = 10",
+            captured.clone(),
+        );
 
-        let pinned = router(state.clone())
-            .oneshot(responses_request(Some("resp-from-a")))
-            .await
-            .unwrap();
-        assert_eq!(pinned.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
-        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
+        for (index, request) in [
+            responses_request(Some("resp-from-a")),
+            responses_request_with_null_previous_id(),
+            responses_request(None),
+            streaming_responses_request(None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let _ = response.into_body().collect().await.unwrap();
+            assert_eq!(hits_a.load(Ordering::SeqCst), index + 1);
+            assert_eq!(hits_b.load(Ordering::SeqCst), 0);
+        }
 
-        let unpinned = router(state)
-            .oneshot(responses_request_with_null_previous_id())
-            .await
-            .unwrap();
-        assert_eq!(unpinned.status(), StatusCode::OK);
-        assert_eq!(hits_a.load(Ordering::SeqCst), 2);
+        // Streaming settlement is detached from the response future. Wait for
+        // the fourth Responses record before issuing chat so the record order
+        // below cannot race the settlement task.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let count = captured.0.lock().unwrap().len();
+            if count >= 4 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "streamed Responses settlement did not arrive before timeout; records={count}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Chat over the same alias still fails over: pinning is scoped to the
+        // Responses wire, not to the alias.
+        let chat = router(state).oneshot(chat_request()).await.unwrap();
+        assert_eq!(chat.status(), StatusCode::OK);
         assert_eq!(hits_b.load(Ordering::SeqCst), 1);
 
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let count = captured.0.lock().unwrap().len();
+            if count >= 5 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "chat settlement did not arrive before timeout; records={count}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
         let records = captured.0.lock().unwrap();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].status.as_str(), "upstream_error");
-        assert_eq!(records[0].attempts, 1);
-        assert_eq!(records[0].target_provider, "pa");
-        assert_eq!(records[1].status.as_str(), "ok");
-        assert_eq!(records[1].attempts, 2);
-        assert_eq!(records[1].target_provider, "pb");
+        assert_eq!(records.len(), 5);
+        for record in records.iter().take(4) {
+            assert_eq!(record.status.as_str(), "upstream_error");
+            assert_eq!(record.attempts, 1);
+            assert_eq!(record.target_provider, "pa");
+        }
+        assert_eq!(records[4].status.as_str(), "ok");
+        assert_eq!(records[4].target_provider, "pb");
     }
 
+    /// Initial and continuation requests share the pin but not its error
+    /// semantics: only a request carrying a `previous_response_id` has affinity
+    /// to lose, so only it reports `continuation_affinity_unavailable`. An
+    /// initial request that cannot use the pinned target reports the ordinary
+    /// routing error.
     #[tokio::test]
-    async fn a_pinned_responses_request_does_not_use_a_skipped_first_target() {
+    async fn only_a_continuation_reports_lost_affinity_for_a_skipped_first_target() {
         let (url_a, hits_a) = controllable_upstream(
             Arc::new(AtomicBool::new(false)),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -5075,21 +5135,21 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             captured.clone(),
         );
 
+        // The initial call is pinned to the failing first target, tripping its
+        // breaker without ever reaching the second one.
         let first = router(state.clone())
             .oneshot(responses_request(None))
             .await
             .unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(hits_a.load(Ordering::SeqCst), 1);
-        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
 
-        let pinned = router(state)
+        let pinned = router(state.clone())
             .oneshot(responses_request(Some("resp-from-a")))
             .await
             .unwrap();
         assert_eq!(pinned.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
-        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
         let body = pinned.into_body().collect().await.unwrap().to_bytes();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "continuation_affinity_unavailable");
@@ -5099,6 +5159,19 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
                 .unwrap()
                 .contains("continuation affinity")
         );
+
+        let initial = router(state)
+            .oneshot(responses_request(None))
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = initial.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "all_provider_circuits_open");
+
+        // Neither request that skipped the pinned target reached an upstream.
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
         let records = captured.0.lock().unwrap();
         assert_eq!(records.len(), 1);
     }
@@ -5126,18 +5199,22 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             .oneshot(responses_request(None))
             .await
             .unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(hits_a.load(Ordering::SeqCst), 1);
-        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
 
-        let pinned = router(state)
-            .oneshot(streaming_responses_request("resp-from-a"))
-            .await
-            .unwrap();
-        assert_eq!(pinned.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let _ = pinned.into_body().collect().await.unwrap();
+        // Both streamed shapes skip the tripped pinned target, and neither may
+        // leave its reservation outstanding.
+        for request in [
+            streaming_responses_request(Some("resp-from-a")),
+            streaming_responses_request(None),
+        ] {
+            let pinned = router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(pinned.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let _ = pinned.into_body().collect().await.unwrap();
+        }
         assert_eq!(hits_a.load(Ordering::SeqCst), 1);
-        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
 
         let key = BudgetKey {
             namespace: "platform".to_owned(),
@@ -5150,14 +5227,16 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "pinned continuation leaked its budget reservation"
+                "a pinned Responses request leaked its budget reservation"
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
+    /// A response created under a rotated key is one no continuation can
+    /// recover, so the pooled credential is pinned for initial calls too.
     #[tokio::test]
-    async fn pinned_responses_reuse_the_first_credential_while_unpinned_requests_rotate() {
+    async fn every_responses_request_reuses_the_first_pooled_credential() {
         let (base_url, seen) = credential_probe_upstream(false).await;
         let captured = CapturingSink::default();
         let state = two_credential_responses_state(&base_url, captured);
@@ -5182,11 +5261,13 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
                 StatusCode::OK
             );
         }
+        let streamed = router(state)
+            .oneshot(streaming_responses_request(None))
+            .await
+            .unwrap();
+        let _ = streamed.into_body().collect().await.unwrap();
 
-        assert_eq!(
-            *seen.lock().unwrap(),
-            ["Bearer sk-a", "Bearer sk-a", "Bearer sk-a", "Bearer sk-b"]
-        );
+        assert_eq!(*seen.lock().unwrap(), ["Bearer sk-a"; 5]);
     }
 
     #[tokio::test]
@@ -5195,13 +5276,22 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         let captured = CapturingSink::default();
         let state = two_credential_responses_state(&base_url, captured);
 
-        let response = router(state)
+        let response = router(state.clone())
             .oneshot(responses_request(Some("resp-from-a")))
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(*seen.lock().unwrap(), ["Bearer sk-a"]);
+
+        // The initial call is pinned to the same exhausted key: rotation stays
+        // off, and it reports the ordinary upstream error.
+        let initial = router(state)
+            .oneshot(responses_request(None))
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(*seen.lock().unwrap(), ["Bearer sk-a", "Bearer sk-a"]);
     }
 
     #[tokio::test]

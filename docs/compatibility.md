@@ -30,10 +30,18 @@ including one carrying a `credentials:all` claim — receive
 `403 token_scope_insufficient`. A scoped token also needs `credentials` for the
 route. `credentials:all` remains unmintable through `POST /v1/tokens`.
 
-Responses is forwarded natively with only `model` rewritten; streaming is
-byte-faithful and requests carrying a non-empty `previous_response_id` consider
-only their alias's first configured target and first configured credential; they
-do not fail over or rotate credentials.
+Responses is forwarded natively with only `model` rewritten and streaming is
+byte-faithful. **Every** `/v1/responses` request — initial calls as well as ones
+carrying a `previous_response_id` — considers only its alias's first configured
+target and first configured credential, and never fails over or rotates
+credentials. That is what lets a continuation reach the provider that stored the
+response without gateway state; the trade-off is that the Responses route has no
+failover, so a first-target outage or an exhausted first key is returned to the
+caller. Only a request with a non-empty `previous_response_id` reports
+`continuation_affinity_unavailable`; a pinned initial request that cannot use
+its target or key reports the ordinary routing, credential, or upstream error.
+`/v1/chat/completions`, `/v1/messages`, and `/v1/embeddings` keep full failover
+and credential rotation over the same aliases.
 
 ## Providers
 
@@ -87,6 +95,15 @@ describes is a public interface. Within `0.x`:
   [`CHANGELOG.md`](../CHANGELOG.md) with the migration.
 
 Practically: the config that boots on `0.x.y` boots on `0.x.(y+1)`.
+
+**Operating modes do not change that promise.**
+[ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md) accepts an
+opt-in stateful mode whose resources live in a Postgres control plane rather
+than TOML. The mode key is optional and defaults to `stateless`, so it is an
+additive change under the rules above: no existing key is renamed or removed, no
+default changes, and stateless validation is not tightened. Stateful mode is a
+deliberate operator choice with its own bootstrap surface, and configuration
+valid in one mode is not expected to be valid in the other.
 
 ### The usage schema
 
@@ -154,3 +171,7 @@ version 2 transition.
 - **Deferred features arriving on a date.** Cross-provider translation and
   further usage sinks (Tinybird, ClickHouse) remain post-beta with no committed
   schedule.
+- **The stateful control plane.** The design is accepted in
+  [ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md), but no
+  stateful mode, `/admin/v1` route, or durable schema ships yet. Nothing about
+  its surface is under the `0.x` config or HTTP promise until it exists.

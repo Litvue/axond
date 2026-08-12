@@ -120,11 +120,18 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | `429` | `budget_exceeded` | The `(namespace, subject)` cap is spent — settled spend plus live holds leaves no room. With `namespace_limit_microdollars` set, the same code and body also cover the namespace-wide cap being spent; `axond.budget.namespace_denials` is what tells them apart. | Raise `limit_microdollars` (or `namespace_limit_microdollars`) or wait. This is the tenant's own cap, not a provider rate limit. |
 | `503` | `budget_unavailable` | The budget store could not be reached and `on_unavailable = "deny"` (the default). | Fix Redis/Postgres. **Distinguish this from `429`:** `429` is the tenant over budget, `503` is *your* dependency down. |
 | `503` | `rate_limit_unavailable` | The Redis rate-limit store could not be reached and `on_unavailable = "deny"` (the default). | Fix Redis or deliberately choose `on_unavailable = "allow"`. |
-| `503` | `all_provider_circuits_open` | Every target for the alias has a tripped circuit. | The upstreams are down or the thresholds are too tight; check `axond.upstream.circuit_state`. |
+| `503` | `all_provider_circuits_open` | Every target the request could consider has a tripped circuit. That is all of the alias's targets on every route except `/v1/responses`, which considers only its pinned first target — so a Responses request can raise this while the alias's later targets are healthy. | The upstreams are down or the thresholds are too tight; check `axond.upstream.circuit_state`. On `/v1/responses`, read it as *the first target* being down, not the whole alias, and do not alert on it as an alias-wide outage. |
 | `502` | `no_credential` | The namespace has no credential for the resolved provider and no platform fallback. | Add a `[[credential]]`, or set `allow_platform_fallback` deliberately. |
 | `502` | `upstream_transport`, `provider_dependency_failed`, `model_unavailable`, `invalid_stream` | The upstream failed after the failover walk was exhausted. | Check the provider's status and the attempt spans; `attempts` on the usage record says how hard the gateway tried. |
 | `504` | `upstream_timeout` | A transport bound fired before a response could be served: connecting, waiting for headers, reading a buffered body, waiting for the next chunk of an open stream, or `failover.overall_timeout_ms` cancelling the in-flight attempt. | `axond.upstream.timeouts{axond.timeout}` and the attempt span's `axond.timeout` name the phase. Tune the matching `[transport]` bound, or `overall_timeout_ms` when the phase is `overall`. |
 | `502` | `upstream_body_too_large` | A buffered provider response exceeded `transport.max_response_bytes`, so it was refused instead of held in memory. | Raise `max_response_bytes` if the workload legitimately returns bodies that size; otherwise treat it as a misbehaving target. |
+| `503` | `continuation_affinity_unavailable` | A request carrying `previous_response_id` could not use the alias's pinned first target or credential, and continuity forbids substituting another. | Restore the first target/credential; retry later. An *initial* Responses request in the same state reports the ordinary error above instead. |
+
+`/v1/responses` records exactly one upstream attempt per request: it is pinned to
+the alias's first target and first credential whether or not it continues a
+stored response, so `attempts` is always `1` and no rotation lease appears
+([ADR 0023](./adr/0023-openai-responses-passthrough.md)). A Responses request
+failing while chat on the same alias succeeds is that pin, not a routing bug.
 
 Mid-stream failures are different by construction. Native passthrough streams
 and OpenAI-normalized streams that have already queued downstream bytes remain
@@ -149,7 +156,7 @@ terminated in band on the already-`200` response. Nothing is retried there, and
 no second completion is spliced in — the usage record settles once, as `partial`
 or `upstream_error`, and `axond.upstream.timeouts{axond.timeout="stream_idle"}`
 is what distinguishes a stalled provider from one that ended early
-([ADR 0027](./adr/0027-transport-phase-bounds.md)).
+([ADR 0028](./adr/0028-transport-phase-bounds.md)).
 
 A `504` whose phase is `overall` reports the gateway's own spent failover
 budget, so it is attributed to the request and the target's metrics but does not

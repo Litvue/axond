@@ -317,9 +317,11 @@ impl Credentials {
         self.plan_at(config, namespace, provider, Instant::now())
     }
 
-    /// Plan only the first configured credential for a stateful continuation.
+    /// Plan only the first configured credential for an affinity-pinned route.
     /// Provider-stored response ids are scoped to the credential's project or
-    /// organization, so rotating to another key would break continuity. This
+    /// organization, so rotating to another key would break continuity — for the
+    /// *initial* request as much as for the continuation, since a response
+    /// created under a rotated key is one no continuation can recover. This
     /// intentionally bypasses credential health so a parked or cooling-down
     /// first key surfaces its provider error instead of silently switching to
     /// a key that cannot see the stored response.

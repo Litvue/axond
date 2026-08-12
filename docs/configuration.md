@@ -43,13 +43,34 @@ egress: upstream provider calls still use the network at Tier 0.
 | `/healthz`, `/readyz` | Tier 0. |
 
 Namespaces, providers, aliases, prices, and provider credentials are
-permanently config-owned and reload through ADR 0011. Only callers and keys may
-ever become store-owned at Tier 2; nothing is defined in both. A database may
-not override namespace provider access, an alias's target, a price, or the
-credential pool. Even at Tier 2, a token verifier intersects token claims with
-config-owned namespace authority (ADR 0016). See
+config-owned and reload through ADR 0011. Only callers and keys may ever become
+store-owned at Tier 2; nothing is defined in both. A database may not override
+namespace provider access, an alias's target, a price, or the credential pool.
+Even at Tier 2, a token verifier intersects token claims with config-owned
+namespace authority (ADR 0016). See
 [ADR 0017](./adr/0017-state-tiers-and-optional-backends.md) and the hermetic
 [Tier 0 gate](./adr/0018-tier-0-hermetic-boot-gate.md).
+
+## Operating mode
+
+Everything in this reference describes the **stateless** operating mode, which
+is what the gateway does today and what it does when no mode is selected.
+
+[ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md) accepts a
+second, opt-in **stateful** mode in which tenants, identities, providers,
+credentials, catalogues, prices, aliases, and policies are owned by a durable
+Postgres control plane and administered through `/admin/v1` instead of TOML,
+while ordinary inference still reads one immutable in-memory snapshot. In that
+mode bootstrap TOML shrinks to `mode`, `[server]`, telemetry, control-plane
+connectivity, secret-store/KEK settings, a mandatory static breakglass operator
+credential for `/admin/v1`, and connectivity references for any opt-in
+budget/rate-limit/revocation backend; a stateful-owned section appearing in TOML
+is a boot error.
+
+No key in this reference has changed, and no existing configuration needs one:
+the mode key is optional, omitting it means stateless, and the stateful surface
+is not implemented yet. Read the ADR's ownership and failure matrices before
+planning a stateful deployment.
 
 ## `[server]`
 
@@ -94,6 +115,13 @@ Each target:
 Pricing is mandatory because budgets are denominated in currency: an unpriced
 target could not be charged, so it fails to parse.
 
+`/v1/responses` does not use the target order at all: every Responses request,
+initial or continuation, is served only by the **first** target so a
+provider-stored response id stays reachable without gateway state. An alias
+whose first target is low-availability is a poor Responses alias, and reordering
+`targets` strands response ids created under the previous order
+([ADR 0023](./adr/0023-openai-responses-passthrough.md)).
+
 An alias cannot fail over between OpenAI-shaped and Anthropic targets because no
 single route can serve both wires. Such a cross-family alias is rejected at boot
 and on reload; a request that uses an alias from one family on the wrong route
@@ -134,6 +162,10 @@ credential.
 | `failure_threshold` | integer | `2` | Consecutive credential-scoped failures (429 / quota) that park one credential. Must be ≥ 1. |
 | `cooldown_seconds` | integer | `30` | How long a parked credential waits before a single half-open probe. Must be ≥ 1. |
 
+`/v1/responses` is exempt: every Responses request uses the **first** configured
+credential of the pool regardless of `strategy` or parked state, because a
+response id is scoped to the key that created it (ADR 0023).
+
 Parking is per credential, never per target: a rate-limited key is skipped while
 the same target keeps serving every other key. This applies to streamed opens;
 an OpenAI-normalized stream can rotate on an explicit rate-limit event before
@@ -150,6 +182,10 @@ The outer loop around pool dispatch: an alias's targets, in order
 | `overall_timeout_ms` | integer | `30000` | Wall-clock budget for the whole walk. No further target is attempted once spent. Must be ≥ 1. |
 | `failure_threshold` | integer | `3` | Consecutive target-scoped failures that trip a target's circuit. Distinct from the credential threshold. Must be ≥ 1. |
 | `cooldown_seconds` | integer | `30` | How long a tripped target is skipped before a half-open probe. Must be ≥ 1. |
+
+`max_attempts` does not apply to `/v1/responses`, which always attempts exactly
+one target. Its circuit is still recorded and observed: a tripped first target
+makes Responses requests fail rather than move on.
 
 Circuits are in-memory and per replica, consistent with running stateless
 ([ADR 0002](./adr/0002-stateless-by-default-stateful-by-opt-in.md)).
