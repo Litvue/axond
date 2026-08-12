@@ -396,8 +396,9 @@ pub struct Occupancy {
     /// The most requests waiting for the first byte of their *answer* at once —
     /// response headers for a buffered request, the first relayed chunk for a
     /// stream. The driver-side view of the queue the replica is holding, which is
-    /// what an operator sees as `axond.admission.in_flight{resource="queue"}`
-    /// from the inside.
+    /// what an operator sees as
+    /// `axond.admission.in_flight{axond.admission.resource="queue"}` from the
+    /// inside.
     pub awaiting_first_byte_peak: u64,
     /// The admission queue the process was configured with, for context.
     pub admission_queue_capacity: u64,
