@@ -160,8 +160,8 @@ fn minted_scenarios() -> Vec<(&'static str, TokenInput<'static>)> {
             scope,
             aliases,
         };
-    let in_namespace = axond::NAMESPACES[0];
-    let other_namespace = axond::NAMESPACES[1];
+    let in_namespace = axond_fuzz_seam::NAMESPACES[0];
+    let other_namespace = axond_fuzz_seam::NAMESPACES[1];
     vec![
         (
             // No `scope` claim at all: what a plain `axond mint` issues, and
@@ -266,8 +266,8 @@ fn minted_scenarios() -> Vec<(&'static str, TokenInput<'static>)> {
                 in_namespace,
                 "smoke",
                 None,
-                axond::MAX_TTL_SECONDS,
-                Some(axond::epoch_min_iat() - 60),
+                axond_fuzz_seam::MAX_TTL_SECONDS,
+                Some(axond_fuzz_seam::epoch_min_iat() - 60),
                 None,
                 None,
             ),
@@ -280,8 +280,8 @@ fn minted_scenarios() -> Vec<(&'static str, TokenInput<'static>)> {
                 in_namespace,
                 "smoke",
                 None,
-                axond::MAX_TTL_SECONDS,
-                Some(axond::epoch_min_iat() + 1),
+                axond_fuzz_seam::MAX_TTL_SECONDS,
+                Some(axond_fuzz_seam::epoch_min_iat() + 1),
                 None,
                 None,
             ),

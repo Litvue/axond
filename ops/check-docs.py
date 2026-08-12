@@ -393,6 +393,40 @@ def check_review_trigger_tests() -> list[str]:
     return failures
 
 
+def check_documented_targets() -> list[str]:
+    """No crate names a library after one of its own binaries.
+
+    `cargo doc` documents one target per crate name, so a library sharing a
+    binary's name quietly takes its place: `target/doc/axond/` becomes the
+    library's, every module under the binary stops being rustdoc-linted, and the
+    `Documentation` lane keeps passing with `RUSTDOCFLAGS=-D warnings` covering
+    nothing. Marking the library `doc = false` does not help — it removes the
+    whole crate from the documentation instead. Only distinct names keep both.
+    """
+    failures: list[str] = []
+    for manifest in sorted((ROOT / "crates").glob("*/Cargo.toml")):
+        text = manifest.read_text(encoding="utf-8")
+        library = re.search(r"^\[lib\]$(.*?)(?=^\[|\Z)", text, re.M | re.S)
+        if not library:
+            continue
+        name = re.search(r'^name = "([^"]+)"', library.group(1), re.M)
+        if not name:
+            continue
+        binaries = [
+            match.group(1)
+            for match in re.finditer(
+                r"^\[\[bin\]\]$.*?^name = \"([^\"]+)\"", text, re.M | re.S
+            )
+        ]
+        if name.group(1) in binaries:
+            failures.append(
+                f"{manifest.relative_to(ROOT)}: the library is named {name.group(1)!r} "
+                "after a binary of the same crate, so `cargo doc` documents only one "
+                "of them and the other's modules are no longer rustdoc-linted"
+            )
+    return failures
+
+
 def main(argv: list[str]) -> int:
     if argv == ["--self-test"]:
         return self_test()
@@ -413,6 +447,7 @@ def main(argv: list[str]) -> int:
     failures.extend(check_release_script_triggers())
     failures.extend(check_review_trigger_tests())
     failures.extend(check_front_door_size())
+    failures.extend(check_documented_targets())
     if failures:
         for failure in failures:
             print(f"documentation check failed: {failure}", file=sys.stderr)

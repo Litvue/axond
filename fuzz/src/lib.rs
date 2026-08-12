@@ -24,7 +24,7 @@
 //! synthetic key material, so a fuzz run is hermetic and holds no real secret.
 
 use arbitrary::Arbitrary;
-use axond::{Rejection, VerifiedToken};
+use axond_fuzz_seam::{Rejection, VerifiedToken};
 
 /// A refusal must carry an operator-facing reason. An empty one would reach a
 /// log or a response body as a blank message.
@@ -62,7 +62,7 @@ pub fn config_toml(data: &[u8]) -> &'static str {
     let Ok(text) = str::from_utf8(data) else {
         return "not_utf8";
     };
-    let first = axond::config_from_toml_str(text);
+    let first = axond_fuzz_seam::config_from_toml_str(text);
     let outcome = match &first {
         Ok(shape) => {
             // A config that validated is a config the process would serve, so
@@ -104,7 +104,7 @@ pub fn config_toml(data: &[u8]) -> &'static str {
     // refused.
     assert_eq!(
         first.is_ok(),
-        axond::config_from_toml_str(text).is_ok(),
+        axond_fuzz_seam::config_from_toml_str(text).is_ok(),
         "the same configuration text was accepted and refused"
     );
     outcome
@@ -116,7 +116,7 @@ pub fn credentials_query(data: &[u8]) -> &'static str {
     let Ok(text) = str::from_utf8(data) else {
         return "not_utf8";
     };
-    let outcome = axond::credentials_query_namespaces(Some(text));
+    let outcome = axond_fuzz_seam::credentials_query_namespaces(Some(text));
     let class = match &outcome {
         Ok(Some(value)) => {
             // Percent-decoding only ever shrinks, so an accepted value cannot
@@ -144,13 +144,13 @@ pub fn credentials_query(data: &[u8]) -> &'static str {
     };
     assert_eq!(
         outcome.is_ok(),
-        axond::credentials_query_namespaces(Some(text)).is_ok(),
+        axond_fuzz_seam::credentials_query_namespaces(Some(text)).is_ok(),
         "the same query string was accepted and refused"
     );
     // A query the router never received must parse like an absent filter, and
     // an empty one must not be confused with it.
     assert_eq!(
-        axond::credentials_query_namespaces(None).expect("no query is not a rejection"),
+        axond_fuzz_seam::credentials_query_namespaces(None).expect("no query is not a rejection"),
         None
     );
     class
@@ -195,8 +195,8 @@ pub fn token_verify(input: &TokenInput<'_>) -> &'static str {
             scope,
             aliases,
         } => {
-            let audience = audience.unwrap_or(axond::AUDIENCE);
-            let Some(token) = axond::mint_hs256_token(
+            let audience = audience.unwrap_or(axond_fuzz_seam::AUDIENCE);
+            let Some(token) = axond_fuzz_seam::mint_hs256_token(
                 namespace,
                 subject,
                 audience,
@@ -222,13 +222,13 @@ pub fn token_verify(input: &TokenInput<'_>) -> &'static str {
 /// `None` for a seed that is not a signable JWS — most of the corpus, which
 /// exists for the decoding path and is replayed as bytes instead.
 pub fn token_verify_resigned_seed(seed: &str) -> Option<&'static str> {
-    let token = axond::resign_seed_onto_this_run(seed)?;
+    let token = axond_fuzz_seam::resign_seed_onto_this_run(seed)?;
     Some(check_verification(&token, None))
 }
 
 /// The properties that hold for every credential, however it was produced.
 fn check_verification(credential: &str, minted_audience: Option<&str>) -> &'static str {
-    match axond::verify_token(credential) {
+    match axond_fuzz_seam::verify_token(credential) {
         Ok(None) => {
             // The verifier owns the `axt1.` shape; declining to answer would
             // hand the credential to a store that does not own it.
@@ -239,14 +239,14 @@ fn check_verification(credential: &str, minted_audience: Option<&str>) -> &'stat
             if let Some(audience) = minted_audience {
                 assert_eq!(
                     audience,
-                    axond::AUDIENCE,
+                    axond_fuzz_seam::AUDIENCE,
                     "a token for a foreign audience verified"
                 );
                 // The HS256 signer is scoped to one namespace; a signature it
                 // produced must never confer authority over another.
                 assert_eq!(
                     verified.namespace,
-                    axond::NAMESPACES[0],
+                    axond_fuzz_seam::NAMESPACES[0],
                     "the HS256 signer minted authority over a namespace it does not hold"
                 );
             }
@@ -270,10 +270,10 @@ fn check_verification(credential: &str, minted_audience: Option<&str>) -> &'stat
 ///
 /// If a signature check is not actually happening.
 pub fn assert_signature_verification_is_real() {
-    let token = axond::mint_hs256_token(
-        axond::NAMESPACES[0],
+    let token = axond_fuzz_seam::mint_hs256_token(
+        axond_fuzz_seam::NAMESPACES[0],
         "signature-check",
-        axond::AUDIENCE,
+        axond_fuzz_seam::AUDIENCE,
         300,
         None,
         None,
@@ -281,7 +281,7 @@ pub fn assert_signature_verification_is_real() {
     )
     .expect("the seam mints its own token");
     assert!(
-        matches!(axond::verify_token(&token), Ok(Some(_))),
+        matches!(axond_fuzz_seam::verify_token(&token), Ok(Some(_))),
         "the seam cannot verify a token it just minted"
     );
 
@@ -303,7 +303,7 @@ pub fn assert_signature_verification_is_real() {
         characters[0] = if characters[0] == 'A' { 'B' } else { 'A' };
         tampered[segment] = characters.into_iter().collect();
         let credential = format!("axt1.{}", tampered.join("."));
-        let outcome = axond::verify_token(&credential);
+        let outcome = axond_fuzz_seam::verify_token(&credential);
         assert!(
             matches!(
                 outcome,
@@ -316,7 +316,7 @@ pub fn assert_signature_verification_is_real() {
 
 fn assert_accepted(verified: &VerifiedToken) {
     assert!(
-        axond::NAMESPACES.contains(&verified.namespace.as_str()),
+        axond_fuzz_seam::NAMESPACES.contains(&verified.namespace.as_str()),
         "a token verified into undeclared namespace {:?}",
         verified.namespace
     );
@@ -327,9 +327,9 @@ fn assert_accepted(verified: &VerifiedToken) {
     // The scope vocabulary is closed, so a token cannot present more distinct
     // capabilities than the gateway defines.
     assert!(
-        verified.capabilities <= axond::CAPABILITY_COUNT,
+        verified.capabilities <= axond_fuzz_seam::CAPABILITY_COUNT,
         "a token presented {} capabilities, more than the {} defined",
         verified.capabilities,
-        axond::CAPABILITY_COUNT
+        axond_fuzz_seam::CAPABILITY_COUNT
     );
 }

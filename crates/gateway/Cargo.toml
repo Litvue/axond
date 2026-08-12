@@ -30,8 +30,13 @@ path = "src/main.rs"
 # A cfg rather than a Cargo feature for exactly that reason: a feature would be
 # reachable by any dependant, and `--all-features` would compile it here.
 # No tests of its own — the crate's tests run from the binary target.
+#
+# The name deliberately differs from the binary's: Cargo documents only one
+# target of a given crate name, so a library named `axond` alongside the `axond`
+# binary silently takes the binary's place in `cargo doc`, and every module under
+# `src/` stops being rustdoc-linted. `ops/check-docs.py` pins that apart.
 [lib]
-name = "axond"
+name = "axond_fuzz_seam"
 path = "src/fuzz_seam.rs"
 test = false
 doctest = false

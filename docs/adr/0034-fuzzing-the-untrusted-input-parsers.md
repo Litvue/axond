@@ -45,7 +45,12 @@ updates both lockfiles.
 ### A seam gated on a cfg, not a Cargo feature
 
 The targets need private items. They reach them through a second library target
-over the same module sources (`crates/gateway/src/fuzz_seam.rs`), gated
+over the same module sources (`crates/gateway/src/fuzz_seam.rs`), named
+`axond_fuzz_seam` rather than `axond` — a library sharing the binary's crate name
+takes its place in `cargo doc`, which would leave every module under `src/`
+unlinted while the documentation lane still passed, and `doc = false` removes the
+crate from the documentation altogether. `ops/check-docs.py` keeps the names
+apart. It is gated
 `#![cfg(fuzzing)]` — set by `fuzz/.cargo/config.toml` and by `cargo fuzz`, and by
 nothing at the repository root:
 
