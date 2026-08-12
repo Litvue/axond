@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.5](https://github.com/Litvue/axond/compare/v0.3.4...v0.3.5) (2026-08-12)
+
+
+### Features
+
+* **config:** add explicit stateless/stateful operating modes ([#174](https://github.com/Litvue/axond/issues/174)) ([0a179db](https://github.com/Litvue/axond/commit/0a179db3182264ddf17ae2172b653309d99633d1))
+
+
+### Refactors
+
+* **state:** scaffold responsibility-specific backend contracts ([#173](https://github.com/Litvue/axond/issues/173)) ([c0361f7](https://github.com/Litvue/axond/commit/c0361f79b53bea0c83eed3e69c2cdf51c694b6b6))
+
 ## [0.3.4](https://github.com/Litvue/axond/compare/v0.3.3...v0.3.4) (2026-08-12)
 
 
