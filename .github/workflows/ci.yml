@@ -202,7 +202,12 @@ jobs:
           python3 ops/check-docs.py
           python3 ops/check-release-config.py
           shellcheck install.sh ops/publish-image-index.sh \
-            ops/verify-image-evidence.sh ops/check-compose-platform.sh
+            ops/verify-image-evidence.sh ops/check-compose-platform.sh \
+            ops/check-installer-download.sh
+          # A failed download must name the kind of failure: the older-release
+          # explanation belongs to a 404, and a transport failure must read as
+          # retryable rather than as a missing artifact.
+          bash ops/check-installer-download.sh
           # Every released Unix target must resolve to its own archive, and a
           # target outside the release matrix must be refused rather than
           # producing a download URL for an asset that was never published.

@@ -31,6 +31,7 @@ docs-check:
     bash -n ops/publish-image-index.sh
     bash -n ops/verify-image-evidence.sh
     bash ops/check-compose-platform.sh
+    bash ops/check-installer-download.sh
     AXOND_VERSION=0.0.0 AXOND_TARGET=x86_64-unknown-linux-musl AXOND_INSTALL_DRY_RUN=1 sh install.sh | grep -F 'axond-0.0.0-x86_64-unknown-linux-musl.tar.gz'
     AXOND_VERSION=0.0.0 AXOND_TARGET=aarch64-unknown-linux-musl AXOND_INSTALL_DRY_RUN=1 sh install.sh | grep -F 'axond-0.0.0-aarch64-unknown-linux-musl.tar.gz'
     docker compose --env-file ops/compose/env.example config --quiet
