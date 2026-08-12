@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.18](https://github.com/Litvue/axond/compare/v0.3.17...v0.3.18) (2026-08-12)
+
+
+### Features
+
+* **release:** add ARM64 archives and multi-architecture OCI artifacts ([#204](https://github.com/Litvue/axond/issues/204)) ([a31699f](https://github.com/Litvue/axond/commit/a31699facef3afd3915d49b4810800426653ea0e))
+
+
+### Bug Fixes
+
+* **release:** assert the index before promotion applies any release tag ([#240](https://github.com/Litvue/axond/issues/240)) ([f1afb15](https://github.com/Litvue/axond/commit/f1afb154c12eb3c29d066cb356c32b4ea5669aba))
+
+
+### Tests
+
+* **qualification:** add deterministic capacity harness and result schema ([#232](https://github.com/Litvue/axond/issues/232)) ([6ac036b](https://github.com/Litvue/axond/commit/6ac036b468cf95800102c80186421278b7a61f32))
+
 ## [0.3.17](https://github.com/Litvue/axond/compare/v0.3.16...v0.3.17) (2026-08-12)
 
 
