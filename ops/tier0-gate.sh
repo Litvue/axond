@@ -248,11 +248,20 @@ if [[ "$check_listeners" != 1 ]]; then
   echo "listeners: DEGRADED, in-namespace listener invariant not checked"
 else
   listeners="$(listener_ports)"
-  expected_listeners="$(printf '%s\n18081\n18082\n' "$baseline_listeners" | sed '/^$/d' | sort -n | uniq)"
-  if [[ "$listeners" != "$expected_listeners" ]]; then
-    failure "listener invariant violated: namespace must contain its baseline listeners plus only gateway 18081 and fake upstream 18082; unexpected listener set (${listeners//$'\n'/, }), expected (${expected_listeners//$'\n'/, }). This includes any Redis 6379 or Postgres 5432 listener. External datastore dependencies are excluded by the network namespace and would instead appear as boot or serving failure."
+  # Expect exactly the ports this run actually starts: 18082 belongs to the
+  # fixture upstream, which a run without `python3` never launched.
+  if [[ "$check_serving" == 1 ]]; then
+    expected_ports=$'18081\n18082'
+    expected_description="gateway 18081 and fake upstream 18082"
+  else
+    expected_ports='18081'
+    expected_description="gateway 18081 (the fixture upstream was not started)"
   fi
-  echo "namespace listeners: baseline (${baseline_listeners//$'\n'/, }) plus gateway 18081 and fake upstream 18082 only; external Redis 6379/Postgres 5432 are excluded by namespace egress denial"
+  expected_listeners="$(printf '%s\n%s\n' "$baseline_listeners" "$expected_ports" | sed '/^$/d' | sort -n | uniq)"
+  if [[ "$listeners" != "$expected_listeners" ]]; then
+    failure "listener invariant violated: namespace must contain its baseline listeners plus only $expected_description; unexpected listener set (${listeners//$'\n'/, }), expected (${expected_listeners//$'\n'/, }). This includes any Redis 6379 or Postgres 5432 listener. External datastore dependencies are excluded by the network namespace and would instead appear as boot or serving failure."
+  fi
+  echo "namespace listeners: baseline (${baseline_listeners//$'\n'/, }) plus $expected_description only; external Redis 6379/Postgres 5432 are excluded by namespace egress denial"
 fi
 
 health_probe_body="$(mktemp "$tmpdir/axond-tier0-healthz.XXXXXX")"
