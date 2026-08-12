@@ -28,7 +28,12 @@ fi
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
-curl --fail --silent --show-error --location --output "$workdir/$ARCHIVE" "$URL"
+# The release CDN answers an occasional 503, and a lint lane that fails on one
+# is a false red, so retry before giving up. The checksum below is what makes
+# the download trustworthy, not the transport.
+curl --fail --silent --show-error --location \
+    --retry 5 --retry-delay 2 --retry-connrefused --retry-all-errors \
+    --output "$workdir/$ARCHIVE" "$URL"
 echo "$ACTIONLINT_SHA256  $workdir/$ARCHIVE" | sha256sum --check --quiet
 tar -C "$workdir" -xzf "$workdir/$ARCHIVE" actionlint
 
