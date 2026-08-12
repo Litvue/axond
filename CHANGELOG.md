@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.14](https://github.com/Litvue/axond/compare/v0.3.13...v0.3.14) (2026-08-12)
+
+
+### Documentation
+
+* **security:** document threat-model review triggers ([#226](https://github.com/Litvue/axond/issues/226)) ([3a0150c](https://github.com/Litvue/axond/commit/3a0150c7951bd5a03a1c803398cb854a2baca22f))
+
 ## [0.3.13](https://github.com/Litvue/axond/compare/v0.3.12...v0.3.13) (2026-08-12)
 
 
