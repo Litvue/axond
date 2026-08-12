@@ -9,8 +9,8 @@
 //! schema inherits them instead of restating them.
 //!
 //! The reader is generic over its error type rather than owning one, because the
-//! *classification* of a refusal is a per-schema question — see
-//! [`BodyError::is_incompatible`] on each implementation. So [`Record`] decides
+//! *classification* of a refusal is a per-schema question — each schema's error
+//! enum answers it with its own `is_incompatible`. So [`Record`] decides
 //! what is wrong and each schema's error enum decides what that means, and no
 //! schema can drift into reading a body more loosely than another.
 

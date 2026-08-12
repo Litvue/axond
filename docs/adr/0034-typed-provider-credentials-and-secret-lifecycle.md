@@ -1,4 +1,4 @@
-# 33. Typed provider credentials, opaque secret references, and a secret lifecycle
+# 34. Typed provider credentials, opaque secret references, and a secret lifecycle
 
 Date: 2026-08-12
 
@@ -81,8 +81,11 @@ display_name, secret_id, secret_version, lifecycle
   not publish.
 - **`SecretStore` is a contract, and its only implementation is a test double.**
   `SecretResolver` (resolve, exists) is split from `SecretStore` (stage, rotate,
-  transition, describe) so a resolving caller cannot mint or move material. The
-  in-memory fake states the contract executably and is not a selectable backend.
+  transition, describe) so a resolving caller cannot mint or move material.
+  `exists` answers what `resolve` would do rather than whether a row is present,
+  so a check built on it cannot approve withdrawn material, and it answers
+  identically for another owner's reference and an absent one. The in-memory fake
+  states the contract executably and is not a selectable backend.
 
 Stateless mode is untouched: `[[credential]]` material still comes from TOML,
 `env:`, or `file:` through `crate::credentials`, which has no `SecretRef` in it

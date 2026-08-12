@@ -200,7 +200,7 @@ path is in [backend contracts](../maintainers/backend-contracts.md) and
 [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md); the durable
 credential contract — opaque exactly-versioned references, exact ownership, and
 the lifecycle states — is
-[ADR 0033](../adr/0033-typed-provider-credentials-and-secret-lifecycle.md), and a
+[ADR 0034](../adr/0034-typed-provider-credentials-and-secret-lifecycle.md), and a
 change to the lifecycle relation or to what a reference discloses amends it.
 Making secret resolution reachable from the request path changes the availability
 argument and needs an ADR.

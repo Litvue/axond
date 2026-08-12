@@ -129,7 +129,7 @@ A reference is a *domain* type, not a store type:
 `desired_state::secrets::SecretRef` is what a credential body carries and what
 the store is asked about, so there is no second reference shape to keep in step.
 Three properties of it are enforced by types rather than by review
-([ADR 0033](../adr/0033-typed-provider-credentials-and-secret-lifecycle.md)):
+([ADR 0034](../adr/0034-typed-provider-credentials-and-secret-lifecycle.md)):
 
 - **Opaque and exact.** `SecretId` (`sct_…`) is deliberately not a `ResourceId`,
   so a credential's id and the id of its material are not interchangeable in a
@@ -148,10 +148,14 @@ Three properties of it are enforced by types rather than by review
 
 The trait is split so that resolving cannot mint: `SecretResolver` has `resolve`
 and `exists`, and `SecretStore: SecretResolver` adds `stage`, `rotate`,
-`transition`, and `describe`. The only implementation today is the in-memory fake
-in `backends::fakes`, which states the contract executably and is not a selectable
-backend. Provider-credential bodies and the publication rules that cross-check
-them live in `desired_state::credentials`; nothing there calls a store.
+`transition`, and `describe`. `exists` answers what `resolve` would do rather
+than whether a row is present — withdrawn material answers `false`, so a
+pre-publication check cannot approve a version that will never authorize
+anything, and `describe` is where a caller asks *why*. The only implementation
+today is the in-memory fake in `backends::fakes`, which states the contract
+executably and is not a selectable backend. Provider-credential bodies and the
+publication rules that cross-check them live in `desired_state::credentials`;
+nothing there calls a store.
 
 ## Catalogue metadata is not activation
 

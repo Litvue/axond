@@ -3,7 +3,7 @@
 //! A provider credential is the resource an operator authors when a tenant brings
 //! its own provider key (ADR 0003). What makes it unusual among resources is what
 //! it must *not* contain: the key. So its body carries a
-//! [`SecretRef`](super::secrets::SecretRef) — an opaque, exactly-versioned handle
+//! [`SecretRef`] — an opaque, exactly-versioned handle
 //! — the [`SecretOwner`] that handle belongs to, and the
 //! [`SecretLifecycle`] state of that material. The bytes are behind
 //! [`SecretStore`](crate::backends::secrets::SecretStore), which nothing in this
@@ -15,7 +15,7 @@
 //! | --- | --- |
 //! | `schema` | `axond.provider-credential.v1` |
 //! | `credential_id` | its own [`ResourceId`], bound to the envelope's |
-//! | `tenant_id` | the owning [`TenantId`](super::ids::TenantId) |
+//! | `tenant_id` | the owning [`TenantId`] |
 //! | `project_id` | the owning project, when the credential is a project's |
 //! | `provider_id` | the provider resource this credential authenticates to |
 //! | `display_name` | operator-facing prose |
@@ -58,8 +58,7 @@
 //!
 //! Stateless mode is untouched by all of this: `[[credential]]` material still
 //! comes from TOML, `env:`, or `file:` through [`crate::credentials`], which has
-//! no [`SecretRef`](super::secrets::SecretRef) in it and no dependency on this
-//! module.
+//! no [`SecretRef`] in it and no dependency on this module.
 
 use std::collections::BTreeMap;
 

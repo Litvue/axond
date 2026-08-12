@@ -185,7 +185,7 @@ material — `secret_id` (`sct_…`) plus `secret_version` — and never the mat
 nor a fingerprint, prefix, or length of it. Plaintext lives in the secret store,
 is unwrapped only while a snapshot is compiled, and is never in the journal, a
 manifest, an audit event, or a log line ([ADR
-0033](../adr/0033-typed-provider-credentials-and-secret-lifecycle.md)).
+0034](../adr/0034-typed-provider-credentials-and-secret-lifecycle.md)).
 
 Four things follow, and each is worth knowing before you rotate a key:
 

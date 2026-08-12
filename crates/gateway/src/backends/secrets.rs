@@ -253,11 +253,19 @@ pub trait SecretResolver: Send + Sync {
         reference: &SecretRef,
     ) -> Result<SecretMaterial, SecretError>;
 
-    /// Whether a reference still resolves for this owner, without unwrapping it.
+    /// Whether `reference` would resolve for this owner, without unwrapping it.
     ///
     /// For `/admin/v1` reads and pre-publication checks that have no business
-    /// holding plaintext. Answers `false` for material this owner may not use, so
-    /// probing is not a way to enumerate another tenant's secrets.
+    /// holding plaintext. `true` means exactly what [`SecretResolver::resolve`]
+    /// would do: material this owner holds, in a state that
+    /// [`SecretLifecycle::permits_resolution`]. Anything withdrawn — disabled,
+    /// revoked, or tombstoned — answers `false`, so a check cannot approve a
+    /// credential that will never authorize anything; a caller that wants the
+    /// *reason* asks [`SecretStore::describe`].
+    ///
+    /// Another owner's material answers `false` too, and identically, so probing
+    /// is not a way to enumerate another tenant's secrets or to tell a foreign
+    /// reference from an absent one.
     async fn exists(&self, owner: SecretOwner, reference: &SecretRef) -> Result<bool, SecretError>;
 }
 
@@ -597,10 +605,16 @@ mod tests {
             }
         );
         assert_eq!(error.category(), FailureCategory::Denied);
+        // A presence check answers what resolution would do, so a
+        // pre-publication check cannot approve withdrawn material. `describe`
+        // still says *why*, without unwrapping anything.
         assert!(
-            store.exists(owner(), &reference).await.unwrap(),
-            "disabled material is still stored"
+            !store.exists(owner(), &reference).await.unwrap(),
+            "disabled material would not resolve"
         );
+        let descriptor = store.describe(owner(), &reference).await.unwrap();
+        assert_eq!(descriptor.lifecycle, SecretLifecycle::Disabled);
+        assert!(!descriptor.lifecycle.permits_resolution());
         store
             .transition(owner(), &reference, SecretLifecycle::Active)
             .await
@@ -609,6 +623,7 @@ mod tests {
             store.resolve(owner(), &reference).await.unwrap().expose(),
             "sk-live-1"
         );
+        assert!(store.exists(owner(), &reference).await.unwrap());
 
         // Revoking is one-way, and tombstoning destroys the material.
         store
@@ -616,6 +631,10 @@ mod tests {
             .await
             .unwrap();
         assert!(store.resolve(owner(), &reference).await.is_err());
+        assert!(
+            !store.exists(owner(), &reference).await.unwrap(),
+            "revoked material would not resolve"
+        );
         assert_eq!(
             store
                 .transition(owner(), &reference, SecretLifecycle::Active)
@@ -641,6 +660,11 @@ mod tests {
             store.describe(owner(), &reference).await.unwrap().lifecycle,
             SecretLifecycle::Tombstoned
         );
+        assert!(
+            !store.exists(owner(), &reference).await.unwrap(),
+            "destroyed material would not resolve"
+        );
+        assert!(store.resolve(owner(), &reference).await.is_err());
     }
 
     #[tokio::test]
