@@ -1,0 +1,187 @@
+//! Deterministic capacity qualification (ADR 0031).
+//!
+//! Every profile in `qualification/capacity/manifest.toml` is offered to a real
+//! `axond` process talking to the deterministic fake upstream, and each run
+//! writes a machine-readable artifact under `target/capacity/` carrying both the
+//! measurements and the exact inputs that produced them.
+//!
+//! What fails here is deliberately narrow. Throughput, latency, and TTFT are
+//! recorded and never asserted: a shared CI runner cannot bound them without
+//! flaking, and a flaky capacity gate is one that gets disabled. The hard
+//! failures are the properties that do not move with the machine — every
+//! request accepted, nothing shed, no upstream socket leaked, one usage record
+//! per admitted request, and resident memory that does not grow with the load.
+//!
+//! The reduced tier runs under `cargo test`. The heavy tier is the same code and
+//! the same assertions at a scale that needs its own runner, behind
+//! `AXOND_CAPACITY=1` and the `capacity` workflow.
+//!
+//! Nothing here qualifies stateful serving: the profiles run a Tier 0 process.
+
+mod support;
+
+use support::capacity::{self, CapacityResult, Tier, Workload};
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reduced_capacity_profiles_qualify_and_publish_their_evidence() {
+    qualify(Tier::Reduced).await;
+}
+
+/// The heavy tier: the same profiles at a scale that takes minutes. Opt-in,
+/// because it is slow and wants a runner to itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_heavy_capacity_profiles_qualify_and_publish_their_evidence() {
+    if std::env::var("AXOND_CAPACITY").as_deref() != Ok("1") {
+        eprintln!("skipping the heavy capacity profiles; set AXOND_CAPACITY=1 to run them");
+        return;
+    }
+    qualify(Tier::Heavy).await;
+}
+
+/// Every workload the driver implements is exercised by the committed manifest,
+/// and every profile carries the thresholds that make it a gate. A profile that
+/// silently loses its thresholds would still produce an artifact, and the
+/// artifact would look like evidence.
+#[test]
+fn the_committed_manifest_covers_every_workload_with_thresholds() {
+    let (manifest, _) = capacity::manifest::load();
+    let mut ids: Vec<&str> = manifest.profiles.iter().map(|p| p.id.as_str()).collect();
+    ids.sort_unstable();
+    let unique = ids.len();
+    ids.dedup();
+    assert_eq!(unique, ids.len(), "profile ids must be unique: {ids:?}");
+
+    for workload in [
+        Workload::Buffered,
+        Workload::Streaming,
+        Workload::Mixed,
+        Workload::ResponseSize,
+        Workload::Cancellation,
+    ] {
+        assert!(
+            manifest
+                .profiles
+                .iter()
+                .any(|profile| profile.workload == workload),
+            "no committed profile exercises the {} workload",
+            workload.as_str()
+        );
+    }
+    for profile in &manifest.profiles {
+        for tier in [Tier::Reduced, Tier::Heavy] {
+            let scale = profile.scale(tier);
+            assert!(
+                scale.concurrency > 0 && scale.requests >= scale.concurrency,
+                "{} [{}]: a scale must offer at least one request per worker",
+                profile.id,
+                tier.as_str()
+            );
+        }
+        assert!(
+            profile.thresholds.min_accepted_fraction > 0.0,
+            "{}: a profile without an acceptance threshold asserts nothing",
+            profile.id
+        );
+        if profile.workload == Workload::Cancellation {
+            assert!(
+                profile.cancel_every.is_some(),
+                "{}: the cancellation workload needs `cancel_every`",
+                profile.id
+            );
+        }
+    }
+}
+
+async fn qualify(tier: Tier) {
+    let (manifest, text) = capacity::manifest::load();
+    let mut failures = Vec::new();
+    for profile in &manifest.profiles {
+        let result = capacity::run(profile, tier, &text).await;
+        let path = result.write();
+        eprintln!(
+            "capacity: {}\n           -> {}",
+            result.summary(),
+            path.display()
+        );
+        assert_expected_outcomes(profile, &result);
+        for verdict in result.failures() {
+            failures.push(format!(
+                "{} [{}]: {} {} {} (measured {})",
+                profile.id,
+                tier.as_str(),
+                verdict.threshold,
+                verdict.comparison,
+                verdict.bound,
+                verdict.value
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "capacity thresholds failed:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// The workload-specific shape of a run, beyond the numeric thresholds: a
+/// cancellation profile that recorded no cancelled stream measured something
+/// else, and a streaming profile with no TTFT never opened a stream.
+fn assert_expected_outcomes(profile: &capacity::Profile, result: &CapacityResult) {
+    let usage = &result.usage_records;
+    match profile.workload {
+        Workload::Cancellation => {
+            let cancelled = result.outcomes.client_cancelled;
+            let expected = result.throughput.offered
+                / profile.cancel_every.expect("a cancellation cadence") as u64;
+            assert_eq!(
+                cancelled, expected,
+                "{}: the cancellation cadence did not hold: {result:#?}",
+                profile.id
+            );
+            assert_eq!(
+                usage.by_status.get("client_cancelled").copied(),
+                Some(cancelled),
+                "{}: every cancelled stream must settle as `client_cancelled`: {:?}",
+                profile.id,
+                usage.by_status
+            );
+            assert!(result.ttft_ms.is_some(), "{}: no stream opened", profile.id);
+        }
+        Workload::Streaming => {
+            assert!(result.ttft_ms.is_some(), "{}: no stream opened", profile.id);
+            assert_eq!(
+                usage.by_status.get("ok").copied(),
+                Some(result.throughput.accepted),
+                "{}: every completed stream must settle as `ok`: {:?}",
+                profile.id,
+                usage.by_status
+            );
+        }
+        Workload::Mixed => {
+            assert!(
+                result.ttft_ms.is_some(),
+                "{}: the mix must include streams",
+                profile.id
+            );
+            assert!(
+                result.upstream.streams_opened > 0,
+                "{}: no upstream stream was opened",
+                profile.id
+            );
+        }
+        Workload::Buffered | Workload::ResponseSize => {
+            assert_eq!(
+                usage.by_status.get("ok").copied(),
+                Some(result.throughput.accepted),
+                "{}: every buffered request must settle as `ok`: {:?}",
+                profile.id,
+                usage.by_status
+            );
+        }
+    }
+    assert_eq!(
+        result.upstream.requests, result.throughput.accepted,
+        "{}: every accepted request must have reached the upstream exactly once",
+        profile.id
+    );
+}
