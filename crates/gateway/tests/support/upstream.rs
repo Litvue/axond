@@ -462,7 +462,9 @@ fn split_events(bytes: &Bytes) -> Vec<Bytes> {
 
 /// A long stream of small events in the wire shape the route speaks, ending
 /// cleanly. Used to hold hundreds of streams open at once.
-fn slow_events(anthropic: bool, count: usize) -> Vec<Bytes> {
+/// Public so a test can assert against the bytes a client actually sees rather
+/// than a hand-written approximation of them.
+pub fn slow_events(anthropic: bool, count: usize) -> Vec<Bytes> {
     let mut chunks = Vec::new();
     if anthropic {
         chunks.push(event(

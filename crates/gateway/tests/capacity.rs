@@ -1,4 +1,4 @@
-//! Deterministic capacity qualification (ADR 0031).
+//! Deterministic capacity qualification (ADR 0032).
 //!
 //! Every profile in `qualification/capacity/manifest.toml` is offered to a real
 //! `axond` process talking to the deterministic fake upstream, and each run
@@ -23,6 +23,7 @@
 mod support;
 
 use support::capacity::{self, CapacityResult, Gauges, ResourceReport, Span, Tier, Workload};
+use support::upstream;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_reduced_capacity_profiles_qualify_and_publish_their_evidence() {
@@ -170,33 +171,48 @@ fn a_stream_waits_in_the_first_byte_gauge_until_its_first_relayed_chunk() {
     assert_eq!(gauges.awaiting(), 0);
 }
 
-/// Output events are counted over the relayed text, not per transport read: a
-/// starved reader takes several events in one read, and a marker can straddle a
-/// chunk boundary. Counting reads instead would let a busy machine miss the
-/// hang-up and fail the cadence assertion with nothing wrong.
+/// Output events are counted from the bytes the fake upstream really emits, over
+/// both wire families, however the transport frames them. Substring counting
+/// would miscount both ways — a preamble mentions `content` without relaying
+/// any, and an Anthropic delta names its type twice — and counting transport
+/// reads instead of events would let a starved reader miss its hang-up and fail
+/// the cadence assertion with nothing wrong.
 #[test]
 fn output_events_are_counted_however_the_transport_frames_them() {
-    let openai = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n";
-    let anthropic = "event: content_block_delta\ndata: {}\n\n";
+    for anthropic in [false, true] {
+        let wire: String = upstream::slow_events(anthropic, 5)
+            .iter()
+            .map(|chunk| String::from_utf8(chunk.to_vec()).expect("UTF-8 events"))
+            .collect();
+        assert_eq!(
+            capacity::output_events(&wire),
+            5,
+            "anthropic={anthropic}: only the five deltas relay output:\n{wire}"
+        );
 
-    assert_eq!(capacity::output_events(openai), 1);
-    assert_eq!(capacity::output_events(anthropic), 1);
-    // Several events coalesced into one read still count as several.
-    assert_eq!(capacity::output_events(&openai.repeat(4)), 4);
-    assert_eq!(
-        capacity::output_events(&format!("{openai}{anthropic}{openai}")),
-        3
-    );
-    // A preamble carries no output, and neither does the terminator.
-    assert_eq!(
-        capacity::output_events("event: message_start\ndata: {}\n\ndata: [DONE]\n\n"),
-        0
-    );
-    // A marker split across two reads counts once when the text is accumulated,
-    // which is why the driver accumulates it.
-    let (head, tail) = openai.split_at(openai.find("content").expect("a marker") + 3);
-    assert_eq!(capacity::output_events(head), 0);
-    assert_eq!(capacity::output_events(&format!("{head}{tail}")), 1);
+        // A preamble relays nothing, so a cancellation cannot fire on it.
+        let (preamble, _) = wire.split_at(wire.find("tok0").expect("a first token"));
+        assert_eq!(
+            capacity::output_events(preamble),
+            0,
+            "anthropic={anthropic}: nothing is relayed before the first token"
+        );
+
+        // Whole events arriving in one read count as several; a partial event
+        // counts once its remainder arrives, which is why the text accumulates.
+        let mid = wire.len() / 2;
+        let (head, tail) = wire.split_at(mid);
+        let progressive = capacity::output_events(head);
+        assert!(
+            progressive <= 5,
+            "anthropic={anthropic}: a partial read cannot overcount"
+        );
+        assert_eq!(
+            capacity::output_events(&format!("{head}{tail}")),
+            5,
+            "anthropic={anthropic}: an event split across two reads counts once"
+        );
+    }
 }
 
 /// An absent memory measurement means two different things, and they must not

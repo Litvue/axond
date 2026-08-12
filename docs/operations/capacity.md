@@ -2,7 +2,7 @@
 
 What one Axond replica costs to serve, how the numbers were produced, and which
 of them a change is allowed to move. The design and its boundaries are
-[ADR 0031](../adr/0031-capacity-qualification-harness.md); the bounds the
+[ADR 0032](../adr/0032-capacity-qualification-harness.md); the bounds the
 replica sheds at are [ADR 0030](../adr/0030-request-bounds-and-load-shedding.md).
 
 This page qualifies the **stateless request path only** — a Tier 0 process with

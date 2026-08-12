@@ -115,7 +115,7 @@ jobs:
           cache-targets: false
       - run: cargo test --workspace --all-features --locked
       # The reduced capacity profiles run inside the suite above; their result
-      # artifacts are kept so an envelope has evidence behind it (ADR 0031).
+      # artifacts are kept so an envelope has evidence behind it (ADR 0032).
       - name: Publish the reduced capacity results
         if: always()
         uses: actions/upload-artifact@v4

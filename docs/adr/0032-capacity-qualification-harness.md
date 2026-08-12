@@ -1,4 +1,4 @@
-# 31. Deterministic capacity qualification and its result artifact
+# 32. Deterministic capacity qualification and its result artifact
 
 Date: 2026-08-12
 

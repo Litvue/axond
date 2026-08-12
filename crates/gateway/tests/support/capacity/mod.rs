@@ -1,6 +1,6 @@
 //! The deterministic capacity harness: a Rust-native driver that offers a
 //! committed profile's load to a real `axond` process and a deterministic fake
-//! upstream, and writes a machine-readable result artifact (ADR 0031).
+//! upstream, and writes a machine-readable result artifact (ADR 0032).
 //!
 //! Nothing here qualifies stateful serving: the profiles run a Tier 0 process
 //! with no Redis, no Postgres, and no control plane.

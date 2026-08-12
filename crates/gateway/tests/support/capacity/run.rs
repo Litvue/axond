@@ -612,10 +612,48 @@ async fn await_closed_upstreams(upstream: &FakeUpstream) -> i64 {
 }
 
 /// Relayed model-output events in a stream read so far, over both wire families.
-/// Counted over the accumulated text rather than per transport chunk: a starved
-/// reader takes several events in one read, and a marker can straddle a boundary.
+///
+/// Framed per SSE event rather than counted as substrings: a stream's preamble
+/// mentions `content` without relaying any (`message_start` carries an empty
+/// content array), and an Anthropic delta names its type in both the event line
+/// and the payload, so substring counting would both over- and under-state the
+/// output. Only complete events count — a trailing partial one is counted when
+/// the rest of it arrives, which is why the driver accumulates the text.
 pub fn output_events(relayed: &str) -> usize {
-    relayed.matches("\"content\":").count() + relayed.matches("content_block_delta").count()
+    relayed
+        .split_inclusive("\n\n")
+        .filter(|event| event.ends_with("\n\n") && relays_output(event))
+        .count()
+}
+
+/// Whether one SSE event carries model output, over either wire family.
+fn relays_output(event: &str) -> bool {
+    let named_delta = event
+        .lines()
+        .filter_map(|line| line.strip_prefix("event:"))
+        .any(|name| name.trim() == "content_block_delta");
+    if named_delta {
+        return true;
+    }
+    event
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|payload| serde_json::from_str::<Value>(payload.trim()).ok())
+        .any(|payload| {
+            let kind = payload["type"].as_str().unwrap_or_default();
+            // Anthropic without an event line, and the Responses wire.
+            if kind == "content_block_delta" || kind == "response.output_text.delta" {
+                return true;
+            }
+            // A chat chunk relays output when a choice's delta holds text.
+            payload["choices"].as_array().is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    choice["delta"]["content"]
+                        .as_str()
+                        .is_some_and(|text| !text.is_empty())
+                })
+            })
+        })
 }
 
 fn millis(duration: Duration) -> f64 {
