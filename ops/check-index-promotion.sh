@@ -83,8 +83,12 @@ run_index() {
   # Runs the script and prints its exit status; the caller inspects the log. The
   # mode, tags, and expected digest are the parameters every case varies.
   local mode="$1" tags="$2" expect="$3" status=0
+  # GITHUB_OUTPUT is redirected, not inherited: the script writes the digest it
+  # published there, and a fixture digest must not land in the real CI step's
+  # outputs.
   CALL_LOG="$work/calls.log" FIXTURES="$fixtures" \
   PATH="$work/bin:$PATH" \
+  GITHUB_OUTPUT="$work/github-output.txt" \
   IMAGE_NAME=ghcr.io/litvue/axond \
   RELEASE_VERSION=9.9.9 \
   RELEASE_SHORT_SHA=abcdef1 \
@@ -194,6 +198,10 @@ grep -qF -e "ghcr.io/litvue/axond@$index_digest" <<<"$create" || {
 }
 if grep -qF -e "$amd64_child" <<<"$create"; then
   echo "FAIL: the promotion reassembled the index from child references: $create" >&2
+  exit 1
+fi
+if [[ "$(cat "$work/github-output.txt")" != "digest=$index_digest" ]]; then
+  echo "FAIL: the promotion reported $(cat "$work/github-output.txt"), not the smoked digest" >&2
   exit 1
 fi
 echo "index promotion check: a valid promotion retags the smoked digest itself"
