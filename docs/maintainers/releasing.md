@@ -158,6 +158,14 @@ floor still builds.
 
 ## Security releases
 
+Before the release, the changes it carries should already have been reviewed
+against the [threat-model review triggers](../security/threat-model-review.md):
+each trigger names the release-impact statement it owes, which is what the
+changelog, the migration notes, and the
+[compatibility contract](../compatibility.md) are assembled from. A release
+containing a token-format, namespace-key, schema, artifact, or signer-identity
+change without that statement is a release whose upgrade notes are guesswork.
+
 A security fix uses this same runbook — same required CI, signed artifacts, and
 attestations — with the additions in [`SECURITY.md`](../../SECURITY.md): a
 regression test that failed before the fix, a backport to the previous supported
