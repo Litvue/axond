@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.12](https://github.com/Litvue/axond/compare/v0.3.11...v0.3.12) (2026-08-12)
+
+
+### Features
+
+* **state:** converge durable revisions into runtime snapshots ([#189](https://github.com/Litvue/axond/issues/189)) ([e70328c](https://github.com/Litvue/axond/commit/e70328c5c4180904dc2a2c1b2a134fff1b1d4584)), closes [#142](https://github.com/Litvue/axond/issues/142)
+
 ## [0.3.11](https://github.com/Litvue/axond/compare/v0.3.10...v0.3.11) (2026-08-12)
 
 
