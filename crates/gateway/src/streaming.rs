@@ -38,9 +38,9 @@ use crate::admission::AdmissionPermit;
 use crate::budget::{BudgetKey, Reservation};
 use crate::credentials::{CredentialLease, CredentialSource};
 use crate::rate_limit::RateLimitPermit;
-use crate::routes::next_request_id;
 use crate::state::AppState;
 use crate::telemetry;
+use crate::usage::identity::EventIdentity;
 use crate::usage::{Status, UsageRecord};
 
 /// Everything the relay needs to attribute a streamed request once it ends.
@@ -53,9 +53,12 @@ pub struct StreamContext {
     pub target_model: String,
     pub source: CredentialSource,
     pub credential_id: String,
-    /// Captured in the handler while the server span is live; settlement may run
-    /// in a detached task where the span context is no longer current.
-    pub trace_id: Option<String>,
+    /// The identity of the single usage event this stream will settle as, minted
+    /// in the handler when the request was admitted. Carried rather than derived:
+    /// settlement may run in a detached task where the server span is no longer
+    /// current, and every way a stream can end — terminal, cancelled, rotated,
+    /// never opened — has to report the same event.
+    pub identity: EventIdentity,
     pub price: ModelPrice,
     pub budget_key: BudgetKey,
     /// The hold this request was admitted under, settled once when the stream
@@ -844,7 +847,8 @@ impl Accounting {
         });
         let record = UsageRecord {
             schema_version: UsageRecord::SCHEMA_VERSION,
-            request_id: next_request_id(),
+            request_id: self.ctx.identity.request_id.to_string(),
+            trace_id: self.ctx.identity.trace_id.clone(),
             namespace: self.ctx.namespace.clone(),
             subject: self.ctx.subject.clone(),
             signer_kid: self.ctx.signer_kid.clone(),
@@ -853,7 +857,6 @@ impl Accounting {
             target_model: self.ctx.target_model.clone(),
             credential_source: UsageRecord::credential_source_str(self.ctx.source),
             credential_id: self.ctx.credential_id.clone(),
-            trace_id: self.ctx.trace_id.clone(),
             status,
             input_tokens: usage.input_tokens,
             cache_read_tokens: usage.cache_read_tokens,
@@ -956,6 +959,7 @@ mod tests {
     use crate::config::Config;
     use crate::rate_limit::RateLimiter;
     use crate::routes::router;
+    use crate::usage::identity::{RequestId, next_request_id};
     use crate::usage::{UsageFanout, UsageSink};
 
     use super::*;
@@ -1235,7 +1239,10 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             target_model: "gpt-4o".to_owned(),
             source: CredentialSource::Platform,
             credential_id: "openai-primary".to_owned(),
-            trace_id: None,
+            identity: EventIdentity {
+                request_id: next_request_id(),
+                trace_id: None,
+            },
             price: ModelPrice {
                 input_microdollars_per_million: 1_000_000,
                 output_microdollars_per_million: 2_000_000,
@@ -1345,6 +1352,63 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         // 11 input @ 1 µ$/token + 3 output @ 2 µ$/token.
         assert_eq!(record["cost_microdollars"], 17);
         assert_eq!(ledger.settlements(), vec![17]);
+    }
+
+    /// A streamed request settles under the identity the handler minted, not one
+    /// invented in the detached settlement task.
+    #[tokio::test]
+    async fn a_streamed_request_settles_under_a_parseable_event_identity() {
+        let ledger = Arc::new(Ledger::default());
+        let base_url = upstream_serving(OPENAI_STREAM).await;
+        let resp = router(state_for(&base_url, ledger.clone()))
+            .oneshot(stream_request())
+            .await
+            .expect("response");
+        let mut body = resp.into_body().into_data_stream();
+        while body.next().await.is_some() {}
+
+        let record = settled(&ledger).await;
+        let id = record["request_id"].as_str().expect("a request id");
+        RequestId::parse(id).unwrap_or_else(|e| panic!("`{id}` is not an event identity: {e}"));
+    }
+
+    /// Every way a stream can end settles the *same* event: the id belongs to the
+    /// request, so a cancelled stream and a completed one are one billable fact
+    /// each, both nameable by whatever else logged the request.
+    #[tokio::test]
+    async fn a_cancelled_stream_settles_the_identity_the_handler_minted() {
+        let ledger = Arc::new(Ledger::default());
+        let ctx = context();
+        let minted = ctx.identity.request_id;
+        let accounting = Accounting::new(
+            state_for("http://127.0.0.1:1", ledger.clone()),
+            ctx,
+            Instant::now(),
+        );
+        // Dropped without settling: the caller went away mid-stream.
+        drop(accounting);
+
+        let record = settled(&ledger).await;
+        assert_eq!(record["status"], "client_cancelled");
+        assert_eq!(record["request_id"], minted.to_string());
+    }
+
+    /// A walk that never opened a stream still settles one record, under the same
+    /// identity the request was admitted with.
+    #[tokio::test]
+    async fn a_stream_that_never_opened_settles_the_same_identity() {
+        let ledger = Arc::new(Ledger::default());
+        let ctx = context();
+        let minted = ctx.identity.request_id;
+        settle_upstream_error(
+            state_for("http://127.0.0.1:1", ledger.clone()),
+            ctx,
+            Instant::now(),
+        );
+
+        let record = settled(&ledger).await;
+        assert_eq!(record["status"], "upstream_error");
+        assert_eq!(record["request_id"], minted.to_string());
     }
 
     #[tokio::test]
