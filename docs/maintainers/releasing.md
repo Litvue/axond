@@ -20,9 +20,11 @@ pipeline.
    `sha-<short>-index`, and assert every descriptor in it is a supported platform
    child (or an attestation manifest for one).
 8. Pull that index digest on each architecture and smoke it natively.
-9. Promote the smoked index: assert that digest still holds exactly the release
-   children, retag *that digest* as `<version>` and `sha-<short>` — nothing is
-   reassembled, so no check can run after a tag exists — sign it keylessly,
+9. Promote the smoked index (`INDEX_MODE=promote`, which requires the smoked
+   digest and refuses an empty one — staging cannot apply these tags at all):
+   assert that digest still holds exactly the release children, retag *that
+   digest* as `<version>` and `sha-<short>` — nothing is reassembled, so no check
+   can run after a tag exists — sign it keylessly,
    attest its provenance, verify both, and attach it to the release as
    `axond-image-<version>.digest`. SBOM attestations and SPDX assets stay
    per-architecture, on the children.

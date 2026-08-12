@@ -79,10 +79,10 @@ write_index() {
 JSON
 }
 
-run_promotion() {
-  # Runs the script in promotion mode and prints its exit status; the caller
-  # inspects the log.
-  local status=0
+run_index() {
+  # Runs the script and prints its exit status; the caller inspects the log. The
+  # mode, tags, and expected digest are the parameters every case varies.
+  local mode="$1" tags="$2" expect="$3" status=0
   CALL_LOG="$work/calls.log" FIXTURES="$fixtures" \
   PATH="$work/bin:$PATH" \
   IMAGE_NAME=ghcr.io/litvue/axond \
@@ -90,10 +90,15 @@ run_promotion() {
   RELEASE_SHORT_SHA=abcdef1 \
   RELEASE_COMMIT_SHA=abcdef1234567890 \
   GITHUB_REPOSITORY=litvue/axond \
-  INDEX_TAGS="9.9.9 sha-abcdef1" \
-  EXPECT_INDEX_DIGEST="$index_digest" \
+  INDEX_MODE="$mode" \
+  INDEX_TAGS="$tags" \
+  EXPECT_INDEX_DIGEST="$expect" \
     bash "$script" > "$work/out.txt" 2> "$work/err.txt" || status=$?
   echo "$status"
+}
+
+run_promotion() {
+  run_index promote "9.9.9 sha-abcdef1" "$index_digest"
 }
 
 assert_no_tag_applied() {
@@ -192,5 +197,63 @@ if grep -qF -e "$amd64_child" <<<"$create"; then
   exit 1
 fi
 echo "index promotion check: a valid promotion retags the smoked digest itself"
+
+# 5. The promotion's expected digest resolved empty — a workflow edit, an
+#    unwritten job output, a partial re-dispatch. Promotion mode is explicit, so
+#    this fails; it must never silently degrade into assembling the index and
+#    publishing `<version>` before anything asserted it.
+: > "$work/calls.log"
+status="$(run_index promote "9.9.9 sha-abcdef1" "")"
+[[ "$status" != 0 ]] || {
+  echo "FAIL: an empty EXPECT_INDEX_DIGEST did not fail the promotion" >&2
+  exit 1
+}
+grep -q "requires EXPECT_INDEX_DIGEST" "$work/err.txt" || {
+  echo "FAIL: the empty digest was not reported:" >&2
+  cat "$work/err.txt" >&2
+  exit 1
+}
+assert_no_tag_applied "an empty EXPECT_INDEX_DIGEST"
+echo "index promotion check: an empty expected digest fails instead of falling back to staging"
+
+# 6. Same for a digest that is not a digest.
+: > "$work/calls.log"
+status="$(run_index promote "9.9.9 sha-abcdef1" "not-a-digest")"
+[[ "$status" != 0 ]] || {
+  echo "FAIL: a malformed EXPECT_INDEX_DIGEST did not fail the promotion" >&2
+  exit 1
+}
+assert_no_tag_applied "a malformed EXPECT_INDEX_DIGEST"
+echo "index promotion check: a malformed expected digest fails before any tag is applied"
+
+# 7. Staging may not apply an operator-facing tag even if asked to: those tags
+#    exist only after a promotion has asserted the digest.
+for tag in "9.9.9" "sha-abcdef1"; do
+  : > "$work/calls.log"
+  status="$(run_index stage "$tag" "")"
+  [[ "$status" != 0 ]] || {
+    echo "FAIL: staging accepted the operator-facing tag $tag" >&2
+    exit 1
+  }
+  grep -q "cannot apply the operator-facing tag" "$work/err.txt" || {
+    echo "FAIL: staging did not report the operator-facing tag $tag:" >&2
+    cat "$work/err.txt" >&2
+    exit 1
+  }
+  assert_no_tag_applied "staging under $tag"
+done
+echo "index promotion check: staging refuses the operator-facing tags"
+
+# 8. An unknown or missing mode is a failure, not a default.
+for mode in "" "publish"; do
+  : > "$work/calls.log"
+  status="$(run_index "$mode" "sha-abcdef1-index" "")"
+  [[ "$status" != 0 ]] || {
+    echo "FAIL: INDEX_MODE='$mode' was accepted" >&2
+    exit 1
+  }
+  assert_no_tag_applied "INDEX_MODE='$mode'"
+done
+echo "index promotion check: the mode is explicit, with no inferred default"
 
 echo "index promotion checks passed"

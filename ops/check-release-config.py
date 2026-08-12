@@ -202,7 +202,26 @@ def check_image_matrix(text: str) -> list[str]:
             "index digest itself, so it can publish an operator-facing tag before "
             "the digest is checked"
         )
-    promotion = script.partition('if [[ -n "${EXPECT_INDEX_DIGEST:-}" ]]; then')[2]
+    # The mode must be explicit. Inferring promotion from a non-empty
+    # EXPECT_INDEX_DIGEST means an empty job output silently becomes a staging run
+    # that publishes the operator-facing tags before asserting anything.
+    if '"${INDEX_MODE:?' not in script:
+        failures.append(
+            "ops/publish-image-index.sh: INDEX_MODE is not required, so the mode "
+            "can be inferred from a possibly-empty variable"
+        )
+    if 'INDEX_MODE=promote requires EXPECT_INDEX_DIGEST' not in script:
+        failures.append(
+            "ops/publish-image-index.sh: promotion does not fail on an empty "
+            "EXPECT_INDEX_DIGEST"
+        )
+    if "cannot apply the operator-facing tag" not in script:
+        failures.append(
+            "ops/publish-image-index.sh: staging does not refuse the "
+            "operator-facing tags, so a mislabelled run can publish them before "
+            "the index is asserted"
+        )
+    promotion = script.partition('if [[ "$INDEX_MODE" == promote ]]; then')[2]
     promotion = promotion.partition("\nelse\n")[0]
     if not promotion:
         failures.append("ops/publish-image-index.sh: no promotion branch found")
@@ -288,7 +307,14 @@ def check_image_gates(text: str) -> list[str]:
                 f"({needle!r}) before the index is smoked; that belongs to "
                 "release-image-index-promote"
             )
+    # Each job must name its own mode: the script refuses to guess, and a job that
+    # omits it fails at the tag rather than in the registry.
+    if "INDEX_MODE: stage" not in index:
+        failures.append(
+            "release-please.yml: release-image-index does not set INDEX_MODE: stage"
+        )
     for label, needle in {
+        "explicit promotion mode": "INDEX_MODE: promote",
         "index retag from the smoked digest": "ops/publish-image-index.sh",
         "smoked-digest assertion": "EXPECT_INDEX_DIGEST",
         "keyless signature": "cosign sign --yes",

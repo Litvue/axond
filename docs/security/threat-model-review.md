@@ -295,7 +295,10 @@ non-operator-facing tag and booted by digest on both architectures, and only the
 is it retagged as `<version>`/`sha-<short>`, signed, attested, and re-verified by
 `ops/verify-image-evidence.sh`. Promotion retags the smoked digest itself and
 runs every rejectable check before the first tag, because a registry tag cannot
-be withdrawn by a later failure. A change that signs or tags the index before
+be withdrawn by a later failure. Which of the two it is doing is stated by
+`INDEX_MODE`, never inferred: promotion fails if the smoked digest is empty
+instead of degrading into an assemble-then-tag run, and staging refuses the
+operator-facing tags outright. A change that signs or tags the index before
 that boot is the regression this ordering exists to prevent:
 `ops/check-release-config.py` rejects the shape of it, and
 `ops/check-index-promotion.sh` drives the script against a stubbed registry to

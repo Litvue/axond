@@ -23,10 +23,16 @@
 # booted, and a registry tag cannot be retracted. So every check that can reject
 # a promotion runs strictly before the first tag is applied.
 #
-# Inputs (environment): IMAGE_NAME, RELEASE_VERSION, RELEASE_SHORT_SHA,
-# RELEASE_COMMIT_SHA, GITHUB_REPOSITORY, INDEX_TAGS (space-separated), and
-# optionally EXPECT_INDEX_DIGEST. Writes `digest=<index-digest>` to GITHUB_OUTPUT
-# when it is set.
+# The mode is explicit, never inferred: INDEX_MODE=stage assembles under
+# non-operator-facing tags, INDEX_MODE=promote retags a smoked digest. An empty
+# EXPECT_INDEX_DIGEST therefore fails the promotion instead of quietly turning it
+# into an assemble-then-tag run, and staging refuses to apply an operator-facing
+# tag at all.
+#
+# Inputs (environment): INDEX_MODE, IMAGE_NAME, RELEASE_VERSION,
+# RELEASE_SHORT_SHA, RELEASE_COMMIT_SHA, GITHUB_REPOSITORY, INDEX_TAGS
+# (space-separated), and EXPECT_INDEX_DIGEST when INDEX_MODE=promote. Writes
+# `digest=<index-digest>` to GITHUB_OUTPUT when it is set.
 set -euo pipefail
 
 : "${IMAGE_NAME:?IMAGE_NAME must be set}"
@@ -35,6 +41,15 @@ set -euo pipefail
 : "${RELEASE_COMMIT_SHA:?RELEASE_COMMIT_SHA must be set}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}"
 : "${INDEX_TAGS:?INDEX_TAGS must be set}"
+: "${INDEX_MODE:?INDEX_MODE must be stage or promote}"
+
+case "$INDEX_MODE" in
+  stage | promote) ;;
+  *)
+    echo "INDEX_MODE is $INDEX_MODE, not stage or promote" >&2
+    exit 1
+    ;;
+esac
 
 # The supported platforms, as `<os>/<arch>`. ops/check-release-config.py keeps
 # this list, the release workflow's image matrix, and the documentation in step.
@@ -164,16 +179,21 @@ assert_tags_resolve_to() {
   done
 }
 
-if [[ -n "${EXPECT_INDEX_DIGEST:-}" ]]; then
+if [[ "$INDEX_MODE" == promote ]]; then
   # Promotion. Nothing is assembled: the smoked index already exists, so it is
   # asserted first and then retagged from its own digest, which cannot yield a
   # different one. Assembling from the child tags again and checking the digest
   # afterwards would be too late — if a child tag had moved since staging, the
   # operator-facing tags would already point at an index nothing booted, and no
   # later failure can retract them.
-  index_digest="$EXPECT_INDEX_DIGEST"
+  #
+  # An unset or empty EXPECT_INDEX_DIGEST is a failure, not a fallback: the job
+  # output it comes from could be empty after a workflow edit or a partial
+  # re-dispatch, and inferring staging from that would publish `<version>` before
+  # anything asserted it.
+  index_digest="${EXPECT_INDEX_DIGEST:-}"
   [[ "$index_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
-    echo "EXPECT_INDEX_DIGEST is not a digest: $index_digest" >&2
+    echo "INDEX_MODE=promote requires EXPECT_INDEX_DIGEST to name the smoked index; got: ${index_digest:-empty}" >&2
     exit 1
   }
   assert_index_contents "$index_digest"
@@ -182,6 +202,18 @@ if [[ -n "${EXPECT_INDEX_DIGEST:-}" ]]; then
 else
   # Staging. The tags here are not operator-facing, so assembling first and
   # asserting the result is safe: a failure strands a staging tag, not a release.
+  # That safety is the reason an operator-facing tag is refused outright — it may
+  # only be applied by a promotion, after the digest has been asserted.
+  for tag in "${index_tags[@]}"; do
+    if [[ "$tag" == "$RELEASE_VERSION" || "$tag" == "sha-${RELEASE_SHORT_SHA}" ]]; then
+      echo "INDEX_MODE=stage cannot apply the operator-facing tag $tag; promote the smoked digest instead" >&2
+      exit 1
+    fi
+  done
+  [[ -z "${EXPECT_INDEX_DIGEST:-}" ]] || {
+    echo "INDEX_MODE=stage was given EXPECT_INDEX_DIGEST; use INDEX_MODE=promote to retag a smoked index" >&2
+    exit 1
+  }
   apply_tags \
     --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
     --annotation "index:org.opencontainers.image.revision=${RELEASE_COMMIT_SHA}" \
