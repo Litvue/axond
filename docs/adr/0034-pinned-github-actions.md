@@ -1,4 +1,4 @@
-# 33. Pinned GitHub Actions and an enforced pin policy
+# 34. Pinned GitHub Actions and an enforced pin policy
 
 Date: 2026-08-12
 
@@ -55,7 +55,12 @@ look:
 - every `SIGNER_IDENTITY:` declaration stays an anchored regular expression, and
   every `cosign verify` keeps `--certificate-identity-regexp` and
   `--certificate-oidc-issuer`. The check is per occurrence, so an unanchored
-  job-level `env:` override cannot shadow an anchored workflow-level value.
+  job-level `env:` override cannot shadow an anchored workflow-level value. The
+  `cosign verify` half also reads the shell under `ops/`, because the release
+  verifies its images through
+  [`ops/verify-image-evidence.sh`](../../ops/verify-image-evidence.sh) rather
+  than an inline `run:` block; a gate that only read the workflows would pass
+  while the real verification accepted any Fulcio certificate.
 
 `ops/workflow-policy.py --self-test` runs the checker against in-memory fixtures
 for each rejection class and runs first in the lane, so a pass means the gate is

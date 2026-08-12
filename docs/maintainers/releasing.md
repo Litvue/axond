@@ -254,7 +254,7 @@ floor still builds.
 ## Workflow Action pins
 
 The policy behind this section is
-[ADR 0033](../adr/0033-pinned-github-actions.md). The release jobs can reach the
+[ADR 0034](../adr/0034-pinned-github-actions.md). The release jobs can reach the
 release GitHub App token, `CARGO_REGISTRY_TOKEN`, and the keyless signing
 identity, so a third-party Action running there is as privileged as this runbook.
 `owner/action@v3` is a pointer the upstream owner can move, so every `uses:` in
@@ -270,8 +270,11 @@ The required `workflow-policy` lane runs
 branch ref, a short SHA, a pin with no readable version comment, a workflow with
 no `permissions:` block, `permissions: write-all`, an unanchored
 `SIGNER_IDENTITY`, and a `cosign verify` that does not restrict the certificate
-identity and issuer. It also requires one reviewed pin per action across all
-workflows, so two lanes cannot silently run different builds of the same Action.
+identity and issuer — in the workflows and in the shell under `ops/`, which is
+where [`ops/verify-image-evidence.sh`](../../ops/verify-image-evidence.sh)
+actually verifies the release images. It also requires one reviewed pin per
+action across all workflows, so two lanes cannot silently run different builds of
+the same Action.
 The lane proves it still rejects those with `ops/workflow-policy.py --self-test`
 before it checks the repository, and then lints the workflows with
 [`ops/actionlint.sh`](../../ops/actionlint.sh). That script runs one pinned

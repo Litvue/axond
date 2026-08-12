@@ -149,7 +149,7 @@ def check_binary_gates(text: str) -> list[str]:
         "checksum sidecar": "shasum -a 256",
         "windows checksum sidecar": "Get-FileHash",
         # Matched without a ref: the Actions are pinned to commit SHAs
-        # (ADR 0033), so only the repository name is stable here.
+        # (ADR 0034), so only the repository name is stable here.
         "SBOM": "anchore/sbom-action@",
         "provenance attestation": "Attest binary provenance",
         "SBOM attestation": "Attest binary SBOM",

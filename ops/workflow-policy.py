@@ -9,7 +9,10 @@ full commit SHA, with the human-readable version kept in a trailing comment, and
 this gate is what keeps a new mutable ref from being merged.
 
 The gate is deliberately line-based and dependency-free: it must run on the same
-`python3` floor as the other `ops/` checks, with no PyYAML.
+`python3` floor as the other `ops/` checks, with no PyYAML. It reads the shell
+under `ops/` as well, because that is where the release's `cosign verify` calls
+live and an unrestricted one there weakens exactly what a workflow-level check
+would be protecting.
 
 Usage:
     ops/workflow-policy.py              # check the workflows in this repository
@@ -41,6 +44,16 @@ ANCHORED_IDENTITY = re.compile(r"^\s*SIGNER_IDENTITY:\s*\^.+\$\s*$")
 def workflows(root: Path) -> list[Path]:
     directory = root / ".github" / "workflows"
     return sorted(p for p in directory.glob("*.y*ml") if p.is_file())
+
+
+def verifier_scripts(root: Path) -> list[Path]:
+    """The shell the workflows call, where the `cosign verify` invocations live.
+
+    A workflow step that runs `ops/verify-image-evidence.sh` is as much part of
+    the release's signature verification as an inline `run:` block, so the
+    identity restriction has to be checked where the command actually is.
+    """
+    return sorted(p for p in (root / "ops").glob("*.sh") if p.is_file())
 
 
 def check_pins(text: str, relative: str) -> tuple[list[str], list[tuple[str, str, str, str]]]:
@@ -103,6 +116,28 @@ def check_permissions(text: str, relative: str) -> list[str]:
     return failures
 
 
+def check_cosign_verify(text: str, relative: str) -> list[str]:
+    """Every `cosign verify` restricts the certificate identity and its issuer.
+
+    Without both flags the command accepts any Fulcio certificate, so it proves
+    only that *someone* signed the artifact.
+    """
+    failures: list[str] = []
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        # A shell comment discussing the command is prose, not an invocation.
+        if "cosign verify" not in line or line.lstrip().startswith("#"):
+            continue
+        # The flags live on the continuation lines of the same command.
+        block = "\n".join(lines[index : index + 16])
+        if "--certificate-identity-regexp" not in block or "--certificate-oidc-issuer" not in block:
+            failures.append(
+                f"{relative}:{index + 1}: `cosign verify` must pass "
+                "--certificate-identity-regexp and --certificate-oidc-issuer"
+            )
+    return failures
+
+
 def check_signer_identity(text: str, relative: str) -> list[str]:
     """Keyless verification stays bound to this workflow's own identity."""
     failures: list[str] = []
@@ -118,16 +153,6 @@ def check_signer_identity(text: str, relative: str) -> list[str]:
             "expression (`^…$`), so it cannot match a copy of the workflow on "
             "another ref"
         )
-    for index, line in enumerate(lines):
-        if "cosign verify" not in line:
-            continue
-        # The flags live on the continuation lines of the same `run:` script.
-        block = "\n".join(lines[index : index + 16])
-        if "--certificate-identity-regexp" not in block or "--certificate-oidc-issuer" not in block:
-            failures.append(
-                f"{relative}:{index + 1}: `cosign verify` must pass "
-                "--certificate-identity-regexp and --certificate-oidc-issuer"
-            )
     return failures
 
 
@@ -144,6 +169,7 @@ def check(root: Path) -> list[str]:
         failures.extend(pin_failures)
         failures.extend(check_permissions(text, relative))
         failures.extend(check_signer_identity(text, relative))
+        failures.extend(check_cosign_verify(text, relative))
         for action, sha, comment, where in pins:
             first = seen.setdefault(action, (sha, comment, where))
             if first[0] != sha:
@@ -156,6 +182,10 @@ def check(root: Path) -> list[str]:
                     f"{where}: {action}@{sha[:7]}… is labelled {comment!r} here "
                     f"but {first[1]!r} at {first[2]}"
                 )
+    for path in verifier_scripts(root):
+        failures.extend(
+            check_cosign_verify(path.read_text(encoding="utf-8"), str(path.relative_to(root)))
+        )
     return failures
 
 
@@ -269,6 +299,26 @@ def self_test() -> list[str]:
         )
         if not any("one reviewed pin per action" in failure for failure in check(root)):
             problems.append("self-test: disagreeing pins for one action were not rejected")
+        (directory / "other.yml").unlink()
+        # The release verifies signatures from a shell script, not from a `run:`
+        # block, so the identity restriction is checked there too.
+        ops = root / "ops"
+        ops.mkdir()
+        script = ops / "verify-evidence.sh"
+        script.write_text('cosign verify "$IMAGE" --certificate-identity-regexp "$ID" \\\n  --certificate-oidc-issuer https://token.actions.githubusercontent.com\n', encoding="utf-8")
+        if check(root):
+            problems.append(f"self-test: a restricted script verify was rejected: {check(root)}")
+        # Prose about the command is not the command.
+        script.write_text("# cosign verify runs below\n", encoding="utf-8")
+        if check(root):
+            problems.append(f"self-test: a comment was read as a verify: {check(root)}")
+        script.write_text('cosign verify "$IMAGE"\n', encoding="utf-8")
+        if not any(
+            "--certificate-identity-regexp" in failure for failure in check(root)
+        ):
+            problems.append(
+                "self-test: an unrestricted `cosign verify` in ops/ was not rejected"
+            )
     return problems
 
 
@@ -290,7 +340,10 @@ def main(argv: list[str]) -> int:
         print(f"workflow policy failed: {failure}", file=sys.stderr)
     if failures:
         return 1
-    print(f"workflow policy passed ({len(workflows(ROOT))} workflows)")
+    print(
+        f"workflow policy passed ({len(workflows(ROOT))} workflows, "
+        f"{len(verifier_scripts(ROOT))} ops scripts)"
+    )
     return 0
 
 
