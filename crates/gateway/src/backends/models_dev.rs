@@ -939,7 +939,23 @@ fn price(
         match tiers.iter().find(|tier| tier.threshold == threshold) {
             Some(stated) if *stated == legacy => {}
             Some(_) => return Err(ModelsDevError::DuplicateTier { pointer }),
-            None => tiers.push(legacy),
+            // The newer spelling usually states the offering's own context
+            // boundary instead of 200k (`size: 272000`), so an explicit tier
+            // charging exactly the legacy rates is that same schedule under a
+            // migrated threshold rather than a second one. Keeping both would
+            // publish one schedule twice; the legacy threshold is kept because
+            // it is the lower of the two and therefore the one that already
+            // decided the rate everywhere the two overlap.
+            None => match tiers
+                .iter()
+                .enumerate()
+                .filter(|(_, tier)| tier.rates == legacy.rates && tier.threshold > threshold)
+                .min_by_key(|(_, tier)| tier.threshold)
+                .map(|(index, _)| index)
+            {
+                Some(migrated) => tiers[migrated].threshold = threshold,
+                None => tiers.push(legacy),
+            },
         }
     }
     tiers.sort_by_key(|tier| tier.threshold);
@@ -1601,6 +1617,50 @@ mod tests {
         );
     }
 
+    /// Upstream is migrating one long-context schedule from
+    /// `context_over_200k` to `tiers`, and the newer spelling states the
+    /// offering's own boundary rather than 200k. Same rates are that migration;
+    /// different rates are a genuinely different tier.
+    #[test]
+    fn the_two_spellings_of_a_long_context_tier_are_one_tier_when_the_rates_agree() {
+        fn tiers(cost: &str) -> Vec<(u64, ObservedRate)> {
+            let cost: WireCost = serde_json::from_str(cost).expect("a cost object");
+            price(Some(&cost), &JsonPointer::new(""))
+                .expect("a representable price")
+                .expect("a published price")
+                .tiers
+                .iter()
+                .map(|tier| match tier.threshold {
+                    PriceTierThreshold::ContextOver { tokens } => (tokens, tier.rates.input),
+                })
+                .collect()
+        }
+
+        assert_eq!(
+            tiers(
+                r#"{"input": 5, "output": 30,
+                    "tiers": [{"input": 10, "output": 45,
+                               "tier": {"type": "context", "size": 272000}}],
+                    "context_over_200k": {"input": 10, "output": 45}}"#
+            ),
+            vec![(200_000, ObservedRate::from_nanos(10_000_000_000))],
+            "one schedule stated twice is one tier, from the threshold it already applied at"
+        );
+        assert_eq!(
+            tiers(
+                r#"{"input": 5, "output": 30,
+                    "tiers": [{"input": 20, "output": 60,
+                               "tier": {"type": "context", "size": 272000}}],
+                    "context_over_200k": {"input": 10, "output": 45}}"#
+            ),
+            vec![
+                (200_000, ObservedRate::from_nanos(10_000_000_000)),
+                (272_000, ObservedRate::from_nanos(20_000_000_000)),
+            ],
+            "two thresholds charging differently are two tiers"
+        );
+    }
+
     #[test]
     fn published_decimals_become_exact_integer_rates() {
         let snapshot = parse(IDENTITY).expect("fixture parses");
@@ -1955,10 +2015,10 @@ mod tests {
                 .iter()
                 .map(|tier| tier.threshold)
                 .collect::<Vec<_>>(),
-            vec![
-                PriceTierThreshold::ContextOver { tokens: 200_000 },
-                PriceTierThreshold::ContextOver { tokens: 272_000 },
-            ]
+            // The seed states one long-context schedule in both spellings, the
+            // newer one at the offering's own context boundary: it is one tier,
+            // at the threshold from which those rates already applied.
+            vec![PriceTierThreshold::ContextOver { tokens: 200_000 }]
         );
     }
 
