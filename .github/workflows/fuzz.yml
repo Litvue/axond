@@ -69,6 +69,13 @@ jobs:
       matrix:
         target: ${{ fromJSON(needs.select.outputs.targets) }}
     timeout-minutes: 45
+    env:
+      # `dtolnay/rust-toolchain@nightly` selects nightly with `rustup default`,
+      # which the repository's `rust-toolchain.toml` pin overrides in every
+      # directory under the checkout. Naming the toolchain in the environment
+      # beats that pin and reaches the `cargo build` that `cargo fuzz` spawns,
+      # which is where the sanitizer `-Z` flags stable would reject are used.
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v7
       # libFuzzer needs the sanitizer runtimes, which only nightly ships.
@@ -106,6 +113,7 @@ jobs:
           SECONDS_PER_TARGET: ${{ inputs.seconds_per_target || '600' }}
         run: |
           set -euo pipefail
+          cargo --version
           # -rss_limit_mb and -malloc_limit_mb are the uncontrolled-allocation
           # gate: an input that makes a parser ask for more than 2 GiB, or a
           # single allocation over 1 GiB, is a finding rather than an OOM kill.
