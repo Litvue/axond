@@ -71,6 +71,31 @@ lane, and `dependency-audit.yml` already cover it, and a lockfile bump belongs t
 Container base images are out of scope here; they are pinned by tag in
 `Dockerfile` and tracked separately.
 
+### Alternatives considered
+
+- **Tags plus review discipline.** Rejected: the compromise leaves no trace in
+  the repository, so there is nothing for a reviewer to catch.
+- **Pins without a gate.** Rejected: a convention that only lives in a document
+  is reintroduced by the first contributor who copies an upstream README snippet.
+- **Renovate instead of Dependabot.** Renovate resolves pins with version
+  comments well and offers finer scheduling, but it needs an app installation and
+  its own config surface. Dependabot is already available to the org, and the pin
+  refresh is a small weekly diff either way. Revisit if the grouped PR becomes
+  noisy.
+- **A vendored copy of each Action.** Rejected: full control over what runs, but
+  the maintenance cost and the loss of upstream security fixes are worse than the
+  pin.
+- **`actionlint` in a required lane via an installer Action.**
+  `taiki-e/install-action` has no `actionlint` manifest and falls through to
+  `cargo-binstall`, which fails because `actionlint` is not a crate. The script
+  therefore owns acquisition, and its version is pinned two ways (release
+  checksum, image digest).
+- **PyYAML for the gate.** Rejected: real parsing would be more robust than
+  line matching, but it would make a required lane depend on a Python package
+  where every other `ops/` check runs on the interpreter alone. Line numbers in
+  failures are also more useful for a `SIGNER_IDENTITY` override than a parsed
+  mapping would be.
+
 ### State tier
 
 Tier 0 (config-only). This decision covers CI and release automation only: no
