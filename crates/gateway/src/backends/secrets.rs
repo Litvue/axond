@@ -31,7 +31,7 @@ use super::{BackendFailure, BackendKind, Capabilities, FailureCategory};
 /// Redis is absent, and so is any unencrypted store: material at rest is
 /// wrapped or held by something whose whole job is holding it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 pub enum SecretBackend {
     /// Postgres rows holding material wrapped under a bootstrap-referenced KEK.
     #[default]

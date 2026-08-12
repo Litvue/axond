@@ -75,7 +75,10 @@ This is structural, not a naming convention:
   `BackendKind::durable_control_plane`.
 - `ControlPlaneBackend::parse` rejects `redis` with its own error arm
   (`UnsupportedControlPlaneBackend::HotStateOnly`) rather than as an unknown
-  name, so an operator who tries it is told why the answer is no.
+  name, so an operator who tries it is told why the answer is no. `parse` is the
+  single resolution path — `Deserialize` delegates to it — so a configured value
+  and a programmatic lookup accept the same canonical spelling (`postgres`) and
+  fail with the same explanation.
 - `SecretBackend` offers encrypted Postgres and external managers only.
 - `RESPONSIBILITIES` lists no durable responsibility that permits
   `BackendKind::Redis`, and a test fails if one ever does.
@@ -103,6 +106,12 @@ Each contract keeps its own error enum and maps into a shared
 | `Invalid` | Malformed input, dangling reference, violated constraint | No |
 | `Denied` | Refused on authorization or policy grounds | No |
 | `Corrupt` | Stored data is unreadable (decryption failure, unknown record version) | No — operator alert |
+
+Idempotency is payload-aware: a repeat of a key carrying the same checksum
+replays the revision the first call published, while a repeat carrying a
+*different* checksum is refused with
+`ControlPlaneError::IdempotencyKeyReused` (an `Invalid`). Replaying the earlier
+revision would tell a caller their change landed when it never did.
 
 `Corrupt` exists so an unwrappable secret or an unreadable revision is never
 reported as an outage: retrying cannot help, and an operator has to know.

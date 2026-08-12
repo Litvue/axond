@@ -42,11 +42,21 @@ use super::{BackendFailure, BackendKind, Capabilities, FailureCategory};
 /// One variant, on purpose. A second durable store is a new variant *and* a new
 /// `durable_control_plane` implementation, which is a reviewable change rather
 /// than a config string that happened to parse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+///
+/// [`ControlPlaneBackend::parse`] is the only resolution path: deserialization
+/// delegates to it, so a TOML value and a programmatic lookup accept exactly the
+/// same names and produce exactly the same explanation when they do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ControlPlaneBackend {
     #[default]
     Postgres,
+}
+
+impl<'de> serde::Deserialize<'de> for ControlPlaneBackend {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        Self::parse(&name).map_err(serde::de::Error::custom)
+    }
 }
 
 impl ControlPlaneBackend {
@@ -63,7 +73,12 @@ impl ControlPlaneBackend {
     /// answer is no, not that they made a typo.
     pub fn parse(name: &str) -> Result<Self, UnsupportedControlPlaneBackend> {
         match name {
-            "postgres" | "postgresql" => Ok(Self::Postgres),
+            "postgres" => Ok(Self::Postgres),
+            // A near miss on the one durable backend is a typo, not a request
+            // for something else.
+            "postgresql" | "pg" => Err(UnsupportedControlPlaneBackend::Unknown {
+                name: name.to_owned(),
+            }),
             "redis" => Err(UnsupportedControlPlaneBackend::HotStateOnly {
                 name: "redis".to_owned(),
             }),
@@ -166,8 +181,11 @@ pub struct AuditEvent {
     pub summary: String,
 }
 
-/// A caller-supplied deduplication token. A retry carrying the same key must
-/// return the original outcome rather than publishing a second revision.
+/// A caller-supplied deduplication token. A retry carrying the same key *and*
+/// the same desired state must return the original outcome rather than
+/// publishing a second revision; the same key with different desired state is
+/// [`ControlPlaneError::IdempotencyKeyReused`], never a silent replay of the
+/// revision the caller did not describe.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IdempotencyKey(pub String);
 
@@ -223,6 +241,17 @@ pub enum ControlPlaneError {
     RevisionNotFound(RevisionId),
     #[error("invalid candidate revision: {0}")]
     Invalid(String),
+    /// The key was already used to publish *different* desired state. Replaying
+    /// the earlier revision would tell the caller their change was applied when
+    /// it never was, so the write is refused instead.
+    #[error(
+        "idempotency key `{}` already published revision {published} with different desired state",
+        key.0
+    )]
+    IdempotencyKeyReused {
+        key: IdempotencyKey,
+        published: RevisionId,
+    },
     #[error("control-plane store `{backend}` refused the operation: {message}")]
     Denied {
         backend: &'static str,
@@ -243,7 +272,7 @@ impl BackendFailure for ControlPlaneError {
             Self::Unavailable { .. } => FailureCategory::Unavailable,
             Self::Conflict { .. } => FailureCategory::Conflict,
             Self::RevisionNotFound(_) => FailureCategory::NotFound,
-            Self::Invalid(_) => FailureCategory::Invalid,
+            Self::Invalid(_) | Self::IdempotencyKeyReused { .. } => FailureCategory::Invalid,
             Self::Denied { .. } => FailureCategory::Denied,
             Self::Corrupt { .. } => FailureCategory::Corrupt,
         }
@@ -285,7 +314,11 @@ pub trait ControlPlaneStore: Send + Sync {
     ///
     /// Atomic with its audit event, conditioned on
     /// [`RevisionCandidate::expected`], and idempotent under
-    /// [`RevisionCandidate::idempotency_key`]. Publication does not validate
+    /// [`RevisionCandidate::idempotency_key`]: a repeat of the same key carrying
+    /// the same [`RevisionCandidate::checksum`] returns the revision the first
+    /// call published, and a repeat carrying a different checksum is refused with
+    /// [`ControlPlaneError::IdempotencyKeyReused`] rather than replaying an
+    /// outcome the caller did not ask for. Publication does not validate
     /// desired state into a snapshot — compilation and rejection are the
     /// replica's job (#142); the store's job is to make the transition
     /// all-or-nothing.
@@ -324,14 +357,32 @@ mod tests {
 
     #[test]
     fn every_selectable_control_plane_backend_is_durable() {
-        for name in ["postgres", "postgresql"] {
-            let backend = ControlPlaneBackend::parse(name).expect("durable backend");
-            assert!(backend.kind().durable_control_plane());
-        }
+        let backend = ControlPlaneBackend::parse("postgres").expect("durable backend");
+        assert!(backend.kind().durable_control_plane());
         assert_eq!(
             ControlPlaneBackend::default(),
             ControlPlaneBackend::Postgres
         );
+    }
+
+    #[test]
+    fn deserialization_resolves_through_parse() {
+        assert_eq!(
+            serde_json::from_str::<ControlPlaneBackend>("\"postgres\"").unwrap(),
+            ControlPlaneBackend::Postgres
+        );
+        // One resolution path, so a configured value is refused with the same
+        // explanation a programmatic lookup gets — including for a near miss.
+        for name in ["redis", "in-memory", "postgresql", "sqlite"] {
+            let refusal = serde_json::from_str::<ControlPlaneBackend>(&format!("\"{name}\""))
+                .expect_err("only postgres is a durable control plane")
+                .to_string();
+            let expected = ControlPlaneBackend::parse(name).unwrap_err().to_string();
+            assert!(
+                refusal.contains(&expected),
+                "`{name}` was refused as `{refusal}` instead of `{expected}`"
+            );
+        }
     }
 
     #[tokio::test]
@@ -396,6 +447,61 @@ mod tests {
             .expect("a retry replays the original outcome");
         assert_eq!(first, retried);
         assert_eq!(store.published_revisions(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reused_key_carrying_different_state_is_refused() {
+        let store = InMemoryControlPlane::new();
+        let first = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "first", "a"))
+            .await
+            .unwrap();
+
+        // Same key, different desired state: replaying `first` would report a
+        // change that was never published.
+        let mut reused = candidate(ExpectedRevision::Exactly(first.id), "second", "a");
+        reused.checksum = RevisionChecksum("sha256:b".to_owned());
+        let error = store
+            .publish_revision(reused)
+            .await
+            .expect_err("a reused key must not replay a different revision");
+        assert_eq!(
+            error,
+            ControlPlaneError::IdempotencyKeyReused {
+                key: IdempotencyKey("a".to_owned()),
+                published: first.id,
+            }
+        );
+        assert_eq!(error.category(), FailureCategory::Invalid);
+        assert!(!error.retryable());
+        assert_eq!(store.published_revisions(), 1);
+        assert_eq!(store.desired_revision().await.unwrap(), Some(first.id));
+    }
+
+    #[tokio::test]
+    async fn a_replay_survives_a_moved_expectation() {
+        let store = InMemoryControlPlane::new();
+        let first = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "first", "a"))
+            .await
+            .unwrap();
+        store
+            .publish_revision(candidate(
+                ExpectedRevision::Exactly(first.id),
+                "second",
+                "b",
+            ))
+            .await
+            .unwrap();
+
+        // The original candidate's expectation is now stale, but its key and
+        // desired state are unchanged: a retry replays rather than conflicts.
+        let replayed = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "first", "a"))
+            .await
+            .expect("an unchanged retry replays its own outcome");
+        assert_eq!(replayed, first);
+        assert_eq!(store.published_revisions(), 2);
     }
 
     #[tokio::test]

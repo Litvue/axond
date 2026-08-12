@@ -56,7 +56,9 @@ pub(crate) fn candidate(expected: ExpectedRevision, action: &str, key: &str) -> 
 struct ControlPlaneState {
     revisions: Vec<RevisionManifest>,
     audit: HashMap<RevisionId, Vec<AuditEvent>>,
-    applied: HashMap<IdempotencyKey, RevisionId>,
+    /// The revision a key published, plus the desired state it published, so a
+    /// reused key can be told apart from a retried one.
+    applied: HashMap<IdempotencyKey, (RevisionId, RevisionChecksum)>,
 }
 
 /// A `ControlPlaneStore` whose transaction is a mutex.
@@ -155,7 +157,14 @@ impl ControlPlaneStore for InMemoryControlPlane {
 
         let mut state = self.state.lock().expect("not poisoned");
 
-        if let Some(existing) = state.applied.get(&candidate.idempotency_key).copied() {
+        if let Some((existing, published)) = state.applied.get(&candidate.idempotency_key).cloned()
+        {
+            if published != candidate.checksum {
+                return Err(ControlPlaneError::IdempotencyKeyReused {
+                    key: candidate.idempotency_key,
+                    published: existing,
+                });
+            }
             let manifest = state
                 .revisions
                 .iter()
@@ -190,7 +199,9 @@ impl ControlPlaneStore for InMemoryControlPlane {
         // visible together or not at all.
         state.revisions.push(manifest.clone());
         state.audit.insert(id, vec![candidate.audit]);
-        state.applied.insert(candidate.idempotency_key, id);
+        state
+            .applied
+            .insert(candidate.idempotency_key, (id, manifest.checksum.clone()));
         Ok(manifest)
     }
 

@@ -26,7 +26,7 @@ use super::{BackendFailure, BackendKind, Capabilities, FailureCategory};
 
 /// The sources a deployment may select for catalogue metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 pub enum CatalogBackend {
     #[default]
     ModelsDev,
