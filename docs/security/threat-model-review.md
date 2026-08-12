@@ -48,7 +48,7 @@ unnoticed one.
 | --- | --- |
 | `routes.rs` authentication, `mint.rs`, `principals.rs`, `revocation/`, scopes, claims, epochs | [Authentication, claims, and authorization](#1-authentication-token-claims-and-authorization) |
 | Namespace resolution, `credentials.rs` pool lookup, `allow_platform_fallback`, budget/rate-limit keys, operator views | [Tenant and namespace scoping](#2-tenant-and-namespace-scoping) |
-| `backends/secrets.rs`, `key_material.rs`, credential injection, error and log text, rotation | [SecretStore, credential delivery, rotation, and redaction](#3-secretstore-credential-delivery-rotation-and-redaction) |
+| `backends/secrets.rs`, `key_material.rs`, `desired_state/secrets.rs`, `desired_state/credentials.rs`, credential injection, error and log text, rotation | [SecretStore, credential delivery, rotation, and redaction](#3-secretstore-credential-delivery-rotation-and-redaction) |
 | `backends/catalog.rs`, `aliases.rs`, `/v1/models`, alias scope, wire families, pricing | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
 | `ops/postgres/`, `crates/gateway/sql/`, `usage/`, `telemetry/`, control-plane journal | [Persistence, migrations, telemetry, and usage](#5-persistence-migrations-telemetry-and-usage) |
 | `.github/workflows/`, `ops/publish-crates.sh`, `install.sh`, `install.ps1`, `Dockerfile`, `deny.toml` | [Actions, release permissions, attestations, and signing](#6-actions-release-permissions-attestations-and-signing) |
@@ -148,7 +148,12 @@ is intended.
 
 **Fires on** any change to how secret material enters, is held, moves, or is
 described: `crates/gateway/src/backends/secrets.rs` and its `SecretStore`
-contract, `crates/gateway/src/key_material.rs`, the credential resolution in
+contract, the reference, ownership, and lifecycle types in
+`crates/gateway/src/desired_state/secrets.rs`, the credential body and its
+publication rules in `crates/gateway/src/desired_state/credentials.rs` — a new
+*field* on that body is a disclosure change, since bodies are canonically encoded
+into a checksum an operator reads — `crates/gateway/src/key_material.rs`, the
+credential resolution in
 `crates/gateway/src/credentials.rs`, header injection and failure description in
 `crates/gateway-transport/src/lib.rs`, a new `expose_secret` call site, a new
 `Debug`/`Display`/`Serialize` derive on a type that can reach one, rotation and
@@ -167,7 +172,19 @@ in `resolves_env_without_trimming`,
 `resolves_file_bytes_without_trimming`. Outbound description:
 `a_described_failure_keeps_the_endpoint_and_drops_its_secrets`, the regression
 for the one finding of the security review. Attribution without disclosure:
-`fallback_status_hides_default_platform_label_but_keeps_explicit_id`.
+`fallback_status_hides_default_platform_label_but_keeps_explicit_id`. Durable
+references: `a_body_carries_a_reference_and_nothing_derived_from_the_material`
+(the body's field set is asserted, so adding one fails the test),
+`no_refusal_can_carry_material`,
+`a_reference_names_an_exact_version_and_prints_no_material`. Ownership and
+lifecycle: `one_secret_belongs_to_one_owner`,
+`a_credential_reaches_only_the_providers_its_owner_can_reach`,
+`material_never_resolves_for_another_owner`,
+`the_lifecycle_matrix_is_total_and_deterministic`,
+`withdrawn_material_is_never_put_back_in_service`,
+`only_staged_and_active_material_unwraps`,
+`one_version_of_a_secret_is_in_service_and_it_is_not_ambiguous`, and
+`a_revision_is_refused_before_publication_and_again_on_hydration`.
 
 A new `expose_secret` call site is a review item in its own right: the security
 review counts them, so a PR that adds one says why the count changed. Boot- or
@@ -180,9 +197,13 @@ not silently outgrown; the secret-delivery section of the
 [deployment security model](./deployment-model.md) is the operator-facing
 contract; `SecretStore`'s placement at `SnapshotCompilation` and off the request
 path is in [backend contracts](../maintainers/backend-contracts.md) and
-[ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md). Making secret
-resolution reachable from the request path changes the availability argument and
-needs an ADR.
+[ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md); the durable
+credential contract — opaque exactly-versioned references, exact ownership, and
+the lifecycle states — is
+[ADR 0033](../adr/0033-typed-provider-credentials-and-secret-lifecycle.md), and a
+change to the lifecycle relation or to what a reference discloses amends it.
+Making secret resolution reachable from the request path changes the availability
+argument and needs an ADR.
 
 **Release impact.** A rotation or wrapping change is an operator procedure
 change: update the [minted-token guide](../minted-token-guide.md) for signer
@@ -190,7 +211,12 @@ material and the [configuration reference](../configuration.md) for references,
 and say whether an overlapping-key rotation still works across the upgrade. A
 new secret reference shape is a configuration surface addition — it belongs in
 `axond.example.toml` or `axond.stateful.example.toml`, which `ops/check-docs.py`
-enforces for stateful bootstrap keys.
+enforces for stateful bootstrap keys. A change to a credential body's schema or
+to its lifecycle vocabulary is a *compatibility* change: say which stored
+revisions the new build stops reading, and record it in the
+[journal runbook](../operations/control-plane-journal.md) and
+[revision convergence](../operations/revision-convergence.md#resource-body-schemas)
+rather than only in the changelog.
 
 ## 4. Catalogue and model entitlement
 

@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use super::canonical::{Canonical, CanonicalError, CanonicalValue, Checksum, SerializerVersion};
+use super::credentials::{CredentialError, Credentials};
 use super::ids::{AuditEventId, MutationId, RevisionId, Slug};
 use super::mutation::{AuditEvent, ExpectedRevision, Mutation};
 use super::resource::{BlobRef, ResourceRef, ResourceScope, ResourceVersion};
@@ -71,6 +72,8 @@ pub enum ValidationError {
     TenantScopedDependency { from: ResourceRef, to: ResourceRef },
     #[error("this revision's tenancy is not valid: {0}")]
     Tenancy(#[from] TenancyError),
+    #[error("this revision's provider credentials are not valid: {0}")]
+    Credential(#[from] CredentialError),
     #[error("audit event {audit} records mutation {recorded}, not this candidate's {mutation}")]
     AuditMutationMismatch {
         audit: AuditEventId,
@@ -247,6 +250,13 @@ impl DesiredState {
         // scoped to one — a domain invariant rather than a projection's problem.
         Tenancy::of(self)?;
 
+        // Then the bodies that hang off tenancy. Credentials are read after it
+        // because their ownership is stated in the same terms — a tenant, and
+        // optionally one of its projects — and a project that does not belong to
+        // the tenant a credential names is tenancy's refusal to make, not a second
+        // opinion about it here (#198).
+        Credentials::of(self)?;
+
         Ok(())
     }
 
@@ -389,6 +399,42 @@ impl RevisionManifest {
     }
 }
 
+/// A stored body this build cannot read, whichever schema it declares.
+///
+/// One label rather than one arm per schema: an operator's action is the same —
+/// run a build that reads the revision, or publish one this build reads — and
+/// convergence classifies by [`IntegrityError::is_incompatible`] rather than by
+/// matching on which body it was.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BodySkew {
+    #[error(transparent)]
+    Tenancy(TenancyError),
+    #[error(transparent)]
+    Credential(CredentialError),
+}
+
+impl From<TenancyError> for BodySkew {
+    fn from(error: TenancyError) -> Self {
+        Self::Tenancy(error)
+    }
+}
+
+impl From<CredentialError> for BodySkew {
+    fn from(error: CredentialError) -> Self {
+        Self::Credential(error)
+    }
+}
+
+impl BodySkew {
+    /// The resource the refusal is about, whichever schema refused it.
+    pub const fn reference(&self) -> ResourceRef {
+        match self {
+            Self::Tenancy(error) => error.reference(),
+            Self::Credential(error) => error.reference(),
+        }
+    }
+}
+
 /// Why stored state could not be trusted as the revision it claims to be.
 ///
 /// Distinct from [`ValidationError`] on purpose: a validation error means a
@@ -452,7 +498,7 @@ pub enum IntegrityError {
     /// a revision the deployed version understands, rather than repair storage.
     /// The replica keeps serving what it already holds either way.
     #[error("stored revision is not compatible with this build: {0}")]
-    Incompatible(TenancyError),
+    Incompatible(BodySkew),
     /// A stored record could not be interpreted at all: an id, checksum, kind,
     /// scope, or canonical body that is not the value it was written as. Distinct
     /// from the mismatch arms above, which compare two things that were both
@@ -471,7 +517,10 @@ impl IntegrityError {
     fn classify(error: ValidationError) -> Self {
         match error {
             ValidationError::Tenancy(tenancy) if tenancy.is_incompatible() => {
-                Self::Incompatible(tenancy)
+                Self::Incompatible(BodySkew::Tenancy(tenancy))
+            }
+            ValidationError::Credential(credential) if credential.is_incompatible() => {
+                Self::Incompatible(BodySkew::Credential(credential))
             }
             other => Self::Invalid(other),
         }

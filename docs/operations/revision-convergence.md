@@ -118,12 +118,13 @@ deployment, not a restore.
 
 A published resource carries a **body**: a record whose meaning is fixed by an
 explicit schema identifier stored inside it, alongside the resource's identity,
-scope, and slug. Two schemas exist today:
+scope, and slug. Three schemas exist today:
 
 | Schema | Resource | Fields |
 | --- | --- | --- |
 | `axond.tenant.v1` | a deployment tenant | `schema`, `tenant_id`, `display_name` |
 | `axond.project.v1` | a tenant-owned project | `schema`, `project_id`, `tenant_id`, `display_name` |
+| `axond.provider-credential.v1` | a tenant's or project's credential for one provider | `schema`, `credential_id`, `tenant_id`, `project_id` (a project's only), `provider_id`, `display_name`, `secret_id`, `secret_version`, `lifecycle` |
 
 Five rules hold for every body schema, present and future:
 
@@ -176,6 +177,47 @@ credential or an alias published before tenancy bodies existed may carry a tenan
 no row describes, and adding that requirement now would make revisions already in
 the journal stop hydrating on upgrade. Such a scope is *unroutable*, which the
 boundary that routes reports, rather than unreadable.
+
+### Provider credentials name material without holding it
+
+A credential body carries an **opaque, exactly-versioned reference** to secret
+material — `secret_id` (`sct_…`) plus `secret_version` — and never the material,
+nor a fingerprint, prefix, or length of it. Plaintext lives in the secret store,
+is unwrapped only while a snapshot is compiled, and is never in the journal, a
+manifest, an audit event, or a log line ([ADR
+0033](../adr/0033-typed-provider-credentials-and-secret-lifecycle.md)).
+
+Four things follow, and each is worth knowing before you rotate a key:
+
+- **A revision pins one exact version.** Rotating stages a *new* version of the
+  same secret and publishes a new version of the credential; the revision that
+  pinned the old version keeps pinning it, so a rollback restores the material as
+  well as the manifest. A rotation therefore does not take effect until the
+  credential naming it is published and activated.
+- **`lifecycle` says what may be done with the material**, and moves
+  deterministically: `staged` (loaded, resolvable, so a candidate can be compiled
+  against it) → `active` (in service) ⇄ `disabled` (withdrawn, reversible); any of
+  those → `revoked` (never returns to service) → `tombstoned` (the stored bytes
+  are destroyed). Repeating a state an entry already has is a no-op, so
+  republishing the same desired state is not a conflict. Only `staged` and
+  `active` resolve.
+- **Ownership is exact.** The body's `tenant_id`/`project_id` *are* the
+  resource's scope, and one secret has exactly one owner: a project's credential
+  never resolves its tenant's material, and a credential naming another owner's
+  secret is refused at publication and again at hydration. A credential
+  authenticates only to a provider its owner can reach — its own scope, or its
+  tenant's — so a sibling project's or another tenant's provider is refused.
+- **Two credentials cannot disagree about one secret.** Two references to the same
+  version must declare the same `lifecycle`, and at most one version of a secret
+  is `active`, so which key authorizes a request never depends on iteration order.
+
+A `provider_id` naming a resource the same revision does not declare is *not*
+refused, for the reason given above: such a reference is unroutable rather than
+unreadable. A credential body written before this schema existed — no
+`schema` field — is `incompatible` rather than corrupt, as an untyped tenant or
+project body is; republish the affected credentials from a build that writes typed
+bodies. A `lifecycle` identifier this build does not know is the same refusal, so
+a newer release may add a state without older replicas reporting damage.
 
 ### How a project becomes a namespace
 

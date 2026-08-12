@@ -52,11 +52,15 @@
 //! `ControlPlaneStore` must behave when they do.
 
 pub mod canonical;
+pub mod credentials;
 pub mod ids;
 pub mod mutation;
 pub mod resource;
 pub mod revision;
+pub mod secrets;
 pub mod tenancy;
+
+mod record;
 
 #[cfg(test)]
 pub(crate) mod fixtures;
@@ -71,9 +75,14 @@ pub use canonical::{
     Canonical, CanonicalError, CanonicalValue, Checksum, InvalidChecksum, SerializerVersion,
 };
 #[allow(unused_imports)]
+pub use credentials::{
+    CredentialError, Credentials, PROVIDER_CREDENTIAL_SCHEMA, ProviderCredential,
+    ProviderCredentialBody,
+};
+#[allow(unused_imports)]
 pub use ids::{
     AuditEventId, InvalidId, InvalidSlug, InvalidUuid7, MutationId, ProjectId, ResourceId,
-    RevisionId, Slug, TenantId, Uuid7, Uuid7Generator,
+    RevisionId, SecretId, Slug, TenantId, Uuid7, Uuid7Generator,
 };
 #[allow(unused_imports)]
 pub use mutation::{
@@ -87,8 +96,13 @@ pub use resource::{
 };
 #[allow(unused_imports)]
 pub use revision::{
-    DesiredState, IntegrityError, LoadedRevision, ManifestEntry, RevisionCandidate,
+    BodySkew, DesiredState, IntegrityError, LoadedRevision, ManifestEntry, RevisionCandidate,
     RevisionManifest, ValidationError,
+};
+#[allow(unused_imports)]
+pub use secrets::{
+    ForbiddenTransition, LifecycleTransition, SecretLifecycle, SecretOwner, SecretRef,
+    SecretVersion,
 };
 #[allow(unused_imports)]
 pub use tenancy::{
