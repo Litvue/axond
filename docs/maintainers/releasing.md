@@ -108,7 +108,15 @@ The preflight requires the tag's `Dockerfile`, `ops/docker-smoke.sh`,
 publish a multi-architecture index and verify its evidence, and neither can be
 done with a tag that does not carry those scripts. So a tag cut before ARM support
 cannot be repaired through this dispatch path — dispatch the workflow **from that
-tag** instead, where its own definition and scripts are used. crates.io
+tag** instead, where its own definition and scripts are used. The preflight
+failure prints that remediation itself, so it does not depend on this page being
+read first, and it is a refusal rather than a partial release: nothing is
+published for a tag whose tree cannot produce and verify the index.
+
+Every tag published before ARM support is in that position, so the release notes
+for the release that introduces it say so — a maintainer with
+`--ref main -f release_tag=<older-tag>` in their shell history needs to learn the
+new form from the changelog, not from a failed dispatch. crates.io
 publication is enabled only if the tag also contains `ops/publish-crates.sh`;
 older tags skip that lane explicitly.
 
