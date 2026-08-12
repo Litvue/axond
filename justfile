@@ -22,11 +22,16 @@ test:
 docs:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
 
-# Validate documentation links, release markers, route coverage, and Compose variants.
+# Validate documentation links, release markers, route coverage, the release
+# artifact matrix, and Compose variants.
 docs-check:
     python3 ops/check-docs.py
+    python3 ops/check-release-config.py
     sh -n install.sh
+    bash -n ops/publish-image-index.sh
+    bash -n ops/verify-image-evidence.sh
     AXOND_VERSION=0.0.0 AXOND_TARGET=x86_64-unknown-linux-musl AXOND_INSTALL_DRY_RUN=1 sh install.sh | grep -F 'axond-0.0.0-x86_64-unknown-linux-musl.tar.gz'
+    AXOND_VERSION=0.0.0 AXOND_TARGET=aarch64-unknown-linux-musl AXOND_INSTALL_DRY_RUN=1 sh install.sh | grep -F 'axond-0.0.0-aarch64-unknown-linux-musl.tar.gz'
     docker compose --env-file ops/compose/env.example config --quiet
     docker compose --env-file ops/compose/env.example -f docker-compose.yml -f docker-compose.build.yml config --quiet
     AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml docker compose --env-file ops/compose/env.example -f docker-compose.yml -f docker-compose.stateful.yml --profile stateful config --quiet

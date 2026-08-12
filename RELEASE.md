@@ -10,8 +10,8 @@ evidence and known limitations; the reusable process lives in the
 | --- | --- | --- |
 | Required routes, failover, credential pools, identity, controls, telemetry, and durable usage are implemented | Met | Compatibility contract, ADRs, unit/integration tests, SDK compatibility, stateful tests, Tier 0 gate, and stream soak. |
 | Public source repository | Met | `https://github.com/Litvue/axond`. |
-| Cross-platform release archives | Met | The [latest GitHub release](https://github.com/Litvue/axond/releases/latest) contains Linux GNU/musl, Apple Silicon macOS, and Windows archives, checksums, SBOMs, and provenance. |
-| Public OCI image | Met | The versioned `ghcr.io/litvue/axond` image for each release is public, smoke-tested, signed keylessly, and carries provenance/SBOM attestations. |
+| Cross-platform release archives | Met | The [latest GitHub release](https://github.com/Litvue/axond/releases/latest) contains Linux x86-64 and ARM64 GNU/musl, Apple Silicon macOS, and Windows archives, checksums, SBOMs, and provenance. |
+| Public OCI image | Met | The versioned `ghcr.io/litvue/axond` image for each release is public, published as a `linux/amd64` + `linux/arm64` index, smoke-tested per architecture, signed keylessly, and carries provenance/SBOM attestations. |
 | crates.io workspace | Met | [`gateway-core`](https://crates.io/crates/gateway-core), [`gateway-transport`](https://crates.io/crates/gateway-transport), and [`axond`](https://crates.io/crates/axond) are published in dependency order. |
 | Deployment/configuration/operator documentation | Met | Task-oriented documentation index, executable examples, references, and runbooks under `docs/`. |
 
@@ -35,8 +35,13 @@ and publishes crates.io last because registry versions are immutable.
 
 ## Known limitations
 
-- The OCI image is currently `linux/amd64` only. Release archives cover Linux
-  x86_64, Apple Silicon macOS, and Windows x86_64.
+- Released platforms are the ones in
+  [the supported platform matrix](./docs/compatibility.md#supported-platforms):
+  Linux x86-64 and ARM64 (glibc and static musl), Apple Silicon macOS, and
+  Windows x86-64, with `linux/amd64` and `linux/arm64` images. Other platforms
+  build from source.
+- Release archives are verified by checksum and GitHub attestation; keyless
+  cosign signatures cover the published image manifests only.
 - `/readyz` reports a serving, boot-validated process; it does not continuously
   probe providers, Redis, or Postgres.
 - Cross-provider request translation is intentionally not supported. OpenAI and
@@ -72,4 +77,5 @@ The required CI aggregate covers:
 - Docker image and Compose quickstart smoke tests.
 
 Release jobs add archive/image SBOMs, provenance attestations, cosign signing,
-published-image smoke, and crates.io upload.
+native per-architecture archive and published-image smoke, multi-architecture
+index platform assertions, and crates.io upload.

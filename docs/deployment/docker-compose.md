@@ -9,8 +9,10 @@ The repository ships three composable files:
 | `docker-compose.stateful.yml` | Redis/Postgres dependency and health-gating overlay. |
 
 Configuration lives in `ops/compose/*.toml`; secrets and DSNs live in `.env`.
-The service explicitly selects `linux/amd64`, matching the current release
-image and allowing Docker Desktop to emulate the source build on Apple Silicon.
+The service pins no platform: the release image is a `linux/amd64` +
+`linux/arm64` index, so an ARM host pulls a native image and an ARM source build
+builds natively. Set `platform:` explicitly only to force the other
+architecture under emulation.
 
 ## Pull-first Tier 0
 

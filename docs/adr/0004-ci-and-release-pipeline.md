@@ -90,3 +90,36 @@ dirty worktree — and the signing identity is pinned to this workflow on
   the `GITHUB_TOKEN` fallback leaves the release PR un-CI-validated until merge.
 - The pipeline currently publishes a single `linux/amd64` image; multi-arch is a
   later addition, not a rewrite.
+
+## Amendment (2026-08-12): ARM64 archives and a multi-architecture image
+
+The original decision left multi-arch as "a later addition, not a rewrite". This
+is that addition, and it is additive in exactly that sense: nothing above is
+withdrawn.
+
+Two Linux `aarch64` archives (glibc and static musl) join the four existing
+binary targets, and the image is published for `linux/arm64` alongside
+`linux/amd64`. Every Linux archive and every published manifest is built on a
+runner of its own architecture, so the release never ships an artifact that was
+only cross-compiled and never executed: each Linux archive is booted through the
+Tier 0 gate, and each single-platform image is smoke-tested before it is signed.
+
+The two signed, attested child images are then joined — by digest, not rebuilt —
+into an OCI index that the existing `<version>` and `sha-<short>` tags point at,
+so a digest-pinned deployment resolves on either architecture. The index digest
+is itself signed and attested, and it is what `axond-image-<version>.digest`
+names on the release. Single-platform references remain first-class as
+`<version>-<arch>` and `sha-<short>-<arch>`; per-architecture SBOM and digest
+assets are attached per architecture, since their contents genuinely differ.
+Still no `latest` tag.
+
+Keyless signatures remain image-only. Archives are covered by their SHA-256
+sidecar and GitHub provenance/SBOM attestations, as before; signing archives
+would be a separate decision with its own verification story for installers.
+
+Because the release matrix is only exercised for real at a tag,
+`ops/check-release-config.py` asserts its shape on every change: the published
+targets and archive extensions, the image platforms, that ARM lanes run on ARM
+runners, that each lane keeps its checksum/SBOM/provenance/signature/smoke gate,
+that `release-success` requires every lane, and that no `latest` tag is
+introduced anywhere.

@@ -11,7 +11,7 @@ resource model rather than copying an unverified provider-specific template.
 | Requirement | Axond value |
 | --- | --- |
 | Image | `ghcr.io/litvue/axond@sha256:<verified-digest>` |
-| Architecture | `linux/amd64` |
+| Architecture | `linux/amd64` or `linux/arm64`, resolved from the image index |
 | Container port | `8080` by default |
 | Config | Read-only TOML mounted into the container |
 | Config selector | `AXOND_CONFIG=/path/to/axond.toml` |

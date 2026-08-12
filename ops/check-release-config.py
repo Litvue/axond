@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Deterministic release-artifact configuration checks.
+
+The release matrix is only exercised for real at a tag, when a mistake is
+already published and a `latest` tag or a dropped target cannot be taken back.
+So the shape of the release configuration is asserted here on every change,
+without a YAML dependency: the published binary targets, the published image
+platforms, the archive extension per target, the integrity and smoke gates each
+lane must carry, the release-success aggregate, and the absence of any
+`latest`-tag requirement.
+
+The expectations are written out rather than derived from the workflow, so
+removing a supported target or dropping a gate fails this check instead of
+silently shrinking the release.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+WORKFLOW = ROOT / ".github/workflows/release-please.yml"
+
+# target -> archive extension published for it.
+BINARY_TARGETS = {
+    "x86_64-unknown-linux-gnu": "tar.gz",
+    "x86_64-unknown-linux-musl": "tar.gz",
+    "aarch64-unknown-linux-gnu": "tar.gz",
+    "aarch64-unknown-linux-musl": "tar.gz",
+    "aarch64-apple-darwin": "tar.gz",
+    "x86_64-pc-windows-msvc": "zip",
+}
+UNIX_INSTALLER_TARGETS = {
+    target for target in BINARY_TARGETS if not target.endswith("-pc-windows-msvc")
+}
+WINDOWS_INSTALLER_TARGET = "x86_64-pc-windows-msvc"
+IMAGE_PLATFORMS = {"linux/amd64", "linux/arm64"}
+# Documentation that must name every target and platform an operator can pick.
+PLATFORM_DOCS = ("docs/installation.md", "docs/compatibility.md")
+
+
+def workflow_text() -> str:
+    return WORKFLOW.read_text(encoding="utf-8")
+
+
+def job_block(text: str, job: str) -> str | None:
+    """The body of one top-level workflow job, by name."""
+    match = re.search(
+        rf"\n  {re.escape(job)}:\n(.*?)(?=\n  [A-Za-z0-9_-]+:\n|\Z)", text, re.DOTALL
+    )
+    return None if match is None else match.group(1)
+
+
+def check_binary_matrix(text: str) -> list[str]:
+    failures: list[str] = []
+    block = job_block(text, "release-binaries")
+    if block is None:
+        return ["release-please.yml: release-binaries job not found"]
+    entries = re.findall(
+        r"- os: (\S+)\n\s+target: (\S+)\n\s+archive: (\S+)", block
+    )
+    found = {target: archive for _os, target, archive in entries}
+    if len(entries) != len(found):
+        failures.append("release-please.yml: duplicate target in the binary matrix")
+    for target, archive in BINARY_TARGETS.items():
+        if target not in found:
+            failures.append(f"release-please.yml: binary matrix is missing {target}")
+        elif found[target] != archive:
+            failures.append(
+                f"release-please.yml: {target} publishes .{found[target]}, expected .{archive}"
+            )
+    for target in sorted(set(found) - set(BINARY_TARGETS)):
+        failures.append(
+            f"ops/check-release-config.py: undeclared binary target {target}; document it first"
+        )
+    # An aarch64 Linux archive built on an x86_64 runner would be cross-compiled
+    # and could not be booted by the smoke gate below.
+    for os_label, target, _archive in entries:
+        if target.startswith("aarch64-unknown-linux") and not os_label.endswith("-arm"):
+            failures.append(
+                f"release-please.yml: {target} builds on {os_label}, not an arm64 runner"
+            )
+    return failures
+
+
+def check_binary_gates(text: str) -> list[str]:
+    block = job_block(text, "release-binaries")
+    if block is None:
+        return []
+    required = {
+        "checksum sidecar": "shasum -a 256",
+        "windows checksum sidecar": "Get-FileHash",
+        "SBOM": "anchore/sbom-action@v0",
+        "provenance attestation": "Attest binary provenance",
+        "SBOM attestation": "Attest binary SBOM",
+        "static-link assertion": "Assert the musl binary is statically linked",
+        "boot smoke": "ops/tier0-gate.sh",
+    }
+    return [
+        f"release-please.yml: release-binaries lacks a {label} gate ({needle!r})"
+        for label, needle in required.items()
+        if needle not in block
+    ]
+
+
+def check_image_matrix(text: str) -> list[str]:
+    failures: list[str] = []
+    for job in ("release-image", "release-image-index-smoke"):
+        block = job_block(text, job)
+        if block is None:
+            failures.append(f"release-please.yml: {job} job not found")
+            continue
+        entries = re.findall(r"- os: (\S+)\n\s+platform: (\S+)\n\s+arch: (\S+)", block)
+        platforms = {platform for _os, platform, _arch in entries}
+        if platforms != IMAGE_PLATFORMS:
+            failures.append(
+                f"release-please.yml: {job} publishes {sorted(platforms)}, "
+                f"expected {sorted(IMAGE_PLATFORMS)}"
+            )
+        for os_label, platform, arch in entries:
+            if platform != f"linux/{arch}":
+                failures.append(
+                    f"release-please.yml: {job} pairs platform {platform} with arch {arch}"
+                )
+            if arch == "arm64" and not os_label.endswith("-arm"):
+                failures.append(
+                    f"release-please.yml: {job} builds arm64 on {os_label}, not an arm64 runner"
+                )
+    # The image builds every published platform from one Dockerfile, so each
+    # architecture must map to a Rust target there too.
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    if "ARG TARGETARCH" not in dockerfile:
+        failures.append(
+            "Dockerfile: TARGETARCH is not declared; the build is not platform-aware"
+        )
+    for platform in sorted(IMAGE_PLATFORMS):
+        arch = platform.split("/", 1)[1]
+        mapping = rf"\n\s+{re.escape(arch)}\) rust_target=\S+-unknown-linux-musl ;;"
+        if not re.search(mapping, dockerfile):
+            failures.append(f"Dockerfile: {arch} does not select a static musl Rust target")
+    # The index script is the one place the platform list is applied at runtime.
+    script = (ROOT / "ops/publish-image-index.sh").read_text(encoding="utf-8")
+    declared = re.search(r"PLATFORMS=\(([^)]*)\)", script)
+    if declared is None:
+        failures.append("ops/publish-image-index.sh: PLATFORMS list not found")
+    elif set(declared.group(1).split()) != IMAGE_PLATFORMS:
+        failures.append(
+            "ops/publish-image-index.sh: PLATFORMS "
+            f"{sorted(declared.group(1).split())} does not match {sorted(IMAGE_PLATFORMS)}"
+        )
+    return failures
+
+
+def check_image_gates(text: str) -> list[str]:
+    failures: list[str] = []
+    per_platform = job_block(text, "release-image")
+    index = job_block(text, "release-image-index")
+    smoke = job_block(text, "release-image-index-smoke")
+    if per_platform is None or index is None or smoke is None:
+        return ["release-please.yml: an OCI image job is missing"]
+    for label, needle in {
+        "published-image smoke": "ops/docker-smoke.sh",
+        "SBOM": "anchore/sbom-action@v0",
+        "provenance attestation": "Attest image provenance",
+        "SBOM attestation": "Attest image SBOM",
+        "keyless signature": "cosign sign --yes",
+        "evidence verification": "ops/verify-image-evidence.sh",
+        "per-architecture digest asset": ".digest",
+    }.items():
+        if needle not in per_platform:
+            failures.append(
+                f"release-please.yml: release-image lacks a {label} gate ({needle!r})"
+            )
+    for label, needle in {
+        "index assembly and platform assertion": "ops/publish-image-index.sh",
+        "keyless signature": "cosign sign --yes",
+        "provenance attestation": "Attest index provenance",
+        "evidence verification": "ops/verify-image-evidence.sh",
+        "index digest asset": '"axond-image-${RELEASE_VERSION}.digest"',
+    }.items():
+        if needle not in index:
+            failures.append(
+                f"release-please.yml: release-image-index lacks a {label} gate ({needle!r})"
+            )
+    if "ops/docker-smoke.sh" not in smoke:
+        failures.append(
+            "release-please.yml: release-image-index-smoke does not smoke the index digest"
+        )
+    if "docker image inspect" not in smoke:
+        failures.append(
+            "release-please.yml: release-image-index-smoke does not assert the resolved architecture"
+        )
+    return failures
+
+
+def check_release_success(text: str) -> list[str]:
+    block = job_block(text, "release-success")
+    if block is None:
+        return ["release-please.yml: release-success job not found"]
+    failures: list[str] = []
+    for lane in (
+        "release-binaries",
+        "release-image",
+        "release-image-index",
+        "release-image-index-smoke",
+    ):
+        if f"- {lane}\n" not in block:
+            failures.append(f"release-please.yml: release-success does not need {lane}")
+        if f"needs['{lane}'].result }}}}\" = success" not in block:
+            failures.append(f"release-please.yml: release-success does not require {lane}")
+    return failures
+
+
+def check_no_latest_tag(text: str) -> list[str]:
+    failures: list[str] = []
+    if "flavor: latest=false" not in text:
+        failures.append("release-please.yml: OCI metadata does not disable the latest tag")
+    if re.search(r"type=raw,value=latest|:latest\b", text):
+        failures.append("release-please.yml: a latest tag is published")
+    candidates = [
+        ROOT / "docker-compose.yml",
+        ROOT / "docker-compose.build.yml",
+        ROOT / "docker-compose.stateful.yml",
+        ROOT / "install.sh",
+        ROOT / "install.ps1",
+    ]
+    candidates.extend(sorted((ROOT / "deploy").rglob("*.yaml")))
+    candidates.extend(sorted((ROOT / "deploy").rglob("*")))
+    for path in candidates:
+        if not path.is_file():
+            continue
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if re.search(r"axond:latest|/axond:\s*latest", line):
+                failures.append(
+                    f"{path.relative_to(ROOT)}:{number}: deployment example requires a latest tag"
+                )
+    return failures
+
+
+def check_documented_matrix() -> list[str]:
+    failures: list[str] = []
+    docs = {
+        relative: (ROOT / relative).read_text(encoding="utf-8") for relative in PLATFORM_DOCS
+    }
+    for target in BINARY_TARGETS:
+        if not any(target in text for text in docs.values()):
+            failures.append(
+                f"{' / '.join(PLATFORM_DOCS)}: release target {target} is not documented"
+            )
+    container = (ROOT / "docs/deployment/container.md").read_text(encoding="utf-8")
+    for platform in sorted(IMAGE_PLATFORMS):
+        for relative, text in list(docs.items()) + [("docs/deployment/container.md", container)]:
+            if platform not in text:
+                failures.append(f"{relative}: image platform {platform} is not documented")
+    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+    allowlist = re.search(r"\ncase \"\$target\" in\n(.*?)\n  \*\)", installer, re.DOTALL)
+    if allowlist is None:
+        failures.append("install.sh: target allowlist not found")
+    else:
+        allowed = set(re.findall(r"[A-Za-z0-9_.]+-[A-Za-z0-9_.-]+", allowlist.group(1)))
+        for target in sorted(UNIX_INSTALLER_TARGETS):
+            if target not in allowed:
+                failures.append(f"install.sh: prebuilt target {target} is not accepted")
+    if "Linux/aarch64|Linux/arm64" not in installer:
+        failures.append("install.sh: Linux arm64 is not detected by uname")
+    windows_installer = (ROOT / "install.ps1").read_text(encoding="utf-8")
+    if WINDOWS_INSTALLER_TARGET not in windows_installer:
+        failures.append(f"install.ps1: {WINDOWS_INSTALLER_TARGET} is not accepted")
+    return failures
+
+
+def main() -> int:
+    text = workflow_text()
+    failures: list[str] = []
+    failures.extend(check_binary_matrix(text))
+    failures.extend(check_binary_gates(text))
+    failures.extend(check_image_matrix(text))
+    failures.extend(check_image_gates(text))
+    failures.extend(check_release_success(text))
+    failures.extend(check_no_latest_tag(text))
+    failures.extend(check_documented_matrix())
+    if failures:
+        for failure in failures:
+            print(f"release configuration check failed: {failure}", file=sys.stderr)
+        return 1
+    print(
+        "release configuration checks passed "
+        f"({len(BINARY_TARGETS)} binary targets, {len(IMAGE_PLATFORMS)} image platforms)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

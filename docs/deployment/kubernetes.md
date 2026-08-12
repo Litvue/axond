@@ -11,7 +11,8 @@ PodDisruptionBudget.
    with a Secret supplied by your secret manager.
 2. Replace the version tag with the verified release digest.
 3. Review resource requests and limits against your payload and concurrency.
-4. Confirm nodes can run `linux/amd64`; the public image is not yet multi-arch.
+4. Confirm nodes run `linux/amd64` or `linux/arm64`; the public image index
+   covers both, so one pinned index digest schedules onto either.
 
 For example:
 

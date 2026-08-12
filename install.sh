@@ -45,6 +45,9 @@ if [ -z "$target" ]; then
     Linux/x86_64|Linux/amd64)
       target="x86_64-unknown-linux-musl"
       ;;
+    Linux/aarch64|Linux/arm64)
+      target="aarch64-unknown-linux-musl"
+      ;;
     Darwin/arm64|Darwin/aarch64)
       target="aarch64-apple-darwin"
       ;;
@@ -55,7 +58,8 @@ if [ -z "$target" ]; then
 fi
 
 case "$target" in
-  x86_64-unknown-linux-gnu|x86_64-unknown-linux-musl|aarch64-apple-darwin)
+  x86_64-unknown-linux-gnu|x86_64-unknown-linux-musl| \
+  aarch64-unknown-linux-gnu|aarch64-unknown-linux-musl|aarch64-apple-darwin)
     ;;
   *)
     fail "unsupported prebuilt target: $target"

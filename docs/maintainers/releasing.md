@@ -8,14 +8,21 @@ pipeline.
 
 1. Resolve the immutable tag/version/commit.
 2. Require the tagged commit's `CI Success` aggregate.
-3. Build four binary targets with checksums, SPDX SBOMs, and provenance/SBOM
-   attestations.
-4. Build and publish the `linux/amd64` image.
-5. Smoke the published image before signing it.
+3. Build six binary targets with checksums, SPDX SBOMs, and provenance/SBOM
+   attestations, each Linux archive booted through the Tier 0 gate on a runner
+   of its own architecture.
+4. Build and publish the `linux/amd64` and `linux/arm64` images, each on a native
+   runner, under their `<version>-<arch>` and `sha-<short>-<arch>` tags.
+5. Smoke each published single-platform image before signing it.
 6. Generate image SBOM/provenance attestations, sign the digest keylessly, and
-   verify signature plus attestations.
-7. Require every artifact lane.
-8. Publish `gateway-core`, `gateway-transport`, then `axond` to crates.io.
+   verify signature plus attestations, per architecture.
+7. Join the signed child digests into the multi-architecture index that
+   `<version>` and `sha-<short>` point at, assert it contains exactly the
+   supported platforms, sign and attest the index digest, and attach it to the
+   release as `axond-image-<version>.digest`.
+8. Pull that index digest on each architecture and smoke it natively.
+9. Require every artifact lane.
+10. Publish `gateway-core`, `gateway-transport`, then `axond` to crates.io.
 
 crates.io is last because a published version cannot be replaced. The publish
 script is idempotent: an existing aligned package is skipped, and a partial

@@ -79,6 +79,36 @@ Compatibility is enforced by CI, not asserted: a required lane drives a real
 provider account and no network
 ([ADR 0014](./adr/0014-compatibility-and-soak-harness.md)).
 
+## Supported platforms
+
+Released artifacts cover these targets. Anything else builds from source; a
+target is added by a release, never by an unpublished build.
+
+| Platform | Release archive | OCI platform |
+| --- | --- | --- |
+| Linux x86-64, glibc | `x86_64-unknown-linux-gnu.tar.gz` | — |
+| Linux x86-64, static musl | `x86_64-unknown-linux-musl.tar.gz` | `linux/amd64` |
+| Linux ARM64, glibc | `aarch64-unknown-linux-gnu.tar.gz` | — |
+| Linux ARM64, static musl | `aarch64-unknown-linux-musl.tar.gz` | `linux/arm64` |
+| macOS Apple Silicon | `aarch64-apple-darwin.tar.gz` | — |
+| Windows x86-64 | `x86_64-pc-windows-msvc.zip` | — |
+
+`ghcr.io/litvue/axond:<version>` and `:sha-<short>` resolve to a
+multi-architecture index containing `linux/amd64` and `linux/arm64`, so one
+pinned digest deploys on either architecture. Single-platform references remain
+available as `:<version>-amd64` and `:<version>-arm64`. There is no `latest`
+tag, and adding one is not planned.
+
+Every archive carries a SHA-256 sidecar, an SPDX SBOM, and provenance/SBOM
+attestations; every published image manifest — each single-platform image and
+the index — is smoke-tested on its own architecture, signed keylessly, and
+attested. Archive signing is deliberately not part of this: archives are
+verified through their checksum and GitHub attestations, and keyless signatures
+are an image-only mechanism here.
+
+Dropping a supported platform is a minor-release, changelog-listed act under the
+same rules as the config surface below.
+
 ## Stability promises
 
 ### The config surface

@@ -156,7 +156,24 @@ jobs:
       - name: Documentation links, drift, routes, and deployment manifests
         run: |
           python3 ops/check-docs.py
-          shellcheck install.sh
+          python3 ops/check-release-config.py
+          shellcheck install.sh ops/publish-image-index.sh \
+            ops/verify-image-evidence.sh
+          # Every released Unix target must resolve to its own archive, and a
+          # target outside the release matrix must be refused rather than
+          # producing a download URL for an asset that was never published.
+          for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl \
+            aarch64-unknown-linux-gnu aarch64-unknown-linux-musl \
+            aarch64-apple-darwin; do
+            AXOND_VERSION=0.0.0 AXOND_TARGET="$target" \
+              AXOND_INSTALL_DRY_RUN=1 sh install.sh |
+              grep -F "axond-0.0.0-${target}.tar.gz"
+          done
+          if AXOND_VERSION=0.0.0 AXOND_TARGET=aarch64-unknown-linux-uclibc \
+            AXOND_INSTALL_DRY_RUN=1 sh install.sh; then
+            echo "Unix installer accepted an unpublished target" >&2
+            exit 1
+          fi
           unix_installer_output="$(AXOND_VERSION=0.0.0 \
             AXOND_TARGET=x86_64-unknown-linux-musl \
             AXOND_REQUIRE_ATTESTATION=true \

@@ -3,9 +3,9 @@ services:
     # Pull-first for evaluators. Development and CI add docker-compose.build.yml
     # to build the checked-out tree instead.
     image: ${AXOND_IMAGE:-ghcr.io/litvue/axond:0.3.12} # x-release-please-version
-    # The public image and Dockerfile are linux/amd64 today. Declaring it makes
-    # pulls and source builds deterministic on Apple Silicon via emulation.
-    platform: linux/amd64
+    # No platform pin: the release image is a linux/amd64 + linux/arm64 index and
+    # the Dockerfile builds either natively, so an ARM host runs a native image
+    # instead of an emulated one. Set `platform:` only to force an architecture.
     ports:
       - "${AXOND_QUICKSTART_HOST_PORT:-127.0.0.1:8080}:8080"
     environment:
