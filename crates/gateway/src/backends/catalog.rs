@@ -46,6 +46,10 @@
 //! admitted through it, a typed parse or validation failure returns without
 //! touching the active snapshot, and a successful admission reports the semantic
 //! [`CatalogDiff`] against what it replaced.
+//!
+//! The observed-rate denomination, the three identities and their validator
+//! semantics, and the bundled offline seed are recorded in
+//! [ADR 0031](https://github.com/Litvue/axond/blob/main/docs/adr/0031-catalogue-source-imports.md).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
@@ -624,6 +628,10 @@ pub enum ModelField {
     LastUpdated,
     /// The offering's own endpoint metadata, when a provider states one.
     Endpoint,
+    /// The model id this provider publishes, which is the id a request to it
+    /// must use. Only ever a change, never an override: it has no neutral
+    /// counterpart to contradict.
+    PublishedModelId,
 }
 
 impl ModelField {
@@ -641,6 +649,7 @@ impl ModelField {
         Self::ReleaseDate,
         Self::LastUpdated,
         Self::Endpoint,
+        Self::PublishedModelId,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -658,6 +667,7 @@ impl ModelField {
             Self::ReleaseDate => "release_date",
             Self::LastUpdated => "last_updated",
             Self::Endpoint => "endpoint",
+            Self::PublishedModelId => "published_model_id",
         }
     }
 
@@ -1614,6 +1624,13 @@ fn offering_changes(
     if previous.endpoint != current.endpoint {
         differences.push(ModelField::Endpoint);
     }
+    // The id a request must send is part of the identity, so a provider moving
+    // from an authored key to its own local one has to be reportable: the
+    // offering is otherwise unchanged, and an operator would see a changed
+    // catalogue with nothing named.
+    if previous.published_model_id != current.published_model_id {
+        differences.push(ModelField::PublishedModelId);
+    }
     if differences.iter().any(|field| field.lifecycle()) {
         changes.push(CatalogChange::LifecycleChanged {
             model: model.clone(),
@@ -1961,6 +1978,12 @@ mod tests {
         };
         let endpoint_moved = content(vec![endpoint]);
 
+        // A provider renaming what callers must send: the offering is otherwise
+        // identical, so nothing but this field can report it.
+        let mut renamed = offering("openai", "gpt-4o", None);
+        renamed.published_model_id = "gpt-4o-2024-11-20".to_owned();
+        let republished = content(vec![renamed]);
+
         for (case, after, expected) in [
             (
                 "provider metadata",
@@ -1984,6 +2007,15 @@ mod tests {
                     model: ModelId::parse("gpt-4o").expect("fixture id"),
                     provider: ProviderId::parse("openai").expect("fixture id"),
                     fields: vec![ModelField::Endpoint],
+                },
+            ),
+            (
+                "the id a request must send",
+                republished,
+                CatalogChange::MetadataChanged {
+                    model: ModelId::parse("gpt-4o").expect("fixture id"),
+                    provider: ProviderId::parse("openai").expect("fixture id"),
+                    fields: vec![ModelField::PublishedModelId],
                 },
             ),
         ] {

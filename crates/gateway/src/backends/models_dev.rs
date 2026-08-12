@@ -761,6 +761,7 @@ fn field_pointer(offering: &JsonPointer, field: ModelField) -> JsonPointer {
         ModelField::ReleaseDate => offering.child("release_date"),
         ModelField::LastUpdated => offering.child("last_updated"),
         ModelField::Endpoint => offering.child("provider"),
+        ModelField::PublishedModelId => offering.child("id"),
     }
 }
 
