@@ -106,6 +106,31 @@ path. Because the ceilings own semaphores built at boot, `[admission]` is
 boot-only: a reload validates it and warns that a restart applies it, exactly as
 `[transport]` behaves.
 
+### What these bounds do not cover
+
+Three gaps are known and accepted for this ADR, because closing them changes
+either the request pipeline's shape or a default's meaning:
+
+- **The stream bounds need a draining caller.** `max_stream_duration_ms` and
+  `max_stream_bytes` are evaluated in the relay, which the server polls only
+  when it can write to the caller's socket. A caller that opens a stream and
+  then stops reading applies write backpressure, the relay stops being polled,
+  and neither bound fires — so that stream's permit and budget hold stay held.
+  Enforcing a lifetime independently of polling needs the relay driven by its
+  own task rather than by the response body, which is a larger change than this
+  ADR takes on.
+- **Bodies are buffered and parsed before admission.** Shedding happens in the
+  handler, after the JSON extractor has read and parsed the body, so the
+  concurrency ceilings bound how many requests reach a provider rather than how
+  many bodies are in memory at once. `max_request_bytes` is the only bound on
+  that phase. Moving admission ahead of body reading means taking it in a
+  middleware layer that does not yet know the caller's namespace.
+- **`max_in_flight_per_tenant` is the effective ceiling in a single-namespace
+  deployment.** With one namespace serving all traffic, the replica sheds at the
+  per-tenant ceiling — and answers `429 tenant_concurrency_exceeded`, which
+  points an operator at the caller rather than at the replica. Such deployments
+  should raise the per-tenant ceiling to `max_in_flight` or disable it with `0`.
+
 ## Consequences
 
 - A single tenant or surge can no longer exhaust the process. Traffic above the

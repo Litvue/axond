@@ -335,11 +335,11 @@ many may be in flight at once.
 | `max_output_tokens` | integer | `200000` | Largest output allowance a request may ask for (`max_tokens`, `max_completion_tokens`, or `max_output_tokens`). Refused, not clamped, so the caller is never silently given a different request than it sent. `0` disables. |
 | `max_in_flight` | integer | `1024` | Concurrent requests this replica admits. `0` disables. |
 | `max_in_flight_streams` | integer | `512` | Of those, how many may be streams. A stream holds a socket and a relay task for as long as the answer lasts, so it is the scarcer resource. Must not exceed `max_in_flight` when both are set. `0` disables. |
-| `max_in_flight_per_tenant` | integer | `256` | Concurrent requests one namespace may hold, so one tenant cannot take the whole replica. Must not exceed `max_in_flight` when both are set. `0` disables. |
+| `max_in_flight_per_tenant` | integer | `256` | Concurrent requests one namespace may hold, so one tenant cannot take the whole replica. Must not exceed `max_in_flight` when both are set. `0` disables. In a single-namespace deployment this, not `max_in_flight`, is the effective ceiling — see below. |
 | `max_tenants` | integer | `1024` | Distinct namespaces tracked concurrently. Bounds the admission table itself. |
 | `queue_capacity` | integer | `0` | Requests that may wait for capacity instead of being refused. `0` refuses immediately. |
 | `queue_wait_ms` | integer | `0` | How long a queued request waits before it is shed. Must be set together with `queue_capacity`, and queueing requires a finite `max_in_flight`. |
-| `max_stream_duration_ms` | integer | `3600000` | Total lifetime of one stream, however productive. Distinct from `transport.stream_idle_timeout_ms`, which bounds silence: this is the bound on a stream that never stops talking. `0` disables. |
+| `max_stream_duration_ms` | integer | `3600000` | Total lifetime of one stream, however productive. Distinct from `transport.stream_idle_timeout_ms`, which bounds silence: this is the bound on a stream that never stops talking. Applies to a stream the caller is draining — see below. `0` disables. |
 | `max_stream_bytes` | integer | `67108864` | Bytes one stream may relay before it is ended. `0` disables. |
 
 Except for `max_request_bytes`, `0` means "this ceiling is off".
@@ -355,6 +355,24 @@ and the body ceiling is the operative input bound. Lower `max_prompt_tokens`
 below `max_request_bytes` / 4 if you want a prompt-shaped refusal
 (`413 prompt_too_large`) rather than a size-shaped one (`413 request_too_large`),
 or raise `max_request_bytes` to make the token ceiling the binding one.
+
+Three limits of these bounds are worth knowing before you tune them:
+
+- **A single-namespace deployment sheds at `max_in_flight_per_tenant`, not at
+  `max_in_flight`.** With one namespace serving all traffic the per-tenant
+  ceiling is the operative one, and it answers `429 tenant_concurrency_exceeded`
+  — which reads as a caller problem. Raise it to `max_in_flight`, or set it to
+  `0`, when one namespace is the whole deployment.
+- **`max_stream_duration_ms` and `max_stream_bytes` bound a stream the caller is
+  draining.** They are evaluated as the relay is polled, and a caller that stops
+  reading stops the polling, so a deliberately non-reading client can hold a
+  stream slot past its lifetime. Front axond with a proxy that enforces a
+  write/response timeout if untrusted clients can do that.
+- **`max_in_flight` bounds requests reaching a provider, not bodies in memory.**
+  Shedding happens after the body has been read and parsed, so
+  `max_request_bytes` is what bounds the pre-admission phase. Size the process's
+  memory against `max_request_bytes` times the connection concurrency your
+  ingress allows, not against `max_in_flight` alone.
 
 ### Where shedding happens
 

@@ -611,6 +611,11 @@ pub struct AdmissionConfig {
     /// Concurrent requests one namespace may hold. Keep it below
     /// `max_in_flight` so no single tenant can take the whole replica. `0`
     /// disables the ceiling.
+    ///
+    /// In a deployment with one namespace this, not `max_in_flight`, is the
+    /// ceiling traffic meets — and it answers `429`, which reads as the caller's
+    /// fault. Raise it to `max_in_flight`, or disable it, when one namespace is
+    /// the whole deployment.
     #[serde(default = "default_max_in_flight_per_tenant")]
     pub max_in_flight_per_tenant: usize,
     /// Tenants tracked concurrently by the per-tenant ceiling. Entries exist
@@ -629,6 +634,11 @@ pub struct AdmissionConfig {
     /// Total lifetime of one open stream, as opposed to
     /// `transport.stream_idle_timeout_ms`, which resets on every chunk. This is
     /// what bounds a socket held open by an endless answer. `0` disables it.
+    ///
+    /// Evaluated as the relay is polled, so it bounds a stream the caller is
+    /// draining: a client that stops reading applies write backpressure, the
+    /// relay stops being polled, and the deadline cannot fire. A proxy's
+    /// write/response timeout is the bound for that case.
     #[serde(default = "default_max_stream_duration_ms")]
     pub max_stream_duration_ms: u64,
     /// Largest prompt, in the gateway's pre-dispatch token estimate, that a
