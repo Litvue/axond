@@ -546,9 +546,29 @@ impl Reconciler {
         let Some(cache) = &self.cache else {
             return Err(Self::uncached(source));
         };
-        let restored = cache.load().map_err(|source| BootstrapError::Cache {
-            source: Box::new(source),
-        })?;
+        let restored = match cache.load() {
+            Ok(restored) => restored,
+            // A cache this build cannot *read* is the same version skew as
+            // desired state being unreadable — a rollback onto an older build
+            // that reuses the volume finds a cache the newer build wrote — so the
+            // refusal names the skew rather than blaming the cache file, which is
+            // authentic and intact. An inconsistent or unauthentic cache is still
+            // the cache's own failure.
+            Err(LastKnownGoodError::Integrity(integrity)) if integrity.is_incompatible() => {
+                telemetry::record_last_known_good("incompatible");
+                tracing::warn!(
+                    error = %integrity,
+                    "the last-known-good snapshot was written by a build this one cannot read; \
+                     it cannot stand in for desired state"
+                );
+                return Err(Self::uncached(source));
+            }
+            Err(source) => {
+                return Err(BootstrapError::Cache {
+                    source: Box::new(source),
+                });
+            }
+        };
         let Some(revision) = restored else {
             return Err(Self::uncached(source));
         };

@@ -302,6 +302,13 @@ What to know about it operationally:
   A replica that boots this way reports `source = last-known-good` and keeps
   reporting `incompatible` for the revision it will not read, so the mixed-version
   state is visible rather than papered over. Roll it forward, as above.
+
+  A rollback that reuses the volume can find a cache the *newer* build exported.
+  It is authentic and intact, and this build still cannot read it, so the boot
+  refusal names the version skew rather than the cache file: the action is to roll
+  the replica forward or repave the volume, not to hunt a disk fault. A cache that
+  fails its signature, or holds rows that do not add up, is still reported as the
+  cache's own failure.
 - **An unwritable cache is a warning, not an outage.** A replica whose disk is
   full keeps serving and logs once; what it loses is the ability to cold-boot
   during an outage.

@@ -729,6 +729,54 @@ async fn a_cold_boot_onto_an_unreadable_revision_without_a_cache_refuses_to_star
     );
 }
 
+/// A rollback that reuses the volume: neither desired state nor the cache the
+/// newer build left behind is readable here. The refusal names the version skew
+/// rather than blaming a cache file that is authentic and intact.
+#[tokio::test]
+async fn a_cold_boot_whose_cache_a_newer_build_wrote_is_refused_as_a_skew() {
+    let store = control_plane();
+    let published = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let path = cache_path("cold-boot-newer-cache");
+
+    let warm = Replica::with_cache(
+        &store,
+        LastKnownGood::new(&path, KEY).expect("a long enough key"),
+    );
+    warm.reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    let cached = LastKnownGood::new(&path, KEY).expect("a long enough key");
+    let readable = cached.load().expect("reads back").expect("a cache exists");
+    cached
+        .export_unassembled(readable.manifest(), &fixtures::state_with_legacy_tenant())
+        .expect("a newer build's export");
+    assert_eq!(readable.manifest().id, published);
+
+    // And desired state is what the newer build published, which this build also
+    // does not read.
+    store.rewrite_version(fixtures::legacy_tenant(1, "acme"));
+
+    let error = Replica::with_cache(
+        &store,
+        LastKnownGood::new(&path, KEY).expect("a long enough key"),
+    )
+    .reconciler
+    .bootstrap()
+    .await
+    .expect_err("there is nothing this build can serve");
+    assert!(
+        matches!(
+            error,
+            BootstrapError::Store {
+                source: ControlPlaneError::Incompatible { .. }
+            }
+        ),
+        "the skew is named, not the cache that faithfully recorded it: {error}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Without a cache, a cold boot during an outage refuses to start rather than
 /// serving an empty configuration while reporting itself healthy.
 #[tokio::test]

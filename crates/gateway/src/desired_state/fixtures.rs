@@ -213,6 +213,32 @@ pub(crate) fn state() -> DesiredState {
     state
 }
 
+/// [`state`], with its tenant row as a build predating typed tenancy bodies
+/// wrote it: what a newer build's storage — or its exported cache — looks like to
+/// an older one, so a test can drive the incompatibility path from realistic
+/// state rather than from one hand-edited row.
+pub(crate) fn state_with_legacy_tenant() -> DesiredState {
+    let mut state = DesiredState::new();
+    state.declare_blob(*blob_backed_catalog(5).body.blob().expect("a blob body"));
+    let credential = credential(&tenant_id(1), 3, "primary");
+    let catalog = blob_backed_catalog(5);
+    state
+        .insert(legacy_tenant(1, "acme"))
+        .and_then(|state| state.insert(project(&tenant_id(1), 2, "core")))
+        .and_then(|state| state.insert(credential.clone()))
+        .and_then(|state| state.insert(catalog.clone()))
+        .and_then(|state| {
+            state.insert(alias(
+                &tenant_id(1),
+                4,
+                "fast",
+                &[credential.reference, catalog.reference],
+            ))
+        })
+        .expect("the envelopes are consistent; only the body is untyped");
+    state
+}
+
 /// A second valid state that shares the catalogue blob with [`state`] — what a
 /// revision that changes one alias looks like.
 pub(crate) fn state_with_renamed_alias() -> DesiredState {
