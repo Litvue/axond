@@ -42,13 +42,34 @@ egress: upstream provider calls still use the network at Tier 0.
 | `/healthz`, `/readyz` | Tier 0. |
 
 Namespaces, providers, aliases, prices, and provider credentials are
-permanently config-owned and reload through ADR 0011. Only callers and keys may
-ever become store-owned at Tier 2; nothing is defined in both. A database may
-not override namespace provider access, an alias's target, a price, or the
-credential pool. Even at Tier 2, a token verifier intersects token claims with
-config-owned namespace authority (ADR 0016). See
+config-owned and reload through ADR 0011. Only callers and keys may ever become
+store-owned at Tier 2; nothing is defined in both. A database may not override
+namespace provider access, an alias's target, a price, or the credential pool.
+Even at Tier 2, a token verifier intersects token claims with config-owned
+namespace authority (ADR 0016). See
 [ADR 0017](./adr/0017-state-tiers-and-optional-backends.md) and the hermetic
 [Tier 0 gate](./adr/0018-tier-0-hermetic-boot-gate.md).
+
+## Operating mode
+
+Everything in this reference describes the **stateless** operating mode, which
+is what the gateway does today and what it does when no mode is selected.
+
+[ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md) accepts a
+second, opt-in **stateful** mode in which tenants, identities, providers,
+credentials, catalogues, prices, aliases, and policies are owned by a durable
+Postgres control plane and administered through `/admin/v1` instead of TOML,
+while ordinary inference still reads one immutable in-memory snapshot. In that
+mode bootstrap TOML shrinks to `mode`, `[server]`, telemetry, control-plane
+connectivity, secret-store/KEK settings, a mandatory static breakglass operator
+credential for `/admin/v1`, and connectivity references for any opt-in
+budget/rate-limit/revocation backend; a stateful-owned section appearing in TOML
+is a boot error.
+
+No key in this reference has changed, and no existing configuration needs one:
+the mode key is optional, omitting it means stateless, and the stateful surface
+is not implemented yet. Read the ADR's ownership and failure matrices before
+planning a stateful deployment.
 
 ## `[server]`
 

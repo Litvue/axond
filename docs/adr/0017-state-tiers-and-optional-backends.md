@@ -4,7 +4,32 @@ Date: 2026-08-09
 
 ## Status
 
-Accepted
+Accepted, partially superseded by
+[ADR 0027](./0027-stateless-and-stateful-operating-modes.md).
+
+The state tiers, the per-feature tier declaration rule, the hermetic Tier 0 CI
+requirement, the `RateLimiter` decision, and both amendments below remain in
+force. Two parts are superseded for the opt-in stateful operating mode ADR 0027
+defines:
+
+- **"One dimension, one owner"** below says namespaces, providers, aliases,
+  prices, and provider credentials are *permanently* config-owned. ADR 0027
+  replaces "permanently config-owned" with "owned by exactly one authority per
+  process, selected by `mode`". In the default `mode = "stateless"` the rule
+  below is unchanged and still describes reality; in `mode = "stateful"` those
+  dimensions are owned by the durable control plane and are rejected in TOML.
+  The property this rule protects — never two disagreeing authorities for one
+  dimension — is preserved by mode exclusivity and boot-time rejection.
+- **"A runtime control plane"** under "Explicitly rejected or deferred" is no
+  longer deferred. ADR 0027 accepts a control plane that is off the ordinary
+  inference path: `/admin/v1` administers durable resources, and requests read
+  one immutable in-memory snapshot instead of querying Postgres or Redis for
+  auth, routing, catalogue, or pricing. The related deferral of "a key registry
+  before a customer needs self-serve keys" is likewise settled by ADR 0027's
+  stateful identity ownership.
+
+Read ADR 0027 for the ownership matrix, the failure/outage matrix, and the
+exhaustive list of request-path database access.
 
 ## Context
 
@@ -43,6 +68,10 @@ serving without Redis, Postgres, or provider access. A feature that makes this
 lane require a network service has violated the default-state promise.
 
 ### One dimension, one owner
+
+**Superseded for `mode = "stateful"` by
+[ADR 0027](./0027-stateless-and-stateful-operating-modes.md); unchanged for the
+default stateless mode.**
 
 **Namespaces, providers, aliases, prices, and provider credentials are
 permanently config-owned.** Callers and keys may be store-owned when a higher
@@ -97,10 +126,14 @@ The following are not part of this state decision:
   gateway's current scope and is already handled at the application layer.
 - **A runtime control plane.** Aliases, routes, prices, namespaces, and
   provider credentials remain file/config owned and reload through ADR 0011.
+  *No longer deferred: accepted, off the inference path, by
+  [ADR 0027](./0027-stateless-and-stateful-operating-modes.md).*
 - **A key registry before a customer needs self-serve keys.** When that need
   exists, a store-backed principal implementation and its administrative
   authentication surface can be added at Tier 2. Minted tokens and offline
-  minting come first.
+  minting come first. *Settled by
+  [ADR 0027](./0027-stateless-and-stateful-operating-modes.md): stateful mode
+  owns identities durably behind `/admin/v1`.*
 
 Per-model and hierarchical budget caps remain the existing opt-in
 `BudgetStore` concern from ADR 0010, not a reason to add another state tier.
@@ -124,7 +157,9 @@ Per-model and hierarchical budget caps remain the existing opt-in
   each default and failure mode.
 - The one-owner rule makes some central-control designs harder: a database
   cannot be used as a convenient override for config-owned routing or
-  credentials. That constraint is intentional.
+  credentials. That constraint is intentional. ADR 0027 keeps the constraint
+  but relocates it: a database may be the *sole* owner in stateful mode, and it
+  still may never be an override.
 - A Tier 0 CI lane must remain hermetic, while Tier 1 and Tier 2 need explicit
   integration coverage for unavailable stores, timeout behavior, fail-closed
   admission, and recovery.
@@ -138,7 +173,10 @@ Per-model and hierarchical budget caps remain the existing opt-in
   (#65) will slot behind the same trait without changing key semantics,
   placement, error shape, or the `NoLimit` default.
 - A future self-serve identity product must define its administrative auth
-  separately; this ADR does not create a runtime control plane.
+  separately; this ADR does not create a runtime control plane. Answered by
+  [ADR 0027](./0027-stateless-and-stateful-operating-modes.md): `/admin/v1`
+  with OIDC human identity and a mandatory static breakglass operator
+  credential.
 - The tier labels should be included in future feature ADRs and deployment
   documentation so operators can choose a tier deliberately.
 
