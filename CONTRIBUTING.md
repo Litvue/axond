@@ -6,6 +6,12 @@ opening an issue to discuss a change before a large PR is appreciated.
 Found a vulnerability? Do not open an issue or a pull request — follow
 [`SECURITY.md`](./SECURITY.md) and report it privately.
 
+Changing authentication, namespace scoping, secret handling, model entitlement,
+durable schema or telemetry, or the release workflows? Start from the
+[threat-model review triggers](./docs/security/threat-model-review.md): they name
+the regression tests your change owes, when it needs an ADR or a threat-model
+update, and what to say about release impact.
+
 ## Development
 
 Requires the toolchain pinned in [`rust-toolchain.toml`](./rust-toolchain.toml).
@@ -87,6 +93,11 @@ raising the MSRV follows
 - **Significant decisions get an ADR** in `docs/adr` in the same PR. Start from
   the [ADR template](./docs/adr/template.md), including its required state-tier
   declaration.
+- **A fired security trigger is answered in the PR body.** Which trigger, the
+  tests that hold the property, whether the threat model or an ADR changed, and
+  the release impact — see the
+  [threat-model review triggers](./docs/security/threat-model-review.md).
+  "No trigger fired" is a fine answer; an unstated one is not.
 
 ## License
 

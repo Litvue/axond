@@ -2,6 +2,12 @@
 
 Use this checklist before exposing Axond beyond a local development network.
 
+It covers a deployment, not a change to Axond. When you carry a local patch, or
+want to know which parts of a release were security-reviewed before you upgrade,
+read the maintainer-facing
+[threat-model review triggers](../security/threat-model-review.md) alongside the
+[deployment security model](../security/deployment-model.md).
+
 ## Artifact and platform
 
 - [ ] Release archive or OCI image is pinned to an explicit version and digest.

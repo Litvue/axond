@@ -101,7 +101,10 @@ to be.
 1. Triage in the draft advisory, with a private fork for the patch when the fix
    would otherwise disclose the issue.
 2. A regression test that fails before the fix. A security fix without one is
-   not finished.
+   not finished; the
+   [threat-model review triggers](./docs/security/threat-model-review.md) name the
+   existing tests for each area, so a fix extends one of them rather than
+   inventing coverage.
 3. A release from `main` through the ordinary
    [release runbook](./docs/maintainers/releasing.md) — a security fix is not a
    different pipeline, so it inherits the same required CI, signed artifacts, and
@@ -130,3 +133,8 @@ before going live, the [minted-token guide](./docs/minted-token-guide.md) for
 scoped credentials and revocation, and the
 [security review](./docs/security-review-2026-08-05.md) for the reviewed
 baseline.
+
+Maintainers reviewing a change *against* that baseline use the
+[threat-model review triggers](./docs/security/threat-model-review.md), which say
+which changes require a security review and what tests, threat-model updates, and
+release-impact statement that review owes.
