@@ -216,6 +216,16 @@ pub fn token_verify(input: &TokenInput<'_>) -> &'static str {
     }
 }
 
+/// Verify a committed token seed re-signed onto the current run, so the claim
+/// check the seed is named for is reached however long ago the seed was written.
+///
+/// `None` for a seed that is not a signable JWS — most of the corpus, which
+/// exists for the decoding path and is replayed as bytes instead.
+pub fn token_verify_resigned_seed(seed: &str) -> Option<&'static str> {
+    let token = axond::resign_seed_onto_this_run(seed)?;
+    Some(check_verification(&token, None))
+}
+
 /// The properties that hold for every credential, however it was produced.
 fn check_verification(credential: &str, minted_audience: Option<&str>) -> &'static str {
     match axond::verify_token(credential) {

@@ -261,6 +261,22 @@ pub(crate) fn fuzz_mint_token_with_raw_scope(
     mint_token_with_scope_claim(request, issued_at, scope)
 }
 
+/// Sign an arbitrary claim object, so a fuzz target can present claim *shapes*
+/// minting cannot express — a missing `jti`, an `exp` before its `iat`, a
+/// `scope` that is a string rather than an array — and reach the check that
+/// rejects each one.
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_sign_claims(
+    header: &Header,
+    claims: &serde_json::Value,
+    algorithm: MintAlgorithm,
+    key_material: &str,
+    kid: &str,
+) -> Result<String> {
+    let encoding_key = encoding_key(algorithm, key_material, kid)?;
+    Ok(format!("axt1.{}", encode(header, claims, &encoding_key)?))
+}
+
 fn mint_token_with_scope_claim(
     request: MintRequest<'_>,
     issued_at: Option<u64>,

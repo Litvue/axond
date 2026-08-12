@@ -54,6 +54,9 @@ const OVERSIZED_BYTES: usize = 64 * 1024;
 /// [`EXPECTED_MINTED_CLASSES`] pins which ones; this is the floor for the rest.
 const MINIMUM_MINTED_CLASSES: usize = 8;
 
+/// How many outcome classes the re-signed token seeds must reach.
+const MINIMUM_RESIGNED_CLASSES: usize = 10;
+
 #[global_allocator]
 static ALLOCATOR: Capped = Capped;
 
@@ -286,6 +289,38 @@ fn minted_scenarios() -> Vec<(&'static str, TokenInput<'static>)> {
     ]
 }
 
+/// The outcome each committed token seed is named for, asserted after the seed
+/// is re-signed onto the current run.
+///
+/// A committed token expires as soon as the date passes its `exp`, so replaying
+/// the bytes alone lands all of these on the expiry check and the checks behind
+/// it go unexercised — the coverage would silently decay with the calendar
+/// rather than with a code change. Re-signing translates the timestamps instead
+/// of replacing them, so the relationships each seed encodes (a lifetime past the
+/// ceiling, an `exp` before its `iat`) survive.
+const EXPECTED_RESIGNED_SEED_CLASSES: &[(&str, &str)] = &[
+    ("hs256-well-formed.txt", "accepted"),
+    ("hs256-scope-array.txt", "accepted"),
+    ("hs256-aliases-list.txt", "accepted"),
+    // A space-delimited `scope` string is as valid as the array form, so this
+    // seed proves both spellings resolve rather than that one is refused.
+    ("hs256-scope-string.txt", "accepted"),
+    ("hs256-aliases-null.txt", "token_alias_claim_invalid"),
+    ("hs256-aliases-wrong-type.txt", "token_alias_claim_invalid"),
+    ("hs256-missing-jti.txt", "token_missing_claim"),
+    ("hs256-empty-subject.txt", "token_missing_claim"),
+    // `exp` before `iat` is refused as expired, not as an invalid lifetime:
+    // decoding validates `exp` against the clock before `resolve` compares the
+    // two claims, and an `exp` behind a translated `iat` is behind now as well.
+    // The `exp < iat` arm is only reachable inside the five-second skew window,
+    // which the coverage-guided lane can hit and a committed seed cannot.
+    ("hs256-exp-before-iat.txt", "token_expired"),
+    ("hs256-lifetime-too-long.txt", "token_invalid_lifetime"),
+    ("hs256-unknown-namespace.txt", "token_unknown_namespace"),
+    ("hs256-denied-namespace.txt", "token_signer_not_permitted"),
+    ("hs256-wrong-audience.txt", "token_wrong_audience"),
+];
+
 /// Scenarios whose whole purpose is the class they land in: a check that stopped
 /// being reachable would otherwise still satisfy the class-count threshold.
 const EXPECTED_MINTED_CLASSES: &[(&str, &str)] = &[
@@ -418,6 +453,56 @@ fn main() {
             classes.len()
         );
     }
+    let mut resigned_classes: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for (seed, bytes) in seeds("token_verify") {
+        let Ok(text) = str::from_utf8(&bytes) else {
+            continue;
+        };
+        let input_started = Instant::now();
+        let Some(class) = axond_fuzz::token_verify_resigned_seed(text) else {
+            continue;
+        };
+        if let Some((_, expected)) = EXPECTED_RESIGNED_SEED_CLASSES
+            .iter()
+            .find(|(name, _)| *name == seed.as_str())
+        {
+            assert_eq!(
+                class, *expected,
+                "re-signed seed {seed} reached {class} rather than {expected}, so the check it is \
+                 named for is no longer the one it lands on"
+            );
+        }
+        *resigned_classes.entry(class).or_default() += 1;
+        let elapsed = input_started.elapsed();
+        assert!(
+            elapsed < PER_INPUT_BUDGET,
+            "re-signed seed {seed} took {elapsed:?}, over the {PER_INPUT_BUDGET:?} budget"
+        );
+        inputs += 1;
+    }
+    for (seed, _) in EXPECTED_RESIGNED_SEED_CLASSES {
+        assert!(
+            seed_directory("token_verify").join(seed).is_file(),
+            "{seed} is pinned to an outcome but no longer exists in the corpus"
+        );
+    }
+    assert!(
+        resigned_classes.len() >= MINIMUM_RESIGNED_CLASSES,
+        "re-signed seeds reached {} outcome classes, fewer than the {MINIMUM_RESIGNED_CLASSES} \
+         required",
+        resigned_classes.len()
+    );
+    println!(
+        "token_verify (seeds re-signed onto this run): {} seeds, {} outcome classes: {}",
+        resigned_classes.values().sum::<usize>(),
+        resigned_classes.len(),
+        resigned_classes
+            .iter()
+            .map(|(class, count)| format!("{class}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+
     let mut minted_classes: BTreeMap<&'static str, usize> = BTreeMap::new();
     for (label, input) in minted_scenarios() {
         let input_started = Instant::now();

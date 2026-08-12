@@ -213,6 +213,60 @@ pub fn mint_hs256_token(
     .map(|minted| minted.token)
 }
 
+/// Re-sign a committed token seed with its timestamps *translated* onto the
+/// current run, so the claim check the seed is named for is the one it reaches.
+///
+/// A committed `axt1.` token expires the moment the date passes its `exp`, after
+/// which every seed collapses onto the expiry check and the checks behind it —
+/// scope, aliases, subject, `jti`, namespace, issuance epoch — go unexercised.
+/// Translating rather than replacing the timestamps is what preserves each
+/// seed's intent: the offset that moves `iat` onto now is applied to `exp` too,
+/// so `exp - iat` is unchanged and a seed built to sit past the lifetime ceiling
+/// still does, while one built with `exp` before `iat` still is.
+///
+/// The header is carried over verbatim and the payload is *not* verified first —
+/// that is the point, since the interesting seeds are the ones a verifier would
+/// refuse. Returns `None` when the seed is not a signable `axt1.` JWS with a
+/// numeric `iat`, which is most of the corpus and not a finding.
+pub fn resign_seed_onto_this_run(token: &str) -> Option<String> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let mut segments = token.strip_prefix("axt1.")?.split('.');
+    let header: jsonwebtoken::Header =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(segments.next()?).ok()?).ok()?;
+    let mut claims: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(segments.next()?).ok()?).ok()?;
+    let iat = claims.get("iat")?.as_u64()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    // Signed, and in a wider type: an `exp` deliberately placed *before* its
+    // `iat` has to stay before it, and a saturating unsigned subtraction would
+    // quietly move it onto `iat` instead.
+    let offset = i128::from(now) - i128::from(iat);
+    let shift = |value: &mut serde_json::Value| {
+        if let Some(seconds) = value.as_u64() {
+            let shifted = (i128::from(seconds) + offset).clamp(0, i128::from(u64::MAX));
+            *value = serde_json::Value::from(u64::try_from(shifted).unwrap_or(0));
+        }
+    };
+    for claim in ["iat", "exp", "nbf"] {
+        if let Some(value) = claims.get_mut(claim) {
+            shift(value);
+        }
+    }
+    let kid = header.kid.clone().unwrap_or_else(|| HS256_KID.to_owned());
+    mint::fuzz_sign_claims(
+        &header,
+        &serde_json::Value::Object(claims),
+        MintAlgorithm::Hs256,
+        HS256_MATERIAL,
+        &kid,
+    )
+    .ok()
+}
+
 /// The audience the seam's verifiers accept, so a fuzzer can aim at the
 /// audience check from either side.
 pub const AUDIENCE: &str = "fuzz.axond.invalid";

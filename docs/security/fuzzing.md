@@ -47,14 +47,17 @@ public for the same reason.
 **Pull requests — `Fuzz smoke`, required.** Replays every committed seed plus
 fixed derivations of it (truncations, single-byte flips, one oversized
 repetition) and a set of tokens minted at replay time, on the pinned stable
-toolchain. Minting at replay time is what keeps the checks *behind* expiry live:
-a committed token seed has expired by the time it is replayed, so every claim
-check past `exp` — audience, lifetime, namespace, signer authority, subject,
-scope, issuance epoch — is reached only by the minted scenarios, and each of
-those asserts the specific outcome it exists for rather than merely counting
-classes. The issuance epoch the seam declares is anchored to the run for the same
-reason: the check runs after the lifetime check, so a token old enough to precede
-a *committed* epoch would already have been refused as expired.
+toolchain. A committed token seed has expired by the time it is replayed, so the
+checks *behind* `exp` — audience, lifetime, namespace, signer authority, subject,
+`jti`, aliases, scope, issuance epoch — are reached two other ways, both of which
+assert the outcome each case exists for by name rather than counting classes:
+each token seed is re-signed with its timestamps *translated* onto the run (the
+offset that moves `iat` onto now moves `exp` with it, so a seed built to sit past
+the lifetime ceiling still does), and a set of claim shapes minting alone cannot
+express is signed fresh. Coverage therefore decays with a code change rather than
+with the calendar. The issuance epoch the seam declares is anchored to the run
+for the same reason: that check runs after the lifetime check, so a token old
+enough to precede a *committed* epoch would already have been refused as expired.
 It fails on a panic, on an input slower than its per-input budget, on
 an allocation past a hard cap the binary enforces through its own global
 allocator, and on the corpus no longer reaching a spread of outcome classes —
