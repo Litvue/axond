@@ -34,7 +34,16 @@ cannot see:
   key. The gateway key the SDK authenticated with must not appear upstream.
 - **The SDK's types.** The lane is compiled with `tsc --strict` before it runs,
   so a shape the SDK's own type definitions no longer describe fails the build
-  rather than passing as `any`.
+  rather than passing as `any`. `skipLibCheck` is deliberately off: the vendors'
+  shipped declarations are *checked*, not trusted, because a release whose own
+  `.d.ts` no longer type-checks — or which references an optional peer nobody
+  installed — is a compatibility fact about that release, which is exactly what
+  this lane exists to notice. The cost is that an SDK bump can fail here for a
+  declaration reason rather than a wire one; the fix is to satisfy the
+  declaration (installing a peer at an exact version, say), not to stop looking.
+  A compiler no longer enforcing any of this would leave every test green, so
+  `negative/` holds code that must *not* compile and `src/typecheck.test.ts`
+  requires it to fail.
 - **Its own failure paths.** `harness.test.ts` boots stub gateways that are
   missing, refuse to launch, crash, or accept the readiness probe without
   answering it, and asserts each fails promptly and leaves nothing listening. A

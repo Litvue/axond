@@ -6,6 +6,10 @@
     "moduleResolution": "nodenext",
     "types": ["node"],
     "strict": true,
+    // Deliberate: the vendors' shipped declarations are checked, not trusted. An
+    // SDK release whose own `.d.ts` stops type-checking is a compatibility fact,
+    // and `../negative` proves this stays enforced.
+    "skipLibCheck": false,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
     "exactOptionalPropertyTypes": true,
