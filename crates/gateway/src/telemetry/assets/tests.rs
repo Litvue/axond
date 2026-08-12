@@ -483,6 +483,18 @@ fn the_lexer_separates_metrics_from_grouping_labels_and_functions() {
     );
 }
 
+/// A Prometheus name is ASCII. A stray letter from somewhere else has to be a
+/// refusal with a message: consuming nothing and continuing would spin.
+#[test]
+fn the_lexer_refuses_a_character_a_prometheus_name_cannot_contain() {
+    let message = selectors("sum(rate(axond_requést_count[5m]))").expect_err("refuses");
+    assert!(message.contains("unexpected character"), "{message}");
+    assert!(matches!(
+        dashboard_failures("sum(rate(axond_requést_count[5m]))").as_slice(),
+        [AssetError::Malformed { .. }]
+    ));
+}
+
 #[test]
 fn the_lexer_reads_every_matcher_operator() {
     let found = selectors(

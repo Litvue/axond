@@ -287,7 +287,12 @@ fn selectors(expr: &str) -> Result<Expression, String> {
                     index += 1;
                 }
             }
-            character if character.is_alphabetic() || character == '_' || character == ':' => {
+            // Only ASCII: a Prometheus metric or label name cannot contain
+            // anything else, so a stray letter outside quotes is refused below
+            // rather than consumed.
+            character
+                if character.is_ascii_alphabetic() || character == '_' || character == ':' =>
+            {
                 let start = index;
                 while index < bytes.len()
                     && (bytes[index].is_ascii_alphanumeric()
@@ -319,7 +324,14 @@ fn selectors(expr: &str) -> Result<Expression, String> {
                     scope.selectors.push(position);
                 }
             }
-            _ => index += 1,
+            character if character.is_whitespace() || character.is_ascii_punctuation() => {
+                index += 1;
+            }
+            character => {
+                return Err(format!(
+                    "unexpected character `{character}` in `{expr}`; a metric or label name is ASCII"
+                ));
+            }
         }
     }
     while !open.is_empty() {

@@ -10,6 +10,16 @@ dashboards and alert rules under [`ops/observability/`](../../ops/observability/
 are the same signals as assets you can import, and every rule's `runbook_url`
 points at a section of this page.
 
+**What is live today.** Every metric named below is emitted, with one exception:
+no release yet runs a status refresher, so `axond_status_component_state`,
+`axond_status_observation_age`, and `axond_status_refreshes` are not produced and
+`GET /admin/v1/status` answers with every component `disabled`. The dependency
+and staleness panels stay empty and their alerts cannot fire until a deployment
+observes its dependencies — see
+[stateful backends](../deployment/stateful-backends.md).
+Import the assets now if you want them versioned with your deployment; do not
+read a flat dependency panel as a healthy dependency.
+
 Three things to hold onto before reading on:
 
 - **A dependency outage is not a fleet outage.** `/readyz` reports lifecycle
