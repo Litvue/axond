@@ -343,6 +343,71 @@ const EXPECTED_MINTED_CLASSES: &[(&str, &str)] = &[
     ("issued-just-after-the-namespace-epoch", "accepted"),
 ];
 
+/// Re-sign one token seed onto this run and check it against its pin.
+///
+/// `None` for a seed that is not a signable JWS — but only if it carries no pin:
+/// skipping is how the corpus keeps its decode-path inputs, and skipping a
+/// *pinned* seed would retire the check it stands for in silence.
+fn resigned_seed_class(seed: &str, bytes: &[u8], asserted: &mut usize) -> Option<&'static str> {
+    let pinned = EXPECTED_RESIGNED_SEED_CLASSES
+        .iter()
+        .find(|(name, _)| *name == seed)
+        .map(|(_, expected)| *expected);
+    let text = match str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            assert!(
+                pinned.is_none(),
+                "{seed} is pinned to an outcome but is no longer utf-8: {error}"
+            );
+            return None;
+        }
+    };
+    let class = match axond_fuzz::token_verify_resigned_seed(text) {
+        Some(class) => class,
+        None => {
+            assert!(
+                pinned.is_none(),
+                "{seed} is pinned to an outcome but can no longer be re-signed, so its check \
+                 would go unexercised"
+            );
+            return None;
+        }
+    };
+    if let Some(expected) = pinned {
+        *asserted += 1;
+        assert_eq!(
+            class, expected,
+            "re-signed seed {seed} reached {class} rather than {expected}, so the check it is \
+             named for is no longer the one it lands on"
+        );
+    }
+    Some(class)
+}
+
+/// Prove [`resigned_seed_class`] refuses to skip a pinned seed.
+///
+/// The guard's whole value is that it fails instead of continuing, which nothing
+/// in a passing run demonstrates: the corpus is signable, so the arm never runs.
+/// Feeding it a pinned name with unsignable bytes is the only evidence that the
+/// arm is still wired to a failure.
+fn assert_pinning_guard_fires() {
+    let (pinned, _) = EXPECTED_RESIGNED_SEED_CLASSES
+        .first()
+        .expect("at least one seed is pinned to an outcome");
+    let previous = std::panic::take_hook();
+    // The panic this expects is the pass condition, so keep it off the output.
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(|| {
+        resigned_seed_class(pinned, b"axt1.not-a-jws", &mut 0);
+    });
+    std::panic::set_hook(previous);
+    assert!(
+        outcome.is_err(),
+        "an unsignable {pinned} was skipped rather than failing the run"
+    );
+}
+
 fn seed_directory(target: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("seeds")
@@ -453,46 +518,16 @@ fn main() {
             classes.len()
         );
     }
+    // The guard below refuses to skip a pinned seed. Prove it fires before
+    // trusting it, the same way `ops/check-docs.py --self-test` does.
+    assert_pinning_guard_fires();
     let mut resigned_classes: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut resigned_seeds_asserted = 0_usize;
     for (seed, bytes) in seeds("token_verify") {
-        let pinned = EXPECTED_RESIGNED_SEED_CLASSES
-            .iter()
-            .find(|(name, _)| *name == seed.as_str())
-            .map(|(_, expected)| *expected);
-        let text = match str::from_utf8(&bytes) {
-            Ok(text) => text,
-            // A seed pinned to a class has to *reach* it. Skipping the ones that
-            // are not signable is how the corpus keeps its decode-path inputs;
-            // skipping a pinned one would retire its check in silence.
-            Err(error) => {
-                assert!(
-                    pinned.is_none(),
-                    "{seed} is pinned to an outcome but is no longer utf-8: {error}"
-                );
-                continue;
-            }
-        };
         let input_started = Instant::now();
-        let class = match axond_fuzz::token_verify_resigned_seed(text) {
-            Some(class) => class,
-            None => {
-                assert!(
-                    pinned.is_none(),
-                    "{seed} is pinned to an outcome but can no longer be re-signed, so its check \
-                     would go unexercised"
-                );
-                continue;
-            }
+        let Some(class) = resigned_seed_class(&seed, &bytes, &mut resigned_seeds_asserted) else {
+            continue;
         };
-        if let Some(expected) = pinned {
-            resigned_seeds_asserted += 1;
-            assert_eq!(
-                class, expected,
-                "re-signed seed {seed} reached {class} rather than {expected}, so the check it is \
-                 named for is no longer the one it lands on"
-            );
-        }
         *resigned_classes.entry(class).or_default() += 1;
         let elapsed = input_started.elapsed();
         assert!(
