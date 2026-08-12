@@ -96,6 +96,24 @@ test(
 );
 
 test(
+  "a gateway that cannot be launched is reported rather than thrown out of the event loop",
+  { skip: process.platform === "win32" ? "POSIX permissions only" : false, timeout: 20_000 },
+  async () => {
+    // Present, so the existence check passes, but not executable: the refusal
+    // arrives as an `error` event, which is fatal to the test file if unhandled.
+    const directory = await mkdtemp(join(tmpdir(), "axond-compat-ts-stub-"));
+    const path = join(directory, "axond");
+    await writeFile(path, "#!/usr/bin/env node\n", { encoding: "utf8", mode: 0o644 });
+
+    const before = listeningSockets();
+    await withBinary(path, async () => {
+      await assert.rejects(start({ readyTimeoutMs: 3_000 }), /axond could not be launched/);
+    });
+    assert.equal(listeningSockets(), before, "the fake upstream outlived a failed launch");
+  },
+);
+
+test(
   "a gateway that never answers the probe gives up on the readiness deadline",
   { timeout: 20_000 },
   async () => {

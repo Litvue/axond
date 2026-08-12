@@ -149,6 +149,13 @@ async function boot(
     },
     stdio: ["ignore", "ignore", "inherit"],
   });
+  // `existsSync` passes for a directory or a file without the execute bit, and
+  // the refusal to launch arrives as an event: unhandled, it throws out of the
+  // event loop and takes the whole test file with it.
+  let launch: Error | undefined;
+  child.once("error", (error) => {
+    launch = error;
+  });
 
   const baseUrl = `http://${bind}`;
   const harness: Harness = {
@@ -160,7 +167,7 @@ async function boot(
     },
   };
   try {
-    await awaitReady(child, baseUrl, readyTimeoutMs);
+    await awaitReady(child, baseUrl, readyTimeoutMs, () => launch);
   } catch (error) {
     // The upstream is the caller's to close, which is what keeps this path from
     // stopping it twice.
@@ -179,9 +186,14 @@ async function awaitReady(
   child: ChildProcess,
   baseUrl: string,
   readyTimeoutMs: number,
+  launchFailure: () => Error | undefined,
 ): Promise<void> {
   const deadline = Date.now() + readyTimeoutMs;
   while (Date.now() < deadline) {
+    const failure = launchFailure();
+    if (failure !== undefined) {
+      throw new Error(`axond could not be launched: ${failure.message}`);
+    }
     if (dead(child)) {
       throw new Error(`axond exited with ${child.exitCode ?? child.signalCode}`);
     }
@@ -205,7 +217,9 @@ async function awaitReady(
 }
 
 async function terminate(child: ChildProcess): Promise<void> {
-  if (dead(child)) {
+  // A process that never launched has no pid and emits `error` in place of
+  // `exit`, so there is nothing to signal and nothing to wait for.
+  if (child.pid === undefined || dead(child)) {
     return;
   }
   const exited = new Promise<void>((done) => child.once("exit", () => done()));
