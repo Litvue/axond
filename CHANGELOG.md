@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.9](https://github.com/Litvue/axond/compare/v0.3.8...v0.3.9) (2026-08-12)
+
+
+### Features
+
+* **state:** store the desired-state revision journal in Postgres ([#183](https://github.com/Litvue/axond/issues/183)) ([e364a0d](https://github.com/Litvue/axond/commit/e364a0dde237c33010659a35bd64f466c7de0ee3)), closes [#165](https://github.com/Litvue/axond/issues/165)
+
 ## [0.3.8](https://github.com/Litvue/axond/compare/v0.3.7...v0.3.8) (2026-08-12)
 
 
