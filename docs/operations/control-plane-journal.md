@@ -138,9 +138,10 @@ inspect or repair, and a failed load never becomes state a replica serves. Three
 outcomes need different responses:
 
 - **Unreadable (`stored revision … is unreadable`).** The rows no longer add up:
-  a missing resource version, a dependency that leaves the revision, a body this
-  build cannot decode, a checksum that no longer matches, or a reference that
-  crosses a tenant boundary. The message names the resource. This is corruption,
+  a missing resource version, a declared blob whose record is gone, a dependency
+  that leaves the revision or closes a cycle, a body this build cannot decode, a
+  checksum that no longer matches, or a reference that crosses a tenant boundary.
+  The message names the resource or edge. This is corruption,
   not an outage — retrying will not clear it — and it means something wrote to the
   journal outside the gateway, or a restore was partial. Compare against a backup;
   a healthy older revision still loads, so serving can continue from one while the
@@ -150,7 +151,8 @@ outcomes need different responses:
   dependency edges or nesting, inline body bytes, or total candidate size); the
   message names which bound and, where useful, what was observed. Nothing is
   truncated to fit. Either raise that bound deliberately or split the change into
-  smaller revisions.
+  smaller revisions. A dependency *cycle* is never reported here — no bound could
+  clear one — it is unreadable, above.
 - **Unavailable.** Postgres is unreachable. Retryable, and covered by
   [During a Postgres outage](#during-a-postgres-outage).
 

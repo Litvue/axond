@@ -243,8 +243,11 @@ naming no row. A reference-layer query refuses a dependency edge that crosses a
 tenant boundary — or that makes deployment-scoped state depend on one tenant's —
 before anything is hydrated, and `DesiredState::validate` checks the same rule on
 the value that comes back. The dependency walk is iterative and memoized, so the
-depth it bounds is not depth on the call stack, and a cycle storage holds (which
-the domain would never publish) terminates as a refusal.
+depth it bounds is not depth on the call stack. Its two refusals are different
+answers on purpose: nesting past the bound is `TooLarge`, which an operator can
+raise, while a cycle — which the domain refuses at publication, so storage only
+holds one if something wrote outside the gateway — is `Corrupt` naming the edge
+that closes it, because no bound could ever clear it.
 
 One consequence of canonical encoding is worth stating: an inline body reads back
 in canonical order, which need not be the order a caller wrote its map keys in.

@@ -567,13 +567,18 @@ enum Step {
     Leave(ResourceRef),
 }
 
-/// Bound how deeply a revision's dependencies nest, and terminate on a cycle.
+/// Bound how deeply a revision's dependencies nest, and refuse a cycle.
 ///
 /// Memoized: each version's depth is computed once, so a diamond costs one visit
-/// per edge instead of one per path. A version that is re-entered while it is
-/// still on the current path is a cycle, which storage can hold — the domain
-/// refuses one at publication, a restored backup does not — and which is
-/// reported as the depth bound it cannot satisfy rather than followed.
+/// per edge instead of one per path.
+///
+/// The two refusals are deliberately different answers. Nesting past the bound is
+/// a bound: the graph is well-formed and this build declines to walk that far, so
+/// an operator can raise the bound. A version re-entered while it is still on the
+/// current path is a *cycle*, which no bound can ever clear — the domain refuses
+/// one at publication, so its presence means something wrote outside the gateway
+/// or a restore was partial — and it is corruption naming the edge that closes
+/// it.
 fn refuse_deep_dependencies(
     id: RevisionId,
     state: &DesiredState,
@@ -588,6 +593,14 @@ fn refuse_deep_dependencies(
             },
         )
     };
+    let cycle = |from: ResourceRef, to: ResourceRef| {
+        ControlPlaneError::corrupt(
+            id,
+            rows::unreadable(format!(
+                "{from} depends on {to}, which closes a dependency cycle"
+            )),
+        )
+    };
     // How deeply each version's own dependencies nest below it.
     let mut depth: BTreeMap<ResourceRef, usize> = BTreeMap::new();
     let mut on_path: BTreeSet<ResourceRef> = BTreeSet::new();
@@ -600,7 +613,7 @@ fn refuse_deep_dependencies(
                         continue;
                     }
                     if !on_path.insert(current) {
-                        return Err(too_deep(current));
+                        return Err(cycle(current, current));
                     }
                     pending.push(Step::Leave(current));
                     // A version the state does not contain is a dangling edge,
@@ -609,7 +622,7 @@ fn refuse_deep_dependencies(
                     if let Some(resource) = state.get(&current) {
                         for dependency in &resource.depends_on {
                             if on_path.contains(dependency) {
-                                return Err(too_deep(*dependency));
+                                return Err(cycle(current, *dependency));
                             }
                             if !depth.contains_key(dependency) {
                                 pending.push(Step::Enter(*dependency));
@@ -830,15 +843,27 @@ mod tests {
         );
         let error = refuse_deep_dependencies(revision(4), &state, &HydrationLimits::default())
             .expect_err("a cycle is not hydratable");
-        assert!(
-            matches!(
-                error,
-                ControlPlaneError::TooLarge {
-                    limit: HydrationLimit::DependencyDepth { .. },
-                    ..
-                }
-            ),
-            "{error:?}"
+        // Corruption, not a bound: no ceiling an operator could raise will ever
+        // make a cycle walkable, and the writer cannot produce one.
+        assert_eq!(error.category(), FailureCategory::Corrupt);
+        let ControlPlaneError::Corrupt { source, .. } = &error else {
+            panic!("expected corruption, got {error:?}");
+        };
+        let IntegrityError::Unreadable { detail } = &**source else {
+            panic!("expected an unreadable graph, got {error:?}");
+        };
+        assert!(detail.contains("closes a dependency cycle"), "{detail}");
+
+        // And a bound cannot be raised into hydrating it either.
+        let generous = HydrationLimits {
+            max_dependency_depth: usize::MAX,
+            ..HydrationLimits::default()
+        };
+        assert_eq!(
+            refuse_deep_dependencies(revision(4), &state, &generous)
+                .expect_err("raising the bound must not make a cycle walkable")
+                .category(),
+            FailureCategory::Corrupt
         );
     }
 }
