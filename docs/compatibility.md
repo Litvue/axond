@@ -293,13 +293,16 @@ claim here cannot drift from what CI and the release actually do:
 | Matrix | Owner (source of truth) | Exercised by |
 | --- | --- | --- |
 | Supported versions for fixes | [`SECURITY.md`](../SECURITY.md) — latest `0.x` release plus the immediately previous minor, security fixes only | the release/backport process |
-| Release targets | the `binaries` matrix in [`release-please.yml`](../.github/workflows/release-please.yml): `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`, plus the `linux/amd64` image | the release workflow, and the musl static-binary and Docker smoke lanes on every change |
+| Release targets | the `binaries` matrix in [`release-please.yml`](../.github/workflows/release-please.yml), listed under [supported platforms](#supported-platforms) above: six archive targets plus the `linux/amd64` + `linux/arm64` image index | the release workflow, and the musl static-binary and Docker smoke lanes on every change |
 | Provider-SDK compatibility | [`tests/compat/requirements.in`](../tests/compat/requirements.in) (exact pins, hash-locked in `requirements.txt`) | the required `sdk-compat` lane against committed fixtures ([ADR 0014](./adr/0014-compatibility-and-soak-harness.md)) |
 | Rust floor and published API | `rust-version` in [`Cargo.toml`](../Cargo.toml); [`ops/api-compat-overrides.toml`](../ops/api-compat-overrides.toml) for accepted breaks | the required `msrv` and `api-compat` lanes |
 
 Adding a target, an SDK, or a supported version means editing the owner file
 above; this document describes the policy and does not restate the values it
 cannot enforce. What is *not* covered: only `x86_64-unknown-linux-musl` boots
-hermetically in CI on every change (the Tier 0 gate), the other three targets are
-built and attested but not smoke-booted, and only the Python SDKs are exercised
-end to end.
+hermetically in CI on every change (the Tier 0 gate). Every Linux archive is
+booted through that same gate at release time, on a runner of its own
+architecture, but with the hermetic namespace treated as best-effort there
+([ADR 0018](./adr/0018-tier-0-hermetic-boot-gate.md)); the macOS and Windows
+archives are built and attested but never executed, and only the Python SDKs are
+exercised end to end.

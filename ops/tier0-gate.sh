@@ -116,15 +116,24 @@ command -v python3 >/dev/null 2>&1 ||
 # Outside a namespace the listener set is the host's, so it is not an invariant.
 [[ "$degraded" != 1 ]] || check_listeners=0
 
-if [[ "$degraded" == 1 && "$check_serving" == 1 ]]; then
+if [[ "$degraded" == 1 ]]; then
   # Outside a namespace the fixed ports are the host's, so a stale listener would
-  # be mistaken for the gateway or the fake upstream.
-  for port in 18081 18082; do
-    if ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .; then
-      echo "TIER 0 INVARIANT FAILED: port $port is already in use; a degraded run needs both fixed ports free." >&2
-      exit 1
-    fi
-  done
+  # be mistaken for the gateway or the fake upstream. The gateway always binds
+  # 18081; 18082 is only bound when the fixture upstream runs.
+  required_free=(18081)
+  [[ "$check_serving" != 1 ]] || required_free+=(18082)
+  if command -v ss >/dev/null 2>&1; then
+    for port in "${required_free[@]}"; do
+      if ss -H -ltn "sport = :$port" | grep -q .; then
+        echo "TIER 0 INVARIANT FAILED: port $port is already in use; a degraded run needs its fixed ports free." >&2
+        exit 1
+      fi
+    done
+  else
+    # Never let a missing probe read as a free port: without `ss` the answer is
+    # unknown, and a conflict would otherwise surface as a confusing boot failure.
+    echo "TIER 0 DEGRADED: ss is unavailable, so port availability for ${required_free[*]} is not checked; a conflict will appear as a boot or bind failure." >&2
+  fi
 fi
 
 config="$repo_root/tests/tier0/axond.tier0.toml"
