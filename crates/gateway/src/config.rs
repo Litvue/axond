@@ -711,10 +711,21 @@ impl<'de> Deserialize<'de> for AdmissionConfig {
         };
         let (max_in_flight_streams, max_in_flight_streams_explicit) =
             clamp(wire.max_in_flight_streams, default_max_in_flight_streams());
-        let (max_in_flight_per_tenant, max_in_flight_per_tenant_explicit) = clamp(
-            wire.max_in_flight_per_tenant,
-            default_max_in_flight_per_tenant(),
-        );
+        // A tenant ceiling *equal* to the global one isolates nothing, and it
+        // would shed at the same point with the wrong verdict: the tenant gate
+        // never queues and answers `429`. So a defaulted ceiling that reaches the
+        // global one is turned off instead of clamped to it, leaving the global
+        // gate — which queues and answers `503` — as the operative bound.
+        let (max_in_flight_per_tenant, max_in_flight_per_tenant_explicit) =
+            match wire.max_in_flight_per_tenant {
+                Some(value) => (value, true),
+                None if wire.max_in_flight > 0
+                    && default_max_in_flight_per_tenant() >= wire.max_in_flight =>
+                {
+                    (0, false)
+                }
+                None => (default_max_in_flight_per_tenant(), false),
+            };
         Ok(Self {
             max_request_bytes: wire.max_request_bytes,
             max_in_flight: wire.max_in_flight,
@@ -3878,14 +3889,22 @@ env = "GW_ADMIN_BREAKGLASS"
     }
 
     /// Turning one number down is the common tuning move, and it must not fail
-    /// boot over the stock sub-ceilings the operator never wrote.
+    /// boot over the stock sub-ceilings the operator never wrote. A defaulted
+    /// tenant ceiling that reaches the global one is turned off rather than
+    /// clamped onto it, so the replica sheds at the gate that queues.
+    ///
+    /// A tenant ceiling the operator *lowers* under a lowered global one is
+    /// honored, because that is a request for isolation rather than a default.
     #[test]
     fn a_lowered_global_ceiling_pulls_the_defaulted_sub_ceilings_down_with_it() {
         let config = Config::from_toml_str(&format!("{VALID}\n[admission]\nmax_in_flight = 16\n"))
             .expect("lowering only the global ceiling boots");
         assert_eq!(config.admission.max_in_flight, 16);
-        assert_eq!(config.admission.max_in_flight_per_tenant, 16);
         assert_eq!(config.admission.max_in_flight_streams, 16);
+        assert_eq!(
+            config.admission.max_in_flight_per_tenant, 0,
+            "a tenant ceiling at the global one isolates nothing and would shed with a 429"
+        );
         assert!(!config.admission.max_in_flight_per_tenant_explicit);
         assert!(!config.admission.max_in_flight_streams_explicit);
 
@@ -3895,6 +3914,12 @@ env = "GW_ADMIN_BREAKGLASS"
         .expect("a written ceiling is honored, including the disabling zero");
         assert_eq!(written.admission.max_in_flight_per_tenant, 0);
         assert!(written.admission.max_in_flight_per_tenant_explicit);
+
+        let isolated = Config::from_toml_str(&format!(
+            "{VALID}\n[admission]\nmax_in_flight = 16\nmax_in_flight_per_tenant = 4\n"
+        ))
+        .expect("a tenant ceiling under the global one is isolation the operator asked for");
+        assert_eq!(isolated.admission.max_in_flight_per_tenant, 4);
 
         let error = Config::from_toml_str(&format!(
             "{VALID}\n[admission]\nmax_in_flight = 16\nmax_in_flight_streams = 32\n"

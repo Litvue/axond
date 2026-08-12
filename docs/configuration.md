@@ -373,9 +373,18 @@ Except for `max_request_bytes`, `0` means "this ceiling is off".
 
 Lowering `max_in_flight` alone is enough. The two sub-ceilings default below the
 shipped global one, so a config that only writes `max_in_flight = 16` would
-otherwise leave a 256-request tenant ceiling above a 16-request process: an unset
-sub-ceiling is clamped down to `max_in_flight` on load instead. Write both
-numbers and they are taken literally — a sub-ceiling above a configured
+otherwise leave a 256-request tenant ceiling above a 16-request process. An unset
+sub-ceiling therefore follows a lowered `max_in_flight`:
+
+- `max_in_flight_streams` is clamped down to it;
+- `max_in_flight_per_tenant` is turned **off**, because a tenant ceiling equal to
+  the global one isolates nothing and would shed at the same point with the wrong
+  verdict — the tenant gate never queues and answers `429`. Shedding then happens
+  at the global gate, which honors `queue_capacity` and answers `503`.
+
+Write the numbers yourself and they are taken literally, including a
+`max_in_flight_per_tenant` below a lowered `max_in_flight` (isolation you asked
+for) and a `0` (the ceiling off). A written sub-ceiling *above* a written
 `max_in_flight` is a boot error, because there is no obvious way to reconcile two
 numbers an operator chose.
 

@@ -258,7 +258,8 @@ async fn a_saturated_replica_sheds_with_a_503_and_serves_again_afterwards() {
 }
 
 /// Lowering one ceiling must not be refused by the stock sub-ceilings, which
-/// ship above it. The clamped ceiling is the one traffic then meets.
+/// ship above it — and the ceiling traffic then meets must be the global one,
+/// answering `503`, not a tenant ceiling clamped onto it answering `429`.
 #[tokio::test]
 async fn lowering_only_the_global_ceiling_boots_and_sheds_at_that_ceiling() {
     let (upstream, gateway) = boot_with(LOWERED_GLOBAL_ONLY).await;
@@ -266,13 +267,9 @@ async fn lowering_only_the_global_ceiling_boots_and_sheds_at_that_ceiling() {
     assert_eq!(held.status(), 200, "{}", gateway.output());
 
     let shed = chat(&gateway, alias::CHAT, false).await;
-    assert!(
-        shed.status() == 429 || shed.status() == 503,
-        "the replica admits one request at a time: {}\n{}",
-        shed.status(),
-        gateway.output()
-    );
+    assert_eq!(shed.status(), 503, "{}", gateway.output());
     let body: Value = shed.json().await.expect("a JSON body");
+    assert_eq!(body["error"]["type"], "gateway_overloaded");
     assert_discreet(&body.to_string(), &upstream);
 
     drain(held).await;
