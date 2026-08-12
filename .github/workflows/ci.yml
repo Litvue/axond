@@ -79,6 +79,13 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-semver-checks@0.50.0
+      # The gate must run on the oldest Python the contributor flow supports, not
+      # just on whatever a runner ships, so the floor is exercised explicitly.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - name: Prove the gate runs on the Python floor
+        run: python3 --version && ops/api-compat.py --self-test
       - name: Compare the published library crates against crates.io
         run: ops/api-compat.py
 

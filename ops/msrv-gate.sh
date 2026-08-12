@@ -79,10 +79,23 @@ if [[ ${AXOND_MSRV_CHECK_ONLY_POLICY:-0} == 1 ]]; then
     exit 0
 fi
 
-if command -v rustup >/dev/null 2>&1; then
-    rustup toolchain install "$msrv_full" --profile minimal --no-self-update
-    export RUSTUP_TOOLCHAIN="$msrv_full"
-fi
+# Without rustup there is no way to select the floor, and compiling with whatever
+# ambient compiler happens to be installed would report the MSRV as verified
+# while proving nothing. Fail instead of quietly checking the wrong toolchain.
+command -v rustup >/dev/null 2>&1 || {
+    echo "rustup is required to build with the MSRV toolchain $msrv_full" >&2
+    echo "install it from https://rustup.rs, or run only the policy checks with" >&2
+    echo "AXOND_MSRV_CHECK_ONLY_POLICY=1 ops/msrv-gate.sh" >&2
+    exit 1
+}
+rustup toolchain install "$msrv_full" --profile minimal --no-self-update
+export RUSTUP_TOOLCHAIN="$msrv_full"
+
+active="$(cargo --version)"
+[[ $active == *" $msrv_full"* ]] || {
+    echo "expected cargo $msrv_full for the MSRV build, got: $active" >&2
+    exit 1
+}
 
 # `--locked` matters: the committed lockfile has to resolve on the floor too, so
 # a dependency bump that raises its own MSRV fails here instead of in a

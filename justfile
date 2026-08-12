@@ -38,9 +38,14 @@ msrv:
     ops/msrv-gate.sh
 
 # Public Rust API compatibility for the published library crates, against the
-# versions on crates.io. Needs cargo-semver-checks and network.
+# versions on crates.io. Needs cargo-semver-checks and network. Runs on any
+# python3 from 3.10 up, the same floor as the provider-SDK lockfile.
 api-compat:
     ops/api-compat.py
+
+# The parts of the API gate that need neither network nor cargo-semver-checks.
+api-compat-self-test:
+    ops/api-compat.py --self-test
 
 # Supply-chain policy: advisories, licenses, sources (see deny.toml).
 deny:

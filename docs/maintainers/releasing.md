@@ -100,6 +100,10 @@ compares each published *library* crate — `gateway-core` and
 `gateway-transport`; the binary-only `axond` has no Rust API surface — against
 the version already on crates.io with `cargo-semver-checks` (pinned in
 `ci.yml`). It is blocking, and there are no allow rules or per-lint bypasses.
+The crate list comes from `cargo metadata`, so a newly added published library
+crate is covered without touching the script, and the script itself needs only
+`python3` 3.10 or newer — the same floor as the provider-SDK lockfile — which CI
+proves with `ops/api-compat.py --self-test` on 3.10.
 
 Run it before pushing an API change:
 
@@ -135,7 +139,11 @@ The MSRV is `rust-version` in `[workspace.package]`, and the `msrv` lane runs
 first patch of that minor and refuses drift between `Cargo.toml`,
 `rust-toolchain.toml`, the `Dockerfile`, and the crate manifests. The pinned
 `1.97.1` lanes are unchanged by it — the floor is proved in its own lane rather
-than by weakening the stable one.
+than by weakening the stable one. The build needs `rustup`, because that is the
+only way to select the floor: without it the lane fails instead of compiling with
+an ambient newer compiler and calling the MSRV verified. Use
+`AXOND_MSRV_CHECK_ONLY_POLICY=1 ops/msrv-gate.sh` to run the declaration checks
+alone.
 
 To raise the floor, in one PR: bump `rust-version`, bump `rust-toolchain.toml`
 and the `Dockerfile` stage if they now trail it, update the `toolchain:` pins in

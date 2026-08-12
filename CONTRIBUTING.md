@@ -61,6 +61,10 @@ cargo install cargo-semver-checks --locked
 just api-compat
 ```
 
+The gate itself runs on `python3` 3.10 or newer, so `just api-compat-self-test`
+works offline and without `cargo-semver-checks`; `just msrv` needs `rustup`, and
+fails rather than measuring the floor with a newer compiler.
+
 A break fails CI. If it is intentional, add a reviewed entry to
 [`ops/api-compat-overrides.toml`](./ops/api-compat-overrides.toml) in the same PR
 and follow

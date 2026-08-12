@@ -13,61 +13,109 @@ the break is measured against, and the review that accepted it. An override is
 honoured only for that one baseline: once a release moves the baseline forward,
 the entry is inert and cannot mask a later break.
 
+This runs on every Python the contributor flow supports — 3.10 and newer, the
+floor `tests/compat/requirements.txt` is compiled for — so it deliberately does
+not import `tomllib`, which only exists from 3.11 on: crate discovery comes from
+`cargo metadata`, and the override file is read by `parse_overrides` below.
+
 Usage:
     ops/api-compat.py                 # check every published library crate
     ops/api-compat.py gateway-core    # check one crate
+    ops/api-compat.py --self-test     # exercise the override parser only
 """
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
 OVERRIDES = ROOT / "ops/api-compat-overrides.toml"
 OVERRIDE_KEYS = {"crate", "baseline", "justification", "reviewed_in"}
+LIBRARY_KINDS = {"lib", "rlib", "dylib", "cdylib", "proc-macro"}
 CHECKING = re.compile(r"^\s*Checking (\S+) v(\S+) -> v(\S+)", re.MULTILINE)
+TABLE = re.compile(r"\[\[break\]\]\s*(?:#.*)?")
+KEY_VALUE = re.compile(r'([A-Za-z0-9_-]+)\s*=\s*"([^"]*)"\s*(?:#.*)?')
 
 
 def published_library_crates() -> list[str]:
-    """Workspace members that publish a library API, in manifest order.
+    """Workspace members that publish a library API.
 
     A binary-only member (`axond`) has no public Rust API to break: its
     compatibility surface is HTTP, config, and telemetry, which
-    `docs/compatibility.md` governs and other CI lanes exercise. Reading this
-    from the manifests rather than a hard-coded list means a new published
-    library crate is covered the day it is added.
+    `docs/compatibility.md` governs and other CI lanes exercise. Asking Cargo
+    rather than keeping a hard-coded list means a new published library crate is
+    covered the day it is added, and Cargo — not this script — decides what
+    counts as a library target or an inherited `publish` setting.
     """
-    workspace = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    completed = subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--format-version", "1", "--locked"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise SystemExit(f"cargo metadata failed:\n{completed.stderr.strip()}")
     crates: list[str] = []
-    for member in workspace["workspace"]["members"]:
-        manifest = tomllib.loads(
-            (ROOT / member / "Cargo.toml").read_text(encoding="utf-8")
-        )
-        package = manifest["package"]
-        library = "lib" in manifest or (ROOT / member / "src/lib.rs").exists()
-        if package.get("publish") is False or not library:
+    for package in json.loads(completed.stdout)["packages"]:
+        # `publish` is null when unrestricted and [] for `publish = false`.
+        if package.get("publish") == []:
+            continue
+        kinds = {kind for target in package["targets"] for kind in target["kind"]}
+        if kinds.isdisjoint(LIBRARY_KINDS):
             continue
         crates.append(package["name"])
     if not crates:
         raise SystemExit("no published library crates found in the workspace")
-    return crates
+    return sorted(crates)
+
+
+def parse_overrides(text: str, name: str) -> list[dict[str, str]]:
+    """Read the override file without a TOML library.
+
+    Its grammar is fixed by policy and tiny: comments, blank lines, and
+    `[[break]]` tables of `key = "value"` pairs. Anything else — another table,
+    a key outside a table, an unquoted value — is rejected rather than guessed
+    at, which is stricter than a general TOML parser and keeps this gate
+    runnable on the oldest Python the contributor flow supports.
+    """
+    entries: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        where = f"{name}:{number}"
+        if line.startswith("["):
+            if not TABLE.fullmatch(line):
+                raise SystemExit(f"{where}: only [[break]] tables are allowed")
+            current = {}
+            entries.append(current)
+            continue
+        matched = KEY_VALUE.fullmatch(line)
+        if not matched:
+            raise SystemExit(
+                f'{where}: expected key = "value" with a double-quoted string'
+            )
+        if current is None:
+            raise SystemExit(f"{where}: keys must belong to a [[break]] table")
+        key, value = matched.group(1), matched.group(2)
+        if key in current:
+            raise SystemExit(f"{where}: duplicate key {key!r}")
+        current[key] = value
+    return entries
 
 
 def load_overrides(crates: list[str]) -> list[dict[str, str]]:
     if not OVERRIDES.exists():
         raise SystemExit(f"missing override policy file: {OVERRIDES.name}")
-    document = tomllib.loads(OVERRIDES.read_text(encoding="utf-8"))
-    unexpected = set(document) - {"break"}
-    if unexpected:
-        raise SystemExit(
-            f"{OVERRIDES.name}: unexpected top-level keys {sorted(unexpected)}"
-        )
-    overrides = document.get("break", [])
+    overrides = parse_overrides(OVERRIDES.read_text(encoding="utf-8"), OVERRIDES.name)
     for entry in overrides:
         missing = OVERRIDE_KEYS - set(entry)
         extra = set(entry) - OVERRIDE_KEYS
@@ -120,7 +168,53 @@ def check(crate: str) -> tuple[bool, str | None, str]:
     return completed.returncode == 0, baseline, completed.stdout
 
 
+def self_test() -> int:
+    """Prove the override parser on whatever interpreter is running it.
+
+    The gate must work on the Python floor the contributor flow documents, and
+    that floor predates `tomllib`, so this runs first in `just api-compat` and in
+    CI — on the floor as well as on the default interpreter.
+    """
+    parsed = parse_overrides(
+        '# a comment\n\n[[break]]\ncrate = "gateway-core"  # trailing\n'
+        'baseline = "0.1.0"\njustification = "why # not"\n'
+        'reviewed_in = "https://example.invalid/pull/1"\n',
+        "self-test",
+    )
+    assert parsed == [
+        {
+            "crate": "gateway-core",
+            "baseline": "0.1.0",
+            "justification": "why # not",
+            "reviewed_in": "https://example.invalid/pull/1",
+        }
+    ], parsed
+    assert parse_overrides("# only a comment\n", "self-test") == []
+    for bad in (
+        '[[allow]]\ncrate = "gateway-core"\n',  # a table that is not a break
+        'crate = "gateway-core"\n',  # a key outside any table
+        "[[break]]\ncrate = gateway-core\n",  # an unquoted value
+        '[[break]]\ncrate = "a"\ncrate = "b"\n',  # a duplicated key
+    ):
+        try:
+            parse_overrides(bad, "self-test")
+        except SystemExit:
+            continue
+        raise AssertionError(f"the parser accepted an invalid policy: {bad!r}")
+    # The committed policy file has to satisfy the same grammar.
+    parse_overrides(OVERRIDES.read_text(encoding="utf-8"), OVERRIDES.name)
+    print(f"api-compat: parser self-test passed on Python {sys.version.split()[0]}")
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if argv and argv[0] == "--self-test":
+        if argv[1:]:
+            raise SystemExit("--self-test takes no other arguments")
+        return self_test()
+    # Every run proves the parser on the interpreter in use, so a contributor on
+    # the Python floor finds out here rather than from a confusing parse error.
+    self_test()
     crates = published_library_crates()
     requested = argv or crates
     unknown = [crate for crate in requested if crate not in crates]
