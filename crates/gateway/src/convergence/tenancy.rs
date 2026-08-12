@@ -24,6 +24,25 @@
 //! unambiguous because `/` is not a legal [`Slug`](crate::desired_state::Slug)
 //! character, and reversible for the same reason.
 //!
+//! # A name is not an identity
+//!
+//! Both halves of that name are renameable, and per-namespace durable state —
+//! budgets, credential pools, gateway-key bindings — must survive a rename. So a
+//! projected namespace carries what it *is* as well as what it is called:
+//! [`Namespace::project`] holds the immutable
+//! [`ProjectIdentity`](crate::config::ProjectIdentity), and the id is the name a
+//! request uses to reach it. Renaming `acme` to `acme-inc` therefore changes the
+//! name callers say and the labels an operator reads, and changes nothing about
+//! which durable object was charged: the runtime slice keys per-namespace state on
+//! the identity, and treats the id as display and routing only. A file-declared
+//! namespace has no identity to carry (`None`) and keeps keying on its id, which
+//! is immutable for the same reason the file is: nobody renames it without an
+//! edit and a boot.
+//!
+//! The projection's own charset guarantee is checked where every compiled config
+//! is: [`Config::validate_compiled`] holds a generated id to one slug, or two
+//! joined by `/`, and refuses a repeated id outright.
+//!
 //! # What the projection refuses
 //!
 //! - a tenancy body this build cannot read, or an ownership inconsistency
@@ -54,20 +73,18 @@
 //!
 //! - **selecting a default namespace** from desired state, which is why a
 //!   bootstrap without one is refused above rather than given one;
-//! - **`/` in a namespace id.** A qualified id is the first namespace id no
-//!   `axond.toml` could have written, and nothing *consumes* one yet: no config
-//!   rule constrains the charset of a compiled id, and this projection's collision
-//!   refusal is the only guard. Before a projected id reaches a request path, `/`
-//!   has to be checked everywhere an id is used rather than declared — metric and
-//!   trace label values, Redis and Postgres key composition, gateway-key bindings
-//!   — and that is where a config-level charset and uniqueness rule belongs. This
-//!   module keeps the ids it emits distinct and reversible, which is all it can
-//!   promise on its own.
+//! - **`/` where an id is *used*.** A qualified id is the first namespace id no
+//!   `axond.toml` could have written. Its charset is now gated for every compiled
+//!   config, but a charset rule only says the id is well formed; before a
+//!   projected id reaches a request path, `/` still has to be checked everywhere
+//!   an id is consumed — metric and trace label values, Redis and Postgres key
+//!   composition, gateway-key bindings — and per-namespace durable state has to
+//!   key on [`Namespace::project`] rather than on the name.
 
 use std::collections::BTreeSet;
 
 use super::compile::{ProjectionError, RevisionProjection};
-use crate::config::{Config, Namespace};
+use crate::config::{Config, Namespace, ProjectIdentity};
 use crate::desired_state::{DesiredState, Tenancy};
 
 /// Projects a revision's projects onto `[[namespace]]`, leaving every
@@ -144,6 +161,13 @@ impl RevisionProjection for TenancyProjection {
                 // project borrows nothing until a credential slice gives it its
                 // own.
                 allow_platform_fallback: false,
+                // The id above is a *name*, and a name is renameable. What the
+                // namespace is, and what durable per-namespace state therefore
+                // keys on, is this pair.
+                project: Some(ProjectIdentity {
+                    tenant: project.body.tenant(),
+                    project: project.body.project(),
+                }),
             });
         }
         Ok(config)
@@ -219,6 +243,63 @@ mod tests {
                 .skip(1)
                 .all(|namespace| !namespace.allow_platform_fallback),
             "a projected project borrows no other namespace's credentials"
+        );
+    }
+
+    /// The projected namespaces of a state, as `(name, identity)`.
+    fn projected(state: &DesiredState) -> Vec<(String, Option<ProjectIdentity>)> {
+        TenancyProjection
+            .project(&bootstrap(), state)
+            .expect("projectable")
+            .namespace
+            .into_iter()
+            .filter(|namespace| namespace.project.is_some())
+            .map(|namespace| (namespace.id, namespace.project))
+            .collect()
+    }
+
+    #[test]
+    fn a_rename_moves_a_namespaces_name_and_not_what_it_is() {
+        let mut before = DesiredState::new();
+        before.insert(tenant(1, "acme")).expect("fresh");
+        before
+            .insert(project(&tenant_id(1), 2, "core"))
+            .expect("a distinct reference");
+
+        // The same tenant and the same project, renamed: ids come from the seed, so
+        // these are the rows a rename produces and not different objects.
+        let mut after = DesiredState::new();
+        after.insert(tenant(1, "acme-inc")).expect("fresh");
+        after
+            .insert(project(&tenant_id(1), 2, "platform-core"))
+            .expect("a distinct reference");
+
+        let identity = ProjectIdentity {
+            tenant: tenant_id(1),
+            project: project_id(2),
+        };
+        assert_eq!(
+            projected(&before),
+            [("acme/core".to_owned(), Some(identity))]
+        );
+        assert_eq!(
+            projected(&after),
+            [("acme-inc/platform-core".to_owned(), Some(identity))],
+            "a rename changes the name a request uses and nothing that was accounted"
+        );
+
+        // A file-declared namespace has no durable identity to carry, so nothing
+        // suggests one may be renamed underneath it.
+        assert!(
+            TenancyProjection
+                .project(&bootstrap(), &before)
+                .expect("projectable")
+                .namespace
+                .iter()
+                .find(|namespace| namespace.id == "platform")
+                .expect("the bootstrap namespace survives")
+                .project
+                .is_none()
         );
     }
 

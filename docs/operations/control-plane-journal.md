@@ -254,7 +254,7 @@ outcomes need different responses:
   that leaves the revision or closes a cycle, a checksum that no longer matches,
   or a reference that crosses a tenant boundary. Tenancy ownership is re-read here
   too, so a project row edited to claim a tenant that does not own it does not
-  hydrate — see
+  hydrate, and neither does a project whose tenant row is gone — see
   [resource body schemas](./revision-convergence.md#resource-body-schemas). The
   message names the resource or edge. This is corruption,
   not an outage — retrying will not clear it — and it means something wrote to the
@@ -263,10 +263,8 @@ outcomes need different responses:
   damage is investigated.
 - **Incompatible (`stored revision … is not compatible with this build`).** The
   rows add up and this build cannot read them: a body whose schema identifier or
-  field set belongs to a newer release, a tenant or project body written before
-  those bodies were typed, or a revision that predates a rule this build enforces
-  (today: that the tenant a resource is scoped to is declared in the same
-  revision). **This is not corruption, and nothing about the database needs
+  field set belongs to a newer release, or a tenant or project body written before
+  those bodies were typed. **This is not corruption, and nothing about the database needs
   repairing.** It is reported separately for exactly that reason, and convergence
   reports it as reason `incompatible`. The replica keeps serving the revision it
   already holds. Roll the replica onto a build that reads the revision, or publish

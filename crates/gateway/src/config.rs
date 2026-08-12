@@ -22,6 +22,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::admission::MAX_PERMITS;
 use crate::aliases::AliasScope;
+use crate::desired_state::{ProjectId, TenantId};
 use crate::principals::Capability;
 use crate::usage::{BatchSettings, validate_table_name};
 
@@ -170,6 +171,21 @@ const OVERRIDE_KEYS: [&str; 24] = [
     "admission",
     "revocation",
 ];
+
+/// Whether one segment of a namespace id is a slug: ASCII alphanumerics, `-`,
+/// and `_`, beginning and ending alphanumeric.
+///
+/// The rule the durable [`Slug`](crate::desired_state::Slug) already enforces,
+/// restated over a `String` because a compiled config carries the rendered id and
+/// not the typed one.
+fn is_namespace_segment(segment: &str) -> bool {
+    let alphanumeric = |character: char| character.is_ascii_alphanumeric();
+    segment.starts_with(alphanumeric)
+        && segment.ends_with(alphanumeric)
+        && segment
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
 
 /// A reference is only a reference if the environment layer leaves it alone.
 fn reject_env_override_collision(key: &str, name: &str) -> Result<(), ConfigError> {
@@ -354,6 +370,36 @@ pub struct Namespace {
     /// key" means exactly that (assessment §5.1, delta A/B).
     #[serde(default)]
     pub allow_platform_fallback: bool,
+    /// The durable objects this namespace *is*, when a projection made it from
+    /// desired state; `None` for a namespace a file declared.
+    ///
+    /// Never read from TOML: a file has no tenants or projects to name, and an id
+    /// shaped like one would be a claim about durable state the file cannot make.
+    ///
+    /// Consumed by the later runtime slice, which keys per-namespace durable state
+    /// on it rather than on the renameable [`Namespace::id`]; nothing in this build
+    /// serves a projected namespace yet.
+    #[serde(skip)]
+    #[allow(dead_code)]
+    pub project: Option<ProjectIdentity>,
+}
+
+/// What a projected namespace is, independently of what it is called.
+///
+/// [`Namespace::id`] is a *name*: it is derived from a tenant's and a project's
+/// slugs because a request names a namespace, and an id no operator can read
+/// would make every metric label, log line, and budget report unreadable. Slugs
+/// are renameable, though, so the name is not identity — and budgets, credential
+/// pools, and gateway-key bindings are keyed per namespace, which is exactly the
+/// state a rename must not re-key.
+///
+/// So a projected namespace carries both: the name it is reached by, and the ids
+/// it *is*. Durable, per-namespace state belongs to this pair; a rename then
+/// changes what callers say and nothing that was accounted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProjectIdentity {
+    pub tenant: TenantId,
+    pub project: ProjectId,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2802,7 +2848,47 @@ impl Config {
     /// must still hold is every whole-graph invariant boot enforces, which is
     /// exactly what this runs.
     pub(crate) fn validate_compiled(&self) -> Result<(), ConfigError> {
+        self.validate_namespace_ids()?;
         self.validate_resource_graph()
+    }
+
+    /// The charset and uniqueness gate for namespace ids a *process* wrote.
+    ///
+    /// A file's namespace ids are reviewed by whoever wrote them, and duplicates
+    /// there are deliberately legal (see [`Config::distinct_namespace_count`], and
+    /// the budget key parser that treats a repeated id as one namespace). Compiled
+    /// ids are not written by anyone: a projection derives them from durable
+    /// state, so this is the only place where a generated id is held to the shape
+    /// a namespace id has to have — it ends up in metric label values, in Redis
+    /// and Postgres key composition, and in gateway-key bindings.
+    ///
+    /// Two ids therefore have to hold. A namespace id is one slug, or two joined
+    /// by `/` (a project under its tenant, `acme/core`), where a slug is ASCII
+    /// alphanumerics, `-`, and `_`, beginning and ending alphanumeric. And no
+    /// compiled id may repeat: a duplicate would silently merge two tenants'
+    /// budgets, credential pools, and key bindings onto one name.
+    fn validate_namespace_ids(&self) -> Result<(), ConfigError> {
+        let mut seen: HashSet<&str> = HashSet::with_capacity(self.namespace.len());
+        for namespace in &self.namespace {
+            let id = namespace.id.as_str();
+            let segments = id.split('/').collect::<Vec<_>>();
+            let shaped = matches!(segments.len(), 1 | 2)
+                && segments.iter().all(|segment| is_namespace_segment(segment));
+            if !shaped {
+                return Err(ConfigError::Invalid(format!(
+                    "namespace `{id}` is not a usable identifier: a namespace id is a slug, or a \
+                     project's slug qualified by its tenant's (`acme/core`), where a slug is \
+                     ASCII letters, digits, `-`, and `_`, beginning and ending alphanumeric"
+                )));
+            }
+            if !seen.insert(id) {
+                return Err(ConfigError::Invalid(format!(
+                    "namespace `{id}` is declared twice; one name cannot key two namespaces' \
+                     budgets, credentials, and gateway keys"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Parse + validate from an in-memory TOML string (tests, and the planned
@@ -3084,6 +3170,53 @@ audience = "test"
             assert!(error.to_string().contains("subject"), "{error}");
             assert!(error.to_string().contains("empty"), "{error}");
         }
+    }
+
+    #[test]
+    fn a_compiled_namespace_id_is_held_to_a_shape_a_file_never_was() {
+        let compiled = |ids: &[&str]| {
+            let mut config = Config::from_toml_str(VALID).expect("the fixture is valid");
+            config.namespace.extend(ids.iter().map(|id| Namespace {
+                id: (*id).to_owned(),
+                default: false,
+                allow_platform_fallback: false,
+                project: None,
+            }));
+            config.validate_compiled()
+        };
+
+        // What a projection emits: a tenant-qualified project.
+        compiled(&["acme/core", "globex/core"]).expect("a qualified id is a namespace id");
+
+        // A generated id is not reviewed by anyone, so the charset is enforced
+        // where the id is produced rather than trusted because it parsed.
+        for rejected in [
+            "acme/core/edge",
+            "acme//core",
+            "acme/",
+            "/core",
+            "acme core",
+            "acme.core",
+            "-acme/core",
+            "acme/core-",
+            "acme/cœur",
+            "",
+        ] {
+            let error = compiled(&[rejected]).expect_err("a malformed id must not compile");
+            assert!(
+                error.to_string().contains("not a usable identifier"),
+                "`{rejected}` is refused as a shape, not by a later gate: {error}"
+            );
+        }
+
+        // A repeated id is legal in a file and cannot be in a compiled config:
+        // there it would put two tenants' budgets, credentials, and keys on one
+        // name.
+        let error =
+            compiled(&["acme/core", "acme/core"]).expect_err("a duplicate must not compile");
+        assert!(error.to_string().contains("declared twice"), "{error}");
+        let error = compiled(&["platform"]).expect_err("including one the file already declared");
+        assert!(error.to_string().contains("declared twice"), "{error}");
     }
 
     #[test]

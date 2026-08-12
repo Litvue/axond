@@ -160,6 +160,16 @@ the tenant it is scoped to, and a mismatch is refused at publication and again a
 hydration. Human-readable slugs live on the envelope, so renaming a tenant leaves
 every body and every reference untouched.
 
+What a revision is *not* required to carry is a tenant row for everything scoped
+to a tenant. A project must name a tenant the same revision declares — nothing can
+name that project's namespace otherwise, and this build never writes a project
+without its tenant, so a project whose tenant row is gone is damage rather than a
+release skew. Other tenant-scoped resources are deliberately not held to it: a
+credential or an alias published before tenancy bodies existed may carry a tenant
+no row describes, and adding that requirement now would make revisions already in
+the journal stop hydrating on upgrade. Such a scope is *unroutable*, which the
+boundary that routes reports, rather than unreadable.
+
 ### How a project becomes a namespace
 
 The runtime's tenancy boundary is the namespace: keys bind to one, credential
@@ -175,14 +185,25 @@ tenants' projects out of one budget, one credential pool, and one key binding, a
 way. A projected namespace whose id a bootstrap namespace already claims is
 refused rather than merged.
 
-A qualified id is the first namespace id no `axond.toml` could have written, and
-nothing consumes one yet. Before the runtime slice wires this projection into
-`serve`, `/` has to be checked against every place a namespace id is *used* rather
-than declared — metric and trace label values, Redis and Postgres key composition,
-and gateway-key bindings — and a config-level charset and uniqueness rule for
-namespace ids belongs with that check. Until then the projection's own collision
-refusal is the only guard, which is enough because no request path reads a
-projected id.
+A qualified id is a *name*, and both halves of it are renameable, so it is not
+what the namespace **is**. A projected namespace also carries the tenant and
+project ids it was made from, and those never change: renaming `acme` to
+`acme-inc` renames what callers say and what an operator reads in a label, and
+moves nothing that was accounted. Per-namespace durable state — budgets,
+credential pools, gateway-key bindings — therefore keys on that identity and not
+on the name, and a rename is a rename rather than a delete plus a create. A
+file-declared namespace has no such identity: its id is immutable for the same
+reason the file is, and it keeps keying on the id.
+
+Every compiled configuration's namespace ids are also held to a shape a file's
+never were: one slug, or two joined by `/`, and never repeated. A file may
+legitimately declare the same id twice (it means one namespace), but a *generated*
+id nobody reviewed may not — a duplicate would put two tenants' budgets,
+credentials, and keys on one name. What that gate does not cover is `/` where an
+id is *used* rather than declared: before the runtime slice wires this projection
+into `serve`, metric and trace label values, Redis and Postgres key composition,
+and gateway-key bindings all have to be checked against a separator no
+`axond.toml` could have produced.
 
 What projection does *not* touch is everything the local file owns: listener,
 transport bounds, admission, telemetry, datastore connectivity, and — until their

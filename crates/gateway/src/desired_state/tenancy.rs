@@ -164,15 +164,16 @@ pub enum TenancyError {
         declared: TenantId,
         scoped: Option<TenantId>,
     },
+    /// A project whose owning tenant row this revision does not carry.
+    ///
+    /// Only a *project* is held to this: a typed project body is never written
+    /// without its tenant, so its absence is a row that went missing rather than
+    /// a revision published before the rule existed. Other tenant-scoped
+    /// resources are not, deliberately — see [`Tenancy::of`].
     #[error("{reference} belongs to {tenant}, which this revision does not declare")]
     UnknownTenant {
         reference: ResourceRef,
         tenant: TenantId,
-    },
-    #[error("{reference} is scoped to {project}, which this revision does not declare")]
-    UnknownProject {
-        reference: ResourceRef,
-        project: ProjectId,
     },
     #[error("{reference} places {project} under {scoped}, but that project belongs to {owner}")]
     ProjectOwnerMismatch {
@@ -194,18 +195,14 @@ impl TenancyError {
     /// refusal: storage is intact, and the fix is to run a build that reads it or
     /// to publish a revision this one does.
     ///
-    /// A tenant or project a revision never declared is the same class, for a
-    /// less obvious reason: requiring the *owner* to be present in the revision is
-    /// a rule this build added, and a revision published before it existed could
-    /// satisfy every rule of its day and still omit that row. A restore that lost
-    /// a row does not arrive here — a manifest entry without its row is
-    /// [`MissingResource`], not this — so what reaches this case is a revision
-    /// that was published that way.
-    ///
-    /// Two kinds of refusal are *not* compatibility failures:
+    /// Three kinds of refusal are *not* compatibility failures:
     ///
     /// - an identity or ownership contradiction: those rows were readable, this
     ///   build understands both of them, and they disagree;
+    /// - a project whose tenant row is absent: a typed project body is only ever
+    ///   written alongside its tenant, so no release skew produces one, and the
+    ///   only rows *required* to exist are ones this build itself wrote (a
+    ///   manifest entry whose row is gone is [`MissingResource`], not this);
     /// - a field missing, mistyped, or unparseable *inside a body whose schema
     ///   this build reads*. Reading takes the schema identifier first, so anything
     ///   past that point declared `axond.tenant.v1` and then failed to be one, and
@@ -233,9 +230,7 @@ impl TenancyError {
             | Self::NotARecord { .. }
             | Self::Schema { .. }
             | Self::UnknownField { .. }
-            | Self::MalformedDisplayName { .. }
-            | Self::UnknownTenant { .. }
-            | Self::UnknownProject { .. } => true,
+            | Self::MalformedDisplayName { .. } => true,
             // Only the schema identifier itself: its absence is a body written
             // before tenancy had one at all.
             Self::MissingField { field, .. } | Self::FieldType { field, .. } => {
@@ -244,6 +239,7 @@ impl TenancyError {
             Self::MalformedId { .. }
             | Self::IdentityMismatch { .. }
             | Self::OwnerMismatch { .. }
+            | Self::UnknownTenant { .. }
             | Self::ProjectOwnerMismatch { .. } => false,
         }
     }
@@ -268,7 +264,6 @@ impl TenancyError {
             | Self::IdentityMismatch { reference, .. }
             | Self::OwnerMismatch { reference, .. }
             | Self::UnknownTenant { reference, .. }
-            | Self::UnknownProject { reference, .. }
             | Self::ProjectOwnerMismatch { reference, .. } => *reference,
         }
     }
@@ -708,18 +703,28 @@ pub struct Tenancy {
 impl Tenancy {
     /// Read and resolve the tenancy of a desired state.
     ///
-    /// Four things are checked that no envelope-level rule can see:
+    /// Three things are checked that no envelope-level rule can see:
     ///
     /// 1. every tenancy body is a body of a schema this build reads, bound to its
     ///    own envelope (identity, and a project's owner);
     /// 2. a project's owning tenant is declared by the same revision — a revision
     ///    is whole desired state, so an owner that is merely assumed to exist is
     ///    a dangling owner;
-    /// 3. so is the tenant of anything tenant- or project-scoped, which is what
-    ///    makes "resource of a tenant this revision does not have" unpublishable
-    ///    rather than merely unroutable;
-    /// 4. a project-scoped resource names its project's *actual* owner, so a
-    ///    project cannot be read under a tenant that does not own it.
+    /// 3. a project-scoped resource whose project this revision *does* declare
+    ///    names that project's actual owner, so a project cannot be read under a
+    ///    tenant that does not own it.
+    ///
+    /// What is deliberately *not* checked is the tenant of every other
+    /// tenant-scoped resource. Requiring it would read well — "a revision is whole
+    /// desired state" — but it is a rule this build would be adding to revisions
+    /// already published under the older one, where a credential or an alias could
+    /// legitimately carry a tenant no row described. Hydration runs these same
+    /// rules, so such a revision would stop loading on upgrade. The tenancy view
+    /// is the wrong place to buy that: nothing here needs the tenant of a
+    /// credential, and a scope naming a tenant that does not exist is unroutable
+    /// at the boundary that routes, not unreadable. A project is held to its owner
+    /// because this build never writes one without it, and because the projection
+    /// cannot name a namespace without it.
     pub fn of(state: &DesiredState) -> Result<Self, TenancyError> {
         let mut tenancy = Self::default();
         for resource in state.resources() {
@@ -760,41 +765,29 @@ impl Tenancy {
         }
 
         for resource in state.resources() {
-            let reference = resource.reference;
-            match &resource.scope {
-                ResourceScope::Deployment => {}
-                ResourceScope::Tenant(tenant) => tenancy.require_tenant(reference, *tenant)?,
-                ResourceScope::Project { tenant, project } => {
-                    tenancy.require_tenant(reference, *tenant)?;
-                    let owner = tenancy
-                        .projects
-                        .get(project)
-                        .ok_or(TenancyError::UnknownProject {
-                            reference,
-                            project: *project,
-                        })?
-                        .body
-                        .tenant();
-                    if owner != *tenant {
-                        return Err(TenancyError::ProjectOwnerMismatch {
-                            reference,
-                            project: *project,
-                            scoped: *tenant,
-                            owner,
-                        });
-                    }
-                }
+            let ResourceScope::Project { tenant, project } = &resource.scope else {
+                continue;
+            };
+            // A project this revision does not declare is not contradicted by
+            // anything, so there is nothing to refuse: what the scope names is
+            // then simply unroutable, and the boundary that routes says so.
+            let Some(owner) = tenancy
+                .projects
+                .get(project)
+                .map(|project| project.body.tenant())
+            else {
+                continue;
+            };
+            if owner != *tenant {
+                return Err(TenancyError::ProjectOwnerMismatch {
+                    reference: resource.reference,
+                    project: *project,
+                    scoped: *tenant,
+                    owner,
+                });
             }
         }
         Ok(tenancy)
-    }
-
-    fn require_tenant(&self, reference: ResourceRef, tenant: TenantId) -> Result<(), TenancyError> {
-        if self.tenants.contains_key(&tenant) {
-            Ok(())
-        } else {
-            Err(TenancyError::UnknownTenant { reference, tenant })
-        }
     }
 
     /// Every tenant, ordered by [`TenantId`].
@@ -1305,28 +1298,7 @@ mod tests {
             "{error}"
         );
 
-        // A revision that never declared the tenant its resources are scoped to
-        // is the third shape of the same problem: requiring the owner row is a
-        // rule this build added, so a revision published before it existed is
-        // refused as an incompatibility and not as a missing row.
-        let mut ownerless = DesiredState::new();
-        ownerless
-            .insert(alias(&tenant_id(1), 4, "fast", &[]))
-            .expect("a fresh state");
-        assert!(
-            TenancyError::UnknownTenant {
-                reference: alias(&tenant_id(1), 4, "fast", &[]).reference,
-                tenant: tenant_id(1),
-            }
-            .is_incompatible(),
-            "an owner row a revision never carried is an upgrade, not a repair"
-        );
-        assert!(matches!(
-            ownerless.validate(),
-            Err(ValidationError::Tenancy(TenancyError::UnknownTenant { .. }))
-        ));
-
-        // And an ownership contradiction is not: those rows were readable and
+        // An ownership contradiction is not a compatibility refusal: those rows were readable and
         // disagree, which is the case that means storage.
         assert!(
             !TenancyError::OwnerMismatch {
@@ -1395,17 +1367,31 @@ mod tests {
             })
         );
 
-        // And so does anything else that is scoped to one.
+        // It is the *project* that is held to this, and it is damage rather than a
+        // skew: this build never writes a project body without its tenant, so the
+        // row went missing rather than never having been required.
+        assert!(
+            !TenancyError::UnknownTenant {
+                reference: project.reference,
+                tenant: tenant_id(9),
+            }
+            .is_incompatible(),
+            "a row this build itself wrote and cannot find is not an upgrade"
+        );
+
+        // Nothing else is: a revision published before this rule existed could
+        // carry a credential or an alias whose tenant no row described, and it
+        // still hydrates — the tenancy view needs no tenant for either, and a scope
+        // naming a tenant that does not exist is unroutable at the boundary that
+        // routes, not unreadable here.
         let mut stray = DesiredState::new();
         let alias = alias(&tenant_id(9), 4, "fast", &[]);
         stray.insert(alias.clone()).expect("a fresh state");
-        assert_eq!(
-            Tenancy::of(&stray),
-            Err(TenancyError::UnknownTenant {
-                reference: alias.reference,
-                tenant: tenant_id(9)
-            })
-        );
+        stray
+            .validate()
+            .expect("an older revision's tenant-scoped resource is not made unhydratable");
+        let tenancy = Tenancy::of(&stray).expect("nothing tenancy reads is missing");
+        assert_eq!(tenancy.tenants().len(), 0);
     }
 
     #[test]
@@ -1436,8 +1422,10 @@ mod tests {
             })
         );
 
-        // An undeclared project is named as such rather than reported as a
-        // mismatch against nothing.
+        // A project this revision does not declare contradicts nothing, so there
+        // is nothing here to refuse: what the scope names is unroutable, which the
+        // boundary that routes says, and an older revision does not become
+        // unhydratable for having said it.
         let dangling = ResourceVersion {
             scope: ResourceScope::Project {
                 tenant: owner,
@@ -1449,13 +1437,9 @@ mod tests {
         missing
             .insert(dangling.clone())
             .expect("a distinct reference");
-        assert_eq!(
-            Tenancy::of(&missing),
-            Err(TenancyError::UnknownProject {
-                reference: dangling.reference,
-                project: project_id(77)
-            })
-        );
+        missing
+            .validate()
+            .expect("a scope naming an undeclared project is unroutable, not unreadable");
 
         // The consistent pair is valid desired state.
         let inside = ResourceVersion {
