@@ -148,7 +148,9 @@ Five rules hold for every body schema, present and future:
   is pointed at storage rather than away from it. (A *display name* this build will
   not take is the exception, and is `incompatible`: validation rules can tighten
   within one schema — this build refuses an invisible byte-order mark an earlier
-  one accepted.)
+  one accepted.) A body that is not an inline record, or that sits under a kind it
+  does not match, is damage for the same reason: every release that has written a
+  tenancy body wrote an inline record, so no skew produces a scalar or a blob there.
 - **A change to a field's presence or meaning is a new identifier.** `v1` bodies
   never change shape, so a checksum computed by one release is computed the same
   way by every release that accepts it. Adding a field, renaming one, or changing

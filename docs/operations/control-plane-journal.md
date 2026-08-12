@@ -273,7 +273,10 @@ outcomes need different responses:
   upgrade stay unreadable to this build by design and remain in the journal as
   history. A body that *declares* a schema this build reads and then is not one —
   a field gone, a field whose type changed — is not this outcome; that is
-  unreadable, above, because no version skew produces it.
+  unreadable, above, because no version skew produces it. Neither is a tenancy body
+  that is not an inline record at all, or one under a kind it does not match: no
+  release ever wrote one, typed or untyped, so the shape itself says the row was
+  rewritten.
 - **Too large (`exceeds what hydration reads`).** The revision is intact but
   larger than this build's read bounds (resource versions, blobs, blob bytes,
   dependency edges or nesting, inline body bytes, or total candidate size); the

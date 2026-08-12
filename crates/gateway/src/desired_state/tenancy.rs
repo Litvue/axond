@@ -195,10 +195,16 @@ impl TenancyError {
     /// refusal: storage is intact, and the fix is to run a build that reads it or
     /// to publish a revision this one does.
     ///
-    /// Three kinds of refusal are *not* compatibility failures:
+    /// Four kinds of refusal are *not* compatibility failures:
     ///
     /// - an identity or ownership contradiction: those rows were readable, this
     ///   build understands both of them, and they disagree;
+    /// - a body that is not an inline record, or sits under a kind that does not
+    ///   match it. Every build that has ever written a tenancy resource wrote an
+    ///   inline record under its own kind, untyped ones included, so no release
+    ///   writes a scalar or a blob here; a body replaced with one was rewritten
+    ///   underneath the gateway, and a newer field set would still arrive as a
+    ///   record and be refused by its identifier;
     /// - a project whose tenant row is absent: a typed project body is only ever
     ///   written alongside its tenant, so no release skew produces one, and the
     ///   only rows *required* to exist are ones this build itself wrote (a
@@ -225,18 +231,18 @@ impl TenancyError {
     /// [`MissingResource`]: super::revision::IntegrityError::MissingResource
     pub fn is_incompatible(&self) -> bool {
         match self {
-            Self::Kind { .. }
-            | Self::NotInline { .. }
-            | Self::NotARecord { .. }
-            | Self::Schema { .. }
-            | Self::UnknownField { .. }
-            | Self::MalformedDisplayName { .. } => true,
+            Self::Schema { .. } | Self::UnknownField { .. } | Self::MalformedDisplayName { .. } => {
+                true
+            }
             // Only the schema identifier itself: its absence is a body written
             // before tenancy had one at all.
             Self::MissingField { field, .. } | Self::FieldType { field, .. } => {
                 *field == SCHEMA_FIELD
             }
-            Self::MalformedId { .. }
+            Self::Kind { .. }
+            | Self::NotInline { .. }
+            | Self::NotARecord { .. }
+            | Self::MalformedId { .. }
             | Self::IdentityMismatch { .. }
             | Self::OwnerMismatch { .. }
             | Self::UnknownTenant { .. }
@@ -1351,6 +1357,43 @@ mod tests {
             }
             .is_incompatible(),
             "only the identifier's own absence is the legacy shape"
+        );
+
+        // Nor is a body that is no longer a record at all, or one under a kind that
+        // does not match it. No release, typed or not, wrote a tenancy body as a
+        // scalar or a blob, so the shape itself is the evidence of a rewrite, and a
+        // newer field set would still be a record refused by its identifier.
+        let mut scalar = DesiredState::new();
+        let not_a_record = ResourceVersion {
+            body: ResourceBody::Inline(CanonicalValue::String("acme".to_owned())),
+            ..tenant_resource()
+        };
+        scalar.insert(not_a_record).expect("a fresh state");
+        let error = scalar
+            .validate()
+            .expect_err("a tenancy body is a record or it is nothing");
+        let ValidationError::Tenancy(tenancy) = &error else {
+            panic!("expected a tenancy refusal, got {error:?}");
+        };
+        assert!(
+            !tenancy.is_incompatible(),
+            "a body no build ever wrote is damage, and points at storage"
+        );
+        assert!(
+            !TenancyError::NotInline {
+                reference: tenant_resource().reference,
+            }
+            .is_incompatible(),
+            "and so is a tenancy record replaced by a blob reference"
+        );
+        assert!(
+            !TenancyError::Kind {
+                reference: tenant_resource().reference,
+                expected: ResourceKind::Tenant,
+                found: ResourceKind::Project,
+            }
+            .is_incompatible(),
+            "and so is a row whose kind and body disagree"
         );
     }
 
