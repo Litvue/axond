@@ -7,14 +7,18 @@ default:
 # release packaging — the CI gates.
 check: fmt-check clippy test fuzz-smoke docs deny publish-dry-run msrv api-compat
 
+# `fuzz/` is a separate workspace, so `--all` and `--workspace` do not reach it.
 fmt:
     cargo fmt --all
+    cd fuzz && cargo fmt --all
 
 fmt-check:
     cargo fmt --all -- --check
+    cd fuzz && cargo fmt --all -- --check
 
 clippy:
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+    cd fuzz && cargo clippy --all-targets --locked -- -D warnings
 
 test:
     cargo test --workspace --all-features --locked

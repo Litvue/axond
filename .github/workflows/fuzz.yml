@@ -37,18 +37,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A dispatch for one target has to narrow the matrix rather than skip jobs from
+  # it: `matrix` is not available in a job-level `if`, so selecting there would be
+  # a workflow validation error and no run at all.
+  select:
+    name: Select targets
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.choose.outputs.targets }}
+    steps:
+      - id: choose
+        env:
+          REQUESTED: ${{ inputs.target || 'all' }}
+        run: |
+          set -euo pipefail
+          case "${REQUESTED}" in
+            all) targets='["config_toml", "token_verify", "credentials_query"]' ;;
+            config_toml | token_verify | credentials_query) targets="[\"${REQUESTED}\"]" ;;
+            *) echo "unknown fuzz target ${REQUESTED}" >&2; exit 1 ;;
+          esac
+          echo "targets=${targets}" >> "${GITHUB_OUTPUT}"
+          echo "running: ${targets}"
+
   fuzz:
     name: Fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest
-    # One target per job: a finding in one must not cut the others' budget short.
-    if: >-
-      github.event_name != 'workflow_dispatch'
-      || inputs.target == 'all'
-      || inputs.target == matrix.target
+    needs: select
     strategy:
+      # One target per job: a finding in one must not cut the others' budget short.
       fail-fast: false
       matrix:
-        target: [config_toml, token_verify, credentials_query]
+        target: ${{ fromJSON(needs.select.outputs.targets) }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
