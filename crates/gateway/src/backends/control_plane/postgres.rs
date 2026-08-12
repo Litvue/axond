@@ -37,14 +37,15 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Config, Row, Transaction};
 
+use super::hydration::{self, HydrationLimits};
 use super::rows;
 use super::schema::{self, MINIMUM_SERVER_VERSION_NUM, SchemaStatus};
 use super::{ControlPlaneError, ControlPlaneStore};
 use crate::backends::{Capabilities, Capability};
 use crate::desired_state::{
-    AuditEvent, BlobRef, DesiredState, IntegrityError, LoadedRevision, ManifestEntry, Mutation,
-    ResourceRef, ResourceVersion, ResourceVersionNumber, RevisionCandidate, RevisionId,
-    RevisionManifest, SerializerVersion, Uuid7Generator,
+    AuditEvent, IntegrityError, LoadedRevision, Mutation, ResourceRef, ResourceVersion,
+    ResourceVersionNumber, RevisionCandidate, RevisionId, RevisionManifest, SerializerVersion,
+    Uuid7Generator,
 };
 
 const BACKEND: &str = "postgres";
@@ -71,6 +72,9 @@ pub struct ControlPlaneSettings {
     /// permanent namespace: expiry never touches the revision or audit trail the
     /// record points at.
     pub idempotency_retention: Duration,
+    /// What one read of a stored revision may consume. Reads are bounded because
+    /// what they read is storage, and storage is not this build's to trust.
+    pub hydration: HydrationLimits,
 }
 
 impl Default for ControlPlaneSettings {
@@ -81,6 +85,7 @@ impl Default for ControlPlaneSettings {
             connect_timeout: Duration::from_secs(10),
             operation_timeout: Duration::from_secs(30),
             idempotency_retention: Duration::from_secs(24 * 60 * 60),
+            hydration: HydrationLimits::default(),
         }
     }
 }
@@ -316,7 +321,7 @@ fn denied(message: impl Into<String>) -> ControlPlaneError {
 ///
 /// SQLSTATE is included because "connection reset" and "deadlock detected" are
 /// the same category to a caller and completely different to an operator.
-fn unavailable(operation: &str, error: &tokio_postgres::Error) -> ControlPlaneError {
+pub(super) fn unavailable(operation: &str, error: &tokio_postgres::Error) -> ControlPlaneError {
     let message = match error.as_db_error() {
         Some(db) => format!(
             "{operation} failed: {} (SQLSTATE {})",
@@ -331,7 +336,7 @@ fn unavailable(operation: &str, error: &tokio_postgres::Error) -> ControlPlaneEr
     }
 }
 
-fn corrupt_storage(detail: impl Into<String>) -> ControlPlaneError {
+pub(super) fn corrupt_storage(detail: impl Into<String>) -> ControlPlaneError {
     ControlPlaneError::CorruptStorage {
         detail: detail.into(),
     }
@@ -415,13 +420,14 @@ impl ControlPlaneStore for PostgresControlPlane {
     }
 
     async fn load_manifest(&self, id: RevisionId) -> Result<RevisionManifest, ControlPlaneError> {
+        let limits = self.settings.hydration;
         self.run(move |client| {
             Box::pin(async move {
                 let transaction = client
                     .transaction()
                     .await
                     .map_err(|error| unavailable("begin manifest read", &error))?;
-                let manifest = read_manifest(&transaction, id).await;
+                let manifest = hydration::manifest(&transaction, id, &limits).await;
                 let _ = transaction.rollback().await;
                 manifest
             })
@@ -430,13 +436,32 @@ impl ControlPlaneStore for PostgresControlPlane {
     }
 
     async fn load_revision(&self, id: RevisionId) -> Result<LoadedRevision, ControlPlaneError> {
+        let limits = self.settings.hydration;
         self.run(move |client| {
             Box::pin(async move {
                 let transaction = client
                     .transaction()
                     .await
                     .map_err(|error| unavailable("begin revision read", &error))?;
-                let loaded = read_revision(&transaction, id).await;
+                let loaded = hydration::revision(&transaction, id, &limits).await;
+                let _ = transaction.rollback().await;
+                loaded
+            })
+        })
+        .await
+    }
+
+    /// The head and its hydration in one read, so a caller cannot be told it
+    /// converged onto a revision that was never the head it read.
+    async fn load_desired_revision(&self) -> Result<Option<LoadedRevision>, ControlPlaneError> {
+        let limits = self.settings.hydration;
+        self.run(move |client| {
+            Box::pin(async move {
+                let transaction = client
+                    .transaction()
+                    .await
+                    .map_err(|error| unavailable("begin desired-revision read", &error))?;
+                let loaded = hydration::desired(&transaction, &limits).await;
                 let _ = transaction.rollback().await;
                 loaded
             })
@@ -455,6 +480,7 @@ impl ControlPlaneStore for PostgresControlPlane {
         let caller_scope = rows::caller_scope(&candidate.mutation.actor)
             .map_err(|error| ControlPlaneError::Invalid(error.into()))?;
         let retention = self.settings.idempotency_retention;
+        let limits = self.settings.hydration;
         let id = RevisionId::new(self.ids.next());
 
         self.run(move |client| {
@@ -470,6 +496,7 @@ impl ControlPlaneStore for PostgresControlPlane {
                     &checksum.to_string(),
                     &caller_scope,
                     retention,
+                    &limits,
                 )
                 .await
                 {
@@ -557,6 +584,7 @@ async fn publish(
     checksum: &str,
     caller_scope: &str,
     retention: Duration,
+    limits: &HydrationLimits,
 ) -> Result<Published, ControlPlaneError> {
     // One row, taken `FOR UPDATE`: every publisher queues here, so "exactly one
     // expected-revision commit wins" does not depend on isolation-level
@@ -614,7 +642,7 @@ async fn publish(
                 published,
             });
         }
-        return read_manifest(transaction, published)
+        return hydration::manifest(transaction, published, limits)
             .await
             .map(Published::Replayed);
     }
@@ -950,202 +978,6 @@ fn is_unique_violation(error: &tokio_postgres::Error) -> bool {
         .is_some_and(|db| db.code() == &SqlState::UNIQUE_VIOLATION)
 }
 
-async fn read_manifest(
-    transaction: &Transaction<'_>,
-    id: RevisionId,
-) -> Result<RevisionManifest, ControlPlaneError> {
-    let revision = transaction
-        .query_opt(
-            "SELECT parent_id, mutation_id, serializer, state_checksum, created_at \
-             FROM axond_cp_revision WHERE revision_id = $1",
-            &[&id.to_string()],
-        )
-        .await
-        .map_err(|error| unavailable("read revision", &error))?
-        .ok_or(ControlPlaneError::RevisionNotFound(id))?;
-
-    let corrupt = |error: IntegrityError| ControlPlaneError::corrupt(id, error);
-    let parent: Option<String> = revision.get(0);
-    let parent = parent
-        .map(|text| rows::revision_id(&text))
-        .transpose()
-        .map_err(corrupt)?;
-    let mutation_text: String = revision.get(1);
-    let mutation = rows::mutation_id(&mutation_text).map_err(corrupt)?;
-    let serializer_text: String = revision.get(2);
-    let serializer = rows::serializer(&serializer_text).map_err(corrupt)?;
-    let checksum_text: String = revision.get(3);
-    let checksum = rows::checksum(&checksum_text).map_err(corrupt)?;
-    let created_at: SystemTime = revision.get(4);
-
-    let mut entries = Vec::new();
-    for row in transaction
-        .query(
-            "SELECT v.resource_kind, v.resource_id, v.version, v.scope_kind, v.tenant_id, \
-             v.project_id, v.slug, v.content_checksum \
-             FROM axond_cp_revision_entry e \
-             JOIN axond_cp_resource_version v \
-             USING (resource_kind, resource_id, version) \
-             WHERE e.revision_id = $1",
-            &[&id.to_string()],
-        )
-        .await
-        .map_err(|error| unavailable("read manifest entries", &error))?
-    {
-        entries.push(manifest_entry(&row).map_err(corrupt)?);
-    }
-    entries.sort_by_key(|entry| entry.reference);
-
-    let mut blobs = Vec::new();
-    for row in transaction
-        .query(
-            "SELECT b.blob_kind, b.digest, b.size_bytes FROM axond_cp_revision_blob rb \
-             JOIN axond_cp_blob b USING (blob_kind, digest) WHERE rb.revision_id = $1",
-            &[&id.to_string()],
-        )
-        .await
-        .map_err(|error| unavailable("read revision blobs", &error))?
-    {
-        let kind: String = row.get(0);
-        let digest: String = row.get(1);
-        let size: i64 = row.get(2);
-        blobs.push(BlobRef {
-            kind: rows::blob_kind(&kind).map_err(corrupt)?,
-            digest: rows::checksum(&digest).map_err(corrupt)?,
-            size_bytes: u64::try_from(size).map_err(|_| {
-                corrupt(rows::unreadable(format!(
-                    "blob {digest} has a negative size"
-                )))
-            })?,
-        });
-    }
-    blobs.sort_by_key(|blob| blob.digest);
-
-    Ok(RevisionManifest {
-        id,
-        parent,
-        created_at,
-        serializer,
-        mutation,
-        entries,
-        blobs,
-        checksum,
-    })
-}
-
-async fn read_revision(
-    transaction: &Transaction<'_>,
-    id: RevisionId,
-) -> Result<LoadedRevision, ControlPlaneError> {
-    let manifest = read_manifest(transaction, id).await?;
-    let corrupt = |error: IntegrityError| ControlPlaneError::corrupt(id, error);
-
-    let mut dependencies: std::collections::BTreeMap<ResourceRef, Vec<ResourceRef>> =
-        std::collections::BTreeMap::new();
-    for row in transaction
-        .query(
-            "SELECT d.resource_kind, d.resource_id, d.version, d.depends_on_kind, \
-             d.depends_on_id, d.depends_on_version FROM axond_cp_resource_dependency d \
-             JOIN axond_cp_revision_entry e USING (resource_kind, resource_id, version) \
-             WHERE e.revision_id = $1",
-            &[&id.to_string()],
-        )
-        .await
-        .map_err(|error| unavailable("read resource dependencies", &error))?
-    {
-        let dependent = reference(&row, 0).map_err(corrupt)?;
-        let dependency = reference(&row, 3).map_err(corrupt)?;
-        dependencies.entry(dependent).or_default().push(dependency);
-    }
-
-    let mut state = DesiredState::new();
-    for blob in &manifest.blobs {
-        state.declare_blob(*blob);
-    }
-    for row in transaction
-        .query(
-            "SELECT v.resource_kind, v.resource_id, v.version, v.scope_kind, v.tenant_id, \
-             v.project_id, v.slug, v.body_form, v.body_inline, v.body_blob_kind, \
-             v.body_blob_digest, b.size_bytes \
-             FROM axond_cp_revision_entry e \
-             JOIN axond_cp_resource_version v \
-             USING (resource_kind, resource_id, version) \
-             LEFT JOIN axond_cp_blob b \
-             ON b.blob_kind = v.body_blob_kind AND b.digest = v.body_blob_digest \
-             WHERE e.revision_id = $1",
-            &[&id.to_string()],
-        )
-        .await
-        .map_err(|error| unavailable("read resource versions", &error))?
-    {
-        let resource = resource_version(&row, &dependencies).map_err(corrupt)?;
-        state
-            .insert(resource)
-            .map_err(|error| corrupt(error.into()))?;
-    }
-
-    LoadedRevision::assemble(manifest, state).map_err(corrupt)
-}
-
-/// A resource reference from three consecutive columns.
-fn reference(row: &Row, at: usize) -> Result<ResourceRef, IntegrityError> {
-    let kind: String = row.get(at);
-    let id: String = row.get(at + 1);
-    let version: i64 = row.get(at + 2);
-    Ok(ResourceRef::new(
-        rows::resource_kind(&kind)?,
-        rows::resource_id(&id)?,
-        rows::version_number(version)?,
-    ))
-}
-
-fn manifest_entry(row: &Row) -> Result<ManifestEntry, IntegrityError> {
-    let scope_kind: String = row.get(3);
-    let tenant: Option<String> = row.get(4);
-    let project: Option<String> = row.get(5);
-    let slug: String = row.get(6);
-    let content: String = row.get(7);
-    Ok(ManifestEntry {
-        reference: reference(row, 0)?,
-        scope: rows::scope(&scope_kind, tenant.as_deref(), project.as_deref())?,
-        slug: rows::slug(&slug)?,
-        content: rows::checksum(&content)?,
-    })
-}
-
-fn resource_version(
-    row: &Row,
-    dependencies: &std::collections::BTreeMap<ResourceRef, Vec<ResourceRef>>,
-) -> Result<ResourceVersion, IntegrityError> {
-    let reference = reference(row, 0)?;
-    let scope_kind: String = row.get(3);
-    let tenant: Option<String> = row.get(4);
-    let project: Option<String> = row.get(5);
-    let slug: String = row.get(6);
-    let form: String = row.get(7);
-    let inline: Option<Vec<u8>> = row.get(8);
-    let blob_kind: Option<String> = row.get(9);
-    let blob_digest: Option<String> = row.get(10);
-    let blob_size: Option<i64> = row.get(11);
-    let body = rows::body(
-        &form,
-        inline.as_deref(),
-        blob_kind.as_deref(),
-        blob_digest.as_deref(),
-        blob_size,
-    )?;
-    let version = ResourceVersion::new(
-        reference,
-        rows::scope(&scope_kind, tenant.as_deref(), project.as_deref())?,
-        rows::slug(&slug)?,
-        body,
-    );
-    Ok(match dependencies.get(&reference) {
-        Some(edges) => version.depending_on(edges.iter().copied()),
-        None => version,
-    })
-}
-
 fn audit_event(row: &Row) -> Result<AuditEvent, IntegrityError> {
     let id: String = row.get(0);
     let mutation: String = row.get(1);
@@ -1192,14 +1024,16 @@ fn audit_event(row: &Row) -> Result<AuditEvent, IntegrityError> {
 mod tests {
     use std::time::UNIX_EPOCH;
 
+    use super::super::hydration::HydrationLimit;
     use super::*;
     use crate::backends::{BackendFailure, FailureCategory};
     use crate::desired_state::fixtures::{
-        DESIRED_STATE_RESOURCES, candidate, state, state_with_renamed_alias, tenant,
+        DESIRED_STATE_RESOURCES, candidate, reference, state, state_with_renamed_alias,
+        state_with_second_tenant, tenant,
     };
     use crate::desired_state::{
-        Actor, AuditEventId, ExpectedRevision, MutationId, ResourceKind, Uuid7,
-        oracle::InMemoryControlPlane,
+        Actor, AuditEventId, DesiredState, ExpectedRevision, MutationId, ResourceKind, Uuid7,
+        ValidationError, oracle::InMemoryControlPlane,
     };
 
     /// Each test owns a schema, so the journal's fixed object names do not make
@@ -1256,7 +1090,47 @@ mod tests {
         .expect("boot against a current schema")
     }
 
+    /// A store on the same journal whose hydration bounds are the caller's.
+    ///
+    /// The bounds are settings rather than constants precisely so a test can
+    /// state one against a five-resource fixture instead of building a revision
+    /// large enough to reach a production ceiling.
+    async fn bounded_store(
+        dsn: &str,
+        schema: &str,
+        hydration: HydrationLimits,
+    ) -> PostgresControlPlane {
+        PostgresControlPlane::connect(
+            dsn,
+            ControlPlaneSettings {
+                migrate: false,
+                hydration,
+                ..settings(schema)
+            },
+        )
+        .await
+        .expect("boot against a current schema")
+    }
+
     impl PostgresControlPlane {
+        /// Corrupt the journal the way a restored backup or a manual `UPDATE`
+        /// would: out of band, behind the store's back. Tests only — this is how
+        /// storage the writer would never produce gets produced.
+        async fn corrupt_with(&self, statement: &str) {
+            let sql = statement.to_owned();
+            self.run(move |client| {
+                let sql = sql.clone();
+                Box::pin(async move {
+                    client
+                        .batch_execute(&sql)
+                        .await
+                        .map_err(|error| unavailable("corrupt the journal", &error))
+                })
+            })
+            .await
+            .expect("the corrupting statement itself must succeed");
+        }
+
         async fn count(&self, table: &str) -> i64 {
             let sql = format!("SELECT count(*) FROM {table}");
             self.run(move |client| {
@@ -1808,6 +1682,610 @@ mod tests {
                 ControlPlaneError::Unavailable { .. } | ControlPlaneError::Denied { .. }
             ),
             "{error:?}"
+        );
+    }
+
+    /// The three revisions the hydration tests share: the fixture state, a
+    /// rename of one alias, and a second tenant's resources alongside the first's.
+    ///
+    /// Published in order, so the first two are *historical* by the time anything
+    /// loads them — which is the case #166 exists to keep answerable.
+    async fn three_revisions(
+        store: &PostgresControlPlane,
+    ) -> (RevisionManifest, RevisionManifest, RevisionManifest) {
+        let first = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "first", state()))
+            .await
+            .expect("first publication");
+        let second = store
+            .publish_revision(candidate(
+                ExpectedRevision::Exactly(first.id),
+                "second",
+                state_with_renamed_alias(),
+            ))
+            .await
+            .expect("second publication");
+        let third = store
+            .publish_revision(candidate(
+                ExpectedRevision::Exactly(second.id),
+                "third",
+                state_with_second_tenant(),
+            ))
+            .await
+            .expect("third publication");
+        (first, second, third)
+    }
+
+    #[tokio::test]
+    async fn a_historical_revision_hydrates_as_the_state_it_published() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let (first, second, third) = three_revisions(&store).await;
+
+        // Two newer commits later, the oldest revision is still the value it was
+        // published as — not a diff to be applied, and not a state the newer
+        // revisions edited.
+        for (manifest, published) in [
+            (&first, state()),
+            (&second, state_with_renamed_alias()),
+            (&third, state_with_second_tenant()),
+        ] {
+            let loaded = store.load_revision(manifest.id).await.expect("hydrate");
+            assert_eq!(loaded.state(), &published);
+            assert_eq!(loaded.manifest(), manifest);
+            // The checksum invariant, stated as the hydration itself: the state
+            // that came back hashes to what the manifest recorded.
+            assert_eq!(
+                loaded.state().checksum().expect("canonical"),
+                manifest.checksum
+            );
+            assert_eq!(loaded.manifest().entries.len(), loaded.state().len());
+        }
+
+        // Hydration is repeatable, because a revision is immutable: the same read
+        // twice is the same value, byte for byte.
+        let once = store.load_revision(first.id).await.expect("hydrate");
+        let twice = store.load_revision(first.id).await.expect("hydrate");
+        assert_eq!(once.state(), twice.state());
+        assert_eq!(once.manifest(), twice.manifest());
+    }
+
+    #[tokio::test]
+    async fn two_revisions_share_immutable_resources_without_sharing_a_value() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let (first, second, _) = three_revisions(&store).await;
+
+        // The tenant, project, credential, and catalogue are one row each,
+        // pinned by every revision that names them; only the alias was rewritten,
+        // and the second tenant's three resources are new.
+        assert_eq!(
+            store.count("axond_cp_resource_version").await,
+            i64::try_from(DESIRED_STATE_RESOURCES + 1 + 3).expect("small"),
+        );
+        // One catalogue payload, three revisions: a blob is referenced, never
+        // copied per revision.
+        assert_eq!(store.count("axond_cp_blob").await, 1);
+        assert_eq!(store.count("axond_cp_revision_blob").await, 3);
+
+        let older = store.load_revision(first.id).await.expect("hydrate");
+        let newer = store.load_revision(second.id).await.expect("hydrate");
+
+        // The shared credential hydrates as an equal value in both revisions,
+        // and each revision holds its own alias version. Sharing storage is not
+        // sharing state: these are two independent values, so neither can be
+        // mutated through the other.
+        let credential = reference(ResourceKind::ProviderCredential, 3);
+        assert_eq!(
+            older.state().get(&credential),
+            newer.state().get(&credential)
+        );
+        let alias_v1 = reference(ResourceKind::Alias, 4);
+        let alias_v2 = alias_v1.at(ResourceVersionNumber::FIRST.next());
+        assert!(older.state().get(&alias_v1).is_some());
+        assert!(older.state().get(&alias_v2).is_none());
+        assert!(newer.state().get(&alias_v2).is_some());
+        assert!(newer.state().get(&alias_v1).is_none());
+        assert_ne!(older.state(), newer.state());
+
+        // And the shared blob is the same reference in both, by digest and size.
+        let blobs: Vec<_> = older.state().blobs().collect();
+        assert_eq!(blobs, newer.state().blobs().collect::<Vec<_>>());
+        assert_eq!(blobs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_desired_revision_and_its_hydration_are_one_read() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        // No publication is an empty answer, not an error: a cold deployment has
+        // nothing desired yet.
+        assert!(
+            store
+                .load_desired_revision()
+                .await
+                .expect("an unpublished journal is not a failure")
+                .is_none()
+        );
+
+        let (_, _, third) = three_revisions(&store).await;
+        let desired = store
+            .load_desired_revision()
+            .await
+            .expect("hydrate the head")
+            .expect("a head exists");
+        assert_eq!(desired.manifest(), &third);
+        assert_eq!(desired.state(), &state_with_second_tenant());
+
+        // The oracle answers the same question the same way through the default
+        // implementation, so #142 reads one seam rather than two.
+        let oracle = InMemoryControlPlane::new();
+        assert!(
+            oracle
+                .load_desired_revision()
+                .await
+                .expect("empty")
+                .is_none()
+        );
+        let published = oracle
+            .publish_revision(candidate(ExpectedRevision::Empty, "first", state()))
+            .await
+            .expect("publication");
+        let loaded = oracle
+            .load_desired_revision()
+            .await
+            .expect("hydrate the head")
+            .expect("a head exists");
+        assert_eq!(loaded.manifest(), &published);
+        assert_eq!(loaded.state(), &state());
+    }
+
+    #[tokio::test]
+    async fn a_manifest_reference_whose_version_is_gone_is_named_not_dropped() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let (first, _, _) = three_revisions(&store).await;
+
+        // A restored backup that lost a row, reproduced exactly: the referential
+        // integrity the writer relies on is dropped, and then the row is.
+        let project = reference(ResourceKind::Project, 2);
+        store
+            .corrupt_with(
+                "DO $$ DECLARE name text; BEGIN \
+                 SELECT conname INTO name FROM pg_constraint \
+                 WHERE conrelid = 'axond_cp_revision_entry'::regclass AND contype = 'f' \
+                 AND conname LIKE '%resource%'; \
+                 EXECUTE format('ALTER TABLE axond_cp_revision_entry DROP CONSTRAINT %I', name); \
+                 END $$;",
+            )
+            .await;
+        store
+            .corrupt_with(&format!(
+                "DELETE FROM axond_cp_resource_version WHERE resource_id = '{}'",
+                project.id
+            ))
+            .await;
+
+        // A shorter manifest would hydrate, and then fail its checksum for
+        // reasons that name no row. The reference is named instead.
+        for error in [
+            store
+                .load_manifest(first.id)
+                .await
+                .expect_err("a manifest missing a version is not a manifest"),
+            store
+                .load_revision(first.id)
+                .await
+                .expect_err("a revision missing a version is not hydratable"),
+        ] {
+            assert_eq!(error.category(), FailureCategory::Corrupt);
+            let ControlPlaneError::Corrupt { source, .. } = &error else {
+                panic!("expected corruption, got {error:?}");
+            };
+            assert_eq!(
+                **source,
+                IntegrityError::MissingResource { reference: project },
+                "{error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dependency_edge_that_leaves_the_revision_is_refused() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let (first, _, _) = three_revisions(&store).await;
+
+        // An edge from the first revision's alias to the *second* revision's
+        // alias version: both rows exist, so referential integrity is satisfied,
+        // and the reference still leaves the revision that names it.
+        let alias = reference(ResourceKind::Alias, 4);
+        store
+            .corrupt_with(&format!(
+                "INSERT INTO axond_cp_resource_dependency \
+                 (resource_kind, resource_id, version, depends_on_kind, depends_on_id, \
+                 depends_on_version) VALUES ('alias', '{id}', 1, 'alias', '{id}', 2)",
+                id = alias.id
+            ))
+            .await;
+
+        let error = store
+            .load_revision(first.id)
+            .await
+            .expect_err("a reference that leaves the revision is not hydratable");
+        let ControlPlaneError::Corrupt { source, .. } = &error else {
+            panic!("expected corruption, got {error:?}");
+        };
+        assert!(
+            matches!(
+                **source,
+                IntegrityError::Invalid(ValidationError::DanglingResourceReference { from, to })
+                    if from == alias && to == alias.at(ResourceVersionNumber::FIRST.next())
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edge_across_a_tenant_boundary_is_refused_by_the_reference_layer() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let (_, _, third) = three_revisions(&store).await;
+
+        // One tenant's alias made to depend on another tenant's credential.
+        // Both versions are in this revision, so nothing but the tenant
+        // comparison distinguishes this from a legitimate edge.
+        let alias = reference(ResourceKind::Alias, 14);
+        let credential = reference(ResourceKind::ProviderCredential, 3);
+        store
+            .corrupt_with(&format!(
+                "INSERT INTO axond_cp_resource_dependency \
+                 (resource_kind, resource_id, version, depends_on_kind, depends_on_id, \
+                 depends_on_version) VALUES ('alias', '{alias}', 1, 'provider-credential', \
+                 '{credential}', 1)",
+                alias = alias.id,
+                credential = credential.id
+            ))
+            .await;
+
+        let error = store
+            .load_revision(third.id)
+            .await
+            .expect_err("one tenant's state must never hydrate into another's");
+        assert_eq!(error.category(), FailureCategory::Corrupt);
+        let ControlPlaneError::Corrupt { source, .. } = &error else {
+            panic!("expected corruption, got {error:?}");
+        };
+        assert!(
+            matches!(
+                **source,
+                IntegrityError::Invalid(ValidationError::CrossTenantReference { from, to })
+                    if from == alias && to == credential
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deployment_scoped_version_may_not_depend_on_one_tenants_state() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let (first, _, _) = three_revisions(&store).await;
+
+        // The catalogue is deployment-scoped: shared by every tenant. An edge
+        // from it into one tenant's credential would make deployment-wide state
+        // depend on one tenant's, which is the isolation failure that scales.
+        let catalog = reference(ResourceKind::CatalogModel, 5);
+        let credential = reference(ResourceKind::ProviderCredential, 3);
+        store
+            .corrupt_with(&format!(
+                "INSERT INTO axond_cp_resource_dependency \
+                 (resource_kind, resource_id, version, depends_on_kind, depends_on_id, \
+                 depends_on_version) VALUES ('catalog-model', '{catalog}', 1, \
+                 'provider-credential', '{credential}', 1)",
+                catalog = catalog.id,
+                credential = credential.id
+            ))
+            .await;
+
+        let error = store
+            .load_revision(first.id)
+            .await
+            .expect_err("deployment-wide state must not depend on one tenant's");
+        let ControlPlaneError::Corrupt { source, .. } = &error else {
+            panic!("expected corruption, got {error:?}");
+        };
+        assert!(
+            matches!(
+                **source,
+                IntegrityError::Invalid(ValidationError::TenantScopedDependency { from, to })
+                    if from == catalog && to == credential
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_state_checksum_that_no_longer_matches_refuses_the_revision() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let (first, _, _) = three_revisions(&store).await;
+
+        // A revision row made to claim a different state's checksum: the rows
+        // are individually well-formed, and the whole no longer adds up.
+        let foreign = state_with_renamed_alias().checksum().expect("canonical");
+        store
+            .corrupt_with(&format!(
+                "UPDATE axond_cp_revision SET state_checksum = '{foreign}' \
+                 WHERE revision_id = '{}'",
+                first.id
+            ))
+            .await;
+
+        let error = store
+            .load_revision(first.id)
+            .await
+            .expect_err("a state that hashes to something else is not the state");
+        let ControlPlaneError::Corrupt { source, .. } = &error else {
+            panic!("expected corruption, got {error:?}");
+        };
+        assert!(
+            matches!(
+                **source,
+                IntegrityError::ChecksumMismatch { expected, .. } if expected == foreign
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resource_whose_content_checksum_no_longer_matches_is_refused() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let (first, _, _) = three_revisions(&store).await;
+
+        // A slug edited in place. Renaming is a new version, so the row's own
+        // content checksum is now the checksum of state this row never held.
+        let project = reference(ResourceKind::Project, 2);
+        store
+            .corrupt_with(&format!(
+                "UPDATE axond_cp_resource_version SET slug = 'edited' \
+                 WHERE resource_id = '{}'",
+                project.id
+            ))
+            .await;
+
+        let error = store
+            .load_revision(first.id)
+            .await
+            .expect_err("a resource that is not its own content checksum is not hydratable");
+        let ControlPlaneError::Corrupt { source, .. } = &error else {
+            panic!("expected corruption, got {error:?}");
+        };
+        assert!(
+            matches!(
+                **source,
+                IntegrityError::ContentMismatch { reference, .. } if reference == project
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_that_cannot_be_decoded_is_corruption_and_not_an_outage() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let (first, _, _) = three_revisions(&store).await;
+
+        let project = reference(ResourceKind::Project, 2);
+        store
+            .corrupt_with(&format!(
+                "UPDATE axond_cp_resource_version SET body_inline = '\\xdeadbeef'::bytea \
+                 WHERE resource_id = '{}'",
+                project.id
+            ))
+            .await;
+
+        // The manifest does not read bodies, so it still loads: corruption is
+        // reported by the read that actually touches the corrupt column, and
+        // hydration is that read.
+        store
+            .load_manifest(first.id)
+            .await
+            .expect("a manifest hydrates no body");
+        let error = store
+            .load_revision(first.id)
+            .await
+            .expect_err("a body this build cannot decode is not hydratable");
+        assert_eq!(error.category(), FailureCategory::Corrupt);
+        assert!(!error.retryable(), "corruption is not cleared by retrying");
+        let ControlPlaneError::Corrupt { source, .. } = &error else {
+            panic!("expected corruption, got {error:?}");
+        };
+        assert!(
+            matches!(**source, IntegrityError::Unreadable { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_written_by_a_serializer_this_build_does_not_read_is_refused() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let (first, _, _) = three_revisions(&store).await;
+
+        store
+            .corrupt_with(
+                "UPDATE axond_cp_resource_version SET serializer = 'axond.desired-state.v99'",
+            )
+            .await;
+
+        let error = store
+            .load_revision(first.id)
+            .await
+            .expect_err("a row this build cannot read is not hydratable");
+        assert_eq!(error.category(), FailureCategory::Corrupt);
+        let ControlPlaneError::Corrupt { source, .. } = &error else {
+            panic!("expected corruption, got {error:?}");
+        };
+        assert!(
+            matches!(**source, IntegrityError::Unreadable { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_version_number_the_domain_cannot_hold_is_refused() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let (first, _, _) = three_revisions(&store).await;
+
+        // Version numbers start at one, and the DDL says so. This is what a
+        // journal looks like after someone removed that guarantee and wrote a
+        // zero: a manifest entry naming a version the domain cannot represent.
+        let alias = reference(ResourceKind::Alias, 4);
+        store
+            .corrupt_with(
+                "DO $$ DECLARE name text; BEGIN \
+                 SELECT conname INTO name FROM pg_constraint \
+                 WHERE conrelid = 'axond_cp_revision_entry'::regclass AND contype = 'f' \
+                 AND conname LIKE '%resource%'; \
+                 EXECUTE format('ALTER TABLE axond_cp_revision_entry DROP CONSTRAINT %I', name); \
+                 END $$;",
+            )
+            .await;
+        store
+            .corrupt_with(&format!(
+                "UPDATE axond_cp_revision_entry SET version = 0 \
+                 WHERE resource_id = '{}' AND revision_id = '{revision}'",
+                alias.id,
+                revision = first.id
+            ))
+            .await;
+
+        let error = store
+            .load_revision(first.id)
+            .await
+            .expect_err("a version number that is not one is not a version number");
+        assert_eq!(error.category(), FailureCategory::Corrupt);
+        let ControlPlaneError::Corrupt { source, .. } = &error else {
+            panic!("expected corruption, got {error:?}");
+        };
+        let IntegrityError::Unreadable { detail } = &**source else {
+            panic!("expected an unreadable row, got {error:?}");
+        };
+        assert!(detail.contains("resource version 0"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn a_revision_larger_than_the_bound_is_refused_whole() {
+        let Some((store, dsn, schema)) = journal().await else {
+            return;
+        };
+        let (first, _, _) = three_revisions(&store).await;
+
+        // Each bound, stated against the same five-resource revision. Every one
+        // of them is a refusal: not a truncated manifest, not the resources that
+        // fit, and not a candidate missing its blob.
+        let cases: [(HydrationLimits, &str); 5] = [
+            (
+                HydrationLimits {
+                    max_entries: 2,
+                    ..HydrationLimits::default()
+                },
+                "resource versions",
+            ),
+            (
+                HydrationLimits {
+                    max_blobs: 0,
+                    ..HydrationLimits::default()
+                },
+                "blobs",
+            ),
+            (
+                HydrationLimits {
+                    max_blob_bytes: 8,
+                    ..HydrationLimits::default()
+                },
+                "bytes",
+            ),
+            (
+                HydrationLimits {
+                    max_dependency_edges: 1,
+                    ..HydrationLimits::default()
+                },
+                "dependency edges",
+            ),
+            (
+                HydrationLimits {
+                    max_inline_body_bytes: 4,
+                    ..HydrationLimits::default()
+                },
+                "inline body",
+            ),
+        ];
+        for (limits, expected) in cases {
+            let bounded = bounded_store(&dsn, &schema, limits).await;
+            let error = bounded
+                .load_revision(first.id)
+                .await
+                .expect_err("a revision past a bound must not hydrate");
+            assert_eq!(error.category(), FailureCategory::Denied);
+            assert!(!error.retryable(), "a bound is not cleared by retrying");
+            assert!(
+                matches!(error, ControlPlaneError::TooLarge { revision, .. } if revision == first.id),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+
+        // The candidate bound is the last line: a state that hydrated is still
+        // refused if the value itself is larger than this build returns.
+        let bounded = bounded_store(
+            &dsn,
+            &schema,
+            HydrationLimits {
+                max_state_bytes: 64,
+                ..HydrationLimits::default()
+            },
+        )
+        .await;
+        let error = bounded
+            .load_revision(first.id)
+            .await
+            .expect_err("a candidate past the bound must not be returned");
+        assert!(
+            matches!(
+                error,
+                ControlPlaneError::TooLarge {
+                    limit: HydrationLimit::StateBytes { .. },
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+
+        // Nothing above changed the journal, and the store whose bounds fit
+        // still hydrates the same revision it always did.
+        assert_eq!(
+            store
+                .load_revision(first.id)
+                .await
+                .expect("hydrate")
+                .state(),
+            &state()
         );
     }
 

@@ -176,6 +176,51 @@ pub(crate) fn state_with_renamed_alias() -> DesiredState {
     state
 }
 
+/// A second tenant's credential, for the isolation cases: two tenants' resources
+/// coexist in one revision, and nothing in either may reference the other.
+pub(crate) fn other_tenant_credential() -> ResourceVersion {
+    credential(&tenant_id(11), 13, "secondary")
+}
+
+/// A valid state holding two tenants' resources, with no reference between them.
+///
+/// The starting point for the isolation tests: a cross-tenant edge is then
+/// something storage is *made* to hold, so what is being tested is hydration
+/// refusing it rather than the domain refusing to build it.
+pub(crate) fn state_with_second_tenant() -> DesiredState {
+    let other = other_tenant_credential();
+    let mut state = state();
+    state
+        .insert(tenant(11, "globex"))
+        .and_then(|state| state.insert(other.clone()))
+        .and_then(|state| state.insert(alias(&tenant_id(11), 14, "steady", &[other.reference])))
+        .expect("two tenants that reference nothing of each other's are valid");
+    state
+}
+
+/// A chain of `depth` aliases, each depending on the next.
+///
+/// Nesting a hydration bound can be stated against: the chain is linear, so its
+/// depth is `depth - 1` edges below the first alias, and no other fixture
+/// property varies with it.
+pub(crate) fn deep_chain_state(depth: u64) -> DesiredState {
+    let owner = tenant_id(1);
+    let mut state = DesiredState::new();
+    state.insert(tenant(1, "acme")).expect("a fresh state");
+    for step in 0..depth {
+        let seed = 100 + step;
+        let depends_on: Vec<ResourceRef> = if step + 1 < depth {
+            vec![reference(ResourceKind::Alias, seed + 1)]
+        } else {
+            Vec::new()
+        };
+        state
+            .insert(alias(&owner, seed, &format!("step-{step}"), &depends_on))
+            .expect("distinct references");
+    }
+    state
+}
+
 pub(crate) fn actor() -> Actor {
     Actor::Human {
         issuer: "https://idp.example".to_owned(),
