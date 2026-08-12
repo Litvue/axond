@@ -3,9 +3,15 @@ services:
     # Pull-first for evaluators. Development and CI add docker-compose.build.yml
     # to build the checked-out tree instead.
     image: ${AXOND_IMAGE:-ghcr.io/litvue/axond:0.3.12} # x-release-please-version
-    # No platform pin: the release image is a linux/amd64 + linux/arm64 index and
-    # the Dockerfile builds either natively, so an ARM host runs a native image
-    # instead of an emulated one. Set `platform:` only to force an architecture.
+    # The pinned tag above is still an amd64-only release, so the default keeps
+    # ARM hosts working through emulation instead of failing to pull. Once a
+    # multi-architecture tag is selected — a bumped default, or AXOND_IMAGE —
+    # `AXOND_PLATFORM=` (set, empty) drops the pin so Docker resolves the native
+    # child from the image index, and an explicit `linux/arm64`/`linux/amd64`
+    # forces one platform. ops/check-release-config.py requires this default to
+    # become `${AXOND_PLATFORM-}` as soon as the pinned tag is multi-arch, so the
+    # fallback cannot outlive the release that makes it unnecessary.
+    platform: ${AXOND_PLATFORM-linux/amd64}
     ports:
       - "${AXOND_QUICKSTART_HOST_PORT:-127.0.0.1:8080}:8080"
     environment:

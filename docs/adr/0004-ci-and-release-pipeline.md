@@ -117,6 +117,14 @@ Keyless signatures remain image-only. Archives are covered by their SHA-256
 sidecar and GitHub provenance/SBOM attestations, as before; signing archives
 would be a separate decision with its own verification story for installers.
 
+The Compose quickstart pins a release tag, so it cannot become multi-architecture
+before the release does. Its `platform:` default therefore stays
+`linux/amd64` — overridable through `AXOND_PLATFORM` — while the pinned tag is an
+amd64-only release, so an ARM host keeps running it under emulation instead of
+failing to pull an image with no ARM child. The validator below flips that
+requirement the moment the pinned tag moves past the last amd64-only version, so
+the fallback cannot outlive its reason.
+
 Because the release matrix is only exercised for real at a tag,
 `ops/check-release-config.py` asserts its shape on every change: the published
 targets and archive extensions, the image platforms, that ARM lanes run on ARM

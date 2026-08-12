@@ -38,6 +38,15 @@ UNIX_INSTALLER_TARGETS = {
 }
 WINDOWS_INSTALLER_TARGET = "x86_64-pc-windows-msvc"
 IMAGE_PLATFORMS = {"linux/amd64", "linux/arm64"}
+# The last release published as a single `linux/amd64` image. The Compose
+# quickstart pins a release tag, so while that tag is at or below this version it
+# must keep an explicit `linux/amd64` default: dropping the pin would leave ARM
+# hosts unable to pull an image that has no ARM child yet. The moment
+# release-please bumps the pinned tag past it, the fallback is wrong and this
+# check demands the unpinned form, so the transition cannot be forgotten.
+LAST_AMD64_ONLY_VERSION = (0, 3, 12)
+AMD64_FALLBACK_PLATFORM = "platform: ${AXOND_PLATFORM-linux/amd64}"
+NATIVE_PLATFORM = "platform: ${AXOND_PLATFORM-}"
 # Documentation that must name every target and platform an operator can pick.
 PLATFORM_DOCS = ("docs/installation.md", "docs/compatibility.md")
 
@@ -214,6 +223,44 @@ def check_release_success(text: str) -> list[str]:
     return failures
 
 
+def check_compose_platform() -> list[str]:
+    """The quickstart's platform default must match what its pinned tag can serve."""
+    failures: list[str] = []
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    pinned = re.search(r"image: \$\{AXOND_IMAGE:-ghcr\.io/litvue/axond:([0-9.]+)\}", compose)
+    if pinned is None:
+        return ["docker-compose.yml: could not read the pinned quickstart image tag"]
+    version = tuple(int(part) for part in pinned.group(1).split("."))
+    multi_arch_tag = version > LAST_AMD64_ONLY_VERSION
+    wanted = NATIVE_PLATFORM if multi_arch_tag else AMD64_FALLBACK_PLATFORM
+    if wanted not in compose:
+        if multi_arch_tag:
+            failures.append(
+                f"docker-compose.yml: the pinned tag {pinned.group(1)} is a "
+                "multi-architecture release, so the amd64 emulation fallback is "
+                f"obsolete; use `{NATIVE_PLATFORM}` so ARM hosts resolve natively"
+            )
+        else:
+            failures.append(
+                f"docker-compose.yml: the pinned tag {pinned.group(1)} is "
+                "amd64-only, so the quickstart must keep "
+                f"`{AMD64_FALLBACK_PLATFORM}` for ARM hosts to run it at all"
+            )
+    # A source build is never limited by the last release's platforms.
+    build_overlay = (ROOT / "docker-compose.build.yml").read_text(encoding="utf-8")
+    if NATIVE_PLATFORM not in build_overlay:
+        failures.append(
+            f"docker-compose.build.yml: source builds must use `{NATIVE_PLATFORM}`, "
+            "not the quickstart's amd64 fallback"
+        )
+    compose_docs = (ROOT / "docs/deployment/docker-compose.md").read_text(encoding="utf-8")
+    if "AXOND_PLATFORM" not in compose_docs:
+        failures.append(
+            "docs/deployment/docker-compose.md: AXOND_PLATFORM is not documented"
+        )
+    return failures
+
+
 def check_no_latest_tag(text: str) -> list[str]:
     failures: list[str] = []
     if "flavor: latest=false" not in text:
@@ -280,6 +327,7 @@ def main() -> int:
     failures.extend(check_image_matrix(text))
     failures.extend(check_image_gates(text))
     failures.extend(check_release_success(text))
+    failures.extend(check_compose_platform())
     failures.extend(check_no_latest_tag(text))
     failures.extend(check_documented_matrix())
     if failures:

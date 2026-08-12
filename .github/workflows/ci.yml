@@ -158,7 +158,7 @@ jobs:
           python3 ops/check-docs.py
           python3 ops/check-release-config.py
           shellcheck install.sh ops/publish-image-index.sh \
-            ops/verify-image-evidence.sh
+            ops/verify-image-evidence.sh ops/check-compose-platform.sh
           # Every released Unix target must resolve to its own archive, and a
           # target outside the release matrix must be refused rather than
           # producing a download URL for an asset that was never published.
@@ -207,6 +207,7 @@ jobs:
             docker compose --env-file ops/compose/env.example \
             -f docker-compose.yml -f docker-compose.stateful.yml \
             --profile stateful config --quiet
+          bash ops/check-compose-platform.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
