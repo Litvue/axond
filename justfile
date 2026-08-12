@@ -105,6 +105,12 @@ fuzz-all seconds="60":
 soak:
     AXOND_SOAK=1 cargo test --locked --all-features --test soak -- --nocapture
 
+# The heavy capacity profiles, writing result artifacts to target/capacity/heavy.
+# The reduced tier of the same driver runs in `just test` (ADR 0033).
+# One tier at a time: two tiers offering load at once measure each other.
+capacity:
+    AXOND_CAPACITY=1 cargo test --locked --all-features --test capacity -- --nocapture --test-threads=1
+
 # Run the gateway against ./axond.toml (copy axond.example.toml first).
 run:
     cargo run -p axond

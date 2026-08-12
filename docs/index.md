@@ -63,6 +63,8 @@ and operate it.
   decision tree.
 - [Upgrades and rollback](./operations/upgrades.md) — compatibility policy,
   migration ordering, mixed-version rules, and rollback limits.
+- [Capacity qualification](./operations/capacity.md) — per-replica envelopes,
+  candidate SLOs, the committed load profiles, and what a capacity run gates on.
 - [Usage schema](./usage-schema.md) — durable row contract and delivery
   guarantees.
 - [Control-plane revision journal](./operations/control-plane-journal.md) — the
