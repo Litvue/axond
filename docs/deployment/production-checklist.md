@@ -12,7 +12,7 @@ read the maintainer-facing
 
 - [ ] Release archive or OCI image is pinned to an explicit version and digest.
 - [ ] SHA-256, GitHub provenance, SBOM attestation, and cosign signature are verified.
-- [ ] Runtime nodes support the selected artifact architecture; the OCI image is currently `linux/amd64`.
+- [ ] Runtime nodes support the selected artifact architecture; the OCI image index covers `linux/amd64` and `linux/arm64`, and archives cover the [supported target matrix](../compatibility.md#supported-platforms).
 - [ ] No deployment depends on a `latest` tag.
 - [ ] Rollback artifact and its compatible configuration are retained.
 

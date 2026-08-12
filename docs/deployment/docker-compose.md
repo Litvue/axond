@@ -9,8 +9,38 @@ The repository ships three composable files:
 | `docker-compose.stateful.yml` | Redis/Postgres dependency and health-gating overlay. |
 
 Configuration lives in `ops/compose/*.toml`; secrets and DSNs live in `.env`.
-The service explicitly selects `linux/amd64`, matching the current release
-image and allowing Docker Desktop to emulate the source build on Apple Silicon.
+
+## Architecture selection
+
+The quickstart's pinned image tag is still an amd64-only release, so
+`platform:` defaults to `linux/amd64` and an ARM host runs it through emulation
+instead of failing to pull. Multi-architecture images are published from the
+next release onward ([supported
+platforms](../compatibility.md#supported-platforms)), and `AXOND_PLATFORM`
+selects what to do with them:
+
+| `AXOND_PLATFORM` | Effect |
+| --- | --- |
+| unset | `linux/amd64` — the documented fallback for the amd64-only pinned tag |
+| set and empty (`AXOND_PLATFORM=`) | No pin: Docker resolves the native child of a multi-architecture image |
+| `linux/arm64` or `linux/amd64` | Forces that platform, emulating it if the host differs |
+
+So an ARM host on a multi-architecture tag runs natively with:
+
+```bash
+AXOND_IMAGE=ghcr.io/litvue/axond@sha256:<verified-index-digest> \
+  AXOND_PLATFORM= docker compose up -d
+```
+
+The source-build overlay (`docker-compose.build.yml`) has no fallback to keep: it
+builds natively on either architecture unless `AXOND_PLATFORM` forces one.
+
+The amd64 fallback is temporary by construction. `ops/check-release-config.py`
+*requires* it while the pinned tag is amd64-only, and once that tag publishes an
+index it prints a note asking for the default to be dropped — a note rather than
+a failure, because release-please bumps the tag inside its own release pull
+request. Dropping it is a post-release step in
+[releasing.md](../maintainers/releasing.md).
 
 ## Pull-first Tier 0
 

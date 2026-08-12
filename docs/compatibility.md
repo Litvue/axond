@@ -79,6 +79,53 @@ Compatibility is enforced by CI, not asserted: a required lane drives a real
 provider account and no network
 ([ADR 0014](./adr/0014-compatibility-and-soak-harness.md)).
 
+## Supported platforms
+
+Released artifacts cover these targets. Anything else builds from source; a
+target is added by a release, never by an unpublished build.
+
+| Platform | Rust target | Release archive | OCI platform |
+| --- | --- | --- | --- |
+| Linux x86-64, glibc | `x86_64-unknown-linux-gnu` | `.tar.gz` | — |
+| Linux x86-64, static musl | `x86_64-unknown-linux-musl` | `.tar.gz` | `linux/amd64` |
+| Linux ARM64, glibc | `aarch64-unknown-linux-gnu` | `.tar.gz` | — |
+| Linux ARM64, static musl | `aarch64-unknown-linux-musl` | `.tar.gz` | `linux/arm64` |
+| macOS Apple Silicon | `aarch64-apple-darwin` | `.tar.gz` | — |
+| Windows x86-64 | `x86_64-pc-windows-msvc` | `.zip` | — |
+
+Archives are named `axond-<version>-<target><extension>`. Every target in this
+table has a `binary-smoke` lane on a runner of its own platform.
+
+`ghcr.io/litvue/axond:<version>` and `:sha-<short>` resolve to a
+multi-architecture index containing `linux/amd64` and `linux/arm64`, so one
+pinned digest deploys on either architecture. That index is published from the
+next release onward; every release up to and including the current quickstart tag
+published a single `linux/amd64` image, and ARM hosts run those under emulation
+([architecture
+selection](./deployment/docker-compose.md#architecture-selection)). Single-platform references remain
+available as `:<version>-amd64` and `:<version>-arm64`. There is no `latest`
+tag, and adding one is not planned.
+
+Every archive carries a SHA-256 sidecar, an SPDX SBOM, and provenance/SBOM
+attestations. Every published image manifest — each single-platform image and
+the multi-architecture index — is smoke-tested on its own architecture before it
+is signed, and carries a keyless signature and a provenance attestation. The
+index reaches its `<version>` and `sha-<short>` tags only after being booted by
+digest on both architectures.
+
+SBOM attestations are per-architecture, on the single-platform children: an
+index has no filesystem of its own, so its SBOM would only ever be one child's
+relabelled. To audit what you run, resolve the child digest for your platform
+from the index and verify that digest's SBOM attestation, or use the
+per-architecture SPDX asset on the release.
+
+Archive signing is deliberately not part of this: archives are verified through
+their checksum and GitHub attestations, and keyless signatures are an image-only
+mechanism here.
+
+Dropping a supported platform is a minor-release, changelog-listed act under the
+same rules as the config surface below.
+
 ## Stability promises
 
 ### The config surface
@@ -255,7 +302,7 @@ claim here cannot drift from what CI and the release actually do:
 | Matrix | Owner (source of truth) | Exercised by |
 | --- | --- | --- |
 | Supported versions for fixes | [`SECURITY.md`](../SECURITY.md) — latest `0.x` release plus the immediately previous minor, security fixes only | the release/backport process |
-| Release targets | the `binaries` matrix in [`release-please.yml`](../.github/workflows/release-please.yml): `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`, plus the `linux/amd64` image | the release workflow; on every change the `binary-smoke` matrix boots each target on a runner of its own platform, the musl `static-binary` lane adds the Tier 0 network-denial gate, and `docker-smoke` covers the image |
+| Release targets | the `binaries` matrix in [`release-please.yml`](../.github/workflows/release-please.yml), listed under [supported platforms](#supported-platforms) above: six archive targets plus the `linux/amd64` + `linux/arm64` image index | the release workflow; on every change the `binary-smoke` matrix boots each target on a runner of its own platform, the musl `static-binary` lane adds the Tier 0 network-denial gate, and `docker-smoke` covers the image |
 | Provider-SDK compatibility | [`tests/compat/requirements.in`](../tests/compat/requirements.in) (exact pins, hash-locked in `requirements.txt`) | the required `sdk-compat` lane against committed fixtures ([ADR 0014](./adr/0014-compatibility-and-soak-harness.md)) |
 | Rust floor and published API | `rust-version` in [`Cargo.toml`](../Cargo.toml); [`ops/api-compat-overrides.toml`](../ops/api-compat-overrides.toml) for accepted breaks | the required `msrv` and `api-compat` lanes |
 
@@ -271,13 +318,17 @@ and again at the tag, for the exact binary that is archived,
 [`ops/binary-smoke.py`](../ops/binary-smoke.py) asserts that `/healthz` and
 `/readyz` answer unauthenticated, that `/v1/models` requires a gateway key and
 lists the configured alias, that an unknown model is refused as `unknown_model`,
-and that one chat completion completes against a local fixture upstream. Linux
-musl is held to more: [`ops/tier0-gate.sh`](../ops/tier0-gate.sh) boots it inside
-a network namespace that denies egress and DNS, which is why a datastore or
-outbound dependency added to the default path fails there first. That gate is
-Linux-only by construction, so macOS and Windows get the portable subset.
+and that one chat completion completes against a local fixture upstream. Each
+Linux archive runs it on a runner of its own architecture, so an ARM64 archive is
+booted on ARM64 rather than emulated. Linux musl is held to more:
+[`ops/tier0-gate.sh`](../ops/tier0-gate.sh) boots it inside a network namespace
+that denies egress and DNS, which is why a datastore or outbound dependency added
+to the default path fails there first. That gate is Linux-only by construction,
+so macOS and Windows get the portable subset.
 
 What is *not* covered: the hermetic Tier 0 gate applies to
-`x86_64-unknown-linux-musl` alone, the smoke exercises one buffered
-fixture request rather than streaming or a real provider, and only the Python
-SDKs are exercised end to end.
+`x86_64-unknown-linux-musl` alone on every change — every Linux archive passes
+through it at release time, but there with the namespace treated as best-effort
+([ADR 0018](./adr/0018-tier-0-hermetic-boot-gate.md)) — the smoke exercises one
+buffered fixture request rather than streaming or a real provider, and only the
+Python SDKs are exercised end to end.

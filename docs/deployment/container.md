@@ -1,7 +1,13 @@
 # Container deployment
 
-`ghcr.io/litvue/axond` is a distroless `linux/amd64` image containing the static
-Axond binary. It runs as non-root and contains no shell or package manager.
+`ghcr.io/litvue/axond` is a distroless image containing the static Axond binary,
+published as a multi-architecture index for `linux/amd64` and `linux/arm64`. It
+runs as non-root and contains no shell or package manager.
+
+The index is published from the next release onward; releases up to and including
+the currently pinned quickstart tag publish a single `linux/amd64` image, which
+ARM hosts run under emulation ([architecture
+selection](./docker-compose.md#architecture-selection)).
 
 ## Runtime contract
 
@@ -14,7 +20,7 @@ Axond binary. It runs as non-root and contains no shell or package manager.
 | Writable filesystem | Not required while serving |
 | Public probes | `GET /healthz`, `GET /readyz` |
 | Logs | Structured JSON on stdout/stderr |
-| Architecture | `linux/amd64` |
+| Architecture | `linux/amd64` and `linux/arm64`, selected by the index |
 
 The image ships no config. Mount one read-only and provide every environment
 variable it references:
@@ -40,6 +46,18 @@ attestation, then deploy the digest. Complete commands are in
 
 There is intentionally no `latest` tag. Version and short-SHA tags are
 convenient discovery pointers, not production locks.
+
+The version and short-SHA tags resolve to the multi-architecture index, so the
+digest they name deploys unchanged on both architectures — pin that index digest
+rather than a per-architecture one unless a platform must be forced. When it
+must, `:<version>-amd64` and `:<version>-arm64` name the single-platform images
+directly. Both architectures are booted and probed in the release pipeline,
+natively, from the index digest that ships.
+
+The index digest carries a keyless signature and a provenance attestation. SBOM
+attestations live on the single-platform children, one per architecture, because
+that is where the packages actually are; resolve the child digest for your
+platform to verify the SBOM of what you run.
 
 ## Health and dependency semantics
 

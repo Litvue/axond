@@ -45,6 +45,9 @@ if [ -z "$target" ]; then
     Linux/x86_64|Linux/amd64)
       target="x86_64-unknown-linux-musl"
       ;;
+    Linux/aarch64|Linux/arm64)
+      target="aarch64-unknown-linux-musl"
+      ;;
     Darwin/arm64|Darwin/aarch64)
       target="aarch64-apple-darwin"
       ;;
@@ -55,7 +58,8 @@ if [ -z "$target" ]; then
 fi
 
 case "$target" in
-  x86_64-unknown-linux-gnu|x86_64-unknown-linux-musl|aarch64-apple-darwin)
+  x86_64-unknown-linux-gnu|x86_64-unknown-linux-musl| \
+  aarch64-unknown-linux-gnu|aarch64-unknown-linux-musl|aarch64-apple-darwin)
     ;;
   *)
     fail "unsupported prebuilt target: $target"
@@ -89,10 +93,38 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
-curl --proto '=https' --tlsv1.2 -fLsS \
-  -o "$temp_dir/$asset" "$base_url/$asset"
-curl --proto '=https' --tlsv1.2 -fLsS \
-  -o "$temp_dir/$asset.sha256" "$base_url/$asset.sha256"
+# A release older than a target answers 404, which is worth explaining: ARM64
+# Linux archives only exist from the first release that published them, so an
+# older pinned version on an ARM host must not fail with a bare transfer error.
+# Only a real 404/410 earns that explanation — a proxy, DNS, TLS, or timeout
+# failure must read as a transfer problem, or it would send someone off to change
+# their version or build from source over an outage they should just retry.
+download() {
+  url="$1"
+  dest="$2"
+  missing_message="$3"
+  curl_error="$temp_dir/curl.err"
+  http_code="$(curl --proto '=https' --tlsv1.2 -fLsS \
+    -o "$dest" -w '%{http_code}' "$url" 2>"$curl_error")" && return 0
+  status=$?
+  detail="$(tr -d '\r' <"$curl_error" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  if [ "$status" -eq 22 ]; then
+    case "$http_code" in
+      404|410)
+        fail "$missing_message"
+        ;;
+      *)
+        fail "downloading ${url} failed with HTTP ${http_code:-error}: ${detail}"
+        ;;
+    esac
+  fi
+  fail "downloading ${url} failed before any HTTP status (curl exit ${status}): ${detail}. This is a transfer problem — DNS, proxy, TLS, or a timeout — not a missing file; retry rather than changing AXOND_VERSION or AXOND_TARGET."
+}
+
+download "$base_url/$asset" "$temp_dir/$asset" \
+  "release v${version} has no ${asset}; it may predate prebuilt ${target} archives. Use a newer AXOND_VERSION, another AXOND_TARGET, or build from source: https://github.com/${repo}/releases/tag/v${version}"
+download "$base_url/$asset.sha256" "$temp_dir/$asset.sha256" \
+  "release v${version} does not contain ${asset}.sha256"
 
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "$temp_dir" && sha256sum -c "$asset.sha256")

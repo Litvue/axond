@@ -231,7 +231,8 @@ jobs:
             esac
             if [[ "$GITHUB_REF" == refs/heads/main ]]; then
               for required_path in Dockerfile ops/docker-smoke.sh \
-                ops/binary-smoke.py; do
+                ops/binary-smoke.py ops/publish-image-index.sh \
+                ops/verify-image-evidence.sh; do
                 required_probe="$RUNNER_TEMP/repair-${required_path//\//-}"
                 if gh api --include "/repos/${GITHUB_REPOSITORY}/contents/${required_path}?ref=${tag_name}" >"$required_probe" 2>&1; then
                   echo "$tag_name contains required repair path $required_path"
@@ -239,6 +240,9 @@ jobs:
                   required_status="$(sed -n '1s/^HTTP\/[^ ]* \([0-9][0-9][0-9]\).*/\1/p' "$required_probe")"
                   if [[ "$required_status" == 404 ]]; then
                     echo "$tag_name does not contain required repair path $required_path" >&2
+                    echo "The image lanes publish and verify a multi-architecture index, which this tag's tree cannot do." >&2
+                    echo "Remediation: dispatch this workflow from $tag_name itself (Run workflow → Use workflow from → tags/$tag_name)," >&2
+                    echo "which uses that tag's own definition and scripts. See docs/maintainers/releasing.md, 'Repair an existing tag'." >&2
                   else
                     cat "$required_probe" >&2
                     echo "could not determine whether $tag_name contains $required_path" >&2
@@ -297,6 +301,12 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             archive: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            archive: tar.gz
           - os: macos-14
             target: aarch64-apple-darwin
             archive: tar.gz
@@ -327,7 +337,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+        if: endsWith(matrix.target, '-unknown-linux-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build the release binary
         run: cargo build --release --locked --target ${{ matrix.target }} -p axond
@@ -346,6 +356,30 @@ jobs:
             cd dist
             shasum -a 256 "$asset" > "${asset}.sha256"
           )
+      # Every Linux archive is built on a runner of its own architecture, so the
+      # binary that ships can be booted here rather than only compiled. A musl
+      # archive that turned out dynamically linked is not the artifact the
+      # installer promises, so that is asserted before the boot.
+      - name: Assert the musl binary is statically linked
+        if: endsWith(matrix.target, '-unknown-linux-musl')
+        shell: bash
+        run: |
+          set -euo pipefail
+          file release-bin/axond | grep -Eq 'static-pie linked|statically linked'
+          ! file release-bin/axond | grep -q 'dynamically linked'
+      # The archive that ships is booted and served here, not merely compiled —
+      # which is the reason ARM archives are built on ARM runners. The hermetic
+      # namespace is a CI guarantee, not a release one: AXOND_TIER0_ALLOW_NO_NETNS
+      # keeps boot and the whole serving path asserted while letting a runner that
+      # forbids namespace creation degrade instead of failing a valid release. The
+      # `static-binary` CI lane leaves it unset, so egress denial is still proven
+      # on every change.
+      - name: Smoke the Linux binary that ships
+        if: endsWith(matrix.target, '-unknown-linux-gnu') || endsWith(matrix.target, '-unknown-linux-musl')
+        shell: bash
+        env:
+          AXOND_TIER0_ALLOW_NO_NETNS: "1"
+        run: bash ops/tier0-gate.sh release-bin/axond
       - name: Package the Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
@@ -394,14 +428,30 @@ jobs:
           $assets = @(Get-ChildItem dist -File | ForEach-Object { $_.FullName })
           gh release upload "$env:RELEASE_TAG" @assets --clobber
 
+  # One job per published platform, each on a runner of that architecture: the
+  # image is a static musl build, so a native builder is both faster and more
+  # honest than emulating the other architecture. Each lane publishes its own
+  # single-platform tags (`<version>-<arch>`, `sha-<short>-<arch>`) and carries
+  # the full evidence chain for its own digest; `release-image-index` then joins
+  # the two digests under the plain `<version>` and `sha-<short>` tags.
   release-image:
-    name: Signed OCI image
+    name: Signed OCI image ${{ matrix.platform }}
     needs: release-metadata
     if: >-
       !cancelled() &&
       needs['release-metadata'].result == 'success' &&
       needs['release-metadata'].outputs.release_created == 'true'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux/amd64
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
       packages: write
@@ -411,6 +461,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ needs['release-metadata'].outputs.tag_name }}
       RELEASE_VERSION: ${{ needs['release-metadata'].outputs.version }}
+      IMAGE_ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -429,15 +480,15 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           flavor: latest=false
           tags: |
-            type=raw,value=${{ needs['release-metadata'].outputs.version }}
-            type=raw,value=sha-${{ needs['release-metadata'].outputs.short_sha }}
+            type=raw,value=${{ needs['release-metadata'].outputs.version }}-${{ matrix.arch }}
+            type=raw,value=sha-${{ needs['release-metadata'].outputs.short_sha }}-${{ matrix.arch }}
       - name: Build and publish the image
         id: image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64
+          platforms: ${{ matrix.platform }}
           push: true
           tags: ${{ steps.metadata.outputs.tags }}
           labels: |
@@ -448,13 +499,13 @@ jobs:
           provenance: false
           sbom: false
       - name: Smoke the published image before signing
-        run: bash ops/docker-smoke.sh "${IMAGE_NAME}:${RELEASE_VERSION}"
+        run: bash ops/docker-smoke.sh "${IMAGE_NAME}:${RELEASE_VERSION}-${IMAGE_ARCH}"
       - name: Generate image SBOM
         uses: anchore/sbom-action@v0
         with:
           image: ${{ env.IMAGE_NAME }}@${{ steps.image.outputs.digest }}
           format: spdx-json
-          output-file: axond-image-${{ needs['release-metadata'].outputs.version }}.spdx.json
+          output-file: axond-image-${{ needs['release-metadata'].outputs.version }}-${{ matrix.arch }}.spdx.json
           upload-artifact: false
           upload-release-assets: false
       - name: Attest image provenance
@@ -468,7 +519,7 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.image.outputs.digest }}
-          sbom-path: axond-image-${{ needs['release-metadata'].outputs.version }}.spdx.json
+          sbom-path: axond-image-${{ needs['release-metadata'].outputs.version }}-${{ matrix.arch }}.spdx.json
           push-to-registry: true
       - uses: sigstore/cosign-installer@v3
       - name: Sign the digest keylessly
@@ -477,25 +528,205 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DIGEST: ${{ steps.image.outputs.digest }}
-        run: |
-          set -euo pipefail
-          cosign verify \
-            --certificate-identity-regexp "$SIGNER_IDENTITY" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "${IMAGE_NAME}@${DIGEST}" >/dev/null
-          gh attestation verify "oci://${IMAGE_NAME}@${DIGEST}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --predicate-type https://slsa.dev/provenance/v1 >/dev/null
+          SBOM_PATH: axond-image-${{ needs['release-metadata'].outputs.version }}-${{ matrix.arch }}.spdx.json
+        run: bash ops/verify-image-evidence.sh "${IMAGE_NAME}@${DIGEST}" "$SBOM_PATH"
       - name: Attach image evidence to the release
         env:
           GH_TOKEN: ${{ github.token }}
           DIGEST: ${{ steps.image.outputs.digest }}
         run: |
           set -euo pipefail
-          printf '%s\n' "${IMAGE_NAME}@${DIGEST}" > "axond-image-${RELEASE_VERSION}.digest"
+          printf '%s\n' "${IMAGE_NAME}@${DIGEST}" \
+            > "axond-image-${RELEASE_VERSION}-${IMAGE_ARCH}.digest"
+          gh release upload "$RELEASE_TAG" \
+            "axond-image-${RELEASE_VERSION}-${IMAGE_ARCH}.digest" \
+            "axond-image-${RELEASE_VERSION}-${IMAGE_ARCH}.spdx.json" \
+            --clobber
+
+  # The multi-architecture index is what `<version>` and `sha-<short>` resolve
+  # to, and its digest is the one the release advertises: a digest-pinned
+  # deployment then works on either architecture without the operator choosing a
+  # per-arch reference. The index is assembled from the already-signed child
+  # digests rather than rebuilt, so nothing it points at is unattested.
+  #
+  # It is staged under `sha-<short>-index` first and only promoted to the
+  # operator-facing tags after both architectures have booted it, so the
+  # reference the documentation names never resolves to an index nothing has
+  # started. Signing, provenance, and the release digest asset belong to the
+  # promotion, for the same reason.
+  release-image-index:
+    name: Multi-architecture image index
+    needs:
+      - release-metadata
+      - release-image
+    if: >-
+      !cancelled() &&
+      needs['release-metadata'].result == 'success' &&
+      needs['release-image'].result == 'success' &&
+      needs['release-metadata'].outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+    env:
+      RELEASE_TAG: ${{ needs['release-metadata'].outputs.tag_name }}
+      RELEASE_VERSION: ${{ needs['release-metadata'].outputs.version }}
+      RELEASE_SHORT_SHA: ${{ needs['release-metadata'].outputs.short_sha }}
+      RELEASE_COMMIT_SHA: ${{ needs['release-metadata'].outputs.commit_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs['release-metadata'].outputs.tag_name }}
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/setup-buildx-action@v3
+      # Staging tag only: `<version>` and `sha-<short>` are applied by the
+      # promotion job, after the smoke lanes have booted this digest.
+      - name: Stage and verify the index
+        id: index
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INDEX_TAGS: sha-${{ needs['release-metadata'].outputs.short_sha }}-index
+        run: bash ops/publish-image-index.sh
+
+  # The per-platform lanes smoke the image they built; this smokes the *index*
+  # digest on each architecture, which is the reference the documentation tells
+  # operators to deploy. A wrong child in the index — or a child that only boots
+  # under emulation — fails here rather than in someone's cluster.
+  release-image-index-smoke:
+    name: Index smoke ${{ matrix.platform }}
+    needs:
+      - release-metadata
+      - release-image-index
+    if: >-
+      !cancelled() &&
+      needs['release-metadata'].result == 'success' &&
+      needs['release-image-index'].result == 'success' &&
+      needs['release-metadata'].outputs.release_created == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux/amd64
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: read
+    env:
+      INDEX_DIGEST: ${{ needs['release-image-index'].outputs.digest }}
+      EXPECTED_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs['release-metadata'].outputs.tag_name }}
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Resolve the index on this architecture
+        run: |
+          set -euo pipefail
+          docker pull "${IMAGE_NAME}@${INDEX_DIGEST}"
+          resolved_arch="$(
+            docker image inspect "${IMAGE_NAME}@${INDEX_DIGEST}" \
+              --format '{{.Architecture}}'
+          )"
+          if [[ "$resolved_arch" != "$EXPECTED_ARCH" ]]; then
+            echo "index resolved to $resolved_arch on an $EXPECTED_ARCH runner" >&2
+            exit 1
+          fi
+          echo "index resolved to $resolved_arch"
+      - name: Smoke the index digest natively
+        run: bash ops/docker-smoke.sh "${IMAGE_NAME}@${INDEX_DIGEST}"
+
+  # Promotion is the first moment `<version>` and `sha-<short>` exist, and it
+  # happens only after both smoke lanes booted this exact digest. The same
+  # children are retagged, and EXPECT_INDEX_DIGEST fails the release if that
+  # produced anything other than the index that was smoked — so the tags, the
+  # signature, the provenance, and the digest asset on the release all describe
+  # an index something has actually started.
+  release-image-index-promote:
+    name: Promote the multi-architecture index
+    needs:
+      - release-metadata
+      - release-image-index
+      - release-image-index-smoke
+    if: >-
+      !cancelled() &&
+      needs['release-metadata'].result == 'success' &&
+      needs['release-image-index'].result == 'success' &&
+      needs['release-image-index-smoke'].result == 'success' &&
+      needs['release-metadata'].outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      RELEASE_TAG: ${{ needs['release-metadata'].outputs.tag_name }}
+      RELEASE_VERSION: ${{ needs['release-metadata'].outputs.version }}
+      RELEASE_SHORT_SHA: ${{ needs['release-metadata'].outputs.short_sha }}
+      RELEASE_COMMIT_SHA: ${{ needs['release-metadata'].outputs.commit_sha }}
+      INDEX_DIGEST: ${{ needs['release-image-index'].outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs['release-metadata'].outputs.tag_name }}
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Promote the smoked index to the release tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INDEX_TAGS: ${{ needs['release-metadata'].outputs.version }} sha-${{ needs['release-metadata'].outputs.short_sha }}
+          EXPECT_INDEX_DIGEST: ${{ needs['release-image-index'].outputs.digest }}
+        run: bash ops/publish-image-index.sh
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the index digest keylessly
+        run: cosign sign --yes "${IMAGE_NAME}@${INDEX_DIGEST}"
+      # Provenance, signature, and platform assertions apply to the index; SBOM
+      # attestations deliberately stay on the per-architecture children, since an
+      # index has no filesystem and an "index SBOM" would be one child's document
+      # under a subject it does not describe. docs/compatibility.md documents
+      # where to fetch the SBOM of the child you actually run.
+      - name: Attest index provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ needs['release-image-index'].outputs.digest }}
+          push-to-registry: true
+      - name: Verify the index signature and attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash ops/verify-image-evidence.sh "${IMAGE_NAME}@${INDEX_DIGEST}"
+      - name: Attach the index digest to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${IMAGE_NAME}@${INDEX_DIGEST}" \
+            > "axond-image-${RELEASE_VERSION}.digest"
           gh release upload "$RELEASE_TAG" \
             "axond-image-${RELEASE_VERSION}.digest" \
-            "axond-image-${RELEASE_VERSION}.spdx.json" \
             --clobber
 
   release-success:
@@ -504,6 +735,9 @@ jobs:
       - release-metadata
       - release-binaries
       - release-image
+      - release-image-index
+      - release-image-index-smoke
+      - release-image-index-promote
     if: >-
       always() &&
       (needs['release-metadata'].result != 'success' ||
@@ -516,6 +750,9 @@ jobs:
           test "${{ needs['release-metadata'].outputs.release_created }}" = true
           test "${{ needs['release-binaries'].result }}" = success
           test "${{ needs['release-image'].result }}" = success
+          test "${{ needs['release-image-index'].result }}" = success
+          test "${{ needs['release-image-index-smoke'].result }}" = success
+          test "${{ needs['release-image-index-promote'].result }}" = success
 
   # crates.io is the one irreversible lane: a published version can be yanked
   # but never replaced or removed. So it runs last, only after the tagged

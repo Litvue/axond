@@ -99,3 +99,61 @@ dirty worktree — and the signing identity is pinned to this workflow on
   the `GITHUB_TOKEN` fallback leaves the release PR un-CI-validated until merge.
 - The pipeline currently publishes a single `linux/amd64` image; multi-arch is a
   later addition, not a rewrite.
+
+## Amendment (2026-08-12): ARM64 archives and a multi-architecture image
+
+The original decision left multi-arch as "a later addition, not a rewrite". This
+is that addition, and it is additive in exactly that sense: nothing above is
+withdrawn.
+
+Two Linux `aarch64` archives (glibc and static musl) join the four existing
+binary targets, and the image is published for `linux/arm64` alongside
+`linux/amd64`. Every Linux archive and every published manifest is built on a
+runner of its own architecture, so the release never ships an artifact that was
+only cross-compiled and never executed: each Linux archive is booted through the
+Tier 0 gate, and each single-platform image is smoke-tested before it is signed.
+That gate runs with `AXOND_TIER0_ALLOW_NO_NETNS=1` in the release lanes only: a
+runner that forbids namespace creation degrades to boot-and-serve evidence instead
+of failing a valid release, while CI keeps proving the hermetic guarantee
+([ADR 0018](./0018-tier-0-hermetic-boot-gate.md)).
+
+The two signed, attested child images are then joined — by digest, not rebuilt —
+into an OCI index that the existing `<version>` and `sha-<short>` tags point at,
+so a digest-pinned deployment resolves on either architecture. Those two tags are
+applied last: the index is staged under `sha-<short>-index`, pulled and booted by
+digest on an amd64 and an arm64 runner, and only then retagged, signed, attested,
+and named on the release. Publishing the operator-facing reference first would
+make the tag the documentation points at exist before anything had started the
+index, and a later smoke failure cannot unpublish a tag. The promotion retags the
+same children and asserts the result is the digest that was smoked, so the tags
+never advertise a second, unproven index. The index digest is itself signed and
+carries a provenance attestation, and it is what
+`axond-image-<version>.digest` names on the release. SBOM attestations stay on
+the per-architecture children, where the packages are: an index has no
+filesystem, so an "index SBOM" could only be one child's document under a
+subject it does not describe. Single-platform references remain first-class as
+`<version>-<arch>` and `sha-<short>-<arch>`; per-architecture SBOM and digest
+assets are attached per architecture, since their contents genuinely differ.
+Still no `latest` tag.
+
+Keyless signatures remain image-only. Archives are covered by their SHA-256
+sidecar and GitHub provenance/SBOM attestations, as before; signing archives
+would be a separate decision with its own verification story for installers.
+
+The Compose quickstart pins a release tag, so it cannot become multi-architecture
+before the release does. Its `platform:` default therefore stays
+`linux/amd64` — overridable through `AXOND_PLATFORM` — while the pinned tag is an
+amd64-only release, so an ARM host keeps running it under emulation instead of
+failing to pull an image with no ARM child. The validator below requires that
+fallback while the pinned tag is amd64-only, and asks for its removal — as a
+note, not a failure — once the tag moves past the last amd64-only version:
+release-please rewrites that tag inside its own release pull request and never
+touches the `platform:` line, so a failure there would block the release itself.
+Dropping the fallback is therefore a documented post-release step.
+
+Because the release matrix is only exercised for real at a tag,
+`ops/check-release-config.py` asserts its shape on every change: the published
+targets and archive extensions, the image platforms, that ARM lanes run on ARM
+runners, that each lane keeps its checksum/SBOM/provenance/signature/smoke gate,
+that `release-success` requires every lane, and that no `latest` tag is
+introduced anywhere.
