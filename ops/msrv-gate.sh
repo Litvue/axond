@@ -35,9 +35,20 @@ pinned="$(read_toml_value rust-toolchain.toml channel)"
     exit 1
 }
 
-# A pinned toolchain older than the MSRV would mean nobody ever builds the floor;
-# an unpinned one would make fmt and clippy output drift release to release.
-if [[ $(printf '%s\n%s\n' "$msrv_full" "$pinned" | sort -V | head -n 1) != "$msrv_full" ]]; then
+# A rolling channel (`stable`, `beta`, `nightly-…`) would make fmt and clippy
+# output drift release to release, so the channel has to be an exact version
+# before it can be compared at all.
+if [[ ! $pinned =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "rust-toolchain.toml: channel $pinned is not a pinned version" >&2
+    exit 1
+fi
+
+# `1.97` resolves to the newest 1.97.x, which is at least 1.97.0.
+pinned_full="$pinned"
+[[ $pinned_full == *.*.* ]] || pinned_full="$pinned_full.0"
+
+# A pinned toolchain older than the MSRV would mean nobody ever builds the floor.
+if [[ $(printf '%s\n%s\n' "$msrv_full" "$pinned_full" | sort -V | head -n 1) != "$msrv_full" ]]; then
     echo "rust-toolchain.toml: pinned $pinned is older than the MSRV $msrv_full" >&2
     exit 1
 fi
