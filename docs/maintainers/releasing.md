@@ -246,11 +246,13 @@ floor still builds.
 
 ## Workflow Action pins
 
-The release jobs can reach the release GitHub App token, `CARGO_REGISTRY_TOKEN`,
-and the keyless signing identity, so a third-party Action running there is as
-privileged as this runbook. `owner/action@v3` is a pointer the upstream owner can
-move, so every `uses:` in `.github/workflows` names a full commit SHA with the
-version in a trailing comment:
+The policy behind this section is
+[ADR 0031](../adr/0031-pinned-github-actions.md). The release jobs can reach the
+release GitHub App token, `CARGO_REGISTRY_TOKEN`, and the keyless signing
+identity, so a third-party Action running there is as privileged as this runbook.
+`owner/action@v3` is a pointer the upstream owner can move, so every `uses:` in
+`.github/workflows` names a full commit SHA with the version in a trailing
+comment:
 
 ```yaml
 - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

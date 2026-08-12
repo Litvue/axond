@@ -52,5 +52,7 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 echo "$URL is unreachable; running the pinned actionlint image instead"
-exec docker run --rm --network none \
+# Not `exec`: that would replace this shell and drop the cleanup trap, leaving
+# the partial download behind.
+docker run --rm --network none \
     --volume "$repository:/repo:ro" --workdir /repo "$IMAGE" -color
