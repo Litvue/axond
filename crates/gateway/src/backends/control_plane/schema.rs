@@ -50,10 +50,10 @@ impl Migration {
     pub fn relations(&self) -> Vec<&'static str> {
         let mut relations = Vec::new();
         for statement in statements(self.sql) {
-            if let Some(Statement::Table(name)) = statement_kind(statement) {
-                if !relations.contains(&name) {
-                    relations.push(name);
-                }
+            if let Some(Statement::Table(name)) = statement_kind(statement)
+                && !relations.contains(&name)
+            {
+                relations.push(name);
             }
         }
         relations
