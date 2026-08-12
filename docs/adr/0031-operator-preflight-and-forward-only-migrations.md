@@ -46,13 +46,23 @@ Their boundaries:
   command an operator types on purpose.
 - **Forward only, and only with a complete history.** The ledger
   (`axond_cp_schema_migration`: version, file name, checksum) is classified
-  strictly — absent, current, behind, ahead of this build, checksum drift, a hole
-  in the applied prefix, a renamed migration, or a table this build cannot read as
-  the ledger. Only *behind* is applied; everything else refuses, because a
-  disagreement about history is an operator's decision and no retry changes it.
-  Applying is serialized by a transaction-scoped advisory lock at an explicit
-  isolation level, so a second or concurrent `apply` is a no-op rather than a
-  second migration.
+  strictly — absent, unrecorded, current, behind, ahead of this build, checksum
+  drift, a hole in the applied prefix, a renamed migration, or a table this build
+  cannot read as the ledger. Only *behind* is applied; everything else refuses,
+  because a disagreement about history is an operator's decision and no retry
+  changes it. Applying is serialized by a transaction-scoped advisory lock at an
+  explicit isolation level, so a second or concurrent `apply` is a no-op rather
+  than a second migration.
+- **An empty ledger is a refusal, not a fresh database.** A ledger table that
+  exists and records nothing is what applying the DDL out of band leaves behind,
+  and it is indistinguishable from an untouched database with a hand-created
+  ledger: the ledger is the only record of what ran. Migrating it from zero would
+  replay every shipped file over objects that may already exist, which holds only
+  while every statement is `IF NOT EXISTS` and breaks on the first `ALTER TABLE`
+  or backfill. So the baseline is the operator's to state — the refusal prints the
+  `INSERT` for each shipped migration, checksum included — or the empty ledger is
+  theirs to drop. An *absent* ledger stays a fresh install: nothing has run, so
+  there is nothing to replay.
 - **`[control_plane] migrate` governs boot only.** It stays `false` by default: the
   supported order is one `apply` before any replica starts. A replica checks the
   schema either way and refuses one it does not recognise.

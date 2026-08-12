@@ -74,6 +74,17 @@ pub const MINIMUM_SERVER_VERSION_NUM: i32 = 140_000;
 pub enum SchemaStatus {
     /// No journal at all: the migration bookkeeping table does not exist.
     Absent,
+    /// The ledger exists and records nothing.
+    ///
+    /// Not migratable, and not the same thing as [`SchemaStatus::Absent`]: an
+    /// empty ledger is indistinguishable from a database whose objects were
+    /// created by hand — the ledger is the only record of what was applied, so
+    /// with no rows this build cannot tell an untouched database from a fully
+    /// populated one. Migrating from 0 would re-run every shipped file over
+    /// objects that may already exist, which survives only as long as every
+    /// statement is `IF NOT EXISTS`; the first `ALTER TABLE` or backfill would
+    /// double-apply. The baseline has to be stated by the operator instead.
+    Unrecorded,
     Current {
         version: i32,
     },
@@ -123,8 +134,9 @@ impl SchemaStatus {
 
     /// Whether applying this build's migrations would make it current.
     ///
-    /// True only for [`SchemaStatus::Absent`] and [`SchemaStatus::Behind`].
-    /// Every other status means the database is not this schema's history, and
+    /// True only for [`SchemaStatus::Absent`] and [`SchemaStatus::Behind`], both
+    /// of which say what the database already contains: nothing, or a recorded
+    /// prefix. Every other status means the database is not this schema's history, and
     /// writing more DDL over it would make that worse rather than better.
     pub fn is_migratable(&self) -> bool {
         matches!(self, Self::Absent | Self::Behind { .. })
@@ -138,6 +150,25 @@ impl fmt::Display for SchemaStatus {
                 f,
                 "the control-plane schema is not present; run `axond migrate apply` (or apply \
                  ops/postgres/control_plane_0001_initial.sql)"
+            ),
+            Self::Unrecorded => write!(
+                f,
+                "`{MIGRATION_TABLE}` exists but records no migrations, so this build cannot tell \
+                 whether the schema it describes was ever applied and will not migrate from \
+                 zero over objects that may already exist; if nothing was applied, drop the empty \
+                 `{MIGRATION_TABLE}` table and run `axond migrate apply`, and if the DDL was \
+                 applied by hand, record the baseline it corresponds to ({}) and re-run",
+                MIGRATIONS
+                    .iter()
+                    .map(|migration| format!(
+                        "INSERT INTO {MIGRATION_TABLE} (version, name, checksum) VALUES ({}, '{}', \
+                         '{}')",
+                        migration.version,
+                        migration.name,
+                        migration.checksum()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ),
             Self::Current { version } => write!(f, "control-plane schema v{version} is current"),
             Self::Behind { applied, required } => write!(
@@ -307,13 +338,13 @@ fn classify(recorded: &[Recorded]) -> SchemaStatus {
         };
     }
     let Some(applied) = versions.last().copied() else {
-        // The table exists and is empty: the ledger of a database whose DDL was
-        // applied by hand without recording it, or one migration away from
-        // existing at all. Either way, forward.
-        return SchemaStatus::Behind {
-            applied: 0,
-            required,
-        };
+        // The table exists and is empty, which is not the same question as
+        // "has anything been applied?". It is what a database whose DDL was
+        // applied by hand looks like, and also what a database with a
+        // hand-created ledger and nothing else looks like, and the ledger is
+        // the only thing that could tell them apart. Migrating from 0 would
+        // replay every file over whatever is there.
+        return SchemaStatus::Unrecorded;
     };
     for row in recorded {
         let Some(migration) = MIGRATIONS.iter().find(|m| m.version == row.version) else {
@@ -368,6 +399,7 @@ pub fn pending(from: &SchemaStatus) -> Vec<i32> {
         // Everything else is either done or a refusal, and a refusal has no
         // pending set: what an operator has to do about it is not "apply files".
         SchemaStatus::Current { .. }
+        | SchemaStatus::Unrecorded
         | SchemaStatus::Ahead { .. }
         | SchemaStatus::Drifted { .. }
         | SchemaStatus::Incomplete { .. }
@@ -456,14 +488,8 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_or_partial_history_is_behind_and_a_complete_one_is_current() {
-        assert_eq!(
-            classify(&[]),
-            SchemaStatus::Behind {
-                applied: 0,
-                required: required_version()
-            }
-        );
+    fn an_unrecorded_or_partial_history_is_not_current_and_a_complete_one_is() {
+        assert_eq!(classify(&[]), SchemaStatus::Unrecorded);
         let complete: Vec<_> = MIGRATIONS.iter().map(|m| recorded(m.version)).collect();
         assert_eq!(
             classify(&complete),
@@ -588,23 +614,40 @@ mod tests {
         );
     }
 
-    /// An empty ledger is the one case where a table that exists still means
-    /// "apply everything": the DDL may have been run without recording it.
+    /// An empty ledger is not "apply everything": the files it would replay may
+    /// already be in the database, and the ledger is the only thing that could
+    /// have said so. An *absent* ledger is "apply everything" — nothing has run.
     #[test]
-    fn an_empty_ledger_is_behind_and_pending_names_every_shipped_version() {
-        let status = classify(&[]);
-        assert_eq!(
-            status,
-            SchemaStatus::Behind {
-                applied: 0,
-                required: required_version()
-            }
+    fn an_empty_ledger_is_refused_while_an_absent_one_pends_every_shipped_version() {
+        let empty = classify(&[]);
+        assert_eq!(empty, SchemaStatus::Unrecorded);
+        assert!(
+            !empty.is_migratable() && !empty.is_current(),
+            "an empty ledger must not be migrated from zero: {empty:?}"
         );
+        assert!(
+            pending(&empty).is_empty(),
+            "nothing is pending against an empty ledger, or an apply would replay every file"
+        );
+        let rendered = empty.to_string();
+        for expected in [
+            "records no migrations",
+            "drop the empty",
+            "INSERT INTO axond_cp_schema_migration",
+            &MIGRATIONS[0].checksum().to_string(),
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "the refusal has to name the action to take, missing `{expected}`: {rendered}"
+            );
+        }
+
         assert_eq!(
-            pending(&status),
+            pending(&SchemaStatus::Absent),
             MIGRATIONS.iter().map(|m| m.version).collect::<Vec<_>>()
         );
         for refused in [
+            SchemaStatus::Unrecorded,
             SchemaStatus::Ahead {
                 applied: 9,
                 required: 1,

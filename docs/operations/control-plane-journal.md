@@ -151,8 +151,22 @@ psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0001_initial.sql
 ```
 
 That path does not write the ledger row, so the journal is then reported as
-*Behind* with an empty ledger. Prefer `axond migrate apply`, which records what it
-applied.
+*Unrecorded* — a ledger table that exists and records nothing — and both `status`
+and `apply` refuse it. An empty ledger is indistinguishable from an untouched
+database, and the ledger is the only record of what was applied, so migrating from
+zero would replay every shipped file over objects that may already be there;
+that survives only while every statement is `IF NOT EXISTS`. Either drop the
+empty `axond_cp_schema_migration` table if nothing was applied, or state the
+baseline the DDL corresponds to:
+
+```bash
+psql "$GW_CONTROL_PLANE_DSN" -c "INSERT INTO axond_cp_schema_migration (version, name, checksum)
+  VALUES (1, 'control_plane_0001_initial', '<checksum>')"
+```
+
+The refusal prints the exact statement, checksum included, for every migration
+this build ships. Prefer `axond migrate apply`, which records what it applied and
+never leaves this state behind.
 
 ## Schema status, and what each state means
 
@@ -164,13 +178,14 @@ applied.
 | --- | --- | --- |
 | Current | The applied history is exactly the required one | Nothing |
 | Behind | Migrations are missing | `axond migrate apply` |
+| Unrecorded | The ledger table exists and records nothing: the DDL was applied out of band, or every row was deleted | Drop the empty ledger if nothing was applied, or record the baseline the database corresponds to (the refusal prints the statement); never migrate it from zero |
 | Ahead | The database records a migration this build does not know | Deploy the newer build; do not downgrade the schema |
 | Drifted | An applied migration's recorded checksum is not this build's file | Restore the file, or add a new migration — never edit in place |
 | Incomplete | The applied versions are not a complete prefix (`v3` without `v2`, or a deleted ledger row) | Find out what applied out of order or removed the row; the maximum version alone is not evidence the history is intact |
 | Renamed | A version is recorded under a name this build does not ship it as | A migration was renumbered or renamed rather than added; restore the shipped numbering |
 | Malformed | The ledger is not the one this build writes: a missing column, a version below 1, a duplicate version, another table under that name | Something else owns `axond_cp_schema_migration`, or a restore was partial |
 
-Only *Behind* (and a database with no journal at all) is migratable. Everything
+Only *Behind* (and a database with no journal table at all) is migratable. Everything
 else is a refusal a retry cannot clear, and `apply` refuses it rather than writing
 more DDL over a history it cannot account for: a replica that served against a
 schema it did not write would be writing rows a newer build defined differently.

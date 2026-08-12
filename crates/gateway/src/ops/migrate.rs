@@ -601,6 +601,100 @@ mod tests {
         );
     }
 
+    /// A ledger table with no rows is the database an operator gets from applying
+    /// the shipped SQL with `psql`, and it is indistinguishable from an untouched
+    /// one: the ledger is the only record of what ran. Migrating it from zero
+    /// would replay every file over objects that are already there, so it is
+    /// refused with the baseline to state instead — and refused *without*
+    /// touching the database, which is what the empty ledger still being empty
+    /// proves.
+    #[tokio::test]
+    async fn an_empty_ledger_is_refused_rather_than_migrated_from_zero() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        // The ledger, by hand, exactly as the shipped migration declares it.
+        fixture
+            .observe()
+            .await
+            .batch_execute(
+                "CREATE TABLE axond_cp_schema_migration (
+                     version     integer     PRIMARY KEY,
+                     name        text        NOT NULL,
+                     checksum    text        NOT NULL,
+                     applied_at  timestamptz NOT NULL DEFAULT now()
+                 )",
+            )
+            .await
+            .expect("create an empty ledger");
+
+        let reported = status(&fixture.config, &fixture.env)
+            .await
+            .expect("an empty ledger has a status");
+        let Some(State::Refused { reason }) = reported.state() else {
+            panic!("an empty ledger is not something to migrate from zero: {reported}");
+        };
+        assert!(
+            reason.contains("records no migrations") && reason.contains("INSERT INTO"),
+            "the refusal names the baseline to state: {reason}"
+        );
+
+        let error = apply(&fixture.config, &fixture.env)
+            .await
+            .expect_err("apply must refuse an empty ledger");
+        assert!(
+            matches!(error, OpsError::Refused { .. }) && !error.is_retryable(),
+            "an operator decision, not an outage: {error:?}"
+        );
+        assert!(
+            fixture.ledger().await.is_empty(),
+            "a refused apply must not record a migration"
+        );
+        let created = fixture
+            .observe()
+            .await
+            .query_one(
+                "SELECT to_regclass($1)::text",
+                &[&format!("{}.axond_cp_blob", fixture.schema)],
+            )
+            .await
+            .expect("probe a table the migration would create")
+            .get::<_, Option<String>>(0)
+            .is_some();
+        assert!(
+            !created,
+            "a refused apply executed the shipped migration SQL anyway"
+        );
+
+        // The baseline, stated: the same database is then current, and still
+        // untouched by an apply.
+        let client = fixture.observe().await;
+        for migration in schema::MIGRATIONS.iter() {
+            client
+                .execute(
+                    "INSERT INTO axond_cp_schema_migration (version, name, checksum) VALUES ($1, \
+                     $2, $3)",
+                    &[
+                        &migration.version,
+                        &migration.name,
+                        &migration.checksum().to_string(),
+                    ],
+                )
+                .await
+                .expect("record the baseline the DDL corresponds to");
+        }
+        let adopted = apply(&fixture.config, &fixture.env)
+            .await
+            .expect("a recorded baseline is current");
+        assert_eq!(
+            adopted.state(),
+            Some(&State::Current {
+                version: schema::required_version()
+            }),
+            "{adopted}"
+        );
+    }
+
     /// Safe before replicas start includes safe *while another operator is doing
     /// the same thing*: the advisory lock is what makes two applies one migration.
     #[tokio::test]

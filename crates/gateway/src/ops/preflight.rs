@@ -783,6 +783,7 @@ mod tests {
         }));
         for rejected in [
             SchemaStatus::Absent,
+            SchemaStatus::Unrecorded,
             SchemaStatus::Behind {
                 applied: 0,
                 required: 1,
