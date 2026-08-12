@@ -204,6 +204,11 @@ def check_review_trigger_tests() -> list[str]:
     other checks and the configuration reference already cover.
     """
     page = ROOT / "docs/security/threat-model-review.md"
+    if not page.is_file():
+        return [
+            "docs/security/threat-model-review.md: the trigger page is missing; "
+            "the security, deployment, contributor, and release docs link to it"
+        ]
     text = page.read_text(encoding="utf-8")
     declared = set()
     for source in (ROOT / "crates").rglob("*.rs"):
