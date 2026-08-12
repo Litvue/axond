@@ -102,12 +102,17 @@ Alongside them:
 | `axond.revision.convergence_duration` (ms) | How long an accepted revision takes to compile and publish |
 | `axond.revision.attempts` (by `trigger`, `outcome`) | Whether convergence is being driven by notifications or by polls |
 | `axond.revision.desired_at` / `axond.revision.active_at` | Publication timestamps embedded in the revision identifiers, for comparing replicas |
-| `axond.revision.last_known_good` (by `outcome`) | Cache exports, export failures, and cold-boot restores |
+| `axond.revision.last_known_good` (by `outcome`) | Cache exports, export failures, cold-boot restores, and a cache this build cannot read (`incompatible`) |
 | `axond.config.generation` | Which snapshot generation a replica serves |
 
 Alert on **lag above the convergence target**, and on
 `axond.revision.last_known_good{outcome="restored"}`, which means a replica
 started without reaching the control plane.
+
+A refusal this build cannot read is its own label rather than a bucket shared with
+damage: `axond.revision.rejections{reason="incompatible"}`, and `schema_incompatible`
+in a status response. Alert on it separately from `corrupt` — the action is a
+deployment, not a restore.
 
 ## Resource body schemas
 

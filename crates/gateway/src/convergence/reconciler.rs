@@ -136,8 +136,14 @@ impl Outcome {
     }
 }
 
+/// A revision, or a last-known-good snapshot, this build cannot read: intact
+/// storage that calls for a deployment rather than a repair. A label of both
+/// `axond.revision.reason` and `axond.revision.outcome`.
+pub const INCOMPATIBLE_REASON: &str = "incompatible";
+
 /// Every value the `axond.revision.reason` label can carry: the store
-/// categories [`category_reason`] classifies, and the compile reasons
+/// categories [`category_reason`] classifies, the refusals
+/// [`AttemptError::reason`] labels ahead of them, and the compile reasons
 /// [`CompileError::reason`] returns. The catalogue enumerates this list rather
 /// than a copy of it, so a new category cannot ship an uncatalogued label.
 pub const REVISION_REASONS: &[&str] = &[
@@ -147,6 +153,9 @@ pub const REVISION_REASONS: &[&str] = &[
     "invalid",
     "denied",
     "corrupt",
+    // Named rather than spelled, because it is the one label no store category
+    // produces and a second instrument also carries it.
+    INCOMPATIBLE_REASON,
     "secret",
     "projection",
     "validation",
@@ -189,7 +198,7 @@ impl AttemptError {
     /// `corrupt` would send an operator looking for the wrong thing.
     fn reason(&self) -> &'static str {
         match self {
-            Self::Store(ControlPlaneError::Incompatible { .. }) => "incompatible",
+            Self::Store(ControlPlaneError::Incompatible { .. }) => INCOMPATIBLE_REASON,
             Self::Store(error) => category_reason(error.category()),
             Self::Compile(error) => error.reason(),
         }
@@ -555,7 +564,7 @@ impl Reconciler {
             // authentic and intact. An inconsistent or unauthentic cache is still
             // the cache's own failure.
             Err(LastKnownGoodError::Integrity(integrity)) if integrity.is_incompatible() => {
-                telemetry::record_last_known_good("incompatible");
+                telemetry::record_last_known_good(INCOMPATIBLE_REASON);
                 tracing::warn!(
                     error = %integrity,
                     "the last-known-good snapshot was written by a build this one cannot read; \
