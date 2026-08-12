@@ -121,6 +121,21 @@ idempotent.
 Precise Postgres revocation uses `ops/postgres/revocation_v1.sql` and the table
 configured under `[revocation]`.
 
+The control-plane journal of `mode = "stateful"` is the exception to applying DDL
+by hand: it keeps a migration ledger, so the binary can tell what a database
+contains and move it forward.
+
+```bash
+axond migrate status --config /etc/axond/axond.toml   # read-only
+axond migrate apply  --config /etc/axond/axond.toml   # forward-only, idempotent
+axond check preflight --config /etc/axond/axond.toml  # read-only boot rehearsal
+```
+
+The stores on this page have no ledger, so nothing above orchestrates them;
+`axond check preflight` still checks that their `dsn_env` references resolve,
+because an unset one is a boot failure whichever section it is in. See
+[the control-plane journal](../operations/control-plane-journal.md#operator-commands).
+
 Use `sslmode=require` in production DSNs. Axond uses rustls and webpki roots.
 
 ## Availability and recovery

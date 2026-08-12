@@ -198,13 +198,35 @@ pub struct ControlPlane {
     /// Name of the env var holding the control-plane Postgres connection string.
     #[serde(default)]
     pub dsn_env: Option<String>,
+    /// The PostgreSQL schema the journal lives in, if not the connection's
+    /// default. A plain identifier: it is interpolated into `SET search_path`,
+    /// so it is validated here rather than trusted.
+    #[serde(default)]
+    pub schema: Option<String>,
+    /// Whether a replica may apply pending migrations while booting.
+    ///
+    /// Off by default, which is the safe order: `axond migrate apply` moves the
+    /// schema forward once, before replicas start, so a rollout cannot have one
+    /// replica migrating a database the others are already reading. A boot
+    /// always *checks* the schema either way — this only decides whether it may
+    /// also change it.
+    #[serde(default)]
+    pub migrate: bool,
     /// Bound on establishing a control-plane connection.
     #[serde(default = "default_control_plane_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
+    /// Bound on one control-plane operation, including a migration. Generous by
+    /// inference-path standards: nothing here runs with a request in flight.
+    #[serde(default = "default_control_plane_operation_timeout_ms")]
+    pub operation_timeout_ms: u64,
 }
 
 fn default_control_plane_connect_timeout_ms() -> u64 {
     5_000
+}
+
+fn default_control_plane_operation_timeout_ms() -> u64 {
+    30_000
 }
 
 /// Which `SecretStore` unwraps tenant secret material, and the KEK it unwraps
@@ -2054,6 +2076,31 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "`[control_plane] connect_timeout_ms` must be at least 1".into(),
             ));
+        }
+        if control_plane.operation_timeout_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "`[control_plane] operation_timeout_ms` must be at least 1: control-plane \
+                 operations, including migrations, are bounded"
+                    .into(),
+            ));
+        }
+        if let Some(schema) = control_plane.schema.as_deref() {
+            // Interpolated into `SET search_path`, so it is an identifier this
+            // build validates rather than a string it forwards.
+            crate::usage::validate_table_name(schema).map_err(|message| {
+                ConfigError::Invalid(format!("`[control_plane] schema`: {message}"))
+            })?;
+            // That validator is written for table names, so it allows one
+            // qualifying dot. A search path takes a single schema, and accepting a
+            // grammar the statement cannot use is a validation gap on a value that
+            // reaches SQL text.
+            if schema.contains('.') {
+                return Err(ConfigError::Invalid(
+                    "`[control_plane] schema` must be a single unqualified schema name: it names \
+                     the search path, not a table"
+                        .into(),
+                ));
+            }
         }
         reject_env_override_collision(
             "[control_plane] dsn_env",
@@ -4164,6 +4211,17 @@ dsn_env = "AXOND_REDIS_URL"
                 "`[control_plane] connect_timeout_ms`",
                 "mode = \"stateful\"\n[control_plane]\ndsn_env = \"DSN\"\nconnect_timeout_ms = 0\n[secret_store]\nkek_env = \"KEK\"\n[[admin_breakglass]]\nenv = \"BG\"",
             ),
+            (
+                "`[control_plane] operation_timeout_ms`",
+                "mode = \"stateful\"\n[control_plane]\ndsn_env = \"DSN\"\noperation_timeout_ms = 0\n[secret_store]\nkek_env = \"KEK\"\n[[admin_breakglass]]\nenv = \"BG\"",
+            ),
+            // The schema is interpolated into `SET search_path`, so anything
+            // that is not a plain identifier is refused at load rather than at
+            // the point it would become a statement.
+            (
+                "`[control_plane] schema`",
+                "mode = \"stateful\"\n[control_plane]\ndsn_env = \"DSN\"\nschema = \"public; DROP SCHEMA public\"\n[secret_store]\nkek_env = \"KEK\"\n[[admin_breakglass]]\nenv = \"BG\"",
+            ),
         ] {
             let error = Config::from_toml_str(toml)
                 .expect_err("stateful cold boot needs the control plane");
@@ -4172,6 +4230,57 @@ dsn_env = "AXOND_REDIS_URL"
                 "{expected}: {error:?}"
             );
         }
+    }
+
+    /// What an operator gets without writing the keys: the connection's own
+    /// schema, and no migration at boot. Migration is opt-in because the safe
+    /// order is one `axond migrate apply` before any replica starts, not each
+    /// replica racing to migrate the database the others are reading.
+    #[test]
+    fn the_control_plane_defaults_to_no_schema_and_no_boot_migration() {
+        let control_plane = Config::from_toml_str(STATEFUL)
+            .expect("the approved bootstrap set validates")
+            .control_plane
+            .expect("stateful mode requires a control plane");
+        assert_eq!(control_plane.schema, None);
+        assert!(
+            !control_plane.migrate,
+            "a replica must not migrate a database on the way up unless asked"
+        );
+        assert_eq!(control_plane.connect_timeout_ms, 5_000);
+        assert_eq!(control_plane.operation_timeout_ms, 30_000);
+    }
+
+    /// The identifier validator this borrows is written for table names, so it
+    /// allows one qualifying dot. A search path takes one schema, so the config has
+    /// to be narrower than the validator it reuses.
+    #[test]
+    fn a_qualified_control_plane_schema_is_rejected() {
+        let error = Config::from_toml_str(
+            "mode = \"stateful\"\n[control_plane]\ndsn_env = \"DSN\"\nschema = \"public.axond\"\n\
+             [secret_store]\nkek_env = \"KEK\"\n[[admin_breakglass]]\nenv = \"BG\"",
+        )
+        .expect_err("`a.b` is not a schema name");
+        assert!(
+            error.to_string().contains("unqualified"),
+            "the error has to say which grammar is wanted: {error}"
+        );
+    }
+
+    #[test]
+    fn the_control_plane_settings_are_read_as_written() {
+        let control_plane = Config::from_toml_str(
+            "mode = \"stateful\"\n[control_plane]\ndsn_env = \"DSN\"\nschema = \"axond_cp\"\n\
+             migrate = true\nconnect_timeout_ms = 250\noperation_timeout_ms = 750\n\
+             [secret_store]\nkek_env = \"KEK\"\n[[admin_breakglass]]\nenv = \"BG\"",
+        )
+        .expect("every control-plane key is settable")
+        .control_plane
+        .expect("stateful mode requires a control plane");
+        assert_eq!(control_plane.schema.as_deref(), Some("axond_cp"));
+        assert!(control_plane.migrate);
+        assert_eq!(control_plane.connect_timeout_ms, 250);
+        assert_eq!(control_plane.operation_timeout_ms, 750);
     }
 
     /// A snapshot is only publishable once its credential references are
