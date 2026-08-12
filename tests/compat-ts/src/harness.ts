@@ -103,7 +103,21 @@ ${models}`;
 
 /** Boot the fake upstream and a real gateway pointed at it. */
 export async function start(): Promise<Harness> {
+  // Before anything with a handle on the event loop: a missing binary must fail
+  // the run, and a listening socket nobody closes keeps `node --test` alive.
+  const program = binary();
   const upstream = await FakeUpstream.start();
+  try {
+    return await boot(program, upstream);
+  } catch (error) {
+    // The upstream holds a listening socket, and `node --test` does not exit
+    // while one is open, so a failed boot must not leave it behind.
+    await upstream.stop();
+    throw error;
+  }
+}
+
+async function boot(program: string, upstream: FakeUpstream): Promise<Harness> {
   const bind = `127.0.0.1:${await freePort()}`;
   const directory = await mkdtemp(join(tmpdir(), "axond-compat-ts-"));
   const configPath = join(directory, "axond.toml");
@@ -111,7 +125,7 @@ export async function start(): Promise<Harness> {
 
   const environment = { ...process.env };
   delete environment["OTEL_EXPORTER_OTLP_ENDPOINT"];
-  const child = spawn(binary(), {
+  const child = spawn(program, {
     env: {
       ...environment,
       AXOND_CONFIG: configPath,
@@ -135,7 +149,9 @@ export async function start(): Promise<Harness> {
   try {
     await awaitReady(child, baseUrl);
   } catch (error) {
-    await harness.stop();
+    // The upstream is the caller's to close, which is what keeps this path from
+    // stopping it twice.
+    await terminate(child);
     throw error;
   }
   return harness;

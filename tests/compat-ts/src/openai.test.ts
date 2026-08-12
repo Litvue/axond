@@ -33,7 +33,8 @@ before(async () => {
 });
 
 after(async () => {
-  await harness.stop();
+  // Optional so a failed boot reports its own error rather than this hook's.
+  await harness?.stop();
 });
 
 test("a buffered chat completion round-trips and forwards the provider credential", async () => {
