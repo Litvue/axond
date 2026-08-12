@@ -157,7 +157,7 @@ impl UsageJournal for InMemoryUsageJournal {
         let mut storage = self.locked();
         if let Some(position) = storage.positions.get(event.idempotency_key()).copied() {
             let stored = storage.entry(position).expect("indexed position exists");
-            if stored.event == *event {
+            if stored.event.is_same_fact_as(event) {
                 return Ok(Appended::AlreadyPresent { position });
             }
             return Err(JournalError::Conflict {

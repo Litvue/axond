@@ -110,6 +110,33 @@ async fn appending_the_same_event_twice_journals_it_once() {
     );
 }
 
+/// A caller that never learned its append's outcome retries it, and after a
+/// restart it cannot recover the original `observed_at` — so it rebuilds the
+/// envelope with a new one. That is the ordinary retry, not a conflict, and the
+/// first observation is the one kept: a consumer may already have written it.
+#[tokio::test]
+async fn a_retry_that_re_observed_the_record_is_still_the_same_event() {
+    let journal = InMemoryUsageJournal::new();
+    let event = event();
+    let first = journal.append(&event).await.expect("append");
+
+    let re_observed = UsageEvent::new(ObservedRecord {
+        record: event.record().clone(),
+        observed_at: event.observed_at() + Duration::from_secs(60),
+    })
+    .expect("identity is unchanged");
+    let second = journal.append(&re_observed).await.expect("re-append");
+
+    assert!(!second.is_new(), "{second:?}");
+    assert_eq!(first.position(), second.position());
+    assert_eq!(journal.stored_events(), 1);
+    let delivered = journal
+        .claim(&consumer("billing"), claim_of(1, SystemTime::now()))
+        .await
+        .expect("claim");
+    assert_eq!(delivered[0].event.observed_at(), event.observed_at());
+}
+
 #[tokio::test]
 async fn the_same_identity_with_different_content_is_a_conflict() {
     let journal = InMemoryUsageJournal::new();

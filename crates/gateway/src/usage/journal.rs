@@ -22,7 +22,7 @@
 //!
 //! | Operation | Guarantee |
 //! | --- | --- |
-//! | [`append`](UsageJournal::append) | An accepted event is durable, or the caller is told it was not. Re-appending the same [`IdempotencyKey`] is [`Appended::AlreadyPresent`], never a second event; re-appending it with *different* content is a [`JournalError::Conflict`] rather than a silent overwrite. |
+//! | [`append`](UsageJournal::append) | An accepted event is durable, or the caller is told it was not. Re-appending the same [`IdempotencyKey`] is [`Appended::AlreadyPresent`], never a second event; re-appending it with a *different record* is a [`JournalError::Conflict`] rather than a silent overwrite ([`UsageEvent::is_same_fact_as`] is what "different" means). |
 //! | [`claim`](UsageJournal::claim) | Hands a consumer a bounded batch of unacknowledged events under a lease. Claims respect [`OrderingKey`], so one caller's events are delivered in append order. |
 //! | [`ack`](UsageJournal::ack) | Idempotent: an event acknowledged twice is acknowledged once, so a crash between the sink write and the ack is safe to retry. |
 //! | [`quarantine`](UsageJournal::quarantine) | A poison event leaves the delivery path explicitly instead of blocking its ordering key forever. |
@@ -219,6 +219,22 @@ impl UsageEvent {
         &self.record
     }
 
+    /// Whether two events under the same idempotency key describe the same
+    /// billable fact — the question `append` answers to tell a benign retry from
+    /// a [`JournalError::Conflict`].
+    ///
+    /// It compares the [`record`](Self::record) and deliberately *not*
+    /// [`observed_at`](Self::observed_at). A caller retrying an append whose
+    /// outcome it never learned has to rebuild the envelope, and `observed_at` is
+    /// a wall-clock reading it cannot recover from the record — so including it
+    /// would turn the ordinary retry into a conflict. The first observation wins,
+    /// because that is the one a consumer may already have delivered. A store
+    /// implements this as equality of the columns it wrote, not of the row it
+    /// was handed.
+    pub fn is_same_fact_as(&self, other: &Self) -> bool {
+        self.record == other.record
+    }
+
     /// When the fan-out first saw the record — the row's `recorded_at`, carried
     /// through the journal so a replay written days later still says when the
     /// request happened.
@@ -361,9 +377,10 @@ pub enum Appended {
         /// across journals.
         position: u64,
     },
-    /// The same idempotency key was already appended, carrying the same content.
-    /// The benign case — a retried append after an unknown outcome — and *not*
-    /// an error: the caller's intent is already satisfied.
+    /// The same idempotency key was already appended, describing the same fact
+    /// ([`UsageEvent::is_same_fact_as`]). The benign case — a retried append after
+    /// an unknown outcome — and *not* an error: the caller's intent is already
+    /// satisfied, and the stored event is left exactly as it was.
     AlreadyPresent { position: u64 },
 }
 

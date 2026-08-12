@@ -94,10 +94,15 @@ CREATE UNIQUE INDEX CONCURRENTLY axond_usage_request_id_key
     ON axond_usage (request_id);
 ```
 
-Ids are time-ordered: sorting by `request_id` sorts by when the gateway settled
-the request, so an index on it stays append-mostly and "everything after id X" is
-a usable cursor. That ordering is a property to rely on; the embedded timestamp is
-not — read `recorded_at` for time.
+Ids are time-ordered, but by **admission**, not settlement: one is minted when the
+gateway accepts a request, and rows are written when requests end. A long stream's
+row therefore lands after — and with a smaller id than — a short request that
+started later. So the ordering is worth having for storage (an index on
+`request_id` stays append-mostly) but `max(request_id)` is not a safe cursor on
+its own: a naive one skips exactly the slow requests. Page on `recorded_at`, which
+is settlement-ordered, and re-read a window at least as long as your longest
+tolerated request. The embedded timestamp is not an interface either — read
+`recorded_at` for time.
 
 Rows written before this change carry a `req_` + 16-hex-digit id
 (`req_0000000000000001`) and are unique only within the process that wrote them.

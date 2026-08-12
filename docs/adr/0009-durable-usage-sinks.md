@@ -156,8 +156,8 @@ to produce.
 a destination that may drop; a journal is a log with named consumers, where an
 event is forgotten only once a consumer acknowledges it. Flattening them would
 hide exactly the decision this ADR is about, so they are separate traits:
-`append` (idempotent on the event id: identical content is `AlreadyPresent`,
-different content under the same key is a `Conflict`, never an overwrite), `claim`
+`append` (idempotent on the event id: the same record is `AlreadyPresent`, a
+different record under the same key is a `Conflict`, never an overwrite), `claim`
 (a bounded batch under a lease, at most one in-flight event per
 `(namespace, subject)` ordering key), `ack` (idempotent, so a crash between the
 destination write and the acknowledgement is recoverable by repeating it),
