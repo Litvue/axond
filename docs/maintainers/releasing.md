@@ -113,8 +113,8 @@ failure prints that remediation itself, so it does not depend on this page being
 read first, and it is a refusal rather than a partial release: nothing is
 published for a tag whose tree cannot produce and verify the index.
 
-Every tag published before ARM support is in that position, so the release notes
-for the release that introduces it say so — a maintainer with
+Every tag published before ARM support is in that position, so call it out in the
+release notes for the release that introduces it — a maintainer with
 `--ref main -f release_tag=<older-tag>` in their shell history needs to learn the
 new form from the changelog, not from a failed dispatch. crates.io
 publication is enabled only if the tag also contains `ops/publish-crates.sh`;
