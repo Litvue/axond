@@ -81,12 +81,16 @@ in-memory control.
 Admission is the sharpest case of that. `[admission]` ceilings are per replica,
 so a fleet of *N* Pods admits *N* x `max_in_flight`, and one tenant behind the
 Service gets *N* x `max_in_flight_per_tenant`. Size them from what a single Pod
-can hold — `resources.limits.memory` against `max_in_flight` x
-`max_request_bytes`, and the node's descriptor budget against the sockets an
-in-flight stream holds — and treat `axond.admission.rejections` rising as either
-a saturation signal for the HPA or a ceiling set below what the Pod can serve.
+can hold — `resources.limits.memory` against several times `max_in_flight` x
+`max_request_bytes`, since a buffered body also costs a parsed JSON value, a
+re-serialization for the usage estimate, and a clone per failover attempt, and
+the node's descriptor budget against the sockets an in-flight stream holds — and
+treat `axond.admission.rejections` rising as either a saturation signal for the
+HPA or a ceiling set below what the Pod can serve.
 The base overlay sets these explicitly for its own 512Mi limit rather than
-inheriting the built-in defaults; change them together.
+inheriting the built-in defaults — a 1 MiB body ceiling and 32 in-flight
+requests, so worst-case bodies stay a small fraction of the limit; change them
+together.
 
 ## Ingress and streaming
 

@@ -29,14 +29,18 @@ targets = [
 # Sized for this manifest's pod, not for the fleet: the ceilings are per replica
 # and in process memory, so `replicas: 2` admits twice these numbers. They are
 # set deliberately below axond's own defaults because the container's memory
-# limit is 512Mi — a bounded body times a bounded number of in-flight requests
-# has to fit in it. Raise them together with `resources.limits.memory`, and use
-# the shared-store `[rate_limit]` for fleet-wide limits on one subject.
+# limit is 512Mi, and the worst case is every admitted request carrying a
+# maximum-size body: 32 * 1 MiB is 32 MiB of raw bodies, and a body costs
+# several times its own size once parsed into a JSON value, re-serialized for
+# the usage estimate, and cloned per failover attempt. That leaves the 512Mi
+# limit headroom for the runtime instead of racing it. Raise these together with
+# `resources.limits.memory`, and use the shared-store `[rate_limit]` for
+# fleet-wide limits on one subject.
 [admission]
-max_request_bytes = 2_097_152
-max_in_flight = 128
-max_in_flight_streams = 64
-max_in_flight_per_tenant = 32
+max_request_bytes = 1_048_576
+max_in_flight = 32
+max_in_flight_streams = 16
+max_in_flight_per_tenant = 8
 max_tenants = 256
 queue_capacity = 0
 queue_wait_ms = 0

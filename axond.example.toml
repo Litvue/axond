@@ -165,6 +165,11 @@ max_error_bytes = 65536
 #
 # The ceilings own semaphores built at boot, so a reload validates `[admission]`
 # and warns; a change takes effect on restart, exactly like `[transport]`.
+#
+# `max_prompt_tokens` is checked against an estimate of four bytes per token, so
+# it only binds below `max_request_bytes / 4`: with the values below the body
+# ceiling refuses first, at roughly 525k estimated tokens. Lower the token
+# ceiling if you want a prompt-shaped refusal instead.
 
 [admission]
 max_request_bytes = 2097152

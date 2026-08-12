@@ -711,6 +711,12 @@ fn default_max_stream_duration_ms() -> u64 {
 
 /// Roughly the largest context the current frontier models accept, so the bound
 /// refuses what no provider would serve rather than second-guessing a model.
+///
+/// It is deliberately above what [`default_max_request_bytes`] admits: the
+/// estimate is four bytes per token, so with the default body ceiling the body
+/// bound refuses first, at roughly 525k estimated tokens. An operator who wants
+/// a prompt-shaped refusal lowers this below `max_request_bytes / 4`; one who
+/// raises the body ceiling gets this one back.
 fn default_max_prompt_tokens() -> u64 {
     1_000_000
 }

@@ -331,7 +331,7 @@ many may be in flight at once.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `max_request_bytes` | integer | `2097152` | Largest inbound request body accepted. Enforced by the router before the body is buffered, so an oversized request is refused rather than read. Must be ≥ 1. |
-| `max_prompt_tokens` | integer | `1000000` | Largest estimated input size a request may carry. `0` disables. |
+| `max_prompt_tokens` | integer | `1000000` | Largest estimated input size a request may carry. `0` disables. Only binds below `max_request_bytes` / 4 — see below. |
 | `max_output_tokens` | integer | `200000` | Largest output allowance a request may ask for (`max_tokens`, `max_completion_tokens`, or `max_output_tokens`). Refused, not clamped, so the caller is never silently given a different request than it sent. `0` disables. |
 | `max_in_flight` | integer | `1024` | Concurrent requests this replica admits. `0` disables. |
 | `max_in_flight_streams` | integer | `512` | Of those, how many may be streams. A stream holds a socket and a relay task for as long as the answer lasts, so it is the scarcer resource. Must not exceed `max_in_flight` when both are set. `0` disables. |
@@ -343,6 +343,18 @@ many may be in flight at once.
 | `max_stream_bytes` | integer | `67108864` | Bytes one stream may relay before it is ended. `0` disables. |
 
 Except for `max_request_bytes`, `0` means "this ceiling is off".
+
+The two input bounds are related, and the body bound wins ties. The estimate
+`max_prompt_tokens` is compared against is the serialized request divided by four
+bytes per token, and the router has already refused anything over
+`max_request_bytes`, so a prompt ceiling above `max_request_bytes` / 4 can never
+be reached: at the shipped defaults `max_request_bytes` alone refuses at roughly
+525 000 estimated tokens, well under the `1000000` ceiling. That pairing is
+deliberate — the shipped prompt ceiling refuses what no provider would serve,
+and the body ceiling is the operative input bound. Lower `max_prompt_tokens`
+below `max_request_bytes` / 4 if you want a prompt-shaped refusal
+(`413 prompt_too_large`) rather than a size-shaped one (`413 request_too_large`),
+or raise `max_request_bytes` to make the token ceiling the binding one.
 
 ### Where shedding happens
 
