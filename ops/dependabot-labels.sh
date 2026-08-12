@@ -130,7 +130,17 @@ if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
     exit 0
 fi
 
-existing="$(gh api "repos/$REPOSITORY/labels" --paginate --jq '.[].name')"
+# A refused query is not evidence about the labels, so say which of the two it
+# was. Listing labels is Issues-scoped and needs no permission on a public
+# repository; a private one needs `issues: read` on the job.
+errors="$(mktemp)"
+trap 'rm -f "$errors"' EXIT
+if ! existing="$(gh api "repos/$REPOSITORY/labels" --paginate --jq '.[].name' 2>"$errors")"; then
+    cat "$errors" >&2
+    echo "could not list the labels on $REPOSITORY, so nothing here was verified" >&2
+    echo "In a workflow job a private repository needs 'issues: read'." >&2
+    exit 1
+fi
 
 missing=()
 for label in "${labels[@]}"; do

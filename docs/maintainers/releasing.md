@@ -299,6 +299,12 @@ verified, so the lane carries its own evidence:
 dependabot labels exist on Litvue/axond (area:operations)
 ```
 
+The job keeps the workflow's `contents: read` and adds nothing: listing labels is
+Issues-scoped, and GitHub serves it without any permission while the repository is
+public. If `axond` ever becomes private, that query starts returning 403 and the
+check says so and fails rather than reporting a verified label — the fix is
+`issues: read` on this job alone, not a wider workflow grant.
+
 Its `--self-test` (also run in the lane) covers the ways the check could pass
 while verifying nothing: a neighbouring `- package-ecosystem:` entry read as a
 label, a config that moved or was renamed, and a `labels:` key written in a shape
