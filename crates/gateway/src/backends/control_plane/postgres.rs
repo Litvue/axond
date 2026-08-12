@@ -77,6 +77,41 @@ pub struct ControlPlaneSettings {
     pub hydration: HydrationLimits,
 }
 
+impl ControlPlaneSettings {
+    /// The settings a `[control_plane]` section asks for.
+    ///
+    /// Every field the section can express is mapped here, so a setting an
+    /// operator writes cannot be silently ignored by a code path that built its
+    /// own defaults instead. The fields it cannot express — the idempotency
+    /// retention window and the hydration limits — are runtime serving
+    /// parameters rather than connection or schema ones, and keep their defaults.
+    pub fn from_config(control_plane: &crate::config::ControlPlane) -> Self {
+        Self {
+            schema: control_plane
+                .schema
+                .as_deref()
+                .map(str::trim)
+                .filter(|schema| !schema.is_empty())
+                .map(str::to_owned),
+            migrate: control_plane.migrate,
+            connect_timeout: Duration::from_millis(control_plane.connect_timeout_ms),
+            operation_timeout: Duration::from_millis(control_plane.operation_timeout_ms),
+            ..Self::default()
+        }
+    }
+
+    /// The settings a maintenance command runs with: the operator's connection
+    /// and schema, and never boot's permission to migrate. `axond migrate apply`
+    /// is the mutation, and it is explicit; nothing else may become one because
+    /// the config happened to allow boot migrations.
+    pub fn for_maintenance(control_plane: &crate::config::ControlPlane) -> Self {
+        Self {
+            migrate: false,
+            ..Self::from_config(control_plane)
+        }
+    }
+}
+
 impl Default for ControlPlaneSettings {
     fn default() -> Self {
         Self {
@@ -123,6 +158,34 @@ impl PostgresControlPlane {
         dsn: &str,
         settings: ControlPlaneSettings,
     ) -> Result<Self, ControlPlaneError> {
+        let (store, mut client) = Self::open(dsn, settings).await?;
+        store.prepare_schema(&mut client).await?;
+        *store.client.lock().await = Some(client);
+        Ok(store)
+    }
+
+    /// Connect for schema maintenance, without deciding anything about the schema.
+    ///
+    /// [`connect`](Self::connect) is a boot: it refuses a schema it cannot serve.
+    /// A `status` command has to *report* that schema instead, and an `apply` has
+    /// to be able to run against the database a boot just refused, so this checks
+    /// the server version — a statement no migration can survive an older server
+    /// running — and stops there. The store it returns is not for serving: it has
+    /// not established that the journal is the one this build writes.
+    pub async fn connect_for_maintenance(
+        dsn: &str,
+        settings: ControlPlaneSettings,
+    ) -> Result<Self, ControlPlaneError> {
+        let (store, client) = Self::open(dsn, settings).await?;
+        *store.client.lock().await = Some(client);
+        Ok(store)
+    }
+
+    /// Connect and check the server, leaving the schema decision to the caller.
+    async fn open(
+        dsn: &str,
+        settings: ControlPlaneSettings,
+    ) -> Result<(Self, Client), ControlPlaneError> {
         let mut config: Config = dsn.parse().map_err(|error| {
             denied(format!(
                 // The DSN itself is never echoed: it carries a password.
@@ -148,33 +211,88 @@ impl PostgresControlPlane {
             ids: Uuid7Generator::new(),
             client: tokio::sync::Mutex::new(None),
         };
-        let mut client =
-            tokio::time::timeout(store.settings.connect_timeout, store.connect_client())
-                .await
-                .map_err(|_| ControlPlaneError::Unavailable {
-                    backend: BACKEND,
-                    message: "connection timed out".to_owned(),
-                })?
-                .map_err(|error| unavailable("connect", &error))?;
+        let client = tokio::time::timeout(store.settings.connect_timeout, store.connect_client())
+            .await
+            .map_err(|_| ControlPlaneError::Unavailable {
+                backend: BACKEND,
+                message: "connection timed out".to_owned(),
+            })?
+            .map_err(|error| unavailable("connect", &error))?;
         store.check_server_version(&client).await?;
-        store.prepare_schema(&mut client).await?;
-        *store.client.lock().await = Some(client);
-        Ok(store)
+        Ok((store, client))
     }
 
-    /// The schema state a database is in, for a status command or a boot refusal.
-    pub async fn schema_status(&self) -> Result<SchemaStatus, ControlPlaneError> {
+    /// Apply every migration the journal is missing, and report which ones.
+    ///
+    /// Forward-only and idempotent: a journal that is already current is left
+    /// untouched and reports nothing applied, so re-running an `apply` is not a
+    /// second migration. A journal this build cannot own — [`SchemaStatus::Ahead`]
+    /// or [`SchemaStatus::Drifted`] — is refused with [`ControlPlaneError::Denied`]
+    /// rather than written to, because writing more DDL over it makes the
+    /// disagreement worse rather than better.
+    ///
+    /// The whole read-and-apply is one transaction under the same advisory lock
+    /// boot takes, so this is safe to run while replicas are starting.
+    pub async fn apply_migrations(&self) -> Result<Vec<i32>, ControlPlaneError> {
         self.run(|client| {
             Box::pin(async move {
                 let transaction = client
                     .transaction()
                     .await
-                    .map_err(|error| unavailable("begin schema read", &error))?;
+                    .map_err(|error| unavailable("begin schema transaction", &error))?;
+                transaction
+                    .query_one("SELECT pg_advisory_xact_lock($1::bigint)", &[&SCHEMA_LOCK])
+                    .await
+                    .map_err(|error| unavailable("acquire schema lock", &error))?;
                 let status = schema::status(&transaction)
                     .await
                     .map_err(|error| unavailable("read schema status", &error))?;
-                // Read-only: rolled back rather than committed, so a status query
-                // cannot be the thing that changed something.
+                if !status.is_migratable() && !status.is_current() {
+                    return Err(denied(status.to_string()));
+                }
+                let pending = schema::pending(&status);
+                schema::migrate(&transaction, &status)
+                    .await
+                    .map_err(|error| unavailable("apply migrations", &error))?;
+                let migrated = schema::status(&transaction)
+                    .await
+                    .map_err(|error| unavailable("re-read schema status", &error))?;
+                if !migrated.is_current() {
+                    return Err(denied(format!(
+                        "migrations were applied but the schema is still not current: {migrated}"
+                    )));
+                }
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| unavailable("commit schema transaction", &error))?;
+                Ok(pending)
+            })
+        })
+        .await
+    }
+
+    /// The schema state a database is in, for a status command or a boot refusal.
+    ///
+    /// Read-only as the *database* enforces it, not just by convention: the
+    /// transaction is opened `READ ONLY`, so a statement that tried to write
+    /// would be rejected by the server rather than by this code being careful.
+    /// A status command an operator runs against production has to be a thing
+    /// that cannot change production.
+    pub async fn schema_status(&self) -> Result<SchemaStatus, ControlPlaneError> {
+        self.run(|client| {
+            Box::pin(async move {
+                let transaction = client
+                    .build_transaction()
+                    .read_only(true)
+                    .start()
+                    .await
+                    .map_err(|error| unavailable("begin read-only schema read", &error))?;
+                let status = schema::status(&transaction)
+                    .await
+                    .map_err(|error| unavailable("read schema status", &error))?;
+                // Rolled back rather than committed: nothing here is a change,
+                // so nothing here needs to be kept.
                 let _ = transaction.rollback().await;
                 Ok(status)
             })
