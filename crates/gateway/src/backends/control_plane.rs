@@ -179,6 +179,19 @@ pub enum ControlPlaneError {
     /// revision to name.
     #[error("control-plane storage is unreadable: {detail}")]
     CorruptStorage { detail: String },
+    /// A retained revision this build cannot interpret: a resource body written to
+    /// a schema this release does not read, or read *before* that body was typed.
+    ///
+    /// Not corruption and not an outage. The rows may be perfectly consistent, so
+    /// this must not page whoever owns storage integrity; what it needs is a build
+    /// that reads the revision, or a revision the deployed build reads. Nothing
+    /// partial is returned, and a replica that already holds a snapshot keeps
+    /// serving it — the same last-known-good behaviour every other refusal has.
+    #[error("stored revision {revision} is not compatible with this build: {source}")]
+    Incompatible {
+        revision: RevisionId,
+        source: Box<IntegrityError>,
+    },
     /// A retained revision is larger than this build reads. Not corruption — the
     /// rows may be perfectly consistent — and not an outage: it is a refusal to
     /// spend unbounded memory hydrating storage, and it needs an operator who can
@@ -203,6 +216,25 @@ impl ControlPlaneError {
         }
     }
 
+    /// Report an integrity failure under the classification the failure itself
+    /// carries: [`ControlPlaneError::Incompatible`] for a revision this build
+    /// cannot read, [`ControlPlaneError::Corrupt`] for storage that does not add
+    /// up.
+    ///
+    /// Hydration reports through this rather than through
+    /// [`ControlPlaneError::corrupt`] so the two never collapse into one alert:
+    /// see [`IntegrityError::is_incompatible`].
+    pub fn integrity(revision: RevisionId, source: IntegrityError) -> Self {
+        if source.is_incompatible() {
+            Self::Incompatible {
+                revision,
+                source: Box::new(source),
+            }
+        } else {
+            Self::corrupt(revision, source)
+        }
+    }
+
     /// Refuse a retained revision that exceeds a hydration bound.
     pub fn too_large(revision: RevisionId, limit: HydrationLimit) -> Self {
         Self::TooLarge { revision, limit }
@@ -219,7 +251,12 @@ impl BackendFailure for ControlPlaneError {
             | Self::ImmutableResourceVersion { .. }
             | Self::IdempotencyKeyReused { .. } => FailureCategory::Invalid,
             // A bound is policy, and policy is a refusal a retry cannot clear.
-            Self::Denied { .. } | Self::TooLarge { .. } => FailureCategory::Denied,
+            // An incompatible revision is the same shape of answer: intact
+            // storage this build declines to interpret, cleared by a deployment
+            // and never by a retry.
+            Self::Denied { .. } | Self::TooLarge { .. } | Self::Incompatible { .. } => {
+                FailureCategory::Denied
+            }
             Self::Corrupt { .. } | Self::CorruptStorage { .. } => FailureCategory::Corrupt,
         }
     }

@@ -17,6 +17,7 @@
 //! | [`resource`] | what a resource is: a generic envelope, versioned references, content-addressed blobs |
 //! | [`mutation`] | who changed it, under what expectation, and what the audit trail records |
 //! | [`revision`] | the complete state, the candidate that proposes it, the manifest that records it, and the integrity checks that let a replica trust it |
+//! | [`tenancy`] | the first two body schemas: what a tenant and a tenant-owned project are, and who owns what |
 //!
 //! # Three properties everything else rests on
 //!
@@ -42,7 +43,11 @@
 //!
 //! It is not wired into the request path. The runtime remains stateless: nothing
 //! here is constructed by `serve`, and no snapshot is compiled from a revision
-//! yet. The types are the contract that #165, #166, and #142 build against, and the
+//! yet. It is also not a complete body model: [`tenancy`] is the only schema the
+//! domain reads, and identity, provider, catalogue, pricing, and policy bodies
+//! remain owned by their own slices.
+//!
+//! The types are the contract that #165, #166, and #142 build against, and the
 //! test-only `oracle` module is the executable statement of how a
 //! `ControlPlaneStore` must behave when they do.
 
@@ -51,6 +56,7 @@ pub mod ids;
 pub mod mutation;
 pub mod resource;
 pub mod revision;
+pub mod tenancy;
 
 #[cfg(test)]
 pub(crate) mod fixtures;
@@ -83,4 +89,9 @@ pub use resource::{
 pub use revision::{
     DesiredState, IntegrityError, LoadedRevision, ManifestEntry, RevisionCandidate,
     RevisionManifest, ValidationError,
+};
+#[allow(unused_imports)]
+pub use tenancy::{
+    DisplayName, InvalidDisplayName, PROJECT_SCHEMA, Project, ProjectBody, QualifiedProject,
+    TENANT_SCHEMA, Tenancy, TenancyError, Tenant, TenantBody,
 };

@@ -92,9 +92,13 @@ pub enum LastKnownGoodError {
     Encoding(#[from] CanonicalError),
     #[error("last-known-good cache does not decode as canonical bytes: {0}")]
     Decode(#[from] CanonicalDecodeError),
-    /// The record was authentic but did not describe a consistent revision. An
-    /// operator alert, exactly as the same failure from Postgres is.
-    #[error("last-known-good cache holds a revision that does not add up: {0}")]
+    /// The record was authentic but this build did not accept the revision it
+    /// describes: either the rows do not add up, or they describe a revision this
+    /// build cannot read. The inner error says which, in the same words hydration
+    /// from Postgres uses, because the operator response differs — repair a cache
+    /// that is inconsistent, and expect an incompatible one on a replica that was
+    /// rolled back onto an older build.
+    #[error("last-known-good cache holds a revision this build did not accept: {0}")]
     Integrity(#[from] IntegrityError),
 }
 
@@ -139,10 +143,30 @@ impl LastKnownGood {
     /// this replica *served*, so a candidate that was refused can never become
     /// the state a cold boot restores.
     pub fn export(&self, revision: &LoadedRevision) -> Result<(), LastKnownGoodError> {
+        self.write_record(revision.manifest(), revision.state())
+    }
+
+    /// Write an authentic cache holding state this build would not assemble: what
+    /// a *newer* build's export looks like to an older one, which no code path on
+    /// this build can produce.
+    #[cfg(test)]
+    pub(crate) fn export_unassembled(
+        &self,
+        manifest: &RevisionManifest,
+        state: &DesiredState,
+    ) -> Result<(), LastKnownGoodError> {
+        self.write_record(manifest, state)
+    }
+
+    fn write_record(
+        &self,
+        manifest: &RevisionManifest,
+        state: &DesiredState,
+    ) -> Result<(), LastKnownGoodError> {
         let mut file = Vec::new();
         file.extend_from_slice(MAGIC);
         file.push(RECORD_VERSION);
-        let record = encode(revision)?;
+        let record = encode(manifest, state)?;
         let tag = hmac::sign(&self.key, &signed_bytes(&record));
         file.extend_from_slice(tag.as_ref());
         file.extend_from_slice(&record);
@@ -246,9 +270,7 @@ fn signed_bytes(record: &[u8]) -> Vec<u8> {
     signed
 }
 
-fn encode(revision: &LoadedRevision) -> Result<Vec<u8>, CanonicalError> {
-    let manifest = revision.manifest();
-    let state = revision.state();
+fn encode(manifest: &RevisionManifest, state: &DesiredState) -> Result<Vec<u8>, CanonicalError> {
     let record = CanonicalValue::map([
         ("manifest", encode_manifest(manifest)?),
         (
@@ -653,6 +675,29 @@ mod tests {
         assert_eq!(
             restored.expect("restored").manifest().checksum,
             revision.manifest().checksum
+        );
+        let _ = fs::remove_file(cache.path());
+    }
+
+    /// A rollback that reuses the volume: the cache is authentic, and this build
+    /// still cannot read the revision it holds. The refusal says which of the two
+    /// it is, because repairing a cache and rolling a replica forward are
+    /// different actions.
+    #[test]
+    fn a_cache_written_by_a_newer_build_is_an_incompatibility_not_damage() {
+        let cache = cache("newer-build");
+        let readable = revision(9, fixtures::state());
+        cache
+            .export_unassembled(readable.manifest(), &fixtures::state_with_legacy_tenant())
+            .expect("export succeeds");
+
+        let error = cache.load().expect_err("this build does not read it");
+        let LastKnownGoodError::Integrity(integrity) = error else {
+            panic!("an authentic record that does not assemble is an integrity failure: {error}");
+        };
+        assert!(
+            integrity.is_incompatible(),
+            "a body this build cannot read is a version skew, not damage: {integrity}"
         );
         let _ = fs::remove_file(cache.path());
     }

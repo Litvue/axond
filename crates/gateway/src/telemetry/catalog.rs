@@ -542,7 +542,12 @@ pub const CATALOG: &[MetricSpec] = &[
         unit: None,
         labels: &[Label::closed(
             "axond.revision.outcome",
-            &["exported", "export_failed", "restored"],
+            &[
+                "exported",
+                "export_failed",
+                "restored",
+                crate::convergence::reconciler::INCOMPATIBLE_REASON,
+            ],
         )],
     },
     MetricSpec {
@@ -863,6 +868,27 @@ mod tests {
         for reason in crate::convergence::reconciler::REVISION_REASONS {
             validate_label_value("axond.revision.rejections", "axond.revision.reason", reason)
                 .expect("every emitted rejection reason is catalogued");
+        }
+        // A label the reconciler produces without asking a category for it: read
+        // from the reconciler rather than from the list above, which the loop
+        // over the catalogue's own constant cannot notice going missing.
+        assert!(
+            crate::convergence::reconciler::REVISION_REASONS
+                .contains(&crate::convergence::reconciler::INCOMPATIBLE_REASON),
+            "a revision this build cannot read is labelled ahead of its category"
+        );
+        for outcome in [
+            "exported",
+            "export_failed",
+            "restored",
+            crate::convergence::reconciler::INCOMPATIBLE_REASON,
+        ] {
+            validate_label_value(
+                "axond.revision.last_known_good",
+                "axond.revision.outcome",
+                outcome,
+            )
+            .expect("every last-known-good outcome is catalogued");
         }
         for category in [
             crate::backends::FailureCategory::Unavailable,
