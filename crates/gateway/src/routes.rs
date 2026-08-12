@@ -65,6 +65,7 @@ use crate::shutdown::Phase;
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::streaming::{self, Framing, StreamContext};
 use crate::telemetry;
+use crate::usage::identity::EventIdentity;
 use crate::usage::{Status, UsageRecord};
 
 pub fn router(state: AppState) -> Router {
@@ -1099,6 +1100,12 @@ async fn serve(
         Admission::Denied(Denial::StoreUnavailable) => return Err(GatewayError::BudgetUnavailable),
     };
 
+    // The request is now admitted and will produce exactly one usage event, so
+    // its identity is minted here — once, while the server span is still current
+    // — and carried to whichever path settles it. A request refused above this
+    // line produces no event and therefore needs no identity.
+    let identity = EventIdentity::capture();
+
     if streamed {
         return stream_with_failover(
             &state,
@@ -1109,6 +1116,7 @@ async fn serve(
                 alias,
                 body,
                 wire: &wire,
+                identity,
                 hold: BudgetHold {
                     key: budget_key,
                     reservation,
@@ -1141,6 +1149,7 @@ async fn serve(
             record_usage(
                 &state,
                 RecordArgs {
+                    identity: &identity,
                     caller: &caller,
                     alias: &alias,
                     target_provider: &served.provider,
@@ -1172,6 +1181,7 @@ async fn serve(
             record_usage(
                 &state,
                 RecordArgs {
+                    identity: &identity,
                     caller: &caller,
                     alias: &alias,
                     target_provider: &served.provider,
@@ -1507,6 +1517,7 @@ async fn stream_with_failover(
         alias,
         body,
         wire,
+        identity,
         mut hold,
     } = request;
     let reservation_guard =
@@ -1617,7 +1628,7 @@ async fn stream_with_failover(
                 target_model: target.model.clone(),
                 source: plan.source,
                 credential_id: lease.id.clone(),
-                trace_id: telemetry::trace_id(),
+                identity: identity.clone(),
                 price: target.price,
                 budget_key: hold.key.clone(),
                 reservation: hold.reservation.clone(),
@@ -1676,6 +1687,7 @@ async fn stream_with_failover(
                     let reservation_for_open = hold.reservation.clone();
                     let estimate_for_open = hold.estimated_input_tokens;
                     let source_for_open = plan.source;
+                    let identity_for_open = identity.clone();
                     let parent_context_for_open =
                         attempt_span.as_ref().expect("attempt span").context();
                     let opener =
@@ -1690,6 +1702,7 @@ async fn stream_with_failover(
                             let budget_key = hold_key_for_open.clone();
                             let reservation = reservation_for_open.clone();
                             let parent_context = parent_context_for_open.clone();
+                            let identity = identity_for_open.clone();
                             Box::pin(async move {
                                 let ctx = StreamContext {
                                     namespace: caller.namespace,
@@ -1700,7 +1713,10 @@ async fn stream_with_failover(
                                     target_model: target.model.clone(),
                                     source: source_for_open,
                                     credential_id: next_lease.id.clone(),
-                                    trace_id: telemetry::trace_id(),
+                                    // The rotation serves the same request, so it
+                                    // carries the same event identity rather than
+                                    // re-reading a span it no longer runs under.
+                                    identity,
                                     price: target.price,
                                     budget_key,
                                     reservation,
@@ -1818,6 +1834,11 @@ struct StreamRequest<'a> {
     alias: String,
     body: Value,
     wire: &'a Wire,
+    /// The identity of the usage event this request will settle as, minted at
+    /// admission and cloned into every stream context the walk builds — including
+    /// a credential rotation's — so a stream that rotates, ends, is cancelled, or
+    /// never opens all report the same event.
+    identity: EventIdentity,
     hold: BudgetHold,
 }
 
@@ -2220,16 +2241,11 @@ fn requested_output_tokens(body: &Value) -> Option<u64> {
         .max()
 }
 
-/// Monotonic per-process request id. The trace it belongs to travels in the
-/// record's `trace_id`, which a caller's whole agent loop shares. `pub` so the
-/// streaming relay can stamp the same id on its settled usage record.
-pub fn next_request_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    format!("req_{:016x}", COUNTER.fetch_add(1, Ordering::Relaxed))
-}
-
 struct RecordArgs<'a> {
+    /// The event identity minted when the request was accepted, so the record
+    /// carries the id the rest of the request already referred to rather than
+    /// one invented at settlement.
+    identity: &'a EventIdentity,
     caller: &'a InboundKey,
     alias: &'a str,
     target_provider: &'a str,
@@ -2254,8 +2270,8 @@ async fn record_usage(state: &AppState, args: RecordArgs<'_>) {
     let attempts = args.attempts;
     let record = UsageRecord {
         schema_version: UsageRecord::SCHEMA_VERSION,
-        request_id: next_request_id(),
-        trace_id: telemetry::trace_id(),
+        request_id: args.identity.request_id.to_string(),
+        trace_id: args.identity.trace_id.clone(),
         namespace: args.caller.namespace.clone(),
         subject: args.caller.subject.clone(),
         signer_kid: args.caller.signer_kid.clone(),
@@ -2286,6 +2302,7 @@ mod tests {
     use crate::config::Config;
     use crate::principals::PrincipalAuthority;
     use crate::rate_limit::{InMemoryRateLimiter, NoLimit, RateLimitKey, RateLimiter};
+    use crate::usage::identity::RequestId;
     use crate::usage::{StdoutSink, UsageFanout, UsageSink};
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
@@ -5701,6 +5718,37 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(records[0].target_model, "m-b");
         assert_eq!(records[0].credential_id, "cred-b");
         assert_eq!(records[0].attempts, 2);
+    }
+
+    /// The identity contract as the buffered path delivers it: every settled
+    /// record carries a parseable, distinct, time-ordered event id, so a reader
+    /// can constrain `request_id` instead of deduplicating on
+    /// `(request_id, recorded_at)` and hoping two replicas never collide.
+    #[tokio::test]
+    async fn buffered_records_carry_distinct_time_ordered_event_identities() {
+        let (url_a, _) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let (url_b, _) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let captured = CapturingSink::default();
+        let router = router(two_target_state(&url_a, &url_b, "", captured.clone()));
+
+        for _ in 0..2 {
+            let response = router.clone().oneshot(chat_request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let records = captured.0.lock().unwrap();
+        let ids: Vec<RequestId> = records
+            .iter()
+            .map(|record| {
+                RequestId::parse(&record.request_id).unwrap_or_else(|e| {
+                    panic!("`{}` is not an event identity: {e}", record.request_id)
+                })
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids[0] < ids[1], "{ids:?} must sort in request order");
     }
 
     /// Affinity a continuation can recover requires the *initial* call to have
