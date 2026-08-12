@@ -15,8 +15,10 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 
 use super::catalog::{
-    CatalogError, CatalogModelMetadata, CatalogPrice, CatalogRefresh, CatalogSnapshot,
-    CatalogSource, CatalogVersion,
+    CatalogContent, CatalogError, CatalogModelEntry, CatalogProvider, CatalogRefresh,
+    CatalogSnapshot, CatalogSource, JsonPointer, Modality, ModelCapability, ModelFacts, ModelId,
+    ModelLimits, ObservedPrice, ObservedRate, PriceRates, ProviderEndpoint, ProviderId,
+    ProviderOffering, SchemaVersion, SourceValidators, source_snapshot,
 };
 use super::secrets::{
     KekRef, SecretDescriptor, SecretError, SecretMaterial, SecretResolver, SecretStore,
@@ -318,37 +320,69 @@ impl SecretStore for InMemorySecrets {
 
 /// A `CatalogSource` serving a fixed model list under a fixed upstream version.
 pub(crate) struct InMemoryCatalog {
-    version: CatalogVersion,
-    models: Vec<CatalogModelMetadata>,
+    validators: SourceValidators,
+    content: CatalogContent,
     transfers: AtomicUsize,
     unavailable: AtomicBool,
 }
 
 impl InMemoryCatalog {
-    pub(crate) fn with_models(models: &[(&str, &str)], version: &str) -> Self {
-        Self {
-            version: CatalogVersion(version.to_owned()),
-            models: models
-                .iter()
-                .map(|(provider, model)| CatalogModelMetadata {
-                    provider: (*provider).to_owned(),
-                    model: (*model).to_owned(),
+    /// A catalogue of `(provider, model)` offerings, served under `etag`.
+    pub(crate) fn with_models(models: &[(&str, &str)], etag: &str) -> Self {
+        let providers: Vec<CatalogProvider> = models
+            .iter()
+            .map(|(provider, _)| CatalogProvider {
+                id: ProviderId::parse(provider).expect("a canonical fake provider id"),
+                display_name: Some((*provider).to_owned()),
+                doc_url: None,
+                endpoint: ProviderEndpoint::default(),
+                env_vars: Vec::new(),
+                pointer: JsonPointer::new("").child("providers").child(provider),
+            })
+            .collect();
+        let entries: Vec<CatalogModelEntry> = models
+            .iter()
+            .map(|(provider, model)| {
+                let id = ModelId::parse(model).expect("a canonical fake model id");
+                let facts = ModelFacts {
                     display_name: Some((*model).to_owned()),
-                    context_window_tokens: Some(128_000),
-                    max_output_tokens: Some(16_384),
-                    price: Some(CatalogPrice {
-                        price: gateway_core::ModelPrice {
-                            input_microdollars_per_million: 2_500_000,
-                            output_microdollars_per_million: 10_000_000,
-                            reasoning_microdollars_per_million: None,
-                            cache_read_microdollars_per_million: None,
-                            cache_write_microdollars_per_million: None,
-                        },
-                        published_at: None,
-                    }),
-                    deprecated: false,
-                })
-                .collect(),
+                    capabilities: [ModelCapability::ToolCall].into_iter().collect(),
+                    input_modalities: [Modality::Text].into_iter().collect(),
+                    output_modalities: [Modality::Text].into_iter().collect(),
+                    limits: ModelLimits {
+                        context_tokens: Some(128_000),
+                        output_tokens: Some(16_384),
+                        ..ModelLimits::default()
+                    },
+                    ..ModelFacts::default()
+                };
+                let pointer = JsonPointer::new("")
+                    .child("providers")
+                    .child(provider)
+                    .child("models")
+                    .child(model);
+                CatalogModelEntry {
+                    id: id.clone(),
+                    neutral: Some(facts.clone()),
+                    offerings: vec![ProviderOffering {
+                        provider: ProviderId::parse(provider).expect("a canonical fake id"),
+                        model: id,
+                        published_model_id: (*model).to_owned(),
+                        facts,
+                        overrides: Vec::new(),
+                        price: Some(ObservedPrice::new(PriceRates::new(
+                            ObservedRate::from_nanos(2_500_000_000),
+                            ObservedRate::from_nanos(10_000_000_000),
+                        ))),
+                        endpoint: ProviderEndpoint::default(),
+                        pointer,
+                    }],
+                }
+            })
+            .collect();
+        Self {
+            validators: SourceValidators::etag(etag),
+            content: CatalogContent::new(providers, entries).expect("a consistent fake catalogue"),
             transfers: AtomicUsize::new(0),
             unavailable: AtomicBool::new(false),
         }
@@ -376,7 +410,7 @@ impl CatalogSource for InMemoryCatalog {
 
     async fn refresh(
         &self,
-        since: Option<&CatalogVersion>,
+        since: Option<&SourceValidators>,
     ) -> Result<CatalogRefresh, CatalogError> {
         if self.unavailable.load(Ordering::Relaxed) {
             return Err(CatalogError::Unavailable {
@@ -384,16 +418,23 @@ impl CatalogSource for InMemoryCatalog {
                 message: "fake catalogue source is unavailable".to_owned(),
             });
         }
-        if since == Some(&self.version) {
+        if since == Some(&self.validators) {
             return Ok(CatalogRefresh::Unchanged {
-                version: Some(self.version.clone()),
+                validators: self.validators.clone(),
             });
         }
         self.transfers.fetch_add(1, Ordering::Relaxed);
+        let source = source_snapshot(
+            "memory://catalogue",
+            SchemaVersion::MODELS_DEV_CATALOG_V1,
+            b"{}",
+            &self.content,
+            self.validators.clone(),
+            SystemTime::UNIX_EPOCH,
+        );
         Ok(CatalogRefresh::Updated(CatalogSnapshot {
-            retrieved_at: SystemTime::UNIX_EPOCH,
-            version: Some(self.version.clone()),
-            models: self.models.clone(),
+            source,
+            content: self.content.clone(),
         }))
     }
 }
