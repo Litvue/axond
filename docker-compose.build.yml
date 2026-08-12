@@ -1,0 +1,6 @@
+# Development/CI overlay: build and test the checked-out source instead of
+# pulling the released image used by the public quickstart.
+services:
+  axond:
+    build: .
+    image: axond:quickstart

@@ -26,6 +26,26 @@
           "type": "toml",
           "path": "Cargo.toml",
           "jsonpath": "$.workspace.dependencies.gateway-transport.version"
+        },
+        {
+          "type": "generic",
+          "path": "README.md"
+        },
+        {
+          "type": "generic",
+          "path": "docs/installation.md"
+        },
+        {
+          "type": "generic",
+          "path": "docker-compose.yml"
+        },
+        {
+          "type": "generic",
+          "path": "docs/deployment/docker-compose.md"
+        },
+        {
+          "type": "generic",
+          "path": "deploy/kubernetes/base/deployment.yaml"
         }
       ]
     }

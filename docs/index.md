@@ -1,0 +1,75 @@
+# Axond documentation
+
+Use this page as the task-oriented entry point. The architecture decision
+records explain *why* Axond works this way; the guides below explain how to use
+and operate it.
+
+## Evaluate Axond
+
+- [Getting started](./getting-started.md) — boot the public image, prove
+  authentication and routing, and make a first provider request.
+- [Compatibility contract](./compatibility.md) — supported routes, provider
+  wires, client behavior, and the `0.x` stability policy.
+- [State tiers](./configuration.md#state-tiers) — decide whether a deployment
+  needs Redis, Postgres, or neither.
+
+## Install
+
+- [Installation and verification](./installation.md) — crates.io, signed
+  binaries, OCI images, checksums, SBOMs, signatures, and attestations.
+- [Docker Compose](./deployment/docker-compose.md) — pull-first Tier 0 and
+  stateful local stacks.
+
+## Connect a client
+
+- [OpenAI clients](./clients/openai.md) — chat completions, Responses,
+  embeddings, streaming, Python, and TypeScript.
+- [Anthropic clients](./clients/anthropic.md) — native Messages and streaming.
+- [Compatibility contract](./compatibility.md) — route and wire-family matrix.
+
+## Configure
+
+- [Configuration reference](./configuration.md) — every key, default, and
+  validation rule.
+- [`axond.example.toml`](../axond.example.toml) — the complete annotated
+  configuration surface.
+- [Minted-token guide](./minted-token-guide.md) — key generation, issuance,
+  scopes, rotation, delegation, and revocation.
+
+## Deploy
+
+- [Deployment overview](./deployment.md) — choose an environment.
+- [Container runtime](./deployment/container.md) — Docker or Podman, image
+  verification, mounts, and runtime contract.
+- [Linux and systemd](./deployment/systemd.md) — prebuilt binary and hardened
+  service unit.
+- [Kubernetes](./deployment/kubernetes.md) — ConfigMap, Secret, Deployment,
+  Service, probes, security context, and rollout constraints.
+- [Managed containers](./deployment/managed-containers.md) — the portable
+  contract for ECS/Fargate, Cloud Run, Azure Container Apps, and Nomad.
+- [Stateful backends](./deployment/stateful-backends.md) — Redis/Postgres
+  availability, migrations, and scaling consequences.
+- [Production checklist](./deployment/production-checklist.md) — security,
+  streaming, rollout, observability, and recovery review.
+
+## Operate
+
+- [Observability and runbook](./observability.md) — traces, metrics, logs,
+  usage records, alerts, boot failures, and reloads.
+- [Troubleshooting](./operations/troubleshooting.md) — symptom and typed-error
+  decision tree.
+- [Upgrades and rollback](./operations/upgrades.md) — compatibility policy,
+  migration ordering, mixed-version rules, and rollback limits.
+- [Usage schema](./usage-schema.md) — durable row contract and delivery
+  guarantees.
+- [Deployment security model](./security/deployment-model.md) — trust
+  boundaries, TLS termination, secret delivery, and image verification.
+
+## Develop and maintain
+
+- [Contributing](../CONTRIBUTING.md) — local checks and dependency-lock policy.
+- [Release runbook](./maintainers/releasing.md) — release-please, artifact
+  repair, crates.io ordering, and verification.
+- [Release readiness](../RELEASE.md) — current public-beta evidence and known
+  limitations.
+- [Architecture decisions](./adr) — accepted design decisions and consequences.

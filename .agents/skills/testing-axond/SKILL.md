@@ -48,9 +48,9 @@ Every route except the `/healthz` and `/readyz` liveness probes needs
 the env var named by `[[gateway_key]] env`, not the env var name).
 
 Typed errors are `{"error":{"type":...,"message":...}}`; useful ones you can trigger with
-no upstream: `401 unauthorized`, `404 unknown_model`, `501 not_implemented`
-(`POST /v1/responses`), `400 unsupported_wire` (send an OpenAI-kind alias to `/v1/messages`
-or an Anthropic-kind alias to `/v1/chat/completions`).
+no upstream: `401 unauthorized`, `404 unknown_model`, `400 unsupported_wire` (send an
+OpenAI-kind alias to `/v1/messages` or an Anthropic-kind alias to
+`/v1/chat/completions`). `/v1/responses` is a supported native OpenAI passthrough.
 
 ### Black-box testing `/v1/credentials`
 

@@ -22,6 +22,13 @@ test:
 docs:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
 
+# Validate documentation links, release markers, route coverage, and Compose variants.
+docs-check:
+    python3 ops/check-docs.py
+    docker compose --env-file ops/compose/env.example config --quiet
+    docker compose --env-file ops/compose/env.example -f docker-compose.yml -f docker-compose.build.yml config --quiet
+    AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml docker compose --env-file ops/compose/env.example -f docker-compose.yml -f docker-compose.stateful.yml --profile stateful config --quiet
+
 # Supply-chain policy: advisories, licenses, sources (see deny.toml).
 deny:
     cargo deny --locked --all-features check
