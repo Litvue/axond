@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.17](https://github.com/Litvue/axond/compare/v0.3.16...v0.3.17) (2026-08-12)
+
+
+### Features
+
+* **tenancy:** land typed tenant/project resource schemas and stateful projection foundation ([#203](https://github.com/Litvue/axond/issues/203)) ([e4c44a0](https://github.com/Litvue/axond/commit/e4c44a0ab89f9830bee474b44196225cffa1c420))
+
+
+### Tests
+
+* **release:** smoke-test every supported binary target ([#227](https://github.com/Litvue/axond/issues/227)) ([7bed10a](https://github.com/Litvue/axond/commit/7bed10a576c34f5f520554dcf8dbc4bab3ab6773))
+
 ## [0.3.16](https://github.com/Litvue/axond/compare/v0.3.15...v0.3.16) (2026-08-12)
 
 
