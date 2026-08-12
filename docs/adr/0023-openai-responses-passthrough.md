@@ -77,4 +77,6 @@ Retrieval and cancellation must be performed against the provider directly
 because those routes are intentionally not served. An optional affinity store
 mapping response ids to the serving target and credential remains the way to
 restore failover later; it would be separately selectable and would not raise
-the required tier of a stateless deployment.
+the required tier of a stateless deployment, whose default `mode = "stateless"`
+boot stays free of any backend
+([ADR 0027](./0027-stateless-and-stateful-operating-modes.md)).
