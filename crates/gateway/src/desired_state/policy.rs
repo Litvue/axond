@@ -637,14 +637,20 @@ impl PolicyBody {
             field: RESERVATION_TTL_FIELD,
             source: Box::new(source),
         })?;
-        let concurrency = ConcurrencyPolicy::new(
-            record.integer(MAX_IN_FLIGHT_FIELD)?,
-            record.integer(LEASE_TTL_FIELD)?,
-        )
-        .map_err(|source| PolicyError::FieldRange {
-            reference: resource.reference,
-            field: MAX_IN_FLIGHT_FIELD,
-            source: Box::new(source),
+        let max_in_flight = record.integer(MAX_IN_FLIGHT_FIELD)?;
+        let lease_ttl = record.integer(LEASE_TTL_FIELD)?;
+        let concurrency = ConcurrencyPolicy::new(max_in_flight, lease_ttl).map_err(|source| {
+            PolicyError::FieldRange {
+                reference: resource.reference,
+                // Two fields share one bound, so the refusal names the one that
+                // broke it rather than the first one checked.
+                field: if max_in_flight == 0 {
+                    MAX_IN_FLIGHT_FIELD
+                } else {
+                    LEASE_TTL_FIELD
+                },
+                source: Box::new(source),
+            }
         })?;
         Ok(Self {
             scope,
@@ -1665,6 +1671,27 @@ mod tests {
                 source: Box::new(InvalidPolicy::NotRepresentable { value: -30 }),
             }),
             "a value this build cannot enforce is refused, not saturated into one it can"
+        );
+        assert_eq!(
+            PolicyBody::read(&edited(|fields| {
+                set(fields, LEASE_TTL_FIELD, CanonicalValue::integer(0u32));
+            })),
+            Err(PolicyError::FieldRange {
+                reference,
+                field: LEASE_TTL_FIELD,
+                source: Box::new(InvalidPolicy::TooSmall { value: 0, min: 1 }),
+            }),
+            "a refusal names the field that broke a bound, not the one checked first"
+        );
+        assert_eq!(
+            PolicyBody::read(&edited(|fields| {
+                set(fields, MAX_IN_FLIGHT_FIELD, CanonicalValue::integer(0u32));
+            })),
+            Err(PolicyError::FieldRange {
+                reference,
+                field: MAX_IN_FLIGHT_FIELD,
+                source: Box::new(InvalidPolicy::TooSmall { value: 0, min: 1 }),
+            })
         );
         assert!(matches!(
             PolicyBody::read(&edited(|fields| {
