@@ -53,10 +53,10 @@ wave 0  (landed)   revision journal · convergence loop · LKG cache · prefligh
                    #254 /admin/v1 protocol boundary        #275 SecretStore (#145)
                    #207 catalogue import                   #143 admin API/CLI served
                    #251 approved price books               #247 catalogue aliases
+                   #252 tenancy/principals/RBAC/audit
                         │
-wave 1  (in flight) #252 tenancy/principals/RBAC/audit      #244 empty-ledger adoption
-                    #255 model enablement + project aliases #249 usage outbox
-                    #276 runtime policy activation
+wave 1  (in flight) #255 model enablement + project aliases #244 empty-ledger adoption
+                    #276 runtime policy activation          #249 usage outbox
                         │
 wave 2  (integration) IG-01 … IG-05: boot → connect → hydrate → compile → publish → serve
                         │
@@ -89,9 +89,9 @@ here without a scenario, or a scenario without a row, fails the suite.
 | --- | --- | --- | --- | --- | --- |
 | IG-01 | Explicit operating modes | `serve` boots stateless with no datastore, and a stateful bootstrap either reaches its control plane and serves `/admin/v1` — refusing inference while no revision is compiled — or fails loudly on the reference it could not resolve | | `stateless_boot_serves_with_no_control_plane`, `stateful_boot_serves_administration_and_refuses_inference`, `stateful_boot_refuses_an_unresolved_reference` | wired |
 | IG-02 | Postgres-first control plane | Operator preflight, forward-only migration, and the connect a replica performs before it serves | #244 | `preflight_describes_a_stateless_install`, `migrate_prepares_a_control_plane_before_replicas_start` | wired |
-| IG-03 | Configuration changes take effect atomically, without a restart | Hydrate the head revision, compile it into a whole snapshot, publish it atomically, keep serving the previous one when compilation or the database fails | #252, #255, #276 | `hydrate_compile_publish_is_one_atomic_step` | blocked |
+| IG-03 | Configuration changes take effect atomically, without a restart | Hydrate the head revision, compile it into a whole snapshot, publish it atomically, keep serving the previous one when compilation or the database fails | #255, #276 | `hydrate_compile_publish_is_one_atomic_step` | blocked |
 | IG-04 | Provider secrets rotate without redeployment | Resolve every credential a candidate snapshot needs through the SecretStore during compilation, never on the request path | IG-03 | `secrets_resolve_during_compilation_only` | blocked |
-| IG-05 | Every mutation validated, revisioned, authorized, audited | The authenticated `/admin/v1` path from request to published revision, including breakglass | #252 | `an_admin_mutation_publishes_an_audited_revision` | blocked |
+| IG-05 | Every mutation validated, revisioned, authorized, audited | The authenticated `/admin/v1` path from request to published revision, including breakglass | | `an_admin_mutation_publishes_an_audited_revision` | blocked |
 | IG-06 | No control-plane reads on ordinary inference | Routing, catalogue, authentication, and pricing read only the published snapshot | IG-03 | `inference_touches_no_control_plane_connection` | blocked |
 | IG-07 | Control-plane loss leaves last-known-good serving | Bounded backoff, staleness reporting, and cold boot from the signed last-known-good cache | IG-03 | `control_plane_loss_keeps_the_last_known_good_snapshot_serving` | blocked |
 | IG-08 | Bounded, observable runtime | Readiness reflects convergence rather than process liveness; `/status` reports desired, loaded, active, and lag | IG-03, #238 | `readiness_and_status_report_convergence` | blocked |
@@ -113,12 +113,12 @@ IG-11 have no served revision to assert against, which is why their scenarios
 assert today's inference refusal instead. Much of its foundation is on main — the
 policy document type (#253), the derived availability contracts (#250), the
 `/admin/v1` boundary and its served runtime (#254, #143), the models.dev
-catalogue import (#207), and the envelope-encrypted SecretStore (#275), on top of
-the wave-0 journal, convergence loop, and last-known-good cache. What a compiled
-snapshot still cannot resolve is *who* a request belongs to and *what* it may
-reach: tenancy, principals, and RBAC (#252), model enablement and project aliases
-(#255), and runtime policy activation (#276). A compilation wired before those
-land would hydrate a revision it cannot fully compile.
+catalogue import (#207), the envelope-encrypted SecretStore (#275), and now
+tenancy, principals, RBAC and audit boundaries (#252), on top of the wave-0
+journal, convergence loop, and last-known-good cache. What a compiled snapshot
+still cannot resolve is *what* a request may reach: model enablement and project
+aliases (#255), and runtime policy activation (#276). A compilation wired before
+those land would hydrate a revision it cannot fully compile.
 
 So the next integration pull request is IG-03, opened when those are on main —
 not against their branches, and not duplicating the compilation a contract slice
