@@ -521,7 +521,15 @@ jobs:
           subject-digest: ${{ steps.image.outputs.digest }}
           sbom-path: axond-image-${{ needs['release-metadata'].outputs.version }}-${{ matrix.arch }}.spdx.json
           push-to-registry: true
+      # The cosign binary is pinned to the 2.x line, independently of the
+      # installer's own version: cosign 3 signs in the protobuf bundle format and
+      # stores the signature as an OCI 1.1 referring artifact by default, which a
+      # consumer running cosign 2.x cannot find. docs/installation.md publishes a
+      # bare `cosign verify`, so the format is part of the release contract and
+      # only moves with those instructions.
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.5.2
       - name: Sign the digest keylessly
         run: cosign sign --yes "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"
       - name: Verify the signature and attestations
@@ -702,7 +710,11 @@ jobs:
           INDEX_TAGS: ${{ needs['release-metadata'].outputs.version }} sha-${{ needs['release-metadata'].outputs.short_sha }}
           EXPECT_INDEX_DIGEST: ${{ needs['release-image-index'].outputs.digest }}
         run: bash ops/publish-image-index.sh
+      # Pinned to the 2.x line for the same reason as the per-architecture lane:
+      # the signature format consumers verify is part of the release contract.
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.5.2
       - name: Sign the index digest keylessly
         run: cosign sign --yes "${IMAGE_NAME}@${INDEX_DIGEST}"
       # Provenance, signature, and platform assertions apply to the index; SBOM

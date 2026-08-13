@@ -334,6 +334,20 @@ just workflow-policy   # pins, permissions, signer restrictions, Dependabot labe
 just actionlint        # workflow linting; downloads the pinned actionlint
 ```
 
+`sigstore/cosign-installer` needs one pin more than its own SHA: the cosign
+binary it installs, named by `cosign-release`. The installer's default tracks its
+major version, so bumping the Action changes what `cosign sign` writes. cosign 3
+defaults to the protobuf bundle format stored as an OCI 1.1 referring artifact,
+while cosign 2 writes the `sha256-<digest>.sig` tag that
+[the verification instructions](../installation.md) hand to operators — and
+because the release verifies its own output with the same binary that produced
+it, a format change passes every lane and fails only in an operator's terminal.
+The release therefore pins cosign to the 2.x line, and
+[`ops/check-release-config.py`](../../ops/check-release-config.py) fails if an
+installer step drops that pin or moves off it. Adopting cosign 3 is a deliberate
+migration: the published verification instructions, the operator-facing docs, and
+that check move in the same change, not in a dependency bump.
+
 Everything in that lane is offline except the label check
 ([`ops/dependabot-labels.sh`](../../ops/dependabot-labels.sh)), which needs an
 authenticated `gh` and reports that it skipped when there is none. It also skips
