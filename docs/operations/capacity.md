@@ -29,6 +29,22 @@ upstream over loopback and offers the profile's load at a fixed concurrency:
 | `mixed` | Both wire families, four routes, two providers, two credentials per provider, buffered and streamed interleaved. |
 | `response-size` | Buffered answers rotating over 1 KiB, 32 KiB, and 256 KiB bodies. |
 | `cancellation` | Streams where every second caller hangs up mid-answer. |
+| `tenants` | Two namespaces served at once, each with its own inbound key and its own credential pool, platform fallback off. |
+| `shedding` | More callers than the replica admits, each holding its slot while the upstream thinks. |
+| `backend-limits` | One healthy upstream per two that stall — one before response headers, one mid-body. |
+
+The last three profiles answer questions a throughput number cannot. `tenants`
+records, per namespace, what it offered, what it was served, what it was
+charged, and how many upstream calls carried *its own* credential — the
+credential itself is never recorded, only whose it was and how often. `shedding`
+boots a ceiling far below the load it offers, so what is measured is the refusal
+rather than the throughput. `backend-limits` boots a short transport bound and
+then stalls two upstreams out of three: every request has to end on the bound
+the replica declares rather than on the upstream relenting, and once a stalling
+target's circuit trips the rest are refused at once while the healthy target
+keeps serving every request sent to it. Each of the three also offers one more
+request after the load stops, because a ceiling that keeps a permit or a bound
+that keeps a slot is invisible in every other number on this page.
 
 Each run writes `target/capacity/<tier>/<profile>.json`: throughput, latency
 percentiles, TTFT and stream lifetime, RSS, CPU, sockets, occupancy, rejection
@@ -124,8 +140,17 @@ release-build qualification on known hardware before they can be promised.
 Hard failures, asserted on every reduced and heavy run, because none of them
 depends on how fast the runner was:
 
-- every offered request accepted (`min_accepted_fraction`),
+- every offered request accepted (`min_accepted_fraction`) — except where the
+  profile exists to be refused, where the refusal itself is bounded instead
+  (`min_rejected_fraction`, `max_rejected_fraction`, `max_error_fraction`),
 - nothing shed (`max_rejections`) and no errors (`max_errors`),
+- no request outliving the bound the replica declares (`max_over_deadline`) and
+  no untyped failure (`max_untyped_errors`),
+- no tenant served with a credential it does not own
+  (`max_foreign_credential_uses`) and no charge filed against a namespace that
+  did not send the request (`max_misattributed_usage_records`),
+- the replica still serving one request after the load stops
+  (`max_unserved_after_load`),
 - one usage record per admitted request (`max_missing_usage_records`), with
   cancelled streams settling as `client_cancelled`,
 - no upstream response body still open once every client is gone

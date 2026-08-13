@@ -34,6 +34,15 @@ pub struct CapacityResult {
     pub outcomes: Outcomes,
     pub usage_records: UsageRecords,
     pub upstream: Upstream,
+    /// Per-namespace accounting, for the profiles that serve more than one.
+    /// Absent — rather than empty — on a single-tenant profile, so a reader
+    /// cannot mistake "not measured" for "measured and nothing crossed".
+    pub tenancy: Option<Tenancy>,
+    /// How the run held to the bound the replica declares, for the profiles
+    /// that boot one an upstream will breach.
+    pub deadlines: Option<Deadlines>,
+    /// Whether the replica still served after the load stopped.
+    pub recovery: Option<Recovery>,
     pub verdicts: Vec<Verdict>,
 }
 
@@ -458,6 +467,11 @@ pub struct Occupancy {
     pub awaiting_first_byte_peak: u64,
     /// The admission queue the process was configured with, for context.
     pub admission_queue_capacity: u64,
+    /// The concurrency ceiling the profile booted the replica with, when it
+    /// sets one. Absent means the shipped default was left far above the
+    /// offered load, so the run measured the process rather than its own
+    /// shedding.
+    pub admission_max_in_flight: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -489,6 +503,51 @@ pub struct Upstream {
     pub streams_opened: u64,
     /// Upstream response bodies still open once every client is gone: a leak.
     pub streams_open_at_end: i64,
+}
+
+/// What each namespace offered, was served, and was charged for.
+#[derive(Debug, Clone, Serialize)]
+pub struct Tenancy {
+    pub by_namespace: BTreeMap<String, TenantCounts>,
+    /// Upstream calls that cannot be accounted for by their owner being
+    /// served: a tenant answered with a credential it does not own, or with
+    /// the platform pool it did not opt into.
+    pub foreign_credential_uses: u64,
+    /// Usage rows filed against a namespace that did not send them.
+    pub misattributed_usage_records: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct TenantCounts {
+    pub offered: u64,
+    pub accepted: u64,
+    pub rejected: u64,
+    pub usage_records: u64,
+    /// Requests the upstream saw bearing this namespace's own credential. The
+    /// credential itself is never recorded — only whose it was, and how often.
+    pub upstream_calls: u64,
+}
+
+/// The bound the replica declares for an upstream that stops answering, and
+/// what the run measured against it.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Deadlines {
+    pub bound_ms: u64,
+    /// How far past the bound a request may still end before it counts as
+    /// having outlived it, so a loaded runner does not fail a working bound.
+    pub slack_multiple: u32,
+    pub over_bound: u64,
+    pub max_latency_ms: f64,
+}
+
+/// One request offered after the load stopped. A ceiling that keeps a permit,
+/// or a bound that keeps a slot, is invisible in a throughput number and
+/// obvious here.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Recovery {
+    pub served: bool,
+    pub status: Option<u16>,
+    pub latency_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]

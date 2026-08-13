@@ -6,7 +6,7 @@
 //! open, which is what makes an upstream connection leak observable: a soak run
 //! asserts opens and closes balance once the clients are gone.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -183,6 +183,13 @@ pub fn fixture(name: &str) -> Bytes {
 
 pub struct UpstreamState {
     requests: Mutex<VecDeque<Recorded>>,
+    /// How many requests arrived bearing each presented credential, kept for
+    /// every request rather than only the retained ones: a multi-tenant run
+    /// offers more requests than [`RECORDED_LIMIT`], and "was anyone served
+    /// with someone else's key" has to be answered over all of them. The keys
+    /// are the fixture secrets the harness itself set, and stay in this
+    /// process — a caller that publishes a tally maps them to labels first.
+    credentials: Mutex<BTreeMap<String, u64>>,
     counters: Counters,
     fixtures: Fixtures,
 }
@@ -197,6 +204,12 @@ impl UpstreamState {
             .iter()
             .cloned()
             .collect()
+    }
+
+    /// Every credential the gateway presented, and how many requests carried
+    /// it. Exact over the whole run.
+    pub fn credentials(&self) -> BTreeMap<String, u64> {
+        self.credentials.lock().expect("upstream lock").clone()
     }
 
     /// How many requests arrived, whether or not they were retained.
@@ -242,6 +255,7 @@ impl FakeUpstream {
     pub async fn start() -> Self {
         let state = Arc::new(UpstreamState {
             requests: Mutex::new(VecDeque::new()),
+            credentials: Mutex::new(BTreeMap::new()),
             counters: Counters::default(),
             fixtures: Fixtures::load(),
         });
@@ -300,6 +314,14 @@ async fn handle(
             .map(str::to_owned)
     };
     state.counters.received.fetch_add(1, Ordering::SeqCst);
+    if let Some(presented) = header("authorization").or_else(|| header("x-api-key")) {
+        *state
+            .credentials
+            .lock()
+            .expect("upstream lock")
+            .entry(presented)
+            .or_default() += 1;
+    }
     {
         let mut recorded = state.requests.lock().expect("upstream lock");
         if recorded.len() == RECORDED_LIMIT {

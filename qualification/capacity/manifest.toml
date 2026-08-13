@@ -108,6 +108,107 @@ max_leaked_upstream_streams = 0
 max_rss_growth_kib = 262144
 
 [[profile]]
+id = "tenants"
+workload = "tenants"
+description = """
+Two namespaces served at once, each with its own inbound key and its own \
+credential pool, buffered and streamed requests interleaved. Platform fallback \
+is off, so every dispatch has to be paid for by the caller's own credential."""
+
+[profile.reduced]
+concurrency = 8
+requests = 96
+
+[profile.heavy]
+concurrency = 128
+requests = 12000
+
+[profile.thresholds]
+min_accepted_fraction = 1.0
+max_rejections = 0
+max_errors = 0
+max_missing_usage_records = 0
+max_leaked_upstream_streams = 0
+max_rss_growth_kib = 262144
+# Concurrency is what makes a mix-up possible, so it is what is asserted: no
+# tenant was ever served with a credential it does not own, and no row was
+# filed against a namespace that did not send the request.
+max_foreign_credential_uses = 0
+max_misattributed_usage_records = 0
+
+[[profile]]
+id = "shedding"
+workload = "shedding"
+description = """
+More callers than the replica admits, each holding its slot for as long as the \
+upstream takes to answer. The ceiling has to bite, the shed callers have to be \
+turned away rather than queued or served badly, and the permits have to come \
+back when the load stops."""
+# Far below the offered concurrency below, so shedding is the profile rather
+# than an accident of how fast the runner served.
+max_in_flight = 8
+
+[profile.reduced]
+concurrency = 64
+requests = 640
+
+[profile.heavy]
+concurrency = 512
+requests = 20000
+
+[profile.thresholds]
+# A shed request is the point of this profile, so the acceptance floor only says
+# that the replica kept serving at its ceiling while it shed. What the run has
+# to show is the rest: the ceiling bit, it did not swallow everything, nothing
+# failed, and the next caller after the storm was served.
+min_accepted_fraction = 0.0005
+min_rejected_fraction = 0.5
+max_rejected_fraction = 0.999
+max_errors = 0
+max_missing_usage_records = 0
+max_leaked_upstream_streams = 0
+max_rss_growth_kib = 262144
+max_unserved_after_load = 0
+
+[[profile]]
+id = "backend-limits"
+workload = "backend_limits"
+description = """
+One healthy answer per two upstreams that stop answering — one before response \
+headers, one after them and mid-body. Every request has to end on the bound \
+the replica declares, with a typed verdict and a settled charge; once a \
+stalling target has failed often enough its circuit trips and the rest are \
+turned away at once, and the healthy target keeps serving every request sent \
+to it throughout."""
+# The transport bound the profile boots, and therefore the wall clock every
+# request must end inside.
+upstream_timeout_ms = 2000
+
+[profile.reduced]
+concurrency = 12
+requests = 96
+
+[profile.heavy]
+concurrency = 64
+requests = 1200
+
+[profile.thresholds]
+# Two of every three upstreams never answer, so two thirds of the requests end
+# either on the bound or — once that target's circuit has tripped — shed
+# immediately, which is the same protection arriving sooner. What must not
+# happen is a request that outlives the bound, an untyped body, a leaked
+# stream, or a charge that never settled.
+min_accepted_fraction = 0.333
+max_error_fraction = 0.667
+max_rejected_fraction = 0.667
+max_untyped_errors = 0
+max_over_deadline = 0
+max_missing_usage_records = 0
+max_leaked_upstream_streams = 0
+max_rss_growth_kib = 262144
+max_unserved_after_load = 0
+
+[[profile]]
 id = "cancellation"
 workload = "cancellation"
 description = """

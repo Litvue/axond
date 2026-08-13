@@ -22,6 +22,8 @@
 
 mod support;
 
+use std::collections::BTreeMap;
+
 use support::capacity::{self, CapacityResult, Gauges, ResourceReport, Span, Tier, Workload};
 use support::upstream;
 
@@ -54,13 +56,7 @@ fn the_committed_manifest_covers_every_workload_with_thresholds() {
     ids.dedup();
     assert_eq!(unique, ids.len(), "profile ids must be unique: {ids:?}");
 
-    for workload in [
-        Workload::Buffered,
-        Workload::Streaming,
-        Workload::Mixed,
-        Workload::ResponseSize,
-        Workload::Cancellation,
-    ] {
+    for workload in Workload::ALL {
         assert!(
             manifest
                 .profiles
@@ -80,18 +76,100 @@ fn the_committed_manifest_covers_every_workload_with_thresholds() {
                 tier.as_str()
             );
         }
+        let thresholds = &profile.thresholds;
         assert!(
-            profile.thresholds.min_accepted_fraction > 0.0,
+            thresholds.min_accepted_fraction > 0.0,
             "{}: a profile without an acceptance threshold asserts nothing",
             profile.id
         );
-        if profile.workload == Workload::Cancellation {
-            assert!(
+        // The absolute counts are optional because two profiles exist to
+        // provoke the outcome they bound. Optional must not become ungated: a
+        // profile bounds each of them as a count or as a fraction.
+        assert!(
+            thresholds.max_rejections.is_some() || thresholds.max_rejected_fraction.is_some(),
+            "{}: nothing bounds how much of the offered load may be shed",
+            profile.id
+        );
+        assert!(
+            thresholds.max_errors.is_some() || thresholds.max_error_fraction.is_some(),
+            "{}: nothing bounds how much of the offered load may fail",
+            profile.id
+        );
+        match profile.workload {
+            Workload::Cancellation => assert!(
                 profile.cancel_every.is_some(),
                 "{}: the cancellation workload needs `cancel_every`",
                 profile.id
-            );
+            ),
+            Workload::Shedding => {
+                let ceiling = profile
+                    .max_in_flight
+                    .expect("the shedding workload needs `max_in_flight`");
+                for tier in [Tier::Reduced, Tier::Heavy] {
+                    assert!(
+                        profile.scale(tier).concurrency as u64 > ceiling,
+                        "{} [{}]: a ceiling at or above the offered concurrency \
+                         would never shed, and the profile would pass by \
+                         measuring nothing",
+                        profile.id,
+                        tier.as_str()
+                    );
+                }
+                assert!(
+                    thresholds.min_rejected_fraction.unwrap_or_default() > 0.0,
+                    "{}: a shedding profile that need not shed asserts nothing",
+                    profile.id
+                );
+            }
+            Workload::BackendLimits => {
+                assert!(
+                    profile.upstream_timeout_ms.is_some(),
+                    "{}: the backend-limits workload needs `upstream_timeout_ms`",
+                    profile.id
+                );
+                assert_eq!(
+                    thresholds.max_over_deadline,
+                    Some(0),
+                    "{}: the bound the replica declares is the whole claim",
+                    profile.id
+                );
+            }
+            Workload::Tenants => assert_eq!(
+                (
+                    thresholds.max_foreign_credential_uses,
+                    thresholds.max_misattributed_usage_records
+                ),
+                (Some(0), Some(0)),
+                "{}: a multi-tenant profile that tolerates a crossed credential \
+                 or a misfiled charge is not an isolation claim",
+                profile.id
+            ),
+            Workload::Buffered | Workload::Streaming | Workload::Mixed | Workload::ResponseSize => {
+            }
         }
+    }
+}
+
+/// The tenant rotation splits the offered load evenly and exactly, for any
+/// request count: a per-tenant expectation divided out of the total would be
+/// wrong whenever the count is not a whole number of rotations, and the
+/// isolation assertion is built on it.
+#[test]
+fn the_tenant_rotation_accounts_for_every_offered_request() {
+    for offered in 0..64u64 {
+        let per_tenant: Vec<u64> = capacity::tenants()
+            .iter()
+            .map(|tenant| capacity::offered_per_tenant(offered, tenant))
+            .collect();
+        assert_eq!(
+            per_tenant.iter().sum::<u64>(),
+            offered,
+            "every offered request belongs to exactly one tenant: {per_tenant:?}"
+        );
+        assert!(
+            per_tenant.iter().max().unwrap_or(&0) - per_tenant.iter().min().unwrap_or(&0) <= 1,
+            "{offered} offered requests split unevenly: {per_tenant:?}"
+        );
     }
 }
 
@@ -385,10 +463,140 @@ fn assert_expected_outcomes(profile: &capacity::Profile, result: &CapacityResult
                 usage.by_status
             );
         }
+        Workload::Shedding => {
+            assert_eq!(
+                usage.by_status.get("ok").copied(),
+                Some(result.throughput.accepted + served_probe(result)),
+                "{}: every served request must settle as `ok`: {:?}",
+                profile.id,
+                usage.by_status
+            );
+            // Shed with the verdict that names the ceiling, rather than with
+            // a served-but-broken answer or a queue the caller cannot see.
+            assert_eq!(
+                error_types(&result.outcomes.rejections_by_error_type),
+                vec!["gateway_overloaded"],
+                "{}: a shed request must say the replica was full",
+                profile.id
+            );
+            assert!(
+                result.occupancy.admission_max_in_flight.is_some(),
+                "{}: a shedding run records the ceiling it booted",
+                profile.id
+            );
+            // Offered load is conserved: every caller was either served or
+            // told no, and none was left holding a request the replica had
+            // quietly dropped.
+            assert_eq!(
+                result.throughput.accepted + result.throughput.rejected + result.throughput.errors,
+                result.throughput.offered,
+                "{}: the offered load does not add up",
+                profile.id
+            );
+        }
+        Workload::Tenants => {
+            let tenancy = result
+                .tenancy
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}: a multi-tenant run records tenancy", profile.id));
+            for tenant in capacity::tenants() {
+                let counts = tenancy
+                    .by_namespace
+                    .get(tenant.namespace)
+                    .unwrap_or_else(|| panic!("{}: {} sent nothing", profile.id, tenant.namespace));
+                assert_eq!(
+                    counts.offered,
+                    capacity::offered_per_tenant(result.throughput.offered, tenant),
+                    "{}: {} did not offer its share of the rotation",
+                    profile.id,
+                    tenant.namespace
+                );
+                // Without this, a run where one tenant was served nothing —
+                // the loudest isolation failure there is — would satisfy every
+                // count above by having nothing to misattribute.
+                assert!(
+                    counts.accepted > 0 && counts.upstream_calls > 0,
+                    "{}: {} was never served, so nothing about it was measured",
+                    profile.id,
+                    tenant.namespace
+                );
+            }
+            assert!(
+                result.ttft_ms.is_some(),
+                "{}: the tenants must include streams",
+                profile.id
+            );
+        }
+        Workload::BackendLimits => {
+            let deadlines = result
+                .deadlines
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}: a bounded run records its bound", profile.id));
+            assert!(
+                result.throughput.errors > 0,
+                "{}: no upstream was cut off, so no bound was exercised",
+                profile.id
+            );
+            assert!(
+                deadlines.max_latency_ms >= deadlines.bound_ms as f64,
+                "{}: nothing waited for the bound, so the profile measured \
+                 healthy upstreams: {deadlines:?}",
+                profile.id
+            );
+            // A stalling target trips its own circuit, and everything after
+            // that is shed rather than made to wait out the bound again. That
+            // is the replica protecting itself, so it is allowed — but only
+            // with that verdict, and only for the stalling targets: the
+            // healthy one owes an answer to every request sent to it.
+            assert_eq!(
+                error_types(&result.outcomes.rejections_by_error_type),
+                if result.throughput.rejected > 0 {
+                    vec!["all_provider_circuits_open"]
+                } else {
+                    Vec::new()
+                },
+                "{}: a shed request here must be a tripped circuit, nothing else",
+                profile.id
+            );
+            assert_eq!(
+                result.throughput.accepted,
+                capacity::offered_to_healthy_backend(result.throughput.offered),
+                "{}: a target that stalls must not cost the healthy target a \
+                 single request",
+                profile.id
+            );
+            // The charge a cut-off upstream still earns is the point: a bound
+            // that ends a request without settling it is a hole in the ledger.
+            assert_eq!(
+                usage.observed, usage.expected,
+                "{}: a request the replica dispatched must settle whatever the \
+                 upstream did: {:?}",
+                profile.id, usage.by_status
+            );
+        }
     }
+    let dispatched_failures = match profile.workload {
+        // The bound ends the request after it reached the upstream.
+        Workload::BackendLimits => result.throughput.errors - result.outcomes.transport_failures,
+        _ => 0,
+    };
     assert_eq!(
-        result.upstream.requests, result.throughput.accepted,
-        "{}: every accepted request must have reached the upstream exactly once",
+        result.upstream.requests,
+        result.throughput.accepted + dispatched_failures + served_probe(result),
+        "{}: every request the replica dispatched must have reached the \
+         upstream exactly once, and a shed one must not have reached it at all",
         profile.id
     );
+}
+
+/// The one request offered after the load stopped, when the profile asks for
+/// one. It is served by the same fake upstream and settles its own charge, so
+/// every count that reconciles against the load has to know about it.
+/// The verdicts a set of outcomes carried, in a stable order.
+fn error_types(tally: &BTreeMap<String, u64>) -> Vec<&str> {
+    tally.keys().map(String::as_str).collect()
+}
+
+fn served_probe(result: &CapacityResult) -> u64 {
+    u64::from(result.recovery.as_ref().is_some_and(|probe| probe.served))
 }

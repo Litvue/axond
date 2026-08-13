@@ -297,6 +297,57 @@ fn retained_evidence_is_reproducible_from_the_committed_inputs() {
                     profile.leaked_upstream_streams, 0,
                     "{relative}: {id} left an upstream stream open"
                 );
+                // A profile that carries one of the specific claims carries the
+                // count behind it, at the value that makes it a claim. Without
+                // this a re-run that quietly started crossing tenants, or
+                // outliving its bound, could still be retained as evidence:
+                // the throughput above would look the same.
+                if let Some(tenants) = profile.tenants {
+                    assert!(
+                        tenants > 1,
+                        "{relative}: {id} claims tenant isolation with {tenants} tenant"
+                    );
+                    assert_eq!(
+                        (
+                            profile.foreign_credential_uses,
+                            profile.misattributed_usage_records
+                        ),
+                        (Some(0), Some(0)),
+                        "{relative}: {id} retains a run where a credential or a \
+                         charge crossed a namespace"
+                    );
+                }
+                if let Some(bound) = profile.upstream_bound_ms {
+                    assert_eq!(
+                        profile.over_bound,
+                        Some(0),
+                        "{relative}: {id} retains a run that outlived the bound \
+                         the replica declares"
+                    );
+                    assert!(
+                        profile
+                            .max_latency_ms
+                            .is_some_and(|slowest| slowest >= bound as f64),
+                        "{relative}: {id} declares a {bound} ms bound nothing in \
+                         the run ever reached, so the bound was not exercised"
+                    );
+                }
+                if let Some(ceiling) = profile.admission_max_in_flight {
+                    assert!(
+                        profile.rejected > 0,
+                        "{relative}: {id} booted a ceiling of {ceiling} and shed \
+                         nothing, so the ceiling was not exercised"
+                    );
+                }
+                if profile.admission_max_in_flight.is_some() || profile.upstream_bound_ms.is_some()
+                {
+                    assert_eq!(
+                        profile.served_after_load,
+                        Some(true),
+                        "{relative}: {id} pushed the replica to a limit and never \
+                         checked it could still serve afterwards"
+                    );
+                }
             }
         }
     }
