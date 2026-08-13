@@ -78,8 +78,27 @@ impl Deployment {
                 Arc::new(authorizer),
             )
             .with_availability(Arc::new(StaticAvailability {
-                index: Arc::new(index),
+                index: Some(Arc::new(index)),
                 runtime,
+            })),
+        );
+        Self { api, store }
+    }
+
+    /// A deployment whose availability reader is attached and derives nothing:
+    /// the shape every shipped binary currently has, since no compiler is wired
+    /// to project a view.
+    fn attached_but_underiving() -> Self {
+        let store = Arc::new(InMemoryControlPlane::new());
+        let api = Arc::new(
+            AdminApi::new(
+                Arc::new(AdminService::stateful(store.clone())),
+                Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
+                Arc::new(FakeAdminAuthorizer::permissive()),
+            )
+            .with_availability(Arc::new(StaticAvailability {
+                index: None,
+                runtime: RuntimeObservations::none(),
             })),
         );
         Self { api, store }
@@ -1510,13 +1529,13 @@ async fn a_stateless_deployment_refuses_every_administrative_route_by_mode() {
 
 /// A replica's derived availability, as a snapshot would carry it.
 struct StaticAvailability {
-    index: Arc<AvailabilityIndex>,
+    index: Option<Arc<AvailabilityIndex>>,
     runtime: RuntimeObservations,
 }
 
 impl AvailabilityReader for StaticAvailability {
-    fn index(&self) -> Arc<AvailabilityIndex> {
-        Arc::clone(&self.index)
+    fn index(&self) -> Option<Arc<AvailabilityIndex>> {
+        self.index.clone()
     }
 
     fn runtime(&self) -> RuntimeObservations {
@@ -1580,6 +1599,16 @@ async fn an_availability_read_distinguishes_deriving_nothing_from_finding_nothin
     assert_eq!(body["deriving"], json!(false));
     assert_eq!(body["targets"], json!([]));
 
+    // Attached and deriving nothing is the same answer: what the flag reports is
+    // whether a view exists, not whether a reader was wired up.
+    let attached = Deployment::attached_but_underiving();
+    let (status, body) = attached
+        .get(&format!("/availability?tenant={}", fixtures::tenant_id(1)))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["deriving"], json!(false));
+    assert_eq!(body["targets"], json!([]));
+
     let (index, mine, _) = two_tenant_index();
     let deriving = Deployment::deriving(
         FakeAdminAuthorizer::permissive(),
@@ -1610,7 +1639,7 @@ async fn an_availability_read_reaches_no_control_plane() {
             Arc::new(FakeAdminAuthorizer::permissive()),
         )
         .with_availability(Arc::new(StaticAvailability {
-            index: Arc::new(index),
+            index: Some(Arc::new(index)),
             runtime: RuntimeObservations::none(),
         })),
     );

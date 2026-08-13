@@ -683,8 +683,13 @@ impl AvailabilityEvidence {
 /// reaches no store, so the question is answerable during exactly the outages
 /// that prompt it.
 pub trait AvailabilityReader: Send + Sync {
-    /// The index the snapshot this replica is serving carries.
-    fn index(&self) -> Arc<AvailabilityIndex>;
+    /// The index the snapshot this replica is serving carries, or `None` when it
+    /// derives no view at all.
+    ///
+    /// The distinction is the point: a replica that has derived nothing must not
+    /// answer with an empty catalogue, which an operator reads as a tenant that
+    /// has lost every entitlement.
+    fn index(&self) -> Option<Arc<AvailabilityIndex>>;
 
     /// This replica's own per-target health, as of now.
     fn runtime(&self) -> RuntimeObservations;

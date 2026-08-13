@@ -1689,6 +1689,7 @@ async fn a_published_revision_derives_availability_that_catalogue_presence_alone
     let snapshot = replica.state.config();
     let verdict = snapshot
         .availability()
+        .expect("a compiler holding evidence derives a view")
         .evaluate(&availability_key(), SystemTime::now());
     assert_eq!(verdict.state, AvailabilityState::Unknown);
     assert_eq!(verdict.reason, AvailabilityReason::NoEvidence);
@@ -1747,6 +1748,7 @@ async fn discovery_evidence_survives_the_revisions_published_over_it() {
         .state
         .config()
         .availability()
+        .expect("a compiler holding evidence derives a view")
         .evaluate(&key, SystemTime::now());
     assert_eq!(verdict.state, AvailabilityState::Available);
     assert_eq!(verdict.reason, AvailabilityReason::Observed);
@@ -1794,7 +1796,11 @@ async fn a_discovery_outage_ages_a_verdict_without_touching_convergence() {
             .await;
     }
 
-    let availability = replica.state.config().availability_handle();
+    let availability = replica
+        .state
+        .config()
+        .availability_handle()
+        .expect("a compiler holding evidence derives a view");
     assert_eq!(
         availability.evaluate(&key, looked_at).state,
         AvailabilityState::Available

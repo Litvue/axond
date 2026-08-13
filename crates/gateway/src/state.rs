@@ -190,11 +190,15 @@ pub struct ConfigSnapshot {
     /// one-way — a projection cannot add a model, a namespace, or a credential, so
     /// no amount of discovery evidence can enlarge what is served.
     ///
-    /// [`ConfigSnapshot::build`] always produces the empty index. A compiler
-    /// holding availability evidence attaches a derived one during compilation
-    /// (#148), off the request path and before publication; no request consults a
-    /// verdict, and nothing polls a provider to produce it.
-    availability: Arc<AvailabilityIndex>,
+    /// [`ConfigSnapshot::build`] produces `None`. A compiler holding availability
+    /// evidence attaches a derived one during compilation (#148), off the request
+    /// path and before publication; no request consults a verdict, and nothing
+    /// polls a provider to produce it.
+    ///
+    /// Absent rather than empty, because those are different answers: a replica
+    /// that derives nothing must not report an empty catalogue, which reads
+    /// identically to a tenant that has just lost every entitlement.
+    availability: Option<Arc<AvailabilityIndex>>,
     /// The approved pricing this snapshot serves under, when it was compiled from
     /// a revision that published a price book (#201).
     ///
@@ -524,7 +528,7 @@ impl ConfigSnapshot {
             // Never a populated index, and never an optimistic one: a snapshot is
             // compiled from configuration, and availability is derived afterwards
             // by whatever produced the evidence.
-            availability: Arc::new(AvailabilityIndex::empty()),
+            availability: None,
             pricing: None,
         })
     }
@@ -538,16 +542,16 @@ impl ConfigSnapshot {
         &self.secrets
     }
 
-    /// The derived availability index this snapshot carries.
+    /// The derived availability index this snapshot carries, if it derives one.
     #[allow(dead_code)]
-    pub fn availability(&self) -> &AvailabilityIndex {
-        &self.availability
+    pub fn availability(&self) -> Option<&AvailabilityIndex> {
+        self.availability.as_deref()
     }
 
     /// The index as a handle, for carrying the evidence an outgoing snapshot holds
     /// onto its replacement without cloning the records.
-    pub fn availability_handle(&self) -> Arc<AvailabilityIndex> {
-        Arc::clone(&self.availability)
+    pub fn availability_handle(&self) -> Option<Arc<AvailabilityIndex>> {
+        self.availability.clone()
     }
 
     /// Project a derived availability index onto a snapshot that has not been
@@ -580,7 +584,7 @@ impl ConfigSnapshot {
     #[must_use]
     #[allow(dead_code)]
     pub fn with_availability(mut self, availability: Arc<AvailabilityIndex>) -> Self {
-        self.availability = availability;
+        self.availability = Some(availability);
         self
     }
 
@@ -813,7 +817,7 @@ impl AppState {
 /// one `Arc`, so an answer cannot describe one revision's targets with another
 /// revision's circuits.
 impl AvailabilityReader for AppState {
-    fn index(&self) -> Arc<AvailabilityIndex> {
+    fn index(&self) -> Option<Arc<AvailabilityIndex>> {
         self.config().availability_handle()
     }
 
@@ -892,8 +896,8 @@ namespace = "platform"
         let snapshot =
             ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 0).expect("the key resolves");
         assert!(
-            snapshot.availability().is_empty(),
-            "a compiled snapshot carries no derived evidence, and no optimistic default"
+            snapshot.availability().is_none(),
+            "a compiled snapshot derives no view, which is not an empty one"
         );
 
         let scope = ScopeRef::tenant(TenantId::new(
@@ -914,7 +918,13 @@ namespace = "platform"
             .map(|model| model.name.clone())
             .collect();
         let projected = snapshot.with_availability(Arc::new(index));
-        assert_eq!(projected.availability().len(), 1);
+        assert_eq!(
+            projected
+                .availability()
+                .expect("the projected snapshot derives a view")
+                .len(),
+            1
+        );
         assert_eq!(
             projected
                 .config
@@ -951,13 +961,17 @@ namespace = "platform"
         let rebuilt =
             ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 1).expect("the key resolves");
         assert!(
-            rebuilt.availability().is_empty(),
+            rebuilt.availability().is_none(),
             "a rebuild inherits no evidence it did not ask for"
         );
 
         let carried = ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 1)
             .expect("the key resolves")
-            .with_availability(outgoing.availability_handle());
+            .with_availability(
+                outgoing
+                    .availability_handle()
+                    .expect("the outgoing snapshot derives a view"),
+            );
         assert_eq!(carried.availability(), outgoing.availability());
         assert_eq!(carried.generation, 1);
     }
