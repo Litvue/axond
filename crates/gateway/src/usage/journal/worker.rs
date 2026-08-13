@@ -49,6 +49,17 @@ const DRAIN_MARGIN: Duration = Duration::from_secs(1);
 /// stopped correctly look abandoned nor push shutdown past the flush timeout.
 const CLOSING_READ: Duration = Duration::from_millis(500);
 
+/// How many refused writes one delivery pass may spend isolating a refusal
+/// before a batch nothing has been accepted from is taken as the destination
+/// being down.
+///
+/// The bisection has to reach single events to attribute a refusal, and in a
+/// real outage every one of those probes fails, so without a bound a claim of
+/// 256 would beat on a dead destination 512 times. Anything under this bound is
+/// enough to isolate the handful of poison events a destination refuses while
+/// it is healthy, which is what the budget exists for.
+const PROBE_WRITES: usize = 32;
+
 /// How the worker claims and how often.
 #[derive(Debug, Clone)]
 pub struct WorkerSettings {
@@ -195,12 +206,9 @@ impl DeliveryWorker {
         };
         let mut next_maintain = Instant::now() + self.settings.maintain_interval;
         let budget = loop {
-            self.pump_until_idle(&mut report, &stop).await;
-            if Instant::now() >= next_maintain {
-                self.maintain().await;
-                self.publish_stats().await;
-                next_maintain = Instant::now() + self.settings.maintain_interval;
-            }
+            self.pump_until_idle(&mut report, &stop, &mut next_maintain)
+                .await;
+            self.maintain_if_due(&mut next_maintain).await;
             tokio::select! {
                 changed = stop.changed() => {
                     // A dropped sender is a process that is going away without a
@@ -239,15 +247,22 @@ impl DeliveryWorker {
     /// polls, because a replica with a long backlog and a healthy destination
     /// would otherwise keep claiming past its shutdown bound and be abandoned
     /// mid-loop.
+    ///
+    /// Housekeeping is due on its own interval rather than once delivery has
+    /// caught up: a replica that never catches up is exactly the one whose
+    /// retention has to run, whose claim floor has to advance, and whose depth
+    /// an operator is watching.
     async fn pump_until_idle(
         &self,
         report: &mut DrainReport,
         stop: &watch::Receiver<Option<Duration>>,
+        next_maintain: &mut Instant,
     ) {
         loop {
             if stop.has_changed().unwrap_or(true) {
                 return;
             }
+            self.maintain_if_due(next_maintain).await;
             match self.pump(report).await {
                 Ok(0) => return,
                 Ok(_) => {}
@@ -390,9 +405,17 @@ impl DeliveryWorker {
     /// So a refusal is attributed rather than assumed. The batch is halved and
     /// rewritten until a refused range is a single event, and *only* an event
     /// refused while the same destination accepted its siblings counts as
-    /// refused-on-its-own-account. If nothing lands, the destination is down: the
-    /// probing stops immediately, no attempt is charged to any event, and the
-    /// lease hands the batch back to be retried whole.
+    /// refused-on-its-own-account. If the whole bisection lands nothing, the
+    /// destination is down: no attempt is charged to any event, and the lease
+    /// hands the batch back to be retried whole.
+    ///
+    /// That verdict is taken at the *end* of the bisection rather than at the
+    /// first level that lands nothing, because two events refused on their own
+    /// account — one in each half — also land nothing at the first level. Ending
+    /// there would deliver neither them nor their healthy siblings, spend no
+    /// attempt, and re-claim the identical batch forever. Only the bound in
+    /// [`PROBE_WRITES`] cuts the search short, and then only while nothing at
+    /// all has been accepted.
     ///
     /// A batch of one is refused without a verdict for the same reason: with no
     /// sibling to judge it against, "the destination is down" and "this row is
@@ -416,6 +439,7 @@ impl DeliveryWorker {
         }
 
         let mut orphans: Vec<usize> = Vec::new();
+        let mut refusals = 1;
         let mut level = vec![halve(0..claimed.len())];
         while !level.is_empty() {
             let mut next = Vec::new();
@@ -425,20 +449,28 @@ impl DeliveryWorker {
                         outcome.landed.extend(range);
                         continue;
                     }
+                    refusals += 1;
                     if range.len() == 1 {
                         orphans.push(range.start);
                     } else {
                         next.push(halve(range));
                     }
+                    if outcome.landed.is_empty() && refusals >= PROBE_WRITES {
+                        // Nothing has been accepted after a bounded search, so
+                        // the destination is down rather than refusing anybody
+                        // in particular: stop probing it and let the lease hand
+                        // the batch back whole.
+                        return Delivered::default();
+                    }
                 }
             }
-            if outcome.landed.is_empty() {
-                // Nothing at all has been accepted, so this is the destination
-                // failing rather than an event being refused: stop probing and
-                // let the lease retry the batch whole.
-                return outcome;
-            }
             level = next;
+        }
+        if outcome.landed.is_empty() {
+            // Every event, alone, was refused by a destination that accepted
+            // nothing else either. That is an outage, and an outage condemns
+            // no one.
+            return outcome;
         }
         outcome.refused = orphans;
         outcome
@@ -490,6 +522,17 @@ impl DeliveryWorker {
                 "usage journal stats could not be read"
             ),
         }
+    }
+
+    /// Prune and publish if the interval has come round. Cheap to call between
+    /// batches: it is a clock comparison until it is due.
+    async fn maintain_if_due(&self, next_maintain: &mut Instant) {
+        if Instant::now() < *next_maintain {
+            return;
+        }
+        self.maintain().await;
+        self.publish_stats().await;
+        *next_maintain = Instant::now() + self.settings.maintain_interval;
     }
 
     async fn maintain(&self) {
@@ -637,6 +680,7 @@ impl WorkerHandle {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
 
@@ -654,10 +698,10 @@ mod tests {
         /// Whether the destination refuses the batch. A refusal is the failure
         /// the lease exists for.
         refuse: bool,
-        /// A `request_id` this destination refuses whenever it appears in a
-        /// batch, accepting everything else: one bad row, which is the only
-        /// failure the poison budget is for.
-        poison: Option<String>,
+        /// The `request_id`s this destination refuses whenever one of them
+        /// appears in a batch, accepting everything else: the bad rows the
+        /// poison budget is for.
+        poison: Vec<String>,
     }
 
     impl Recorder {
@@ -683,10 +727,9 @@ mod tests {
             if self.refuse {
                 return Err(SinkFailure::new("the destination is refusing writes"));
             }
-            if let Some(poison) = self.poison.as_deref()
-                && batch
-                    .iter()
-                    .any(|observed| observed.record.request_id == poison)
+            if batch
+                .iter()
+                .any(|observed| self.poison.contains(&observed.record.request_id))
             {
                 return Err(SinkFailure::new("the destination refuses this row"));
             }
@@ -997,7 +1040,7 @@ mod tests {
         }));
         let poison = event_for("poison");
         let sink = Arc::new(Recorder {
-            poison: Some(poison.record().request_id.clone()),
+            poison: vec![poison.record().request_id.clone()],
             ..Recorder::default()
         });
         let handle = worker(
@@ -1030,6 +1073,151 @@ mod tests {
         let report = handle.drain(Duration::from_millis(50)).await;
         assert_eq!(report.quarantined, 1, "{report:?}");
         assert_eq!(report.undelivered, 0, "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn two_refused_events_in_one_batch_are_both_isolated() {
+        // One refused event in each half of the claim, so nothing lands at the
+        // first split. Ending the search there — as it once did — delivered
+        // neither them nor their healthy siblings, spent no attempt, and
+        // re-claimed the identical batch forever.
+        let journal = Arc::new(InMemoryUsageJournal::with_capacity(Capacity {
+            max_events: 8,
+            max_delivery_attempts: 1,
+            retain_acknowledged: Duration::from_secs(60),
+            policy: CapacityPolicy::Refuse,
+        }));
+        let (first, second) = (event_for("poison-one"), event_for("poison-two"));
+        let (healthy, other) = (event_for("one"), event_for("two"));
+        let sink = Arc::new(Recorder {
+            poison: vec![
+                first.record().request_id.clone(),
+                second.record().request_id.clone(),
+            ],
+            ..Recorder::default()
+        });
+        let handle = worker(
+            Arc::clone(&journal) as Arc<dyn UsageJournal>,
+            Arc::clone(&sink),
+            settings(Duration::from_millis(5)),
+        );
+        for event in [&first, &healthy, &second, &other] {
+            journal.append(event).await.expect("append");
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stats = journal.stats(&consumer("billing")).await.expect("stats");
+            if stats.quarantined == 2 && stats.pending == 0 && stats.in_flight == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the refused events were not isolated: {stats:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let written = sink.written();
+        for delivered in [&healthy, &other] {
+            assert!(
+                written.contains(&delivered.record().request_id),
+                "a sibling of the refused events was delivered: {written:?}"
+            );
+        }
+        let report = handle.drain(Duration::from_millis(50)).await;
+        assert_eq!(report.quarantined, 2, "{report:?}");
+        assert_eq!(report.undelivered, 0, "{report:?}");
+    }
+
+    /// A journal that always has something claimable: every claim appends
+    /// another event first, which is a replica whose arrivals outpace its
+    /// deliveries.
+    struct NeverCatchesUp {
+        inner: InMemoryUsageJournal,
+        maintained: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl UsageJournal for NeverCatchesUp {
+        fn name(&self) -> &'static str {
+            "never-catches-up"
+        }
+
+        fn capacity(&self) -> Capacity {
+            self.inner.capacity()
+        }
+
+        fn mode(&self) -> super::super::DeliveryMode {
+            self.inner.mode()
+        }
+
+        async fn append(&self, event: &UsageEvent) -> Result<Appended, JournalError> {
+            self.inner.append(event).await
+        }
+
+        async fn claim(
+            &self,
+            consumer: &ConsumerId,
+            claim: Claim,
+        ) -> Result<Vec<Delivery>, JournalError> {
+            // A round trip a real journal cannot answer synchronously, so the
+            // busy worker still leaves the runtime to the rest of the test.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            self.inner.append(&event_for("arriving")).await?;
+            self.inner.claim(consumer, claim).await
+        }
+
+        async fn ack(&self, delivery: &DeliveryId) -> Result<(), JournalError> {
+            self.inner.ack(delivery).await
+        }
+
+        async fn quarantine(
+            &self,
+            delivery: &DeliveryId,
+            reason: PoisonReason,
+        ) -> Result<(), JournalError> {
+            self.inner.quarantine(delivery, reason).await
+        }
+
+        async fn relinquish(&self, delivery: &DeliveryId) -> Result<(), JournalError> {
+            self.inner.relinquish(delivery).await
+        }
+
+        async fn stats(&self, consumer: &ConsumerId) -> Result<JournalStats, JournalError> {
+            self.inner.stats(consumer).await
+        }
+
+        async fn maintain(&self, now: SystemTime) -> Result<u64, JournalError> {
+            self.maintained.fetch_add(1, Ordering::Relaxed);
+            self.inner.maintain(now).await
+        }
+    }
+
+    #[tokio::test]
+    async fn housekeeping_runs_on_a_worker_that_never_catches_up() {
+        // Retention, the claim floor, and the depth gauges used to wait for the
+        // worker to find nothing left to deliver, so the replica under the most
+        // pressure was the one that never pruned and never said how far behind
+        // it was.
+        let journal = Arc::new(NeverCatchesUp {
+            inner: InMemoryUsageJournal::new(),
+            maintained: AtomicUsize::new(0),
+        });
+        let handle = worker(
+            Arc::clone(&journal) as Arc<dyn UsageJournal>,
+            Arc::new(Recorder::default()),
+            settings(Duration::from_secs(30)),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while journal.maintained.load(Ordering::Relaxed) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a worker that never went idle never ran its maintenance tick"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        handle.drain(Duration::from_millis(50)).await;
     }
 
     #[tokio::test]

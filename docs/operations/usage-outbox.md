@@ -200,6 +200,11 @@ delivered. The margin is far longer than `operation_timeout_ms` can let an appen
 run, so the only thing it costs is that the floor trails the backlog by one
 maintenance tick's worth of events.
 
+The maintenance tick runs on its own interval whether or not the worker has
+caught up: pruning, the floor, and the gauges happen between delivery batches, so
+the replica furthest behind is not the one that stops pruning and stops saying how
+far behind it is.
+
 The gauges published each maintenance tick are floored the same way, for the same
 reason: `depth`, `in_flight`, and the oldest pending age describe the backlog, so
 they are read from the events above the floor. The poison count cannot be — a
@@ -280,9 +285,13 @@ reason (`axond.usage.journal.quarantined`) so it stops blocking its ordering key
 A destination-wide outage is *not* poison and never quarantines anything, however
 long it lasts. When a whole batch is refused the worker halves it and rewrites the
 halves until the refusal is isolated to a single event, and only an event refused
-while the same destination accepted its siblings spends an attempt. A destination
-that accepts nothing has said nothing about any particular event, so the probing
-stops, the attempt is given back, and the lease retries the batch whole. A batch
+while the same destination accepted its siblings spends an attempt. Several bad
+rows in one batch are isolated the same way, one at a time, and their healthy
+siblings still land. A destination that accepts nothing — from the whole batch
+nor from any piece of it — has said nothing about any particular event, so the
+attempt is given back and the lease retries the batch whole. That search is
+bounded: a batch nothing has been accepted from stops being probed after 32
+refused writes, so an outage is not beaten on once per event. A batch
 of one is refused without a verdict for the same reason: with no sibling to judge
 it against, "the destination is down" and "this row is bad" are the same
 observation, so it is retried rather than condemned. A genuinely poisonous event
