@@ -1021,11 +1021,12 @@ mod tests {
         // Everything after the role exists runs through `outcome`, so the shared
         // test database does not keep the login role when an assertion fails.
         let outcome = match with_role(&dsn, &role, "axond") {
-            Some(read_only_dsn) => Some(
+            Some(read_only_dsn) => Some((
+                schema_ddl_sqlstate(&read_only_dsn).await,
                 PostgresSecrets::connect(&read_only_dsn, SecretStoreSettings::default(), kek(29))
                     .await
                     .err(),
-            ),
+            )),
             None => None,
         };
         client
@@ -1035,10 +1036,21 @@ mod tests {
             .await
             .expect("drop the test role");
 
-        let Some(outcome) = outcome else {
+        let Some((sqlstate, outcome)) = outcome else {
             // A key/value DSN this cannot rewrite: nothing was exercised.
             return;
         };
+        // The fixture is pinned rather than assumed: the role holds `CREATE` on
+        // the schema, so the server cannot answer the DDL with `42501` and reach
+        // the assertions below by a different route than the one they name.
+        assert_eq!(
+            sqlstate.as_ref(),
+            Some(&SqlState::READ_ONLY_SQL_TRANSACTION),
+            "this fixture is only a demotion window if the endpoint refuses the DDL for being \
+             read-only; a different SQLSTATE means the role or the pooler, not read-only-ness, \
+             is what fails here"
+        );
+
         let error = outcome.expect("a read-only endpoint cannot be prepared");
         assert_eq!(
             error.category(),
@@ -1048,9 +1060,27 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains("default_transaction_read_only"),
-            "only a `25006` carries the read-only diagnosis, so this also pins that the DDL \
-             failed on read-only-ness rather than on privilege: {message}"
+            "the outage carries the preflight's answer for the endpoint that is read-only \
+             without being in recovery: {message}"
         );
+    }
+
+    /// The SQLSTATE the endpoint actually answers the shipped schema statements
+    /// with, so a classification assertion cannot quietly start proving
+    /// something else on another server version or behind a pooler.
+    async fn schema_ddl_sqlstate(dsn: &str) -> Option<SqlState> {
+        let (client, connection) = tokio_postgres::connect(dsn, crate::usage::tls_connector())
+            .await
+            .ok()?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(SCHEMA_DDL)
+            .await
+            .err()?
+            .code()
+            .cloned()
     }
 
     fn kek(seed: u8) -> DeploymentKek {
