@@ -545,6 +545,15 @@ async fn diagnostic_authentication_middleware(
 #[derive(Clone)]
 struct AuthenticatingPermit(Arc<crate::admission::DiagnosticPermit>);
 
+impl AuthenticatingPermit {
+    /// Give the permit back. Dropping the extension would do it too, but only
+    /// once the request itself is dropped, which is the timing this exists to
+    /// avoid.
+    fn release(self) {
+        drop(self.0);
+    }
+}
+
 /// Reserve a slot for a request and hold it until the response body is fully
 /// delivered, so an open SSE stream counts as in-flight for as long as it runs.
 async fn admission_middleware(
@@ -885,7 +894,9 @@ async fn authenticate_middleware(
     }
     // Authentication is over, whatever it cost, so the permit that bounded it
     // goes back before the handler runs rather than after.
-    drop(request.extensions_mut().remove::<AuthenticatingPermit>());
+    if let Some(permit) = request.extensions_mut().remove::<AuthenticatingPermit>() {
+        permit.release();
+    }
     request.extensions_mut().insert(snapshot);
     request.extensions_mut().insert(caller);
     Ok(next.run(request).await)
