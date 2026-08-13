@@ -81,6 +81,9 @@ and operate it.
   the signed last-known-good cache.
 - [Deployment security model](./security/deployment-model.md) — trust
   boundaries, TLS termination, secret delivery, and image verification.
+- [Secret material in the stateful control plane](./security/secret-material.md)
+  — what a stored secret reference guarantees, and the regression suite that
+  proves material stays out of state, responses, logs, and telemetry.
 - [Security policy](../SECURITY.md) — private vulnerability reporting, the
   supported-version window, response targets, and how a fix and advisory ship.
 - [Fuzzing](./security/fuzzing.md) — the config, token, and query targets, the
