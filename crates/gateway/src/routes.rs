@@ -2245,17 +2245,20 @@ fn note_attempt_failure(span: &tracing::Span, target: &Target, err: &TransportEr
         );
         return;
     }
-    // The caller is told only that the transport failed, so this line is the
-    // one place the reason survives: a DNS failure, a refused connect, and a
-    // TLS handshake failure are the same answer and different incidents. The
-    // endpoint stays here, in the operator's log, where it is already
-    // credential-redacted and where the operator configured it.
-    warn!(
-        provider = %target.provider,
-        model = %target.model,
-        error = %err,
-        "upstream attempt failed on the transport"
-    );
+    // An `Http` failure is the one the caller is told only that the transport
+    // failed, so this line is the one place its reason survives: a DNS failure,
+    // a refused connect, and a TLS handshake failure are the same answer and
+    // different incidents. The endpoint stays here, in the operator's log, where
+    // it is already credential-redacted and where the operator configured it. A
+    // provider's own verdict reaches the caller intact and is not repeated here.
+    if matches!(err, TransportError::Http(_)) {
+        warn!(
+            provider = %target.provider,
+            model = %target.model,
+            error = %err,
+            "upstream attempt failed on the transport"
+        );
+    }
 }
 
 fn record_target_success(snapshot: &ConfigSnapshot, target: &Target, circuit_key: &str) {
