@@ -259,6 +259,11 @@ pub async fn run_with(
     // idle wait into the last loaded segment would make the busiest segment
     // look like the calmest.
     state.close_segment(elapsed);
+    // A run can end while every replica is still unready. Close that interval
+    // against the run's end before the settle wait, so a failed fleet cannot
+    // disappear from the readiness verdict merely because the driver stopped
+    // sampling it.
+    state.close_readiness_gap(elapsed);
 
     let settle = Duration::from_millis(profile.termination.settle_ms);
     state.settle(&mut fleet, settle, started).await;
@@ -666,6 +671,26 @@ fn error_type(body: &str) -> Option<String> {
 pub fn issued_by_the_driver(record: &Value) -> bool {
     record["namespace"].as_str() == Some(fleet::PROBE)
         || record["model"].as_str() == Some(fleet::CATALOGUE_ALIAS)
+}
+
+/// Classify a gateway settlement against the committed workload plan.
+///
+/// `rejected` is a legitimate usage-schema settlement for a refusal. The
+/// stateful plan deliberately opens refusal paths during its declared fault
+/// window, and a gateway may record one of those refusals even though the
+/// current driver usually sees no usage row for it. It is therefore a planned
+/// refusal, not an unknown success. The response-side outcome gate still
+/// catches an admission refusal outside the declared window as an unplanned
+/// error. Anything absent or not produced by a planned ending remains unknown
+/// and fails the qualification gate.
+fn classify_usage_status(status: Option<&str>) -> Option<&'static str> {
+    let status = status?;
+    if status == "rejected" {
+        return Some("rejected");
+    }
+    Ending::ALL
+        .iter()
+        .find_map(|ending| ending.settles(status).then_some(ending.as_str()))
 }
 
 fn fingerprint(id: &str) -> u64 {
@@ -1534,10 +1559,14 @@ impl State {
             Some(id) => self.ledger.record(fingerprint(id)),
             None => self.unexpected_statuses += 1,
         }
-        let status = record["status"].as_str().unwrap_or("unknown").to_owned();
-        if !Ending::ALL.iter().any(|ending| ending.settles(&status)) {
+        let raw_status = record["status"].as_str();
+        if classify_usage_status(raw_status).is_none() {
             self.unexpected_statuses += 1;
         }
+        // Keep a visible bucket for malformed rows while never treating the
+        // fallback as a successful settlement. The classifier above is the
+        // qualification gate; this value is only diagnostic output.
+        let status = raw_status.unwrap_or("unknown").to_owned();
         *self.by_status.entry(status).or_default() += 1;
 
         // Which side of the outage a record was settled on, as the database
@@ -1675,14 +1704,19 @@ impl State {
     fn observe_readiness(&mut self, any_ready: bool, now: Duration) {
         match (any_ready, self.unready_since) {
             (false, None) => self.unready_since = Some(now),
-            (true, Some(since)) => {
-                let gap = now.saturating_sub(since).as_millis() as u64;
-                self.telemetry.worst_readiness_gap_ms =
-                    self.telemetry.worst_readiness_gap_ms.max(gap);
-                self.unready_since = None;
-            }
+            (true, Some(_)) => self.close_readiness_gap(now),
             _ => {}
         }
+    }
+
+    /// Fold a readiness interval that has ended, including one that is still
+    /// open when the run reaches its deadline or aborts.
+    fn close_readiness_gap(&mut self, now: Duration) {
+        let Some(since) = self.unready_since.take() else {
+            return;
+        };
+        let gap = readiness_gap_ms(since, now);
+        self.telemetry.worst_readiness_gap_ms = self.telemetry.worst_readiness_gap_ms.max(gap);
     }
 
     fn observe_probe(&mut self, served: Option<bool>, policy_applied: bool, now: Duration) {
@@ -2292,5 +2326,30 @@ fn trend(segments: &[Segment], slo: &Slo) -> Trend {
         rss_kib_per_hour: (variance > f64::EPSILON).then(|| covariance / variance),
         evaluated: variance > f64::EPSILON,
         segments: points.len(),
+    }
+}
+
+fn readiness_gap_ms(since: Duration, ended: Duration) -> u64 {
+    ended.saturating_sub(since).as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_open_readiness_gap_is_counted_when_the_run_ends_unready() {
+        assert_eq!(
+            readiness_gap_ms(Duration::from_millis(100), Duration::from_millis(850)),
+            750
+        );
+    }
+
+    #[test]
+    fn settlement_statuses_require_plan_classification() {
+        assert_eq!(classify_usage_status(Some("rejected")), Some("rejected"));
+        assert_eq!(classify_usage_status(Some("ok")), Some("complete"));
+        assert_eq!(classify_usage_status(Some("mystery-success")), None);
+        assert_eq!(classify_usage_status(None), None);
     }
 }
