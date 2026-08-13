@@ -218,6 +218,34 @@ fn a_swap_between_two_tenants_is_not_a_clean_run() {
         7,
         "a credential belonging to nobody in the run is foreign too"
     );
+    // The upstream records a request that presented nothing rather than
+    // dropping it: an unrecorded call is one the isolation count cannot see, so
+    // a run that reached an upstream with no credential at all would have been
+    // the cleanest-looking run of the lot.
+    assert_eq!(
+        capacity::crossed_credential_uses(&BTreeMap::from([(
+            upstream::Dispatch {
+                caller: acme.namespace.to_owned(),
+                credential: upstream::UNCREDENTIALED.to_owned(),
+            },
+            3,
+        )])),
+        3,
+        "a request that carried no credential is nobody's, so it is foreign"
+    );
+}
+
+/// The label standing for "no credential" has to be one no credential can
+/// produce, or a key could be mistaken for its own absence.
+#[test]
+fn the_uncredentialed_label_is_not_a_digest() {
+    for material in ["", "none", "Bearer none", "test-upstream-capacity-acme"] {
+        assert_ne!(
+            upstream::credential_digest(material),
+            upstream::UNCREDENTIALED,
+            "{material:?} digests to the label reserved for presenting nothing"
+        );
+    }
 }
 
 /// A profile that moves a bound moves it in the config the process boots. A

@@ -195,9 +195,17 @@ pub struct Dispatch {
     /// The label behind [`CALLER_TAG`] on the target model, or empty for a
     /// request routed by a target that carries none.
     pub caller: String,
-    /// [`credential_digest`] of the presented material.
+    /// [`credential_digest`] of the presented material, or [`UNCREDENTIALED`]
+    /// when the request carried none. Recording the absence is what keeps an
+    /// uncredentialed dispatch visible to a count of who paid for what, rather
+    /// than dropping it and leaving the tally looking clean.
     pub credential: String,
 }
+
+/// The credential label of a request that presented none. It is not a digest,
+/// and no key can produce it, so nobody owns it — which is what makes such a
+/// call foreign to every caller.
+pub const UNCREDENTIALED: &str = "none";
 
 /// A stable, short, non-reversing name for a presented credential. The upstream
 /// keeps this rather than the material, so a tally can be printed, serialised,
@@ -357,17 +365,17 @@ async fn handle(
         None => (model, String::new()),
     };
     state.counters.received.fetch_add(1, Ordering::SeqCst);
-    if let Some(presented) = header("authorization").or_else(|| header("x-api-key")) {
-        *state
-            .dispatches
-            .lock()
-            .expect("upstream lock")
-            .entry(Dispatch {
-                caller,
-                credential: credential_digest(&presented),
-            })
-            .or_default() += 1;
-    }
+    *state
+        .dispatches
+        .lock()
+        .expect("upstream lock")
+        .entry(Dispatch {
+            caller,
+            credential: header("authorization")
+                .or_else(|| header("x-api-key"))
+                .map_or_else(|| UNCREDENTIALED.to_owned(), |p| credential_digest(&p)),
+        })
+        .or_default() += 1;
     {
         let mut recorded = state.requests.lock().expect("upstream lock");
         if recorded.len() == RECORDED_LIMIT {

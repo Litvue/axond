@@ -654,8 +654,19 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Capacity
     let expected_records = accepted + failed_settlements(profile.workload, failed) + served_probe;
     let observed = await_usage_records(&gateway, expected_records).await;
     let leaked = await_closed_upstreams(&upstream).await;
-    let tenancy = (profile.workload == Workload::Tenants)
-        .then(|| tenancy(&attempts, &observed, &upstream.state.dispatches()));
+    let tenancy = (profile.workload == Workload::Tenants).then(|| {
+        let dispatches = upstream.state.dispatches();
+        // An upstream call the tally never saw is one the isolation counts
+        // cannot speak for, and its absence reads as a cleaner run rather than
+        // an unmeasured one.
+        assert_eq!(
+            dispatches.values().sum::<u64>(),
+            upstream.state.received(),
+            "{}: the upstream answered calls the dispatch tally did not record",
+            profile.id
+        );
+        tenancy(&attempts, &observed, &dispatches)
+    });
     let deadlines = profile.upstream_timeout_ms.map(|bound| Deadlines {
         bound_ms: bound,
         slack_multiple: DEADLINE_SLACK,
