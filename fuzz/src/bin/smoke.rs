@@ -169,12 +169,16 @@ fn replay_sse_decode(data: &[u8]) -> Vec<&'static str> {
         classes.push("not_utf8");
         return classes;
     };
-    for max_buffer_bytes in [u16::MAX, SMOKE_BUFFER_LIMIT] {
-        classes.extend(axond_fuzz::sse_decode(&SseInput {
+    // A limit the body cannot trip, then one it always can. The first is sized
+    // from the body rather than pinned to `u16::MAX`, because the oversized
+    // derivation is `OVERSIZED_BYTES` — one byte past what a `u16` can express,
+    // which would make this pass a second refusal rather than a clean decode.
+    for max_buffer_bytes in [body.len().max(1), usize::from(SMOKE_BUFFER_LIMIT)] {
+        classes.extend(axond_fuzz::sse_decode_at_limit(
             body,
-            cuts: SMOKE_CUTS.to_vec(),
+            SMOKE_CUTS,
             max_buffer_bytes,
-        }));
+        ));
     }
     classes
 }

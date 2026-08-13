@@ -90,8 +90,13 @@ struct Run {
 /// SSE decoding: arbitrary bodies, arbitrary chunk boundaries, truncated final
 /// events, and a reachable buffer limit.
 pub fn sse_decode(input: &SseInput<'_>) -> Vec<&'static str> {
-    let body = input.body;
-    let boundaries = boundaries(body, &input.cuts);
+    sse_decode_at_limit(input.body, &input.cuts, usize::from(input.max_buffer_bytes))
+}
+
+/// [`sse_decode`] with the buffer limit given directly, for a caller holding a
+/// body larger than a `u16` limit could ever be untrippable for.
+pub fn sse_decode_at_limit(body: &str, cuts: &[u16], max_buffer_bytes: usize) -> Vec<&'static str> {
+    let boundaries = boundaries(body, cuts);
 
     // A limit the body cannot trip, so this run is about parsing rather than
     // refusal: the buffer never holds more than the body itself.
@@ -130,7 +135,7 @@ pub fn sse_decode(input: &SseInput<'_>) -> Vec<&'static str> {
     // The same body under a limit it can trip. Everything decoded before the
     // refusal has to match what the unbounded run decoded, or a limit would be
     // rewriting a stream rather than ending it.
-    let limited = drive(body, &boundaries, usize::from(input.max_buffer_bytes));
+    let limited = drive(body, &boundaries, max_buffer_bytes);
     assert!(
         limited.events.len() <= whole.events.len()
             && limited.events[..] == whole.events[..limited.events.len()],
@@ -146,8 +151,7 @@ pub fn sse_decode(input: &SseInput<'_>) -> Vec<&'static str> {
     classes.push(match &limited.push_error {
         Some(StreamParseError::BufferLimit(limit)) => {
             assert_eq!(
-                *limit,
-                usize::from(input.max_buffer_bytes),
+                *limit, max_buffer_bytes,
                 "the refusal reported a limit the decoder was not configured with"
             );
             "buffer_limit"

@@ -31,7 +31,7 @@ use axond_fuzz_seam::{Rejection, VerifiedToken};
 pub use wire::{
     GATEWAY_CREDENTIAL_CANARY, PROVIDER_URL_CANARY, ProviderStreamInput, SseInput, StreamShape,
     UpstreamFailure, assert_valid_fixtures_are_stable, provider_error, provider_stream, sse_decode,
-    sse_events,
+    sse_decode_at_limit, sse_events,
 };
 
 /// A refusal must carry an operator-facing reason. An empty one would reach a
