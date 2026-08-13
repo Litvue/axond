@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Deterministic release-artifact configuration checks.
 
+Usage:
+    ops/check-release-config.py              # every check against the committed tree
+    ops/check-release-config.py --self-test  # only the platform-default decision
+
 The release matrix is only exercised for real at a tag, when a mistake is
 already published and a `latest` tag or a dropped target cannot be taken back.
 So the shape of the release configuration is asserted here on every change,
@@ -39,13 +43,14 @@ UNIX_INSTALLER_TARGETS = {
 WINDOWS_INSTALLER_TARGET = "x86_64-pc-windows-msvc"
 IMAGE_PLATFORMS = {"linux/amd64", "linux/arm64"}
 # The last release published as a single `linux/amd64` image — the release that
-# was current when ARM support landed, so it must be bumped alongside a rebase
-# onto a newer amd64-only release. The Compose
-# quickstart pins a release tag, so while that tag is at or below this version it
-# must keep an explicit `linux/amd64` default: dropping the pin would leave ARM
-# hosts unable to pull an image that has no ARM child yet. The moment
-# release-please bumps the pinned tag past it, the fallback is wrong and this
-# check demands the unpinned form, so the transition cannot be forgotten.
+# was current when ARM support landed. It is a fixed historical fact, not a
+# pointer at the current release: it only moves if the quickstart is ever pinned
+# back onto a newer amd64-only release. The Compose quickstart pins a release
+# tag, so while that tag is at or below this version it must keep an explicit
+# `linux/amd64` default: dropping the pin would leave ARM hosts unable to pull an
+# image that has no ARM child yet. The moment release-please bumps the pinned tag
+# past it, the fallback is wrong and this check asks for the unpinned form, so the
+# transition cannot be forgotten.
 LAST_AMD64_ONLY_VERSION = (0, 3, 17)
 # Paths the repair dispatch needs in the tag it rebuilds. A tag lacking any of
 # them cannot publish or verify the image index, so the preflight refuses.
@@ -74,6 +79,26 @@ PLATFORM_DOCS = ("docs/installation.md", "docs/compatibility.md")
 
 def workflow_text() -> str:
     return WORKFLOW.read_text(encoding="utf-8")
+
+
+def format_version(version: tuple[int, ...]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def platform_default(
+    version: tuple[int, ...], last_amd64_only: tuple[int, ...] = LAST_AMD64_ONLY_VERSION
+) -> str:
+    """The quickstart `platform:` default a pinned release tag calls for.
+
+    A tag newer than the last amd64-only release resolves a native child on both
+    architectures, so it wants no pin at all; anything at or below that release
+    has no ARM child and must keep the explicit `linux/amd64` fallback.
+
+    So `last_amd64_only` only ever names a release *older* than the pinned tag:
+    setting it to the pinned tag would ask the quickstart for the fallback again,
+    which is exactly what the multi-architecture release removed.
+    """
+    return NATIVE_PLATFORM if version > last_amd64_only else AMD64_FALLBACK_PLATFORM
 
 
 def job_block(text: str, job: str) -> str | None:
@@ -402,15 +427,15 @@ def check_compose_platform(notes: list[str]) -> list[str]:
     if pinned is None:
         return ["docker-compose.yml: could not read the pinned quickstart image tag"]
     version = tuple(int(part) for part in pinned.group(1).split("."))
-    if version > LAST_AMD64_ONLY_VERSION:
+    if platform_default(version) == NATIVE_PLATFORM:
         if AMD64_FALLBACK_PLATFORM in compose:
             notes.append(
                 f"docker-compose.yml: the pinned tag {pinned.group(1)} publishes a "
                 "multi-architecture image, so the amd64 fallback now only forces "
                 f"emulation on ARM hosts; switch to `{NATIVE_PLATFORM}`. Leave "
                 "LAST_AMD64_ONLY_VERSION alone: it names the last amd64-only "
-                "release, and raising it to this tag re-asserts the fallback "
-                "this note asks to drop"
+                f"release ({format_version(LAST_AMD64_ONLY_VERSION)}), and raising "
+                "it to this tag re-asserts the fallback this note asks to drop"
             )
         elif NATIVE_PLATFORM not in compose:
             failures.append(
@@ -446,7 +471,7 @@ def check_compose_platform(notes: list[str]) -> list[str]:
         text = " ".join((ROOT / page).read_text(encoding="utf-8").split())
         if "multi-architecture index" not in text and "arm64` index" not in text:
             continue
-        if version > LAST_AMD64_ONLY_VERSION:
+        if platform_default(version) == NATIVE_PLATFORM:
             if INDEX_TRANSITION_PHRASE in text:
                 notes.append(
                     f"{page}: the pinned tag {pinned.group(1)} is a "
@@ -554,7 +579,77 @@ def check_repair_preflight(text: str) -> list[str]:
     return failures
 
 
-def main() -> int:
+def check_platform_transition_guidance() -> list[str]:
+    """The post-release follow-up must not ask for `LAST_AMD64_ONLY_VERSION` to move.
+
+    The constant names the last release published as a single amd64 image, and
+    `platform_default` compares the pinned tag against it. Bumping it to the
+    release that first published an index puts the pin back *at* the constant, so
+    the gate demands the amd64 fallback that release just made unnecessary: the
+    follow-up would fail the check it exists to satisfy.
+    """
+    runbook = " ".join(
+        (ROOT / "docs/maintainers/releasing.md").read_text(encoding="utf-8").split()
+    )
+    failures: list[str] = []
+    if re.search(r"bump(?:ing)?\s+`?LAST_AMD64_ONLY_VERSION", runbook, re.IGNORECASE):
+        failures.append(
+            "docs/maintainers/releasing.md: tells the operator to bump "
+            "LAST_AMD64_ONLY_VERSION; setting it to the released version makes "
+            f"`{AMD64_FALLBACK_PLATFORM}` required again"
+        )
+    if "LAST_AMD64_ONLY_VERSION" not in runbook:
+        failures.append(
+            "docs/maintainers/releasing.md: the multi-architecture follow-up does "
+            "not name LAST_AMD64_ONLY_VERSION, so an operator cannot tell whether "
+            "it has to change"
+        )
+    elif format_version(LAST_AMD64_ONLY_VERSION) not in runbook:
+        failures.append(
+            "docs/maintainers/releasing.md: the follow-up does not name the last "
+            f"amd64-only release ({format_version(LAST_AMD64_ONLY_VERSION)}), the "
+            "value LAST_AMD64_ONLY_VERSION holds"
+        )
+    return failures
+
+
+def self_test() -> int:
+    """Prove the platform-default decision, not only that the tree passes today.
+
+    The decision is what the post-release cleanup got wrong once: the pinned tag
+    is compared against the *last amd64-only release*, so the constant trails the
+    pin and never equals it.
+    """
+    last = (0, 3, 17)
+    # A tag newer than the last amd64-only release resolves both architectures.
+    assert platform_default((0, 3, 18), last) == NATIVE_PLATFORM
+    assert platform_default((0, 4, 0), last) == NATIVE_PLATFORM
+    # The amd64-only releases themselves, and anything older, keep the fallback:
+    # dropping it there leaves an ARM host with nothing to pull.
+    assert platform_default((0, 3, 17), last) == AMD64_FALLBACK_PLATFORM
+    assert platform_default((0, 3, 16), last) == AMD64_FALLBACK_PLATFORM
+    # The regression: bumping the constant to the first multi-architecture
+    # release asks for the fallback that release removed.
+    assert platform_default((0, 3, 18), (0, 3, 18)) == AMD64_FALLBACK_PLATFORM
+    # So the committed constant stays at the last amd64-only release, 0.3.17 — not
+    # at the 0.3.18 index release that made the fallback unnecessary. It moves
+    # only if the quickstart is pinned back onto a newer amd64-only release.
+    assert LAST_AMD64_ONLY_VERSION == last, LAST_AMD64_ONLY_VERSION
+
+    print("check-release-config: platform-default self-test passed")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if argv == ["--self-test"]:
+        return self_test()
+    if argv:
+        raise SystemExit(
+            f"usage: check-release-config.py [--self-test], not {' '.join(argv)}"
+        )
+    # The decision the notes and the runbook rest on is proven on every run, so a
+    # refactor that inverts it cannot pass by leaving the tree untouched.
+    self_test()
     text = workflow_text()
     notes: list[str] = []
     failures: list[str] = []
@@ -564,6 +659,7 @@ def main() -> int:
     failures.extend(check_image_gates(text))
     failures.extend(check_release_success(text))
     failures.extend(check_compose_platform(notes))
+    failures.extend(check_platform_transition_guidance())
     failures.extend(check_no_latest_tag(text))
     failures.extend(check_documented_matrix())
     failures.extend(check_repair_preflight(text))
@@ -581,4 +677,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

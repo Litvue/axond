@@ -180,13 +180,13 @@ architecture.
 
 ### Older releases
 
-Linux ARM64 archives and the multi-architecture image exist from the first
-release that published them; earlier releases carry the x86-64 Linux, macOS, and
-Windows artifacts only. Asking an older release for an ARM64 archive fails with
-an explicit message naming the release and target rather than a transfer error,
-and pinning such a release in the Compose quickstart needs an explicit
-`AXOND_PLATFORM=linux/amd64` for an ARM host to run it under emulation rather
-than fail to pull — see [architecture
+Linux ARM64 archives and the multi-architecture image start with 0.3.18;
+releases up to and including 0.3.17 carry the x86-64 Linux, macOS, and Windows
+artifacts and a single `linux/amd64` image only. Asking one of those releases for
+an ARM64 archive fails with an explicit message naming the release and target
+rather than a transfer error, and pinning one in the Compose quickstart needs an
+explicit `AXOND_PLATFORM=linux/amd64` for an ARM host to run it under emulation
+rather than fail to pull — see [architecture
 selection](./deployment/docker-compose.md#architecture-selection).
 
 ## Build from source
