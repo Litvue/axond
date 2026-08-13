@@ -2,7 +2,7 @@ name: Rollout
 
 # The heavy rollout scenarios: the same driver, manifest, and assertions the
 # `CI` workflow runs at the reduced scale, offered at a scale that wants a runner
-# to itself (ADR 0036). The result artifacts are uploaded so a drain bound or a
+# to itself (ADR 0037). The result artifacts are uploaded so a drain bound or a
 # rollback decision can be read from evidence rather than from memory.
 #
 # Unlike the CI lane, this one attaches a control plane, so the forward-only

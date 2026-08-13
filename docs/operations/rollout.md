@@ -3,7 +3,7 @@
 Whether the rolling upgrade in [upgrades and rollback](./upgrades.md) actually
 holds, executed against a fleet of real Axond processes behind a real
 readiness-driven load balancer. The design and its boundaries are
-[ADR 0036](../adr/0036-rollout-qualification-harness.md); the per-replica
+[ADR 0037](../adr/0037-rollout-qualification-harness.md); the per-replica
 envelope the fleet is sized from is
 [capacity qualification](./capacity.md).
 
