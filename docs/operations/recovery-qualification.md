@@ -3,7 +3,7 @@
 What a stateful deployment is required to do when it loses its control plane,
 boots without one, gets it back, rotates a credential, or restores its database
 — and what evidence a run of the recovery harness has to leave behind. The
-design is [ADR 0036](../adr/0036-recovery-qualification-harness.md); the
+design is [ADR 0037](../adr/0037-recovery-qualification-harness.md); the
 behaviour being qualified is
 [revision convergence](./revision-convergence.md#during-a-control-plane-outage)
 and the [control-plane journal](./control-plane-journal.md#during-a-postgres-outage).
@@ -114,7 +114,7 @@ which scenarios it unblocks.
 
 ## Related
 
-- [ADR 0036](../adr/0036-recovery-qualification-harness.md) — the harness
+- [ADR 0037](../adr/0037-recovery-qualification-harness.md) — the harness
   contract and why the scenarios are committed before the driver.
 - [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md) — the mode
   boundary that makes an outage a change-freeze rather than an inference
