@@ -1810,15 +1810,15 @@ impl Models {
             // A target this build cannot read a body for is still a declared,
             // reachable enablement; its wire family is checked when the body is
             // one this build reads.
-            if let Some(enabled) = self.enablements.get(&target.enablement) {
-                if enabled.body.wire_family() != body.wire_family() {
-                    return Err(ModelError::WireFamilyMismatch {
-                        reference: resource.reference,
-                        target: target.reference(),
-                        alias: body.wire_family(),
-                        found: enabled.body.wire_family(),
-                    });
-                }
+            if let Some(enabled) = self.enablements.get(&target.enablement)
+                && enabled.body.wire_family() != body.wire_family()
+            {
+                return Err(ModelError::WireFamilyMismatch {
+                    reference: resource.reference,
+                    target: target.reference(),
+                    alias: body.wire_family(),
+                    found: enabled.body.wire_family(),
+                });
             }
         }
         Ok(())
