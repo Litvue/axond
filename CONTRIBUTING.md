@@ -25,6 +25,7 @@ just check      # fmt --check, clippy -D warnings, tests, the fuzz smoke, docs,
                 # — the CI gates
 just run        # run against ./axond.toml
 just compat     # run the Python SDK compatibility lane
+just compat-ts  # run the TypeScript SDK compatibility lane
 just fuzz-smoke # replay the committed fuzz corpora (see fuzz/README.md)
 just msrv       # build on the declared minimum supported Rust version
 just api-compat # semver-check the published library crates against crates.io
@@ -58,6 +59,12 @@ with `just compat-lock`; the recipe resolves from
 published less than seven days ago. The refresh requires
 [`uv`](https://docs.astral.sh/uv/getting-started/installation/) on `PATH`.
 Review the generated diff, then run `just compat`.
+
+The same claim is made through the vendors' Node SDKs by
+[`tests/compat-ts`](./tests/compat-ts), which pins the SDKs, the TypeScript
+toolchain, and the Node runtime exactly and type-checks the calls before running
+them. `ops/compat-ts-pins.py` (`just compat-ts-pins`) enforces those pins; how to
+bump an SDK is in [that lane's README](./tests/compat-ts/README.md).
 
 Touching a parser that reads untrusted input — configuration, minted tokens, or
 a query string? [`fuzz/`](./fuzz/README.md) is a separate Cargo workspace, so the

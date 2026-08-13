@@ -2,9 +2,9 @@
 
 Recorded provider responses, replayed through a fake upstream so the gateway's
 wire fidelity is asserted offline and deterministically (ADR 0014). Nothing
-here reaches the network: the harnesses in `crates/gateway/tests/` and
-`tests/compat/` boot a real `axond` against a local server that serves these
-bytes.
+here reaches the network: the harnesses in `crates/gateway/tests/`,
+`tests/compat/`, and `tests/compat-ts/` boot a real `axond` against a local
+server that serves these bytes.
 
 ## Layout
 
@@ -44,8 +44,8 @@ asserted expectation rather than a cosmetic sample.
    Anthropic, the final `usage` chunk for OpenAI) plus whatever shape the case
    is about.
 4. Wire it into the fake upstream (`crates/gateway/tests/support/upstream.rs`,
-   `tests/compat/fake_upstream.py`) by adding a target model that serves it, and
-   assert against it from a test.
+   `tests/compat/fake_upstream.py`, `tests/compat-ts/src/fakeUpstream.ts`) by
+   adding a target model that serves it, and assert against it from a test.
 
 ## Current fixtures
 

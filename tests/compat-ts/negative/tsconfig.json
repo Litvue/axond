@@ -1,0 +1,9 @@
+{
+  // The type-checking settings only: nothing is emitted, so this project shares
+  // no build output or `.tsbuildinfo` with the lane it is checking.
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["*.ts"]
+}
