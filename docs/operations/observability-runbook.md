@@ -148,10 +148,13 @@ every probe — an abandoned probe publishes a synthetic `timeout` observation t
   `axond_status_outcome="failed"`, the state is honest, and the dependency — not
   the replica — is the thing to fix.
 - **rounds are slower than the budget.** The age exceeds the budget while still
-  being republished, which means `probe_timeout` or `refresh_interval` is above
-  `status.staleness_budget`. Check whether the replica is saturated
-  (`axond_admission_in_flight`) or the probes are timing out, then reconcile the
-  three settings.
+  being republished, which means a round takes longer than the budget allows —
+  the probe timeout or the refresh interval is above the staleness budget. Those
+  three are fields of the registry's internal settings, not configuration: there
+  is no `[status]` section to edit, so this is a report for whoever wires the
+  refresher rather than a knob you can turn. What you can establish from here is
+  whether the replica is saturated (`axond_admission_in_flight`) or the probes
+  are timing out (`axond_status_outcome="failed"`).
 
 A stale observation is deliberately reported as `degraded`/`stale` rather than as
 `ok` or as a readiness failure, so treat it as "I no longer know", not as "the

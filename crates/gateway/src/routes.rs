@@ -79,12 +79,20 @@ pub fn router(state: AppState) -> Router {
         .fold(Router::new(), |router, spec| {
             let route = (spec.router)().layer(DefaultBodyLimit::max(max_request_bytes));
             // A diagnostic takes no served-traffic slot, but it is not free
-            // either: its own small ceiling keeps a credential holder from
-            // polling it at unbounded concurrency, without letting served
-            // traffic at *its* ceiling make the replica unanswerable. Applied
-            // before authentication and therefore *inside* it: a slot is spent
-            // only once a caller has proved it may ask, so an anonymous flood
-            // cannot hold the ceiling closed against the operators it is for.
+            // either: its own small ceiling bounds how many status reads run at
+            // once, without letting served traffic at *its* ceiling make the
+            // replica unanswerable. Applied before authentication and therefore
+            // *inside* it, which picks a side of a real trade-off: a slot is
+            // spent only once a caller has proved it may ask, so an anonymous
+            // flood cannot hold the ceiling closed against the operators it is
+            // for — but authentication itself (a signature check, and a
+            // revocation lookup for a minted token) then runs outside any
+            // bound on this route, where admission bounds it on every other
+            // authenticated one. Bounding the cheaper, later work in exchange
+            // for keeping the route answerable to a credentialled operator is
+            // the trade an emergency diagnostic wants; a bound covering
+            // authentication too has to be one that anonymous callers cannot
+            // monopolise, which is a wider change than this route.
             let route = if spec.auth.takes_a_diagnostic_slot() {
                 route.layer(from_fn_with_state(state.clone(), diagnostic_middleware))
             } else {
