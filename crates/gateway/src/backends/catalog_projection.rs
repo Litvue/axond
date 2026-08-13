@@ -43,7 +43,11 @@
 //! must send, and a callable id coming to resolve to a different model. It
 //! deliberately does *not* re-report facts, prices, or lifecycle: those are
 //! `CatalogDiff`'s classes, and reporting them twice would make a refresh's
-//! change count depend on how many views someone happened to build.
+//! change count depend on how many views someone happened to build. That
+//! division holds for an alias-heavy provider too, because `CatalogDiff` pairs a
+//! provider's several offerings of one model by the id each is published under,
+//! so a change to one alias is reported against that alias and not folded into a
+//! sibling's.
 //!
 //! Nothing here fetches, persists, or serves anything: it is an I/O-free
 //! projection of content already in hand, off the request path, and the
@@ -766,6 +770,8 @@ mod tests {
         include_str!("fixtures/models_dev/catalog.cross-provider-relocated.json");
     const CROSS_PROVIDER_RELABELLED: &str =
         include_str!("fixtures/models_dev/catalog.cross-provider-relabelled.json");
+    const ALIASES_REPRICED: &str =
+        include_str!("fixtures/models_dev/catalog.aliases-repriced.json");
     const UNAUTHORED: &str = include_str!("fixtures/models_dev/catalog.aliases-unauthored.json");
     const AMBIGUOUS: &str = include_str!("fixtures/models_dev/drift.model-key-ambiguous.json");
 
@@ -966,6 +972,31 @@ mod tests {
                 "a record built here must be the record storage returns"
             );
         }
+    }
+
+    /// One alias of an alias-heavy provider being repriced is reported once, by
+    /// the catalogue diff, and not by this one: the division of labour this
+    /// module documents holds for the case where a provider publishes the model
+    /// several times, which is the case a per-`(model, provider)` view might be
+    /// expected to lose.
+    #[test]
+    fn a_repriced_alias_is_the_catalogue_diff_to_report_and_not_this_one() {
+        let before = content(ALIASES);
+        let after = content(ALIASES_REPRICED);
+
+        assert_eq!(
+            after.diff(&before).counts().prices_changed,
+            1,
+            "the catalogue pairs a provider's several aliases by published id, \
+             so the repriced one is named"
+        );
+        assert!(
+            ModelProjection::project(&after)
+                .expect("a projection")
+                .diff(&ModelProjection::project(&before).expect("a projection"))
+                .is_empty(),
+            "and no callable id appeared, went away, or came to reach another model"
+        );
     }
 
     /// A rename is reported as a rename: the pair a caller has to act on, not a
