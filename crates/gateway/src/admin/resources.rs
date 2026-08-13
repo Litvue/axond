@@ -52,6 +52,12 @@ pub struct ResourcePlan {
     /// the resource being changed, not the caller's own reach.
     pub scope: ResourceScope,
     pub edit: Arc<dyn DesiredStateEdit>,
+    /// Whether the document retires the resource: puts it into the terminal
+    /// state its own lifecycle offers, which is the only kind of deletion this
+    /// surface has. Read by the handler to keep `mutation: "delete"` honest in
+    /// the audit trail — nothing here removes a resource, so a document that
+    /// leaves it in service may not be recorded as a deletion.
+    pub retires: bool,
 }
 
 impl ResourcePlan {
@@ -62,7 +68,15 @@ impl ResourcePlan {
         Self {
             scope,
             edit: Arc::new(edit),
+            retires: false,
         }
+    }
+
+    /// The same plan, marked as retiring the resource it publishes.
+    #[must_use]
+    fn retiring(mut self, retires: bool) -> Self {
+        self.retires = retires;
+        self
     }
 }
 
@@ -180,7 +194,8 @@ impl AdminResourceRequest for TenantRequest {
                 publish(state, body.version_at(slug.clone(), version))?;
                 Ok(())
             },
-        ))
+        )
+        .retiring(lifecycle == TenantLifecycle::Deleted))
     }
 }
 
@@ -271,11 +286,13 @@ impl AdminResourceRequest for ProviderRequest {
 /// The document `POST /admin/v1/credentials` reads.
 ///
 /// The secret is named, never carried: `secret` is a reference into the secret
-/// store, and no field on this document accepts material. A rotation is
-/// `rotate: true`, which advances the version *in force* — the one the
-/// credential's current body names, not the one this document spells — and
-/// re-stages it, so a document that omits `secret_version` still rotates a
-/// credential forward from wherever it is.
+/// store, and no field on this document accepts material.
+///
+/// `secret_version` is *unstated* when omitted rather than "version 1": for a
+/// credential that already names the same secret it means the version in force,
+/// so an edit that only changes a display name cannot silently republish a
+/// rotated credential at v1 and re-stage it. A rotation is `rotate: true`, which
+/// advances from that same in-force version.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialRequest {
@@ -313,10 +330,15 @@ impl AdminResourceRequest for CredentialRequest {
         let display_name = display_name::<Self>(&self.display_name)?;
         let secret = SecretId::parse(&self.secret)
             .map_err(|error| malformed::<Self>("secret", &error.to_string()))?;
+        // An omitted version is *unstated*, not "the first": for a credential
+        // that already exists it means the version in force, resolved against
+        // the state below.
         let version = match self.secret_version {
-            None => SecretVersion::FIRST,
-            Some(version) => SecretVersion::new(version)
-                .ok_or_else(|| malformed::<Self>("secret_version", "versions start at 1"))?,
+            None => None,
+            Some(version) => Some(
+                SecretVersion::new(version)
+                    .ok_or_else(|| malformed::<Self>("secret_version", "versions start at 1"))?,
+            ),
         };
         let lifecycle = match self.lifecycle.as_deref() {
             None => None,
@@ -329,9 +351,8 @@ impl AdminResourceRequest for CredentialRequest {
             None => SecretOwner::tenant(tenant),
         };
         let rotate = self.rotate;
-        Ok(ResourcePlan::new(
-            owner.scope(),
-            move |state: &mut DesiredState| {
+        Ok(
+            ResourcePlan::new(owner.scope(), move |state: &mut DesiredState| {
                 let reference = state.version_of(ResourceKind::ProviderCredential, credential);
                 // A credential that exists moves from what it *is*: the document
                 // reauthors its provider, name, and material, but lifecycle is a
@@ -340,11 +361,13 @@ impl AdminResourceRequest for CredentialRequest {
                     Some(resource) => Some(ProviderCredentialBody::read(resource)?),
                     None => None,
                 };
-                // A rotation advances the material *in force*, never the version
-                // the document happens to spell: a credential serving v5 whose
-                // document omits `secret_version` would otherwise rotate to v2 —
-                // a downgrade wearing a rotation's name — and every later
-                // rotation would land on v2 again. The document names the
+                // Every path here works from the material *in force*, never from
+                // the version a document happens to spell. A credential serving
+                // v5 whose document omits `secret_version` — because a rename is
+                // not a statement about material, and `/admin/v1/state` does not
+                // publish bodies for an author to read it from — would otherwise
+                // be republished at v1 and re-staged: a silent downgrade that
+                // takes the credential out of service. The document names the
                 // credential, not the version it is at.
                 let staged = |material: SecretRef| {
                     ProviderCredentialBody::staged(
@@ -355,16 +378,16 @@ impl AdminResourceRequest for CredentialRequest {
                         material,
                     )
                 };
-                let authored = SecretRef::new(secret, version);
+                // The material the document asks for: the version it states, or
+                // the one in force when it states none and names the same secret.
+                let in_force = previous.as_ref().map(ProviderCredentialBody::secret);
+                let authored = match (version, in_force) {
+                    (Some(version), _) => SecretRef::new(secret, version),
+                    (None, Some(held)) if held.secret == secret => held,
+                    (None, _) => SecretRef::first(secret),
+                };
                 let body = match (previous, rotate) {
-                    (Some(previous), true) => {
-                        let material = if previous.secret().is_same_secret(authored) {
-                            previous.secret()
-                        } else {
-                            authored
-                        };
-                        previous.reauthored(staged(material)).rotated()
-                    }
+                    (Some(previous), true) => previous.reauthored(staged(authored)).rotated(),
                     (Some(previous), false) => previous.reauthored(staged(authored)),
                     // Nothing to rotate: the first version of a credential is the
                     // material the author named, at the version they named.
@@ -377,8 +400,12 @@ impl AdminResourceRequest for CredentialRequest {
                 let next = next_version(state, ResourceKind::ProviderCredential, credential);
                 publish(state, body.version_at(slug.clone(), next))?;
                 Ok(())
-            },
-        ))
+            })
+            .retiring(matches!(
+                lifecycle,
+                Some(SecretLifecycle::Revoked | SecretLifecycle::Tombstoned)
+            )),
+        )
     }
 }
 
@@ -513,9 +540,8 @@ impl AdminResourceRequest for ModelRequest {
             Some(observed) => body.observing(observed),
             None => body,
         };
-        Ok(ResourcePlan::new(
-            owner.scope(),
-            move |state: &mut DesiredState| {
+        Ok(
+            ResourcePlan::new(owner.scope(), move |state: &mut DesiredState| {
                 // The catalogue row is depended on at the version the state holds,
                 // so an enablement pins the snapshot that is actually published
                 // rather than a version the author guessed.
@@ -532,8 +558,9 @@ impl AdminResourceRequest for ModelRequest {
                 let version = next_version(state, ResourceKind::ModelEnablement, enablement);
                 publish(state, body.version_at(slug.clone(), version, pinned))?;
                 Ok(())
-            },
-        ))
+            })
+            .retiring(state == ModelLifecycle::Disabled),
+        )
     }
 }
 
@@ -616,7 +643,8 @@ impl AdminResourceRequest for AliasRequest {
                 publish(state, body.version_at(slug.clone(), version))?;
                 Ok(())
             },
-        ))
+        )
+        .retiring(lifecycle == ModelLifecycle::Disabled))
     }
 }
 

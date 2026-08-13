@@ -62,6 +62,21 @@ it, validates the **whole** candidate — every reference, every ownership rule,
 every wire-family constraint — and publishes it as one immutable revision. A
 refused candidate publishes nothing at all.
 
+Nothing on this surface removes a resource: a revision supersedes versions and
+retains what history resolves against, so the only deletion there is is a
+resource's own terminal lifecycle state — a tenant `deleted`, a credential
+`revoked`, an enablement or alias `disabled`. `"mutation": "delete"` is
+therefore accepted only for a document that states one of those, and refused
+with `admin_request_invalid` for a document that leaves the resource serving:
+an auditor filtering the trail for `delete` is asking what stopped serving, and
+a rename wearing that label would answer wrongly.
+
+A request body is bounded at 1 MiB, refused as `413 admin_request_too_large`.
+The bound is the surface's own rather than the inference `max_request_bytes` an
+operator tunes for their models: an administrative document is identifiers and a
+summary, and the largest thing publishable is a catalogue *reference*, because a
+snapshot's payload is content-addressed and never crosses this surface.
+
 Two preconditions are required on every write:
 
 | Header | Value |
@@ -162,7 +177,12 @@ releases its slug — the projection's unique index is partial — so:
   the tenant that took the name first; the gateway will not silently rename
   either row.
 
-The same holds for projects, whose slugs are unique within their tenant.
+A **project** slug is unique within its tenant and is *not* released this way:
+a project has no lifecycle, its projected row is retained so history keeps
+resolving, and `UNIQUE (tenant_id, slug)` on that row is unconditional. There is
+therefore no way to hand a retired project's name to a new one — publish the new
+project under a different slug, or rename the retired project by publishing it
+with the slug you want it to keep.
 
 ### Refreshing a model catalogue
 

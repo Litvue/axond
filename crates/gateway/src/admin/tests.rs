@@ -1566,6 +1566,9 @@ fn every_declared_code_is_reachable_distinct_and_prose_free() {
             // operator detail, this is not the deployment's to keep.
             detail: "`slug`: a slug is lowercase".to_owned(),
         },
+        AdminError::RequestTooLarge {
+            limit: crate::admin::router::ADMIN_MAX_REQUEST_BYTES,
+        },
         AdminError::RouteNotFound,
         AdminError::MethodNotAllowed,
     ];

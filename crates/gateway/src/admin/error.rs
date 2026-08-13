@@ -150,6 +150,12 @@ pub enum AdminError {
         schema: &'static str,
         detail: String,
     },
+    /// The request body is larger than this surface reads. Declared in the
+    /// envelope rather than left to axum's bare `413`: a handler parses a
+    /// document whole, so the bound is what stops an authenticated caller from
+    /// making the process buffer an arbitrary body.
+    #[error("the request body exceeds the {limit}-byte administrative limit")]
+    RequestTooLarge { limit: usize },
     /// No such administrative route. Unlike `/v1`, where a `404` would be
     /// indistinguishable from a misconfigured `base_url`, an unknown
     /// `/admin/v1` path is a client error and says so in its own code.
@@ -187,6 +193,7 @@ impl AdminError {
         "dry_run_invalid",
         "history_limit_invalid",
         "admin_request_invalid",
+        "admin_request_too_large",
         "admin_route_not_found",
         "admin_method_not_allowed",
     ];
@@ -216,6 +223,7 @@ impl AdminError {
             Self::DryRunInvalid => "dry_run_invalid",
             Self::HistoryLimitInvalid { .. } => "history_limit_invalid",
             Self::RequestInvalid { .. } => "admin_request_invalid",
+            Self::RequestTooLarge { .. } => "admin_request_too_large",
             Self::RouteNotFound => "admin_route_not_found",
             Self::MethodNotAllowed => "admin_method_not_allowed",
         }
@@ -241,6 +249,7 @@ impl AdminError {
             | Self::IdempotencyKeyReused { .. }
             | Self::NameTaken { .. }
             | Self::ImmutableResourceVersion { .. } => StatusCode::CONFLICT,
+            Self::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RevisionNotFound(_) | Self::RouteNotFound => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             // Stateless mode is not a failure and not a misconfiguration: the

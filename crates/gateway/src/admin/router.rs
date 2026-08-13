@@ -59,7 +59,7 @@ use std::error::Error as _;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::HeaderMap;
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::Response;
@@ -259,6 +259,19 @@ pub fn admin_route_specs() -> Vec<AdminRouteSpec> {
     ]
 }
 
+/// The inbound bound on an administrative document, declared rather than
+/// inherited: a handler buffers the whole body to parse it, and axum's implicit
+/// default would make the process's memory the real ceiling.
+///
+/// Not the inference surface's `max_request_bytes`, which bounds a prompt an
+/// operator tunes for their models. An administrative document is a handful of
+/// identifiers and a summary; the largest thing publishable is a catalogue
+/// *reference*, because a snapshot's payload is content-addressed elsewhere and
+/// never crosses this surface. A megabyte is orders of magnitude above any
+/// legitimate document and small enough that an unauthenticated caller cannot
+/// make the process buffer for them.
+pub const ADMIN_MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
 /// Mount a table under [`ADMIN_PREFIX`].
 ///
 /// `pub(crate)` so the contract tests can mount a synthetic spec and assert the
@@ -267,10 +280,12 @@ pub(crate) fn mount(api: Arc<AdminApi>, specs: Vec<AdminRouteSpec>) -> Router {
     let inner = specs
         .into_iter()
         .fold(Router::new(), |router, spec| {
-            let route = (spec.router)().layer(from_fn_with_state(
-                (api.clone(), spec.action),
-                admin_authenticate,
-            ));
+            let route = (spec.router)()
+                .layer(DefaultBodyLimit::max(ADMIN_MAX_REQUEST_BYTES))
+                .layer(from_fn_with_state(
+                    (api.clone(), spec.action),
+                    admin_authenticate,
+                ));
             router.route(spec.path, route)
         })
         .fallback(unknown_route)

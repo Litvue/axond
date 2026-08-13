@@ -23,7 +23,7 @@ use super::protocol::{
     ADMIN_PREFIX, DRY_RUN_HEADER, EXPECTED_REVISION_EMPTY, EXPECTED_REVISION_HEADER,
     IDEMPOTENCY_KEY_HEADER,
 };
-use super::router::{AdminApi, refusing_router, router};
+use super::router::{ADMIN_MAX_REQUEST_BYTES, AdminApi, refusing_router, router};
 use super::service::AdminService;
 use crate::backends::control_plane::ControlPlaneStore;
 use crate::desired_state::oracle::InMemoryControlPlane;
@@ -429,6 +429,83 @@ async fn rotating_a_credential_advances_the_version_currently_in_force() {
         crate::desired_state::SecretLifecycle::Staged
     );
     assert_eq!(body.secret().secret, fixtures::secret_id(12));
+}
+
+/// An edit that says nothing about material must not move any: `secret_version`
+/// is unstated when omitted, not "version 1". A rename that republished a
+/// rotated credential at v1 would re-stage it — taking the credential out of
+/// service — and nothing in the document would have said so.
+#[tokio::test]
+async fn editing_a_credential_without_a_version_keeps_the_one_in_force() {
+    let deployment = Deployment::new();
+    let mut head = deployment
+        .publish(
+            "/tenants",
+            "key-1",
+            EXPECTED_REVISION_EMPTY,
+            &tenant_document(),
+        )
+        .await;
+    head = deployment
+        .publish("/providers", "key-2", &head, &provider_document())
+        .await;
+    head = deployment
+        .publish("/credentials", "key-3", &head, &credential_document())
+        .await;
+
+    let mut rotate = credential_document();
+    rotate["mutation"] = json!("update");
+    rotate["resource"]["rotate"] = json!(true);
+    head = deployment
+        .publish("/credentials", "key-4", &head, &rotate)
+        .await;
+
+    let mut activate = credential_document();
+    activate["mutation"] = json!("update");
+    activate["resource"]["lifecycle"] = json!("active");
+    head = deployment
+        .publish("/credentials", "key-5", &head, &activate)
+        .await;
+
+    let mut renamed = credential_document();
+    renamed["mutation"] = json!("update");
+    renamed["resource"]["display_name"] = json!("OpenAI primary (eu)");
+    head = deployment
+        .publish("/credentials", "key-6", &head, &renamed)
+        .await;
+
+    let body = credential_body(&deployment, &head).await;
+    assert_eq!(
+        body.secret().version.get(),
+        2,
+        "a rename says nothing about material, so the version in force stands"
+    );
+    assert_eq!(
+        body.lifecycle(),
+        crate::desired_state::SecretLifecycle::Active,
+        "and the credential stays in service"
+    );
+    assert_eq!(body.display_name().as_str(), "OpenAI primary (eu)");
+}
+
+/// The credential fixture's body at `head`.
+async fn credential_body(
+    deployment: &Deployment,
+    head: &str,
+) -> crate::desired_state::ProviderCredentialBody {
+    let loaded = deployment
+        .store
+        .load_revision(crate::desired_state::RevisionId::parse(head).expect("a revision"))
+        .await
+        .expect("the published revision hydrates");
+    let credential = loaded
+        .state()
+        .version_of(
+            crate::desired_state::ResourceKind::ProviderCredential,
+            fixtures::resource_id(11),
+        )
+        .expect("the credential is desired");
+    crate::desired_state::ProviderCredentialBody::read(credential).expect("a credential body")
 }
 
 /// The secret reference the credential fixture's resource holds at `head`.
@@ -904,6 +981,69 @@ async fn a_document_that_is_not_its_schema_is_refused_before_the_control_plane()
         counting.calls(),
         0,
         "a document this build cannot read reached the control plane"
+    );
+}
+
+/// Nothing here removes a resource, so the audit trail may not say one was
+/// removed: `delete` is accepted only for a document that retires the resource
+/// through its own lifecycle, and refused for one that leaves it serving.
+#[tokio::test]
+async fn a_deletion_must_retire_the_resource_it_claims_to_delete() {
+    let deployment = Deployment::new();
+    let mut head = deployment
+        .publish(
+            "/tenants",
+            "key-1",
+            EXPECTED_REVISION_EMPTY,
+            &tenant_document(),
+        )
+        .await;
+
+    let mut renamed = tenant_document();
+    renamed["mutation"] = json!("delete");
+    renamed["resource"]["display_name"] = json!("Acme, retired");
+    let (status, body) = deployment.post("/tenants", "key-2", &head, &renamed).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["type"], "admin_request_invalid");
+
+    let mut deleted = tenant_document();
+    deleted["mutation"] = json!("delete");
+    deleted["resource"]["lifecycle"] = json!("deleted");
+    head = deployment
+        .publish("/tenants", "key-3", &head, &deleted)
+        .await;
+
+    let (status, audit) = deployment.get(&format!("/audit/{head}")).await;
+    assert_eq!(status, StatusCode::OK, "{audit}");
+    assert_eq!(audit["events"][0]["kind"], "delete", "{audit}");
+}
+
+/// A handler parses a document whole, so the surface declares how much it will
+/// buffer — and refuses the excess in its own envelope, before anything is
+/// parsed or the control plane is touched.
+#[tokio::test]
+async fn an_oversized_document_is_refused_in_the_administrative_envelope() {
+    let store = Arc::new(InMemoryControlPlane::new());
+    let counting = Arc::new(CountingStore::new(store.clone()));
+    let api = Arc::new(AdminApi::new(
+        Arc::new(AdminService::stateful(counting.clone())),
+        Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
+        Arc::new(FakeAdminAuthorizer::permissive()),
+    ));
+    let deployment = Deployment { api, store };
+    let mut document = tenant_document();
+    document["summary"] = json!("x".repeat(ADMIN_MAX_REQUEST_BYTES + 1));
+
+    let (status, body) = deployment
+        .post("/tenants", "key-1", EXPECTED_REVISION_EMPTY, &document)
+        .await;
+
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body["error"]["type"], "admin_request_too_large");
+    assert_eq!(
+        counting.calls(),
+        0,
+        "an oversized body reached the control plane"
     );
 }
 

@@ -15,8 +15,10 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::rejection::QueryRejection;
+use axum::body::Bytes;
+use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::routing::{MethodRouter, get, post};
 use serde::Deserialize;
 
@@ -27,7 +29,7 @@ use super::reads::{
     AuditPage, ConvergenceResult, HistoryLimit, HistoryRequest, RevisionPage, StateView,
 };
 use super::resources::{AdminResourceRequest, MutationEnvelope, RollbackRequest};
-use super::router::AdminApi;
+use super::router::{ADMIN_MAX_REQUEST_BYTES, AdminApi};
 use super::service::MutationOutcome;
 use crate::desired_state::{MutationKind, ProjectId, ResourceScope, RevisionId, Surface, TenantId};
 
@@ -56,6 +58,31 @@ pub(super) fn convergence_route() -> MethodRouter<Arc<AdminApi>> {
     get(convergence)
 }
 
+/// The buffered request body, or the administrative refusal for one that never
+/// arrived whole.
+///
+/// The body is taken as `Result` rather than as [`Bytes`] so that the router's
+/// declared limit answers in this surface's envelope: a client branching on
+/// [`AdminError::CODES`] would otherwise meet axum's bare `413` on the one
+/// response it cannot afford to misread as success.
+fn document(
+    schema: &'static str,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Bytes, AdminError> {
+    body.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            AdminError::RequestTooLarge {
+                limit: ADMIN_MAX_REQUEST_BYTES,
+            }
+        } else {
+            AdminError::RequestInvalid {
+                schema,
+                detail: rejection.body_text(),
+            }
+        }
+    })
+}
+
 /// Publish, or rehearse, one resource document.
 ///
 /// The body is taken as bytes and deserialized here rather than through
@@ -66,8 +93,9 @@ async fn publish<R: AdminResourceRequest>(
     State(api): State<Arc<AdminApi>>,
     identity: AdminIdentity,
     preconditions: MutationPreconditions,
-    body: axum::body::Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<MutationOutcome>, AdminError> {
+    let body = document(R::SCHEMA, body)?;
     let envelope: MutationEnvelope<R> =
         serde_json::from_slice(&body).map_err(|error| AdminError::RequestInvalid {
             schema: R::SCHEMA,
@@ -76,6 +104,22 @@ async fn publish<R: AdminResourceRequest>(
     let summary = AuditSummary::parse(&envelope.summary)?;
     let kind = envelope.mutation.kind();
     let plan = envelope.resource.plan()?;
+    // Nothing on this surface removes a resource: desired state supersedes
+    // versions and retains what history resolves against, so the only deletion
+    // there is is a resource's own terminal lifecycle state. A document that
+    // leaves the resource in service may not be *recorded* as a deletion — an
+    // auditor filtering the trail for `delete` is asking what stopped serving,
+    // and a rename wearing that label answers wrongly.
+    if kind == MutationKind::Delete && !plan.retires {
+        return Err(AdminError::RequestInvalid {
+            schema: R::SCHEMA,
+            detail: "`mutation: \"delete\"` requires a document that retires the resource: this \
+                     surface removes nothing, so state the terminal lifecycle the resource \
+                     supports (a tenant `deleted`, a credential `revoked`, an enablement or alias \
+                     `disabled`) — or record the change as an update"
+                .to_owned(),
+        });
+    }
     let grant = api
         .authorize(&identity, AdminAction::Publish, R::SURFACE, &plan.scope)
         .await?;
@@ -98,8 +142,9 @@ async fn rollback(
     State(api): State<Arc<AdminApi>>,
     identity: AdminIdentity,
     preconditions: MutationPreconditions,
-    body: axum::body::Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<MutationOutcome>, AdminError> {
+    let body = document("rollback", body)?;
     let request: RollbackRequest =
         serde_json::from_slice(&body).map_err(|error| AdminError::RequestInvalid {
             schema: "rollback",
