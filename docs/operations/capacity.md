@@ -85,16 +85,29 @@ Intel Xeon Platinum 8559C, 31 GiB RAM, Linux 5.15.200, rustc 1.97.1, no queueing
 
 | Profile | Concurrency | Requests | Accepted req/s | p50 | p95 | p99 | TTFT p95 | Peak RSS | Peak sockets | CPU cores used |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `buffered` | 128 | 40 000 | 7 675 | 15.9 ms | 25.0 ms | 30.6 ms | — | 44 MiB | 344 | 4.6 |
-| `streaming` | 300 | 8 000 | 1 034 | 275 ms | 299 ms | 669 ms | 62 ms | 49 MiB | 733 | 3.1 |
-| `mixed` | 128 | 12 000 | 1 360 | 2.7 ms | 279 ms | 293 ms | 51 ms | 38 MiB | 283 | 2.3 |
-| `response-size` | 64 | 6 000 | 1 371 | 44.2 ms | 75.0 ms | 92.4 ms | — | 67 MiB | 156 | 4.1 |
-| `cancellation` | 300 | 8 000 | 1 668 | 270 ms | 303 ms | 479 ms | 65 ms | 54 MiB | 720 | 3.5 |
+| `buffered` | 128 | 40 000 | 7 813 | 15.7 ms | 24.3 ms | 29.7 ms | — | 47 MiB | 354 | 4.8 |
+| `streaming` | 300 | 8 000 | 1 032 | 275 ms | 318 ms | 653 ms | 71 ms | 54 MiB | 805 | 3.2 |
+| `mixed` | 128 | 12 000 | 1 367 | 2.7 ms | 278 ms | 286 ms | 51 ms | 41 MiB | 285 | 2.3 |
+| `response-size` | 64 | 6 000 | 1 447 | 41.8 ms | 70.4 ms | 85.9 ms | — | 68 MiB | 155 | 4.3 |
+| `cancellation` | 300 | 8 000 | 1 668 | 271 ms | 309 ms | 484 ms | 64 ms | 58 MiB | 698 | 3.7 |
+| `tenants` | 128 | 12 000 | 950 | 254 ms | 266 ms | 272 ms | 51 ms | 42 MiB | 268 | 2.1 |
+| `shedding` | 512 | 20 000 | 3.9 | 19.3 ms | 48.7 ms | 80.1 ms | — | 68 MiB | 1 843 | 1.4 |
+| `backend-limits` | 64 | 1 200 | 99 | 3.2 ms | 2 004 ms | 2 043 ms | — | 35 MiB | 143 | 0.1 |
 
 Throughput and latency move 10–25% between runs on a shared host, while the
 socket and memory columns barely move: read the first two as an order of
 magnitude and the last two as the shape of a replica's resource use. Compare two
 artifacts only when their `environment` blocks match.
+
+The last three rows are not throughput measurements and must not be read as
+one. `shedding` offers 20 000 callers at a ceiling of 8, so its accepted rate is
+the ceiling divided by how long one upstream answer takes; what it shows is the
+1 843 descriptors 512 simultaneous callers cost a replica that is refusing
+almost all of them, and that the refusal is cheap (1.4 cores). `backend-limits`
+spends most of its wall clock waiting on upstreams that never answer, so its
+latency columns are the 2 000 ms bound the replica declares rather than work it
+did, and its CPU is near zero for the same reason. `tenants` is a like-for-like
+interleave of `mixed` split across two namespaces, and costs what `mixed` costs.
 
 Streamed latency is dominated by the fake upstream's pacing (a fixed ~40-chunk
 answer), not by the gateway: read the stream rows as *concurrency the replica
@@ -104,16 +117,20 @@ buffered and streamed requests in one distribution.
 What the envelope says, in operator terms:
 
 - **Sockets scale with concurrency, roughly two per in-flight stream** — one
-  inbound, one upstream. 300 concurrent streams held ~730 descriptors. Size
-  `ulimit -n` and `admission.max_in_flight_streams` together.
+  inbound, one upstream. 300 concurrent streams held ~805 descriptors. A
+  refused caller costs an inbound descriptor too, until it is told no: the
+  `shedding` row above holds four times the sockets of any other profile while
+  admitting eight requests. Size `ulimit -n` for the load offered, not for the
+  load admitted, and set it alongside `admission.max_in_flight_streams`.
 - **Resident memory is bounded by concurrency and body size, not by request
-  count.** 40 000 buffered requests cost the same ~44 MiB as 400 would; 256 KiB
-  bodies at 64 concurrent cost ~67 MiB. Bodies are buffered before dispatch
+  count.** 40 000 buffered requests cost the same ~47 MiB as 400 would; 256 KiB
+  bodies at 64 concurrent cost ~68 MiB. Bodies are buffered before dispatch
   (ADR 0030), so `admission.max_request_bytes` × concurrency is the term to
   reason about.
-- **CPU saturates before memory.** Every profile used 2.3–4.6 cores of the 8
-  available at these concurrencies. On this workload shape, a replica is
-  CPU-bound; scale on CPU, and remember `[admission]` ceilings are *per replica*.
+- **CPU saturates before memory.** Every profile that served its load used
+  2.1–4.8 cores of the 8 available at these concurrencies. On this workload
+  shape, a replica is CPU-bound; scale on CPU, and remember `[admission]`
+  ceilings are *per replica*.
 
 ## Candidate SLOs
 

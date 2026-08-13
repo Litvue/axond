@@ -45,10 +45,26 @@ manifest cannot be run, so a result can always be reproduced from the repository
 **The subject is a real process.** Each profile boots the `axond` binary against
 the deterministic fake upstream of ADR 0014, over loopback, with the transport
 and admission bounds written out in full rather than defaulted, so a later change
-to a shipped default cannot silently move a qualification result. Five workloads
-are covered: buffered, streaming, mixed (both wire families, four routes, two
-providers, two credentials per provider), response-size (1 KiB / 32 KiB /
-256 KiB bodies), and cancellation (every second caller hangs up mid-answer).
+to a shipped default cannot silently move a qualification result. Eight
+workloads are covered: buffered, streaming, mixed (both wire families, four
+routes, two providers, two credentials per provider), response-size (1 KiB /
+32 KiB / 256 KiB bodies), cancellation (every second caller hangs up
+mid-answer), tenants (two namespaces with their own inbound keys and credential
+pools, served at once), shedding (offered load far above the admission ceiling
+the profile boots), and backend-limits (two upstreams in three stall past the
+transport bound the profile boots).
+
+**A limit is measured by being reached, and by what is true afterwards.** The
+last three workloads exist because a replica's behaviour at its limits is not
+visible in a throughput number: what is recorded for them is the refusal, the
+bound, and the isolation rather than the rate. Their thresholds are of the same
+kind as the others — environment-independent properties of the gateway — and
+they are stated in the terms each profile can support: a profile behind a
+ceiling states its acceptance floor as a count, because a replica admitting
+eight requests admits eight however many callers arrive, and a share would only
+measure how much load the manifest asked for. Each of the three also offers one
+request after its load stops, because a ceiling that kept a permit or a bound
+that kept a slot is invisible in every other number the run records.
 
 **The driver is closed-loop.** It holds a fixed concurrency and sends a fixed
 *number* of requests rather than pushing a fixed arrival rate. An open-loop rate
@@ -68,11 +84,14 @@ A number without that identity may not be compared with a number that has a
 different one.
 
 **Only environment-independent properties are hard failures.** The thresholds a
-run is gated on are: every offered request accepted, nothing shed, no errors, one
-usage record per admitted request, no upstream body still open once every client
-is gone, and bounded resident-memory growth. Throughput, latency, TTFT, and CPU
-are recorded and never asserted. They are the sizing evidence; the gate is
-correctness under load.
+run is gated on are: every offered request accepted (or, where the profile
+exists to be refused, a bounded refusal and a floor on what was still served),
+nothing shed, no errors, no request outliving the bound the replica declares, no
+credential or charge crossing a namespace, one usage record per admitted
+request, no upstream body still open once every client is gone, a replica still
+serving after the load stops, and bounded resident-memory growth. Throughput,
+latency, TTFT, and CPU are recorded and never asserted. They are the sizing
+evidence; the gate is correctness under load.
 
 **Both tiers are the same code.** The reduced tier runs inside
 `cargo test --workspace`, in the CI `tests` lane, and uploads its artifacts. The
@@ -116,6 +135,16 @@ control. Those need their own profiles once the surfaces exist.
   deliberate: a manifest that could describe arbitrary load would be a load
   generator with a config file, and its results would not be reproducible from
   the repository.
+- Tenant isolation is measured by what the fake upstream saw, counted by label:
+  the harness tallies which namespace's credential arrived on each upstream
+  call and compares it with the caller's. The credential values stay in the
+  process; what is recorded is whose credential it was and how often, so a
+  retained record can carry the isolation claim without carrying a secret.
+- The `backend-limits` profile trips a provider circuit by design, and its
+  rejections are therefore evidence of protection rather than of failure. A
+  threshold that demanded zero rejections there would have to be satisfied by
+  weakening the circuit, which is why the profile bounds the *share* refused and
+  requires the healthy target to keep serving every request sent to it.
 - `/proc` is the source for RSS, CPU, and sockets. Off Linux the run still
   qualifies every other property and records the resource fields as absent
   rather than as zero, so a non-Linux run cannot look like a passing memory

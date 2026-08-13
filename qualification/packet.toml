@@ -27,7 +27,10 @@ issue = 217
 status = "evidenced"
 question = """
 What one Tier 0 replica serves at a fixed offered load, and what it costs in \
-memory, CPU, sockets, and latency while it does."""
+memory, CPU, sockets, and latency while it does — including what it does at \
+its own limits: two namespaces at once without a credential or a charge \
+crossing between them, more callers than it admits, and upstreams that stop \
+answering."""
 covers = ["throughput_and_latency", "mixed_workload", "response_sizes"]
 manifest = "qualification/capacity/manifest.toml"
 driver = "crates/gateway/tests/capacity.rs"
@@ -103,8 +106,11 @@ covers = ["provider_faults", "backend_outage"]
 retained = []
 outstanding = """
 No manifest and no driver. The provider rows are unblocked — the deterministic \
-fake upstream already injects the faults the endurance mix draws from — while \
-the backend rows need a stateful replica to fail."""
+fake upstream already injects the faults the endurance mix draws from, and the \
+capacity slice's `backend-limits` profile already holds a stalling upstream to \
+the replica's own bound — while the backend rows need a stateful replica to \
+fail. One stall shape under load is not the matrix: 429 and 5xx, DNS and TLS \
+and connect failures, truncation, and idle streams have no run behind them."""
 blocked_on = [158]
 
 # The rollout slice: what a fleet does while it is being replaced.
