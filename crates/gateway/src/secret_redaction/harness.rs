@@ -46,9 +46,9 @@ use crate::convergence::{BackoffPolicy, ConvergenceSettings, Outcome, Reconciler
 use crate::desired_state::credentials::{Credentials, ProviderCredentialBody};
 use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{
-    CanonicalValue, DesiredState, ExpectedRevision, LoadedRevision, ResourceBody, ResourceKind,
-    ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber, RevisionId, SecretOwner,
-    SecretRef, Slug, fixtures,
+    CanonicalValue, DesiredState, ExpectedRevision, LoadedRevision, ResourceBody, ResourceId,
+    ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber, RevisionId,
+    SecretOwner, SecretRef, Slug, fixtures,
 };
 use crate::state::{AppState, ConfigSnapshot};
 use crate::telemetry;
@@ -116,10 +116,14 @@ pub(crate) fn bootstrap_env() -> HashMap<String, String> {
 
 /// The env-var name a resolved credential is handed to `ConfigSnapshot::build`
 /// under. A name, never a value — which is the reason it is safe to log.
-fn env_name(slug: &str) -> String {
+///
+/// Keyed by resource id rather than slug: slugs are unique within a scope, not
+/// across them, and two credentials colliding on this name would silently
+/// authenticate one tenant with another tenant's material.
+fn env_name(id: ResourceId) -> String {
     format!(
         "AXOND_RESOLVED_{}",
-        slug.to_uppercase().replace(['-', '.'], "_")
+        id.to_string().to_uppercase().replace(['-', '.'], "_")
     )
 }
 
@@ -193,7 +197,7 @@ impl CandidateCompiler for SecretResolvingCompiler {
                     })
                 })?;
             self.resolutions.fetch_add(1, Ordering::Relaxed);
-            let name = env_name(credential.slug.as_str());
+            let name = env_name(credential.reference.id);
             config.credential.push(crate::config::Credential {
                 namespace: "platform".to_owned(),
                 provider: self.provider.to_owned(),

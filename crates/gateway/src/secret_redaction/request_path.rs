@@ -186,6 +186,14 @@ async fn a_failed_request_leaks_its_credentials_into_no_error_surface() {
         )
         .await;
     replica.converge().await;
+    // The tripwire an unreachable upstream cannot provide by being presented
+    // with the key: the material was resolved into the snapshot, so the request
+    // below really does carry it as far as the transport gets.
+    assert_eq!(
+        replica.compiler.resolutions(),
+        1,
+        "the credential never left the store, so nothing below could leak it"
+    );
 
     let logs = CapturedLogs::default();
     let subscriber = tracing_subscriber::registry().with(
