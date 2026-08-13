@@ -15,7 +15,7 @@
 //! fingerprints — 350 MiB on disk under `target/`, and a few megabytes of
 //! resident memory to count them.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -28,25 +28,12 @@ pub const SHARDS: usize = 64;
 /// is its count and a partial write is visible as a ragged tail.
 const WIDTH: usize = std::mem::size_of::<u64>();
 
-/// How many of the most recent fingerprints are also kept in memory. The final
-/// count does not need them — that is the shards' job — but the settle wait
-/// does: it has to know how many *distinct* records have arrived before the
-/// shards can be read, and a run whose records repeat would otherwise be given
-/// up on early and reported as having lost the ones still in flight. A
-/// duplicate the gateway emits arrives near its original, so a window catches
-/// it; one that does not is only ever *under*-counted, which makes the wait
-/// patient rather than hasty.
-const WINDOW: usize = 1 << 16;
-
 /// An append-only, sharded record of every identified usage record's
 /// fingerprint.
 pub struct Ledger {
     dir: PathBuf,
     shards: Vec<BufWriter<File>>,
     recorded: u64,
-    window: VecDeque<u64>,
-    resident: HashSet<u64>,
-    near_duplicates: u64,
 }
 
 impl Ledger {
@@ -69,9 +56,6 @@ impl Ledger {
             dir: dir.to_owned(),
             shards,
             recorded: 0,
-            window: VecDeque::with_capacity(WINDOW),
-            resident: HashSet::with_capacity(WINDOW),
-            near_duplicates: 0,
         }
     }
 
@@ -83,29 +67,14 @@ impl Ledger {
             .write_all(&fingerprint.to_le_bytes())
             .expect("an endurance fingerprint shard accepts a write");
         self.recorded += 1;
-        if self.resident.insert(fingerprint) {
-            self.window.push_back(fingerprint);
-            if self.window.len() > WINDOW
-                && let Some(evicted) = self.window.pop_front()
-            {
-                self.resident.remove(&evicted);
-            }
-        } else {
-            self.near_duplicates += 1;
-        }
     }
 
-    /// How many fingerprints have been recorded, duplicates included. Echoed on
-    /// the artifact beside the tally, so a reader can see what was counted.
+    /// How many fingerprints have been recorded, duplicates included. How many
+    /// of them are *distinct* is a question only the shards can answer, so a
+    /// caller that needs to know whether everything has arrived has to wait for
+    /// arrivals to stop rather than for this to reach a count.
     pub fn recorded(&self) -> u64 {
         self.recorded
-    }
-
-    /// A lower bound on how many *distinct* fingerprints have been recorded,
-    /// available without reading the shards. Never above the true count, so a
-    /// caller waiting on it waits at least as long as it should.
-    pub fn distinct_at_least(&self) -> u64 {
-        self.recorded - self.near_duplicates
     }
 
     /// Count the run, one shard at a time.

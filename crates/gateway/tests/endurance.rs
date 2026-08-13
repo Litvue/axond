@@ -324,16 +324,6 @@ fn the_fingerprint_ledger_counts_duplicates_exactly_without_holding_the_run() {
     ledger.record(7);
     expected_duplicates += 1;
 
-    // What the settle wait reads before the shards can be counted: never above
-    // the distinct count, and here exact, because every duplicate arrived
-    // within the resident window of its original.
-    assert_eq!(
-        ledger.distinct_at_least(),
-        identities,
-        "the settle wait would stop {} records early",
-        identities as i64 - ledger.distinct_at_least() as i64
-    );
-
     let tally = ledger.tally();
     assert_eq!(
         (tally.distinct, tally.duplicates),

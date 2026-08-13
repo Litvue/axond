@@ -79,6 +79,12 @@ pub const DURATION_ENV: &str = "AXOND_ENDURANCE_DURATION_MS";
 /// lost. Settlement is detached from the request, so this bounds the *sink*.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long the record sink must stay silent after the expected count is
+/// reached before the wait accepts that everything has arrived. The count alone
+/// cannot say so, because it counts duplicates the shards have not been read to
+/// find yet.
+const SETTLE_QUIET: Duration = Duration::from_millis(500);
+
 /// How long an upstream body may stay open once every client is gone.
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -1307,14 +1313,26 @@ fn drift_verdicts(result: &EnduranceResult) -> Vec<Verdict> {
 /// artifact is the evidence, and the threshold is what fails the run.
 async fn await_usage_records(gateway: &Axond, aggregate: &mut Aggregate, expected: u64) {
     let deadline = Instant::now() + SETTLE_TIMEOUT;
+    let mut quiet_since = None;
     loop {
+        let before = aggregate.ledger.recorded();
         for record in gateway.drain_usage_records() {
             aggregate.absorb_record(&record);
         }
-        // Distinct, not total: a run that repeats a record has not accounted
-        // for a request twice, and stopping on the total would report the
-        // records still in flight as lost on top of the duplicate.
-        if aggregate.ledger.distinct_at_least() >= expected || Instant::now() >= deadline {
+        if aggregate.ledger.recorded() > before {
+            quiet_since = None;
+        }
+        // The count reached, and then nothing further for a while. Only the
+        // shards know how many of those records were distinct, so a run whose
+        // records repeat would be given up on early if the count alone ended
+        // the wait — and the records still in flight would then be reported as
+        // lost, on top of the duplicate that was the real fault.
+        if aggregate.ledger.recorded() >= expected
+            && quiet_since.get_or_insert_with(Instant::now).elapsed() >= SETTLE_QUIET
+        {
+            return;
+        }
+        if Instant::now() >= deadline {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
