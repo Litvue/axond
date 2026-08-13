@@ -170,23 +170,26 @@ pub async fn boot(durability: Durability) -> Option<Deployment> {
 }
 
 impl Deployment {
-    /// Drop the tables this boot created. Called by the stateful cases so a
-    /// long-lived CI database does not accumulate one table per run.
+    /// Drop everything this boot created. Called by the stateful cases so a
+    /// long-lived CI database does not accumulate a run's worth of objects per
+    /// run — including the namespace fence function, which the budget DDL also
+    /// names after the table and which dropping the table leaves behind.
     pub async fn drop_tables(&self) {
         let Some(dsn) = &self.dsn else {
             return;
         };
         let client = connect(dsn).await;
-        for table in [
-            format!("{}_reservation", self.budget_table),
-            format!("{}_namespace", self.budget_table),
-            self.budget_table.clone(),
-            self.usage_table.clone(),
+        for object in [
+            format!("TABLE IF EXISTS {}_reservation", self.budget_table),
+            format!("TABLE IF EXISTS {}_namespace", self.budget_table),
+            format!("TABLE IF EXISTS {}", self.budget_table),
+            format!("TABLE IF EXISTS {}", self.usage_table),
+            format!("FUNCTION IF EXISTS {}_namespace_fence()", self.budget_table),
         ] {
             client
-                .batch_execute(&format!("DROP TABLE IF EXISTS {table}"))
+                .batch_execute(&format!("DROP {object}"))
                 .await
-                .expect("a table this boot created can be dropped");
+                .expect("an object this boot created can be dropped");
         }
     }
 }
@@ -216,22 +219,23 @@ pub async fn connect(dsn: &str) -> tokio_postgres::Client {
     client
 }
 
-/// A short per-boot table suffix.
+/// A short per-boot table suffix: eight hex characters, and the width is the
+/// point.
 ///
-/// Short deliberately: the budget DDL derives index and trigger names from the
-/// table (`<table>_reservation_namespace_expires_idx` is 34 characters longer),
-/// and Postgres truncates an identifier at 63 bytes — which does not fail the
-/// `CREATE`, it fails the boot check that looks the derived object up again by
-/// its untruncated name. So the base name stays well inside the budget the
-/// longest derived one leaves.
+/// The budget DDL derives index and trigger names from the table, the longest
+/// being `<table>_reservation_namespace_expires_idx` at 34 characters more.
+/// Postgres truncates an identifier at 63 bytes, which does not fail the
+/// `CREATE` — it fails the boot check that looks the derived object up again by
+/// its untruncated name. `axond_budget_iso_` plus eight leaves that longest
+/// derived name at 59.
 fn unique_suffix() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
-        .as_nanos()
-        % u128::from(u64::MAX);
-    let nanos = u64::try_from(nanos).expect("reduced into range");
-    format!("{:08x}", u64::from(std::process::id()) ^ nanos)
+        .as_nanos();
+    let folded = u32::try_from((nanos ^ u128::from(std::process::id())) & 0xffff_ffff)
+        .expect("masked into range");
+    format!("{folded:08x}")
 }
 
 fn config_toml(

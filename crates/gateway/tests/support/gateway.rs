@@ -299,12 +299,19 @@ impl Axond {
                 // with the child's own output is the difference between naming
                 // the cause and exhausting the retries on "never became
                 // healthy".
-                let output = self.output();
-                assert!(
-                    output.contains("Address already in use"),
-                    "axond exited without serving:\n{output}"
-                );
-                return false;
+                //
+                // The verdict waits for the readers, though: the child's output
+                // is drained by detached threads, so a bind failure observed
+                // through `try_wait` may not have reached `lines` yet, and
+                // deciding immediately would turn the retriable case into a
+                // panic.
+                if self
+                    .lost_the_port_before(Instant::now() + Duration::from_secs(1))
+                    .await
+                {
+                    return false;
+                }
+                panic!("axond exited without serving:\n{}", self.output());
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -341,6 +348,19 @@ impl Axond {
     /// race, and a lost boot is retried on a fresh port.
     fn lost_the_port(&self) -> bool {
         self.output().contains("Address already in use")
+    }
+
+    /// [`Self::lost_the_port`], allowed until `deadline` to become true. For the
+    /// one caller that needs the negative answer to be final — an exited child
+    /// whose output may still be in flight — rather than merely current.
+    async fn lost_the_port_before(&self, deadline: Instant) -> bool {
+        while Instant::now() < deadline {
+            if self.lost_the_port() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        self.lost_the_port()
     }
 
     pub fn url(&self, path: &str) -> String {
