@@ -311,6 +311,11 @@ impl fmt::Display for WireFamily {
 /// Withdrawal is *not* deletion — a disabled row is what makes "who could use this
 /// last week?" answerable — and it is not a tombstone either, because the
 /// catalogue and the price it points at are still perfectly readable facts.
+///
+/// Not the catalogue's [`crate::backends::catalog::ModelLifecycle`], which is
+/// what an upstream says about its own model (`available`, `deprecated`). That
+/// one is an observation; this one is an operator's decision, and neither
+/// implies the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum ModelLifecycle {
     /// In service: available to be resolved, subject to policy and availability.
@@ -516,6 +521,13 @@ impl fmt::Display for ModelOwner {
 /// Integers, in micro-dollars, because desired state has no floating-point
 /// representation at all (ADR 0010): a rate that entered a checksum as a float
 /// would hash differently on two platforms.
+///
+/// The catalogue's [`crate::backends::catalog::ObservedPrice`] shares the name
+/// and not the unit: it holds what a *source* published, in nano-dollars per
+/// million tokens, with tiers. Feeding one into the other is a division by
+/// 1,000 that has to round, so it is the job of the slice that does the
+/// feeding, which can state the rounding direction, and deliberately not of a
+/// conversion an import could apply by accident.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObservedPrice {
     pub input_micros_per_million: u64,

@@ -698,6 +698,12 @@ impl ModelCapability {
 /// A closed set for the same reason as [`Modality`]: lifecycle drives what an
 /// operator is warned about, so an unrecognized status is refused rather than
 /// flattened into "available".
+///
+/// Unrelated to [`crate::desired_state::models::ModelLifecycle`], which is
+/// whether an operator has *put a resource in service*. This one is what the
+/// upstream says about its own model, so a `Deprecated` offering can be
+/// perfectly enabled, and a withdrawn enablement can point at an `Available`
+/// one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum ModelLifecycle {
     #[default]
@@ -873,6 +879,15 @@ impl Canonical for PriceTier {
 /// billed against, and nothing parsed out of an upstream document may be one
 /// without an explicit administrative act. Recording an observation never
 /// activates it.
+///
+/// Not [`crate::desired_state::models::ObservedPrice`] either, and the two are
+/// not interchangeable despite the name: that one is the rate desired state
+/// carries, in **micro**-dollars per million tokens, while this one is what a
+/// source published, in **nano**-dollars per million tokens and with tiers. A
+/// value crossing that boundary is a division by 1,000 that has to round, so it
+/// belongs in the slice that performs the crossing — where the rounding
+/// direction can be stated — and never in a `From` impl a careless import could
+/// apply silently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedPrice {
     pub base: PriceRates,
