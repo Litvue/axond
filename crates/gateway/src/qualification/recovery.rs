@@ -117,11 +117,47 @@ struct Stage {
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 struct Gate {
+    readiness: Readiness,
+    admin_writes: AdminWrites,
     max_serving_error_fraction: f64,
     max_convergence_lag_seconds: u64,
     max_data_loss_revisions: u64,
-    #[allow(dead_code)]
     max_unauthenticated_admin_successes: u64,
+}
+
+/// The two non-numeric gate fields. A stage records the bound it read here and
+/// evaluates against it, so flipping the manifest flips the verdict instead of
+/// leaving a literal behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Readiness {
+    Serves,
+    Refuses,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AdminWrites {
+    Accepted,
+    Unavailable,
+}
+
+impl Readiness {
+    const fn bound(self) -> &'static str {
+        match self {
+            Self::Serves => "serves",
+            Self::Refuses => "refuses",
+        }
+    }
+}
+
+impl AdminWrites {
+    const fn bound(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 fn manifest() -> Manifest {
@@ -595,9 +631,11 @@ async fn control_plane_outage_journal_outage() {
 
     recorder.gate(
         "admin_writes",
-        "unavailable",
+        spec.gate.admin_writes.bound(),
         category,
-        BackendFailure::retryable(&refusal) && category == "unavailable",
+        spec.gate.admin_writes == AdminWrites::Unavailable
+            && BackendFailure::retryable(&refusal)
+            && category == "unavailable",
         "the publish was refused with a retryable category and wrote nothing",
     );
     recorder.deferred(
@@ -607,7 +645,7 @@ async fn control_plane_outage_journal_outage() {
     );
     recorder.deferred(
         "readiness",
-        "serves",
+        spec.gate.readiness.bound(),
         "the blocked `serving` stage owns the readiness probe; this stage records that the \
          active snapshot and its generation survived the cut",
     );
@@ -623,7 +661,7 @@ async fn control_plane_outage_journal_outage() {
     );
     recorder.deferred(
         "max_unauthenticated_admin_successes",
-        "0",
+        spec.gate.max_unauthenticated_admin_successes.to_string(),
         "the blocked `administration` stage authenticates administrative callers",
     );
 
@@ -716,9 +754,11 @@ async fn cold_boot_valid_cache_cold_boot() {
 
     recorder.gate(
         "readiness",
-        "serves",
+        spec.gate.readiness.bound(),
         "restored from last-known-good",
-        report.source == Some(SnapshotSource::LastKnownGood) && report.active == Some(baseline.id),
+        spec.gate.readiness == Readiness::Serves
+            && report.source == Some(SnapshotSource::LastKnownGood)
+            && report.active == Some(baseline.id),
         "the booting replica reached a servable snapshot without the journal, from the cache the \
          previous replica exported",
     );
@@ -739,12 +779,12 @@ async fn cold_boot_valid_cache_cold_boot() {
     );
     recorder.deferred(
         "admin_writes",
-        "unavailable",
+        spec.gate.admin_writes.bound(),
         "`control-plane-outage/journal-outage` measures the administrative write",
     );
     recorder.deferred(
         "max_unauthenticated_admin_successes",
-        "0",
+        spec.gate.max_unauthenticated_admin_successes.to_string(),
         "no administrative surface authenticates callers yet",
     );
 
@@ -810,9 +850,11 @@ async fn cold_boot_no_cache_cold_boot() {
 
     recorder.gate(
         "readiness",
-        "refuses",
+        spec.gate.readiness.bound(),
         "refused: control plane unreachable, no cache",
-        refused_for_the_journal && booting.generation() == generation_before,
+        spec.gate.readiness == Readiness::Refuses
+            && refused_for_the_journal
+            && booting.generation() == generation_before,
         "boot refused and published nothing, so no empty configuration reached the snapshot",
     );
     recorder.deferred(
@@ -832,12 +874,12 @@ async fn cold_boot_no_cache_cold_boot() {
     );
     recorder.deferred(
         "admin_writes",
-        "unavailable",
+        spec.gate.admin_writes.bound(),
         "`control-plane-outage/journal-outage` measures the administrative write",
     );
     recorder.deferred(
         "max_unauthenticated_admin_successes",
-        "0",
+        spec.gate.max_unauthenticated_admin_successes.to_string(),
         "the blocked `readiness` stage owns the probe an operator's tooling calls",
     );
 
@@ -955,9 +997,9 @@ async fn cold_boot_invalid_cache_cold_boot() {
 
     recorder.gate(
         "readiness",
-        "refuses",
+        spec.gate.readiness.bound(),
         format!("{refusals}/3 unauthentic caches refused the boot"),
-        refusals == 3,
+        spec.gate.readiness == Readiness::Refuses && refusals == 3,
         "an edited record, a foreign signing key, and a truncated file each refused the boot and \
          published nothing",
     );
@@ -978,12 +1020,12 @@ async fn cold_boot_invalid_cache_cold_boot() {
     );
     recorder.deferred(
         "admin_writes",
-        "unavailable",
+        spec.gate.admin_writes.bound(),
         "`control-plane-outage/journal-outage` measures the administrative write",
     );
     recorder.deferred(
         "max_unauthenticated_admin_successes",
-        "0",
+        spec.gate.max_unauthenticated_admin_successes.to_string(),
         "the blocked `readiness` stage owns the probe an operator's tooling calls",
     );
 
@@ -1174,9 +1216,9 @@ async fn recovery_convergence_journal_recovery() {
     );
     recorder.gate(
         "admin_writes",
+        spec.gate.admin_writes.bound(),
         "accepted",
-        "accepted",
-        true,
+        spec.gate.admin_writes == AdminWrites::Accepted,
         "the publish refused during the outage succeeded against the recovered journal",
     );
     recorder.gate(
@@ -1194,12 +1236,12 @@ async fn recovery_convergence_journal_recovery() {
     );
     recorder.deferred(
         "readiness",
-        "serves",
+        spec.gate.readiness.bound(),
         "the blocked `serving` stage owns the readiness probe",
     );
     recorder.deferred(
         "max_unauthenticated_admin_successes",
-        "0",
+        spec.gate.max_unauthenticated_admin_successes.to_string(),
         "the blocked `administration` stage authenticates administrative callers",
     );
 
