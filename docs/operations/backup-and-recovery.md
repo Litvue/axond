@@ -170,6 +170,6 @@ a restore of your archive proves your archive.
 - [Recovery qualification](./recovery-qualification.md) — the fleet-level
   contract its `backup-restore` and `point-in-time-recovery` scenarios rehearse
   this procedure under, once its harness exists.
-- [ADR 0038](../adr/0038-recovery-objectives-and-supported-backends.md) — why
+- [ADR 0040](../adr/0040-recovery-objectives-and-supported-backends.md) — why
   these objectives are numbers, why Redis is outside them, and what changing them
   costs.
