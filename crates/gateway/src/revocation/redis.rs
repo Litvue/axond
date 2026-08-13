@@ -6,8 +6,11 @@ use redis::aio::ConnectionManager;
 use std::sync::Arc;
 
 use super::{RevocationError, RevocationStore, expiry_ms, unavailable, validate_expiry};
+use crate::backends::health::BackendHealth;
 use crate::config::StoreUnavailable;
-use crate::redis_support::{RedisConnection, RedisRecovery, operation_liveness_timeout};
+use crate::redis_support::{
+    RedisConnection, RedisHealth, RedisRecovery, operation_liveness_timeout,
+};
 
 struct RevocationInvokeGuard {
     generation: u64,
@@ -43,6 +46,9 @@ pub struct RedisRevocation {
     key_prefix: String,
     timeout: Duration,
     on_unavailable: StoreUnavailable,
+    /// Reachability, for the status refresher: a `PING` on the same swapped
+    /// connection lookups use, carrying no `jti` and returning no denylist state.
+    health: Arc<RedisHealth>,
 }
 
 impl RedisRevocation {
@@ -75,12 +81,22 @@ impl RedisRevocation {
             generation: 1,
         }));
         let recovery = RedisRecovery::new(connection.clone(), recovery_client, connect_timeout);
+        let health = {
+            // One lookup's own budget plus a reconnection: both are bounds this
+            // store is configured to allow.
+            let probed = Arc::clone(&connection);
+            Arc::new(RedisHealth::new(
+                timeout.saturating_add(connect_timeout),
+                move || probed.load().manager.clone(),
+            ))
+        };
         Ok(Self {
             connection,
             recovery,
             key_prefix: key_prefix.to_owned(),
             timeout,
             on_unavailable,
+            health,
         })
     }
 
@@ -93,6 +109,10 @@ impl RedisRevocation {
 impl RevocationStore for RedisRevocation {
     fn name(&self) -> &'static str {
         "redis"
+    }
+
+    fn health(&self) -> Option<Arc<dyn BackendHealth>> {
+        Some(Arc::clone(&self.health) as Arc<dyn BackendHealth>)
     }
 
     async fn is_revoked(&self, jti: &str) -> Result<bool, RevocationError> {
@@ -462,6 +482,49 @@ mod tests {
             .await
             .expect("ttl");
         assert!(ttl > 0);
+    }
+
+    /// A denylist is observed by asking Redis whether it is there, never by
+    /// looking up a synthetic `jti`: a probe that did would answer "not revoked"
+    /// for an identifier nobody minted, which is the one answer this store must
+    /// never be asked to invent, and it would write a monitoring key into the
+    /// denylist's own prefix. The `PING` leaves the prefix empty and the store's
+    /// answers unchanged.
+    #[tokio::test]
+    async fn a_reachability_probe_asks_nothing_about_a_jti() {
+        let Some(url) = crate::test_services::redis_url() else {
+            return;
+        };
+        let prefix = format!(
+            "axond:test:revocation-health:{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let store = RedisRevocation::connect(
+            &url,
+            &prefix,
+            Duration::from_millis(250),
+            Duration::from_secs(5),
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect");
+        let health = store.health().expect("a redis denylist is observable");
+        health.check().await.expect("a reachable redis answers");
+
+        let mut connection = store.connection.load_full().manager.clone();
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(format!("{prefix}*"))
+            .query_async(&mut connection)
+            .await
+            .expect("keys");
+        assert!(keys.is_empty(), "{keys:?}");
+        assert!(
+            !store.is_revoked("never-minted").await.expect("read"),
+            "the probe must not have revoked anything"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

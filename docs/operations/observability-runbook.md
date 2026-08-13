@@ -10,19 +10,49 @@ dashboards and alert rules under [`ops/observability/`](../../ops/observability/
 are the same signals as assets you can import, and every rule's `runbook_url`
 points at a section of this page.
 
-**What is live today.** One family is partly live and one is not produced at all.
+**What is live today.** The dependency-status family is live for the dependencies
+a deployment actually opens; the convergence family is not produced at all.
 
-* **Status.** A replica in `mode = "stateful"` runs a refresher over exactly one
-  component, the **control plane**, observed on the connection its
-  administrative surface was built on. So `axond_status_component_state`,
-  `axond_status_observation_age`, and `axond_status_refreshes` exist on a
-  stateful replica, carrying `axond_status_component="control_plane"` and
-  nothing else. A stateless replica opens no store, runs no refresher, and
-  produces none of the three; `GET /admin/v1/status` answers there with every
-  component `disabled`. Every durable backend other than the control plane is
-  `disabled` in both postures until the slice that owns it injects a probe.
+* **Status.** A replica runs a refresher over the dependencies **it actually
+  opened**, so which components report a state is a property of your
+  configuration rather than of the mode:
 
-  The cadence is derived from `[control_plane]`, not fixed: a probe shares the
+  | Component | Observed when | Not observed when |
+  | --- | --- | --- |
+  | `control_plane` | `mode = "stateful"` | `mode = "stateless"` |
+  | `budget_store` | `[budget] backend` is `redis` or `postgres` | `none`, `in-memory` |
+  | `rate_limit_store` | `[rate_limit] backend = "redis"` | `none`, `in-memory` |
+  | `revocation_store` | `[revocation] backend` is `redis` or `postgres` | `none` |
+  | `secret_store`, `usage_sink`, `catalogue`, `provider_credentials` | never yet | always |
+
+  A component in the right column reports `disabled` and emits no series — that
+  is the correct answer for a dependency the deployment does not have, not a gap.
+  A replica with none of them (a stateless install with in-memory stores) runs no
+  refresher at all and produces none of `axond_status_component_state`,
+  `axond_status_observation_age`, or `axond_status_refreshes`.
+
+  Each component is observed through the connection the *request or admin path*
+  already uses, so the diagnostic and the real work fail together instead of
+  disagreeing: a Redis component is a `PING` on the same swapped connection
+  manager an admission or a denylist lookup takes, and a Postgres component is a
+  `SELECT 1` on its own short-lived session, because the request-path client is
+  serialised behind a mutex a probe must not queue in front of. No probe carries a
+  tenant, a key, or a `jti`, and none of them reserves, acquires, or revokes
+  anything: a probe answers "is this reachable", never "what does it hold".
+
+  Each component is also probed under **its own** backend's bounds, while the
+  fleet-wide refresh cadence is the slowest enabled component's — so adding a
+  Redis store to a stateful deployment does not make the control-plane probe
+  impatient, and the control plane's minute-scale patience is not applied to a
+  `PING`. A request-path store is nonetheless observed on the metric export
+  cadence rather than on its own millisecond bound: a `PING` loop a thousand times
+  faster than anything that reads it would be traffic, not a diagnostic, and a
+  store that is truly down denies requests —
+  `axond_rate_limit_unavailable_denials`,
+  `axond_revocation_unavailable_denials`, `axond_budget_capacity_denials` — which
+  is a louder signal than any gauge.
+
+  The control-plane cadence is derived from `[control_plane]`, not fixed: a probe shares the
   single administrative connection, so it may queue behind the operations
   already holding or waiting for that connection, reconnect within
   `connect_timeout_ms`, and then run under `operation_timeout_ms` again. The
@@ -54,10 +84,11 @@ points at a section of this page.
 
 The five status-side rules — `AxondDependencyImpaired`,
 `AxondStatusObservationsStale`, `AxondStatusRefreshesFailing`,
-`AxondStatusRefresherStalled`, and `AxondControlPlaneUnreachable` — are live on a
-stateful deployment and report on the control plane; on a stateless one they stay
-silent, since the series never appear. The same holds for the *Dependency state*,
-*Observation age*, and *Refresh outcomes* panels: expect one series each.
+`AxondStatusRefresherStalled`, and `AxondControlPlaneUnreachable` — are live
+wherever a component above is observed; on a replica that observes nothing they
+stay silent, since the series never appear. The same holds for the *Dependency
+state*, *Observation age*, and *Refresh outcomes* panels: expect one series per
+observed component.
 
 The three convergence rules — `AxondRevisionLagAboveTarget`,
 `AxondRevisionRejectionsSustained`, and `AxondRevisionConvergenceSplit` — are
@@ -79,8 +110,9 @@ Nothing here needs to be disabled at import. Everything else — served traffic,
 latency, config reloads, providers, capacity, usage delivery, lifecycle — is live
 now.
 
-So do not read a flat dependency panel as a healthy dependency: until that
-wiring lands, use `axond_config_reloads`, upstream health
+So do not read a flat dependency panel as a healthy dependency for the components
+nobody probes yet: for the secret store, the usage sink, the catalogue, and
+provider credentials, use `axond_config_reloads`, upstream health
 (`axond_upstream_circuit_state`, `axond_upstream_timeouts`), and the fail-closed
 denial counters (`axond_rate_limit_unavailable_denials`,
 `axond_revocation_unavailable_denials`, `axond_budget_capacity_denials`) as the
@@ -152,9 +184,18 @@ and the store's schema disagree (see
 answered but the material was not there. Fix the named dependency; the gateway
 recovers on its own once the next observation succeeds.
 
+A `degraded` state on a request-path store (`budget_store`, `rate_limit_store`,
+`revocation_store`) means the store answered and *refused* — a rotated password,
+a revoked grant — rather than that it is gone; that is a credential to fix, and it
+is reported separately from `unavailable` on purpose, because only the latter is
+an outage. Cross-check with the denial counters: a store that is genuinely down
+is also denying or degrading requests, and a component that is `unavailable`
+while no denials are being recorded is more likely a probe path that lost its
+connection than a store the request path cannot reach.
+
 **Do not** remove the replica from service. Which components even matter depends
-on the deployment: a stateless replica reports every component `disabled` and
-that is the correct answer, not an incident.
+on the deployment: a replica with no shared dependencies reports every component
+`disabled` and that is the correct answer, not an incident.
 
 ### Dependency observations have gone stale
 
@@ -188,8 +229,10 @@ stuck and resets when one lands. So:
 - **rounds are slower than the budget.** The age climbs past the budget between
   exports, which means a round is taking longer than the budget allows —
   the probe timeout or the refresh interval is above the staleness budget. The
-  three are derived from `[control_plane]` for a stateful replica and are
-  internal settings otherwise; there is no `[status]` section to edit, and the
+  three are derived from the enabled backends' own configured timeouts —
+  `[control_plane]` for the control plane, the store's operation and connect
+  timeouts for a request-path store, merged to the slowest — and there is no
+  `[status]` section to edit. The
   control-plane rule's five-minute threshold is above the slowest capped round
   the derivation permits, so this is a report about a refresher falling behind rather than a
   deployment that configured itself into it. What you can establish from here is

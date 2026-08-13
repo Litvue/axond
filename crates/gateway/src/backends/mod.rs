@@ -29,8 +29,15 @@
 //! The four existing seams are deliberately *not* moved, re-exported, or given
 //! a common supertrait here: each keeps its own error type, its own
 //! `on_unavailable` policy, and its own tier declaration, so those stay
-//! independently reviewable. [`RESPONSIBILITIES`] is the machine-checkable
-//! version of the table above, and it is what the tests assert against.
+//! independently reviewable. The one thing they do share is
+//! [`health::BackendHealth`], an optional diagnostic accessor: a store that
+//! talks to a remote dependency can say whether it is reachable *right now*,
+//! off the request path, so `GET /admin/v1/status` can tell an outage from a
+//! cap being hit. It is not a supertrait and not a capability a caller may
+//! route on — nothing in the request path can reach it.
+//!
+//! [`RESPONSIBILITIES`] is the machine-checkable version of the table above, and
+//! it is what the tests assert against.
 //!
 //! ## Scaffolding only
 //!
@@ -47,6 +54,7 @@ pub mod catalog_projection;
 pub mod catalog_refresh;
 pub mod catalog_store;
 pub mod control_plane;
+pub mod health;
 pub mod models_dev;
 pub mod secrets;
 

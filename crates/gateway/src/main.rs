@@ -584,30 +584,36 @@ async fn serve() -> anyhow::Result<()> {
         "administrative surface"
     );
 
-    // What this replica can say about itself. A stateful replica observes the
-    // control plane it administers against — on administration's own store, so
-    // the diagnostic and the administrative path fail together rather than
-    // disagreeing — and a stateless one has nothing durable to observe, so it
-    // reports every component `disabled` without opening a socket. Neither
-    // posture touches `/readyz`: readiness is "do I hold a snapshot", and a
-    // probe that consulted a dependency would multiply one outage by the fleet
-    // size (ADR 0031).
-    let (observability, status_refresher) = match admin.control_plane.as_ref() {
-        Some(observed) => {
-            let (observability, refresher) = ReplicaObservability::observing(
-                Arc::clone(&observed.store),
-                observed.pacing.clone(),
-            );
-            tracing::info!(
-                component = "control_plane",
-                refresh_interval_ms = observed.pacing.refresh_interval.as_millis() as u64,
-                probe_timeout_ms = observed.pacing.probe_timeout.as_millis() as u64,
-                "dependency status observed"
-            );
-            (observability, Some(refresher))
-        }
-        None => (ReplicaObservability::stateless(), None),
-    };
+    // What this replica can say about itself: every dependency it opened is
+    // observed, on that dependency's own connection where the driver allows it,
+    // and nothing this deployment did not configure is. A stateless replica with
+    // no shared store therefore reports every component `disabled` without
+    // opening a socket. No posture touches `/readyz`: readiness is "do I hold a
+    // snapshot", and a probe that consulted a dependency would multiply one
+    // outage by the fleet size (ADR 0031).
+    let plan = ReplicaObservability::plan(
+        admin
+            .control_plane
+            .as_ref()
+            .map(|observed| (Arc::clone(&observed.store), observed.pacing.clone())),
+        budget.as_ref(),
+        rate_limiter.as_ref(),
+        revocation.as_ref(),
+    );
+    if !plan.is_empty() {
+        tracing::info!(
+            components = plan
+                .components()
+                .iter()
+                .map(|component| component.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            refresh_interval_ms = plan.pacing().refresh_interval.as_millis() as u64,
+            staleness_budget_ms = plan.pacing().staleness_budget.as_millis() as u64,
+            "dependency status observed"
+        );
+    }
+    let (observability, status_refresher) = ReplicaObservability::observing(plan);
 
     let bind = config.server.bind;
     let watching = config.reload.watch;

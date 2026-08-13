@@ -172,6 +172,65 @@ pub(crate) fn connection_manager_config() -> ConnectionManagerConfig {
     ConnectionManagerConfig::new().set_response_timeout(None)
 }
 
+/// Reachability of a Redis-backed request-path store, on the store's own
+/// multiplexed connection.
+///
+/// Redis multiplexes, so a `PING` shares the socket every request-path command
+/// uses without queueing in front of one. That is the property that makes this
+/// the honest diagnostic rather than a second opinion: it observes the
+/// connection whose loss is what an operator is trying to confirm. The
+/// connection is *loaded* per check rather than captured once, so a check after
+/// a recovery replacement uses the live one.
+pub(crate) struct RedisHealth {
+    bound: Duration,
+    /// The current manager. A closure because the three stores hold their
+    /// connection differently — one owns a self-reconnecting manager, two swap
+    /// a shared cell on replacement — and the diagnostic must not fork that.
+    connection: Box<dyn Fn() -> ConnectionManager + Send + Sync>,
+}
+
+impl RedisHealth {
+    pub(crate) fn new(
+        bound: Duration,
+        connection: impl Fn() -> ConnectionManager + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            bound,
+            connection: Box::new(connection),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::backends::health::BackendHealth for RedisHealth {
+    fn backend(&self) -> &'static str {
+        "redis"
+    }
+
+    fn bound(&self) -> Duration {
+        self.bound
+    }
+
+    async fn check(&self) -> Result<(), crate::backends::health::HealthFailure> {
+        let mut connection = (self.connection)();
+        redis::cmd("PING")
+            .query_async::<String>(&mut connection)
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                // A `NOAUTH`/`WRONGPASS` refusal is not an outage: the server
+                // answered. Separated so it reaches whoever owns the credential
+                // instead of whoever owns Redis.
+                let category = if error.kind() == redis::ErrorKind::AuthenticationFailed {
+                    crate::backends::FailureCategory::Denied
+                } else {
+                    crate::backends::FailureCategory::Unavailable
+                };
+                crate::backends::health::HealthFailure::new(category, error.to_string())
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::connection_manager_config;

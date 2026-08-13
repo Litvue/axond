@@ -50,12 +50,14 @@ convergence reconciler yet
 carries the field and
 no data until that slice hands the status page the same handle the
 administrative surface reads. Which
-components are enabled is a deployment property, so a stateless replica answers
-`200` with every component `disabled` rather than `404`. A stateful replica
-observes one component today, the control plane, on the connection its
-administrative surface holds; the rest stay `disabled` until the slice owning
-each backend injects a probe, and a component moving from `disabled` to a real
-state is additive rather than a contract change. The route is bounded by
+components are enabled is a deployment property, so a replica with no durable
+dependency answers `200` with every component `disabled` rather than `404`. A
+replica observes the dependencies it opened — the control plane on the connection
+its administrative surface holds, and the budget, rate-limit, and revocation
+stores wherever those are backed by Redis or PostgreSQL; the secret store, the
+usage sink, the catalogue, and provider credentials stay `disabled` until the
+slice owning each one exposes a reachability seam, and a component moving from
+`disabled` to a real state is additive rather than a contract change. The route is bounded by
 its own fixed eight-deep diagnostic ceiling on answering — `503
 diagnostic_concurrency_exceeded` beyond it — rather than by
 `admission.max_in_flight`, so it stays answerable on a saturated or draining

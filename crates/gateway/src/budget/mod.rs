@@ -33,12 +33,13 @@ mod postgres;
 mod redis;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
+use crate::backends::health::BackendHealth;
 use crate::config::{BudgetBackend, BudgetConfig, StoreUnavailable};
 use crate::desired_state::policy::PolicyGeneration;
 use crate::policy::{BudgetCaps, Ceilings, PolicyHold, Unenforceable, denied};
@@ -147,6 +148,18 @@ pub trait BudgetStore: Send + Sync {
     /// operation, and every backend implements it that way.
     async fn release(&self, key: &BudgetKey, reservation: &Reservation) {
         self.settle(key, reservation, 0).await;
+    }
+
+    /// This store's reachability, for the status refresher only.
+    ///
+    /// `None` for a store with no remote dependency — `none` and `in-memory`
+    /// cannot be unreachable, and their component reports `disabled` rather than
+    /// a state invented for them. Never called from the request path: the handle
+    /// goes to a [`ComponentProbe`], which only the refresher holds.
+    ///
+    /// [`ComponentProbe`]: crate::status::registry::ComponentProbe
+    fn health(&self) -> Option<Arc<dyn BackendHealth>> {
+        None
     }
 }
 

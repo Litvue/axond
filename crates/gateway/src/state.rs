@@ -26,6 +26,7 @@ use crate::admission::{AdmissionControl, DiagnosticCredential};
 use crate::aliases::AliasScope;
 use crate::availability::{AvailabilityIndex, AvailabilityReader, RuntimeObservations};
 use crate::backends::control_plane::ControlPlaneStore;
+use crate::backends::health::BackendHealth;
 use crate::budget::BudgetStore;
 use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind};
 use crate::convergence::SystemClock;
@@ -45,8 +46,11 @@ use crate::rate_limit::NoLimit;
 use crate::rate_limit::RateLimiter;
 use crate::revocation::RevocationStore;
 use crate::shutdown::Lifecycle;
-use crate::status::probes::ControlPlaneProbe;
-use crate::status::registry::{CachedStatusRegistry, StatusRefresher, StatusSettings};
+use crate::status::Component;
+use crate::status::probes::{BackendProbe, ControlPlaneProbe};
+use crate::status::registry::{
+    CachedStatusRegistry, ObservationPlan, StatusRefresher, StatusSettings,
+};
 use crate::usage::UsageDelivery;
 #[cfg(test)]
 use crate::usage::UsageFanout;
@@ -113,30 +117,28 @@ impl ReplicaObservability {
         }
     }
 
-    /// The stateful posture: the control plane this replica administers against
-    /// is observed on the same store administration uses, and every component
-    /// this deployment does not have stays `disabled`.
+    /// The posture this replica's own configuration implies: every dependency it
+    /// opened is observed, and every component it does not have stays `disabled`.
+    ///
+    /// The plan carries both halves of that — the enabled set and the probes —
+    /// because they are one fact, and the pacing in it comes from the stores' own
+    /// timeouts ([`ObservationPlan::observe`]) rather than from a default: a probe
+    /// cut off before its backend's bounds have elapsed publishes a timeout the
+    /// backend never had.
     ///
     /// The refresher is returned rather than spawned so the caller owns its
     /// lifetime: it has to stop with the process, and a task spawned out of a
-    /// constructor would outlive the drain that is supposed to end it.
-    ///
-    /// `pacing` comes from the store's own timeouts
-    /// ([`ControlPlaneProbe::pacing`]) rather than from a default: it decides
-    /// which components are enabled — and so which are probed at all, since an
-    /// enabled component nobody probes ages into `unavailable` instead of
-    /// reporting `disabled` — and how long a round may take before the refresher
-    /// calls it a timeout.
-    pub fn observing(
-        control_plane: Arc<dyn ControlPlaneStore>,
-        pacing: StatusSettings,
-    ) -> (Self, StatusRefresher) {
+    /// constructor would outlive the drain that is supposed to end it. It is
+    /// `None` for a plan with nothing in it, which is the stateless posture: a
+    /// loop observing no components would be a timer that publishes nothing.
+    pub fn observing(plan: ObservationPlan) -> (Self, Option<StatusRefresher>) {
+        if plan.is_empty() {
+            return (Self::stateless(), None);
+        }
+        let (pacing, probes) = plan.into_parts();
         debug_assert!(pacing.validate().is_ok(), "the derived pacing is valid");
         let status = Arc::new(CachedStatusRegistry::new(pacing, Arc::new(SystemClock)));
-        let refresher = StatusRefresher::new(
-            Arc::clone(&status),
-            vec![Arc::new(ControlPlaneProbe::new(control_plane))],
-        );
+        let refresher = StatusRefresher::new(Arc::clone(&status), probes);
         (
             Self {
                 status,
@@ -145,8 +147,40 @@ impl ReplicaObservability {
                 // false all-clear (#142).
                 revision: None,
             },
-            refresher,
+            Some(refresher),
         )
+    }
+
+    /// The plan a deployment's own stores imply: one probe per dependency that
+    /// exposes a reachability handle, and nothing for the backends that have none.
+    ///
+    /// The mapping from store to [`Component`] is made here, in one place, rather
+    /// than by each store naming its own component: one Redis server can back the
+    /// caps, the leases, and the denylist at once, and which of those a given
+    /// handle speaks for is the deployment's arrangement, not the store's.
+    pub fn plan(
+        control_plane: Option<(Arc<dyn ControlPlaneStore>, StatusSettings)>,
+        budget: &dyn BudgetStore,
+        rate_limiter: &dyn RateLimiter,
+        revocation: &dyn RevocationStore,
+    ) -> ObservationPlan {
+        let mut plan = ObservationPlan::stateless();
+        if let Some((store, pacing)) = control_plane {
+            plan.observe(Arc::new(ControlPlaneProbe::new(store)), pacing);
+        }
+        let request_path: [(Component, Option<Arc<dyn BackendHealth>>); 3] = [
+            (Component::BudgetStore, budget.health()),
+            (Component::RateLimitStore, rate_limiter.health()),
+            (Component::RevocationStore, revocation.health()),
+        ];
+        for (component, health) in request_path {
+            let Some(health) = health else {
+                continue;
+            };
+            let pacing = BackendProbe::pacing(component, &health);
+            plan.observe(Arc::new(BackendProbe::new(component, health)), pacing);
+        }
+        plan
     }
 }
 

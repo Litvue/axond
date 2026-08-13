@@ -654,6 +654,88 @@ fn the_registry_refuses_pacings_that_would_make_it_a_hazard() {
     );
 }
 
+/// One refresher paces every component, so two components' pacings have to
+/// combine into settings the registry accepts — otherwise adding a second
+/// dependency to a deployment turns a validated posture into a rejected one, or
+/// worse, into overlapping rounds nothing rejects. The property is that validity
+/// survives the merge for *any* pair of valid inputs, in either order.
+#[test]
+fn merging_two_valid_pacings_stays_valid() {
+    let pacings = [
+        StatusSettings {
+            refresh_interval: Duration::from_secs(15),
+            probe_timeout: Duration::from_secs(5),
+            staleness_budget: Duration::from_secs(45),
+            enabled: vec![Component::RateLimitStore],
+        },
+        StatusSettings {
+            refresh_interval: Duration::from_secs(70),
+            probe_timeout: Duration::from_secs(65),
+            staleness_budget: Duration::from_secs(210),
+            enabled: vec![Component::ControlPlane],
+        },
+        StatusSettings {
+            refresh_interval: Duration::from_secs(1),
+            probe_timeout: Duration::from_millis(1),
+            staleness_budget: Duration::from_secs(2),
+            enabled: vec![Component::BudgetStore],
+        },
+    ];
+    for first in &pacings {
+        for second in &pacings {
+            let merged = first.clone().merge(second.clone());
+            assert_eq!(merged.validate(), Ok(()), "{first:?} + {second:?}");
+            // The slowest component's numbers, so no component is rushed.
+            assert_eq!(
+                merged.refresh_interval,
+                first.refresh_interval.max(second.refresh_interval)
+            );
+            // And every component either side enabled is still probed.
+            for component in first.enabled.iter().chain(&second.enabled) {
+                assert!(merged.enabled.contains(component), "{component:?}");
+            }
+        }
+    }
+}
+
+/// The two halves of an observation cannot drift: a component enabled without a
+/// probe ages into `unavailable` (asserted by
+/// `an_enabled_component_nobody_has_observed_is_not_reported_healthy`), and a
+/// probe for a component nobody enabled is never run
+/// (`a_probe_for_a_disabled_component_is_not_run`). The plan is what makes both
+/// impossible to get wrong, so it is asserted directly.
+#[test]
+fn a_plan_enables_exactly_the_components_it_probes() {
+    let mut plan = registry::ObservationPlan::stateless();
+    assert!(plan.is_empty());
+    assert_eq!(plan.components(), &[]);
+
+    for (component, interval) in [
+        (Component::BudgetStore, Duration::from_secs(15)),
+        (Component::ControlPlane, Duration::from_secs(70)),
+    ] {
+        plan.observe(
+            HostileProbe::new(component, false),
+            StatusSettings {
+                refresh_interval: interval,
+                probe_timeout: Duration::from_secs(5),
+                staleness_budget: interval.saturating_mul(3),
+                enabled: vec![component],
+            },
+        );
+    }
+
+    assert!(!plan.is_empty());
+    let (pacing, probes) = plan.into_parts();
+    assert_eq!(pacing.validate(), Ok(()));
+    assert_eq!(pacing.refresh_interval, Duration::from_secs(70));
+    let mut enabled = pacing.enabled.clone();
+    let mut probed: Vec<Component> = probes.iter().map(|probe| probe.component()).collect();
+    enabled.sort();
+    probed.sort();
+    assert_eq!(enabled, probed);
+}
+
 #[test]
 fn every_reason_code_is_bounded_and_distinct() {
     let mut codes: Vec<&str> = StatusReason::ALL

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use std::{future::Future, pin::Pin};
 
@@ -5,6 +6,7 @@ use async_trait::async_trait;
 use tokio_postgres::{Client, Config};
 
 use super::{RevocationError, RevocationStore, unavailable, validate_expiry};
+use crate::backends::health::{BackendHealth, PostgresHealth};
 use crate::config::StoreUnavailable;
 use crate::usage::validate_table_name;
 
@@ -18,6 +20,9 @@ pub struct PostgresRevocation {
     timeout: Duration,
     on_unavailable: StoreUnavailable,
     client: tokio::sync::Mutex<Option<Client>>,
+    /// Reachability, for the status refresher. On its own session: the client
+    /// above is serialised behind a mutex a request-path lookup holds.
+    health: Arc<PostgresHealth>,
 }
 
 impl PostgresRevocation {
@@ -37,9 +42,14 @@ impl PostgresRevocation {
         config.application_name(crate::telemetry::SERVICE_NAME);
         let store = Self {
             table: table.to_owned(),
-            config,
             timeout,
             on_unavailable,
+            health: Arc::new(PostgresHealth::new(
+                "postgres",
+                config.clone(),
+                timeout.saturating_add(connect_timeout),
+            )),
+            config,
             client: tokio::sync::Mutex::new(None),
         };
         let mut client = tokio::time::timeout(connect_timeout, store.connect_client())
@@ -161,6 +171,10 @@ impl RevocationStore for PostgresRevocation {
         "postgres"
     }
 
+    fn health(&self) -> Option<Arc<dyn BackendHealth>> {
+        Some(Arc::clone(&self.health) as Arc<dyn BackendHealth>)
+    }
+
     async fn is_revoked(&self, jti: &str) -> Result<bool, RevocationError> {
         let table = self.table.clone();
         let jti = jti.to_owned();
@@ -213,11 +227,17 @@ mod tests {
 
     #[test]
     fn schema_ddl_keeps_index_name_unqualified_for_schema_tables() {
+        let config: Config = "host=localhost".parse().expect("dsn");
         let store = PostgresRevocation {
             table: "tenant.axond_revocation".to_owned(),
-            config: "host=localhost".parse().expect("dsn"),
             timeout: Duration::from_millis(1),
             on_unavailable: StoreUnavailable::Deny,
+            health: Arc::new(PostgresHealth::new(
+                "postgres",
+                config.clone(),
+                Duration::from_millis(1),
+            )),
+            config,
             client: tokio::sync::Mutex::new(None),
         };
         let ddl = store.schema_ddl();

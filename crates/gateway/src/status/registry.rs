@@ -106,6 +106,35 @@ impl StatusSettings {
         }
         Ok(())
     }
+
+    /// Combine two components' pacings into one registry's.
+    ///
+    /// One refresher paces every component, so the registry's numbers have to be
+    /// the ones the *slowest* enabled component needs: an interval short enough
+    /// for a Redis store would make rounds overlap for a Postgres one, and a
+    /// staleness budget sized for the fast store would report the slow one stale
+    /// while it is being observed exactly as configured. Each probe still bounds
+    /// its own call ([`ComponentProbe::begin`]), so taking the maxima here costs
+    /// the fast component only cadence, never a false timeout.
+    ///
+    /// Validity is preserved rather than re-derived: for each input
+    /// `probe_timeout < refresh_interval < staleness_budget`, so the largest
+    /// probe timeout is still below the largest interval — it is below the
+    /// interval of the settings it came from, which is at most the maximum — and
+    /// the same argument holds for the budget. Pinned by
+    /// `merging_two_valid_pacings_stays_valid`.
+    #[must_use]
+    pub fn merge(mut self, other: Self) -> Self {
+        self.refresh_interval = self.refresh_interval.max(other.refresh_interval);
+        self.probe_timeout = self.probe_timeout.max(other.probe_timeout);
+        self.staleness_budget = self.staleness_budget.max(other.staleness_budget);
+        for component in other.enabled {
+            if !self.enabled.contains(&component) {
+                self.enabled.push(component);
+            }
+        }
+        self
+    }
 }
 
 /// One component's last observation, with when it was taken.
@@ -293,6 +322,57 @@ pub trait ComponentProbe: Send + Sync {
     /// failure as a bounded [`StatusReason`] plus an operator-facing detail
     /// rather than propagating the backend's error type.
     async fn observe(&self) -> ComponentObservation;
+}
+
+/// What a replica has decided to observe, accumulated as the backends it
+/// configured are built.
+///
+/// Exists so the enabled set and the probe list cannot drift apart. They are two
+/// halves of one fact — an enabled component nobody probes ages into
+/// `unavailable`, and a probe for a component nobody enabled is dropped on the
+/// floor — and a caller that assembled a `Vec<Component>` and a
+/// `Vec<Arc<dyn ComponentProbe>>` separately would have to keep them in step by
+/// review. Here one call adds both.
+#[derive(Default)]
+pub struct ObservationPlan {
+    pacing: StatusSettings,
+    probes: Vec<Arc<dyn ComponentProbe>>,
+}
+
+impl ObservationPlan {
+    /// The stateless posture: nothing observed, so every component reports
+    /// `disabled` and no refresher is needed.
+    pub fn stateless() -> Self {
+        Self::default()
+    }
+
+    /// Observe one component, on the pacing that component's own bounds allow.
+    ///
+    /// The pacing is merged rather than replaced ([`StatusSettings::merge`]), so
+    /// the registry ends up on the cadence its slowest component needs while each
+    /// probe keeps its own timeout.
+    pub fn observe(&mut self, probe: Arc<dyn ComponentProbe>, pacing: StatusSettings) {
+        self.pacing = std::mem::take(&mut self.pacing).merge(pacing);
+        self.probes.push(probe);
+    }
+
+    /// Whether anything is observed at all.
+    pub fn is_empty(&self) -> bool {
+        self.probes.is_empty()
+    }
+
+    pub fn pacing(&self) -> &StatusSettings {
+        &self.pacing
+    }
+
+    /// The enabled components, for the boot log.
+    pub fn components(&self) -> &[Component] {
+        &self.pacing.enabled
+    }
+
+    pub fn into_parts(self) -> (StatusSettings, Vec<Arc<dyn ComponentProbe>>) {
+        (self.pacing, self.probes)
+    }
 }
 
 /// The background loop that keeps the registry fresh.

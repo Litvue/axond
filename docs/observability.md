@@ -60,22 +60,35 @@ authority additionally sees only the components its own traffic depends on,
 reasons coarsened to `unavailable`, ages rounded to whole seconds, and no revision
 summary.
 
-A stateless replica reports every component `disabled` — that is the correct
-answer, not a degraded one — because no component is *enabled*, and an enabled
-component is one this deployment configured. A stateless replica opens no store,
-so it observes nothing and produces no `axond.status.*` series at all.
+A component reports `disabled` when this deployment has no such dependency — that
+is the correct answer, not a degraded one — so a replica that configured nothing
+durable reports `disabled` everywhere, observes nothing, and produces no
+`axond.status.*` series at all.
 
-A replica in `mode = "stateful"` observes **the control plane**, on the same
-connection its administrative surface was built on rather than a second pool of
-its own: a diagnostic that probed a path no administrative request takes is how
-status reports `ok` throughout an outage of the thing being asked about. That is
-the one live component today, observed on a cadence derived from that store's
-own `connect_timeout_ms`/`operation_timeout_ms` rather than a fixed one — a
-probe that gave up before the backend's own bounds elapsed would report an
-outage it had caused. Every other durable backend is still `disabled`
-until the slice that owns it injects a probe through the same seam
-(`ReplicaObservability::observing`), and neither the response shape nor the
-metric names change when it does:
+The components a replica does observe are the ones its own configuration opened:
+**the control plane** in `mode = "stateful"`, and the **budget**, **rate-limit**,
+and **revocation** stores wherever those are backed by Redis or PostgreSQL rather
+than by `none`/`in-memory`. Each is observed on the connection the administrative
+or request path already uses, rather than a second pool of its own: a diagnostic
+that probed a path no real request takes is how status reports `ok` throughout an
+outage of the thing being asked about. The exception is PostgreSQL, whose
+request-path client is serialised behind a mutex — a probe queued there would
+delay inference to answer a status page, so it opens its own short-lived session
+and runs `SELECT 1`.
+
+A probe asks only for reachability: a `PING` or a `SELECT 1`, with no tenant, key,
+or `jti` in it, never a `reserve`, an `acquire`, or a revocation lookup. A store
+that answers and refuses (a rotated credential) is `degraded`, not `unavailable`,
+which keeps the unreachability alert for an outage.
+
+Each component is probed under its own backend's configured bounds — a probe that
+gave up before the backend's own bounds elapsed would report an outage it had
+caused — while the shared refresh cadence is the slowest enabled component's, and
+a request-path store is never observed faster than the metric export interval that
+reads it. Backends with no reachability seam yet (the secret store, the usage
+sink, the catalogue, and provider credentials) stay `disabled` until the slice
+that owns each one exposes one; neither the response shape nor the metric names
+change when they do:
 
 ```bash
 curl -sS -H "Authorization: Bearer $AXOND_KEY" http://localhost:8080/admin/v1/status
