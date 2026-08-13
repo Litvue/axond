@@ -488,7 +488,8 @@ async fn migrate_prepares_a_control_plane_before_replicas_start() {
         preflight.context()
     );
 
-    control_plane.drop_schema().await;
+    // The schema drops with `control_plane`, on this path and on every failing
+    // one.
 }
 
 // ── Gates whose wiring has not landed ────────────────────────────────────────

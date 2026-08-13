@@ -130,8 +130,8 @@ pub fn postgres_dsn() -> Option<String> {
 /// A stateful bootstrap pointed at a schema of this test's own.
 ///
 /// Every scenario owns a schema, so the journal's fixed table names do not make
-/// the suite one test, and a crashed run leaks one empty schema rather than a
-/// ledger the next run would adopt.
+/// the suite one test, and the schema is dropped when the fixture goes out of
+/// scope, however the scenario ends.
 pub struct ControlPlane {
     pub dsn: String,
     pub schema: String,
@@ -229,13 +229,35 @@ impl ControlPlane {
             .map(|row| row.get::<_, i32>(0))
             .collect()
     }
+}
 
-    pub async fn drop_schema(&self) {
-        client(&self.dsn)
-            .await
-            .batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema))
-            .await
-            .expect("drop the scenario's schema");
+/// Cleanup a failing assertion cannot skip: a scenario that panics half-way
+/// through a migration would otherwise leave a fully populated schema behind in
+/// a database every other run shares.
+///
+/// The drop runs on a thread of its own with its own runtime, because a `Drop`
+/// cannot await and the test's runtime may already be shutting down.
+impl Drop for ControlPlane {
+    fn drop(&mut self) {
+        let dsn = self.dsn.clone();
+        let schema = self.schema.clone();
+        let cleanup = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a cleanup runtime");
+            runtime.block_on(async {
+                client(&dsn)
+                    .await
+                    .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                    .await
+                    .expect("drop the scenario's schema");
+            });
+        });
+        // Only report a cleanup failure when nothing worse is already unwinding.
+        if cleanup.join().is_err() && !std::thread::panicking() {
+            panic!("the scenario's schema was left behind");
+        }
     }
 }
 

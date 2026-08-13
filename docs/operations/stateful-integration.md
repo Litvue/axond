@@ -121,6 +121,6 @@ AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:5432/postgres \
 Without `AXOND_TEST_POSTGRES_DSN` the control-plane scenarios skip, the way the
 rest of the suite treats optional datastores. CI's stateful lane sets
 `AXOND_TEST_REQUIRE_SERVICES=1`, so a skipped scenario there is a failure rather
-than a quiet pass. Each run works in a schema of its own and drops it afterwards,
-so a shared database is safe and a crashed run leaks one empty schema rather than
-poisoning the next.
+than a quiet pass. Each run works in a schema of its own and drops it when the
+fixture goes out of scope — including when an assertion fails — so a shared
+database stays clean and no run poisons the next.
