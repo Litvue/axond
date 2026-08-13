@@ -142,6 +142,13 @@ def check_release_markers() -> list[str]:
     return failures
 
 
+# One reason, shared by the phrases that describe the boot refusal `/admin/v1`
+# serving retired: `ops::serving_refusal` became `ops::inference_refusal`.
+STATEFUL_BOOTS = (
+    "a stateful replica boots and serves `/admin/v1`; inference is what refuses"
+)
+
+
 def check_stale_claims(files: list[Path]) -> list[str]:
     forbidden = {
         "open dev mode": "authentication has no open/keyless mode",
@@ -152,14 +159,20 @@ def check_stale_claims(files: list[Path]) -> list[str]:
         "`POST /v1/responses`), `400 unsupported_wire`": "Responses is implemented",
         "the stateful surface is not implemented yet": "stateful mode parsing and bootstrap validation have shipped",
         "no stateful mode, `/admin/v1` route, or durable schema ships yet": "stateful bootstrap configuration ships; the control plane does not",
-        "refuses to start until the control-plane": "a stateful replica boots and serves /admin/v1; inference is what refuses",
-        "the process refuses to start rather": "a stateful replica boots and serves /admin/v1; inference is what refuses",
+        "refuses to start until the control-plane": STATEFUL_BOOTS,
+        "refuses to start rather than serve an empty snapshot": STATEFUL_BOOTS,
+        "boot still refuses to start": STATEFUL_BOOTS,
     }
     failures: list[str] = []
+    # Beyond Markdown, because this claim is made in an operator's config, in the
+    # gate that asserts it, and in the module docs of the slice that retires it.
     for source in files + [
         ROOT / "axond.example.toml",
         ROOT / "axond.stateful.example.toml",
         ROOT / ".agents/skills/testing-axond/SKILL.md",
+        ROOT / "ops/tier0-gate.sh",
+        ROOT / "tests/tier0/axond.stateful-bootstrap.toml",
+        ROOT / "crates/gateway/src/convergence/mod.rs",
     ]:
         text = source.read_text(encoding="utf-8")
         for phrase, reason in forbidden.items():
