@@ -224,6 +224,11 @@ impl IntoResponse for GatewayError {
         let message = match &self {
             Self::TokenUnauthorized(_) => "token authentication failed".to_owned(),
             Self::TokenForbidden(_) => "token authorization failed".to_owned(),
+            // `reqwest` renders the endpoint it failed against into its message.
+            // That belongs in the operator's logs and on the attempt span, where
+            // the full `Display` still goes — not in the caller's answer, which
+            // would name a provider host, port, and path the caller never chose.
+            Self::Transport(TransportError::Http(_)) => "upstream transport failure".to_owned(),
             _ => self.to_string(),
         };
         let body = json!({
@@ -406,6 +411,25 @@ mod tests {
             body["error"]["message"],
             "request body exceeds the configured inbound limit"
         );
+    }
+
+    #[tokio::test]
+    async fn a_transport_failure_does_not_name_the_endpoint_it_failed_against() {
+        let error = GatewayError::Transport(TransportError::Http(
+            "error sending request for url (http://provider.internal:9443/v1/chat/completions)"
+                .to_owned(),
+        ));
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "upstream_transport");
+        assert_eq!(body["error"]["message"], "upstream transport failure");
     }
 
     #[tokio::test]

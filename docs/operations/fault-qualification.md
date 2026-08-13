@@ -3,7 +3,8 @@
 How a replica behaves when the provider, the network to it, or a state tier
 fails — and the evidence that says so. This page is the fault half of the
 production qualification programme; the load half is
-[Capacity qualification](./capacity.md).
+[Capacity qualification](./capacity.md). The design and its boundaries are
+[ADR 0040](../adr/0040-fault-qualification-harness.md).
 
 The two are deliberately separate. A capacity profile qualifies a healthy
 replica and treats any error as a finding. A fault row expects the failure and

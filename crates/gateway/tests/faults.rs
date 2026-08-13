@@ -259,6 +259,26 @@ fn a_record_belongs_to_the_request_whose_identity_it_carries() {
     assert_eq!(fault::run::minted_at_unix_ms("req_nonsense"), None);
 }
 
+/// A row that must settle *no* usage record reads that absence off the whole of
+/// the exited process's drained output, not off a fixed quiet window: a record
+/// the row should never have written is a finding however late it lands.
+#[test]
+fn a_record_that_settles_late_still_fails_a_row_that_expects_none() {
+    let minted =
+        |at: u128| json!({ "request_id": format!("req_{at:012x}-7000-8000-0000-0000000000") });
+    let measured_from = 2_000;
+
+    // Everything the process wrote, read after it exited and flushed. The
+    // denied request's record landed long after any window would have closed.
+    let settled = fault::run::Settled::of(&[minted(1_000), minted(9_000)], measured_from);
+
+    assert_eq!(settled.counts.measured, 1);
+    assert!(
+        !fault::result::Verdict::equals("usage_records", 0, settled.counts.measured).passed,
+        "a row expecting no record must fail on one that settled late"
+    );
+}
+
 /// A Postgres row keeps its spend in a run-scoped table, and the store derives
 /// a fence trigger name from that table. Postgres refuses an identifier of 64
 /// characters, so the table name has to leave room for what is derived from it.

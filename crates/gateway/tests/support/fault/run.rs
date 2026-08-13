@@ -86,9 +86,6 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 /// Extra delay the latency rows inject into every datastore read.
 const LATENCY_SETTLE: Duration = Duration::from_millis(200);
-/// How long a row that must settle *no* record waits before concluding none is
-/// coming. Rows that expect records wait for those records by identity.
-const USAGE_ABSENCE_WINDOW: Duration = Duration::from_millis(750);
 
 /// How long the upstream may take to be released once the caller is gone.
 /// Recorded and gated: a release that happens only at process shutdown is a
@@ -124,6 +121,10 @@ struct Wiring {
     how: String,
     bound: &'static str,
     bound_ms: Option<u64>,
+    /// Provider endpoints this row points the model at instead of the fake
+    /// upstream. Scanned for as leaks in their own right, so a transport row's
+    /// "no endpoint leaked" evidence is about the endpoint it actually used.
+    injected_endpoints: Vec<String>,
 }
 
 pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
@@ -295,8 +296,9 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
         }
     }
 
-    let settled = await_usage_records(&gateway, started_at, row.expect.usage_records).await;
-    let records = settled.measured;
+    // Waited out before the cleanup timing is read, so a row that settles its
+    // records late is not mistaken for one that released its upstream late.
+    await_usage_records(&gateway, started_at, row.expect.usage_records).await;
     let upstream_requests = upstream.state.requests().len() as u64 - upstream_before;
     let cleanup_started = Instant::now();
     let cleaned = await_upstream_release(&upstream).await;
@@ -316,6 +318,12 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
         drop_budget_table(dsn, &budget_table(&row.id)).await;
     }
 
+    // The process is gone and its sink is drained, so this is every record the
+    // row could ever have settled: a row expecting none is judged against the
+    // whole of it rather than against however long the harness waited.
+    let settled = Settled::of(&gateway.usage_records(), started_at);
+    let records = settled.measured;
+
     let output = gateway.output();
     let measured = records.last().cloned();
     let usage = usage_outcome(&records, measured.as_ref(), &settled.counts);
@@ -327,6 +335,7 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
 
     let leakage = scan(
         &upstream,
+        &wiring.injected_endpoints,
         backend.as_ref(),
         &observed.body_text,
         &output,
@@ -744,9 +753,17 @@ reservation_ttl_seconds = 60
         }
     };
 
+    let injected_endpoints = match row.fault {
+        Fault::DnsFailure => vec![UNRESOLVABLE_BASE_URL.to_owned()],
+        Fault::ConnectRefused => vec![format!("http://{refused}")],
+        Fault::TlsHandshake => vec![tls.base_url()],
+        _ => Vec::new(),
+    };
+
     Wiring {
         alias: row_alias.to_owned(),
         extra_config: extra,
+        injected_endpoints,
         env: backend
             .map(|backend| vec![(STATE_DSN_ENV.to_owned(), backend.dsn.clone())])
             .unwrap_or_default(),
@@ -874,26 +891,30 @@ pub fn attribute(records: &[Value], minted_after_unix_ms: u128) -> (Vec<Value>, 
     (measured, counts)
 }
 
-struct Settled {
-    measured: Vec<Value>,
-    counts: Attribution,
+pub struct Settled {
+    pub measured: Vec<Value>,
+    pub counts: Attribution,
 }
 
-/// The records the measured request settled, recognised by their identities. A
-/// row expecting none still waits, because a record it should not have written
-/// is the finding.
+impl Settled {
+    /// What the identities in `records` say the measured request settled.
+    pub fn of(records: &[Value], minted_after: u128) -> Self {
+        let (measured, counts) = attribute(records, minted_after);
+        Self { measured, counts }
+    }
+}
+
+/// Wait for the records the measured request is expected to settle, recognised
+/// by their identities. A row expecting *none* does not wait at all and is not
+/// judged here: no interval is long enough to prove a record is not coming, so
+/// its absence is read off the process's whole drained output once it has
+/// exited and flushed ([`Settled::of`] at the end of the row).
 async fn await_usage_records(gateway: &Axond, minted_after: u128, expected: u64) -> Settled {
     let deadline = Instant::now() + SETTLE_TIMEOUT;
-    let absent = Instant::now() + USAGE_ABSENCE_WINDOW;
     loop {
-        let (measured, counts) = attribute(&gateway.usage_records(), minted_after);
-        let done = if expected == 0 {
-            Instant::now() >= absent
-        } else {
-            counts.measured >= expected
-        };
-        if done || Instant::now() >= deadline {
-            return Settled { measured, counts };
+        let settled = Settled::of(&gateway.usage_records(), minted_after);
+        if expected == 0 || settled.counts.measured >= expected || Instant::now() >= deadline {
+            return settled;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -970,6 +991,7 @@ fn spans_observed(collector: &Collector) -> Vec<String> {
 /// the surface and the label of what leaked.
 fn scan(
     upstream: &FakeUpstream,
+    injected_endpoints: &[String],
     backend: Option<&Backend>,
     response: &str,
     output: &str,
@@ -1001,6 +1023,18 @@ fn scan(
         ),
         ("secret", "inbound_gateway_key", GATEWAY_KEY.into()),
     ];
+    // A transport row never reaches the fake upstream, so its endpoint needles
+    // are the endpoint it was actually pointed at.
+    for endpoint in injected_endpoints {
+        needles.push(("url", "injected_provider_endpoint", endpoint.clone()));
+        if let Some((_, authority)) = endpoint.split_once("://") {
+            needles.push((
+                "url",
+                "injected_provider_authority",
+                authority.trim_end_matches('/').to_owned(),
+            ));
+        }
+    }
     if let Some(backend) = backend {
         needles.push(("dsn", "state_dsn", backend.dsn.clone()));
         if let Some(password) = password_of(&backend.dsn) {
