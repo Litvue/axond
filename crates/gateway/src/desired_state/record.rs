@@ -152,6 +152,41 @@ impl<'a, E: BodyError> Record<'a, E> {
             .ok_or_else(|| E::missing_field(self.reference, field))
     }
 
+    /// A nested record inside `field`, read as strictly as the body around it.
+    ///
+    /// A schema's sub-records are part of the schema, so a key they do not define
+    /// is an unknown field rather than a value to drop: a body a newer release
+    /// extended inside `approved_price` or inside a target must be a typed
+    /// compatibility refusal, exactly as one extended at the top level is.
+    /// The refusal names the path (`approved_price.effective_from`) so an
+    /// operator can tell which sub-record the field appeared in.
+    pub(super) fn nested(
+        &self,
+        value: &'a CanonicalValue,
+        field: &'static str,
+        schema: &'static str,
+        known: &[&str],
+    ) -> Result<Self, E> {
+        let CanonicalValue::Map(fields) = value else {
+            return Err(E::field_type(self.reference, field));
+        };
+        if let Some((key, _)) = fields
+            .iter()
+            .find(|(key, _)| !known.contains(&key.as_str()))
+        {
+            return Err(E::unknown_field(
+                self.reference,
+                schema,
+                format!("{field}.{key}"),
+            ));
+        }
+        Ok(Self {
+            reference: self.reference,
+            fields,
+            error: std::marker::PhantomData,
+        })
+    }
+
     pub(super) fn string(&self, field: &'static str) -> Result<&'a str, E> {
         match self.value(field)? {
             CanonicalValue::String(text) => Ok(text),

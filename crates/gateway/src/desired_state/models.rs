@@ -151,6 +151,12 @@ const OUTPUT_MICROS_FIELD: &str = "output_micros_per_million";
 const PRICE_ID_FIELD: &str = "price_id";
 const VERSION_FIELD: &str = "version";
 
+/// The field list of each nested record the two schemas define, so a sub-record
+/// is held to its schema the way the body around it is.
+const OBSERVED_PRICE_FIELDS: &[&str] = &[INPUT_MICROS_FIELD, OUTPUT_MICROS_FIELD];
+const APPROVED_PRICE_FIELDS: &[&str] = &[PRICE_ID_FIELD, VERSION_FIELD];
+const ALIAS_TARGET_FIELDS: &[&str] = &[ENABLEMENT_ID_FIELD, VERSION_FIELD];
+
 /// Why an offering identity could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidOfferingId {
@@ -936,26 +942,19 @@ fn lifecycle(record: &ModelRecord<'_>) -> Result<ModelLifecycle, ModelError> {
 
 /// A field of a nested record, named for the outer field so a refusal an operator
 /// reads names the field the schema documents.
+///
+/// The sub-record itself is opened by [`Record::nested`], which holds it to its
+/// own field list, so a key a newer release added inside it is an unknown field
+/// rather than a value this build drops.
 fn nested<'a>(
-    record: &ModelRecord<'_>,
-    value: &'a CanonicalValue,
+    sub: &ModelRecord<'a>,
     field: &'static str,
-    name: &str,
+    name: &'static str,
 ) -> Result<&'a CanonicalValue, ModelError> {
-    let CanonicalValue::Map(fields) = value else {
-        return Err(ModelError::FieldType {
-            reference: record.reference(),
-            field,
-        });
-    };
-    fields
-        .iter()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value)
-        .ok_or(ModelError::MissingField {
-            reference: record.reference(),
-            field,
-        })
+    sub.optional_value(name).ok_or(ModelError::MissingField {
+        reference: sub.reference(),
+        field,
+    })
 }
 
 fn integer(
@@ -1238,8 +1237,14 @@ impl ModelEnablementBody {
         let observed = match record.optional_value(OBSERVED_PRICE_FIELD) {
             None => None,
             Some(value) => {
-                let input = nested(&record, value, OBSERVED_PRICE_FIELD, INPUT_MICROS_FIELD)?;
-                let output = nested(&record, value, OBSERVED_PRICE_FIELD, OUTPUT_MICROS_FIELD)?;
+                let sub = record.nested(
+                    value,
+                    OBSERVED_PRICE_FIELD,
+                    MODEL_ENABLEMENT_SCHEMA,
+                    OBSERVED_PRICE_FIELDS,
+                )?;
+                let input = nested(&sub, OBSERVED_PRICE_FIELD, INPUT_MICROS_FIELD)?;
+                let output = nested(&sub, OBSERVED_PRICE_FIELD, OUTPUT_MICROS_FIELD)?;
                 Some(ObservedPrice::new(
                     micros(&record, input, INPUT_MICROS_FIELD)?,
                     micros(&record, output, OUTPUT_MICROS_FIELD)?,
@@ -1249,8 +1254,14 @@ impl ModelEnablementBody {
         let approved = match record.optional_value(APPROVED_PRICE_FIELD) {
             None => None,
             Some(value) => {
-                let price = nested(&record, value, APPROVED_PRICE_FIELD, PRICE_ID_FIELD)?;
-                let version = nested(&record, value, APPROVED_PRICE_FIELD, VERSION_FIELD)?;
+                let sub = record.nested(
+                    value,
+                    APPROVED_PRICE_FIELD,
+                    MODEL_ENABLEMENT_SCHEMA,
+                    APPROVED_PRICE_FIELDS,
+                )?;
+                let price = nested(&sub, APPROVED_PRICE_FIELD, PRICE_ID_FIELD)?;
+                let version = nested(&sub, APPROVED_PRICE_FIELD, VERSION_FIELD)?;
                 let CanonicalValue::String(text) = price else {
                     return Err(ModelError::FieldType {
                         reference: resource.reference,
@@ -1545,8 +1556,14 @@ impl ModelAliasBody {
         let targets = targets
             .iter()
             .map(|target| {
-                let enablement = nested(&record, target, TARGETS_FIELD, ENABLEMENT_ID_FIELD)?;
-                let version = nested(&record, target, TARGETS_FIELD, VERSION_FIELD)?;
+                let sub = record.nested(
+                    target,
+                    TARGETS_FIELD,
+                    MODEL_ALIAS_SCHEMA,
+                    ALIAS_TARGET_FIELDS,
+                )?;
+                let enablement = nested(&sub, TARGETS_FIELD, ENABLEMENT_ID_FIELD)?;
+                let version = nested(&sub, TARGETS_FIELD, VERSION_FIELD)?;
                 let CanonicalValue::String(text) = enablement else {
                     return Err(ModelError::FieldType {
                         reference: resource.reference,
@@ -2660,6 +2677,99 @@ mod tests {
                 "{error} should say what {field} is not"
             );
         }
+    }
+
+    /// Extend the nested record at `outer` with `field`, as a newer release that
+    /// added a key inside a sub-record would have written it.
+    fn extend_nested(resource: &ResourceVersion, outer: &str, field: &str) -> ResourceVersion {
+        with_fields(resource, |fields| {
+            let (_, value) = fields
+                .iter_mut()
+                .find(|(name, _)| name == outer)
+                .expect("the fixture body carries the nested field");
+            let CanonicalValue::Map(nested) = value else {
+                panic!("{outer} is a nested record");
+            };
+            nested.push((field.to_owned(), CanonicalValue::string("later")));
+        })
+    }
+
+    #[test]
+    fn a_field_a_newer_release_added_inside_a_nested_record_is_refused_too() {
+        // A sub-record is part of its schema, so extending one is the same skew as
+        // extending the body around it: refused, never read past and dropped.
+        let enablement = enablement_body(30, owner_tenant(), "gpt-4o")
+            .observing(observed_price())
+            .approving(approved_price(40))
+            .version(Slug::parse("gpt-4o").unwrap(), catalog_reference());
+        for (outer, field, schema) in [
+            (
+                OBSERVED_PRICE_FIELD,
+                "cached_input_micros_per_million",
+                MODEL_ENABLEMENT_SCHEMA,
+            ),
+            (
+                APPROVED_PRICE_FIELD,
+                "effective_from",
+                MODEL_ENABLEMENT_SCHEMA,
+            ),
+        ] {
+            let extended = extend_nested(&enablement, outer, field);
+            let error = ModelEnablementBody::read(&extended).expect_err("an extended sub-record");
+            assert_eq!(
+                error,
+                ModelError::UnknownField {
+                    reference: extended.reference,
+                    schema,
+                    field: format!("{outer}.{field}")
+                }
+            );
+            assert!(
+                error.is_incompatible(),
+                "a body a newer release wrote is a compatibility refusal: {error}"
+            );
+        }
+
+        let alias = typed_alias(
+            &tenant_id(1),
+            &project_id(2),
+            32,
+            "fast",
+            &[reference_of(30)],
+        );
+        let extended = with_fields(&alias, |fields| {
+            let (_, value) = fields
+                .iter_mut()
+                .find(|(name, _)| name == TARGETS_FIELD)
+                .expect("a typed alias carries targets");
+            let CanonicalValue::List(targets) = value else {
+                panic!("targets is a list");
+            };
+            let CanonicalValue::Map(target) = &mut targets[0] else {
+                panic!("a target is a nested record");
+            };
+            target.push(("weight".to_owned(), CanonicalValue::integer(1)));
+        });
+        let error = ModelAliasBody::read(&extended).expect_err("an extended target");
+        assert_eq!(
+            error,
+            ModelError::UnknownField {
+                reference: extended.reference,
+                schema: MODEL_ALIAS_SCHEMA,
+                field: format!("{TARGETS_FIELD}.weight")
+            }
+        );
+        assert!(error.is_incompatible());
+
+        // The revision refuses to validate at all, so nothing converges on a body
+        // it read only part of.
+        let error = state_replacing(extended)
+            .validate()
+            .expect_err("a revision carrying an extended sub-record is not valid");
+        assert!(
+            matches!(model_error(&error), Some(ModelError::UnknownField { .. })),
+            "{error}"
+        );
     }
 
     #[test]
