@@ -1290,6 +1290,63 @@ fn a_diff_shows_a_rewiring_that_nothing_else_about_the_resource_would_reveal() {
 }
 
 #[test]
+fn a_diff_names_the_object_a_repointed_blob_body_now_addresses() {
+    // Both snapshots stay declared, so no blob appears or disappears and the blob
+    // section of the diff says nothing. The body view has to carry the digest, or
+    // "which snapshot is this catalogue now serving" is unanswerable from the diff
+    // a reviewer approves.
+    let base = fixtures::state_with_two_blobs();
+    let repointed_to = fixtures::second_blob_backed_catalog(6);
+    let catalog = base
+        .get(&fixtures::reference(ResourceKind::CatalogModel, 5))
+        .expect("the fixture catalogue");
+
+    let mut candidate = base.clone();
+    candidate
+        .insert(ResourceVersion::new(
+            catalog.reference.at(catalog.reference.version.next()),
+            catalog.scope.clone(),
+            catalog.slug.clone(),
+            repointed_to.body.clone(),
+        ))
+        .expect("repointing at an already declared blob is valid");
+
+    let diff = SemanticDiff::between(Some(&base), &candidate).expect("a diff");
+    assert!(
+        diff.blobs.is_empty(),
+        "neither snapshot entered or left the revision"
+    );
+    let delta = &diff.resources[0];
+    let before = delta.previous_body.as_ref().expect("the body it had");
+    let after = delta.body.as_ref().expect("the body it has");
+    assert_eq!(
+        before.digest.as_deref(),
+        Some(
+            catalog
+                .body
+                .blob()
+                .expect("a blob body")
+                .digest
+                .to_string()
+                .as_str()
+        )
+    );
+    assert_eq!(
+        after.digest.as_deref(),
+        Some(
+            repointed_to
+                .body
+                .blob()
+                .expect("a blob body")
+                .digest
+                .to_string()
+                .as_str()
+        )
+    );
+    assert_ne!(before.digest, after.digest);
+}
+
+#[test]
 fn a_state_view_describes_resources_without_their_bodies() {
     let view = StateView::of(None).expect("an empty state view");
     assert!(view.revision.is_none());
@@ -1722,6 +1779,28 @@ async fn a_known_admin_path_reached_with_the_wrong_method_answers_in_the_admin_e
     assert_eq!(body["error"]["type"], "admin_method_not_allowed");
     assert_eq!(body["error"]["retryable"], false);
     assert_eq!(store.published_revisions(), 0);
+}
+
+#[tokio::test]
+async fn a_method_refusal_still_names_the_methods_the_path_answers() {
+    let store = Arc::new(InMemoryControlPlane::new());
+    let response = mount(api(Some(store)), test_specs())
+        .oneshot(
+            Request::post(format!("{ADMIN_PREFIX}/state"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("a response");
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let allow = response
+        .headers()
+        .get(axum::http::header::ALLOW)
+        .and_then(|value| value.to_str().ok())
+        .expect("a 405 carries Allow, custom envelope or not");
+    assert!(allow.contains("GET"), "{allow}");
+    assert!(!allow.contains("POST"), "{allow}");
 }
 
 #[tokio::test]

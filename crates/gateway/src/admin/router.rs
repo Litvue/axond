@@ -170,7 +170,9 @@ pub(crate) fn mount(api: Arc<AdminApi>, specs: Vec<AdminRouteSpec>) -> Router {
         // is attached per route — a wrong method on an administrative path is a
         // protocol mistake, and answering it does not need an identity or reveal
         // whether one would have been accepted. See the module docs on what the
-        // 404/405 split does and does not disclose.
+        // 404/405 split does and does not disclose. The custom handler replaces
+        // the body, not the response's `Allow` header, which axum still sets from
+        // the method router — asserted, because RFC 9110 requires it on a 405.
         .method_not_allowed_fallback(wrong_method)
         .with_state(api);
     Router::new().nest(ADMIN_PREFIX, inner)

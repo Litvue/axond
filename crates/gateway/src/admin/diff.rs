@@ -10,8 +10,10 @@
 //! - the **checksum of its canonical bytes**, which changes exactly when the body
 //!   changes, so "this credential was rotated" is visible without the material
 //!   being; and
-//! - for a blob, its **digest and size**, which are already public identifiers of
-//!   immutable content.
+//! - for a blob, its **digest and size**, which are already public identifiers
+//!   of immutable content, and which are what say *which* snapshot a body now
+//!   addresses when a resource is repointed between two blobs the revision keeps
+//!   declaring — a change no blob delta reports.
 //!
 //! Its dependency edges are rendered in full, because they are references rather
 //! than material and because rewiring an alias onto a different credential
@@ -98,6 +100,12 @@ pub struct BodyView {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blob_kind: Option<&'static str>,
+    /// The content-addressed object a blob body points at. A public identifier of
+    /// immutable content, and the answer to "which snapshot is this now" when a
+    /// resource is repointed between two blobs that both stay declared, in which
+    /// case no [`BlobDelta`] is emitted to say so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
 }
@@ -110,12 +118,14 @@ impl BodyView {
                 form: "inline",
                 content: content.to_string(),
                 blob_kind: None,
+                digest: None,
                 size_bytes: None,
             },
             ResourceBody::Blob(blob) => Self {
                 form: "blob",
                 content: content.to_string(),
                 blob_kind: Some(blob.kind.as_str()),
+                digest: Some(blob.digest.to_string()),
                 size_bytes: Some(blob.size_bytes),
             },
         })
