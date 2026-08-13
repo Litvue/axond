@@ -191,7 +191,13 @@ ok "$(grep -m 1 "applied .* migration" <<<"$migration_log")"
 # Forward-only and idempotent is the property that makes it safe in front of an
 # upgrade, so it is asserted rather than assumed: the same Job spec, run again,
 # has to report a current schema instead of migrating a second time.
-kube -n axond delete job axond-migrate --wait=true >/dev/null
+# Foreground cascade, because the default one deletes the Job and leaves its
+# Pod to the garbage collector: the first attempt's log stays readable under the
+# same job-name label, and the rerun's aggregation would read a migration that
+# this run did not perform.
+kube -n axond delete job axond-migrate --cascade=foreground --wait=true >/dev/null
+kube -n axond wait --for=delete pod -l job-name=axond-migrate --timeout=120s >/dev/null ||
+  fail "the first migration's Pod outlived its Job, so the rerun's log is not its own"
 kube apply -f "${workdir}/rendered.yaml" >/dev/null
 kube -n axond wait --for=condition=complete job/axond-migrate --timeout=180s >/dev/null ||
   fail "the rerun of the migration Job did not complete"
