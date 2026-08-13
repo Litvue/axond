@@ -20,6 +20,8 @@
 //!   this map, which the request path never reads.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -274,11 +276,16 @@ impl CachedStatusRegistry {
 pub trait ComponentProbe: Send + Sync {
     fn component(&self) -> Component;
 
-    /// The timeout for this probe's next observation. Most components use the
-    /// registry-wide fallback; a serialized backend may derive one from work
-    /// already queued ahead of the call.
-    fn probe_timeout(&self, fallback: Duration) -> Duration {
-        fallback
+    /// Start one observation and return its timeout together with the future
+    /// that owns any admission lease acquired for that observation.
+    fn begin<'a>(
+        &'a self,
+        fallback: Duration,
+    ) -> (
+        Duration,
+        Pin<Box<dyn Future<Output = ComponentObservation> + Send + 'a>>,
+    ) {
+        (fallback, Box::pin(self.observe()))
     }
 
     /// Observe the backend. Called from the background refresher only, and
@@ -314,8 +321,8 @@ impl StatusRefresher {
     pub async fn refresh_once(&self) {
         let fallback = self.registry.settings().probe_timeout;
         let observations = futures::future::join_all(self.probes.iter().map(|probe| async move {
-            let timeout = probe.probe_timeout(fallback);
-            match tokio::time::timeout(timeout, probe.observe()).await {
+            let (timeout, observation) = probe.begin(fallback);
+            match tokio::time::timeout(timeout, observation).await {
                 Ok(observation) => observation,
                 // An abandoned probe is an observation like any other, so a
                 // hung backend ages into `unavailable` rather than leaving the

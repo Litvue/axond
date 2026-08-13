@@ -30,6 +30,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -41,7 +42,7 @@ use tokio_postgres::{Client, Config, Row, Transaction};
 use super::hydration::{self, HydrationLimits};
 use super::rows;
 use super::schema::{self, Baseline, MINIMUM_SERVER_VERSION_NUM, SchemaStatus};
-use super::{ControlPlaneError, ControlPlaneStore};
+use super::{ControlPlaneError, ControlPlaneStore, StatusProbeAdmission};
 use crate::backends::{Capabilities, Capability};
 use crate::desired_state::{
     AccessDenial, Action, AuditEvent, Credential, DenialPage, DenialReason, Directory,
@@ -171,7 +172,7 @@ pub struct PostgresControlPlane {
     /// Operations currently holding or waiting for the serialized client. A
     /// status probe samples this before joining the queue so its timeout covers
     /// every operation already ahead of it, not just one.
-    pending_operations: AtomicUsize,
+    pending_operations: Arc<AtomicUsize>,
 }
 
 /// Written by hand, and deliberately narrow: a derived one would print the
@@ -255,7 +256,7 @@ impl PostgresControlPlane {
             search_path,
             ids: Uuid7Generator::new(),
             client: tokio::sync::Mutex::new(None),
-            pending_operations: AtomicUsize::new(0),
+            pending_operations: Arc::new(AtomicUsize::new(0)),
         };
         let client = tokio::time::timeout(store.settings.connect_timeout, store.connect_client())
             .await
@@ -280,7 +281,7 @@ impl PostgresControlPlane {
     /// The whole read-and-apply is one transaction under the same advisory lock
     /// boot takes, so this is safe to run while replicas are starting.
     pub async fn apply_migrations(&self) -> Result<Vec<i32>, ControlPlaneError> {
-        self.run(|client| {
+        self.run(None, |client| {
             Box::pin(async move {
                 // Read committed explicitly rather than by inheritance: the status
                 // is read *after* the lock is granted, and it has to be the winner's
@@ -357,7 +358,7 @@ impl PostgresControlPlane {
     /// a history is left exactly as it is and reported back, which is what makes a
     /// second `adopt` a no-op rather than a second baseline.
     pub async fn adopt_ledger(&self) -> Result<Adoption, ControlPlaneError> {
-        self.run(|client| {
+        self.run(None, |client| {
             Box::pin(async move {
                 // Read committed and the journal's advisory lock, for the reasons
                 // `apply_migrations` pins both: the status has to be the winner's
@@ -470,7 +471,7 @@ impl PostgresControlPlane {
     /// A status command an operator runs against production has to be a thing
     /// that cannot change production.
     pub async fn schema_status(&self) -> Result<SchemaStatus, ControlPlaneError> {
-        self.run(|client| {
+        self.run(None, |client| {
             Box::pin(async move {
                 let transaction = client
                     .build_transaction()
@@ -590,13 +591,15 @@ impl PostgresControlPlane {
     /// a reconnect.
     async fn run<T>(
         &self,
+        admission: Option<StatusProbeAdmission>,
         operation: impl for<'a> FnOnce(
             &'a mut Client,
         ) -> Pin<
             Box<dyn Future<Output = Result<T, ControlPlaneError>> + Send + 'a>,
         >,
     ) -> Result<T, ControlPlaneError> {
-        let _pending = PendingOperation::new(&self.pending_operations);
+        let _pending = admission
+            .unwrap_or_else(|| StatusProbeAdmission::pending(Arc::clone(&self.pending_operations)));
         let mut guard = self.client.lock().await;
         if guard.as_ref().is_none_or(Client::is_closed) {
             *guard = Some(
@@ -619,25 +622,6 @@ impl PostgresControlPlane {
             *guard = None;
         }
         result
-    }
-}
-
-/// Keeps the store's pending-operation count correct even when a caller drops
-/// an operation while it is waiting for the serialized client.
-struct PendingOperation<'a> {
-    count: &'a AtomicUsize,
-}
-
-impl<'a> PendingOperation<'a> {
-    fn new(count: &'a AtomicUsize) -> Self {
-        count.fetch_add(1, Ordering::AcqRel);
-        Self { count }
-    }
-}
-
-impl Drop for PendingOperation<'_> {
-    fn drop(&mut self) {
-        self.count.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -756,15 +740,23 @@ impl ControlPlaneStore for PostgresControlPlane {
         ])
     }
 
-    fn status_probe_timeout(&self) -> Option<Duration> {
-        Some(
-            self.settings
-                .status_probe_timeout(self.pending_operations.load(Ordering::Acquire)),
-        )
+    fn status_probe_admission(&self) -> Option<StatusProbeAdmission> {
+        let queued_operations = self.pending_operations.fetch_add(1, Ordering::AcqRel);
+        Some(StatusProbeAdmission::new(
+            self.settings.status_probe_timeout(queued_operations),
+            Arc::clone(&self.pending_operations),
+        ))
     }
 
     async fn health(&self) -> Result<(), ControlPlaneError> {
-        self.run(|client| {
+        self.health_with_status_probe(None).await
+    }
+
+    async fn health_with_status_probe(
+        &self,
+        admission: Option<StatusProbeAdmission>,
+    ) -> Result<(), ControlPlaneError> {
+        self.run(admission, |client| {
             Box::pin(async move {
                 client
                     .query_one("SELECT 1", &[])
@@ -777,7 +769,7 @@ impl ControlPlaneStore for PostgresControlPlane {
     }
 
     async fn desired_revision(&self) -> Result<Option<RevisionId>, ControlPlaneError> {
-        self.run(|client| {
+        self.run(None, |client| {
             Box::pin(async move {
                 let row = client
                     .query_opt(
@@ -805,7 +797,7 @@ impl ControlPlaneStore for PostgresControlPlane {
 
     async fn load_manifest(&self, id: RevisionId) -> Result<RevisionManifest, ControlPlaneError> {
         let limits = self.settings.hydration;
-        self.run(move |client| {
+        self.run(None, move |client| {
             Box::pin(async move {
                 let transaction = client
                     .transaction()
@@ -821,7 +813,7 @@ impl ControlPlaneStore for PostgresControlPlane {
 
     async fn load_revision(&self, id: RevisionId) -> Result<LoadedRevision, ControlPlaneError> {
         let limits = self.settings.hydration;
-        self.run(move |client| {
+        self.run(None, move |client| {
             Box::pin(async move {
                 let transaction = client
                     .transaction()
@@ -839,7 +831,7 @@ impl ControlPlaneStore for PostgresControlPlane {
     /// converged onto a revision that was never the head it read.
     async fn load_desired_revision(&self) -> Result<Option<LoadedRevision>, ControlPlaneError> {
         let limits = self.settings.hydration;
-        self.run(move |client| {
+        self.run(None, move |client| {
             Box::pin(async move {
                 let transaction = client
                     .transaction()
@@ -867,7 +859,7 @@ impl ControlPlaneStore for PostgresControlPlane {
         let limits = self.settings.hydration;
         let id = RevisionId::new(self.ids.next());
 
-        self.run(move |client| {
+        self.run(None, move |client| {
             Box::pin(async move {
                 let transaction = client
                     .transaction()
@@ -913,7 +905,7 @@ impl ControlPlaneStore for PostgresControlPlane {
     }
 
     async fn audit_trail(&self, id: RevisionId) -> Result<Vec<AuditEvent>, ControlPlaneError> {
-        self.run(move |client| {
+        self.run(None, move |client| {
             Box::pin(async move {
                 let revision = client
                     .query_opt(
@@ -949,7 +941,7 @@ impl ControlPlaneStore for PostgresControlPlane {
 
     async fn record_denial(&self, denial: &AccessDenial) -> Result<(), ControlPlaneError> {
         let denial = denial.clone();
-        self.run(move |client| {
+        self.run(None, move |client| {
             Box::pin(async move {
                 let actor = rows::actor_columns(&denial.actor);
                 let scope = rows::scope_columns(&denial.scope);
@@ -995,7 +987,7 @@ impl ControlPlaneStore for PostgresControlPlane {
         // Clamped rather than rejected: this is a page size, and an administrator
         // asking for everything gets the first page rather than an error.
         let limit = i64::try_from(limit.clamp(1, 1_000)).unwrap_or(1_000);
-        self.run(move |client| {
+        self.run(None, move |client| {
             Box::pin(async move {
                 // `IS NOT DISTINCT FROM` so `None` selects the deployment-scoped
                 // denials rather than every row: a refusal that named no tenant is
@@ -2091,16 +2083,41 @@ mod tests {
 
     #[test]
     fn pending_operations_count_waiters_and_release_on_drop() {
-        let count = AtomicUsize::new(0);
-        let first = PendingOperation::new(&count);
+        let count = Arc::new(AtomicUsize::new(0));
+        let first = StatusProbeAdmission::pending(Arc::clone(&count));
         assert_eq!(count.load(Ordering::Acquire), 1);
 
-        let second = PendingOperation::new(&count);
+        let second = StatusProbeAdmission::pending(Arc::clone(&count));
         assert_eq!(count.load(Ordering::Acquire), 2);
         drop(second);
         assert_eq!(count.load(Ordering::Acquire), 1);
 
         drop(first);
+        assert_eq!(count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn status_probe_reservation_is_visible_to_a_concurrent_operation() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let probe = StatusProbeAdmission::new(Duration::from_secs(65), Arc::clone(&count));
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let observed = Arc::new(AtomicUsize::new(0));
+        let worker_count = Arc::clone(&count);
+        let worker_start = Arc::clone(&start);
+        let worker_observed = Arc::clone(&observed);
+        let worker = std::thread::spawn(move || {
+            worker_start.wait();
+            let _admin = StatusProbeAdmission::pending(worker_count.clone());
+            worker_observed.store(worker_count.load(Ordering::Acquire), Ordering::Release);
+        });
+
+        start.wait();
+        worker
+            .join()
+            .expect("the concurrent operation does not panic");
+        assert_eq!(count.load(Ordering::Acquire), 1);
+        assert_eq!(observed.load(Ordering::Acquire), 2);
+        drop(probe);
         assert_eq!(count.load(Ordering::Acquire), 0);
     }
 
@@ -2147,7 +2164,7 @@ mod tests {
         /// storage the writer would never produce gets produced.
         async fn corrupt_with(&self, statement: &str) {
             let sql = statement.to_owned();
-            self.run(move |client| {
+            self.run(None, move |client| {
                 let sql = sql.clone();
                 Box::pin(async move {
                     client
@@ -2162,7 +2179,7 @@ mod tests {
 
         async fn count(&self, table: &str) -> i64 {
             let sql = format!("SELECT count(*) FROM {table}");
-            self.run(move |client| {
+            self.run(None, move |client| {
                 Box::pin(async move {
                     client
                         .query_one(&sql, &[])
@@ -2220,7 +2237,7 @@ mod tests {
         // gateway that serves against a schema it did not write.
         let bare = format!("{schema}_bare");
         store
-            .run(move |client| {
+            .run(None, move |client| {
                 let sql = format!("CREATE SCHEMA {bare}");
                 Box::pin(async move {
                     client
@@ -2250,7 +2267,7 @@ mod tests {
             return;
         };
         store
-            .run(|client| {
+            .run(None, |client| {
                 Box::pin(async move {
                     client
                         .execute(
@@ -3609,7 +3626,7 @@ mod tests {
     impl PostgresControlPlane {
         async fn column(&self, sql: &str) -> Vec<String> {
             let sql = sql.to_owned();
-            self.run(move |client| {
+            self.run(None, move |client| {
                 let sql = sql.clone();
                 Box::pin(async move {
                     client
@@ -3635,7 +3652,7 @@ mod tests {
         /// would try to write, and what the database refuses on its own.
         async fn attempt(&self, statement: &str) -> Result<(), ControlPlaneError> {
             let sql = statement.to_owned();
-            self.run(move |client| {
+            self.run(None, move |client| {
                 let sql = sql.clone();
                 Box::pin(async move {
                     client

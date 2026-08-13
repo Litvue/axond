@@ -164,6 +164,13 @@ fn the_derived_cadence_cannot_outrun_the_pipeline_that_watches_it() {
              healthy replica's series lapses and the stall rule pages"
         );
     }
+    assert!(
+        crate::status::probes::MAX_PROBE_TIMEOUT
+            < Duration::from_secs(minutes(expiration, COLLECTOR) * 60),
+        "a queue-aware probe may wait {:?} while the exporter retains samples for {expiration}, \
+         so a deep queue would make a live refresher look stalled",
+        crate::status::probes::MAX_PROBE_TIMEOUT
+    );
 
     // The same cap against the other status rule: a round is allowed to take up
     // to the cap, and the age gauge carries what the round took, so a threshold

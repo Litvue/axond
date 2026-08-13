@@ -23,8 +23,8 @@ use super::registry::StatusRefresher;
 use super::registry::{ComponentProbe, StatusSettings};
 use super::{Component, ComponentObservation, StatusReason};
 use crate::backends::BackendFailure;
-use crate::backends::control_plane::ControlPlaneStore;
 use crate::backends::control_plane::postgres::ControlPlaneSettings;
+use crate::backends::control_plane::{ControlPlaneStore, StatusProbeAdmission};
 
 /// Observes the control plane a stateful replica administers against.
 ///
@@ -74,14 +74,10 @@ impl ControlPlaneProbe {
     /// diagnostic lowers `[control_plane] operation_timeout_ms`, which is the
     /// honest lever: status can only be as prompt as the backend it reports on.
     ///
-    /// It is bounded above by [`MAX_REFRESH_INTERVAL`] regardless: a cadence
-    /// slower than the exporter holds a series for is indistinguishable from a
-    /// refresher that stopped, so an operation bound generous enough to outrun
-    /// the monitoring pipeline buys a permanent `AxondStatusRefresherStalled`
-    /// page rather than a patient probe. Past that point the probe is cut off
-    /// early and the round is published as a timeout — an honest "this control
-    /// plane is slower than a diagnostic can wait for", where silence would say
-    /// nothing at all.
+    /// The boot cadence is bounded by [`MAX_REFRESH_INTERVAL`], and a runtime
+    /// queue-derived wait is bounded by [`MAX_PROBE_TIMEOUT`]. A queue deeper
+    /// than the monitoring pipeline can retain a refresh sample is cut off and
+    /// published as a timeout rather than making a live refresher look stalled.
     pub fn pacing(settings: &ControlPlaneSettings) -> StatusSettings {
         // Reserve one operation ahead of the first probe. The live Postgres
         // implementation replaces this fallback with the current queue-aware
@@ -128,6 +124,24 @@ impl ControlPlaneProbe {
             enabled: vec![Component::ControlPlane],
         }
     }
+
+    async fn observe_with_status_probe(
+        &self,
+        admission: Option<StatusProbeAdmission>,
+    ) -> ComponentObservation {
+        match self.store.health_with_status_probe(admission).await {
+            Ok(()) => ComponentObservation::ok(Component::ControlPlane),
+            Err(error) => {
+                let reason = StatusReason::from_failure(error.category());
+                let detail = format!("{}: {error}", self.store.name());
+                if reason == StatusReason::Unreachable {
+                    ComponentObservation::unavailable(Component::ControlPlane, reason, detail)
+                } else {
+                    ComponentObservation::degraded(Component::ControlPlane, reason, detail)
+                }
+            }
+        }
+    }
 }
 
 /// The gap between a round's ceiling and the next round. Taken from the store's
@@ -160,6 +174,14 @@ const MAX_SPACING: Duration = Duration::from_secs(30);
 /// observed exactly as configured.
 pub const MAX_REFRESH_INTERVAL: Duration = Duration::from_secs(2 * 60);
 
+/// The longest one queue-aware probe may wait before it must publish a result.
+///
+/// This stays below the shipped five-minute metric expiration, so even a deep
+/// administrative queue cannot make `axond_status_refreshes` disappear and
+/// trigger `AxondStatusRefresherStalled` merely because the health call is still
+/// waiting for its turn.
+pub const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(4 * 60);
+
 /// The oldest a control-plane observation may be before the replica itself
 /// calls it `stale`.
 ///
@@ -182,29 +204,24 @@ impl ComponentProbe for ControlPlaneProbe {
         Component::ControlPlane
     }
 
-    fn probe_timeout(&self, fallback: Duration) -> Duration {
-        self.store.status_probe_timeout().unwrap_or(fallback)
+    fn begin<'a>(
+        &'a self,
+        fallback: Duration,
+    ) -> (
+        Duration,
+        std::pin::Pin<Box<dyn std::future::Future<Output = ComponentObservation> + Send + 'a>>,
+    ) {
+        let admission = self.store.status_probe_admission();
+        let timeout = admission
+            .as_ref()
+            .map(StatusProbeAdmission::timeout)
+            .unwrap_or(fallback)
+            .min(MAX_PROBE_TIMEOUT);
+        (timeout, Box::pin(self.observe_with_status_probe(admission)))
     }
 
     async fn observe(&self) -> ComponentObservation {
-        match self.store.health().await {
-            Ok(()) => ComponentObservation::ok(Component::ControlPlane),
-            // Classified through the backend's own category rather than by
-            // matching its variants: a store that grows a failure mode gets a
-            // safe code here instead of silently falling through to `ok`.
-            Err(error) => {
-                let reason = StatusReason::from_failure(error.category());
-                // A control plane that answers "denied" or "corrupt" is reachable
-                // and wrong, which an operator triages differently from one that
-                // is not there at all.
-                let detail = format!("{}: {error}", self.store.name());
-                if reason == StatusReason::Unreachable {
-                    ComponentObservation::unavailable(Component::ControlPlane, reason, detail)
-                } else {
-                    ComponentObservation::degraded(Component::ControlPlane, reason, detail)
-                }
-            }
-        }
+        self.observe_with_status_probe(None).await
     }
 }
 
@@ -276,8 +293,8 @@ mod tests {
             self.inner.capabilities()
         }
 
-        fn status_probe_timeout(&self) -> Option<Duration> {
-            self.probe_timeout
+        fn status_probe_admission(&self) -> Option<StatusProbeAdmission> {
+            self.probe_timeout.map(StatusProbeAdmission::standalone)
         }
 
         async fn health(&self) -> Result<(), ControlPlaneError> {
@@ -383,12 +400,36 @@ mod tests {
             probe_timeout: Some(expected),
         }));
 
+        let (timeout, observation) = probe.begin(Duration::from_secs(1));
+        drop(observation);
         assert_eq!(
-            <ControlPlaneProbe as ComponentProbe>::probe_timeout(&probe, Duration::from_secs(1),),
-            expected,
+            timeout, expected,
             "the health probe must budget for all queued operations, not one fixed slot"
         );
         assert_eq!(expected, Duration::from_secs(125));
+    }
+
+    #[test]
+    fn a_deep_queue_cannot_extend_a_probe_past_metric_expiration() {
+        let settings = ControlPlaneSettings {
+            connect_timeout: Duration::from_secs(5),
+            operation_timeout: Duration::from_secs(30),
+            ..ControlPlaneSettings::default()
+        };
+        let deep_queue = 100;
+        let uncapped = settings.status_probe_timeout(deep_queue);
+        let probe = ControlPlaneProbe::new(Arc::new(Answering {
+            inner: Arc::new(InMemoryControlPlane::new()),
+            health: healthy(),
+            health_delay: None,
+            probe_timeout: Some(uncapped),
+        }));
+
+        let (timeout, observation) = probe.begin(Duration::from_secs(1));
+        drop(observation);
+        assert!(uncapped > MAX_PROBE_TIMEOUT);
+        assert_eq!(timeout, MAX_PROBE_TIMEOUT);
+        assert!(MAX_PROBE_TIMEOUT < Duration::from_secs(5 * 60));
     }
 
     /// The queue-aware timeout is part of the refresher contract, not just a
