@@ -1841,6 +1841,12 @@ impl LastKnownGoodCatalog {
     /// evidence the held content is current as of then, which is what an active
     /// snapshot's age means to an operator.
     ///
+    /// A validator the answer does not state is *not* a validator withdrawn: a
+    /// `304` only SHOULD repeat them and intermediaries drop them, so an
+    /// unstated one keeps the held value. Overwriting it with nothing would
+    /// leave nothing to ask conditionally with, turning every later refresh into
+    /// a full transfer of the whole document.
+    ///
     /// Returns whether anything was recorded; there is nothing to move before a
     /// first import.
     pub fn record_unchanged(
@@ -1851,7 +1857,13 @@ impl LastKnownGoodCatalog {
         let Some(active) = self.active.as_mut() else {
             return false;
         };
-        active.source.validators = validators;
+        let held = &mut active.source.validators;
+        if let Some(etag) = validators.etag {
+            held.etag = Some(etag);
+        }
+        if let Some(last_modified) = validators.last_modified {
+            held.last_modified = Some(last_modified);
+        }
         active.source.fetched_at = checked_at;
         true
     }
@@ -2127,6 +2139,29 @@ mod tests {
             "an unchanged answer is not new content"
         );
         assert_eq!(active.source.content_id, content_id);
+
+        assert!(catalogue.record_unchanged(SourceValidators::default(), checked_at));
+        assert_eq!(
+            catalogue.validators(),
+            Some(&SourceValidators::etag("\"two\"")),
+            "an answer that repeats no tag has not withdrawn one: dropping it \
+             would leave nothing to ask conditionally with, and every later \
+             refresh would transfer the whole document"
+        );
+
+        let last_modified = SourceValidators {
+            etag: None,
+            last_modified: Some(HttpDate("Wed, 21 Oct 2015 07:28:00 GMT".to_owned())),
+        };
+        assert!(catalogue.record_unchanged(last_modified, checked_at));
+        assert_eq!(
+            catalogue.validators(),
+            Some(&SourceValidators {
+                etag: Some(ETag("\"two\"".to_owned())),
+                last_modified: Some(HttpDate("Wed, 21 Oct 2015 07:28:00 GMT".to_owned())),
+            }),
+            "and a partial answer states the one it carries without clearing the other"
+        );
     }
 
     #[test]
