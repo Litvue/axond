@@ -1,4 +1,4 @@
-# 49. Stateful availability projection and discovery persistence
+# 50. Stateful availability projection and discovery persistence
 
 Date: 2026-08-12
 
