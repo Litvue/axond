@@ -163,3 +163,12 @@ a config-only deployment at Tier 0.
 - Adding an instrument or a label now means updating the catalogue in the same
   change, and adding a genuinely unbounded default label is no longer possible
   without deleting a test.
+- Amended by #241: the deployment-scope response carries one string that is not
+  a closed vocabulary, the active catalogue's content id, as a fixed-width prefix
+  of a digest this process computed over content it normalized itself
+  ([ADR 0043](./0043-catalogue-source-imports.md)). Nothing upstream said reaches
+  it, it is omitted at namespace scope, and it is not a metric label; the
+  free-text sweep that guards this contract now permits exactly that digest and
+  nothing else. The rule the exception keeps is the one that matters: a response
+  field may only carry a value this process can account for, which is why a raw
+  error, a URL, or a JSON Pointer still has nowhere to go.

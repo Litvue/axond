@@ -159,6 +159,21 @@ without a configured source the compiled-in seed is the catalogue, and because
 metadata is never an entitlement or admission input, a stale catalogue degrades
 metadata quality rather than availability.
 
+That visibility has since landed ahead of the scheduler rather than with it
+(#241), which is possible because it is a property of the last-known-good holder
+and not of a refresh loop: refusals are classified into a closed `RefusalReason`
+vocabulary and counted, an admitted or `304`-confirmed import ends the run, and
+one `CatalogReport` feeds the metrics (`axond.catalog.refusals` by reason,
+`axond.catalog.active_age`, `axond.catalog.consecutive_refusals`), the alert at
+two consecutive refusals, and the deployment-scope status surface. The surface
+carries the active content id as a fixed-width digest prefix — the one string in
+a status response that is not a closed vocabulary, admissible because it is
+derived from bytes this process hashed, is operator-scope only, and is never a
+metric label. The pointer every rejection names stays in the log line, where it
+is bounded by nothing and needs to be. A scheduler now inherits working signals
+rather than a contract to keep; what remains its own is the cadence, and
+recording the refusals it drives.
+
 [241]: https://github.com/Litvue/axond/issues/241
 
 The compiled-in seed adds bytes to the binary and one more thing to keep
