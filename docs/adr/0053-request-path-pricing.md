@@ -78,7 +78,12 @@ control-plane facts an unprivileged data-plane caller must not read out of an
 error body. A target that is
 ineligible is skipped by the failover walk; an alias whose every target is
 ineligible refuses the request as `model_not_priced` (503) before admission
-capacity or a rate-limit permit is spent. The alias remains listed by `/v1/models`
+capacity or a rate-limit permit is spent. A route that pins its destination (the
+Responses affinity pin) cannot fail over past the target it is pinned to, so a
+walk that skipped only ineligible candidates reports the same typed
+`model_not_priced` refusal rather than the generic "nothing to attempt" request
+error — an unpriced pin is a pricing refusal even when a later target of the same
+alias is chargeable. The alias remains listed by `/v1/models`
 throughout: discoverability is a catalogue question, chargeability is a pricing
 one.
 

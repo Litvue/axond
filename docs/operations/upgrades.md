@@ -100,11 +100,18 @@ Exact namespace-wide budgets require a stopped fleet:
 Do not mix cap-aware and cap-unaware replicas. Both backends contain fences so
 an unsafe mix fails loudly rather than undercounting spend.
 
-Usage schema migrations are additive and should be applied before the new
-binary. Missing usage columns cause off-path sink drops rather than request
-failure, which still makes migration ordering operationally important.
+Usage schema migrations are additive and must be applied before the new binary,
+in filename order. This release adds
+`ops/postgres/usage_v2_001_add_price_identity.sql` (nullable `price_book`,
+`price_book_checksum`, `price_catalog`), which follows
+`ops/postgres/usage_v1_001_add_signer_kid.sql`. A Postgres usage sink compares
+the existing table's columns against the ones it binds while it connects, so a
+replica started before its migration refuses to boot and names the file to apply
+rather than dropping rows. Mixed versions are safe in both directions: the
+columns are nullable, and an older binary neither writes nor reads them. Rolling
+back does not require dropping them.
 
-That last sentence stops being true for a billing-grade deployment: with
+The usage *outbox* is stricter still for a billing-grade deployment: with
 `[usage_journal] backend = "postgres"` the outbox is on the request path, so a
 missing or unreadable outbox table is `503 usage_not_durable` per request under
 the default policy, not an off-path drop. Apply outbox DDL before the writers,

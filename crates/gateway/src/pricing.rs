@@ -222,6 +222,16 @@ impl AliasPrices {
             .find_map(|priced| priced.as_ref().ok().copied())
     }
 
+    /// Why one target position cannot be charged. The failover walk reports this
+    /// when the target it was pinned to is the ineligible one, so a pinned
+    /// destination is refused for the reason it was skipped for rather than as a
+    /// walk that found nothing to attempt.
+    pub fn ineligible(&self, index: usize) -> Option<&Ineligible> {
+        self.priced
+            .get(index)
+            .and_then(|priced| priced.as_ref().err())
+    }
+
     /// Why the alias cannot be routed, when none of its targets can be charged.
     pub fn refusal(&self) -> Option<&Ineligible> {
         if self.estimate().is_some() {

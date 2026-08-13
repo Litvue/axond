@@ -59,7 +59,7 @@ use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target};
 use crate::credentials::{CredentialLease, CredentialPlan, CredentialSource, CredentialStatusView};
 use crate::error::GatewayError;
 use crate::mint::{MintRequest, mint_issued_at, mint_token_at};
-use crate::pricing::{AliasPrices, RequestPrice};
+use crate::pricing::{AliasPrices, Ineligible, RequestPrice};
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
 use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::shutdown::Phase;
@@ -1596,6 +1596,7 @@ async fn dispatch_with_failover(
         // circuit: it is configured and discoverable, but nothing approved says
         // what it costs, so it cannot be dispatched under a budget hold.
         let Some(price) = prices.get(index) else {
+            walk.note_unpriced(&model.name, prices.ineligible(index));
             continue;
         };
         let Some(provider) = cfg.provider(&target.provider) else {
@@ -1880,6 +1881,7 @@ async fn stream_with_failover(
         }
         // Ineligible: discoverable, but not dispatchable under a budget hold.
         let Some(price) = prices.get(index) else {
+            walk.note_unpriced(&model.name, prices.ineligible(index));
             continue;
         };
         let Some(provider) = cfg.provider(&target.provider) else {
@@ -2278,6 +2280,10 @@ struct FailoverWalk {
     attempts: u32,
     skipped_open: Vec<String>,
     no_credential: Option<GatewayError>,
+    /// The refusal for a target skipped because nothing approved prices it,
+    /// carried so a walk pinned to that target reports the pricing refusal
+    /// instead of a generic "nothing to attempt" request error.
+    unpriced: Option<GatewayError>,
     /// The last buffered attempt's error + attribution, carried so a walk that
     /// exhausts its targets still returns a real upstream error.
     last: Option<(TransportError, ServedTarget, u64, Option<u64>)>,
@@ -2294,8 +2300,29 @@ impl FailoverWalk {
             attempts: 0,
             skipped_open: Vec::new(),
             no_credential: None,
+            unpriced: None,
             last: None,
             last_error: None,
+        }
+    }
+
+    /// Remember that a candidate was skipped for want of an approved price. The
+    /// operator-facing identity of the book stays in the log; the walk keeps only
+    /// the stable redacted reason a caller may be told (#147).
+    fn note_unpriced(&mut self, alias: &str, refusal: Option<&Ineligible>) {
+        let Some(refusal) = refusal else {
+            return;
+        };
+        if self.unpriced.is_none() {
+            tracing::warn!(
+                model = %alias,
+                detail = %refusal.detail(),
+                "skipping a target with no approved price"
+            );
+            self.unpriced = Some(GatewayError::ModelNotPriced {
+                alias: alias.to_owned(),
+                reason: refusal.reason().to_owned(),
+            });
         }
     }
 
@@ -2314,6 +2341,7 @@ impl FailoverWalk {
             return ProviderError::AllCircuitsOpen(self.skipped_open).into();
         }
         self.no_credential
+            .or(self.unpriced)
             .unwrap_or_else(|| ProviderError::InvalidRequest("no attemptable target".into()).into())
     }
 }
@@ -3110,6 +3138,110 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         // The refusal is a data-plane answer, so it says the model is not
         // chargeable and nothing about which book a deployment runs, at which
         // version, or whether that book is still a draft.
+        let pricing = approved_pricing_snapshot();
+        let message = body["error"]["message"]
+            .as_str()
+            .expect("an error message")
+            .to_owned();
+        assert!(message.contains("gpt-4o"), "{message}");
+        for internal in [
+            pricing.book().to_string(),
+            pricing.book().id.to_string(),
+            pricing.checksum().to_string(),
+            pricing.catalog().to_string(),
+            pricing.approval().state().to_owned(),
+        ] {
+            assert!(
+                !message.contains(&internal),
+                "the refusal `{message}` discloses `{internal}`"
+            );
+        }
+    }
+
+    /// A deployment whose alias leads with an unpriced catalogue-bound target and
+    /// falls back to a file-priced one. Only the *first* target is reachable on
+    /// the pinned Responses route, so the alias as a whole is chargeable while the
+    /// pinned destination is not.
+    fn state_pinned_to_an_unpriced_offering() -> AppState {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "AXOND_PLATFORM_OPENAI"
+
+{GATEWAY_KEY}
+
+[[model]]
+name = "gpt-4o"
+targets = [
+  {{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }}, catalog = {{ provider = "openai", model = "o3" }} }},
+  {{ provider = "openai", model = "gpt-4o-mini", price = {{ input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 }} }},
+]
+"#
+        ))
+        .expect("a catalogue binding parses");
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        let env = env_with([("AXOND_PLATFORM_OPENAI", "sk-platform-test")]);
+        let state = AppState::new(
+            cfg.clone(),
+            &env,
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+        )
+        .expect("credentials resolve");
+        state.publish(
+            ConfigSnapshot::build(cfg, &env, 1)
+                .expect("minting snapshot")
+                .with_pricing(approved_pricing_snapshot()),
+        );
+        state
+    }
+
+    /// A pinned route cannot fail over past the target it is pinned to, so an
+    /// unpriced pin is a refusal in its own right: it must be the documented
+    /// typed `model_not_priced` unavailability, not the generic "nothing to
+    /// attempt" request error a walk that dispatched nothing used to answer with,
+    /// and it must disclose no more about the price book than the alias-wide
+    /// refusal does.
+    #[tokio::test]
+    async fn a_pinned_target_without_an_approved_price_is_a_typed_pricing_refusal() {
+        let refused = router(state_pinned_to_an_unpriced_offering())
+            .oneshot(
+                authorized("/v1/responses")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "gpt-4o",
+                            "input": "hi"
+                        }))
+                        .expect("body"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("a response");
+
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_slice(
+            &refused
+                .into_body()
+                .collect()
+                .await
+                .expect("a body")
+                .to_bytes(),
+        )
+        .expect("an error document");
+        assert_eq!(body["error"]["type"], "model_not_priced");
+
         let pricing = approved_pricing_snapshot();
         let message = body["error"]["message"]
             .as_str()
