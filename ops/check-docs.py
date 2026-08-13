@@ -485,6 +485,17 @@ def self_test() -> int:
     assert len(superseded) == 1, superseded
     assert "peak sockets" in superseded[0], superseded
 
+    # A renamed profile and an unreadable cell are reported, not raised: a gate
+    # that tracebacks tells a contributor nothing about what to fix.
+    renamed = capacity_envelope_failures(
+        record.replace('"streaming"', '"streamed"'), envelope
+    )
+    assert len(renamed) == 1, renamed
+    assert "no streaming or cancellation profile" in renamed[0], renamed
+    unreadable = capacity_envelope_failures(record, envelope.replace("| 50 MiB |", "| n/a |"))
+    assert len(unreadable) == 1, unreadable
+    assert "not a number" in unreadable[0], unreadable
+
     print("check-docs: release-path gate self-test passed")
     return 0
 
@@ -566,6 +577,21 @@ def record_profiles(record: str) -> dict[str, dict[str, float]]:
     return profiles
 
 
+def number(cell: str) -> float | None:
+    """The leading number of a table cell, in the units the column is headed in.
+
+    Cells carry their unit (`44 MiB`, `7 675`), and a hand-edited one may carry
+    no number at all — which is a finding to report, not a traceback.
+    """
+    match = re.match(r"[\d\u202f ]*\d", cell)
+    if not match:
+        return None
+    try:
+        return float(match.group().replace("\u202f", "").replace(" ", ""))
+    except ValueError:
+        return None
+
+
 def capacity_envelope_failures(record: str, page: str) -> list[str]:
     """The published envelope is the retained record, read in operator units.
 
@@ -583,35 +609,48 @@ def capacity_envelope_failures(record: str, page: str) -> list[str]:
         if name not in profiles:
             continue
         cells = [cell.strip() for cell in rest.split("|")]
-        if len(cells) < 10 or not cells[8].isdigit():
+        if len(cells) < 10:
             continue
         profile = profiles[name]
+        elapsed = profile.get("elapsed_ms") or 0.0
         published = {
-            "accepted req/s": (
-                int(cells[2].replace("\u202f", "").replace(" ", "")),
-                profile["accepted_rps"],
-            ),
-            "peak RSS MiB": (int(cells[7].split()[0]), profile["peak_rss_kib"] / 1024),
-            "peak sockets": (int(cells[8]), profile["peak_sockets"]),
+            "accepted req/s": (cells[2], profile.get("accepted_rps")),
+            "peak RSS MiB": (cells[7], (profile.get("peak_rss_kib") or 0.0) / 1024),
+            "peak sockets": (cells[8], profile.get("peak_sockets")),
             "CPU cores": (
-                float(cells[9]),
-                profile["cpu_seconds"] / (profile["elapsed_ms"] / 1000),
+                cells[9],
+                (profile.get("cpu_seconds") or 0.0) / (elapsed / 1000) if elapsed else None,
             ),
         }
-        for column, (shown, measured) in published.items():
-            if abs(shown - measured) > max(1.0, measured * 0.01):
+        for column, (cell, measured) in published.items():
+            shown = number(cell)
+            if shown is None or measured is None:
                 failures.append(
-                    f"docs/operations/capacity.md: {name} publishes {shown} "
+                    f"docs/operations/capacity.md: {name} publishes {cell!r} as "
+                    f"{column}, which is not a number the record can be read against"
+                )
+            elif abs(shown - measured) > max(1.0, measured * 0.01):
+                failures.append(
+                    f"docs/operations/capacity.md: {name} publishes {cell} "
                     f"{column}, the retained record measured {measured:.1f}"
                 )
 
     streamed = max(
-        profile["peak_sockets"]
-        for name, profile in profiles.items()
-        if name in {"streaming", "cancellation"}
+        (
+            profile["peak_sockets"]
+            for name, profile in profiles.items()
+            if name in {"streaming", "cancellation"} and "peak_sockets" in profile
+        ),
+        default=None,
     )
     for shown in re.findall(r"held ~(\d+) descriptors", page):
-        if abs(int(shown) - streamed) > streamed * 0.02:
+        if streamed is None:
+            failures.append(
+                "docs/operations/capacity.md: the descriptor rule of thumb has no "
+                "streaming or cancellation profile in the retained record to check "
+                "against; rename it with the profiles or re-run the tier"
+            )
+        elif abs(int(shown) - streamed) > streamed * 0.02:
             failures.append(
                 f"docs/operations/capacity.md: the descriptor rule of thumb says "
                 f"~{shown}, the retained record peaked at {streamed:.0f}"
