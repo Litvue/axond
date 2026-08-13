@@ -81,7 +81,10 @@ pub const MAX_IN_FLIGHT_DIAGNOSTICS: usize = 8;
 /// not.
 ///
 /// Partitioned rather than pooled, by what the credential costs and by whether
-/// one was presented at all: see [`MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS`].
+/// one was presented at all: see [`MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS`]. No
+/// semaphore holds this number — it is the sum the shares add up to, which is
+/// why only the tests reach for it.
+#[cfg(test)]
 pub const MAX_AUTHENTICATING_DIAGNOSTICS: usize = MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS
     + MAX_AUTHENTICATING_DIAGNOSTIC_KEYS
     + MAX_AUTHENTICATING_DIAGNOSTIC_ANONYMOUS;
