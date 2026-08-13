@@ -489,6 +489,60 @@ fn a_declared_listing_is_retained_for_the_outage_that_follows_it() {
     );
 }
 
+/// Replaying stored evidence is not disorder: a projection that re-applies the looks
+/// it already applied must not make the out-of-order counter climb, or the signal is
+/// useless for spotting a genuinely disordered projection.
+#[test]
+fn replaying_a_look_the_current_slot_already_holds_reports_no_disorder() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, None))
+        .build();
+
+    let builder = AvailabilityIndexBuilder::from_index(&index)
+        .observe(present(scope, "gpt-4o", 100, None))
+        .observe(present(scope, "gpt-4o", 100, None));
+
+    assert_eq!(builder.superseded(), 0, "nothing arrived out of order");
+    let replayed = builder.build();
+    assert_eq!(replayed, index, "and nothing changed");
+    assert_eq!(
+        replayed.evaluate(&key(scope, "gpt-4o"), at(200)).reason,
+        AvailabilityReason::Observed
+    );
+}
+
+/// The probe detail is log-line material an operator opts into, and a record dump is
+/// not that opt-in: `Debug` must not reproduce whatever a provider handed back.
+#[test]
+fn a_record_dump_does_not_print_the_probe_detail() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(outage(scope, "gpt-4o", 100))
+        .build();
+    let dumped = format!("{index:?}");
+
+    assert!(
+        !dumped.contains("sk-live"),
+        "a dump must not carry what a probe read back: {dumped}"
+    );
+    assert!(!dumped.contains("api.example.test"));
+    assert!(
+        dumped.contains("<redacted>"),
+        "and it says the detail is there to be read on purpose"
+    );
+    assert_eq!(
+        index
+            .record(&key(scope, "gpt-4o"))
+            .and_then(|record| record.discovery.as_ref())
+            .and_then(|look| look.detail.as_deref()),
+        outage(scope, "gpt-4o", 100).detail.as_deref(),
+        "the field itself is intact for the log line that wants it"
+    );
+}
+
 /// One refused look is one out-of-order arrival, even when a record carries it in
 /// both slots: the counter is what tells an operator a projection is disordered, so
 /// it must not double-count.

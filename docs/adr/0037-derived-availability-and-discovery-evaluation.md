@@ -133,7 +133,10 @@ observations can raise it without new definitive evidence.
 **The verdict has nowhere to put free text.** Every field is an enum, a bool, or a
 timestamp, and the reason vocabulary is closed, so redaction is the absence of a
 field rather than a filter someone can forget to apply. The operator-facing detail
-a probe collects lives on the internal observation and has no projection path.
+a probe collects lives on the internal observation and has no projection path — and
+no `Debug` path either: an observation prints only whether it carried detail, so a
+record or index dump cannot spill an error body or a URL bearing a key into a log,
+and the string reaches one only where somebody read the field on purpose.
 A namespace-scoped verdict additionally coarsens the reasons that describe the
 deployment's own machinery — how discovery is performed, how this replica is
 faring — to `unspecified` and drops the discovery source; what a tenant keeps is

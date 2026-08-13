@@ -500,12 +500,16 @@ impl AvailabilityIndexBuilder {
     /// the result independent of arrival order: the current slot keeps the newest
     /// observation, while retention is judged against
     /// [`definitive_at`](AvailabilityRecord::definitive_at) — every conclusive
-    /// answer this key has ever reached, not merely the ones still held. The rest
-    /// of the rules are in the module docs.
+    /// answer this key has ever reached, not merely the ones still held. Replaying a
+    /// look the current slot already holds discards nothing and is not counted in
+    /// [`superseded`](Self::superseded), so re-deriving an index from stored evidence
+    /// does not report disorder. The rest of the rules are in the module docs.
     #[must_use]
     pub fn observe(mut self, observation: DiscoveryObservation) -> Self {
         let entry = self.records.entry(observation.key()).or_default();
-        if !Self::admit(entry, observation) {
+        // A look the current slot already holds was applied when it first arrived:
+        // re-applying it discards nothing, so it is not an out-of-order arrival.
+        if entry.discovery.as_ref() != Some(&observation) && !Self::admit(entry, observation) {
             self.superseded += 1;
         }
         self

@@ -49,8 +49,12 @@
 //! account, occasionally a URL with a query string in it.
 //! [`DiscoveryObservation::detail`] is where that goes, for the log line, and
 //! [`Availability`] has no field it fits in — so no
-//! projection can leak it, because there is nowhere to project it to.
+//! projection can leak it, because there is nowhere to project it to. Nor does a
+//! record or index dump print it: [`DiscoveryObservation`]'s `Debug` reports only
+//! whether detail was carried, so the string reaches a log only where somebody read
+//! the field on purpose.
 
+use std::fmt;
 use std::time::SystemTime;
 
 use super::refs::{AvailabilityKey, ScopeRef, TargetRef};
@@ -170,7 +174,7 @@ impl DiscoveryResult {
 /// tenant's account and no other: a model absent from tenant A's listing may be
 /// present in tenant B's, and an index that shared the observation between them
 /// would deny B on A's evidence.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DiscoveryObservation {
     pub scope: ScopeRef,
     pub target: TargetRef,
@@ -181,8 +185,32 @@ pub struct DiscoveryObservation {
     /// When this evidence stops counting. `None` never expires.
     pub expires_at: Option<SystemTime>,
     /// Operator-facing detail, for the log line only. Never projected into a
-    /// verdict — see the module docs.
+    /// verdict, and never printed by [`Debug`](std::fmt::Debug) — see the module
+    /// docs. Read it explicitly to log it.
     pub detail: Option<String>,
+}
+
+/// Prints every field except [`detail`](DiscoveryObservation::detail), which is
+/// whatever a probe collected — an error body, a URL bearing a query string — and
+/// so is exactly what must not reach a log through a record or index dump. It is
+/// reported as present or absent, because *whether* a look carried detail is the
+/// part an operator reading a dump can act on.
+impl fmt::Debug for DiscoveryObservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DiscoveryObservation")
+            .field("scope", &self.scope)
+            .field("target", &self.target)
+            .field("result", &self.result)
+            .field("completeness", &self.completeness)
+            .field("source", &self.source)
+            .field("observed_at", &self.observed_at)
+            .field("expires_at", &self.expires_at)
+            .field(
+                "detail",
+                &self.detail.as_ref().map(|_| "<redacted>").unwrap_or("none"),
+            )
+            .finish()
+    }
 }
 
 impl DiscoveryObservation {
