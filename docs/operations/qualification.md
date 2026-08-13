@@ -59,22 +59,26 @@ asserted against the committed manifest, so editing a profile's scale or
 thresholds invalidates every record taken before the edit rather than leaving it
 quietly describing a workload that no longer exists.
 
-| Record | Tier | Runner | Commit |
-| --- | --- | --- | --- |
-| `qualification/capacity/evidence/reduced-local.toml` | reduced | local | `c857cd6` |
-| `qualification/capacity/evidence/heavy-local.toml` | heavy | local | `c857cd6` |
+A record's identity is its digests, not its commit. The binary that produced
+the numbers, the manifest it ran, and the config each profile booted are
+content-addressed; they say exactly what was measured and they outlive any
+rewriting of history. The branch commit is recorded too, but this repository
+squash-merges, so read it as a note about the run rather than something to
+check out.
+
+| Record | Tier | Runner | Binary `sha256` | Branch commit (pre-squash) |
+| --- | --- | --- | --- | --- |
+| `qualification/capacity/evidence/reduced-local.toml` | reduced | local | `32503505f810` | `bd7075a` |
+| `qualification/capacity/evidence/heavy-local.toml` | heavy | local | `32503505f810` | `bd7075a` |
 
 Both were produced on an 8 vCPU cloud VM from a **debug build**, which is what
 `cargo test` builds. They are the first envelope, not a fleet baseline: a release
 build on production-representative hardware will move every number in them, and
 `runner = "local"` is in the record so that caveat travels with the data instead
 of with this paragraph. The contract test requires a locally recorded run to be
-disclosed here by path and by the commit it was taken at, so re-running a tier
+disclosed here by path and by the digest of the binary that produced it, so
+re-running a tier — which rebuilds the binary, and so changes the digest —
 without rewriting this table is a test failure rather than a stale paragraph.
-That commit is the branch commit the run happened on; this repository
-squash-merges, so it is provenance rather than something to check out. What
-makes a record reproducible is the digests it carries — manifest, binary, and
-per-profile config — and those survive the squash.
 
 Write a record from a run's artifacts:
 

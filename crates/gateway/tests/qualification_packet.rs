@@ -330,14 +330,17 @@ fn a_locally_recorded_run_is_disclosed_as_one() {
                     "{relative}: a local run without a note about the machine is \
                      an envelope nobody can reproduce"
                 );
-                // The commit too, and not only the path: a re-run rewrites the
-                // record but leaves the prose pointing at history the reader
-                // cannot check out.
-                let short = &record.source.git_commit[..7];
+                // And the binary digest, not the commit: this repository
+                // squashes, so a branch SHA names history that never lands,
+                // while the digest of the artifact that produced the numbers is
+                // content-addressed and survives any rewriting. Disclosing it
+                // is also what makes a re-run visible in the prose, because a
+                // rebuilt binary hashes differently.
+                let identity = &record.binary.sha256[..12];
                 assert!(
-                    contract.contains(short),
-                    "{relative}: it was taken at {short}, which {} does not \
-                     mention \u{2014} the disclosure has drifted from the record",
+                    contract.contains(identity),
+                    "{relative}: it was produced by binary {identity}, which {} \
+                     does not name \u{2014} the disclosure has drifted from the record",
                     packet::CONTRACT_RELATIVE
                 );
             }
