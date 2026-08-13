@@ -774,6 +774,14 @@ async fn an_admin_mutation_publishes_an_audited_revision() {
         published["diff"]["summary"]["added"], 1,
         "the published revision adds exactly the resource the caller described: {published}"
     );
+    let checksum = published["checksum"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a publish result checksums what it published: {published}"))
+        .to_owned();
+    assert!(
+        checksum.starts_with("sha256:"),
+        "a revision is identified by a digest an operator can compare: {published}"
+    );
 
     // 4. Durable and readable: the revision is the deployment's desired state and
     //    its history, read back from the control plane through the surface.
@@ -838,6 +846,11 @@ async fn an_admin_mutation_publishes_an_audited_revision() {
         "replaying a mutation under its idempotency key is not a second mutation:\n{}",
         replica.output()
     );
+    let replayed: serde_json::Value = replayed.json().await.expect("a replay result");
+    assert_eq!(
+        replayed["revision"], revision,
+        "a replay returns the revision the original request published: {replayed}"
+    );
     let stale = publish("ig-05-tenant-again", "empty")
         .await
         .expect("a conflict response");
@@ -862,6 +875,10 @@ async fn an_admin_mutation_publishes_an_audited_revision() {
         history["revisions"].as_array().map(Vec::len),
         Some(1),
         "three requests describing one change leave one revision behind: {history}"
+    );
+    assert_eq!(
+        history["revisions"][0]["checksum"], checksum,
+        "history identifies the revision by the digest the publish reported: {history}"
     );
 }
 
