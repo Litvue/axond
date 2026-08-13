@@ -26,6 +26,7 @@
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -323,6 +324,26 @@ fn stateful_boot_refuses_to_serve_an_empty_snapshot() {
     }
     let mut child = command.spawn().expect("the axond binary runs");
 
+    // Both streams are drained while the child runs. Left unread, a chatty boot
+    // would fill its pipe, block on `write`, and be reported below as a process
+    // that would not stop — a failure blaming the wrong thing.
+    let streams: Vec<Box<dyn Read + Send>> = vec![
+        Box::new(child.stdout.take().expect("a piped stdout")),
+        Box::new(child.stderr.take().expect("a piped stderr")),
+    ];
+    let drains: Vec<_> = streams
+        .into_iter()
+        .map(|mut stream| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                stream
+                    .read_to_string(&mut text)
+                    .expect("the child's output is readable");
+                text
+            })
+        })
+        .collect();
+
     // A refusal exits immediately. Waiting without a deadline would instead hang
     // the suite for as long as CI allows on the day `serve` learns to boot
     // statefully — the very change this scenario exists to catch.
@@ -338,12 +359,10 @@ fn stateful_boot_refuses_to_serve_an_empty_snapshot() {
             None => std::thread::sleep(Duration::from_millis(20)),
         }
     };
-    let output = child.wait_with_output().expect("the child's output");
-    let reported = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let reported: String = drains
+        .into_iter()
+        .map(|drain| drain.join().expect("the drain finishes"))
+        .collect();
     let status = status.unwrap_or_else(|| {
         panic!(
             "IG-01: a stateful boot kept running instead of refusing, so this gate's real scenario \
