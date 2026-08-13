@@ -674,7 +674,7 @@ async fn serve() -> anyhow::Result<()> {
     tracing::info!(
         outcome = outcome.as_str(),
         usage_flushed = flushed.is_complete(),
-        usage_journal_drained = journal_drain.as_ref().map(|report| report.drained),
+        usage_journal_drained = journal_drain.as_ref().and_then(|report| report.caught_up()),
         telemetry_flushed = telemetry_failures.is_empty(),
         "axond stopped"
     );

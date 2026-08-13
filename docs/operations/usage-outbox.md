@@ -281,7 +281,10 @@ Two policies change this, and both are a deliberate trade against accounting:
 Requests that are already terminal cannot be refused: a stream whose bytes were
 relayed, or a cancellation, is still appended durably first, but a failure there
 can only be counted (`axond.usage.journal.lost`), because there is no answer left
-to change.
+to change. The same holds for a caller that hangs up while its append is in
+flight: the append finishes regardless, but a refusal it is no longer there to
+receive cannot be retried away, so that failure is counted as lost rather than
+returned.
 
 ## Recovery
 
@@ -406,6 +409,10 @@ shutdown budget on what is deliverable, and reports the rest:
 ```text
 INFO shutdown complete usage_journal_drained=false ...
 ```
+
+`usage_journal_drained` is absent rather than `false` when the worker stopped
+cleanly but its closing backlog read did not answer in time: whether delivery was
+caught up is then unknown, not "no".
 
 Events it could not deliver are **undelivered durable work, not lost usage**:
 they are still in the outbox, and the next process claims them. An incomplete

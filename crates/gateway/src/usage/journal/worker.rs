@@ -120,6 +120,12 @@ pub struct DrainReport {
 }
 
 impl DrainReport {
+    /// Whether delivery was caught up when the worker stopped, or `None` when
+    /// the backlog was never read and the answer is unknown rather than "no".
+    pub fn caught_up(&self) -> Option<bool> {
+        self.counted.then_some(self.drained)
+    }
+
     fn observe(&mut self, stats: JournalStats) {
         self.undelivered = stats.pending + stats.in_flight;
         self.quarantined = stats.quarantined;
@@ -146,6 +152,19 @@ impl DrainReport {
                      could not be read; the events are durable and will be delivered after restart"
                 );
             }
+            return;
+        }
+        if !self.counted {
+            // The worker stopped when it was asked to; only the closing backlog
+            // read did not answer. "Not drained" would be a claim about a
+            // backlog nobody read, and it would carry a zero beside it.
+            tracing::warn!(
+                delivered = self.delivered,
+                failed = self.failed,
+                "usage journal worker stopped but its backlog could not be read; whether \
+                 delivery was caught up is unknown, and anything left behind is durable and \
+                 will be delivered after restart"
+            );
             return;
         }
         if self.drained {
@@ -1003,6 +1022,11 @@ mod tests {
         assert!(
             !report.counted,
             "the backlog read did not finish, so it is unknown rather than zero: {report:?}"
+        );
+        assert_eq!(
+            report.caught_up(),
+            None,
+            "an unread backlog cannot be reported as an incomplete drain: {report:?}"
         );
     }
 

@@ -2558,7 +2558,14 @@ async fn record_usage(state: &AppState, args: RecordArgs<'_>) -> Result<(), Gate
     let (verdict, decided) = tokio::sync::oneshot::channel();
     let recording = state.clone();
     crate::streaming::spawn_settlement(async move {
-        let _ = verdict.send(recording.0.usage.record(&record).await);
+        // A refusal the handler is still there to receive is not a loss — the
+        // caller is told to retry and its spend is unwound. Once the handler is
+        // gone that answer reaches nobody, so an event that could not be
+        // journaled is a billable fact that no longer exists anywhere and is
+        // counted as one.
+        if let Err(Err(unheard)) = verdict.send(recording.0.usage.record(&record).await) {
+            recording.0.usage.count_unheard_refusal(&unheard);
+        }
     });
     match decided.await {
         Ok(Ok(())) => Ok(()),
@@ -6317,6 +6324,116 @@ targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// A journal that refuses every append, slowly enough for the caller to
+    /// hang up inside one.
+    struct SlowRefusal(Duration);
+
+    #[async_trait::async_trait]
+    impl journal::UsageJournal for SlowRefusal {
+        fn name(&self) -> &'static str {
+            "slow-refusal"
+        }
+
+        fn capacity(&self) -> journal::Capacity {
+            journal::Capacity::BILLING_GRADE
+        }
+
+        fn mode(&self) -> journal::DeliveryMode {
+            journal::DeliveryMode::BillingGrade
+        }
+
+        async fn append(
+            &self,
+            _event: &journal::UsageEvent,
+        ) -> Result<journal::Appended, journal::JournalError> {
+            tokio::time::sleep(self.0).await;
+            Err(journal::JournalError::Backend {
+                detail: "the outbox is unreachable".to_owned(),
+            })
+        }
+
+        async fn claim(
+            &self,
+            _consumer: &journal::ConsumerId,
+            _claim: journal::Claim,
+        ) -> Result<Vec<journal::Delivery>, journal::JournalError> {
+            Ok(Vec::new())
+        }
+
+        async fn ack(&self, _delivery: &journal::DeliveryId) -> Result<(), journal::JournalError> {
+            Ok(())
+        }
+
+        async fn quarantine(
+            &self,
+            _delivery: &journal::DeliveryId,
+            _reason: journal::PoisonReason,
+        ) -> Result<(), journal::JournalError> {
+            Ok(())
+        }
+
+        async fn relinquish(
+            &self,
+            _delivery: &journal::DeliveryId,
+        ) -> Result<(), journal::JournalError> {
+            Ok(())
+        }
+
+        async fn stats(
+            &self,
+            _consumer: &journal::ConsumerId,
+        ) -> Result<journal::JournalStats, journal::JournalError> {
+            Ok(journal::JournalStats::default())
+        }
+    }
+
+    /// A refusal is only a refusal while there is somebody to refuse: the caller
+    /// gets `503`, and the event it describes comes back with the retry. Once
+    /// the caller has hung up, that answer reaches nobody while the spend stays
+    /// settled, so the failed append is a billable fact that exists nowhere —
+    /// and the one counter an operator watches for exactly that has to move.
+    #[tokio::test]
+    async fn an_append_that_fails_after_the_caller_hung_up_is_counted_as_lost() {
+        let (url, _) = controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let state = billing_state(&url, Arc::new(SlowRefusal(Duration::from_millis(200))));
+        let usage = Arc::clone(&state.0.usage);
+
+        let mut serving = Box::pin(router(state).oneshot(chat_request()));
+        tokio::select! {
+            _ = &mut serving => panic!("the request answered before the append could be cut off"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        drop(serving);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while usage.unheard_refusals() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the refusal nobody heard was never counted as a loss"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The other side of that rule: a caller still on the connection is told
+    /// `503` and can retry, so the event is not lost and must not be counted as
+    /// though it were.
+    #[tokio::test]
+    async fn a_refusal_the_caller_receives_is_not_counted_as_a_loss() {
+        let (url, _) = controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let state = billing_state(&url, Arc::new(SlowRefusal(Duration::ZERO)));
+        let usage = Arc::clone(&state.0.usage);
+
+        let response = router(state).oneshot(chat_request()).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            usage.unheard_refusals(),
+            0,
+            "a refusal the caller received is a retry, not a loss"
+        );
     }
 
     /// The identity contract as the buffered path delivers it: every settled

@@ -434,6 +434,10 @@ pub struct UsageDelivery {
     fanout: UsageFanout,
     journal: Option<Arc<dyn UsageJournal>>,
     on_undurable: UndurablePolicy,
+    /// Test-only witness for [`UsageDelivery::count_unheard_refusal`]: the loss
+    /// counter it moves is a global instrument no test can read back.
+    #[cfg(test)]
+    unheard: std::sync::atomic::AtomicU64,
 }
 
 /// A usage event that could not be made durable, and the request that must now
@@ -454,6 +458,8 @@ impl UsageDelivery {
             fanout,
             journal: None,
             on_undurable: UndurablePolicy::Serve,
+            #[cfg(test)]
+            unheard: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -464,6 +470,8 @@ impl UsageDelivery {
             fanout: UsageFanout::new(Vec::new()),
             journal: Some(journal),
             on_undurable,
+            #[cfg(test)]
+            unheard: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -556,6 +564,40 @@ impl UsageDelivery {
         );
         crate::telemetry::metrics::record_usage_journal_lost(journal, reason, 1);
         Ok(())
+    }
+
+    /// Count a refusal that reached nobody as a loss.
+    ///
+    /// A refusal is not a loss while there is a caller to hand it to: the
+    /// request is answered `503`, its spend is unwound, and the event it
+    /// describes can be produced again by a retry, so [`record`](Self::record)
+    /// leaves the loss counter alone. A caller that hung up before the append
+    /// finished never receives that status, its spend has already been settled,
+    /// and the billable fact is as gone as one served under
+    /// [`UndurablePolicy::Serve`] — which is the counter this is.
+    pub fn count_unheard_refusal(&self, refusal: &NotDurable) {
+        let journal = self
+            .journal
+            .as_ref()
+            .map_or("none", |journal| journal.name());
+        tracing::error!(
+            request_id = %refusal.request_id,
+            reason = refusal.reason,
+            detail = %refusal.detail,
+            "a usage event could not be journaled and the caller was gone before it could be \
+             told, so the request stands charged with nothing recorded"
+        );
+        crate::telemetry::metrics::record_usage_journal_lost(journal, refusal.reason, 1);
+        #[cfg(test)]
+        self.unheard
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many refusals were counted as losses because nobody was left to hear
+    /// them.
+    #[cfg(test)]
+    pub fn unheard_refusals(&self) -> u64 {
+        self.unheard.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Record where the caller has no way to refuse: a stream that has already

@@ -143,7 +143,7 @@ destination receives by exactly what the refusals in
 | `axond.usage.journal.quarantined` | counter | `axond.usage_journal`, `axond.usage_journal.consumer`, `axond.journal.poison_reason` | Events set aside as poison: `malformed`, `rejected`, `attempts_exhausted`. |
 | `axond.usage.journal.quarantined_events` | gauge | `axond.usage_journal`, `axond.usage_journal.consumer` | Quarantined events still retained, each waiting on a human. |
 | `axond.usage.journal.undeliverable` | counter | `axond.usage_journal`, `axond.journal.reason` | Rows this build declined to deliver: `schema_ahead` (a newer build wrote it) or `corrupt`. |
-| `axond.usage.journal.lost` | counter | `axond.usage_journal`, `axond.journal.loss_reason` | Events a billing-grade deployment gave up. The only data-loss counter of this mode. |
+| `axond.usage.journal.lost` | counter | `axond.usage_journal`, `axond.journal.loss_reason` | Events a billing-grade deployment gave up: served under `on_undurable = "serve"`, dropped for capacity, terminal, or refused after the caller had already hung up. The only data-loss counter of this mode. |
 | `axond.shutdown.phase` | gauge | — | `0` serving, `1` draining (readiness fails, still admitting), `2` admission closed. |
 | `axond.shutdown.rejected_requests` | counter | — | Requests refused with `503 draining` after admission closed. |
 | `axond.shutdown.abandoned_requests` | counter | — | Requests still in flight when the shutdown deadline cut them. |
