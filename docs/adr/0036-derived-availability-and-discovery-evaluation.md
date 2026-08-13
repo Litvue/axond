@@ -1,4 +1,4 @@
-# 35. Derived availability and discovery evaluation
+# 36. Derived availability and discovery evaluation
 
 Date: 2026-08-12
 
@@ -105,9 +105,10 @@ direction: an older negative does not discredit a later positive, and an older
 positive does not resurrect a target a later complete listing dropped. Two looks
 bearing the same instant resolve the same way whichever lands first — the negative
 holds, because two answers about one instant are not evidence of reachability. The
-same rule governs *declared* evidence: a projection that hands the builder a
-complete listing which dropped the target discredits the retained positive exactly
-as an observed one would.
+Declared evidence goes through the same gate: a projection
+handing the builder a look cannot do what an observed one is refused, so a complete
+listing which dropped the target discredits the retained positive, and a look
+predating a conclusive answer is neither adopted nor retained.
 
 **Uncertainty is routable only where a scope chose it.** `unknown` and `stale` are
 not refusals, but routability is a property of the whole verdict:

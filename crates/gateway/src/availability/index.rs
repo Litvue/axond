@@ -396,49 +396,37 @@ impl AvailabilityIndexBuilder {
     /// Declare the single-valued dimensions for a key, replacing any already
     /// declared and keeping the discovery evidence held for it.
     ///
-    /// Declared evidence is held to the same retention rule as an observed one: a
-    /// complete listing that does not carry the target discredits a retained
-    /// positive it is not older than.
+    /// Any evidence the declaration carries is judged by the same rules as an
+    /// observed look ([`observe`](Self::observe)), so declaring cannot do what
+    /// observing refuses to: a declared look that predates a conclusive answer
+    /// neither becomes the current evidence nor is retained, and a declared complete
+    /// listing that does not carry the target discredits the retained positive.
+    /// Declared retained evidence is retained, not adopted as the current look.
     #[must_use]
     pub fn record(mut self, key: AvailabilityKey, record: AvailabilityRecord) -> Self {
         let entry = self.records.entry(key).or_default();
-        let discovery = record.discovery.clone().or_else(|| entry.discovery.clone());
-        let mut last_known_good = record
-            .last_known_good
-            .clone()
-            .or_else(|| entry.last_known_good.clone());
-        // Declared evidence obeys the retention rule `observe` enforces, or a
-        // projection that declared a complete listing dropping the target would
-        // leave a retained positive behind for the next failed refresh to fall back
-        // onto.
-        if let (Some(retained), Some(current)) = (&last_known_good, &discovery)
-            && current.is_definitive()
-            && !current.is_positive()
-            && current.observed_at >= retained.observed_at
-        {
-            last_known_good = None;
-        }
-        // The watermark tracks every definitive look this key has seen, so it
-        // advances to cover declared evidence rather than being reset by a
-        // redeclaration of the dimensions.
-        let definitive_at = [
-            entry.definitive_at,
-            record.definitive_at,
-            discovery
-                .as_ref()
-                .filter(|held| held.is_definitive())
-                .map(|held| held.observed_at),
-            last_known_good.as_ref().map(|held| held.observed_at),
-        ]
-        .into_iter()
-        .flatten()
-        .max();
+        // The dimensions are replaced and the evidence is not: a redeclaration says
+        // what the authorities now answer, and says nothing about what has been seen.
+        // The watermark only ever advances, so redeclaring cannot forget a conclusion.
         *entry = AvailabilityRecord {
-            discovery,
-            last_known_good,
-            definitive_at,
-            ..record
+            discovery: entry.discovery.clone(),
+            last_known_good: entry.last_known_good.clone(),
+            definitive_at: entry.definitive_at.max(record.definitive_at),
+            ..record.clone()
         };
+        // Declared retained evidence is judged for retention but never becomes the
+        // current look: the caller said it is what is being fallen back on, not what
+        // was last seen.
+        if let Some(retained) = &record.last_known_good
+            && !Self::retain(entry, retained)
+        {
+            self.superseded += 1;
+        }
+        if let Some(current) = record.discovery
+            && !Self::admit(entry, current)
+        {
+            self.superseded += 1;
+        }
         self
     }
 
@@ -453,6 +441,41 @@ impl AvailabilityIndexBuilder {
     #[must_use]
     pub fn observe(mut self, observation: DiscoveryObservation) -> Self {
         let entry = self.records.entry(observation.key()).or_default();
+        if !Self::admit(entry, observation) {
+            self.superseded += 1;
+        }
+        self
+    }
+
+    /// Apply one look to a record, whether it was observed or declared, returning
+    /// whether it became the current evidence.
+    ///
+    /// The single place the ordering rules live, so the declaring path cannot drift
+    /// from the observing one.
+    fn admit(entry: &mut AvailabilityRecord, observation: DiscoveryObservation) -> bool {
+        let overturns_conclusion = Self::retain(entry, &observation);
+        // The current slot is the newest look, whatever it said, so an older
+        // arrival can never become the evidence a verdict reads first — and a
+        // positive that failed to overturn a conclusion cannot enter it either,
+        // or it would be read as current evidence having been refused retention.
+        let newest_held = entry
+            .discovery
+            .iter()
+            .chain(entry.last_known_good.iter())
+            .map(|held| held.observed_at)
+            .chain(entry.definitive_at)
+            .max();
+        if !overturns_conclusion || newest_held.is_some_and(|held| held > observation.observed_at) {
+            return false;
+        }
+        entry.discovery = Some(observation);
+        true
+    }
+
+    /// Judge one look against every conclusive answer this key has reached, updating
+    /// the retained evidence and the watermark, and returning whether it overturned
+    /// what was concluded.
+    fn retain(entry: &mut AvailabilityRecord, observation: &DiscoveryObservation) -> bool {
         // A look that predates a conclusive answer overturns nothing — neither an
         // older negative discrediting a later positive, nor an older positive
         // resurrecting a target a later complete listing dropped — while a slow
@@ -475,23 +498,7 @@ impl AvailabilityIndexBuilder {
             entry.last_known_good = observation.is_positive().then(|| observation.clone());
             entry.definitive_at = Some(observation.observed_at);
         }
-        // The current slot is the newest look, whatever it said, so an older
-        // arrival can never become the evidence a verdict reads first — and a
-        // positive that failed to overturn a conclusion cannot enter it either,
-        // or it would be read as current evidence having been refused retention.
-        let newest_held = entry
-            .discovery
-            .iter()
-            .chain(entry.last_known_good.iter())
-            .map(|held| held.observed_at)
-            .chain(entry.definitive_at)
-            .max();
-        if !overturns_conclusion || newest_held.is_some_and(|held| held > observation.observed_at) {
-            self.superseded += 1;
-            return self;
-        }
-        entry.discovery = Some(observation);
-        self
+        overturns_conclusion
     }
 
     /// How many observations did not advance the current slot because something

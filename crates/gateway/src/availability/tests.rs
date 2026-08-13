@@ -383,6 +383,47 @@ fn a_declared_definitive_absence_discredits_the_retained_positive() {
     assert!(!after_outage.last_known_good);
 }
 
+/// Declaring is not a way around the ordering rule observing enforces: a look that
+/// predates a conclusive answer is refused the current slot whichever call carries
+/// it, so a redeclaration cannot resurrect a target a complete listing dropped.
+#[test]
+fn a_declared_stale_positive_cannot_resurrect_a_target_a_newer_listing_dropped() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let builder = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(absent(scope, "gpt-4o", 500))
+        .record(
+            key(scope, "gpt-4o"),
+            AvailabilityRecord {
+                discovery: Some(present(scope, "gpt-4o", 100, None)),
+                ..permitting()
+            },
+        );
+    assert_eq!(
+        builder.superseded(),
+        1,
+        "a declared look that overturns nothing is counted, not applied silently"
+    );
+
+    let index = builder.build();
+    let record = index
+        .record(&key(scope, "gpt-4o"))
+        .expect("the key is held");
+    assert_eq!(record.definitive_at, Some(at(500)));
+    assert!(record.last_known_good.is_none());
+
+    let verdict = index.evaluate(&key(scope, "gpt-4o"), at(600));
+    assert_eq!(
+        (verdict.state, verdict.reason, verdict.decided_by),
+        (
+            AvailabilityState::Denied,
+            AvailabilityReason::DiscoveryAbsent,
+            DecidedBy::Discovery,
+        ),
+        "the newest complete listing still decides"
+    );
+}
+
 /// A policy denial outranks a positive listing, and a catalogue absence outranks
 /// the denial: the ladder is ordered, not a set of independent vetoes.
 #[test]
