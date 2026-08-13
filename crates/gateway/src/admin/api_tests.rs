@@ -675,6 +675,36 @@ async fn advancing_a_resource_other_resources_pin_carries_those_resources_forwar
         .await;
 }
 
+#[tokio::test]
+async fn disabling_an_alias_can_clear_targets_in_one_revision() {
+    let deployment = Deployment::new();
+    let mut head = build(&deployment).await;
+    let mut disabled = alias_document();
+    disabled["mutation"] = json!("update");
+    disabled["resource"]["state"] = json!("disabled");
+    disabled["resource"]["targets"] = json!([]);
+
+    head = deployment
+        .publish("/aliases", "key-alias-disable", &head, &disabled)
+        .await;
+
+    let loaded = deployment
+        .store
+        .load_revision(crate::desired_state::RevisionId::parse(&head).expect("a revision"))
+        .await
+        .expect("the published revision hydrates");
+    let alias = loaded
+        .state()
+        .version_of(
+            crate::desired_state::ResourceKind::Alias,
+            fixtures::resource_id(15),
+        )
+        .expect("the disabled alias is retained");
+    let body = crate::desired_state::ModelAliasBody::read(alias).expect("an alias body");
+    assert!(!body.is_enabled());
+    assert!(body.targets().is_empty());
+}
+
 /// A refreshed catalogue is a new snapshot, and an enablement's snapshot is part
 /// of what it is: re-importing different content under a row an enablement reads
 /// from is refused by name, rather than published into a state whose pins no

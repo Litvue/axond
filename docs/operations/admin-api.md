@@ -231,6 +231,13 @@ billed) or `unaliased` (no enabled alias names it). `routable` is the absence of
 all of them; a read of a project reports the tenant default beside the override
 that shadows it, so an operator can see both without a second request.
 
+An active alias must have a non-empty, reachable target list in its own project
+or tenant and all targets must share its wire family; disabled fallback entries
+may remain in priority order while a later mutation retargets the name.
+Disabling an alias is the withdrawal operation: it may publish with an empty
+target list, retaining the alias identity and revision history without leaving an
+active routing graph.
+
 `aliases` is the alias resource projection, separate from the `aliases` name list
 on each offering entry. It preserves the durable alias id and version, its
 project scope and wire family, and the ordered enablement targets. The target

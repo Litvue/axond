@@ -799,9 +799,8 @@ pub enum ModelError {
         reference: ResourceRef,
         target: ResourceRef,
     },
-    /// An alias with nothing to resolve to. Not the same thing as a disabled
-    /// alias: withdrawal is a state, and an empty target list is a name that
-    /// resolves to nothing at all.
+    /// An enabled alias with nothing to resolve to. A disabled alias may retain
+    /// an empty target list because it is not an active routing graph.
     #[error("{reference} is an alias with no targets")]
     NoTargets { reference: ResourceRef },
     /// One enablement twice in a priority list, where the second occurrence could
@@ -1793,7 +1792,7 @@ impl Models {
         resource: &ResourceVersion,
         body: &ModelAliasBody,
     ) -> Result<(), ModelError> {
-        if body.targets().is_empty() {
+        if body.is_enabled() && body.targets().is_empty() {
             return Err(ModelError::NoTargets {
                 reference: resource.reference,
             });
@@ -2516,6 +2515,19 @@ mod tests {
             matches!(model_error(&error), Some(ModelError::NoTargets { .. })),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_disabled_alias_may_be_retained_without_an_active_routing_graph() {
+        let tenant = tenant_id(1);
+        let project = project_id(2);
+        let disabled = alias_body(&tenant, &project, 32, &[])
+            .transitioned(ModelLifecycle::Disabled)
+            .version(Slug::parse("fast").unwrap());
+
+        state_replacing(disabled)
+            .validate()
+            .expect("disabling an alias may clear its targets atomically");
     }
 
     #[test]
