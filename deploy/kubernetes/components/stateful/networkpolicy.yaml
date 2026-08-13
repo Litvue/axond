@@ -1,0 +1,58 @@
+# The migration Pod carries `app.kubernetes.io/name: axond-migrate`, so the
+# production overlay's default-deny — which selects `app.kubernetes.io/name:
+# axond` — does not select it, and a Pod no policy selects is a Pod with
+# unrestricted egress holding the control-plane DSN. These two objects give it
+# the same treatment the gateway gets: deny everything, then name DNS and the
+# control-plane database.
+#
+# The peer is a `podSelector` for a Postgres running in this namespace, matching
+# the gateway's own rule. Replace it with an `ipBlock` for a managed database, or
+# add a `namespaceSelector` beside the `podSelector` when the database runs
+# elsewhere in the cluster; a selector that matches nothing leaves the deny in
+# place, which is the safe direction to be wrong in.
+#
+# On a cluster whose CNI does not implement NetworkPolicy these objects are
+# accepted and do nothing. That is the same caveat the overlay's own policies
+# carry, and the same denied-egress probe answers it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: axond-migrate-default-deny
+  namespace: axond
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: axond-migrate
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: axond-migrate-allow
+  namespace: axond
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: axond-migrate
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432

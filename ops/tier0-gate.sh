@@ -116,11 +116,24 @@ command -v python3 >/dev/null 2>&1 ||
 # Outside a namespace the listener set is the host's, so it is not an invariant.
 [[ "$degraded" != 1 ]] || check_listeners=0
 
+config="$repo_root/tests/tier0/axond.tier0.toml"
+stateful_config="$repo_root/tests/tier0/axond.stateful-bootstrap.toml"
+# Read here, not beside its probe below: the degraded pre-check has to reserve
+# this port too. Taken from the config rather than a literal, so a port moved
+# there cannot leave the probe dialling a port nothing was ever going to use.
+stateful_port="$(sed -n 's/^bind = "127\.0\.0\.1:\([0-9]\+\)"$/\1/p' "$stateful_config")"
+[[ -n "$stateful_port" ]] || {
+  echo "TIER 0 INVARIANT FAILED: could not read the stateful bootstrap's bind port; the listener probe would prove nothing." >&2
+  exit 1
+}
+
 if [[ "$degraded" == 1 ]]; then
   # Outside a namespace the fixed ports are the host's, so a stale listener would
   # be mistaken for the gateway or the fake upstream. The gateway always binds
-  # 18081; 18082 is only bound when the fixture upstream runs.
-  required_free=(18081)
+  # 18081; 18082 is only bound when the fixture upstream runs. The stateful
+  # bootstrap's port belongs here as much as those: nothing is ever meant to
+  # answer on it, so a stranger's listener would read as a boot that bound one.
+  required_free=(18081 "$stateful_port")
   [[ "$check_serving" != 1 ]] || required_free+=(18082)
   if command -v ss >/dev/null 2>&1; then
     for port in "${required_free[@]}"; do
@@ -136,8 +149,6 @@ if [[ "$degraded" == 1 ]]; then
   fi
 fi
 
-config="$repo_root/tests/tier0/axond.tier0.toml"
-stateful_config="$repo_root/tests/tier0/axond.stateful-bootstrap.toml"
 upstream="$repo_root/tests/tier0/fake_upstream_serve.py"
 gateway_log="$(mktemp "$tmpdir/axond-tier0-gateway.XXXXXX.log")"
 upstream_log="$(mktemp "$tmpdir/axond-tier0-upstream.XXXXXX.log")"
@@ -325,28 +336,54 @@ fi
 
 # Stateful bootstrap validates without a database: the same namespace that
 # denies egress is where a config-parse connection attempt would fail, so a
-# clean refusal here is evidence that parsing connects to nothing. A stateful
-# replica does boot and serve `/admin/v1` now, so what this asserts is the Tier 0
-# invariant only: with every referenced env var unset, the refusal comes from an
-# unresolved *reference* — named, never with its value (ADR 0027) — rather than
-# from a connection this namespace would have had to allow.
+# clean refusal here is evidence that parsing connects to nothing.
+#
+# The refusal is about *this* namespace, not about stateful mode in general: a
+# replica that reaches its control plane boots and serves `/admin/v1` while it
+# refuses inference (docs/deployment/kubernetes.md#stateful-mode). Here every
+# referenced env var is unset and nothing is reachable, so the boot must fail
+# loudly and bind no listener, and its refusal must come from an unresolved
+# *reference* — named, never with its value (ADR 0027) — rather than from a
+# connection this namespace would have had to allow.
 stateful_log="$(mktemp "$tmpdir/axond-tier0-stateful.XXXXXX.log")"
 stateful_status=0
 env -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
   -u GW_TIER0_CONTROL_PLANE_DSN -u GW_TIER0_SECRET_STORE_KEK \
   -u GW_TIER0_ADMIN_BREAKGLASS \
   AXOND_CONFIG="$stateful_config" RUST_LOG=warn \
-  timeout 10 "$bin" >"$stateful_log" 2>&1 || stateful_status=$?
+  timeout 10 "$bin" >"$stateful_log" 2>&1 &
+stateful_pid=$!
+# Observed rather than read out of the log: the startup line is emitted at info
+# level and before `bind` returns, so a log search proves neither that a socket
+# was opened nor, under this gate's `RUST_LOG`, that one was not.
+stateful_bound=no
+while kill -0 "$stateful_pid" 2>/dev/null; do
+  if (exec 3<>"/dev/tcp/127.0.0.1/${stateful_port}") 2>/dev/null; then
+    stateful_bound=yes
+    break
+  fi
+  sleep 0.1
+done
+wait "$stateful_pid" || stateful_status=$?
+# The process may have exited between the last liveness sample and `wait`.
+# Take one post-mortem refusal sample as well; otherwise the loop's lifetime
+# would become the evidence and a short-lived listener could be missed simply
+# because the failed boot ended before the next iteration.
+if (exec 3<>"/dev/tcp/127.0.0.1/${stateful_port}") 2>/dev/null; then
+  stateful_bound=yes
+fi
 [[ "$stateful_status" != 0 ]] ||
-  failure "a stateful process started with its control-plane, KEK, and breakglass references unset; it must refuse rather than serve an unadministrable deployment"
+  failure "a stateful process started with no control plane reachable and its control-plane, KEK, and breakglass references unset; it must fail loudly rather than serve an empty snapshot"
 [[ "$stateful_status" != 124 ]] ||
-  failure "a stateful process kept running instead of refusing at boot"
+  failure "a stateful process kept running with an unreachable control plane instead of failing at boot"
 grep -q 'stateful' "$stateful_log" ||
   failure "stateful refusal did not explain the mode"
 # Without this the gate would pass on any boot failure, including a datastore
 # connection the namespace denied — the opposite of what it claims to prove.
 grep -q 'GW_TIER0_' "$stateful_log" ||
   failure "stateful refusal did not name the unresolved reference, so it is not evidence that boot stopped at the reference rather than at a connection"
+[[ "$stateful_bound" == no ]] ||
+  failure "a stateful boot that cannot reach a control plane accepted a connection on 127.0.0.1:${stateful_port}; it must bind nothing"
 if grep -Eq 'postgres(ql)?://|dbname=' "$stateful_log"; then
   failure "stateful diagnostics must name references, never a resolved DSN"
 fi
@@ -363,7 +400,7 @@ if [[ "$check_serving" == 1 ]]; then
 else
   echo "serving: DEGRADED, fixture upstream path not checked"
 fi
-echo "stateful: bootstrap validates with no datastore, then refuses on an unresolved reference"
+echo "stateful: bootstrap validates with no datastore, then fails loudly on an unresolved reference"
 if [[ "$degraded" == 1 || "$check_listeners" != 1 || "$check_serving" != 1 ]]; then
   echo "Tier 0 boot and serve passed (DEGRADED: a runner prerequisite was unavailable, so the assertions marked DEGRADED above were not proven)"
 else

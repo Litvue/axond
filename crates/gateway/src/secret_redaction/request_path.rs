@@ -92,6 +92,7 @@ async fn a_served_request_leaks_its_credentials_into_nothing_it_emits() {
                 .with_writer(logs.clone()),
         )
         .with(tracing_opentelemetry::layer().with_tracer(traces.tracer("axond-secret-redaction")));
+    crate::telemetry::testing::keep_callsites_answerable();
     let dispatch = tracing::Dispatch::new(subscriber);
 
     let state = replica.state.clone();
@@ -179,6 +180,7 @@ async fn a_failed_request_leaks_its_credentials_into_no_error_surface() {
             .with_ansi(false)
             .with_writer(logs.clone()),
     );
+    crate::telemetry::testing::keep_callsites_answerable();
     let dispatch = tracing::Dispatch::new(subscriber);
     let state = replica.state.clone();
     let response = tokio::spawn(async move {
@@ -218,6 +220,7 @@ async fn a_rejected_caller_learns_nothing_about_the_key_it_failed_to_present() {
             .with_ansi(false)
             .with_writer(logs.clone()),
     );
+    crate::telemetry::testing::keep_callsites_answerable();
     let dispatch = tracing::Dispatch::new(subscriber);
     let state = replica.state.clone();
     // A near-miss: the same key with one character changed, which a naive

@@ -1,0 +1,53 @@
+# The whole file a stateful replica reads. Tenants, projects, providers,
+# credentials, catalogues, prices, aliases, and policy live in the control plane
+# and are administered through `/admin/v1`; declaring any of them here is a boot
+# error before the listener binds. `axond.stateful.example.toml` at the root of
+# the repository documents every field, including the optional enforcement
+# backends this manifest leaves off.
+#
+# The three references below are supplied by the `axond-secrets` Secret the
+# container takes with `envFrom`: GW_CONTROL_PLANE_DSN, GW_SECRET_STORE_KEK, and
+# GW_ADMIN_BREAKGLASS. The base's published placeholder Secret carries none of
+# them, which is deliberate — a stateful deployment supplies its own.
+
+mode = "stateful"
+
+[server]
+bind = "0.0.0.0:8080"
+
+[control_plane]
+dsn_env = "GW_CONTROL_PLANE_DSN"
+connect_timeout_ms = 5000
+operation_timeout_ms = 30000
+# `migrate` stays at its default of false: `migrate-job.yaml` applies the schema
+# once, before the replicas that read it. A booting replica still checks the
+# schema and refuses one it does not recognise.
+
+[secret_store]
+backend = "postgres"
+kek_env = "GW_SECRET_STORE_KEK"
+
+[[admin_breakglass]]
+env = "GW_ADMIN_BREAKGLASS"
+id = "breakglass"
+
+# Per-replica ceilings, sized against this Pod's 512Mi limit exactly as the
+# base's stateless config is. They bound `/admin/v1` request bodies here rather
+# than inference, because inference is refused on this replica.
+[admission]
+max_request_bytes = 1_048_576
+max_in_flight = 32
+max_in_flight_streams = 16
+max_in_flight_per_tenant = 0
+max_tenants = 256
+queue_capacity = 0
+queue_wait_ms = 0
+max_stream_duration_ms = 900_000
+max_stream_bytes = 33_554_432
+
+# No `[reload]`, unlike the base: nothing left in this file is live-reloadable
+# — `[server]`, `[control_plane]`, `[secret_store]`, `[[admin_breakglass]]`, and
+# `[admission]` all take effect at boot — and everything that changes day to day
+# is administered through `/admin/v1`. A watch here would observe swaps it could
+# not act on. Editing this file is therefore a rollout, and with `Recreate` that
+# is a maintenance window (docs/deployment/kubernetes.md#configuration-and-secrets).

@@ -53,6 +53,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BASE = ROOT / "deploy/kubernetes/base"
 PRODUCTION = ROOT / "deploy/kubernetes/overlays/production"
 AUTOSCALING = ROOT / "deploy/kubernetes/components/autoscaling"
+PRODUCTION_STATEFUL = ROOT / "deploy/kubernetes/overlays/production-stateful"
 KUBERNETES_DOC = ROOT / "docs/deployment/kubernetes.md"
 STATEFUL_DOC = ROOT / "docs/deployment/stateful-backends.md"
 RECOVERY_DOC = ROOT / "docs/operations/backup-and-recovery.md"
@@ -61,6 +62,7 @@ SCHEMA_SOURCE = ROOT / "crates/gateway/src/backends/control_plane/schema.rs"
 REVOCATION_SOURCE = ROOT / "crates/gateway/src/revocation/redis.rs"
 DRILL = ROOT / "ops/restore-drill.sh"
 ROLLOUT_DRILL = ROOT / "ops/rollout-drill.sh"
+STATEFUL_DRILL = ROOT / "ops/stateful-deploy-drill.sh"
 TELEMETRY_SOURCE = ROOT / "crates/gateway/src/telemetry/mod.rs"
 
 IMAGE_REPOSITORY = "ghcr.io/litvue/axond"
@@ -293,7 +295,7 @@ def parse_quantity(quantity: str | int) -> int:
     return int(text)
 
 
-def check_topology_spread(documents: list[Document]) -> list[str]:
+def check_topology_spread(documents: list[Document], label: str) -> list[str]:
     """Replicas are spread across nodes at minimum, and zones where they exist."""
     deployment = one(documents, "Deployment")
     constraints = deployment["spec"]["template"]["spec"].get("topologySpreadConstraints", [])
@@ -301,11 +303,11 @@ def check_topology_spread(documents: list[Document]) -> list[str]:
     failures: list[str] = []
     for key in ("kubernetes.io/hostname", "topology.kubernetes.io/zone"):
         if key not in by_key:
-            failures.append(f"overlays/production: no topology spread constraint on {key}")
+            failures.append(f"{label}: no topology spread constraint on {key}")
     node = by_key.get("kubernetes.io/hostname")
     if node is not None and node.get("whenUnsatisfiable") != "DoNotSchedule":
         failures.append(
-            "overlays/production: the per-node spread constraint is best-effort; two replicas "
+            f"{label}: the per-node spread constraint is best-effort; two replicas "
             "of a fleet sized to survive one disruption must not share a node"
         )
     # A hard constraint that counts the Pods it is replacing deadlocks against
@@ -313,7 +315,7 @@ def check_topology_spread(documents: list[Document]) -> list[str]:
     # Pod is unschedulable and nothing may be evicted to make room for it.
     if node is not None and "pod-template-hash" not in node.get("matchLabelKeys", []):
         failures.append(
-            "overlays/production: the per-node spread constraint counts every axond Pod, so a "
+            f"{label}: the per-node spread constraint counts every axond Pod, so a "
             "rolling update's surge Pod exceeds its own skew and never schedules; scope the skew "
             "with matchLabelKeys: [pod-template-hash]"
         )
@@ -321,18 +323,24 @@ def check_topology_spread(documents: list[Document]) -> list[str]:
         selector = constraint.get("labelSelector", {}).get("matchLabels")
         if selector != SELECTOR:
             failures.append(
-                f"overlays/production: the {key} spread constraint selects {selector!r} rather "
+                f"{label}: the {key} spread constraint selects {selector!r} rather "
                 f"than the Deployment's own {SELECTOR!r}, so it spreads a different set of Pods"
             )
     return failures
 
 
-def check_network_policies(documents: list[Document]) -> list[str]:
+def check_network_policies(
+    documents: list[Document], label: str, workloads: tuple[Document, ...] = (SELECTOR,)
+) -> list[str]:
     """Default deny in both directions, and no allowance back into the cluster.
 
     The open-internet egress rule is what lets a gateway reach provider APIs; the
     exceptions on it are what keep the same rule from reaching the cloud metadata
     service or a neighbouring service on a private address.
+
+    `workloads` is every Pod label set the overlay runs. An overlay that adds a
+    Pod adds a selector here too: a default deny that covers the gateway says
+    nothing about the migration Pod holding the control-plane DSN beside it.
     """
     policies = of_kind(documents, "NetworkPolicy")
     failures: list[str] = []
@@ -341,27 +349,31 @@ def check_network_policies(documents: list[Document]) -> list[str]:
         for policy in policies
         if not policy["spec"].get("ingress") and not policy["spec"].get("egress")
     ]
-    if not denies:
-        failures.append(
-            "overlays/production: no NetworkPolicy denies by default; a policy that only allows "
-            "leaves every unnamed flow open"
-        )
+    for workload in workloads:
+        if not any(
+            policy["spec"].get("podSelector", {}).get("matchLabels") == workload
+            for policy in denies
+        ):
+            failures.append(
+                f"{label}: no NetworkPolicy denies by default for {workload!r}; a policy that "
+                "only allows leaves every unnamed flow open"
+            )
     for policy in denies:
         if sorted(policy["spec"].get("policyTypes", [])) != ["Egress", "Ingress"]:
             failures.append(
-                f"overlays/production: NetworkPolicy {policy['metadata']['name']!r} does not deny "
+                f"{label}: NetworkPolicy {policy['metadata']['name']!r} does not deny "
                 "both directions"
             )
     for policy in policies:
-        if policy["spec"].get("podSelector", {}).get("matchLabels") != SELECTOR:
+        if policy["spec"].get("podSelector", {}).get("matchLabels") not in workloads:
             failures.append(
-                f"overlays/production: NetworkPolicy {policy['metadata']['name']!r} does not "
-                f"select {SELECTOR!r}"
+                f"{label}: NetworkPolicy {policy['metadata']['name']!r} does not "
+                f"select any of this overlay's Pods {list(workloads)!r}"
             )
         for rule in policy["spec"].get("ingress", []):
             if not rule.get("from"):
                 failures.append(
-                    f"overlays/production: NetworkPolicy {policy['metadata']['name']!r} admits "
+                    f"{label}: NetworkPolicy {policy['metadata']['name']!r} admits "
                     "ingress from every source"
                 )
         for rule in policy["spec"].get("egress", []):
@@ -372,14 +384,29 @@ def check_network_policies(documents: list[Document]) -> list[str]:
                 missing = PRIVATE_RANGES - set(block.get("except", []))
                 if missing:
                     failures.append(
-                        f"overlays/production: NetworkPolicy {policy['metadata']['name']!r} "
+                        f"{label}: NetworkPolicy {policy['metadata']['name']!r} "
                         f"allows egress to {sorted(missing)} through an open-internet rule; the "
                         "metadata service and the private ranges stay excepted"
                     )
     return failures
 
 
-def check_telemetry_egress(documents: list[Document], telemetry_source: str) -> list[str]:
+def pod_labels(documents: list[Document]) -> tuple[Document, ...]:
+    """Every Pod label set the overlay schedules, gateway and Job alike."""
+    seen: list[Document] = []
+    for document in documents:
+        if document.get("kind") not in ("Deployment", "Job"):
+            continue
+        labels = document["spec"]["template"]["metadata"].get("labels", {})
+        selector = {"app.kubernetes.io/name": labels.get("app.kubernetes.io/name")}
+        if selector not in seen:
+            seen.append(selector)
+    return tuple(seen)
+
+
+def check_telemetry_egress(
+    documents: list[Document], telemetry_source: str, label: str
+) -> list[str]:
     """The collector egress port is the one axond's exporter can actually dial.
 
     Axond exports OTLP over HTTP only, so an allowance for the gRPC receiver is a
@@ -406,13 +433,13 @@ def check_telemetry_egress(documents: list[Document], telemetry_source: str) -> 
             allowed |= {port.get("port") for port in rule.get("ports", [])}
     if not allowed:
         failures.append(
-            "overlays/production: no egress rule reaches a Pod labelled "
+            f"{label}: no egress rule reaches a Pod labelled "
             "app.kubernetes.io/name: opentelemetry-collector, so the default-deny policy drops "
             "every OTLP export while the cluster reports nothing"
         )
     elif allowed != {4318}:
         failures.append(
-            f"overlays/production: telemetry egress allows {sorted(allowed)}, but axond exports "
+            f"{label}: telemetry egress allows {sorted(allowed)}, but axond exports "
             "OTLP/HTTP only, whose receiver is 4318; a gRPC allowance drops every export"
         )
     return failures
@@ -430,12 +457,20 @@ def check_service_port(documents: list[Document], label: str) -> list[str]:
                 f"{label}: container {container['name']!r} exposes {sorted(ports)} but the "
                 f"mounted config binds {bind_port}"
             )
-    for port in one(documents, "Service").get("spec", {}).get("ports", []):
-        if port.get("port") != bind_port:
-            failures.append(
-                f"{label}: the Service publishes {port.get('port')} but the mounted config "
-                f"binds {bind_port}"
-            )
+    # Every Service, not one: the stateful overlay publishes the administrative
+    # surface on a second Service, and it reaches the same listener. Emptiness is
+    # its own failure, because `of_kind` reports nothing where `one` raised: a
+    # manifest set that publishes no Service at all reaches no caller.
+    services = of_kind(documents, "Service")
+    if not services:
+        failures.append(f"{label}: no Service publishes the port the gateway binds")
+    for service in services:
+        for port in service.get("spec", {}).get("ports", []):
+            if port.get("port") != bind_port:
+                failures.append(
+                    f"{label}: Service {service['metadata']['name']!r} publishes "
+                    f"{port.get('port')} but the mounted config binds {bind_port}"
+                )
     for policy in of_kind(documents, "NetworkPolicy"):
         for rule in policy["spec"].get("ingress", []):
             for port in rule.get("ports", []):
@@ -447,7 +482,9 @@ def check_service_port(documents: list[Document], label: str) -> list[str]:
     return failures
 
 
-def check_disruption_budget(documents: list[Document], autoscaled: list[Document]) -> list[str]:
+def check_disruption_budget(
+    documents: list[Document], label: str, autoscaled: list[Document] | None = None
+) -> list[str]:
     """A drain can always proceed: budget, replica count, and HPA floor agree.
 
     `minAvailable` equal to the replica count is a deadlocked node drain rather
@@ -460,18 +497,25 @@ def check_disruption_budget(documents: list[Document], autoscaled: list[Document
     replicas = deployment["spec"].get("replicas")
     failures: list[str] = []
     if replicas is None:
-        failures.append("overlays/production: the Deployment does not declare replicas")
+        failures.append(f"{label}: the Deployment does not declare replicas")
     elif replicas < minimum + 1:
         failures.append(
-            f"overlays/production: {replicas} replicas against minAvailable {minimum} leaves no "
+            f"{label}: {replicas} replicas against minAvailable {minimum} leaves no "
             "room for a voluntary disruption"
         )
-    strategy = deployment["spec"].get("strategy", {}).get("rollingUpdate", {})
-    if strategy.get("maxUnavailable") != 0:
-        failures.append(
-            "overlays/production: the rolling update may take a replica below the fleet size "
-            "the disruption budget assumes"
-        )
+    # A Recreate fleet has no rolling update to bound; `check_stateful` asserts
+    # that it upgrades that way and keeps no rollingUpdate settings beside it.
+    if deployment["spec"].get("strategy", {}).get("type") != "Recreate":
+        strategy = deployment["spec"].get("strategy", {}).get("rollingUpdate", {})
+        if strategy.get("maxUnavailable") != 0:
+            failures.append(
+                f"{label}: the rolling update may take a replica below the fleet size "
+                "the disruption budget assumes"
+            )
+    # The autoscaling component is not part of every overlay: an overlay that
+    # does not ship it has no floor to reconcile against the budget.
+    if autoscaled is None:
+        return failures
     if one(autoscaled, "Deployment")["spec"].get("replicas") is not None:
         failures.append(
             "components/autoscaling: the Deployment still declares replicas, so every apply "
@@ -504,7 +548,9 @@ def check_namespaces(documents: list[Document], label: str) -> list[str]:
     ]
 
 
-def check_example_secret(production: list[Document], base: list[Document]) -> list[str]:
+def check_example_secret(
+    production: list[Document], base: list[Document], label: str
+) -> list[str]:
     """The base's published placeholder Secret does not survive into production.
 
     The base ships one so an evaluation renders something bootable, and its values
@@ -524,7 +570,7 @@ def check_example_secret(production: list[Document], base: list[Document]) -> li
         leaked = sorted(set(secret.get("stringData", {}).values()) & published)
         if leaked:
             failures.append(
-                f"overlays/production: Secret {name!r} still carries the base's published "
+                f"{label}: Secret {name!r} still carries the base's published "
                 f"placeholders {leaked}; delete the resource in the overlay so an operator has "
                 "to supply the credential rather than serving with one from this repository"
             )
@@ -727,6 +773,190 @@ def check_component_layering(kustomization: str) -> list[str]:
     return []
 
 
+def check_stateful(documents: list[Document]) -> list[str]:
+    """The stateful overlay deploys the lifecycle the runtime actually has.
+
+    A stateful replica boots, serves `/admin/v1`, and refuses inference until
+    revision convergence ships, so it never reports Ready. Three defaults of a
+    serving fleet are wrong for one that does not, and each is a silent wrongness
+    — an upgrade that hangs, an administrative surface with no endpoints, a node
+    drain that never finishes — so each is asserted here rather than left to the
+    comment that explains it. The fourth assertion is the schema ordering: the
+    migration is a Job, and a booting replica is not allowed to apply it.
+    """
+    label = "overlays/production-stateful"
+    failures: list[str] = []
+    deployment = one(documents, "Deployment")
+
+    strategy = deployment["spec"].get("strategy", {})
+    if strategy.get("type") != "Recreate":
+        failures.append(
+            f"{label}: the Deployment upgrades with {strategy.get('type')!r}; a rolling update "
+            "waits for an availability a fleet refusing inference never reports, so the upgrade "
+            "stalls instead of landing"
+        )
+    if strategy.get("rollingUpdate") is not None:
+        failures.append(f"{label}: the Deployment keeps rollingUpdate settings beside Recreate")
+
+    budget = one(documents, "PodDisruptionBudget")
+    if budget["spec"].get("unhealthyPodEvictionPolicy") != "AlwaysAllow":
+        failures.append(
+            f"{label}: the disruption budget does not set unhealthyPodEvictionPolicy: "
+            "AlwaysAllow, so with no Ready Pod it allows no eviction at all and every node "
+            "drain blocks"
+        )
+
+    services = {service["metadata"]["name"]: service for service in of_kind(documents, "Service")}
+    # The default stateful component must not publish `/admin/v1` through a
+    # Service. NetworkPolicy is not a security boundary on clusters whose CNI
+    # ignores it, so even a ClusterIP would make the break-glass surface
+    # reachable by every Pod. Operators use direct Pod port-forwarding; an
+    # administrative Service is an explicit opt-in outside this component.
+    if "axond-admin" in services:
+        failures.append(
+            f"{label}: the default stateful overlay publishes axond-admin; a Service cannot "
+            "secure /admin/v1 when the cluster CNI ignores NetworkPolicy — use Pod "
+            "port-forwarding or an independently enforced operator boundary"
+        )
+    # The inference ingress path is the boundary that matters here. `/admin/v1`
+    # shares one listener with inference, and on this fleet inference is refused
+    # — so the overlay's allowance for the ingress controller's namespace, which
+    # exists to admit inference callers, would admit the public path into the
+    # administrative surface and nothing else. The component replaces it with an
+    # opt-in Pod selector, and that replacement is asserted rather than trusted:
+    # a namespace-wide allowance is how it silently comes back.
+    for policy in of_kind(documents, "NetworkPolicy"):
+        if policy["spec"].get("podSelector", {}).get("matchLabels") != SELECTOR:
+            continue
+        for rule in policy["spec"].get("ingress", []):
+            for peer in rule.get("from", []):
+                if peer.get("podSelector") is None:
+                    failures.append(
+                        f"{label}: NetworkPolicy {policy['metadata']['name']!r} admits "
+                        f"{sorted(peer)} to the gateway's port; on a fleet that refuses "
+                        "inference the only surface behind that port is /admin/v1, so ingress "
+                        "is named Pod by Pod (axond.dev/admin-client) rather than by namespace"
+                    )
+
+    for ingress in of_kind(documents, "Ingress"):
+        backends = [
+            path.get("backend", {}).get("service", {}).get("name")
+            for rule in ingress["spec"].get("rules", [])
+            for path in rule.get("http", {}).get("paths", [])
+        ]
+        if "axond-admin" in backends:
+            failures.append(
+                f"{label}: Ingress {ingress['metadata']['name']!r} routes to axond-admin; this "
+                "overlay does not carry the operator authentication that would make publishing "
+                "/admin/v1 safe, so the ingress belongs beside it, not here"
+            )
+    if services.get("axond", {}).get("spec", {}).get("publishNotReadyAddresses"):
+        failures.append(
+            f"{label}: the inference Service publishes not-ready addresses, so an ingress would "
+            "route callers to a replica that refuses them"
+        )
+
+    jobs = of_kind(documents, "Job")
+    if len(jobs) != 1 or jobs[0]["metadata"]["name"] != "axond-migrate":
+        failures.append(f"{label}: the forward migration is not deployed as one axond-migrate Job")
+    else:
+        job = jobs[0]
+        pod = job["spec"]["template"]["spec"]
+        job_containers = pod.get("containers", [])
+        if ["migrate", "apply"] != job_containers[0].get("args", [])[:2]:
+            failures.append(f"{label}: the axond-migrate Job does not run `axond migrate apply`")
+        if pod.get("restartPolicy") != "Never":
+            failures.append(f"{label}: the axond-migrate Job restarts its Pod in place")
+        job_labels = job["spec"]["template"]["metadata"].get("labels", {})
+        if job_labels.get("app.kubernetes.io/name") == "axond":
+            failures.append(
+                f"{label}: the migration Pod carries the serving label, so it becomes a Service "
+                "endpoint and is selected by the gateway's NetworkPolicies"
+            )
+        selected = {
+            policy["spec"]["podSelector"].get("matchLabels", {}).get("app.kubernetes.io/name")
+            for policy in of_kind(documents, "NetworkPolicy")
+        }
+        if job_labels.get("app.kubernetes.io/name") not in selected:
+            failures.append(
+                f"{label}: no NetworkPolicy selects the migration Pod, so the Pod holding the "
+                "control-plane DSN has unrestricted egress under a default-deny overlay"
+            )
+
+    for document in (deployment, *jobs):
+        for container in document["spec"]["template"]["spec"].get("containers", []):
+            image = container["image"]
+            if f"{IMAGE_REPOSITORY}@{SENTINEL_DIGEST}" != image:
+                failures.append(
+                    f"{label}: container {container['name']!r} runs {image!r}; this overlay's "
+                    "own images: block has to pin every container — including the Job the "
+                    "production overlay's transformer never sees — to the sentinel digest"
+                )
+
+    config = gateway_config(documents)
+    if config.get("mode") != "stateful":
+        failures.append(f"{label}: the mounted config is not `mode = \"stateful\"`")
+    owned_by_the_control_plane = sorted(
+        key
+        for key in ("namespace", "provider", "credential", "model", "gateway_key", "alias")
+        if key in config
+    )
+    if owned_by_the_control_plane:
+        failures.append(
+            f"{label}: the bootstrap declares {owned_by_the_control_plane}, which the control "
+            "plane owns in this mode — a boot error before the listener binds"
+        )
+    if config.get("control_plane", {}).get("migrate"):
+        failures.append(
+            f"{label}: booting replicas may apply migrations, so a restart can have one replica "
+            "migrating a database its peers are reading; the Job is the migration"
+        )
+    return failures
+
+
+def check_stateful_drill(workflow: dict[str, Any], page: str, drill: str) -> list[str]:
+    """The stateful overlay's behaviour has a cluster proof, and CI runs it.
+
+    `check_stateful` reads the rendered shape. Whether `/admin/v1` is reachable,
+    whether an upgrade lands, and whether a Pod can be evicted are answers only an
+    API server gives, and each of the three has a counterfactual in the drill —
+    without them a change restoring the stateless defaults would still pass.
+    """
+    failures: list[str] = []
+    jobs = workflow["jobs"]
+    lane = jobs.get("stateful-deploy-drill")
+    if lane is None:
+        failures.append(".github/workflows/ci.yml: the stateful-deploy-drill lane is missing")
+    elif not any(
+        "ops/stateful-deploy-drill.sh" in str(step.get("run", "")) for step in lane["steps"]
+    ):
+        failures.append(
+            ".github/workflows/ci.yml: the stateful-deploy-drill lane does not run the drill"
+        )
+    elif (reason := unblocked_lane(jobs, "stateful-deploy-drill")) is not None:
+        failures.append(
+            f".github/workflows/ci.yml: {reason}, so a stateful deployment that cannot be "
+            "upgraded or drained would not block a merge"
+        )
+    if "ops/stateful-deploy-drill.sh" not in page:
+        failures.append(
+            "docs/deployment/kubernetes.md: ops/stateful-deploy-drill.sh is not documented"
+        )
+    for counterfactual, lost in (
+        ("RollingUpdate has to stall", "an upgrade that never lands would read as one that did"),
+        (
+            "the default budget has to refuse it",
+            "a budget that blocks every drain would read as one that permits them",
+        ),
+    ):
+        if counterfactual not in drill:
+            failures.append(
+                f"ops/stateful-deploy-drill.sh: the {counterfactual!r} counterfactual is gone; "
+                f"{lost}"
+            )
+    return failures
+
+
 def check_documented() -> list[str]:
     """The operator-facing page names the paths and the sentinel workflow."""
     page = KUBERNETES_DOC.read_text(encoding="utf-8")
@@ -734,7 +964,9 @@ def check_documented() -> list[str]:
     for path in (
         "deploy/kubernetes/base",
         "deploy/kubernetes/overlays/production",
+        "deploy/kubernetes/overlays/production-stateful",
         "deploy/kubernetes/components/autoscaling",
+        "deploy/kubernetes/components/stateful",
         "ops/pin-image-digest.sh",
     ):
         if path not in page:
@@ -755,16 +987,108 @@ def check_sentinel_refused() -> list[str]:
         text=True,
         check=False,
     )
+    failures: list[str] = []
     if completed.returncode == 0:
-        return [
+        failures.append(
             "ops/pin-image-digest.sh --check accepted the committed overlay; it must refuse the "
             "unresolved sentinel digest"
-        ]
-    return []
+        )
+    # A `--check` that passes is only worth what it covers. Every overlay
+    # carrying the sentinel has to be in the helper's list, or an operator
+    # resolves one overlay, sees the check pass, and applies another that still
+    # names an image no node can pull.
+    helper = (ROOT / "ops/pin-image-digest.sh").read_text(encoding="utf-8")
+    for overlay in sorted((ROOT / "deploy/kubernetes/overlays").glob("*/kustomization.yaml")):
+        relative = overlay.relative_to(ROOT).as_posix()
+        if SENTINEL_DIGEST in overlay.read_text(encoding="utf-8") and relative not in helper:
+            failures.append(
+                f"ops/pin-image-digest.sh: {relative} pins the sentinel digest but the helper "
+                "neither rewrites nor checks it, so its placeholder survives a passing --check"
+            )
+    return failures
 
 
-def gate(base: list[Document], production: list[Document], autoscaled: list[Document]) -> list[str]:
+def check_digest_scope() -> list[str]:
+    """`--check` answers for the whole fleet, or for the overlay it is given.
+
+    A repository gate wants the fleet. An operator rolling out one overlay wants
+    that overlay: naming it must not fail on a sentinel in an overlay nobody is
+    applying, and must still fail on one in the overlay they are. The contract is
+    exercised on a copy, because the committed tree has no resolved overlay in it.
+    """
+    resolved = "sha256:" + "1" * 64
+    failures: list[str] = []
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        (root / "ops").mkdir()
+        shutil.copy(ROOT / "ops/pin-image-digest.sh", root / "ops/pin-image-digest.sh")
+        overlays = ROOT / "deploy/kubernetes/overlays"
+        copied = root / "deploy/kubernetes/overlays"
+        copied.mkdir(parents=True)
+        for overlay in ("production", "production-stateful"):
+            (copied / overlay).mkdir()
+            shutil.copy(
+                overlays / overlay / "kustomization.yaml", copied / overlay / "kustomization.yaml"
+            )
+        pinned = copied / "production/kustomization.yaml"
+        pinned.write_text(
+            pinned.read_text(encoding="utf-8").replace(SENTINEL_DIGEST, resolved), encoding="utf-8"
+        )
+
+        def check(*arguments: str) -> int:
+            return subprocess.run(  # noqa: S603 - fixed argv, no shell
+                ["bash", str(root / "ops/pin-image-digest.sh"), "--check", *arguments],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).returncode
+
+        expectations = (
+            ((), 0, "the fleet still carries an unresolved overlay"),
+            (("overlays/production",), 1, "the named overlay is resolved"),
+            (
+                ("deploy/kubernetes/overlays/production/kustomization.yaml",),
+                1,
+                "the named overlay is resolved, named by path",
+            ),
+            (("overlays/production-stateful",), 0, "the named overlay is unresolved"),
+            (("overlays/nowhere",), 0, "the named overlay does not exist"),
+        )
+        for arguments, forbidden, because in expectations:
+            if check(*arguments) == forbidden:
+                verdict = "accepted" if forbidden == 0 else "refused"
+                failures.append(
+                    f"ops/pin-image-digest.sh --check {' '.join(arguments)}: {verdict} a tree "
+                    f"where {because}"
+                )
+    return failures
+
+
+def gate(
+    base: list[Document],
+    production: list[Document],
+    autoscaled: list[Document],
+    stateful: list[Document],
+) -> list[str]:
     return [
+        *check_stateful(stateful),
+        *check_termination_budget(stateful, "overlays/production-stateful"),
+        *check_resources(stateful, "overlays/production-stateful"),
+        *check_service_port(stateful, "overlays/production-stateful"),
+        *check_topology_spread(stateful, "overlays/production-stateful"),
+        *check_namespaces(stateful, "overlays/production-stateful"),
+        *check_example_secret(stateful, base, "overlays/production-stateful"),
+        # The stateful overlay inherits the production overlay's policies, PDB
+        # and telemetry egress, and inheritance is exactly what a render can
+        # lose: a component that renames a label or drops a patch leaves this
+        # fleet default-open while the stateless one still passes.
+        *check_network_policies(
+            stateful, "overlays/production-stateful", pod_labels(stateful)
+        ),
+        *check_telemetry_egress(
+            stateful, TELEMETRY_SOURCE.read_text(encoding="utf-8"), "overlays/production-stateful"
+        ),
+        *check_disruption_budget(stateful, "overlays/production-stateful"),
         *check_image_pinning(base, production),
         *check_termination_budget(base, "base"),
         *check_termination_budget(production, "overlays/production"),
@@ -772,13 +1096,15 @@ def gate(base: list[Document], production: list[Document], autoscaled: list[Docu
         *check_resources(production, "overlays/production"),
         *check_service_port(base, "base"),
         *check_service_port(production, "overlays/production"),
-        *check_topology_spread(production),
-        *check_network_policies(production),
-        *check_telemetry_egress(production, TELEMETRY_SOURCE.read_text(encoding="utf-8")),
-        *check_disruption_budget(production, autoscaled),
+        *check_topology_spread(production, "overlays/production"),
+        *check_network_policies(production, "overlays/production"),
+        *check_telemetry_egress(
+            production, TELEMETRY_SOURCE.read_text(encoding="utf-8"), "overlays/production"
+        ),
+        *check_disruption_budget(production, "overlays/production", autoscaled),
         *check_namespaces(base, "base"),
         *check_namespaces(production, "overlays/production"),
-        *check_example_secret(production, base),
+        *check_example_secret(production, base, "overlays/production"),
     ]
 
 
@@ -787,14 +1113,114 @@ def self_test() -> int:
     base = render(BASE)
     production = render(PRODUCTION)
     autoscaled = render(PRODUCTION, (AUTOSCALING,))
+    stateful = render(PRODUCTION_STATEFUL)
     failures: list[str] = []
 
     def expect_failure(name: str, produced: list[str]) -> None:
         if not produced:
             failures.append(f"self-test: {name} did not fail on a manifest it must reject")
 
-    if gate(base, production, autoscaled):
+    if gate(base, production, autoscaled, stateful):
         failures.append("self-test: the committed manifests must pass the gate")
+
+    rolling = copy.deepcopy(stateful)
+    one(rolling, "Deployment")["spec"]["strategy"] = {
+        "type": "RollingUpdate",
+        "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1},
+    }
+    expect_failure("a stateful fleet upgraded with RollingUpdate", check_stateful(rolling))
+
+    blocked = copy.deepcopy(stateful)
+    one(blocked, "PodDisruptionBudget")["spec"].pop("unhealthyPodEvictionPolicy")
+    expect_failure("a budget that blocks every drain", check_stateful(blocked))
+
+    published_admin = copy.deepcopy(stateful)
+    published_admin.append(
+        {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "axond-admin", "namespace": "axond"},
+            "spec": {"type": "ClusterIP", "selector": dict(SELECTOR)},
+        }
+    )
+    expect_failure(
+        "the default stateful overlay publishes an admin Service",
+        check_stateful(published_admin),
+    )
+
+    ingressed_admin = copy.deepcopy(stateful)
+    ingressed_admin.append(
+        {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": "axond-admin", "namespace": "axond"},
+            "spec": {
+                "rules": [
+                    {
+                        "http": {
+                            "paths": [
+                                {
+                                    "path": "/admin",
+                                    "pathType": "Prefix",
+                                    "backend": {
+                                        "service": {
+                                            "name": "axond-admin",
+                                            "port": {"number": 8080},
+                                        }
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        }
+    )
+    expect_failure("an ingress that fronts /admin/v1", check_stateful(ingressed_admin))
+
+    routed = copy.deepcopy(stateful)
+    for service in of_kind(routed, "Service"):
+        if service["metadata"]["name"] == "axond":
+            service["spec"]["publishNotReadyAddresses"] = True
+    expect_failure("callers routed to a refusing replica", check_stateful(routed))
+
+    self_migrating = copy.deepcopy(stateful)
+    config = one(self_migrating, "ConfigMap")
+    # The first occurrence only: the table header ends `[control_plane]`, and a
+    # comment further down may mention the same name without opening a table.
+    config["data"]["axond.toml"] = config["data"]["axond.toml"].replace(
+        "[secret_store]", "migrate = true\n\n[secret_store]", 1
+    )
+    expect_failure("replicas allowed to migrate at boot", check_stateful(self_migrating))
+
+    statelessly_configured = copy.deepcopy(stateful)
+    config = one(statelessly_configured, "ConfigMap")
+    config["data"]["axond.toml"] += '\n[[namespace]]\nid = "platform"\n'
+    expect_failure("a bootstrap that also declares resources", check_stateful(statelessly_configured))
+
+    tagged_job = copy.deepcopy(stateful)
+    containers(one(tagged_job, "Job"))[0]["image"] = f"{IMAGE_REPOSITORY}:0.3.27"
+    expect_failure("a migration Job left on a mutable tag", check_stateful(tagged_job))
+
+    serving_label = copy.deepcopy(stateful)
+    one(serving_label, "Job")["spec"]["template"]["metadata"]["labels"] = dict(SELECTOR)
+    expect_failure("a migration Pod wearing the serving label", check_stateful(serving_label))
+
+    unpoliced = copy.deepcopy(stateful)
+    unpoliced[:] = [
+        document
+        for document in unpoliced
+        if document.get("kind") != "NetworkPolicy"
+        or not document["metadata"]["name"].startswith("axond-migrate")
+    ]
+    expect_failure("a migration Pod no NetworkPolicy selects", check_stateful(unpoliced))
+
+    unpublished = copy.deepcopy(stateful)
+    unpublished[:] = [document for document in unpublished if document.get("kind") != "Service"]
+    expect_failure(
+        "a manifest set that publishes no Service",
+        check_service_port(unpublished, "overlays/production-stateful"),
+    )
 
     tagged = copy.deepcopy(production)
     containers(one(tagged, "Deployment"))[0]["image"] = f"{IMAGE_REPOSITORY}:latest"
@@ -856,21 +1282,21 @@ def self_test() -> int:
         ]
         if constraint["topologyKey"] != "kubernetes.io/hostname"
     ]
-    expect_failure("topology spread", check_topology_spread(flat))
+    expect_failure("topology spread", check_topology_spread(flat, "overlays/production"))
 
     stacked = copy.deepcopy(production)
     for constraint in one(stacked, "Deployment")["spec"]["template"]["spec"][
         "topologySpreadConstraints"
     ]:
         constraint["whenUnsatisfiable"] = "ScheduleAnyway"
-    expect_failure("per-node spread enforcement", check_topology_spread(stacked))
+    expect_failure("per-node spread enforcement", check_topology_spread(stacked, "overlays/production"))
 
     fleet_wide = copy.deepcopy(production)
     for constraint in one(fleet_wide, "Deployment")["spec"]["template"]["spec"][
         "topologySpreadConstraints"
     ]:
         constraint.pop("matchLabelKeys", None)
-    expect_failure("a hard spread that deadlocks its own rollout", check_topology_spread(fleet_wide))
+    expect_failure("a hard spread that deadlocks its own rollout", check_topology_spread(fleet_wide, "overlays/production"))
 
     open_egress = copy.deepcopy(production)
     for policy in of_kind(open_egress, "NetworkPolicy"):
@@ -878,13 +1304,13 @@ def self_test() -> int:
             for peer in rule.get("to", []):
                 if peer.get("ipBlock", {}).get("cidr") == "0.0.0.0/0":
                     peer["ipBlock"].pop("except")
-    expect_failure("private-range egress", check_network_policies(open_egress))
+    expect_failure("private-range egress", check_network_policies(open_egress, "overlays/production"))
 
     open_ingress = copy.deepcopy(production)
     for policy in of_kind(open_ingress, "NetworkPolicy"):
         for rule in policy["spec"].get("ingress", []):
             rule.pop("from", None)
-    expect_failure("unrestricted ingress", check_network_policies(open_ingress))
+    expect_failure("unrestricted ingress", check_network_policies(open_ingress, "overlays/production"))
 
     allow_only = copy.deepcopy(production)
     allow_only[:] = [
@@ -892,23 +1318,102 @@ def self_test() -> int:
         for document in allow_only
         if document.get("kind") != "NetworkPolicy" or document["spec"].get("egress")
     ]
-    expect_failure("default deny", check_network_policies(allow_only))
+    expect_failure("default deny", check_network_policies(allow_only, "overlays/production"))
 
     tight = copy.deepcopy(production)
     one(tight, "PodDisruptionBudget")["spec"]["minAvailable"] = 3
-    expect_failure("disruption budget", check_disruption_budget(tight, autoscaled))
+    expect_failure("disruption budget", check_disruption_budget(tight, "overlays/production", autoscaled))
 
     contended = copy.deepcopy(autoscaled)
     one(contended, "Deployment")["spec"]["replicas"] = 3
-    expect_failure("autoscaled replica ownership", check_disruption_budget(production, contended))
+    expect_failure("autoscaled replica ownership", check_disruption_budget(production, "overlays/production", contended))
 
     shrunk = copy.deepcopy(autoscaled)
     one(shrunk, "HorizontalPodAutoscaler")["spec"]["minReplicas"] = 1
-    expect_failure("autoscaler floor", check_disruption_budget(production, shrunk))
+    expect_failure("autoscaler floor", check_disruption_budget(production, "overlays/production", shrunk))
+
+    # The same three gates, against the stateful render: the overlay inherits
+    # them through a component, and a component that stops applying is exactly
+    # the regression a gate on the stateless render alone would not see.
+    stateful_open = copy.deepcopy(stateful)
+    for policy in of_kind(stateful_open, "NetworkPolicy"):
+        for rule in policy["spec"].get("egress", []):
+            for peer in rule.get("to", []):
+                if peer.get("ipBlock", {}).get("cidr") == "0.0.0.0/0":
+                    peer["ipBlock"].pop("except")
+    expect_failure(
+        "private-range egress on the stateful fleet",
+        check_network_policies(
+            stateful_open, "overlays/production-stateful", pod_labels(stateful_open)
+        ),
+    )
+
+    unpoliced_job = copy.deepcopy(stateful)
+    migration = {"app.kubernetes.io/name": "axond-migrate"}
+    unpoliced_job[:] = [
+        document
+        for document in unpoliced_job
+        if document.get("kind") != "NetworkPolicy"
+        or document["spec"].get("podSelector", {}).get("matchLabels") != migration
+    ]
+    expect_failure(
+        "a migration Pod no policy denies by default",
+        check_network_policies(
+            unpoliced_job, "overlays/production-stateful", pod_labels(unpoliced_job)
+        ),
+    )
+
+    inherited_ingress = copy.deepcopy(stateful)
+    for policy in of_kind(inherited_ingress, "NetworkPolicy"):
+        if policy["spec"].get("podSelector", {}).get("matchLabels") != SELECTOR:
+            continue
+        if policy["spec"].get("ingress"):
+            policy["spec"]["ingress"] = [
+                {
+                    "from": [
+                        {
+                            "namespaceSelector": {
+                                "matchLabels": {"kubernetes.io/metadata.name": "ingress-nginx"}
+                            }
+                        }
+                    ],
+                    "ports": [{"protocol": "TCP", "port": 8080}],
+                }
+            ]
+    expect_failure(
+        "the inference ingress path inherited onto the admin surface",
+        check_stateful(inherited_ingress),
+    )
+
+    stateful_grpc = copy.deepcopy(stateful)
+    for policy in of_kind(stateful_grpc, "NetworkPolicy"):
+        for rule in policy["spec"].get("egress", []):
+            for peer in rule.get("to", []):
+                labels = peer.get("podSelector", {}).get("matchLabels", {})
+                if labels.get("app.kubernetes.io/name") == "opentelemetry-collector":
+                    rule["ports"] = [{"protocol": "TCP", "port": 4317}]
+    expect_failure(
+        "stateful telemetry egress on a port axond cannot dial",
+        check_telemetry_egress(
+            stateful_grpc,
+            TELEMETRY_SOURCE.read_text(encoding="utf-8"),
+            "overlays/production-stateful",
+        ),
+    )
+
+    stateful_tight = copy.deepcopy(stateful)
+    one(stateful_tight, "PodDisruptionBudget")["spec"]["minAvailable"] = 3
+    expect_failure(
+        "a stateful budget that leaves no room for a drain",
+        check_disruption_budget(stateful_tight, "overlays/production-stateful"),
+    )
 
     inherited = copy.deepcopy(production)
     inherited.extend(copy.deepcopy(of_kind(base, "Secret")))
-    expect_failure("the base's example Secret inherited", check_example_secret(inherited, base))
+    expect_failure(
+        "the base's example Secret inherited",
+        check_example_secret(inherited, base, "overlays/production"),
+    )
 
     stray = copy.deepcopy(production)
     one(stray, "Service")["metadata"].pop("namespace")
@@ -924,7 +1429,7 @@ def self_test() -> int:
     telemetry = TELEMETRY_SOURCE.read_text(encoding="utf-8")
     expect_failure(
         "telemetry egress on a port axond cannot dial",
-        check_telemetry_egress(grpc, telemetry),
+        check_telemetry_egress(grpc, telemetry, "overlays/production"),
     )
     unreachable = copy.deepcopy(production)
     for policy in of_kind(unreachable, "NetworkPolicy"):
@@ -942,12 +1447,14 @@ def self_test() -> int:
         ]
     expect_failure(
         "telemetry egress deleted altogether",
-        check_telemetry_egress(unreachable, telemetry),
+        check_telemetry_egress(unreachable, telemetry, "overlays/production"),
     )
     expect_failure(
         "telemetry egress derived from a protocol the gateway no longer names",
         check_telemetry_egress(
-            production, telemetry.replace('Some("http/protobuf")', 'Some("grpc")')
+            production,
+            telemetry.replace('Some("http/protobuf")', 'Some("grpc")'),
+            "overlays/production",
         ),
     )
 
@@ -1038,6 +1545,33 @@ def self_test() -> int:
         check_rollout_drill(workflow, kubernetes_page, rollout.replace("has to deadlock", "runs")),
     )
 
+    stateful_drill = STATEFUL_DRILL.read_text(encoding="utf-8")
+    if check_stateful_drill(workflow, kubernetes_page, stateful_drill):
+        failures.append("self-test: the committed stateful drill wiring must pass the gate")
+    optional_stateful = copy.deepcopy(workflow)
+    optional_stateful["jobs"]["CI-Success"]["needs"].remove("stateful-deploy-drill")
+    expect_failure(
+        "optional stateful deploy lane",
+        check_stateful_drill(optional_stateful, kubernetes_page, stateful_drill),
+    )
+    unasserted_stateful = copy.deepcopy(workflow)
+    for step in unasserted_stateful["jobs"]["CI-Success"]["steps"]:
+        if "run" in step:
+            step["run"] = re.sub(
+                r"^.*needs\.stateful-deploy-drill\.result.*$", "", step["run"], flags=re.MULTILINE
+            )
+    expect_failure(
+        "a needed stateful lane CI-Success never asserts",
+        check_stateful_drill(unasserted_stateful, kubernetes_page, stateful_drill),
+    )
+    for counterfactual in ("RollingUpdate has to stall", "the default budget has to refuse it"):
+        expect_failure(
+            f"stateful drill without {counterfactual!r}",
+            check_stateful_drill(
+                workflow, kubernetes_page, stateful_drill.replace(counterfactual, "runs")
+            ),
+        )
+
     for failure in failures:
         print(failure, file=sys.stderr)
     if failures:
@@ -1051,12 +1585,18 @@ def main(argv: list[str]) -> int:
     if "--self-test" in argv:
         return self_test()
     failures = [
-        *gate(render(BASE), render(PRODUCTION), render(PRODUCTION, (AUTOSCALING,))),
+        *gate(
+            render(BASE),
+            render(PRODUCTION),
+            render(PRODUCTION, (AUTOSCALING,)),
+            render(PRODUCTION_STATEFUL),
+        ),
         *check_component_layering(
             (PRODUCTION / "kustomization.yaml").read_text(encoding="utf-8")
         ),
         *check_documented(),
         *check_sentinel_refused(),
+        *check_digest_scope(),
         *check_supported_backends(
             STATEFUL_DOC.read_text(encoding="utf-8"),
             ci_service_images(yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))),
@@ -1072,6 +1612,11 @@ def main(argv: list[str]) -> int:
             yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8")),
             KUBERNETES_DOC.read_text(encoding="utf-8"),
             ROLLOUT_DRILL.read_text(encoding="utf-8"),
+        ),
+        *check_stateful_drill(
+            yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8")),
+            KUBERNETES_DOC.read_text(encoding="utf-8"),
+            STATEFUL_DRILL.read_text(encoding="utf-8"),
         ),
     ]
     for failure in failures:

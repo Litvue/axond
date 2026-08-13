@@ -5145,6 +5145,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         snapshot.credentials.record_failure(&parked);
         snapshot.credentials.record_failure(&parked);
 
+        crate::telemetry::testing::keep_callsites_answerable();
         let exporter = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())

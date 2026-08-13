@@ -178,10 +178,15 @@ dependencies. The [stateful guide](./deployment/stateful-backends.md) contains
 the capability matrix, failure policy, and namespace-cap migration sequence.
 
 Every deployment described here runs the stateless operating mode, where TOML is
-the authority. The accepted design for an opt-in, Postgres-backed control plane
-(`/admin/v1`, immutable revisions, one snapshot per request) is
-[ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md); it is not
-implemented, and it changes nothing about the deployments above.
+the authority, and nothing about them changes if you never set `mode`. The
+opt-in, Postgres-backed control plane accepted in
+[ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md) is partly
+built: a stateful replica boots, applies no schema of its own, and serves
+[`/admin/v1`](./operations/admin-api.md) — but it fails `/readyz` and answers
+inference `503 inference_unavailable` until revision convergence ships, so it
+serves no traffic yet. Its deployment shape, and the operator commands that
+prepare its schema, are in
+[Kubernetes › Stateful mode](./deployment/kubernetes.md#stateful-mode).
 
 ## Next steps
 
