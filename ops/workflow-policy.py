@@ -116,6 +116,20 @@ def check_permissions(text: str, relative: str) -> list[str]:
     return failures
 
 
+def command_block(lines: list[str], index: int) -> str:
+    """One shell command: the line, plus the continuations a trailing `\\` joins.
+
+    A fixed lookahead reads past the end of the command, which is unsafe in both
+    directions here: a restriction belonging to a *later* command would satisfy
+    an unrestricted one, so an unrestricted keyless `cosign verify` sitting near
+    a key-based one would pass the gate.
+    """
+    end = index
+    while lines[end].rstrip().endswith("\\") and end + 1 < len(lines):
+        end += 1
+    return "\n".join(lines[index : end + 1])
+
+
 def check_cosign_verify(text: str, relative: str) -> list[str]:
     """Every `cosign verify` restricts who the signature must come from.
 
@@ -130,8 +144,7 @@ def check_cosign_verify(text: str, relative: str) -> list[str]:
         # A shell comment discussing the command is prose, not an invocation.
         if "cosign verify" not in line or line.lstrip().startswith("#"):
             continue
-        # The flags live on the continuation lines of the same command.
-        block = "\n".join(lines[index : index + 16])
+        block = command_block(lines, index)
         if re.search(r"--key[= ]", block):
             continue
         if "--certificate-identity-regexp" not in block or "--certificate-oidc-issuer" not in block:
@@ -340,6 +353,28 @@ def self_test() -> list[str]:
         ):
             problems.append(
                 "self-test: an unrestricted `cosign verify` in ops/ was not rejected"
+            )
+        # A key-based verify restricts the signer by naming the key, and a
+        # neighbouring one must not lend that restriction to a keyless verify:
+        # both invocations are read as the separate commands they are.
+        script.write_text(
+            'cosign verify --key "$PUB" "$IMAGE" >/dev/null\n'
+            'cosign verify --key "$PUB" "$INDEX" >/dev/null\n',
+            encoding="utf-8",
+        )
+        if check(root):
+            problems.append(f"self-test: key-based verifies were rejected: {check(root)}")
+        script.write_text(
+            'cosign verify "$IMAGE" >/dev/null\n'
+            'cosign verify --key "$PUB" "$INDEX" >/dev/null\n',
+            encoding="utf-8",
+        )
+        if not any(
+            "--certificate-identity-regexp" in failure for failure in check(root)
+        ):
+            problems.append(
+                "self-test: an unrestricted `cosign verify` was excused by a "
+                "key-based one on the next line"
             )
     return problems
 
