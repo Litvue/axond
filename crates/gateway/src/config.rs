@@ -97,7 +97,7 @@ pub struct Config {
     pub usage_sink: Vec<UsageSinkConfig>,
     /// Durable, replayed usage delivery. Defaults to `backend = "none"`: the
     /// telemetry-grade path stays exactly as it is and no datastore joins the
-    /// default deployment (ADR 0002, ADR 0036).
+    /// default deployment (ADR 0002, ADR 0037).
     #[serde(default)]
     pub usage_journal: UsageJournalConfig,
     /// Spend cap enforcement. Defaults to no budget at all, so nothing drags a
@@ -1186,7 +1186,7 @@ impl UsageSinkConfig {
 const DEFAULT_USAGE_TABLE: &str = "axond_usage";
 
 /// Billing-grade usage delivery: durable append before the request is answered,
-/// replayed until the destinations acknowledge it (ADR 0036).
+/// replayed until the destinations acknowledge it (ADR 0037).
 ///
 /// Off by default, and off in every configuration written so far, because the
 /// guarantee costs a datastore on the request path. Turning it on is the operator
