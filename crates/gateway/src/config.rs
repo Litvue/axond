@@ -1225,8 +1225,10 @@ pub struct UsageJournalConfig {
     /// operation.
     pub operation_timeout_ms: u64,
     pub connect_timeout_ms: u64,
-    /// Connections the outbox holds open. Two is the useful minimum: one for the
-    /// request path's appends, one for the delivery worker's claims.
+    /// Connections the outbox holds open. One is reserved for the delivery
+    /// worker's claims, so the rest bound how many appends a replica can have in
+    /// flight: a claim that waits on a slow destination cannot hold a connection
+    /// a request needs.
     pub connections: usize,
     /// Events one claim takes.
     pub claim_batch: usize,
@@ -1252,7 +1254,7 @@ impl Default for UsageJournalConfig {
             on_undurable: UndurablePolicy::Refuse,
             operation_timeout_ms: 5_000,
             connect_timeout_ms: 5_000,
-            connections: 2,
+            connections: 8,
             claim_batch: 256,
             lease_seconds: 30,
             poll_interval_ms: 250,
@@ -3095,9 +3097,11 @@ impl Config {
                 "usage_journal: claim_batch must be at least 1".into(),
             ));
         }
-        if journal.connections == 0 {
+        if journal.connections < 2 {
             return Err(ConfigError::Invalid(
-                "usage_journal: connections must be at least 1".into(),
+                "usage_journal: connections must be at least 2, because one is reserved for the \
+                 delivery worker"
+                    .into(),
             ));
         }
         for (field, value) in [
@@ -3888,6 +3892,31 @@ dsn_env = "AXOND_BUDGET_REDIS_URL"
                 "expected `{budget}` to be rejected"
             );
         }
+    }
+
+    /// One connection is the delivery worker's, so a single-connection journal
+    /// would be a worker and no lane for the appends requests wait on. The
+    /// default is wide enough to serve concurrent requests rather than to merely
+    /// boot.
+    #[test]
+    fn a_journal_needs_a_connection_for_appends_besides_the_workers() {
+        let journal = "[usage_journal]\nbackend = \"postgres\"\ndsn_env = \"OUTBOX_DSN\"\n";
+        for connections in ["0", "1"] {
+            let error = Config::from_toml_str(&format!(
+                "{VALID}\n[[usage_sink]]\nkind = \"stdout\"\n{journal}connections = {connections}\n"
+            ))
+            .expect_err("a journal without a request lane cannot serve");
+            assert!(
+                matches!(error, ConfigError::Invalid(ref message)
+                    if message.contains("connections must be at least 2")),
+                "{connections}: {error:?}"
+            );
+        }
+        let config = Config::from_toml_str(&format!(
+            "{VALID}\n[[usage_sink]]\nkind = \"stdout\"\n{journal}"
+        ))
+        .expect("a journal with default connections validates");
+        assert_eq!(config.usage_journal.connections, 8);
     }
 
     #[test]

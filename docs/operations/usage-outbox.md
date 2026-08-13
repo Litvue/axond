@@ -141,12 +141,15 @@ counts rows, at most once per second per replica and never past `max_events + 1`
 rows — the largest number the decision can tell apart. So the request path never
 pays for the size of the backlog, which is exactly when it could least afford to.
 
-What the request path *does* pay for is a connection. `connections` defaults to
-`2` — one for appends, one for the worker's claims — and a connection is handed to
-one operation at a time, so on a busy replica concurrent appends queue behind each
-other and throughput is bounded by the round trip to the outbox rather than by the
-upstreams. Raise it towards the concurrency you actually serve (and inside what
-your Postgres `max_connections` allows) before concluding the mode is slow.
+What the request path *does* pay for is a connection. The pool has two lanes and
+they do not overlap: the last connection belongs to the delivery worker, and the
+rest serve appends, so a claim waiting on a slow destination can never hold a
+connection a request needs. `connections` defaults to `8`, which is seven
+concurrent appends per replica, and the floor is `2`. A connection serves one
+operation at a time, so appends beyond the lane's width queue and throughput
+becomes the round trip to the outbox: raise `connections` towards the concurrency
+you actually serve, inside the share of your Postgres `max_connections` this
+replica may hold, before concluding the mode is slow.
 
 ## What enabling it changes about your sinks
 

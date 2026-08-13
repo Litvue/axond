@@ -503,8 +503,9 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # # Bounds on the append a request waits for, and on connecting.
 # operation_timeout_ms = 5_000
 # connect_timeout_ms = 5_000
-# # Two is the useful minimum: one for appends, one for the worker's claims.
-# connections = 2
+# # One is reserved for the worker's claims; the rest bound the appends this
+# # replica can have in flight. Two is the floor.
+# connections = 8
 # # Delivery worker: events per claim, how long a claim stays invisible to
 # # other claimants (also how long recovery from a dead worker takes), and how
 # # long to wait after finding nothing.

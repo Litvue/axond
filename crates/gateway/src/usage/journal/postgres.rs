@@ -102,8 +102,8 @@ pub struct PostgresJournalSettings {
     /// The ceiling on one journal operation, including the append that a request
     /// waits on.
     pub operation_timeout: Duration,
-    /// Connections held open. Two is the useful minimum — one for the request
-    /// path's appends, one for the delivery worker.
+    /// Connections held open. One is reserved for the delivery worker, so the
+    /// rest are the appends a replica can have in flight at once.
     pub connections: usize,
 }
 
@@ -115,7 +115,7 @@ impl Default for PostgresJournalSettings {
             capacity: Capacity::BILLING_GRADE,
             connect_timeout: Duration::from_secs(10),
             operation_timeout: Duration::from_secs(10),
-            connections: 2,
+            connections: 8,
         }
     }
 }
@@ -176,8 +176,11 @@ impl PostgresJournal {
                 Ok(schema.to_owned())
             })
             .transpose()?;
-        if settings.connections == 0 {
-            return Err(backend("a usage journal needs at least one connection"));
+        if settings.connections < 2 {
+            return Err(backend(
+                "a usage journal needs at least two connections: one is reserved for the \
+                 delivery worker so its claims cannot stall the appends requests wait on",
+            ));
         }
 
         let journal = Self {
@@ -187,7 +190,7 @@ impl PostgresJournal {
         };
         if journal.settings.create_schema {
             journal
-                .run("apply schema", |client| {
+                .run("apply schema", Lane::Request, |client| {
                     Box::pin(async move {
                         client.batch_execute(SCHEMA_DDL).await?;
                         Ok(())
@@ -210,7 +213,7 @@ impl PostgresJournal {
     /// `resolved_through`, which every claim reads — is a boot refusal rather than
     /// a runtime error on the first claim.
     async fn check_schema(&self) -> Result<(), JournalError> {
-        self.run("check schema", |client| {
+        self.run("check schema", Lane::Request, |client| {
             Box::pin(async move {
                 for (table, columns) in [
                     (
@@ -248,12 +251,13 @@ impl PostgresJournal {
     }
 
     /// Run one operation on a pooled connection, under the operation timeout.
-    async fn run<T, F>(&self, what: &'static str, op: F) -> Result<T, JournalError>
+    async fn run<T, F>(&self, what: &'static str, lane: Lane, op: F) -> Result<T, JournalError>
     where
         T: Send,
         F: for<'a> Fn(&'a mut Client) -> BoxFuture<'a, Result<T, OpError>> + Send + Sync,
     {
-        match tokio::time::timeout(self.settings.operation_timeout, self.pool.run(&op)).await {
+        match tokio::time::timeout(self.settings.operation_timeout, self.pool.run(&op, lane)).await
+        {
             Ok(result) => result,
             Err(_) => Err(backend(format!(
                 "`{what}` exceeded its {:?} bound",
@@ -333,7 +337,7 @@ impl UsageJournal for PostgresJournal {
         let version = i32::try_from(event.record().schema_version).unwrap_or(i32::MAX);
 
         let gate = Arc::clone(&self.stored);
-        self.run("append", move |client| {
+        self.run("append", Lane::Request, move |client| {
             let (key, record, ordering) = (key.clone(), record.clone(), ordering.clone());
             let idempotency_key = idempotency_key.clone();
             let gate = Arc::clone(&gate);
@@ -455,7 +459,7 @@ impl UsageJournal for PostgresJournal {
         let lease_expires_at = claim.now + claim.lease;
         let readable = i32::try_from(UsageRecord::SCHEMA_VERSION).unwrap_or(i32::MAX);
 
-        self.run("claim", move |client| {
+        self.run("claim", Lane::Delivery, move |client| {
             let (name, consumer) = (name.clone(), consumer.clone());
             Box::pin(async move {
                 let tx = client.transaction().await?;
@@ -670,7 +674,7 @@ impl UsageJournal for PostgresJournal {
         );
         let attempt = i32::try_from(delivery.attempt).unwrap_or(i32::MAX);
         let refused = delivery.clone();
-        self.run("relinquish", move |client| {
+        self.run("relinquish", Lane::Delivery, move |client| {
             let (name, key, refused) = (name.clone(), key.clone(), refused.clone());
             Box::pin(async move {
                 // Gated on the attempt this delivery spent, so a refund cannot
@@ -717,7 +721,7 @@ impl UsageJournal for PostgresJournal {
         let name = consumer.as_str().to_owned();
         let now = SystemTime::now();
         let capacity = self.settings.capacity;
-        self.run("stats", move |client| {
+        self.run("stats", Lane::Delivery, move |client| {
             let name = name.clone();
             Box::pin(async move {
                 // Floored on the consumer's resolved prefix for the same reason a
@@ -782,7 +786,7 @@ impl UsageJournal for PostgresJournal {
             .checked_sub(FLOOR_SETTLE_MARGIN.max(self.settings.operation_timeout * 6))
             .unwrap_or(now);
         let pruned = self
-            .run("maintain", move |client| {
+            .run("maintain", Lane::Delivery, move |client| {
                 Box::pin(async move {
                     let cutoff = now.checked_sub(retain).unwrap_or(now);
                     let pruned = client
@@ -820,7 +824,7 @@ impl PostgresJournal {
         let (name, event) = (delivery.consumer.as_str().to_owned(), delivery.event);
         let key = event.to_string();
         let refused = delivery.clone();
-        self.run("verdict", move |client| {
+        self.run("verdict", Lane::Delivery, move |client| {
             let (name, key, refused) = (name.clone(), key.clone(), refused.clone());
             Box::pin(async move {
                 let tx = client.transaction().await?;
@@ -1188,7 +1192,22 @@ impl From<tokio_postgres::Error> for OpError {
     }
 }
 
-/// A fixed set of connections, each replaced on failure.
+/// Which connections an operation may use.
+///
+/// The lanes do not overlap, because they compete over very different
+/// durations: a claim holds its connection for as long as a destination takes to
+/// answer, and an append is a request waiting for a `200`. Sharing one pool lets
+/// one slow delivery pass sit on a slot every append needs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lane {
+    /// Appends, and the boot-time schema work that runs before a worker exists.
+    Request,
+    /// The delivery worker's claims, verdicts, counts, and maintenance.
+    Delivery,
+}
+
+/// A fixed set of connections, each replaced on failure, split into the two
+/// lanes above.
 ///
 /// Small and hand-rolled rather than a pooling dependency: the outbox needs
 /// exactly enough connections that a request's append does not queue behind the
@@ -1198,6 +1217,7 @@ struct Pool {
     /// Re-applied on every connection, including reconnections: a reconnect that
     /// landed on the default schema would silently write another outbox.
     search_path: Option<String>,
+    /// The last slot is the delivery lane; the rest serve requests.
     slots: Vec<tokio::sync::Mutex<Option<Client>>>,
     next: AtomicUsize,
 }
@@ -1207,19 +1227,19 @@ impl Pool {
         Self {
             config,
             search_path,
-            slots: (0..connections.max(1))
+            slots: (0..connections.max(2))
                 .map(|_| tokio::sync::Mutex::new(None))
                 .collect(),
             next: AtomicUsize::new(0),
         }
     }
 
-    async fn run<T, F>(&self, op: &F) -> Result<T, JournalError>
+    async fn run<T, F>(&self, op: &F, lane: Lane) -> Result<T, JournalError>
     where
         T: Send,
         F: for<'a> Fn(&'a mut Client) -> BoxFuture<'a, Result<T, OpError>> + Send + Sync,
     {
-        let mut guard = self.acquire().await;
+        let mut guard = self.acquire(lane).await;
         let mut last: Option<tokio_postgres::Error> = None;
         for _ in 0..2 {
             let mut client = match guard.take() {
@@ -1252,16 +1272,20 @@ impl Pool {
         )))
     }
 
-    /// A free connection if there is one, otherwise a fair wait on the next
-    /// slot in rotation.
-    async fn acquire(&self) -> tokio::sync::MutexGuard<'_, Option<Client>> {
-        for slot in &self.slots {
+    /// A free connection in the lane if there is one, otherwise a fair wait on
+    /// the next slot in that lane's rotation.
+    async fn acquire(&self, lane: Lane) -> tokio::sync::MutexGuard<'_, Option<Client>> {
+        let lane = match lane {
+            Lane::Delivery => &self.slots[self.slots.len() - 1..],
+            Lane::Request => &self.slots[..self.slots.len() - 1],
+        };
+        for slot in lane {
             if let Ok(guard) = slot.try_lock() {
                 return guard;
             }
         }
-        let index = self.next.fetch_add(1, AtomicOrdering::Relaxed) % self.slots.len();
-        self.slots[index].lock().await
+        let index = self.next.fetch_add(1, AtomicOrdering::Relaxed) % lane.len();
+        lane[index].lock().await
     }
 
     async fn connect(&self) -> Result<Client, tokio_postgres::Error> {
@@ -1391,6 +1415,34 @@ mod tests {
             stored.into_record().expect("a known credential source"),
             record
         );
+    }
+
+    /// The worker holds a connection for as long as a destination takes to
+    /// answer. If that connection came out of the same set the appends use, a
+    /// slow destination would be indistinguishable from a slow gateway, so the
+    /// lanes are asserted to be disjoint rather than assumed to be wide enough.
+    #[tokio::test]
+    async fn a_claim_in_flight_does_not_hold_a_connection_an_append_needs() {
+        let pool = Pool::new(
+            "host=127.0.0.1 user=nobody".parse().expect("a config"),
+            None,
+            2,
+        );
+        let claim = pool.acquire(Lane::Delivery).await;
+
+        let append = tokio::time::timeout(Duration::from_millis(50), pool.acquire(Lane::Request));
+        assert!(
+            append.await.is_ok(),
+            "an append waited on the worker's connection"
+        );
+        // And the reservation is mutual: the delivery lane is one slot, so a
+        // second claimant waits rather than borrowing the request lane.
+        let second = tokio::time::timeout(Duration::from_millis(50), pool.acquire(Lane::Delivery));
+        assert!(
+            second.await.is_err(),
+            "a second claim took a connection reserved for requests"
+        );
+        drop(claim);
     }
 
     fn capacity(max_events: u64, policy: CapacityPolicy) -> Capacity {

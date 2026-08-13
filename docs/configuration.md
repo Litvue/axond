@@ -760,7 +760,7 @@ guide](./operations/usage-outbox.md#what-enabling-it-changes-about-your-sinks).
 | `on_undurable` | `refuse` \| `serve` | `refuse` | What a request does when its event could not be journaled. `refuse` answers `503 usage_not_durable`; `serve` answers anyway and counts the event as lost. |
 | `operation_timeout_ms` | integer | `5000` | Bound on the append a request waits for, and on every other outbox operation. Must be ≥ 1. |
 | `connect_timeout_ms` | integer | `5000` | Bound on connecting. Must be ≥ 1. |
-| `connections` | integer | `2` | Connections held open. Two is the useful minimum: one for appends, one for the worker's claims. Must be ≥ 1. |
+| `connections` | integer | `8` | Connections held open. One is reserved for the delivery worker's claims, so the rest bound how many appends a replica can have in flight — a claim waiting on a slow destination cannot hold a connection a request needs. Must be ≥ 2, and no more than the share of Postgres `max_connections` this replica may hold. |
 | `claim_batch` | integer | `256` | Events one claim takes. Must be ≥ 1. |
 | `lease_seconds` | integer | `30` | How long a claimed batch stays invisible to other claimants. Must exceed the slowest write the destinations do, and it is how long recovery from a dead worker takes. |
 | `poll_interval_ms` | integer | `250` | How long the worker waits after finding nothing to deliver. Must be ≥ 1. |
