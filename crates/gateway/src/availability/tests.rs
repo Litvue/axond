@@ -489,6 +489,69 @@ fn a_declared_listing_is_retained_for_the_outage_that_follows_it() {
     );
 }
 
+/// One refused look is one out-of-order arrival, even when a record carries it in
+/// both slots: the counter is what tells an operator a projection is disordered, so
+/// it must not double-count.
+#[test]
+fn a_look_refused_from_both_slots_of_one_record_counts_once() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let confirmed = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, None))
+        .build();
+    let stale_hand_over = confirmed
+        .record(&key(scope, "gpt-4o"))
+        .expect("the key is held")
+        .clone();
+    assert_eq!(
+        stale_hand_over.discovery, stale_hand_over.last_known_good,
+        "one look occupies both slots"
+    );
+
+    let newer = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(absent(scope, "gpt-4o", 500))
+        .build();
+    let builder =
+        AvailabilityIndexBuilder::from_index(&newer).record(key(scope, "gpt-4o"), stale_hand_over);
+
+    assert_eq!(builder.superseded(), 1, "one look, one refusal");
+    assert_eq!(
+        builder
+            .build()
+            .evaluate(&key(scope, "gpt-4o"), at(600))
+            .state,
+        AvailabilityState::Denied,
+        "and the target a complete listing dropped stays dropped"
+    );
+}
+
+/// A hand-built record can carry a retained look newer than its current one, which
+/// no observed sequence produces. Evidence follows the newer of the two, or the
+/// record would report a refusal while holding newer positive evidence.
+#[test]
+fn a_retained_look_newer_than_the_current_one_still_decides() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let index = AvailabilityIndex::builder()
+        .record(
+            key(scope, "gpt-4o"),
+            AvailabilityRecord {
+                discovery: Some(absent(scope, "gpt-4o", 100)),
+                last_known_good: Some(present(scope, "gpt-4o", 500, None)),
+                definitive_at: Some(at(500)),
+                ..permitting()
+            },
+        )
+        .build();
+
+    let verdict = index.evaluate(&key(scope, "gpt-4o"), at(600));
+    assert_eq!(verdict.state, AvailabilityState::Available);
+    assert!(
+        verdict.last_known_good,
+        "and it says which evidence it is resting on"
+    );
+}
+
 /// The shape every freshly confirmed target has — the current look *is* the retained
 /// positive — must survive a hand-over as current evidence, not be demoted to a
 /// fallback.
@@ -1277,6 +1340,40 @@ fn a_namespace_scoped_verdict_coarsens_operator_only_reasons() {
         .for_scope(StatusScope::Namespace);
     assert_eq!(runtime.state, AvailabilityState::Unavailable);
     assert_eq!(runtime.reason, AvailabilityReason::Unspecified);
+
+    // A policy engine that could not decide is the deployment's own failure, so
+    // withholding the code withholds the dimension too — otherwise naming it would
+    // disclose exactly what the coarsening was for. A policy *refusal* is the
+    // tenant's business, and keeps its name.
+    let undecided = AvailabilityIndex::builder()
+        .record(
+            key(scope, "gpt-4o"),
+            AvailabilityRecord {
+                policy: PolicyDecision::Indeterminate,
+                ..permitting()
+            },
+        )
+        .build()
+        .evaluate(&key(scope, "gpt-4o"), at(300));
+    assert_eq!(undecided.decided_by, DecidedBy::Policy);
+    let coarsened_policy = undecided.for_scope(StatusScope::Namespace);
+    assert_eq!(coarsened_policy.state, AvailabilityState::Unknown);
+    assert_eq!(coarsened_policy.reason, AvailabilityReason::Unspecified);
+    assert_eq!(coarsened_policy.decided_by, DecidedBy::Undisclosed);
+
+    let refused = AvailabilityIndex::builder()
+        .record(
+            key(scope, "gpt-4o"),
+            AvailabilityRecord {
+                policy: PolicyDecision::Denied,
+                ..permitting()
+            },
+        )
+        .build()
+        .evaluate(&key(scope, "gpt-4o"), at(300))
+        .for_scope(StatusScope::Namespace);
+    assert_eq!(refused.reason, AvailabilityReason::PolicyDenied);
+    assert_eq!(refused.decided_by, DecidedBy::Policy);
 
     // And a reason about the tenant's own access survives intact.
     let denied = AvailabilityIndex::builder()

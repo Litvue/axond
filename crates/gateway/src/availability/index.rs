@@ -193,7 +193,15 @@ impl AvailabilityRecord {
     /// it is resting on last-known-good evidence.
     fn evidence(&self) -> Option<(&DiscoveryObservation, bool)> {
         match (&self.discovery, &self.last_known_good) {
-            (Some(current), _) if current.is_definitive() => Some((current, false)),
+            // A current definitive look decides — unless the retained one is newer,
+            // which only a hand-built record can be, and reading the older conclusion
+            // there would report a refusal while holding newer positive evidence.
+            (Some(current), Some(retained))
+                if current.is_definitive() && current.observed_at >= retained.observed_at =>
+            {
+                Some((current, false))
+            }
+            (Some(current), None) if current.is_definitive() => Some((current, false)),
             (_, Some(retained)) => Some((retained, true)),
             (Some(current), None) => Some((current, false)),
             (None, None) => None,
@@ -437,13 +445,21 @@ impl AvailabilityIndexBuilder {
         // listing — from having its own conclusion refuse it. A look a slot already
         // holds is left alone, so a refresh that redeclares what it read discarded
         // nothing and reports no out-of-order arrival.
-        if let Some(current) = current
-            && entry.discovery.as_ref() != Some(&current)
-            && !Self::admit(entry, current)
-        {
-            self.superseded += 1;
+        let mut already_judged = None;
+        if let Some(current) = current {
+            if entry.discovery.as_ref() == Some(&current) {
+                already_judged = Some(current);
+            } else {
+                already_judged = Some(current.clone());
+                if !Self::admit(entry, current) {
+                    self.superseded += 1;
+                }
+            }
         }
+        // One refused look counts once, so a record carrying the same look in both
+        // slots — the shape after any complete listing — is judged once.
         if let Some(retained) = retained
+            && Some(&retained) != already_judged.as_ref()
             && entry.last_known_good.as_ref() != Some(&retained)
             && !Self::retain(entry, &retained)
         {

@@ -170,6 +170,12 @@ impl DecidedBy {
     /// They are not reported as [`Self::NoRecord`] either: "nothing is known" and
     /// "you are not being told which dimension decided" are different statements,
     /// and conflating them would make a coarsened verdict unreadable.
+    ///
+    /// Necessary rather than sufficient: [`Availability::for_scope`] also withholds
+    /// a dimension whose *reason* had to be coarsened, because naming it would
+    /// disclose what withholding the code was meant to withhold — an undecided
+    /// policy is the deployment's own failure even though a policy *refusal* is the
+    /// tenant's business.
     pub const fn is_tenant_visible(self) -> bool {
         matches!(
             self,
@@ -411,7 +417,11 @@ impl Availability {
             StatusScope::Namespace => Self {
                 state: self.state,
                 reason: self.reason.for_scope(scope),
-                decided_by: if self.decided_by.is_tenant_visible() {
+                // A withheld reason withholds its dimension too, or naming the
+                // dimension would undo the coarsening: an undecided policy is the
+                // deployment's own failure, and `unknown` *by policy* says so as
+                // plainly as the code would.
+                decided_by: if self.decided_by.is_tenant_visible() && self.reason.is_tenant_safe() {
                     self.decided_by
                 } else {
                     DecidedBy::Undisclosed

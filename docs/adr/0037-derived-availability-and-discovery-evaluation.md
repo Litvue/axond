@@ -138,7 +138,10 @@ A namespace-scoped verdict additionally coarsens the reasons that describe the
 deployment's own machinery — how discovery is performed, how this replica is
 faring — to `unspecified` and drops the discovery source; what a tenant keeps is
 its own state, whether it rests on last-known-good evidence, and when that
-evidence expires.
+evidence expires. A verdict whose reason is withheld withholds its deciding
+dimension too, because naming the dimension would disclose what withholding the
+code was for: a policy engine that could not decide is the deployment's own
+failure, while a policy *refusal* is the tenant's business and keeps its name.
 
 **A reload re-projects availability or re-derives it; it never inherits it
 silently.** `ConfigSnapshot::build` always yields the empty index, and
