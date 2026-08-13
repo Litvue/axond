@@ -245,13 +245,20 @@ impl DeploymentKek {
         let nonce = self.nonce()?;
 
         let mut wrapped_dek = dek.to_vec();
-        self.key
+        let wrapped = self
+            .key
             .seal_in_place_append_tag(
                 Nonce::assume_unique_for_key(dek_nonce),
                 Aad::from(dek_aad(owner, reference)),
                 &mut wrapped_dek,
             )
-            .map_err(|_| EnvelopeError::Unopenable)?;
+            .map_err(|_| EnvelopeError::Unopenable);
+        if wrapped.is_err() {
+            // The buffer still holds the DEK in the clear until the tag is
+            // appended over it.
+            wrapped_dek.zeroize();
+            return Err(EnvelopeError::Unopenable);
+        }
 
         let data_key = LessSafeKey::new(
             UnboundKey::new(&AES_256_GCM, dek).map_err(|_| EnvelopeError::Random)?,

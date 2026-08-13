@@ -55,9 +55,10 @@ rather than aspirational:
   `(secret_id, version)`; rotation inserts the next version and never updates
   sealed bytes. Overlap is therefore structural: a revision compiled against
   version 2 keeps resolving version 2 while version 3 is staged and proven.
-- **Ownership is a predicate on every statement.** Reads match tenant and project
-  exactly, and a row this owner does not own answers exactly as an absent one
-  does — distinguishable only in this process's own logs, so the store cannot be
+- **Ownership is checked on every read.** A statement keys on the reference and
+  returns the row's owner columns, which are matched against the caller's tenant
+  and project exactly; a row this owner does not own answers exactly as an absent
+  one does — distinguishable only in this process's own logs, so the store cannot be
   used to enumerate other tenants' material.
 - **Tombstoning destroys bytes in the transaction that records it.** The
   lifecycle move and the `NULL`ing of the sealed columns are one statement, and

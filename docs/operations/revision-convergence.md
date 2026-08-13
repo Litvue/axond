@@ -397,6 +397,12 @@ The refusal reason is the triage key.
   down. Material a serving snapshot already holds is unaffected — the replica keeps
   serving it, because a candidate is compiled in full before anything is published
   ([ADR 0038](../adr/0038-envelope-encrypted-secret-store-and-snapshot-time-resolution.md)).
+  A *booting* replica is stricter than a serving one here, and deliberately: an
+  unreachable control plane falls back to the last-known-good cache, but an
+  unreachable secret store fails the boot outright, because the cached revision
+  needs the same material the live one does and a replica that started without it
+  would serve nothing. Treat a secret store as a boot dependency of a stateful
+  replica, like the control plane's database — scale-out waits on it.
 - **`projection`** — a candidate this build cannot project: a resource body it
   does not read, or a bootstrap that is missing something projection may not
   supply for it (today, a default namespace). Roll the replica forward, publish a

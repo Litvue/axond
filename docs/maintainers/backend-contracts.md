@@ -169,7 +169,8 @@ itself sealed under the deployment KEK `[secret_store]` references
 ([ADR 0038](../adr/0038-envelope-encrypted-secret-store-and-snapshot-time-resolution.md)).
 Three invariants there are what make the domain above enforceable, and a second
 implementation has to reproduce them: a version is a row written once, ownership is
-a predicate on every statement (another owner's row answers as an absent one),
+checked against the row's own owner columns on every read (another owner's row
+answers as an absent one),
 and tombstoning destroys the sealed bytes in the transaction that records it. The
 seal binds the scheme, the owner, and the exact reference as associated data, so
 ciphertext moved between rows or tenants does not open.

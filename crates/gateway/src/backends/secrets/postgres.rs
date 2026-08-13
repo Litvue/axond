@@ -15,11 +15,13 @@
 //!   updates sealed bytes. A revision compiled against version 2 therefore keeps
 //!   resolving version 2 while version 3 is staged and proven — the overlap a
 //!   zero-downtime rotation is made of.
-//! - **Ownership is a predicate on every statement.** Reads match the tenant and
-//!   the project exactly, and a row this owner does not own answers exactly as an
-//!   absent one does ([`SecretError::NotFound`] to a caller, distinguishable only
-//!   in this process's own logs). The seal is bound to the owner as well, so a row
-//!   moved between tenants in the database does not open.
+//! - **Ownership is checked on every read.** A statement keys on the reference and
+//!   returns the row's own owner columns, which are then matched against the
+//!   caller's tenant and project exactly — so the check cannot be skipped by
+//!   writing a query that forgets a predicate. A row this owner does not own
+//!   answers exactly as an absent one does ([`SecretError::NotFound`] to a caller,
+//!   distinguishable only in this process's own logs). The seal is bound to the
+//!   owner as well, so a row moved between tenants in the database does not open.
 //! - **Tombstoning destroys bytes in the transaction that records it.** The
 //!   lifecycle move and the `NULL`ing of the four sealed columns are one
 //!   statement, and the shipped DDL's check constraint refuses any other

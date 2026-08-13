@@ -96,3 +96,27 @@ fn the_two_copies_of_each_shipped_ddl_file_are_byte_identical() {
         );
     }
 }
+
+/// A shipped DDL header is an operator's route into the reasoning behind the
+/// schema, and ADR 0009 forbids editing the file once it has been applied — so a
+/// pointer at an ADR that does not exist (a number two branches both claimed, a
+/// renamed file) is a mistake this gate has to catch before the file freezes.
+#[test]
+fn every_adr_a_shipped_ddl_file_cites_exists() {
+    let adr_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/adr");
+
+    for (name, contents) in sql_files(&operator_dir()) {
+        let text = String::from_utf8(contents).unwrap_or_else(|_| panic!("{name} is not UTF-8"));
+        for cited in text
+            .split("docs/adr/")
+            .skip(1)
+            .filter_map(|rest| rest.split(|c: char| c.is_whitespace() || c == ')').next())
+            .map(|cited| cited.trim_end_matches(['.', ',']))
+        {
+            assert!(
+                adr_dir.join(cited).exists(),
+                "ops/postgres/{name} cites docs/adr/{cited}, which does not exist"
+            );
+        }
+    }
+}

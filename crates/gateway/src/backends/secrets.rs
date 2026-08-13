@@ -49,6 +49,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use secrecy::zeroize::Zeroize;
 use secrecy::{ExposeSecret, SecretString};
 
 use super::{BackendFailure, BackendKind, Capabilities, Capability, FailureCategory};
@@ -384,12 +385,16 @@ fn dsn(
     control_plane: &crate::config::ControlPlane,
     env: &HashMap<String, String>,
 ) -> Result<String, SecretError> {
-    let name = secret_store
-        .dsn_env
-        .as_deref()
-        .or(control_plane.dsn_env.as_deref())
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
+    fn named(name: &Option<String>) -> Option<&str> {
+        name.as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+    // Each candidate is trimmed before it is considered, so a blank
+    // `[secret_store] dsn_env` inherits the control plane's — the same reading
+    // configuration validation takes.
+    let name = named(&secret_store.dsn_env)
+        .or_else(|| named(&control_plane.dsn_env))
         .ok_or_else(|| {
             denied("no `dsn_env` names the secret store's connection string".to_owned())
         })?;
@@ -408,9 +413,10 @@ fn deployment_kek(
         denied("`[secret_store]` names no key-encryption key to unwrap material with".to_owned())
     })?;
     let reference = KekRef(format!("{source}:{name}"));
-    // Read into a value that is dropped before this function returns either way;
-    // `DeploymentKek::parse` zeroizes what it decodes from it.
-    let encoded = match source {
+    // The encoded key is zeroized on every path out of here, including the
+    // failing ones: `DeploymentKek::parse` only owns what it decodes, not the
+    // encoding this function read.
+    let mut encoded = match source {
         "kek_env" => env
             .get(name)
             .cloned()
@@ -419,8 +425,10 @@ fn deployment_kek(
             .map_err(|error| denied(format!("`{name}` could not be read: {error}")))?,
     };
     // The failure names the reference and the reason, never the material.
-    envelope::DeploymentKek::parse(reference, &encoded)
-        .map_err(|error| denied(format!("the deployment KEK is unusable: {error}")))
+    let kek = envelope::DeploymentKek::parse(reference, &encoded)
+        .map_err(|error| denied(format!("the deployment KEK is unusable: {error}")));
+    encoded.zeroize();
+    kek
 }
 
 /// A refusal that names the backend, and never the value it was reading.
@@ -963,6 +971,27 @@ mod tests {
             dsn(&inheriting, &control_plane(), &env).expect("the inherited reference"),
             "postgres://inherited"
         );
+    }
+
+    /// A blank reference is an absent one, the reading configuration validation
+    /// takes — otherwise a section validation accepted would refuse to boot.
+    #[test]
+    fn a_blank_reference_inherits_the_control_plane_s_instead_of_refusing() {
+        let env = HashMap::from([(
+            "AXOND_CONTROL_PLANE_DSN".to_owned(),
+            "postgres://inherited".to_owned(),
+        )]);
+        for blank in ["", "   ", "\n"] {
+            let section = crate::config::SecretStore {
+                dsn_env: Some(blank.to_owned()),
+                ..section()
+            };
+            assert_eq!(
+                dsn(&section, &control_plane(), &env).expect("the inherited reference"),
+                "postgres://inherited",
+                "a `dsn_env` of {blank:?} should inherit"
+            );
+        }
     }
 
     /// An unset reference is a refusal that names the variable and never a value.

@@ -1,5 +1,5 @@
 -- Axond secret store schema, version 1 — envelope-encrypted provider credential
--- material (docs/adr/0036-envelope-encrypted-secret-store.md).
+-- material (docs/adr/0038-envelope-encrypted-secret-store-and-snapshot-time-resolution.md).
 --
 -- One row per *version* of a secret. A version is immutable: rotation inserts
 -- the next version, it never updates this row's bytes, so a revision compiled
@@ -74,9 +74,10 @@ CREATE TABLE IF NOT EXISTS axond_secret (
     )
 );
 
--- One secret belongs to one owner, and every read is scoped by that owner. The
--- index serves the ownership predicate; the primary key serves the reference.
-CREATE INDEX IF NOT EXISTS axond_secret_owner_idx
-    ON axond_secret (tenant_id, project_id, secret_id);
+-- No index on the owner columns: every statement here keys on the reference
+-- through the primary key and checks the owner columns it read, so an owner index
+-- would be unused weight on the write path. An owner-scoped listing, where the
+-- reference is not known up front, arrives with the index it needs in a later
+-- `secret_store_v<N>.sql`.
 
 COMMIT;
