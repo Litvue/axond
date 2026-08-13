@@ -162,10 +162,16 @@ def check_stale_claims(files: list[Path]) -> list[str]:
         "refuses to start until the control-plane": STATEFUL_BOOTS,
         "refuses to start rather than serve an empty snapshot": STATEFUL_BOOTS,
         "boot still refuses to start": STATEFUL_BOOTS,
+        "refuses to serve an empty snapshot": STATEFUL_BOOTS,
+        "declines a stateful config": STATEFUL_BOOTS,
+        "never serves an empty snapshot": STATEFUL_BOOTS,
     }
     failures: list[str] = []
     # Beyond Markdown, because this claim is made in an operator's config, in the
-    # gate that asserts it, and in the module docs of the slice that retires it.
+    # gates that assert it, and in the module docs of the slice that retires it. A
+    # test is the worst place for it to survive: a scenario naming the retired
+    # rule keeps passing for a reason that no longer holds, which is how the
+    # phrase came back the last time.
     for source in files + [
         ROOT / "axond.example.toml",
         ROOT / "axond.stateful.example.toml",
@@ -173,6 +179,8 @@ def check_stale_claims(files: list[Path]) -> list[str]:
         ROOT / "ops/tier0-gate.sh",
         ROOT / "tests/tier0/axond.stateful-bootstrap.toml",
         ROOT / "crates/gateway/src/convergence/mod.rs",
+        ROOT / "crates/gateway/tests/stateful_integration.rs",
+        ROOT / "crates/gateway/tests/support/stateful.rs",
     ]:
         text = source.read_text(encoding="utf-8")
         for phrase, reason in forbidden.items():

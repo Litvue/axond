@@ -12,11 +12,12 @@
 //! process.** Not when its dependencies merged, and not when a type exists.
 //!
 //! **A `Blocked` gate still runs.** Its scenario asserts the standing refusal:
-//! `serve` declines a stateful config rather than serving the empty snapshot an
-//! unread control plane would leave behind. That refusal is what makes the
-//! unproven gates safe, so it is the thing worth testing until each one is
-//! wired — and when the wiring lands, the scenario fails here and has to be
-//! rewritten into the real assertion instead of quietly passing.
+//! a stateful replica boots and serves `/admin/v1`, and refuses *inference*
+//! rather than serving the empty snapshot an uncompiled revision would leave
+//! behind. That refusal is what makes the unproven gates safe, so it is the
+//! thing worth testing until each one is wired — and when convergence lands,
+//! the scenario fails here and has to be rewritten into the real assertion
+//! instead of quietly passing.
 //!
 //! The gate table below and the matrix in
 //! `docs/operations/stateful-integration.md` are checked against each other, so
@@ -63,10 +64,11 @@ struct Gate {
 const GATES: &[Gate] = &[
     Gate {
         id: "IG-01",
-        status: Status::Blocked,
+        status: Status::Wired,
         scenarios: &[
             "stateless_boot_serves_with_no_control_plane",
-            "stateful_boot_refuses_to_serve_an_empty_snapshot",
+            "stateful_boot_serves_administration_and_refuses_inference",
+            "stateful_boot_refuses_an_unresolved_reference",
         ],
     },
     Gate {
@@ -215,8 +217,8 @@ fn every_gate_has_a_scenario_that_exists() {
 
 // ── The standing refusal every blocked gate rests on ─────────────────────────
 
-/// A complete stateful bootstrap whose references are satisfied — the config
-/// closest to a production one that can exist before the control plane is wired.
+/// A complete stateful bootstrap whose references are satisfied, pointed at no
+/// database — enough for the checks that only resolve references and report.
 fn stateful_bootstrap() -> (PathBuf, BTreeMap<&'static str, String>, SocketAddr) {
     let bind = stateful::free_addr();
     let config = stateful::private_config(
@@ -238,9 +240,10 @@ fn stateful_bootstrap() -> (PathBuf, BTreeMap<&'static str, String>, SocketAddr)
             breakglass = stateful::BREAKGLASS_ENV,
         ),
     );
-    // A DSN that resolves but points nowhere: the refusal must come from the
-    // missing wiring, not from an unreachable database, so the scenario cannot
-    // pass for the wrong reason.
+    // A DSN that resolves but points nowhere. `check preflight` reads and
+    // reports rather than serving, so it reaches its serving line whether or not
+    // a database answers; the scenarios that need a live control plane use the
+    // migrated [`ControlPlane`] fixture instead.
     let env = BTreeMap::from([
         (
             stateful::DSN_ENV,
@@ -258,19 +261,21 @@ fn stateful_bootstrap() -> (PathBuf, BTreeMap<&'static str, String>, SocketAddr)
     (config, env, bind)
 }
 
-/// `serve` still declines a stateful config, so a gate that depends on stateful
-/// serving cannot be silently unproven: nothing serves.
+/// A stateful deployment still refuses *inference*, so a gate that depends on a
+/// revision reaching the request path cannot be silently unproven: a replica
+/// administers, and nothing it is told to serve is served.
 ///
-/// Every blocked gate asserts this. When the wiring lands, these assertions fail
-/// — which is the point: each gate is then rewritten into the property it was
-/// always meant to prove, and its matrix row moves with it.
+/// Every blocked gate asserts this, through the operator-facing report of it:
+/// `check preflight` fails on its `serving` line. When convergence lands, these
+/// assertions fail — which is the point: each gate is then rewritten into the
+/// property it was always meant to prove, and its matrix row moves with it.
 fn stateful_serving_is_still_refused(gate: &str) {
     let (config, env, _bind) = stateful_bootstrap();
     let run = stateful::run(&config, &["check", "preflight"], &env);
     assert!(
         !run.succeeded(),
-        "{gate}: `serve` no longer refuses a stateful config, so this gate's real scenario is now \
-         possible and required. Rewrite it and move its row in \
+        "{gate}: a stateful deployment no longer refuses inference, so this gate's real scenario is \
+         now possible and required. Rewrite it and move its row in \
          docs/operations/stateful-integration.md.\n{}",
         run.context()
     );
@@ -307,9 +312,97 @@ async fn stateless_boot_serves_with_no_control_plane() {
     );
 }
 
+/// The other half of IG-01: a stateful bootstrap *reaches* its control plane,
+/// and what it will not do is serve inference from a snapshot it does not have.
+///
+/// This is the property, not a placeholder for one: administration is how
+/// durable desired state is written at all, so a replica that could not serve
+/// `/admin/v1` would leave stateful mode unusable, and a replica that answered
+/// inference here would be answering from an empty snapshot. Both halves are
+/// asserted on one running process, because either alone is satisfied by a
+/// deployment that is broken in the opposite direction.
+#[tokio::test]
+async fn stateful_boot_serves_administration_and_refuses_inference() {
+    let Some(control_plane) = ControlPlane::create().await else {
+        eprintln!("skipping: AXOND_TEST_POSTGRES_DSN is not set");
+        return;
+    };
+    let migrated = control_plane.run(&["migrate", "apply"]);
+    assert!(
+        migrated.succeeded(),
+        "a replica opens the control plane at boot, so this scenario needs it migrated:\n{}",
+        migrated.context()
+    );
+    let replica = control_plane.serve().await;
+
+    // 1. The administrative surface is served and authenticated. An unauthorized
+    //    read is the strongest evidence a scenario without an OIDC provider can
+    //    state without holding a credential: `401` in the administrative error
+    //    envelope means the surface is mounted, reached, and gated — where a
+    //    stateless replica answers the same path `stateful_mode_required`, and an
+    //    unmounted one would answer axum's empty 404.
+    let unauthorized = client()
+        .get(replica.url("/admin/v1/state"))
+        .send()
+        .await
+        .expect("a response");
+    assert_eq!(
+        unauthorized.status(),
+        401,
+        "a stateful replica serves `/admin/v1` and authenticates it:\n{}",
+        replica.output()
+    );
+    let envelope: serde_json::Value = unauthorized.json().await.expect("an error envelope");
+    assert_eq!(
+        envelope["error"]["type"], "admin_unauthenticated",
+        "the refusal must be the administrative surface's own, rather than a mode refusal or the \
+         router's:\n{envelope}"
+    );
+
+    // 2. Inference refuses, per request, naming itself — not by failing to boot,
+    //    and not by pretending an empty configuration is a catalogue.
+    let readyz = client()
+        .get(replica.url("/readyz"))
+        .send()
+        .await
+        .expect("a response");
+    assert_eq!(
+        readyz.status(),
+        503,
+        "readiness reflects convergence: a replica serving no revision is not ready:\n{}",
+        replica.output()
+    );
+    let models = client()
+        .get(replica.url("/v1/models"))
+        .send()
+        .await
+        .expect("a response");
+    assert_eq!(
+        models.status(),
+        503,
+        "an unconverged replica must refuse inference rather than serve an empty snapshot:\n{}",
+        replica.output()
+    );
+    let refusal: serde_json::Value = models.json().await.expect("an error envelope");
+    assert_eq!(
+        refusal["error"]["type"], "inference_unavailable",
+        "the refusal must name itself, so a caller can tell it from an outage:\n{refusal}"
+    );
+}
+
+/// The loud failure IG-01 also promises: a reference the deployment names and
+/// the environment does not hold stops the boot, before anything is served.
+///
+/// The refusal must name the unresolved reference. A stateful replica does boot
+/// now, so a nonzero exit that named nothing could be an unreachable database
+/// instead — which would leave this scenario passing for a reason it does not
+/// state, and passing on a day the bootstrap check had regressed.
 #[test]
-fn stateful_boot_refuses_to_serve_an_empty_snapshot() {
-    let (config, env, bind) = stateful_bootstrap();
+fn stateful_boot_refuses_an_unresolved_reference() {
+    // The references the config names are deliberately left out of the
+    // environment, and nothing else is in it either: an inherited DSN would let
+    // this boot get as far as a connection.
+    let (config, _references, bind) = stateful_bootstrap();
     let mut command = std::process::Command::new(stateful::axond());
     command
         .env_clear()
@@ -318,9 +411,6 @@ fn stateful_boot_refuses_to_serve_an_empty_snapshot() {
         .stderr(Stdio::piped());
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
-    }
-    for (key, value) in &env {
-        command.env(key, value);
     }
     let mut child = command.spawn().expect("the axond binary runs");
 
@@ -345,8 +435,8 @@ fn stateful_boot_refuses_to_serve_an_empty_snapshot() {
         .collect();
 
     // A refusal exits immediately. Waiting without a deadline would instead hang
-    // the suite for as long as CI allows on the day `serve` learns to boot
-    // statefully — the very change this scenario exists to catch.
+    // the suite for as long as CI allows on the day an unresolved reference stops
+    // being fatal — the very change this scenario exists to catch.
     let deadline = Instant::now() + Duration::from_secs(20);
     let status = loop {
         match child.try_wait().expect("the child's status is readable") {
@@ -365,19 +455,22 @@ fn stateful_boot_refuses_to_serve_an_empty_snapshot() {
         .collect();
     let status = status.unwrap_or_else(|| {
         panic!(
-            "IG-01: a stateful boot kept running instead of refusing, so this gate's real scenario \
-             is now possible and required. Rewrite it and move its row in \
-             docs/operations/stateful-integration.md.\n{reported}"
+            "IG-01: a stateful boot kept running with every reference it names unset, so a \
+             deployment can start unadministrable.\n{reported}"
         )
     });
 
     assert!(
         !status.success(),
-        "a stateful replica must refuse to start rather than serve an empty snapshot:\n{reported}"
+        "a stateful replica must refuse to start rather than serve an unadministrable \
+         deployment:\n{reported}"
     );
     assert!(
-        reported.contains("stateful"),
-        "the refusal must name the mode it refuses, so an operator can act on it:\n{reported}"
+        reported.contains(stateful::DSN_ENV)
+            || reported.contains(stateful::KEK_ENV)
+            || reported.contains(stateful::BREAKGLASS_ENV),
+        "the refusal must name the unresolved reference, or it is not evidence that boot stopped \
+         at the reference rather than at a connection:\n{reported}"
     );
     // The child's own report, not a probe of `bind`: an ephemeral port is free
     // the moment the fixture reserves it, so a sibling test that binds the same
