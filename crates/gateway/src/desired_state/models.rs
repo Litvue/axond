@@ -95,14 +95,20 @@
 //!
 //! # Bodies published before this slice
 //!
-//! An enablement or alias row whose body declares no `schema` at all is a row
-//! written before these bodies were typed. It is skipped rather than refused, for
-//! the same reason [`Tenancy::of`](super::tenancy::Tenancy) does not require every
-//! tenant-scoped resource to name a declared tenant: hydration runs these rules,
-//! so refusing such a row would stop an existing revision from loading on
-//! upgrade. A body that *does* declare a schema is held to it exactly — an
-//! identifier this build does not read is a typed compatibility refusal
-//! ([`ModelError::Schema`]), never a field-by-field guess.
+//! An *alias* row whose body declares no `schema` at all is a row written before
+//! these bodies were typed. It is skipped rather than refused, because hydration
+//! runs these rules and refusing such a row would stop an existing revision from
+//! loading on upgrade.
+//!
+//! An *enablement* has no such history — no release ever wrote one — so an
+//! untyped enablement body is refused rather than skipped. Skipping it would be
+//! an entitlement hole and not an upgrade accommodation: a row nothing reads is
+//! also a row nothing binds to a scope, pins to a snapshot, or holds to one
+//! enablement per offering.
+//!
+//! A body that declares a schema is held to it exactly — an identifier this build
+//! does not read is a typed compatibility refusal ([`ModelError::Schema`]), never
+//! a field-by-field guess.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -1696,14 +1702,14 @@ impl Models {
     /// once per scope, and that every alias resolves — in order, within its own
     /// reach, and in one wire family.
     ///
-    /// A row whose body declares no `schema` is skipped rather than refused; see
-    /// the module documentation for why an untyped enablement or alias is a
-    /// revision published before this slice rather than damage.
+    /// An *alias* row whose body declares no `schema` is skipped rather than
+    /// refused, because such rows predate this slice; an untyped *enablement* is
+    /// refused, because none was ever published. See the module documentation.
     pub fn of(state: &DesiredState) -> Result<Self, ModelError> {
         let mut models = Self::default();
         for resource in state.resources() {
             match resource.reference.kind {
-                ResourceKind::ModelEnablement if is_typed(resource) => {
+                ResourceKind::ModelEnablement => {
                     let body = ModelEnablementBody::read(resource)?;
                     models.enablements.insert(
                         body.enablement(),
@@ -1867,8 +1873,8 @@ impl Models {
     }
 }
 
-/// Whether a body declares a schema at all, and is therefore a body this slice
-/// reads strictly rather than a row written before it.
+/// Whether an alias body declares a schema at all, and is therefore a body this
+/// slice reads strictly rather than a row written before it.
 fn is_typed(resource: &ResourceVersion) -> bool {
     let ResourceBody::Inline(CanonicalValue::Map(fields)) = &resource.body else {
         return false;
@@ -2705,7 +2711,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_published_before_this_slice_still_load() {
+    fn alias_rows_published_before_this_slice_still_load() {
         // `state` carries an untyped alias, as a build predating typed model
         // bodies wrote it: skipped rather than refused, so an existing revision
         // keeps hydrating on upgrade.
@@ -2716,6 +2722,44 @@ mod tests {
         let models = Models::of(&state).unwrap();
         assert_eq!(models.aliases().len(), 0);
         assert_eq!(models.enablements().len(), 0);
+    }
+
+    #[test]
+    fn an_untyped_enablement_is_refused_rather_than_skipped() {
+        // No release ever wrote an untyped enablement, so skipping one would be an
+        // entitlement hole: a row nothing reads is a row nothing binds to a scope
+        // or pins to a snapshot.
+        let typed = state_with_models();
+        let mut state = DesiredState::new();
+        for blob in typed.blobs() {
+            state.declare_blob(*blob);
+        }
+        for resource in typed.resources() {
+            let resource = if resource.reference.kind == ResourceKind::ModelEnablement {
+                with_fields(resource, |fields| {
+                    fields.retain(|(field, _)| field != SCHEMA_FIELD);
+                })
+            } else {
+                resource.clone()
+            };
+            state.insert(resource).expect("distinct references");
+        }
+
+        let error = Models::of(&state).expect_err("an untyped enablement is refused");
+        assert!(
+            matches!(
+                error,
+                ModelError::MissingField {
+                    field: SCHEMA_FIELD,
+                    ..
+                }
+            ),
+            "{error} should name the missing schema"
+        );
+        assert!(
+            error.is_incompatible(),
+            "a body with no schema is a compatibility refusal, not corruption"
+        );
     }
 
     #[test]
