@@ -1014,8 +1014,10 @@ def self_test() -> int:
 
     self_migrating = copy.deepcopy(stateful)
     config = one(self_migrating, "ConfigMap")
+    # The first occurrence only: the table header ends `[control_plane]`, and a
+    # comment further down may mention the same name without opening a table.
     config["data"]["axond.toml"] = config["data"]["axond.toml"].replace(
-        "[secret_store]", "migrate = true\n\n[secret_store]"
+        "[secret_store]", "migrate = true\n\n[secret_store]", 1
     )
     expect_failure("replicas allowed to migrate at boot", check_stateful(self_migrating))
 
