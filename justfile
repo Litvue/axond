@@ -38,6 +38,7 @@ docs:
 docs-check:
     python3 ops/check-docs.py --self-test
     python3 ops/check-docs.py
+    python3 ops/check-release-config.py --self-test
     python3 ops/check-release-config.py
     sh -n install.sh
     bash -n ops/publish-image-index.sh

@@ -123,12 +123,11 @@ table has a `binary-smoke` lane on a runner of its own platform.
 
 `ghcr.io/litvue/axond:<version>` and `:sha-<short>` resolve to a
 multi-architecture index containing `linux/amd64` and `linux/arm64`, so one
-pinned digest deploys on either architecture. That index is published from the
-next release onward; every release up to and including the current quickstart tag
-published a single `linux/amd64` image, and ARM hosts run those under emulation
-([architecture
-selection](./deployment/docker-compose.md#architecture-selection)). Single-platform references remain
-available as `:<version>-amd64` and `:<version>-arm64`. There is no `latest`
+pinned digest deploys on either architecture, resolving the native child rather
+than emulating one ([architecture
+selection](./deployment/docker-compose.md#architecture-selection)). Releases up to
+and including 0.3.17 published a single `linux/amd64` image. Single-platform
+references remain available as `:<version>-amd64` and `:<version>-arm64`. There is no `latest`
 tag, and adding one is not planned.
 
 Every archive carries a SHA-256 sidecar, an SPDX SBOM, and provenance/SBOM

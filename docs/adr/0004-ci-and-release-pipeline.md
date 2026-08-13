@@ -144,15 +144,20 @@ sidecar and GitHub provenance/SBOM attestations, as before; signing archives
 would be a separate decision with its own verification story for installers.
 
 The Compose quickstart pins a release tag, so it cannot become multi-architecture
-before the release does. Its `platform:` default therefore stays
-`linux/amd64` — overridable through `AXOND_PLATFORM` — while the pinned tag is an
-amd64-only release, so an ARM host keeps running it under emulation instead of
-failing to pull an image with no ARM child. The validator below requires that
-fallback while the pinned tag is amd64-only, and asks for its removal — as a
-note, not a failure — once the tag moves past the last amd64-only version:
+before the release does. The pinned tag is now an index, so the quickstart sets no
+`platform:` default at all and each host resolves its own child;
+`AXOND_PLATFORM` forces one platform where that is wanted.
+
+Historically that default was `linux/amd64`, because releases up to and including
+0.3.17 published a single amd64 image and dropping the pin would have left an ARM
+host unable to pull the tag at all. The same rule applies again if the pin is ever
+moved back onto such a release: the validator below *requires* the fallback while
+the pinned tag is amd64-only, and once the tag moves past the last amd64-only
+version it asks for the fallback's removal as a note rather than a failure —
 release-please rewrites that tag inside its own release pull request and never
-touches the `platform:` line, so a failure there would block the release itself.
-Dropping the fallback is therefore a documented post-release step.
+touches the `platform:` line, so failing there would block the release itself.
+Dropping the fallback was therefore a post-release step, taken after 0.3.18
+published the first index.
 
 Because the release matrix is only exercised for real at a tag,
 `ops/check-release-config.py` asserts its shape on every change: the published

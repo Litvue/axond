@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Prove the Compose architecture selection behaves in every mode operators use.
 #
-# The quickstart pins a release tag, and until a multi-architecture release
-# exists that tag has no ARM child: dropping the platform default outright would
-# turn `docker compose up` on an ARM host from "slow, emulated" into "cannot
-# pull". So the default is deliberately overridable rather than absent, and both
-# ends of the transition are asserted here — the fallback that keeps today's
-# amd64-only tag runnable, and the unpinned resolution a multi-architecture tag
-# needs to run natively.
+# The quickstart pins a release tag. While that tag is an amd64-only release it
+# has no ARM child, so dropping the platform default outright would turn
+# `docker compose up` on an ARM host from "slow, emulated" into "cannot pull". So
+# the default is deliberately overridable rather than absent, and both ends of
+# that transition are asserted here — the unpinned resolution a
+# multi-architecture tag needs to run natively, and the fallback that keeps an
+# amd64-only tag runnable.
 #
 # Whether the default *should* currently be the fallback or unpinned is
 # ops/check-release-config.py's decision, keyed to the pinned tag; this script
@@ -64,15 +64,32 @@ expect_platform() {
   printf 'compose platform: %s -> %s\n' "$label" "${actual:-unpinned (native)}"
 }
 
+# The declared line is read before its default, because an absent or reshaped
+# `platform:` line yields the same empty string as the unpinned default and would
+# make the assertions below vacuous: two of them expect exactly that.
 # shellcheck disable=SC2016  # the Compose interpolation is matched literally
-declared_default="$(
-  sed -n 's/^[[:space:]]*platform: \${AXOND_PLATFORM-\(.*\)}$/\1/p' docker-compose.yml
+declared_line="$(
+  sed -n 's/^[[:space:]]*\(platform: \${AXOND_PLATFORM-.*}\)$/\1/p' docker-compose.yml
 )"
+if [[ "$(printf '%s' "$declared_line" | grep -c .)" != 1 ]]; then
+  # shellcheck disable=SC2016  # the Compose interpolation is quoted literally
+  printf 'compose platform check failed: docker-compose.yml does not declare exactly one overridable `platform: ${AXOND_PLATFORM-...}` default\n' >&2
+  exit 1
+fi
+declared_default="${declared_line#platform: \$\{AXOND_PLATFORM-}"
+declared_default="${declared_default%\}}"
 
-# 1. Unset: the file's own default applies. With an amd64-only pinned tag that is
-#    `linux/amd64`, which an ARM host runs under emulation instead of failing.
-expect_platform "quickstart, AXOND_PLATFORM unset" "$declared_default" \
-  unset "${compose[@]}"
+# 1. Unset: the file's own default applies. With a multi-architecture pinned tag
+#    that default is empty, so every host resolves its own child of the index;
+#    with an amd64-only tag it is `linux/amd64`, which an ARM host runs under
+#    emulation instead of failing to pull.
+if [[ -z "$declared_default" ]]; then
+  expect_platform "quickstart, AXOND_PLATFORM unset (multi-arch native)" "" \
+    unset "${compose[@]}"
+else
+  expect_platform "quickstart, AXOND_PLATFORM unset (amd64 fallback)" \
+    "$declared_default" unset "${compose[@]}"
+fi
 
 # 2. Set but empty: no pin, so Docker resolves the native child of an index. This
 #    is what an ARM host uses once a multi-architecture tag or digest is pinned.

@@ -107,9 +107,8 @@ For a managed Linux service, use the complete
 ## Running the container image
 
 The OCI image is public, distroless, non-root, signed, attested, and published as
-a `linux/amd64` + `linux/arm64` index from the next release onward — releases up
-to and including the currently pinned quickstart tag are `linux/amd64` only. It
-has no `latest` tag and ships no config. Verify and pin a digest as described in the
+a `linux/amd64` + `linux/arm64` index, so it runs natively on either
+architecture. It has no `latest` tag and ships no config. Verify and pin a digest as described in the
 [container guide](./deployment/container.md).
 
 ## Environment variables
