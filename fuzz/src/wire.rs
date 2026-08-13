@@ -48,6 +48,11 @@ pub const PROVIDER_URL_CANARY: &str = "https://fuzz-upstream.provider.invalid/v1
 /// The longest a diagnostic may be once bounding has been applied.
 const DIAGNOSTIC_CEILING: usize = MAX_DIAGNOSTIC_BYTES + DIAGNOSTIC_TRUNCATION_MARKER.len();
 
+/// How far back a scan must reach to catch a delimiter that straddles the join
+/// between what a push appended and what was already there: `\r\n\r\n` less its
+/// last byte.
+const DELIMITER_OVERLAP: usize = 3;
+
 /// Every code [`ProviderError::code`] may answer with. A code outside this set
 /// would reach a response body and a metric label unrecognized.
 const PROVIDER_ERROR_CODES: &[&str] = &[
@@ -181,8 +186,17 @@ fn drive(body: &str, boundaries: &[usize], max_buffer_bytes: usize) -> Run {
                 // Anything terminated has been emitted, so what is held is a
                 // partial event. A decoder retaining a complete one would grow
                 // without bound on a stream that never stops.
+                //
+                // Only the part of the buffer this push could have changed is
+                // scanned. The buffer grew by the chunk and shrank by whatever
+                // was drained, so everything below `len - chunk` was already
+                // scanned by an earlier push and cannot have been rewritten —
+                // `push` only appends and drains a prefix. That keeps the whole
+                // drive linear in the body rather than quadratic in the chunk
+                // count, so a slow input means a slow *decoder*.
+                let unscanned = tail(buffered, chunk.len() + DELIMITER_OVERLAP);
                 assert!(
-                    !buffered.contains("\n\n") && !buffered.contains("\r\n\r\n"),
+                    !unscanned.contains("\n\n") && !unscanned.contains("\r\n\r\n"),
                     "the decoder retained a complete event: {buffered:?}"
                 );
                 events.extend(decoded);
@@ -193,12 +207,32 @@ fn drive(body: &str, boundaries: &[usize], max_buffer_bytes: usize) -> Run {
             }
         }
     }
+    // One full scan of what survived the whole drive, so the incremental scans
+    // cannot hide a retained event behind a wrong assumption about what a push
+    // may rewrite. Once per drive, over a buffer the limit already caps — after
+    // a refusal the decoder is entitled to still hold the chunk it rejected.
+    if push_error.is_none() {
+        let buffered = decoder.fuzz_buffered();
+        assert!(
+            !buffered.contains("\n\n") && !buffered.contains("\r\n\r\n"),
+            "the decoder retained a complete event: {buffered:?}"
+        );
+    }
     let finish = decoder.finish();
     Run {
         events,
         push_error,
         finish,
     }
+}
+
+/// The last `bytes` of `text`, widened to the nearest character boundary below.
+fn tail(text: &str, bytes: usize) -> &str {
+    let mut start = text.len().saturating_sub(bytes);
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    &text[start..]
 }
 
 /// Turn arbitrary integers into sorted, deduplicated, character-aligned offsets
