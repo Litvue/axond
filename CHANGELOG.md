@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.3.34](https://github.com/Litvue/axond/compare/v0.3.33...v0.3.34) (2026-08-13)
+
+
+### Features
+
+* **catalog:** resolve a pinned offering against the snapshot it names ([#319](https://github.com/Litvue/axond/issues/319)) ([c27f169](https://github.com/Litvue/axond/commit/c27f1692809ccc61a05eec67cc543433b334bd69))
+* **models:** derive stateful availability and persist discovery evidence ([#302](https://github.com/Litvue/axond/issues/302)) ([de43bd9](https://github.com/Litvue/axond/commit/de43bd908ed61906905796185ac94084e3798e13))
+* **models:** give a tenant its own alias names and a management catalogue ([57cf3be](https://github.com/Litvue/axond/commit/57cf3be41c25fab0491058b267a513286695ded9))
+* **models:** give a tenant its own alias names and a management catalogue ([64a88be](https://github.com/Litvue/axond/commit/64a88be4e6a30873f0dcee346665143bbfb7b805))
+* **pricing:** activate effective-dated rates at boundaries ([c699fec](https://github.com/Litvue/axond/commit/c699fec0693b3293cbac2035caf2a5c691f75e16))
+* **pricing:** activate effective-dated rates at boundaries ([d55423e](https://github.com/Litvue/axond/commit/d55423ef867d08b35eea8f7877b6ed41837654dc))
+* **status:** observe the durable stores a replica opened ([c559cbf](https://github.com/Litvue/axond/commit/c559cbfa4f2b6bc53a74b14f98cbd3170f0eedf6))
+* **status:** observe the durable stores a replica opened ([#157](https://github.com/Litvue/axond/issues/157)) ([8f2fd2d](https://github.com/Litvue/axond/commit/8f2fd2dd207e7e711aa54ed25b2ae4667bce07ff))
+
+
+### Documentation
+
+* assign tenant catalogue ADR number ([afa3727](https://github.com/Litvue/axond/commit/afa3727743811a68f42497f71df4fd03b187cdfa))
+* **models:** link the offering type the catalogue seam names ([962c8da](https://github.com/Litvue/axond/commit/962c8da33b07b51f47690c17df3bb2555fc83f5e))
+
+
+### Tests
+
+* **auth:** make token expiry assertion race-free ([#326](https://github.com/Litvue/axond/issues/326)) ([d64f488](https://github.com/Litvue/axond/commit/d64f4888c18f55cb1780c85a9724a2880a183c8f))
+* **recovery:** pin durable inventory dependencies ([#328](https://github.com/Litvue/axond/issues/328)) ([e9081f7](https://github.com/Litvue/axond/commit/e9081f7b2949897282fea63da1b57501e6fa572b))
+* **security:** journal a tenant's usage events under its own namespace ([#313](https://github.com/Litvue/axond/issues/313)) ([9928a9c](https://github.com/Litvue/axond/commit/9928a9cdd79d5ee66cf368b4d7520d06b495e994))
+
 ## [0.3.33](https://github.com/Litvue/axond/compare/v0.3.32...v0.3.33) (2026-08-13)
 
 
