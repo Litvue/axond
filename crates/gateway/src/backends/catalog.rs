@@ -2311,7 +2311,10 @@ impl LastKnownGoodCatalog {
     /// token an intermediary can keep matching, leaving the catalogue on content
     /// it never received with every signal reading confirmed. A full response
     /// establishes validators legitimately, and this state ends at the first one.
-    fn can_confirm_unchanged(&self, asked_with: Option<&SourceValidators>) -> bool {
+    /// Public because durable state has to answer it too: a store that recorded
+    /// a confirmation this holder is about to refuse would be the one place a
+    /// deployment's staleness could read healthier than it is.
+    pub fn can_confirm_unchanged(&self, asked_with: Option<&SourceValidators>) -> bool {
         self.active.is_some() && asked_with.is_some_and(|validators| !validators.is_empty())
     }
 

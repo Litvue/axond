@@ -412,6 +412,12 @@ impl CatalogStore for PostgresCatalogStore {
                     )
                     .await
                     .map_err(|error| unavailable("retain a catalogue snapshot", &error))?;
+                // Re-activating the content already active carries the stated
+                // validators over the held ones, exactly as `confirm` does: a
+                // full answer whose bytes are the active content is the `304`
+                // case with a body, and an intermediary that stripped the
+                // `ETag` must not cost the deployment its conditional request.
+                // Genuinely new content replaces them, held value and all.
                 transaction
                     .execute(
                         "INSERT INTO axond_catalog_active (singleton, content_id, etag, \
@@ -419,7 +425,12 @@ impl CatalogStore for PostgresCatalogStore {
                          last_refusal_at, updated_at) \
                          VALUES (true, $1, $2, $3, $4, 0, NULL, NULL, now()) \
                          ON CONFLICT (singleton) DO UPDATE SET content_id = EXCLUDED.content_id, \
-                         etag = EXCLUDED.etag, last_modified = EXCLUDED.last_modified, \
+                         etag = CASE WHEN axond_catalog_active.content_id = EXCLUDED.content_id \
+                         THEN COALESCE(EXCLUDED.etag, axond_catalog_active.etag) \
+                         ELSE EXCLUDED.etag END, \
+                         last_modified = CASE WHEN axond_catalog_active.content_id = \
+                         EXCLUDED.content_id THEN COALESCE(EXCLUDED.last_modified, \
+                         axond_catalog_active.last_modified) ELSE EXCLUDED.last_modified END, \
                          confirmed_at = EXCLUDED.confirmed_at, consecutive_refusals = 0, \
                          last_refusal = NULL, last_refusal_at = NULL, updated_at = now()",
                         &[&content_id, &etag, &last_modified, &activated_at],
@@ -751,6 +762,50 @@ mod tests {
             state.active.expect("active").source.fetched_at,
             at(200),
             "an unchanged re-import still moves the confirmation time"
+        );
+        drop_schema(&schema).await;
+    }
+
+    /// The `CASE`/`COALESCE` on the active pointer, proved where it runs: a
+    /// full answer carrying the active content without an `ETag` keeps the tag
+    /// the deployment holds, while genuinely new content replaces it.
+    #[tokio::test]
+    async fn re_activation_carries_a_validator_over_and_new_content_replaces_it() {
+        let Some((store, schema)) = store().await else {
+            return;
+        };
+        let mut import = seed_import();
+        import.source.validators = SourceValidators::etag("\"held\"");
+        store.activate(&import, at(100)).await.expect("activate");
+
+        let mut stripped = import.clone();
+        stripped.source.validators = SourceValidators::default();
+        store
+            .activate(&stripped, at(200))
+            .await
+            .expect("re-activate");
+        assert_eq!(
+            store
+                .load()
+                .await
+                .expect("load")
+                .active
+                .expect("active")
+                .source
+                .validators,
+            SourceValidators::etag("\"held\""),
+            "an intermediary that stripped the tag must not cost the tag"
+        );
+
+        let mut newer = trimmed_import();
+        newer.source.validators = SourceValidators::default();
+        store.activate(&newer, at(300)).await.expect("activate");
+        let active = store.load().await.expect("load").active.expect("active");
+        assert_eq!(active.content_id(), newer.content_id());
+        assert_eq!(
+            active.source.validators,
+            SourceValidators::default(),
+            "a validator describes a document, so new content does not inherit one"
         );
         drop_schema(&schema).await;
     }

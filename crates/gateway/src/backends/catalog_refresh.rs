@@ -1,9 +1,8 @@
 //! Refresh orchestration: when a catalogue is imported, and what an import may
 //! disturb.
 //!
-//! [`CatalogSource`] answers one question and
-//! [`CatalogStore`](super::catalog_store::CatalogStore) retains one answer;
-//! neither decides *when* to ask, what a slow upstream costs, or how a run of
+//! [`CatalogSource`] answers one question and [`CatalogStore`] retains one
+//! answer; neither decides *when* to ask, what a slow upstream costs, or how a run of
 //! failures paces itself. Left to a caller, those decisions are where silent
 //! staleness comes from — a scheduler that forgot to count a refusal, a retry
 //! loop that hammered a struggling mirror, a boot path that admitted a
@@ -13,8 +12,7 @@
 //!
 //! - **Retention precedes admission.** An import is written to the store before
 //!   it becomes active in this process, so a store that refuses leaves the
-//!   previous catalogue active and counts a
-//!   [`RefusalReason::NotRetained`](super::catalog::RefusalReason::NotRetained)
+//!   previous catalogue active and counts a [`RefusalReason::NotRetained`]
 //!   refusal. A replica cannot serve a catalogue it did not manage to keep.
 //! - **Every outcome is counted.** Success, `304`, a refused parse, an outage, a
 //!   store failure, and a timeout all pass through
@@ -159,7 +157,7 @@ pub enum Bootstrap {
     /// catalogue immediately.
     ///
     /// The seed's provenance is seed-local by construction
-    /// ([`seed_snapshot`](super::models_dev::seed_snapshot)), so no upstream can
+    /// ([`seed_snapshot`]), so no upstream can
     /// answer `304` against it and the first live refresh transfers the real
     /// document: seeding establishes content, never a claim that an upstream
     /// confirmed it.
@@ -359,9 +357,20 @@ impl<S: CatalogSource, T: CatalogStore> CatalogRefresher<S, T> {
             let snapshot = match hydrate(&active) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
+                    // Adopt the run the store recorded *before* counting this
+                    // refusal onto it. Counting onto a fresh holder would report
+                    // one refusal for a deployment that has been refusing for a
+                    // week, and an unreadable stored catalogue is precisely when
+                    // the durable count is the only history there is.
+                    self.catalogue = LastKnownGoodCatalog::restored(
+                        None,
+                        stored.consecutive_refusals,
+                        stored.last_refusal.map(Refusal::new),
+                    );
                     let refusal = error.refusal();
                     self.catalogue.record_refusal(refusal.clone());
                     self.record_refusal_durably(refusal.reason(), now).await;
+                    self.report_state(now);
                     return Err(RefreshError::Stored(error));
                 }
             };
@@ -415,7 +424,7 @@ impl<S: CatalogSource, T: CatalogStore> CatalogRefresher<S, T> {
         let asked_with = self.catalogue.validators().cloned();
         let answer = self.ask(asked_with.as_ref()).await;
         let answer = match answer {
-            Ok(refresh) => self.retain(refresh, now).await,
+            Ok(refresh) => self.retain(refresh, asked_with.as_ref(), now).await,
             Err(error) => Err(error),
         };
         let (answer, retention) = match answer {
@@ -474,6 +483,7 @@ impl<S: CatalogSource, T: CatalogStore> CatalogRefresher<S, T> {
     async fn retain(
         &mut self,
         refresh: CatalogRefresh,
+        asked_with: Option<&SourceValidators>,
         now: SystemTime,
     ) -> Result<(CatalogRefresh, Option<Retention>), RefreshError> {
         match refresh {
@@ -492,9 +502,14 @@ impl<S: CatalogSource, T: CatalogStore> CatalogRefresher<S, T> {
                 ))
             }
             CatalogRefresh::Unchanged { validators } => {
-                // Only content this process actually holds can be confirmed; an
-                // unsolicited `304` is left for `record_refresh` to refuse.
-                if let Some(active) = self.catalogue.active() {
+                // Exactly the condition the holder applies, asked of the holder
+                // rather than restated here: an answer `record_refresh` is about
+                // to refuse as unsolicited must not first move the stored
+                // confirmation time forward and clear the stored refusal run,
+                // which would leave a restarted replica reading as freshly
+                // checked while nothing had confirmed anything.
+                let confirmable = self.catalogue.can_confirm_unchanged(asked_with);
+                if let Some(active) = self.catalogue.active().filter(|_| confirmable) {
                     self.store
                         .confirm(active.content.content_id(), &validators, now)
                         .await?;
@@ -1140,6 +1155,53 @@ mod tests {
         );
     }
 
+    /// The mirror image: an unchanged answer to a request that carried no
+    /// validator proves nothing, so it must not move the store's confirmation
+    /// time or clear the store's refusal run either. A durable state that read
+    /// as freshly checked here would be the one surface on which a catalogue
+    /// nobody is verifying looks healthy.
+    #[tokio::test]
+    async fn an_unchanged_answer_nobody_asked_for_does_not_confirm_the_stored_catalogue() {
+        let (snapshot, payload) = imported(CATALOGUE, SourceValidators::default());
+        let source = ScriptedSource::new([
+            Ok(CatalogRefresh::Updated {
+                snapshot: Box::new(snapshot),
+                payload,
+            }),
+            Ok(CatalogRefresh::Unchanged {
+                validators: SourceValidators::etag("\"upstream\""),
+            }),
+        ]);
+        let store = InMemoryCatalogStore::new();
+        let mut refresher = refresher(source, &store);
+        refresher.restore(at(10)).await.expect("restore");
+        refresher.refresh(RefreshTrigger::Scheduled, at(20)).await;
+
+        let outcome = refresher.refresh(RefreshTrigger::Manual, at(5_000)).await;
+        let RefreshOutcome::Refused { refusal, .. } = outcome else {
+            panic!("nothing was asked, so nothing was confirmed: {outcome:?}");
+        };
+        assert_eq!(refusal.reason(), RefusalReason::UnsolicitedUnchanged);
+        let state = store.load().await.expect("load");
+        let active = state.active.expect("active");
+        assert_eq!(
+            active.source.fetched_at,
+            at(20),
+            "the stored catalogue was last confirmed when it was imported"
+        );
+        assert_eq!(
+            active.source.validators,
+            SourceValidators::default(),
+            "the refused answer's validator has no provenance to record"
+        );
+        assert_eq!(state.consecutive_refusals, 1);
+        assert_eq!(
+            state.last_refusal,
+            Some(RefusalReason::UnsolicitedUnchanged),
+            "the durable run reflects the refusal rather than being cleared by it"
+        );
+    }
+
     #[tokio::test]
     async fn a_conditional_refresh_asks_with_what_it_holds() {
         let source = ScriptedSource::new([
@@ -1251,6 +1313,46 @@ mod tests {
         ));
         assert!(refresher.active().is_none());
         assert_eq!(refresher.report(at(20)).consecutive_refusals, 1);
+    }
+
+    /// And it is counted *onto* the run the store recorded, not instead of it.
+    /// A deployment that has been refusing for a week and then cannot read its
+    /// own stored catalogue is at its least healthy; reporting one refusal
+    /// would be the moment the alarm reset itself.
+    #[tokio::test]
+    async fn an_unreadable_stored_catalogue_is_counted_onto_the_run_the_store_recorded() {
+        let store = InMemoryCatalogStore::new();
+        let (snapshot, _) = imported(CATALOGUE, SourceValidators::etag("\"one\""));
+        store
+            .activate(
+                &RetainedCatalog {
+                    source: snapshot.source,
+                    payload: RawPayload::new(&b"{\"models\":{},\"providers\":{}}"[..]),
+                },
+                at(10),
+            )
+            .await
+            .expect("activate");
+        for _ in 0..PERSISTENT_REFUSAL_THRESHOLD {
+            store
+                .refuse(RefusalReason::Unreachable, at(15))
+                .await
+                .expect("refuse");
+        }
+
+        let mut refresher = refresher(ScriptedSource::new([]), &store);
+        refresher
+            .restore(at(20))
+            .await
+            .expect_err("a damaged record is not served");
+
+        let report = refresher.report(at(20));
+        assert_eq!(
+            report.consecutive_refusals,
+            PERSISTENT_REFUSAL_THRESHOLD + 1
+        );
+        assert_eq!(report.last_refusal, Some(RefusalReason::NotRetained));
+        assert!(report.persistent_refusal());
     }
 
     #[test]

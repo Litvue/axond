@@ -36,7 +36,7 @@
 //! # Rehydration re-parses; it does not deserialize
 //!
 //! [`hydrate`] turns a retained record back into a
-//! [`CatalogSnapshot`](super::catalog::CatalogSnapshot) by running the stored
+//! [`CatalogSnapshot`] by running the stored
 //! bytes through the same parser that accepted them, then checking that the
 //! content it produces still has the identity the record names. There is
 //! deliberately no second serialization of the normalized domain: a stored form
@@ -488,9 +488,23 @@ impl CatalogStore for InMemoryCatalogStore {
                 Retention::Retained
             }
         };
+        // Re-activating the content already active is the `304`-with-a-body
+        // case, so its validators are carried over the held ones for the reason
+        // [`SourceValidators::carry_over`] documents. New content replaces them
+        // wholesale: a validator describes a document, not a deployment.
+        let mut validators = import.source.validators.clone();
+        if let Some(active) = state
+            .active
+            .as_ref()
+            .filter(|active| active.content_id == content_id)
+        {
+            let mut held = active.validators.clone();
+            held.carry_over(validators);
+            validators = held;
+        }
         state.active = Some(ActivePointer {
             content_id,
-            validators: import.source.validators.clone(),
+            validators,
             confirmed_at: activated_at,
         });
         state.consecutive_refusals = 0;
@@ -670,6 +684,52 @@ mod tests {
             SourceValidators::etag("\"held\""),
             "an unstated validator is not a withdrawn one"
         );
+    }
+
+    /// Re-activation is the `304` case with a body, so it obeys the same rule
+    /// as [`CatalogStore::confirm`]: an answer that states no validator has not
+    /// withdrawn the held one, and dropping it would make every later refresh
+    /// transfer a document the deployment already has.
+    #[tokio::test]
+    async fn re_activating_the_active_content_without_a_validator_keeps_the_held_one() {
+        let store = InMemoryCatalogStore::new();
+        let mut import = seed_import();
+        import.source.validators = SourceValidators::etag("\"held\"");
+        store.activate(&import, at(10)).await.expect("activate");
+
+        let mut stripped = import.clone();
+        stripped.source.validators = SourceValidators::default();
+        store
+            .activate(&stripped, at(20))
+            .await
+            .expect("re-activate");
+
+        let state = store.load().await.expect("load");
+        assert_eq!(
+            state.active.expect("active").source.validators,
+            SourceValidators::etag("\"held\""),
+        );
+    }
+
+    /// The carry-over is scoped to the content it describes: a validator names
+    /// a document, so new content arriving without one holds none.
+    #[tokio::test]
+    async fn activating_new_content_does_not_inherit_the_previous_validator() {
+        let store = InMemoryCatalogStore::new();
+        let mut first = seed_import();
+        first.source.validators = SourceValidators::etag("\"held\"");
+        store.activate(&first, at(10)).await.expect("activate");
+
+        let mut second = seed_import();
+        second.source.content_id =
+            CatalogContentId::from_checksum(crate::desired_state::Checksum::of(b"other"));
+        second.source.validators = SourceValidators::default();
+        store.activate(&second, at(20)).await.expect("activate");
+
+        let state = store.load().await.expect("load");
+        let active = state.active.expect("active");
+        assert_eq!(active.content_id(), second.content_id());
+        assert_eq!(active.source.validators, SourceValidators::default());
     }
 
     #[tokio::test]
