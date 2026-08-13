@@ -90,14 +90,32 @@ command -v jq >/dev/null 2>&1 || {
   exit 1
 }
 if command -v docker >/dev/null 2>&1 && docker buildx version >/dev/null 2>&1; then
-  raw="$(docker buildx imagetools inspect --raw "$reference")"
+  reader=buildx
   digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$reference" | jq -r '.digest // empty')"
 elif command -v crane >/dev/null 2>&1; then
-  raw="$(crane manifest "$reference")"
+  reader=crane
   digest="$(crane digest "$reference")"
 else
   echo "need docker buildx or crane to read ${reference} from the registry" >&2
   exit 1
+fi
+
+[[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+  echo "the registry did not report a usable digest for ${reference}: ${digest:-none}" >&2
+  exit 1
+}
+
+# The index body is read back by digest rather than by tag. A tag is a name the
+# registry may repoint at any moment, so validating the body behind the tag and
+# then pinning the digest behind the tag are two reads of two possibly different
+# artifacts: the platform set that gets checked would not be the one that gets
+# pinned. `${image}@${digest}` is immutable, so what is validated below is the
+# artifact this script writes into the overlay.
+pinned="${image}@${digest}"
+if [[ "$reader" == buildx ]]; then
+  raw="$(docker buildx imagetools inspect --raw "$pinned")"
+else
+  raw="$(crane manifest "$pinned")"
 fi
 
 media_type="$(jq -r '.mediaType // empty' <<<"$raw")"
@@ -120,11 +138,6 @@ for platform in "${required_platforms[@]}"; do
     exit 1
   }
 done
-
-[[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
-  echo "the registry did not report a usable digest for ${reference}: ${digest:-none}" >&2
-  exit 1
-}
 
 if [[ "$mode" == print ]]; then
   echo "$digest"
