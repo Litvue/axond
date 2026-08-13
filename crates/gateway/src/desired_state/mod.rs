@@ -47,9 +47,8 @@
 //! yet. It is also not a complete body model: [`tenancy`] and [`policy`] are the
 //! only schemas the domain reads, and identity, provider, catalogue, and pricing
 //! bodies remain owned by their own slices. A policy document is a contract
-//! rather than an activation: nothing enforces one, and
-//! [`PolicyTransition`](policy::PolicyTransition) states what enforcing a change
-//! *would* require of a fleet.
+//! rather than an activation: nothing enforces one, and [`PolicyTransition`]
+//! states what enforcing a change *would* require of a fleet.
 //!
 //! The types are the contract that #165, #166, and #142 build against, and the
 //! test-only `oracle` module is the executable statement of how a
