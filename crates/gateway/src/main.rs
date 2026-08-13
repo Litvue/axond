@@ -497,7 +497,7 @@ async fn serve() -> anyhow::Result<()> {
     // A `[usage_journal]` section is what turns the best-effort path into a
     // durable one, and it is connected here for the same reason: a deployment
     // that asked for billing-grade usage and cannot reach its outbox must fail
-    // at boot rather than fail closed on every request (ADR 0048).
+    // at boot rather than fail closed on every request (ADR 0049).
     let UsageRuntime {
         delivery: usage,
         worker: usage_worker,

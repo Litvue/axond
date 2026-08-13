@@ -1,4 +1,4 @@
-# 48. Billing-grade usage delivery: an opt-in durable outbox
+# 49. Billing-grade usage delivery: an opt-in durable outbox
 
 Date: 2026-08-12
 
