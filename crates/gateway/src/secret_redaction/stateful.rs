@@ -308,6 +308,104 @@ async fn a_revoked_version_refuses_the_candidate_and_leaves_the_snapshot_serving
     drop_schema(&schema).await;
 }
 
+/// A version that is not in the production store yet refuses the candidate as
+/// a whole: the already published snapshot remains the last known good one,
+/// and once the missing row is staged the same desired revision recovers
+/// without a restart.
+#[tokio::test]
+async fn a_missing_version_keeps_the_last_known_good_snapshot_serving() {
+    let Some((secrets, schema)) = store().await else {
+        return;
+    };
+    let provider = FakeProvider::serving().await;
+    let replica = Replica::backed_by(&provider, Arc::clone(&secrets), Vec::new());
+    let sweep = sweep();
+
+    let first = in_service(&secrets, PROVIDER_MATERIAL).await;
+    replica
+        .publish("first", state_pinning(first, ResourceVersionNumber::FIRST))
+        .await;
+    assert!(matches!(
+        replica.converge().await,
+        Outcome::Published { .. }
+    ));
+
+    let first_response = router(replica.state.clone())
+        .oneshot(chat_request())
+        .await
+        .expect("a response");
+    assert_eq!(first_response.status(), StatusCode::OK);
+    sweep.assert_present(
+        "the initial fake provider",
+        "provider",
+        provider.presented().first().expect("a served request"),
+    );
+
+    // Publish a credential body before its rotated row exists. This is a
+    // resolution failure, rather than a lifecycle refusal for a row that was
+    // already present and then withdrawn.
+    let missing = first.rotated();
+    replica
+        .publish(
+            "missing-version",
+            state_pinning(missing, ResourceVersionNumber::FIRST.next()),
+        )
+        .await;
+    let outcome = replica.converge().await;
+    assert!(
+        matches!(outcome, Outcome::Rejected { reason, .. } if reason == "secret"),
+        "{outcome:?}"
+    );
+
+    let report = replica.reconciler.report();
+    let rejection = report.last_rejection.as_ref().expect("a recorded refusal");
+    sweep.assert_absent("a missing-version refusal", &format!("{rejection:?}"));
+    assert!(
+        rejection.detail.contains(&missing.to_string()),
+        "the refusal names the missing version: {}",
+        rejection.detail
+    );
+    assert_eq!(replica.generation(), 1);
+
+    let last_known_good = router(replica.state.clone())
+        .oneshot(chat_request())
+        .await
+        .expect("a response");
+    assert_eq!(last_known_good.status(), StatusCode::OK);
+    assert_eq!(
+        provider.presented().last().expect("a served request"),
+        &format!("Bearer {PROVIDER_MATERIAL}"),
+    );
+
+    // Repair the store, then retry convergence against the same desired
+    // revision. The replica publishes it in place and begins serving the new
+    // material without a process restart.
+    let rotated = rotated_into_service(&secrets, first, ROTATED_MATERIAL).await;
+    assert_eq!(rotated, missing);
+    assert!(matches!(
+        replica.converge().await,
+        Outcome::Published { .. }
+    ));
+    assert_eq!(replica.generation(), 2);
+
+    let recovered = router(replica.state.clone())
+        .oneshot(chat_request())
+        .await
+        .expect("a response");
+    assert_eq!(recovered.status(), StatusCode::OK);
+    assert_eq!(
+        provider.presented().last().expect("a served request"),
+        &format!("Bearer {ROTATED_MATERIAL}"),
+    );
+    sweep.assert_present(
+        "the recovered fake provider",
+        "rotated",
+        provider.presented().last().expect("a served request"),
+    );
+
+    drop_schema(&schema).await;
+}
+
 /// One secret has one owner, and the store checks it on every read: a credential
 /// published under a different owner cannot resolve another's material, so the
 /// candidate is refused rather than served with the wrong tenant's key.
