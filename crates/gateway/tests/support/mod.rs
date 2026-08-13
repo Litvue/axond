@@ -14,6 +14,7 @@ pub mod gateway;
 pub mod packet;
 pub mod recovery;
 pub mod rollout;
+pub mod schema;
 pub mod stateful;
 pub mod tenancy;
 pub mod upstream;

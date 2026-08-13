@@ -12,6 +12,8 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use super::schema::Schema;
+
 /// Distinguishes the fixtures of tests running in the same process.
 static FIXTURES: AtomicU64 = AtomicU64::new(0);
 
@@ -147,6 +149,11 @@ pub struct ControlPlane {
     /// The breakglass credential this fixture's replica accepts, and no other
     /// fixture's does. See [`ControlPlane::spawn`].
     breakglass: String,
+    /// The claim on [`ControlPlane::schema`], held from before the schema was
+    /// created so a setup step that fails after the `CREATE` still takes it
+    /// with it. Declared last, so it is dropped after everything above that was
+    /// granted on it.
+    _schema: Schema,
 }
 
 /// The environment variable names the fixture config refers to. References, not
@@ -166,11 +173,9 @@ impl ControlPlane {
         );
         let schema = format!("axond_it_{fixture}");
         let breakglass = format!("integration-test-breakglass-{fixture}");
-        client(&dsn)
-            .await
-            .batch_execute(&format!("CREATE SCHEMA {schema}"))
-            .await
-            .expect("create the scenario's schema");
+        // Before the config is rendered and before any later step can fail: the
+        // cleanup has to be owned from the moment the schema exists.
+        let claim = Schema::create(&dsn, &schema).await;
         let config = private_config(
             "axond.toml",
             &format!(
@@ -202,6 +207,7 @@ impl ControlPlane {
             config,
             env,
             breakglass,
+            _schema: claim,
         })
     }
 
@@ -405,36 +411,6 @@ impl Drop for Replica {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-    }
-}
-
-/// Cleanup a failing assertion cannot skip: a scenario that panics half-way
-/// through a migration would otherwise leave a fully populated schema behind in
-/// a database every other run shares.
-///
-/// The drop runs on a thread of its own with its own runtime, because a `Drop`
-/// cannot await and the test's runtime may already be shutting down.
-impl Drop for ControlPlane {
-    fn drop(&mut self) {
-        let dsn = self.dsn.clone();
-        let schema = self.schema.clone();
-        let cleanup = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("a cleanup runtime");
-            runtime.block_on(async {
-                client(&dsn)
-                    .await
-                    .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-                    .await
-                    .expect("drop the scenario's schema");
-            });
-        });
-        // Only report a cleanup failure when nothing worse is already unwinding.
-        if cleanup.join().is_err() && !std::thread::panicking() {
-            panic!("the scenario's schema was left behind");
-        }
     }
 }
 

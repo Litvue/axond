@@ -162,6 +162,10 @@ pub(crate) struct Journal {
     roles: Mutex<Vec<String>>,
     /// The password this fixture's roles were created with, generated per run.
     password: String,
+    /// The claim on [`Journal::schema`]. Declared last, so it is dropped after
+    /// this fixture's own [`Drop`] has removed the roles that were granted on
+    /// the schema it takes.
+    _schema: SchemaClaim,
 }
 
 impl Journal {
@@ -180,11 +184,11 @@ impl Journal {
                 .expect("a monotonic wall clock")
                 .as_nanos()
         );
-        connect(&dsn)
-            .await
-            .batch_execute(&format!("CREATE SCHEMA {schema}"))
-            .await
-            .expect("a fresh scenario schema");
+        // Claimed before it exists, because the migration below is exactly the
+        // step that can fail: a scenario whose journal refuses to migrate would
+        // otherwise leave its schema on a shared database with nothing owning
+        // the `DROP`.
+        let claim = SchemaClaim::create(&dsn, &schema).await;
         let store = PostgresControlPlane::connect(
             &dsn,
             ControlPlaneSettings {
@@ -202,6 +206,7 @@ impl Journal {
             schema,
             roles: Mutex::new(Vec::new()),
             password: role_password(),
+            _schema: claim,
         })
     }
 
@@ -315,10 +320,11 @@ impl Drop for Journal {
     /// before it did: a role is a credential on a shared database, and a schema
     /// drop that fails transiently must not be what decides whether the
     /// credential outlives the test. Failures are collected and reported
-    /// together, so one leak does not hide another.
+    /// together, so one leak does not hide another. The schema itself is taken
+    /// after this body by [`SchemaClaim`], which has owned it since before it
+    /// existed.
     fn drop(&mut self) {
         let dsn = self.dsn.clone();
-        let schema = self.schema.clone();
         let roles = std::mem::take(&mut *self.roles.lock().expect("the role list"));
         let cleanup = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -338,12 +344,6 @@ impl Drop for Journal {
                         left_behind.push(format!("the login role {role}: {}", detail(&error)));
                     }
                 }
-                if let Err(error) = client
-                    .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-                    .await
-                {
-                    left_behind.push(format!("the schema {schema}: {}", detail(&error)));
-                }
                 assert!(
                     left_behind.is_empty(),
                     "a scenario could not clean up after itself: {left_behind:?}"
@@ -351,7 +351,58 @@ impl Drop for Journal {
             });
         });
         if cleanup.join().is_err() && !std::thread::panicking() {
-            panic!("a scenario left its schema or its login roles behind");
+            panic!("a scenario left its login roles behind");
+        }
+    }
+}
+
+/// The claim on a scenario's schema, held from before the `CREATE` that makes
+/// it: whatever fails afterwards — the migration, an assertion, the fixture's
+/// own construction — the `DROP` has an owner that outlives the failure.
+struct SchemaClaim {
+    dsn: String,
+    schema: String,
+}
+
+impl SchemaClaim {
+    /// Claim `schema` and create it, in that order: a `CREATE` that half
+    /// succeeded is a schema too, and it is claimed already.
+    async fn create(dsn: &str, schema: &str) -> Self {
+        let claimed = Self {
+            dsn: dsn.to_owned(),
+            schema: schema.to_owned(),
+        };
+        connect(dsn)
+            .await
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .expect("a fresh scenario schema");
+        claimed
+    }
+}
+
+impl Drop for SchemaClaim {
+    /// On a thread of its own with its own runtime, for the same reason
+    /// [`Journal`]'s is: [`Drop`] cannot await, and the surrounding runtime may
+    /// already be unwinding.
+    fn drop(&mut self) {
+        let dsn = self.dsn.clone();
+        let schema = self.schema.clone();
+        let cleanup = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a cleanup runtime")
+                .block_on(async move {
+                    connect(&dsn)
+                        .await
+                        .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                        .await
+                        .expect("the scenario's schema is dropped");
+                });
+        });
+        if cleanup.join().is_err() && !std::thread::panicking() {
+            panic!("a scenario left its schema {} behind", self.schema);
         }
     }
 }
@@ -504,5 +555,79 @@ impl Absent {
                 "{surface} discloses the other tenant's {label}: {rendered}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod claim {
+    use super::{SchemaClaim, connect};
+
+    /// Whether `schema` exists on the test database.
+    async fn exists(dsn: &str, schema: &str) -> bool {
+        connect(dsn)
+            .await
+            .query_one(
+                "SELECT count(*) FROM pg_namespace WHERE nspname = $1",
+                &[&schema],
+            )
+            .await
+            .expect("a schema lookup")
+            .get::<_, i64>(0)
+            > 0
+    }
+
+    /// The window the claim exists for: a setup step that fails after the
+    /// `CREATE SCHEMA` and before the fixture is built still takes the schema
+    /// with it, so a long-lived CI database does not accumulate one abandoned
+    /// schema per failed scenario.
+    #[tokio::test]
+    async fn a_setup_that_fails_after_the_create_still_drops_the_schema() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let schema = format!("ti_claim_{}", std::process::id());
+        /// The arranged failure, so the case cannot pass on some other panic.
+        const ARRANGED: &str = "a scenario's setup failed after its schema existed";
+
+        // A thread with a runtime of its own: the failure has to unwind without
+        // taking this test with it, and the destructor's cleanup cannot re-enter
+        // the runtime it is unwinding.
+        let outcome = std::thread::spawn({
+            let (dsn, schema) = (dsn.clone(), schema.clone());
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime for the failing setup")
+                    .block_on(async move {
+                        let claimed = SchemaClaim::create(&dsn, &schema).await;
+                        assert!(
+                            exists(&dsn, &claimed.schema).await,
+                            "the arranged setup created its schema, or the case proves nothing"
+                        );
+                        // Still a live local, so it is the unwind that has to
+                        // clean up — which is the property under test.
+                        panic!("{ARRANGED}");
+                    });
+            }
+        })
+        .join();
+
+        let Err(panic) = outcome else {
+            panic!("the arranged setup returned instead of failing");
+        };
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.contains(ARRANGED),
+            "the setup failed for the arranged reason, not another: {message}"
+        );
+        assert!(
+            !exists(&dsn, &schema).await,
+            "the failed setup left the schema {schema} behind"
+        );
     }
 }

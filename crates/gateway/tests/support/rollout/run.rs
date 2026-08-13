@@ -37,6 +37,7 @@ use serde_json::{Value, json};
 use crate::support::capacity::manifest::sha256_hex;
 use crate::support::capacity::result::{BinaryMeta, ConfigMeta, Percentiles, Verdict, binary_meta};
 use crate::support::gateway::{self, GATEWAY_KEY, alias};
+use crate::support::schema::Schema;
 
 use super::fleet::{Drained, Fleet, NEXT, NEXT_ONLY_ALIAS, PREVIOUS, Revision, pinned};
 use super::ingress::{CallerRequest, Forward, Ingress, REPLICA_HEADER, REVISION_HEADER};
@@ -783,11 +784,11 @@ async fn fence(timeline: &mut Timeline) -> Fence {
             .expect("clock")
             .as_nanos()
     );
+    // The claim outlives every step below, including the assertion that the
+    // control plane migrated: a fence that fails there must not leave its schema
+    // on a database every other run shares.
+    let _schema = Schema::create(&dsn, &schema).await;
     let client = connect(&dsn).await;
-    client
-        .batch_execute(&format!("CREATE SCHEMA {schema}"))
-        .await
-        .expect("the fence's own schema is created");
 
     let dir = scratch_dir("fence");
     let path = write_config(&dir, "stateful.toml", &stateful_config(&schema));
@@ -827,9 +828,6 @@ async fn fence(timeline: &mut Timeline) -> Fence {
             if refused { "refused" } else { "ALLOWED" }
         ),
     );
-    let _ = client
-        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
-        .await;
     Fence {
         evaluated: true,
         skipped_reason: None,
