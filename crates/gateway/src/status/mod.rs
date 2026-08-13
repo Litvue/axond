@@ -367,7 +367,10 @@ impl StatusReason {
             "unavailable" => Self::Unreachable,
             "corrupt" => Self::PayloadCorrupt,
             "incompatible" => Self::SchemaIncompatible,
-            "projection" => Self::ProjectionRejected,
+            // An availability projection is a projection of the same revision:
+            // the compile refused to derive a view of it, and an operator repairs
+            // it where they repair any other projection refusal.
+            "projection" | "availability" => Self::ProjectionRejected,
             "validation" | "invalid" => Self::ValidationRejected,
             "secret" => Self::SecretUnresolved,
             "snapshot" => Self::SnapshotRejected,

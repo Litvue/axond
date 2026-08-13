@@ -33,7 +33,7 @@
 
 use std::fmt;
 
-use crate::desired_state::{ProjectId, TenantId};
+use crate::desired_state::{ProjectId, ResourceScope, TenantId};
 
 /// Why a token was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -174,6 +174,20 @@ impl ScopeRef {
     /// Whether this scope is the tenant-wide one.
     pub const fn is_tenant_wide(&self) -> bool {
         self.project.is_none()
+    }
+
+    /// The availability scope a resource scope names, if it names one.
+    ///
+    /// [`ResourceScope::Deployment`] names none, and that is not an oversight:
+    /// availability is entitlement, entitlement belongs to a tenant, and a
+    /// deployment-wide availability answer would be every tenant's in one
+    /// document.
+    pub const fn of(scope: &ResourceScope) -> Option<Self> {
+        match scope {
+            ResourceScope::Deployment => None,
+            ResourceScope::Tenant(tenant) => Some(Self::tenant(*tenant)),
+            ResourceScope::Project { tenant, project } => Some(Self::project(*tenant, *project)),
+        }
     }
 }
 

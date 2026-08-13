@@ -78,6 +78,40 @@ impl CircuitBreaker {
             .collect()
     }
 
+    /// The phase the next request would find, without being that request.
+    ///
+    /// [`Self::snapshot`] reports the phase stored, which is the phase the last
+    /// request left behind: a target whose cooldown has elapsed still reads
+    /// `Open` until something calls [`Self::allow`] and moves it. That is the
+    /// right answer for bookkeeping and the wrong one for a reader describing
+    /// what this process would do now — during recovery it reports a target as
+    /// refused that the next request would in fact probe.
+    ///
+    /// So the cooldown is applied to the *answer* and not to the breaker: an open
+    /// or half-open circuit past its cooldown reports [`CircuitState::HalfOpen`],
+    /// the phase in which a probe is allowed, and nothing is written. A reader
+    /// cannot spend a target's probe budget by looking at it.
+    pub fn observed(&self) -> Vec<(String, CircuitState)> {
+        self.observed_at(Instant::now())
+    }
+
+    fn observed_at(&self, now: Instant) -> Vec<(String, CircuitState)> {
+        self.lock()
+            .iter()
+            .map(|(provider, circuit)| {
+                let phase = match circuit.state {
+                    CircuitState::Open | CircuitState::HalfOpen
+                        if elapsed(circuit.phase_started, now) >= self.cooldown =>
+                    {
+                        CircuitState::HalfOpen
+                    }
+                    held => held,
+                };
+                (provider.clone(), phase)
+            })
+            .collect()
+    }
+
     fn allow_at(&self, provider: &str, now: Instant) -> CircuitDecision {
         let mut circuits = self.lock();
         let circuit = circuits.entry(provider.to_owned()).or_default();
@@ -146,5 +180,36 @@ mod tests {
         );
         breaker.record_success("openai");
         assert_eq!(breaker.state("openai"), CircuitState::Closed);
+    }
+
+    #[test]
+    fn an_elapsed_cooldown_is_visible_before_a_request_spends_it() {
+        let breaker = CircuitBreaker::new(2, Duration::from_secs(10));
+        let now = Instant::now();
+        breaker.record_failure_at("openai", now);
+        breaker.record_failure_at("openai", now);
+
+        assert_eq!(
+            breaker.observed_at(now),
+            vec![("openai".to_owned(), CircuitState::Open)],
+            "a target inside its cooldown is one this replica is refusing"
+        );
+
+        let recovered = now + Duration::from_secs(10);
+        assert_eq!(
+            breaker.observed_at(recovered),
+            vec![("openai".to_owned(), CircuitState::HalfOpen)],
+            "a target whose cooldown elapsed is one the next request would probe"
+        );
+        assert_eq!(
+            breaker.snapshot(),
+            vec![("openai".to_owned(), CircuitState::Open)],
+            "and looking at it moved nothing"
+        );
+        assert_eq!(
+            breaker.allow_at("openai", recovered),
+            CircuitDecision::Allow { probe: true },
+            "so the probe is still the next request's to spend"
+        );
     }
 }

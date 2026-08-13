@@ -128,4 +128,6 @@ pub use router::{AdminApi, AdminRouteSpec, admin_route_specs, router};
 #[allow(unused_imports)]
 pub use runtime::{BreakglassAuthenticator, BreakglassAuthorizer};
 #[allow(unused_imports)]
-pub use service::{AdminService, DesiredStateEdit, MutationOutcome, MutationResult};
+pub use service::{
+    AdminService, AvailabilityAuthority, DesiredStateEdit, MutationOutcome, MutationResult,
+};

@@ -274,6 +274,7 @@ psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0001_initial.sql
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0002_tenancy_access.sql
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0003_tenancy_constraints.sql
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0004_journal_ownership.sql
+psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0005_availability_observations.sql
 axond migrate adopt  --config /etc/axond/axond.toml  # record the baseline that applied
 axond migrate status --config /etc/axond/axond.toml  # now Current
 ```
@@ -328,6 +329,15 @@ that already exists is never rewritten, so a rollback demotes no live tenant.
 Ownership stops at the tenant: a journal row's *project* is still checked in the
 domain alone, because a project has no lifecycle to publish (#191) and a
 synthesized project row could not be told apart from a declared one.
+
+0005 adds the durable discovery evidence table availability reads from
+([ADR 0053](../adr/0053-stateful-availability-projection-and-discovery-persistence.md)).
+It is additive and touches no existing table, so mixed versions may run: a replica
+that has not been upgraded neither reads nor writes it, and losing the table costs
+a deployment its discovery freshness rather than any desired state. Rolling back
+to a binary requiring version 4 needs no down-migration; the rows are simply
+ignored.
+
 
 The `psql` path creates the ledger table without recording anything in it, so the
 journal is then reported as *Unrecorded* — a ledger that exists and records nothing

@@ -61,8 +61,10 @@ use super::diff::SemanticDiff;
 use super::error::AdminError;
 use super::protocol::{MutationRequest, WriteMode};
 use super::reads::{
-    AuditPage, ConvergenceResult, HistoryRequest, RevisionPage, RevisionRecord, StateView,
+    AuditPage, AvailabilityResult, ConvergenceResult, HistoryRequest, RevisionPage, RevisionRecord,
+    StateView,
 };
+use crate::availability::{AvailabilityReader, AvailabilityView, ScopeRef};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::config::Mode;
 use crate::convergence::RevisionReport;
@@ -71,6 +73,7 @@ use crate::desired_state::{
     LoadedRevision, Mutation, MutationId, ResourceScope, RevisionCandidate, RevisionId, Surface,
     Uuid7Generator, ValidationError,
 };
+use crate::status::StatusScope;
 
 /// Whether a grant at `granted` may change a resource scoped to `resource`.
 ///
@@ -150,6 +153,43 @@ impl MutationOutcome {
                 Some(revision)
             }
             MutationResult::DryRun => None,
+        }
+    }
+}
+
+/// How much of an availability verdict a caller may be told.
+///
+/// Authority, not scope, and the distinction matters because an availability
+/// read is always *about* one tenant: the scope such a query names is
+/// tenant-shaped whoever asks, so deciding disclosure from the grant would
+/// coarsen the answer for the root operator too — and leave nobody at all who
+/// could see why discovery or this replica's health refused a target, which is
+/// the question the read exists to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvailabilityAuthority {
+    /// The caller holds this authority over the whole deployment, and sees the
+    /// discovery source and the reason behind each verdict.
+    Deployment,
+    /// The caller holds it over a namespace, and sees the namespace projection:
+    /// the state, without the deployment's discovery machinery behind it.
+    Namespace,
+}
+
+impl AvailabilityAuthority {
+    /// The caller's authority, from whether the deployment scope would be
+    /// granted.
+    pub const fn of(deployment_wide: bool) -> Self {
+        if deployment_wide {
+            Self::Deployment
+        } else {
+            Self::Namespace
+        }
+    }
+
+    const fn disclosure(self) -> StatusScope {
+        match self {
+            Self::Deployment => StatusScope::Deployment,
+            Self::Namespace => StatusScope::Namespace,
         }
     }
 }
@@ -402,6 +442,67 @@ impl AdminService {
         Self::permits_deployment_read(grant, AdminAction::ReadConvergence)?;
         self.store()?;
         Ok(report.map_or_else(ConvergenceResult::unreconciled, ConvergenceResult::of))
+    }
+
+    /// What this replica derives about one scope's models (#148).
+    ///
+    /// Takes the reader rather than holding one, for the same reason
+    /// [`AdminService::convergence`] takes a report: the answer is replica-local
+    /// and already in memory, so it reaches no store and survives the outage that
+    /// prompted the question. `None` is a replica that derives no view, and says
+    /// so rather than answering with an empty catalogue.
+    ///
+    /// Scoped rather than deployment-wide, and narrowed twice. The grant must
+    /// enclose the scope asked about, so a tenant administrator cannot read
+    /// another tenant's — or a sibling project's — derived entitlements. And a
+    /// caller holding less than deployment authority sees the namespace
+    /// projection of each verdict, which keeps the deployment's discovery
+    /// machinery out of a tenant's answer.
+    ///
+    /// The disclosure is decided by [`AvailabilityAuthority`] rather than by the
+    /// grant's scope, because they are different questions: this read always
+    /// names a tenant, so every grant it produces is tenant-shaped — deciding on
+    /// the grant would coarsen the answer for the root operator too, and leave
+    /// nobody who could see why discovery or this replica's health refused.
+    ///
+    /// A project is answered with what it inherits as well as what it overrides:
+    /// its enablements are overrides of its tenant's, so reporting only its own
+    /// records would tell an operator a project may call nothing whenever it has
+    /// overridden nothing.
+    pub fn availability(
+        &self,
+        grant: &AdminGrant,
+        scope: &ResourceScope,
+        authority: AvailabilityAuthority,
+        reader: Option<&dyn AvailabilityReader>,
+        now: SystemTime,
+    ) -> Result<AvailabilityResult, AdminError> {
+        Self::permits(grant, AdminAction::ReadAvailability)?;
+        if !grant.scope().contains(scope) {
+            return Err(AdminError::Forbidden(AdminAuthError::ScopeNotPermitted));
+        }
+        self.store()?;
+        let Some(reference) = ScopeRef::of(scope) else {
+            // Availability is a question about a tenant's models: a
+            // deployment-wide answer would be every tenant's entitlements in one
+            // document, which is the cross-tenant disclosure the keying exists to
+            // prevent.
+            return Err(AdminError::RequestInvalid {
+                schema: "availability",
+                detail: "`tenant`: an availability read must name the tenant it asks about"
+                    .to_owned(),
+            });
+        };
+        // Attached but deriving nothing is still deriving nothing: a replica whose
+        // snapshot carries no projection says so, rather than answering with an
+        // empty list of targets an operator would read as a lost entitlement.
+        let Some((index, runtime)) = reader.and_then(AvailabilityReader::read) else {
+            return Ok(AvailabilityResult::underived(scope));
+        };
+        let targets =
+            AvailabilityView::new(&index, &runtime).evaluate_inherited_scope(reference, now);
+        let status = authority.disclosure();
+        Ok(AvailabilityResult::of(scope, status, targets))
     }
 
     /// Republish a retained revision's complete desired state as a new revision.

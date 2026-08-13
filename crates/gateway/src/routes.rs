@@ -2234,7 +2234,7 @@ impl FailoverWalk {
 
 /// The circuit-breaker key for a target: its qualified `provider/model`, so two
 /// aliases pointing at the same concrete target share one breaker.
-fn target_key(target: &Target) -> String {
+pub(crate) fn target_key(target: &Target) -> String {
     FailoverTarget::new(&target.provider, &target.model).qualified_model()
 }
 

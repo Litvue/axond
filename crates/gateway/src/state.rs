@@ -24,7 +24,7 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::admission::{AdmissionControl, DiagnosticCredential};
 use crate::aliases::AliasScope;
-use crate::availability::AvailabilityIndex;
+use crate::availability::{AvailabilityIndex, AvailabilityReader, RuntimeObservations};
 use crate::backends::control_plane::ControlPlaneStore;
 use crate::budget::BudgetStore;
 use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind};
@@ -190,10 +190,15 @@ pub struct ConfigSnapshot {
     /// one-way — a projection cannot add a model, a namespace, or a credential, so
     /// no amount of discovery evidence can enlarge what is served.
     ///
-    /// [`ConfigSnapshot::build`] always produces the empty index: this slice is
-    /// contract only, nothing polls a provider, and no request consults a verdict.
-    #[allow(dead_code)]
-    availability: Arc<AvailabilityIndex>,
+    /// [`ConfigSnapshot::build`] produces `None`. A compiler holding availability
+    /// evidence attaches a derived one during compilation (#148), off the request
+    /// path and before publication; no request consults a verdict, and nothing
+    /// polls a provider to produce it.
+    ///
+    /// Absent rather than empty, because those are different answers: a replica
+    /// that derives nothing must not report an empty catalogue, which reads
+    /// identically to a tenant that has just lost every entitlement.
+    availability: Option<Arc<AvailabilityIndex>>,
     /// The approved pricing this snapshot serves under, when it was compiled from
     /// a revision that published a price book (#201).
     ///
@@ -523,7 +528,7 @@ impl ConfigSnapshot {
             // Never a populated index, and never an optimistic one: a snapshot is
             // compiled from configuration, and availability is derived afterwards
             // by whatever produced the evidence.
-            availability: Arc::new(AvailabilityIndex::empty()),
+            availability: None,
             pricing: None,
         })
     }
@@ -537,17 +542,16 @@ impl ConfigSnapshot {
         &self.secrets
     }
 
-    /// The derived availability index this snapshot carries.
+    /// The derived availability index this snapshot carries, if it derives one.
     #[allow(dead_code)]
-    pub fn availability(&self) -> &AvailabilityIndex {
-        &self.availability
+    pub fn availability(&self) -> Option<&AvailabilityIndex> {
+        self.availability.as_deref()
     }
 
     /// The index as a handle, for carrying the evidence an outgoing snapshot holds
     /// onto its replacement without cloning the records.
-    #[allow(dead_code)]
-    pub fn availability_handle(&self) -> Arc<AvailabilityIndex> {
-        Arc::clone(&self.availability)
+    pub fn availability_handle(&self) -> Option<Arc<AvailabilityIndex>> {
+        self.availability.clone()
     }
 
     /// Project a derived availability index onto a snapshot that has not been
@@ -561,13 +565,17 @@ impl ConfigSnapshot {
     ///
     /// # Reloads re-project, deliberately
     ///
-    /// [`ConfigSnapshot::build`] always yields the empty index, so a reload keeps
+    /// [`ConfigSnapshot::build`] derives no view at all, so a reload keeps
     /// availability only by asking for it:
     ///
     /// ```ignore
     /// let outgoing = state.snapshot();
-    /// let next = ConfigSnapshot::build(config, &env, generation)?
-    ///     .with_availability(outgoing.availability_handle());
+    /// let next = match outgoing.availability_handle() {
+    ///     Some(availability) => {
+    ///         ConfigSnapshot::build(config, &env, generation)?.with_availability(availability)
+    ///     }
+    ///     None => ConfigSnapshot::build(config, &env, generation)?,
+    /// };
     /// ```
     ///
     /// Silent inheritance is the behaviour being refused, not an oversight: evidence
@@ -576,11 +584,20 @@ impl ConfigSnapshot {
     /// about targets the new config may no longer declare. A reload therefore either
     /// re-derives availability or re-projects the outgoing handle because it knows
     /// nothing relevant changed — and either way the choice is visible at the call
-    /// site. Until a projection slice lands, nothing constructs an index at all.
+    /// site.
+    ///
+    /// The file reloader ([`crate::reload`]) makes the second choice, and can:
+    /// nothing availability is derived from is in the file. The four durable
+    /// dimensions come from the revision's enablements, connections, credentials,
+    /// and policy documents, the evidence from discovery, and health is overlaid
+    /// at read time from the serving snapshot's own circuits — so a reload can
+    /// neither invalidate a verdict nor restate one. Dropping or blanking the
+    /// index would make a `SIGHUP` the way an operator loses the answer to which
+    /// models a tenant can reach, and keep it lost: convergence compiles only
+    /// when desired state changes, which a file edit is not.
     #[must_use]
-    #[allow(dead_code)]
     pub fn with_availability(mut self, availability: Arc<AvailabilityIndex>) -> Self {
-        self.availability = availability;
+        self.availability = Some(availability);
         self
     }
 
@@ -805,6 +822,28 @@ impl AppState {
     }
 }
 
+/// A replica answers availability questions from what it is already serving.
+///
+/// Both halves come from the loaded snapshot, and neither reaches a store: the
+/// index is the projection compilation attached to it, and the health is the
+/// circuits that snapshot's own requests have been tripping. Loaded once, so an
+/// answer cannot describe one revision's targets with another revision's
+/// circuits.
+///
+/// The health is [`CircuitBreaker::observed`] rather than
+/// [`CircuitBreaker::snapshot`]: the question this read answers is what the
+/// replica would do with the next request, so a target whose cooldown has
+/// elapsed reports as impaired rather than as refused. Reading still moves
+/// nothing — an operator looking at a target cannot spend its probe.
+impl AvailabilityReader for AppState {
+    fn read(&self) -> Option<(Arc<AvailabilityIndex>, RuntimeObservations)> {
+        let snapshot = self.config();
+        let index = snapshot.availability_handle()?;
+        let runtime = RuntimeObservations::of_circuits(snapshot.target_circuits.observed());
+        Some((index, runtime))
+    }
+}
+
 /// Build the zero-size adapter for a provider kind. Adapters carry no state,
 /// so this is cheap to call per request.
 pub fn adapter_for(kind: ProviderKind) -> Box<dyn ProviderAdapter> {
@@ -875,8 +914,8 @@ namespace = "platform"
         let snapshot =
             ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 0).expect("the key resolves");
         assert!(
-            snapshot.availability().is_empty(),
-            "a compiled snapshot carries no derived evidence, and no optimistic default"
+            snapshot.availability().is_none(),
+            "a compiled snapshot derives no view, which is not an empty one"
         );
 
         let scope = ScopeRef::tenant(TenantId::new(
@@ -897,7 +936,13 @@ namespace = "platform"
             .map(|model| model.name.clone())
             .collect();
         let projected = snapshot.with_availability(Arc::new(index));
-        assert_eq!(projected.availability().len(), 1);
+        assert_eq!(
+            projected
+                .availability()
+                .expect("the projected snapshot derives a view")
+                .len(),
+            1
+        );
         assert_eq!(
             projected
                 .config
@@ -934,13 +979,17 @@ namespace = "platform"
         let rebuilt =
             ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 1).expect("the key resolves");
         assert!(
-            rebuilt.availability().is_empty(),
+            rebuilt.availability().is_none(),
             "a rebuild inherits no evidence it did not ask for"
         );
 
         let carried = ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 1)
             .expect("the key resolves")
-            .with_availability(outgoing.availability_handle());
+            .with_availability(
+                outgoing
+                    .availability_handle()
+                    .expect("the outgoing snapshot derives a view"),
+            );
         assert_eq!(carried.availability(), outgoing.availability());
         assert_eq!(carried.generation, 1);
     }

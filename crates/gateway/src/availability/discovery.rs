@@ -55,7 +55,7 @@
 //! the field on purpose.
 
 use std::fmt;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::refs::{AvailabilityKey, ScopeRef, TargetRef};
 use super::verdict::{Availability, AvailabilityReason, AvailabilityState, DecidedBy};
@@ -213,6 +213,26 @@ impl fmt::Debug for DiscoveryObservation {
     }
 }
 
+/// An instant as a look may carry it: truncated to the resolution the store
+/// keeps.
+///
+/// A look's identity is its instant — [`DiscoveryObservation::is_same_look`]
+/// compares them, and the definitive watermark is ordered by them — so an
+/// instant that changes when it is written down would make a restored look a
+/// *different* look from the one that was stored: an ordinary reload would count
+/// as evidence arriving out of order, and a restored positive could compare
+/// older than the watermark its own conclusion set and be discredited. Postgres
+/// `timestamptz` keeps microseconds, so a look never carries more, and a write
+/// followed by a read is the identity. The journal truncates for the same reason.
+fn to_stored_resolution(instant: SystemTime) -> SystemTime {
+    match instant.duration_since(UNIX_EPOCH) {
+        Ok(since) => UNIX_EPOCH + Duration::from_micros(since.as_micros() as u64),
+        // Before the epoch is not a time any deployment observes anything at;
+        // there is nothing to round toward, so it is left as it came.
+        Err(_) => instant,
+    }
+}
+
 impl DiscoveryObservation {
     /// An observation with no expiry and no detail.
     pub fn new(
@@ -229,7 +249,7 @@ impl DiscoveryObservation {
             result,
             completeness,
             source,
-            observed_at,
+            observed_at: to_stored_resolution(observed_at),
             expires_at: None,
             detail: None,
         }
@@ -238,7 +258,7 @@ impl DiscoveryObservation {
     /// The same observation, expiring at `expires_at`.
     #[must_use]
     pub fn expiring_at(mut self, expires_at: SystemTime) -> Self {
-        self.expires_at = Some(expires_at);
+        self.expires_at = Some(to_stored_resolution(expires_at));
         self
     }
 
@@ -246,6 +266,19 @@ impl DiscoveryObservation {
     #[must_use]
     pub fn detailed(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
+        self
+    }
+
+    /// The same look with its operator-facing detail dropped.
+    ///
+    /// What crosses a storage or process boundary: `detail` is whatever a probe
+    /// collected, so it lives for the lifetime of the process that observed it
+    /// and is not written anywhere a backup or a support session can read it.
+    /// The look is unchanged as *evidence* — [`is_same_look`](Self::is_same_look)
+    /// still matches the original.
+    #[must_use]
+    pub fn without_detail(mut self) -> Self {
+        self.detail = None;
         self
     }
 

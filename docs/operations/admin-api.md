@@ -128,6 +128,7 @@ record, or a state read.
 | `/admin/v1/history` | `GET` | Recent revisions, newest first. `?limit=` is 1–100. |
 | `/admin/v1/audit/{revision}` | `GET` | One revision's actor, summary, and recorded changes. |
 | `/admin/v1/convergence` | `GET` | What this replica has loaded and activated, from its own cached status — never a control-plane read. |
+| `/admin/v1/availability` | `GET` | What this replica derives about one scope's models. `?tenant=` is required, `?project=` optional; answered from the snapshot it is serving and its own circuits — never a control-plane read. |
 | `/admin/v1/tenants` | `POST` | A tenant and its lifecycle. |
 | `/admin/v1/projects` | `POST` | A project (namespace) inside a tenant. |
 | `/admin/v1/providers` | `POST` | A provider connection: wire family and endpoint. |
@@ -137,6 +138,18 @@ record, or a state read.
 | `/admin/v1/aliases` | `POST` | A routing alias and its ordered targets. |
 | `/admin/v1/policies` | `POST` | Budgets, concurrency limits, and token epoch for a scope. |
 | `/admin/v1/rollback` | `POST` | Republish an earlier revision's complete state as a *new* revision. |
+
+An availability read names which authority refused — the catalogue, the
+enablement, the tenant's entitlement, policy, discovery, or this replica's own
+health — and never claims a model is available because the catalogue carries it
+([ADR 0053](../adr/0053-stateful-availability-projection-and-discovery-persistence.md)).
+A replica that derives no view answers `"deriving": false` rather than an empty
+list of targets, and a caller without deployment-wide authority sees a verdict
+with the discovery source dropped and operator-only reasons coarsened — the
+query always names a tenant, so it is the caller's authority that decides this,
+not the scope asked about. Asking about a project answers with what the project
+inherits from its tenant as well as what it overrides, because a project's
+enablements are overrides rather than a catalogue of its own.
 
 Budgets and limits are policy fields rather than a route of their own: they are
 published as a `policies` document, and history is therefore one chain rather

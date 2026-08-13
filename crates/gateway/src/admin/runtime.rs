@@ -28,6 +28,7 @@ use super::auth::{
 };
 use super::router::{self, AdminApi};
 use super::service::AdminService;
+use crate::availability::AvailabilityReader;
 use crate::backends::control_plane::postgres::{ControlPlaneSettings, PostgresControlPlane};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::config::{AdminBreakglass, Config, KeyMaterialSource, Mode};
@@ -78,7 +79,7 @@ pub enum BootError {
 pub async fn surface(config: &Config, env: &HashMap<String, String>) -> Result<Surface, BootError> {
     if config.mode == Mode::Stateless {
         return Ok(Surface {
-            router: router::refusing_router(),
+            api: None,
             mode: "stateless",
             control_plane: None,
         });
@@ -113,7 +114,7 @@ pub async fn surface(config: &Config, env: &HashMap<String, String>) -> Result<S
         Arc::new(BreakglassAuthorizer),
     );
     Ok(Surface {
-        router: router::router(Arc::new(api)),
+        api: Some(api),
         mode: "stateful",
         control_plane: Some(ObservedControlPlane { store, pacing }),
     })
@@ -121,12 +122,35 @@ pub async fn surface(config: &Config, env: &HashMap<String, String>) -> Result<S
 
 /// What administration brought up, and what the diagnostic may observe.
 pub struct Surface {
-    pub router: Router,
+    /// The administrative API in stateful mode; `None` in stateless mode, where
+    /// every request is refused without a backend being touched.
+    api: Option<AdminApi>,
     /// The posture this process booted in, for the log line that records it.
     pub mode: &'static str,
     /// The store administration was built on, or `None` in stateless mode where
     /// no store is opened at all.
     pub control_plane: Option<ObservedControlPlane>,
+}
+
+impl Surface {
+    /// The router to merge into the served application, reading this replica's
+    /// derived availability from `availability` where it has any.
+    ///
+    /// Built here rather than in [`surface`] because the reader is the inference
+    /// state, and the inference state is built from the observability this
+    /// surface's own store paces: deferring the router is what lets one boot
+    /// order satisfy both, with a single connection pool behind administration,
+    /// the diagnostic, and an availability read.
+    pub fn router(self, availability: Option<Arc<dyn AvailabilityReader>>) -> Router {
+        let Some(api) = self.api else {
+            return router::refusing_router();
+        };
+        let api = match availability {
+            None => api,
+            Some(reader) => api.with_availability(reader),
+        };
+        router::router(Arc::new(api))
+    }
 }
 
 /// A control plane the replica diagnostic may report on, with the pacing its

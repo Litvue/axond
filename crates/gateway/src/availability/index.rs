@@ -111,7 +111,7 @@
 //!
 //! [`ConfigSnapshot::with_availability`]: crate::state::ConfigSnapshot::with_availability
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use super::dimensions::{
@@ -189,6 +189,12 @@ impl AvailabilityRecord {
         }
     }
 
+    /// Whether anything has ever been learned about this key: a look in either
+    /// slot, or a conclusion the key once reached.
+    pub const fn holds_evidence(&self) -> bool {
+        self.discovery.is_some() || self.last_known_good.is_some() || self.definitive_at.is_some()
+    }
+
     /// The observation evaluation should read: the current one when it is
     /// definitive, and the retained last-known-good one otherwise.
     ///
@@ -244,6 +250,15 @@ impl AvailabilityIndex {
         self.records.get(key)
     }
 
+    /// Every record, in key order, as filed.
+    ///
+    /// The dimensions rather than verdicts, for the two callers that need the
+    /// facts themselves: an operator-facing dump, and the writer that persists
+    /// discovery evidence between restarts.
+    pub fn records(&self) -> impl Iterator<Item = (&AvailabilityKey, &AvailabilityRecord)> {
+        self.records.iter()
+    }
+
     /// The availability of one target in one scope at `now`.
     ///
     /// Walks the precedence ladder in the module docs. A key the index does not
@@ -254,6 +269,35 @@ impl AvailabilityIndex {
             return Availability::no_record();
         };
         Self::evaluate_record(record, now)
+    }
+
+    /// The availability of one target at `now`, with this replica's own health
+    /// for it overlaid.
+    ///
+    /// Runtime health is the one dimension a *derived* index cannot carry
+    /// honestly: circuits belong to the replica and to the snapshot it is
+    /// serving, so a record built when a revision compiled would report the
+    /// health of a breaker that had not yet attempted anything. The overlay is
+    /// applied here instead, at the instant of the question, and it can only
+    /// lower a verdict — the ladder's runtime rungs sit below every authority, so
+    /// a replica's own trouble never reports a target as *more* available than
+    /// the deployment's facts make it.
+    pub fn evaluate_with(
+        &self,
+        key: &AvailabilityKey,
+        now: SystemTime,
+        health: RuntimeHealth,
+    ) -> Availability {
+        let Some(record) = self.records.get(key) else {
+            return Availability::no_record();
+        };
+        Self::evaluate_record(
+            &AvailabilityRecord {
+                runtime: health,
+                ..record.clone()
+            },
+            now,
+        )
     }
 
     fn evaluate_record(record: &AvailabilityRecord, now: SystemTime) -> Availability {
@@ -410,12 +454,54 @@ pub struct AvailabilityIndexBuilder {
 impl AvailabilityIndexBuilder {
     /// Start from the records of an existing index.
     ///
-    /// How a refresh keeps last-known-good evidence across an index replacement:
-    /// the previous index is immutable, so a refresh reads it into a builder and
-    /// publishes a new one rather than editing what readers hold.
+    /// This is used while restoring stored evidence before a revision is known.
+    /// Once a revision is available, callers must use
+    /// [`carrying_evidence_for`](Self::carrying_evidence_for) so the desired key
+    /// set is explicit and keys a revision stopped describing cannot survive by
+    /// accident.
     pub fn from_index(index: &AvailabilityIndex) -> Self {
         Self {
             records: index.records.clone(),
+            superseded: 0,
+            misfiled: 0,
+        }
+    }
+
+    /// Start from an existing index's evidence, keeping only the keys the
+    /// current revision still describes.
+    ///
+    /// Evidence belongs to a target while that target is part of the current
+    /// desired view. Once the view stops naming it, the projection owns the
+    /// orphan-GC decision; retaining it here would make the index grow forever
+    /// as enablements churn.
+    pub fn carrying_evidence_for(
+        index: &AvailabilityIndex,
+        keys: &BTreeSet<AvailabilityKey>,
+    ) -> Self {
+        Self::carrying_evidence_where(index, |key, record| {
+            keys.contains(key) && record.holds_evidence()
+        })
+    }
+
+    fn carrying_evidence_where(
+        index: &AvailabilityIndex,
+        keep: impl Fn(&AvailabilityKey, &AvailabilityRecord) -> bool,
+    ) -> Self {
+        Self {
+            records: index
+                .records
+                .iter()
+                .filter(|(key, record)| keep(key, record))
+                .map(|(key, record)| {
+                    let evidence = AvailabilityRecord {
+                        discovery: record.discovery.clone(),
+                        last_known_good: record.last_known_good.clone(),
+                        definitive_at: record.definitive_at,
+                        ..AvailabilityRecord::default()
+                    };
+                    (key.clone(), evidence)
+                })
+                .collect(),
             superseded: 0,
             misfiled: 0,
         }

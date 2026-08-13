@@ -1883,3 +1883,45 @@ fn a_scope_renders_its_tenant_and_project() {
     );
     assert_ne!(tenant_wide, scoped);
 }
+
+/// A record whose looks a later conclusion discredited holds a watermark and no
+/// look, so it emits no row. It must still be named as cleared: otherwise the
+/// rows the conclusion removed sit in the database until the next restart reads
+/// them back as evidence.
+#[test]
+fn a_key_whose_looks_were_discredited_is_written_as_cleared() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let discredited = AvailabilityRecord {
+        definitive_at: Some(at(500)),
+        ..permitting()
+    };
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 300, None))
+        .record(key(scope, "gpt-4o"), discredited)
+        .build();
+
+    let write = EvidenceWrite::of_index(&index);
+
+    assert!(write.rows().is_empty(), "both looks were discredited");
+    assert_eq!(
+        write.cleared(),
+        [EvidenceClear::new(key(scope, "gpt-4o"), at(500))],
+        "so the stored looks must go with them"
+    );
+}
+
+#[test]
+fn clearing_same_key_keeps_the_newest_cutoff() {
+    let target_key = key(ScopeRef::tenant(tenant(1)), "gpt-4o");
+    let write = EvidenceWrite::default().clearing([
+        EvidenceClear::new(target_key.clone(), at(100)),
+        EvidenceClear::new(target_key.clone(), at(200)),
+    ]);
+
+    assert_eq!(
+        write.cleared(),
+        [EvidenceClear::new(target_key, at(200))],
+        "deduplicating cleanup must retain the maximum cutoff"
+    );
+}

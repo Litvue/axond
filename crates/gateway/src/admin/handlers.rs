@@ -13,6 +13,7 @@
 //! see which tenant a document is about without parsing it.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use axum::Json;
 use axum::body::Bytes;
@@ -27,11 +28,12 @@ use super::conditional::Conditional;
 use super::error::AdminError;
 use super::protocol::{AuditSummary, MutationPreconditions, MutationRequest};
 use super::reads::{
-    AuditPage, ConvergenceResult, HistoryLimit, HistoryRequest, RevisionPage, StateView,
+    AuditPage, AvailabilityResult, ConvergenceResult, HistoryLimit, HistoryRequest, RevisionPage,
+    StateView,
 };
 use super::resources::{AdminResourceRequest, MutationEnvelope, RollbackRequest};
 use super::router::{ADMIN_MAX_REQUEST_BYTES, AdminApi};
-use super::service::MutationOutcome;
+use super::service::{AvailabilityAuthority, MutationOutcome};
 use crate::desired_state::{MutationKind, ProjectId, ResourceScope, RevisionId, Surface, TenantId};
 
 /// The route table's mutating rows, as method routers.
@@ -57,6 +59,10 @@ pub(super) fn audit_route() -> MethodRouter<Arc<AdminApi>> {
 
 pub(super) fn convergence_route() -> MethodRouter<Arc<AdminApi>> {
     get(convergence)
+}
+
+pub(super) fn availability_route() -> MethodRouter<Arc<AdminApi>> {
+    get(availability)
 }
 
 /// The buffered request body, or the administrative refusal for one that never
@@ -302,6 +308,76 @@ async fn convergence(
     // exists for.
     let identity = result.identity();
     Ok(Conditional::identified_by(&headers, result, &identity))
+}
+
+/// What an availability read asks about.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AvailabilityQuery {
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+}
+
+/// What this replica derives about one scope's models — answered from the
+/// snapshot it is serving and its own circuits, so it survives the control-plane
+/// or provider outage that prompted the question.
+async fn availability(
+    State(api): State<Arc<AdminApi>>,
+    identity: AdminIdentity,
+    headers: HeaderMap,
+    query: Result<Query<AvailabilityQuery>, QueryRejection>,
+) -> Result<Conditional<AvailabilityResult>, AdminError> {
+    let Query(query) = query.map_err(|rejection| AdminError::RequestInvalid {
+        schema: "availability",
+        detail: rejection.body_text(),
+    })?;
+    // Refused before any authority is consulted: an availability read is always
+    // about a tenant, so a query that names none is a malformed request rather
+    // than an attempt on the deployment. Authorizing it first would answer a
+    // tenant-scoped caller's typo with a forbidden — and write it to the denial
+    // trail an investigator later has to rule out. The service's own check stays
+    // where it is, as the defence in depth it already was.
+    if query.tenant.is_none() && query.project.is_none() {
+        return Err(AdminError::RequestInvalid {
+            schema: "availability",
+            detail: "`tenant`: an availability read must name the tenant it asks about".to_owned(),
+        });
+    }
+    let scope = scope_of(
+        "availability",
+        query.tenant.as_deref(),
+        query.project.as_deref(),
+    )?;
+    let grant = api
+        .authorize(
+            &identity,
+            AdminAction::ReadAvailability,
+            Surface::Model,
+            &scope,
+        )
+        .await?;
+    // Asked separately from the grant, because the grant answers "may this
+    // caller read this tenant" and disclosure turns on "would this caller be
+    // trusted with the whole deployment" — and this route's scope is
+    // tenant-shaped for every caller, root operator included.
+    let authority = AvailabilityAuthority::of(
+        api.holds_deployment_authority(&identity, AdminAction::ReadAvailability),
+    );
+    let result = api.service.availability(
+        &grant,
+        &scope,
+        authority,
+        api.availability.as_deref(),
+        SystemTime::now(),
+    )?;
+    // Validated over the bytes, unlike `/convergence`: nothing in this answer
+    // moves on its own. A verdict is evaluated against `now`, but it only
+    // *changes* when evidence expires or a dimension does — which is the answer
+    // changing, exactly what a validator is for. So an operator polling a target
+    // through an incident pays for a body when something moved and not otherwise.
+    Ok(Conditional::new(&headers, result))
 }
 
 /// The scope a request names, from an optional tenant and project.

@@ -13,16 +13,25 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use super::compile::testing::{AliasProjection, bootstrap, env};
 use super::lkg::testing::{KEY, cache_path};
 use super::status::testing::ManualClock;
 use super::*;
+use crate::availability::{
+    self, AvailabilityEvidence, AvailabilityKey, AvailabilityReason, AvailabilityState,
+    DiscoveryCompleteness, DiscoveryObservation, DiscoveryResult, DiscoverySource, ScopeRef,
+    TargetRef,
+};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::budget::NoBudget;
+use crate::desired_state::credentials::ProviderCredentialBody;
+use crate::desired_state::models::WireFamily;
 use crate::desired_state::oracle::InMemoryControlPlane;
-use crate::desired_state::{DesiredState, ExpectedRevision, RevisionId, fixtures};
+use crate::desired_state::providers::ProviderBody;
+use crate::desired_state::secrets::{SecretLifecycle, SecretOwner};
+use crate::desired_state::{DesiredState, ExpectedRevision, RevisionId, Slug, fixtures};
 use crate::state::AppState;
 use crate::telemetry;
 use crate::usage::{UsageFanout, UsageSink};
@@ -160,11 +169,41 @@ impl Replica {
         )
     }
 
+    /// A replica that derives availability, and the evidence holder discovery
+    /// would feed.
+    fn deriving(store: &Arc<InMemoryControlPlane>) -> (Self, Arc<AvailabilityEvidence>) {
+        let evidence = Arc::new(AvailabilityEvidence::new(
+            availability::projection::testing::catalogue(
+                fixtures::catalog_snapshot(),
+                "openai",
+                AVAILABLE_MODEL,
+            ),
+        ));
+        let replica = Self::assembled_with(
+            store,
+            "openai",
+            None,
+            super::secrets::testing::permissive(),
+            Some(Arc::clone(&evidence)),
+        );
+        (replica, evidence)
+    }
+
     fn assembled(
         store: &Arc<InMemoryControlPlane>,
         provider: &'static str,
         cache: Option<LastKnownGood>,
         secrets: Arc<SecretMaterialization>,
+    ) -> Self {
+        Self::assembled_with(store, provider, cache, secrets, None)
+    }
+
+    fn assembled_with(
+        store: &Arc<InMemoryControlPlane>,
+        provider: &'static str,
+        cache: Option<LastKnownGood>,
+        secrets: Arc<SecretMaterialization>,
+        availability: Option<Arc<AvailabilityEvidence>>,
     ) -> Self {
         let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
         // The boot snapshot: generation 0, serving whatever the file said. Every
@@ -178,12 +217,16 @@ impl Replica {
         .expect("the bootstrap config is servable");
         let clock = ManualClock::new();
         let ledger = Arc::clone(secrets.ledger());
-        let compiler = Arc::new(RevisionCompiler::with_secrets(
+        let compiler = RevisionCompiler::with_secrets(
             bootstrap(),
             env(),
             AliasProjection { provider },
             Arc::clone(&secrets),
-        ));
+        );
+        let compiler = Arc::new(match availability {
+            None => compiler,
+            Some(evidence) => compiler.with_availability(evidence),
+        });
         let reconciler = Arc::new(Reconciler::new(
             Arc::clone(store) as Arc<dyn ControlPlaneStore>,
             compiler,
@@ -1571,4 +1614,208 @@ fn required_secrets(state: &DesiredState) -> Vec<crate::desired_state::secrets::
         .collect();
     references.sort_unstable();
     references
+}
+
+/// The model the availability scenarios enable, catalogued by the listing the
+/// deriving replica holds.
+const AVAILABLE_MODEL: &str = "gpt-4o";
+
+/// The revision those scenarios publish: the fixture state, plus an enablement
+/// of a catalogued offering for the tenant that owns the credential.
+fn state_enabling_a_model() -> DesiredState {
+    let tenant = fixtures::tenant_id(1);
+    let mut state = fixtures::state();
+    state
+        .insert(fixtures::tenant_enablement(&tenant, 30, AVAILABLE_MODEL))
+        .and_then(|state| {
+            state.insert(
+                ProviderBody::for_tenant(
+                    fixtures::provider_id(40),
+                    tenant,
+                    fixtures::display_name("OpenAI"),
+                    WireFamily::OpenaiChat,
+                    "https://api.openai.test",
+                )
+                .version(Slug::parse("openai").expect("a well-formed slug")),
+            )
+        })
+        .and_then(|state| {
+            state.insert(
+                ProviderCredentialBody::staged(
+                    fixtures::resource_id(40),
+                    SecretOwner::tenant(tenant),
+                    fixtures::provider_id(40),
+                    fixtures::display_name("Key"),
+                    fixtures::secret_ref(40),
+                )
+                .transitioned(SecretLifecycle::Active)
+                .expect("staged material may enter service")
+                .version(Slug::parse("openai-key").expect("a well-formed slug")),
+            )
+        })
+        .and_then(|state| state.insert(fixtures::tenant_policy(1, 1)))
+        .expect("the availability fixtures are distinct references");
+    state
+}
+
+fn availability_key() -> AvailabilityKey {
+    AvailabilityKey::new(
+        ScopeRef::tenant(fixtures::tenant_id(1)),
+        TargetRef::parse("openai", AVAILABLE_MODEL).expect("a well-formed target"),
+    )
+}
+
+/// The property #148 is for, through the seam a deployment actually publishes
+/// on: converging on a revision derives availability onto the snapshot being
+/// served, and an offering the catalogue carries and every authority permits is
+/// still not `available` until something has looked.
+#[tokio::test]
+async fn a_published_revision_derives_availability_that_catalogue_presence_alone_cannot_grant() {
+    let store = control_plane();
+    publish(
+        &store,
+        "first",
+        ExpectedRevision::Empty,
+        state_enabling_a_model(),
+    )
+    .await;
+    let (replica, _evidence) = Replica::deriving(&store);
+
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+
+    let snapshot = replica.state.config();
+    let verdict = snapshot
+        .availability()
+        .expect("a compiler holding evidence derives a view")
+        .evaluate(&availability_key(), SystemTime::now());
+    assert_eq!(verdict.state, AvailabilityState::Unknown);
+    assert_eq!(verdict.reason, AvailabilityReason::NoEvidence);
+    assert_ne!(
+        verdict.state,
+        AvailabilityState::Available,
+        "a catalogued, enabled, entitled offering nobody has looked at is not available"
+    );
+    assert_eq!(verdict.observed_at, None);
+}
+
+/// Evidence outlives revisions. A look taken under one revision is still the
+/// deployment's evidence under the next, because a price change is not news
+/// about what a provider serves — and a replica that lost it on every
+/// publication would spend a rollout reporting `unknown`.
+#[tokio::test]
+async fn discovery_evidence_survives_the_revisions_published_over_it() {
+    let store = control_plane();
+    let first = publish(
+        &store,
+        "first",
+        ExpectedRevision::Empty,
+        state_enabling_a_model(),
+    )
+    .await;
+    let (replica, evidence) = Replica::deriving(&store);
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+
+    // Discovery looks, off the request path and between publications.
+    let key = availability_key();
+    evidence.observe(DiscoveryObservation::new(
+        key.scope,
+        key.target.clone(),
+        DiscoveryResult::Present,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        SystemTime::now(),
+    ));
+
+    publish(
+        &store,
+        "second",
+        ExpectedRevision::Exactly(first),
+        state_enabling_a_model(),
+    )
+    .await;
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+
+    let verdict = replica
+        .state
+        .config()
+        .availability()
+        .expect("a compiler holding evidence derives a view")
+        .evaluate(&key, SystemTime::now());
+    assert_eq!(verdict.state, AvailabilityState::Available);
+    assert_eq!(verdict.reason, AvailabilityReason::Observed);
+    assert_eq!(replica.generation(), 2, "the second revision was published");
+}
+
+/// A discovery outage is not a readiness failure. Nothing looks for a while, the
+/// evidence ages past its expiry, and the replica keeps serving and keeps
+/// reporting itself converged — the verdict degrades, the deployment does not.
+#[tokio::test]
+async fn a_discovery_outage_ages_a_verdict_without_touching_convergence() {
+    let store = control_plane();
+    publish(
+        &store,
+        "first",
+        ExpectedRevision::Empty,
+        state_enabling_a_model(),
+    )
+    .await;
+    let (replica, evidence) = Replica::deriving(&store);
+    let key = availability_key();
+    let look = DiscoveryObservation::new(
+        key.scope,
+        key.target.clone(),
+        DiscoveryResult::Present,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        SystemTime::now(),
+    )
+    .expiring_at(SystemTime::now() + Duration::from_secs(60));
+    // A look carries its instant at the resolution storage keeps, so the verdict
+    // is read against what the look holds rather than against the clock.
+    let looked_at = look.observed_at;
+    evidence.observe(look);
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+
+    // Nobody looks again. The next convergence carries the same evidence, and the
+    // verdict is read at an instant past its expiry.
+    for _ in 0..3 {
+        replica
+            .reconciler
+            .converge_once(telemetry::CONVERGENCE_POLLED)
+            .await;
+    }
+
+    let availability = replica
+        .state
+        .config()
+        .availability_handle()
+        .expect("a compiler holding evidence derives a view");
+    assert_eq!(
+        availability.evaluate(&key, looked_at).state,
+        AvailabilityState::Available
+    );
+    let aged = availability.evaluate(&key, looked_at + Duration::from_secs(3_600));
+    assert_eq!(aged.state, AvailabilityState::Stale);
+    assert_eq!(aged.reason, AvailabilityReason::EvidenceExpired);
+    assert_eq!(aged.observed_at, Some(looked_at));
+
+    let report = replica.report();
+    assert!(
+        report.converged(),
+        "a discovery outage is not a readiness failure"
+    );
+    assert_eq!(report.consecutive_failures, 0);
+    assert!(replica.served_aliases().contains(&"fast".to_owned()));
 }

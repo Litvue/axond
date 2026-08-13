@@ -219,6 +219,7 @@ pub const REVISION_REASONS: &[&str] = &[
     "withdrawn",
     "ungoverned",
     "invalid_policy",
+    "availability",
 ];
 
 /// The reason label for a store failure. Exhaustive, so a new
@@ -610,12 +611,16 @@ impl Reconciler {
         let snapshot = self.compiler.compile(&revision, generation).await?;
         // Asked before publishing, so an unsafe policy transition costs a
         // rejected candidate rather than a half-applied one.
-        self.sink
-            .admit(&snapshot)
-            .map_err(|source| CompileError::Activation {
+        if let Err(source) = self.sink.admit(&snapshot) {
+            // The compilation moved replica-local state before the sink was
+            // asked, so a refusal here has to be told: a candidate nobody serves
+            // must leave nothing behind describing it.
+            self.compiler.abandoned();
+            return Err(CompileError::Activation {
                 revision: id,
                 source,
-            })?;
+            });
+        }
         self.status.observe_loaded(id);
         // How many secret versions this snapshot holds, read before it is
         // published because publishing moves it. A count, never a reference and
