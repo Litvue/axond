@@ -408,11 +408,12 @@ The refusal reason is the triage key.
   would serve nothing. Treat a secret store as a boot dependency of a stateful
   replica, like the control plane's database — scale-out waits on it. A boot that
   cannot prepare the store's schema refuses *permanently* only for a `SQLSTATE`
-  an operator has to clear (class `42` access/undefined-object, `3F` invalid
-  schema name, `25006` read-only transaction), and its message names the grant or
-  the DDL to apply. A server that is starting up, out of connections, deadlocked,
-  or racing a sibling replica's `CREATE TABLE IF NOT EXISTS` stays retryable, so
-  a whole fleet booting at once does not turn a hiccup into a permanent refusal.
+  an operator has to clear (class `42` access/undefined-object apart from the
+  duplicate-object codes, `3F` invalid schema name, `25006` read-only
+  transaction), and its message names the grant or the DDL to apply. A server that
+  is starting up, out of connections, deadlocked, or racing a sibling replica's
+  `CREATE TABLE IF NOT EXISTS` (`23505`, `42P07`, `42710`) stays retryable, so a
+  whole fleet booting at once does not turn a hiccup into a permanent refusal.
 - **`projection`** — a candidate this build cannot project: a resource body it
   does not read, or a bootstrap that is missing something projection may not
   supply for it (today, a default namespace). Roll the replica forward, publish a

@@ -701,7 +701,19 @@ fn boot_failure(
 /// notably `08` connection, `53` insufficient resources, `57` operator
 /// intervention, `40` rollback, `55` object in use, and the `23505` two
 /// concurrently booting replicas race on — clears on its own.
+///
+/// The duplicate-object codes are the exception inside class `42`:
+/// `CREATE TABLE IF NOT EXISTS` is not race-free, and a fleet booting at once
+/// can surface the collision as `42P07`/`42710` rather than `23505`. The next
+/// attempt finds the object already there, so those are the sibling replica
+/// winning, not a deployment to fix.
 fn operator_must_act(code: &SqlState) -> bool {
+    if matches!(
+        *code,
+        SqlState::DUPLICATE_TABLE | SqlState::DUPLICATE_OBJECT
+    ) {
+        return false;
+    }
     matches!(code.code().get(..2), Some("42" | "3F"))
         || *code == SqlState::READ_ONLY_SQL_TRANSACTION
 }
@@ -758,6 +770,8 @@ mod tests {
             SqlState::T_R_DEADLOCK_DETECTED,
             SqlState::LOCK_NOT_AVAILABLE,
             SqlState::UNIQUE_VIOLATION,
+            SqlState::DUPLICATE_TABLE,
+            SqlState::DUPLICATE_OBJECT,
             SqlState::CONNECTION_FAILURE,
         ] {
             assert!(
