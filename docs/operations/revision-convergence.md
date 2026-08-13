@@ -474,6 +474,11 @@ credentials pin, and each **active** credential becomes one entry in the pool of
   the deployment cannot dial, or one whose revision speaks Anthropic where the
   file declares OpenAI, refuses the candidate with reason `projection` rather than
   publishing a namespace with no key or presenting a key to the wrong account.
+  Like the default namespace above, `[[provider]]` is a control-plane-owned section
+  a stateful file may not declare, so this requirement is a standing gate rather
+  than reachable behaviour today: it is satisfied once the slice that projects
+  provider connections from desired state lands, and until then nothing in `serve`
+  constructs this projection.
 - **staged is not serving.** Staged material resolves — that is how you prove it
   before traffic reaches it — but only `active` material is pooled. `disabled`,
   `revoked`, and `tombstoned` credentials are absent from the next snapshot's
