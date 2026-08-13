@@ -24,6 +24,7 @@ use axum::routing::{MethodRouter, get, post};
 use serde::Deserialize;
 
 use super::auth::{AdminAction, AdminIdentity};
+use super::catalogue::{CatalogueFilters, CatalogueRequest, CatalogueView};
 use super::conditional::Conditional;
 use super::error::AdminError;
 use super::protocol::{AuditSummary, MutationPreconditions, MutationRequest};
@@ -35,6 +36,10 @@ use super::resources::{AdminResourceRequest, MutationEnvelope, RollbackRequest};
 use super::router::{ADMIN_MAX_REQUEST_BYTES, AdminApi};
 use super::service::{AvailabilityAuthority, MutationOutcome};
 use crate::desired_state::{MutationKind, ProjectId, ResourceScope, RevisionId, Surface, TenantId};
+use crate::desired_state::{
+    ModelLifecycle, MutationKind, OfferingId, ProjectId, ResourceScope, RevisionId, Surface,
+    TenantId, WireFamily,
+};
 
 /// The route table's mutating rows, as method routers.
 pub(super) fn publish_route<R: AdminResourceRequest>() -> MethodRouter<Arc<AdminApi>> {
@@ -47,6 +52,10 @@ pub(super) fn rollback_route() -> MethodRouter<Arc<AdminApi>> {
 
 pub(super) fn state_route() -> MethodRouter<Arc<AdminApi>> {
     get(state)
+}
+
+pub(super) fn catalogue_route() -> MethodRouter<Arc<AdminApi>> {
+    get(catalogue)
 }
 
 pub(super) fn history_route() -> MethodRouter<Arc<AdminApi>> {
@@ -205,6 +214,110 @@ async fn state(
     Ok(Conditional::new(
         &headers,
         api.service.desired_state(&grant).await?,
+    ))
+}
+
+/// What a catalogue read may ask for: the scope, and filters over it.
+///
+/// `tenant` is required, so there is no spelling of this query that asks for
+/// every tenant's enablements. Unknown keys are refused rather than ignored,
+/// because a filter this build does not implement — `provider`, `capability`,
+/// `modality`, `availability`, all of which need metadata the catalogue-import and
+/// availability slices own — must not silently widen the answer: a caller that
+/// asked to narrow and was not narrowed would read the result as authoritative.
+/// [`CatalogueView::pending`] names the same gap in the response.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogueQuery {
+    tenant: String,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    wire_family: Option<String>,
+    #[serde(default)]
+    offering: Option<String>,
+    #[serde(default)]
+    billable: Option<bool>,
+}
+
+/// One tenant's management catalogue: what it has enabled, what names route to
+/// it, and why a model is not routable.
+///
+/// A scoped read, unlike every other read on this surface: the scope comes from
+/// the query and the grant has to cover it, so a tenant-scoped administrator gets
+/// its own tenant and nothing else — including no evidence that another tenant's
+/// enablements exist.
+async fn catalogue(
+    State(api): State<Arc<AdminApi>>,
+    identity: AdminIdentity,
+    headers: HeaderMap,
+    query: Result<Query<CatalogueQuery>, QueryRejection>,
+) -> Result<Conditional<CatalogueView>, AdminError> {
+    const SCHEMA: &str = "catalogue";
+    let Query(query) = query.map_err(|rejection| AdminError::RequestInvalid {
+        schema: SCHEMA,
+        detail: rejection.body_text(),
+    })?;
+    let invalid = |field: &'static str, detail: String| AdminError::RequestInvalid {
+        schema: SCHEMA,
+        detail: format!("`{field}`: {detail}"),
+    };
+    let tenant =
+        TenantId::parse(&query.tenant).map_err(|error| invalid("tenant", error.to_string()))?;
+    let project = match query.project.as_deref() {
+        None => None,
+        Some(project) => {
+            Some(ProjectId::parse(project).map_err(|error| invalid("project", error.to_string()))?)
+        }
+    };
+    // Parsed, not matched loosely: text no release wrote is a client error rather
+    // than an unfiltered listing.
+    let state =
+        match query.state.as_deref() {
+            None => None,
+            Some(text) => Some(ModelLifecycle::parse(text).ok_or_else(|| {
+                invalid("state", format!("`{text}` is not a model lifecycle state"))
+            })?),
+        };
+    let wire_family = match query.wire_family.as_deref() {
+        None => None,
+        Some(text) => Some(
+            WireFamily::parse(text)
+                .ok_or_else(|| invalid("wire_family", format!("`{text}` is not a wire family")))?,
+        ),
+    };
+    let offering = match query.offering.as_deref() {
+        None => None,
+        Some(text) => {
+            Some(OfferingId::parse(text).map_err(|error| invalid("offering", error.to_string()))?)
+        }
+    };
+    let request = CatalogueRequest {
+        tenant,
+        project,
+        filters: CatalogueFilters {
+            state,
+            wire_family,
+            offering,
+            billable: query.billable,
+        },
+    };
+    let grant = api
+        .authorize(
+            &identity,
+            AdminAction::ReadState,
+            // The surface a denial is recorded against is what was asked for, and
+            // this read asks about enablements: an auditor filtering the trail for
+            // refused model reads must find it there.
+            Surface::Model,
+            &request.scope(),
+        )
+        .await?;
+    Ok(Conditional::new(
+        &headers,
+        api.service.model_catalogue(&grant, &request).await?,
     ))
 }
 

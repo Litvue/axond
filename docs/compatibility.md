@@ -17,6 +17,7 @@ breaking them is a deliberate, documented act — not that they are frozen.
 | `GET /v1/models` | **supported** | the alias catalogue, gated + namespace-scoped | n/a |
 | `GET /v1/credentials` | **supported** | replica-local credential labels and circuit state, scoped | n/a |
 | `GET /admin/v1/status` | **supported** | this replica's cached dependency status, scoped and redacted | n/a |
+| `GET /admin/v1/catalogue` | **supported** (stateful only) | one tenant's management catalogue, read from the published revision | n/a |
 | `GET /healthz`, `GET /readyz` | **supported** | liveness / readiness text | n/a |
 | `POST /v1/responses` | **supported** | OpenAI Responses, native passthrough | yes |
 

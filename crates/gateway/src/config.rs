@@ -510,7 +510,31 @@ impl ProviderKind {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Model {
     pub name: String,
+    /// The namespace that owns this alias, or `None` for one every namespace
+    /// may reach.
+    ///
+    /// An owned alias is invisible and unroutable outside its namespace, which is
+    /// what makes an alias name a *tenant's* name rather than the deployment's:
+    /// two namespaces may publish `fast` over different targets, and neither can
+    /// enumerate or invoke the other's (ADR 0053). An unowned alias is the
+    /// single-tenant configuration every release before this one wrote, so a file
+    /// that names no namespace behaves exactly as it did.
+    ///
+    /// Ownership is not entitlement on its own: a namespace still sees only the
+    /// aliases it holds a credential for, and an alias scope still narrows what a
+    /// key may name.
+    #[serde(default)]
+    pub namespace: Option<String>,
     pub targets: Vec<Target>,
+}
+
+impl Model {
+    /// Whether `namespace` may see and invoke this alias.
+    pub fn reachable_from(&self, namespace: &str) -> bool {
+        self.namespace
+            .as_deref()
+            .is_none_or(|owner| owner == namespace)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2059,12 +2083,35 @@ impl Config {
         let namespaces: HashMap<&str, &Namespace> =
             self.namespace.iter().map(|n| (n.id.as_str(), n)).collect();
 
+        // An alias name is unique within the namespace that owns it, not across
+        // the deployment: two tenants naming their own `fast` is the point of
+        // ownership. What must stay unique is the pair, because resolution takes
+        // the first row that matches and a second row for the same pair would be
+        // unreachable configuration.
+        let mut owned: HashSet<(Option<&str>, &str)> = HashSet::new();
         for model in &self.model {
             if model.targets.is_empty() {
                 return Err(ConfigError::Invalid(format!(
                     "model `{}` has no targets",
                     model.name
                 )));
+            }
+            if let Some(namespace) = model.namespace.as_deref()
+                && !namespaces.contains_key(namespace)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "model `{}` is owned by undefined namespace `{namespace}`",
+                    model.name
+                )));
+            }
+            if !owned.insert((model.namespace.as_deref(), model.name.as_str())) {
+                return Err(ConfigError::Invalid(match model.namespace.as_deref() {
+                    Some(namespace) => format!(
+                        "namespace `{namespace}` defines model `{}` twice",
+                        model.name
+                    ),
+                    None => format!("model `{}` is defined twice", model.name),
+                }));
             }
             for t in &model.targets {
                 if !providers.contains_key(t.provider.as_str()) {
@@ -3257,8 +3304,33 @@ impl Config {
             .len()
     }
 
+    /// An alias by name, ignoring ownership: "does this deployment define `fast`
+    /// at all", which is a question about a file rather than about a caller.
+    ///
+    /// Deliberately not reachable from a request. Resolution goes through
+    /// [`Config::model_for`], which cannot return an alias another namespace owns,
+    /// and a deployment-wide lookup on the request path would defeat that.
+    #[cfg(test)]
     pub fn model(&self, name: &str) -> Option<&Model> {
         self.model.iter().find(|m| m.name == name)
+    }
+
+    /// The alias `name` resolves to *for* `namespace`: the namespace's own row if
+    /// it owns one, otherwise an unowned row.
+    ///
+    /// The precedence is the same one desired state gives a project override over
+    /// a tenant default (ADR 0042): a namespace that names an alias replaces the
+    /// deployment-wide one for itself alone, and nothing here can reach a row
+    /// another namespace owns.
+    pub fn model_for(&self, namespace: &str, name: &str) -> Option<&Model> {
+        self.model
+            .iter()
+            .find(|m| m.name == name && m.namespace.as_deref() == Some(namespace))
+            .or_else(|| {
+                self.model
+                    .iter()
+                    .find(|m| m.name == name && m.namespace.is_none())
+            })
     }
 
     /// Run the boot-time resource-graph gate on a config this process compiled
@@ -4277,6 +4349,99 @@ targets = []
 "#;
         assert!(matches!(
             Config::from_toml_str(toml),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    /// Two namespaces may publish the same alias name, and each resolves to its
+    /// own: the pair `(namespace, name)` is what has to be unique, not the name.
+    #[test]
+    fn an_owned_alias_is_its_namespaces_own_and_shadows_the_deployments() {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+{VALID}
+
+[[namespace]]
+id = "acme"
+
+[[namespace]]
+id = "globex"
+
+[[model]]
+name = "shared"
+targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+
+[[model]]
+name = "shared"
+namespace = "acme"
+targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+
+[[model]]
+name = "private"
+namespace = "globex"
+targets = [{{ provider = "openai", model = "o3", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+"#
+        ))
+        .expect("an owned alias beside an unowned one");
+
+        // The owner gets its own row; everyone else gets the unowned one.
+        assert_eq!(
+            cfg.model_for("acme", "shared").expect("acme's own").targets[0].model,
+            "gpt-4o-mini"
+        );
+        assert_eq!(
+            cfg.model_for("globex", "shared")
+                .expect("the deployment's")
+                .targets[0]
+                .model,
+            "gpt-4o"
+        );
+        // An owned alias is not reachable from anywhere else, with no unowned row
+        // to fall back to.
+        assert!(cfg.model_for("acme", "private").is_none());
+        assert!(cfg.model_for("globex", "private").is_some());
+    }
+
+    #[test]
+    fn rejects_an_alias_owned_by_a_namespace_the_deployment_does_not_define() {
+        let toml = format!(
+            r#"
+{VALID}
+
+[[model]]
+name = "shared"
+namespace = "nowhere"
+targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+"#
+        );
+        assert!(matches!(
+            Config::from_toml_str(&toml),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_one_namespace_defining_the_same_alias_twice() {
+        let toml = format!(
+            r#"
+{VALID}
+
+[[namespace]]
+id = "acme"
+
+[[model]]
+name = "shared"
+namespace = "acme"
+targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+
+[[model]]
+name = "shared"
+namespace = "acme"
+targets = [{{ provider = "openai", model = "o3", price = {{ input_microdollars_per_million = 1, output_microdollars_per_million = 1 }} }}]
+"#
+        );
+        assert!(matches!(
+            Config::from_toml_str(&toml),
             Err(ConfigError::Invalid(_))
         ));
     }

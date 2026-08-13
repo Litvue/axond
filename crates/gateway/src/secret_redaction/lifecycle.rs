@@ -388,6 +388,7 @@ async fn the_stateless_credential_path_still_serves_and_still_redacts() {
     });
     config.model.push(crate::config::Model {
         name: "fast".to_owned(),
+        namespace: None,
         targets: vec![crate::config::Target {
             provider: "openai".to_owned(),
             model: "gpt-4o".to_owned(),

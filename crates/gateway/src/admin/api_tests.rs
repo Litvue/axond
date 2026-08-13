@@ -104,6 +104,21 @@ impl Deployment {
         Self { api, store }
     }
 
+    /// The same control plane, read through a narrower grant: what a tenant
+    /// administrator sees of a deployment somebody with deployment authority
+    /// built.
+    fn narrowed(&self, scopes: &[ResourceScope]) -> Self {
+        Self {
+            api: Arc::new(AdminApi::new(
+                Arc::new(AdminService::stateful(self.store.clone())),
+                Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
+                Arc::new(FakeAdminAuthorizer::permissive().within(scopes)),
+            )),
+            store: self.store.clone(),
+        }
+    }
+    }
+
     async fn send(&self, request: Request<Body>) -> (StatusCode, Value) {
         let response = router(self.api.clone())
             .oneshot(request)
@@ -1251,6 +1266,110 @@ async fn a_tenant_scoped_administrator_cannot_publish_outside_its_tenant() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"]["type"], "admin_forbidden");
     assert_eq!(deployment.store.published_revisions(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The management catalogue
+// ---------------------------------------------------------------------------
+
+/// The read a tenant administrator makes after publishing: the enablement it
+/// created, the alias that names it, and the one thing still standing between
+/// them and a routable model.
+#[tokio::test]
+async fn the_management_catalogue_reports_what_a_tenant_published() {
+    let deployment = Deployment::new();
+    let head = build(&deployment).await;
+
+    let (status, view) = deployment
+        .get(&format!("/catalogue?tenant={}", fixtures::tenant_id(1)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["revision"], head);
+    assert_eq!(view["scope"]["kind"], "tenant");
+
+    let entries = view["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 1, "{view}");
+    let entry = &entries[0];
+    assert_eq!(entry["slug"], "gpt-4o");
+    assert_eq!(
+        entry["offering"],
+        fixtures::offering_id("gpt-4o").to_string()
+    );
+    assert_eq!(
+        entry["catalog_snapshot"],
+        fixtures::catalog_snapshot().to_string()
+    );
+    assert_eq!(entry["state"], "enabled");
+    assert_eq!(entry["aliases"], json!(["default"]));
+    // Enabled and named, and still not routable: nobody approved a price. The
+    // read says which of the two acts is missing rather than reporting a bare
+    // "unavailable".
+    assert_eq!(entry["billable"], json!(false));
+    assert_eq!(entry["routable"], json!(false));
+    assert_eq!(entry["unavailable"], json!(["unpriced"]));
+    // And it says what this build could not consult, so an operator does not read
+    // silence as an all-clear.
+    assert_eq!(
+        view["pending"],
+        json!(["offering-metadata", "availability"])
+    );
+}
+
+/// The scope is a request parameter, so it is checked against the grant like any
+/// other: a tenant administrator cannot read another tenant's catalogue, and the
+/// refusal does not tell it whether that tenant has anything enabled.
+#[tokio::test]
+async fn a_catalogue_read_outside_the_grant_is_forbidden() {
+    let built = Deployment::new();
+    build(&built).await;
+    let deployment = built.narrowed(&[
+        ResourceScope::Tenant(fixtures::tenant_id(1)),
+        ResourceScope::Project {
+            tenant: fixtures::tenant_id(1),
+            project: fixtures::project_id(2),
+        },
+    ]);
+
+    let (status, body) = deployment
+        .get(&format!("/catalogue?tenant={}", fixtures::tenant_id(7)))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["type"], "admin_forbidden");
+
+    // The scope a project read is checked against is the pair, so a grant that
+    // covers the pair reads it and one that names another tenant does not.
+    let (status, view) = deployment
+        .get(&format!(
+            "/catalogue?tenant={}&project={}",
+            fixtures::tenant_id(1),
+            fixtures::project_id(2)
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["scope"]["kind"], "project");
+    assert_eq!(view["entries"].as_array().expect("entries").len(), 1);
+}
+
+/// A malformed filter is a typed refusal rather than a silently ignored
+/// parameter: a caller that filtered on a spelling this build does not know must
+/// not be handed an unfiltered catalogue and believe it was filtered.
+#[tokio::test]
+async fn a_catalogue_filter_this_build_cannot_read_is_refused() {
+    let deployment = Deployment::new();
+    build(&deployment).await;
+
+    for query in [
+        "tenant=not-a-uuid".to_owned(),
+        format!("tenant={}&state=retired", fixtures::tenant_id(1)),
+        format!("tenant={}&wire_family=telepathy", fixtures::tenant_id(1)),
+        format!("tenant={}&offering=nonsense", fixtures::tenant_id(1)),
+        format!("tenant={}&unknown=1", fixtures::tenant_id(1)),
+        "project=nothing".to_owned(),
+    ] {
+        let (status, body) = deployment.get(&format!("/catalogue?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(body["error"]["type"], "admin_request_invalid", "{query}");
+    }
 }
 
 // ---------------------------------------------------------------------------

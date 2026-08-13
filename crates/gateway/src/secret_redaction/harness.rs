@@ -217,6 +217,7 @@ impl CandidateCompiler for SecretResolvingCompiler {
             }
             config.model.push(Model {
                 name: resource.slug.as_str().to_owned(),
+                namespace: None,
                 targets: vec![Target {
                     provider: self.provider.to_owned(),
                     model: "gpt-4o".to_owned(),

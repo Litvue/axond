@@ -26,6 +26,7 @@
 //! | [`protocol`] | the mutation preconditions: idempotency key, expected revision, dry run, audit summary |
 //! | [`diff`] | the redacted semantic diff between two complete desired states |
 //! | [`reads`] | bounded read projections: state, history, audit, convergence |
+//! | [`catalogue`] | the tenant-scoped management catalogue: what a tenant has enabled, and why a model is not routable |
 //! | [`resources`] | the typed request documents, and the edits they become |
 //! | [`service`] | the one path a mutation takes: mode, authority, read, validate, diff, publish |
 //! | [`handlers`] | the routes themselves: parse, plan, delegate |
@@ -79,6 +80,7 @@
 //! [`Debug`]: std::fmt::Debug
 
 pub mod auth;
+pub mod catalogue;
 pub mod cli;
 pub mod conditional;
 pub mod diff;
@@ -105,6 +107,11 @@ mod tests;
 pub use auth::{
     AdminAction, AdminAuthError, AdminAuthenticator, AdminAuthorizer, AdminCredential, AdminGrant,
     AdminIdentity, AdminPresented, BreakglassAttribution, InvalidAttribution,
+};
+#[allow(unused_imports)]
+pub use catalogue::{
+    CatalogueEntry, CatalogueFilters, CatalogueRequest, CatalogueView, PendingFact,
+    UnavailableReason,
 };
 #[allow(unused_imports)]
 pub use diff::{BlobDelta, ChangeKind, DiffSummary, ResourceDelta, SemanticDiff};

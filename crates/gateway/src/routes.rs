@@ -773,10 +773,23 @@ fn hex_digit(byte: u8) -> Option<u8> {
 }
 
 /// The model catalog, gated behind a gateway key and scoped to the caller's
-/// namespace: a caller sees only the aliases it could actually invoke — those
-/// with at least one target whose provider resolves a credential for the
-/// caller's namespace (its own, or the platform's when fallback is allowed).
-/// So a BYOK tenant cannot enumerate aliases it is not entitled to.
+/// namespace: a caller sees only the aliases it could actually invoke.
+///
+/// Three filters, all of them the caller's own namespace:
+///
+/// 1. **Ownership.** An alias another namespace owns is not listed at all, so an
+///    alias name is a tenant's name rather than the deployment's — even when both
+///    tenants can reach the provider behind it (ADR 0053).
+/// 2. **Alias scope.** A minted token narrowing what its bearer may name narrows
+///    what it may enumerate, so a list never advertises what a key would be
+///    refused for.
+/// 3. **Entitlement.** At least one target must resolve a credential for the
+///    caller's namespace — its own, or the platform's when fallback is allowed —
+///    so a BYOK tenant cannot enumerate aliases it is not entitled to.
+///
+/// Answered entirely from the immutable snapshot the request was admitted with:
+/// no control-plane read happens here, and a disabled alias is absent from the
+/// snapshot rather than filtered out of one.
 async fn list_models(
     Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
     Extension(caller): Extension<InboundKey>,
@@ -786,14 +799,24 @@ async fn list_models(
         .model
         .iter()
         .filter(|m| {
-            caller
-                .alias_scope
-                .as_ref()
-                .is_none_or(|scope| scope.permits(&m.name))
+            m.reachable_from(&caller.namespace)
+                && caller
+                    .alias_scope
+                    .as_ref()
+                    .is_none_or(|scope| scope.permits(&m.name))
                 && m.targets.iter().any(|t| {
                     snapshot
                         .credentials
                         .is_present(cfg, &caller.namespace, &t.provider)
+                })
+        })
+        // One row per name, matching resolution: a namespace that owns `fast`
+        // shadows the unowned `fast` for itself, so the list does not offer the
+        // same name twice over different targets.
+        .filter(|m| {
+            m.namespace.is_some()
+                || !cfg.model.iter().any(|other| {
+                    other.name == m.name && other.namespace.as_deref() == Some(&caller.namespace)
                 })
         })
         .map(|m| json!({ "id": m.name, "object": "model", "owned_by": "axond" }))
@@ -931,19 +954,20 @@ fn namespace_allows(snapshot: &ConfigSnapshot, namespace: &str, capability: Capa
         return true;
     };
     snapshot.config.model.iter().any(|model| {
-        model.targets.iter().any(|target| {
-            snapshot
-                .config
-                .provider(&target.provider)
-                .is_some_and(|provider| {
-                    route.serves(provider.kind)
-                        && snapshot.credentials.is_present(
-                            &snapshot.config,
-                            namespace,
-                            &target.provider,
-                        )
-                })
-        })
+        model.reachable_from(namespace)
+            && model.targets.iter().any(|target| {
+                snapshot
+                    .config
+                    .provider(&target.provider)
+                    .is_some_and(|provider| {
+                        route.serves(provider.kind)
+                            && snapshot.credentials.is_present(
+                                &snapshot.config,
+                                namespace,
+                                &target.provider,
+                            )
+                    })
+            })
     })
 }
 
@@ -1255,8 +1279,12 @@ async fn serve(
         ));
     }
 
+    // Resolved for the caller's namespace, never deployment-wide: an alias
+    // another namespace owns is `unknown_model` here, exactly as it is absent
+    // from `/v1/models`. A caller must not be able to discover, by the shape of
+    // a refusal, that a name it cannot use exists.
     let model = cfg
-        .model(&alias)
+        .model_for(&caller.namespace, &alias)
         .ok_or_else(|| GatewayError::UnknownModel(alias.clone()))?;
     let wire = Wire {
         route,
@@ -4742,6 +4770,134 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
         );
         let acme = models_for(&state, "acme-key").await;
         assert_eq!(acme["data"].as_array().unwrap().len(), 0);
+    }
+
+    /// An alias a namespace owns is that namespace's alone: another namespace
+    /// neither lists it nor can invoke it, and the owner's row shadows the
+    /// deployment-wide one of the same name (ADR 0053).
+    ///
+    /// The isolation asserted here is the catalogue and the resolution, which is
+    /// where a leak would be observable: a caller that cannot name an alias cannot
+    /// reach the upstream behind it, so no provider call is needed to characterise
+    /// it.
+    #[tokio::test]
+    async fn an_owned_alias_is_listed_and_routable_only_by_its_namespace() {
+        let cfg = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[namespace]]
+id = "acme"
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "K_PLATFORM"
+
+[[credential]]
+namespace = "acme"
+provider = "openai"
+env = "K_ACME"
+
+[[gateway_key]]
+env = "GK_PLATFORM"
+namespace = "platform"
+
+[[gateway_key]]
+env = "GK_ACME"
+namespace = "acme"
+
+[[model]]
+name = "shared"
+targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
+
+[[model]]
+name = "shared"
+namespace = "acme"
+targets = [{ provider = "openai", model = "gpt-4o-mini", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
+
+[[model]]
+name = "private"
+namespace = "acme"
+targets = [{ provider = "openai", model = "o3", price = { input_microdollars_per_million = 1, output_microdollars_per_million = 1 } }]
+"#,
+        )
+        .unwrap();
+        let env: HashMap<String, String> = [
+            ("K_PLATFORM", "sk-platform"),
+            ("K_ACME", "sk-acme"),
+            ("GK_PLATFORM", "plat-key"),
+            ("GK_ACME", "acme-key"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let state = AppState::new(
+            cfg,
+            &env,
+            UsageFanout::new(vec![Box::new(StdoutSink)]),
+            Box::new(NoBudget),
+        )
+        .unwrap();
+
+        let ids = |catalogue: &Value| {
+            catalogue["data"]
+                .as_array()
+                .expect("a catalogue")
+                .iter()
+                .map(|entry| entry["id"].as_str().expect("an id").to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        // The owner lists its own aliases once each: the shadowed deployment-wide
+        // `shared` is not a second entry.
+        let mut acme = ids(&models_for(&state, "acme-key").await);
+        acme.sort();
+        assert_eq!(acme, ["private", "shared"]);
+
+        // The other namespace sees no evidence that `private` exists.
+        assert_eq!(ids(&models_for(&state, "plat-key").await), ["shared"]);
+
+        // Nor can it name it: an alias another namespace owns is an unknown model,
+        // not a forbidden one, because a refusal that distinguishes the two is a
+        // way to enumerate what a tenant has enabled.
+        let snapshot = state.config();
+        assert!(snapshot.config.model_for("platform", "private").is_none());
+        assert_eq!(
+            snapshot
+                .config
+                .model_for("acme", "shared")
+                .expect("acme's own")
+                .targets[0]
+                .model,
+            "gpt-4o-mini"
+        );
+
+        let body = serde_json::to_vec(&json!({"model": "private", "messages": []})).unwrap();
+        let resp = router(state.clone())
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {}", "plat-key"),
+                    )
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "unknown_model");
     }
 
     /// The `/v1/models` body a caller presenting `secret` receives.
