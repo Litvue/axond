@@ -332,7 +332,11 @@ An enablement body names an offering by an **opaque derived identity**
 published, and pins the **catalogue snapshot** it was approved against; the
 resource depends on the blob declaring that snapshot, so a revision cannot pin a
 snapshot it does not carry ([ADR
-0036](../adr/0036-model-enablement-and-alias-contracts.md)).
+0036](../adr/0036-model-enablement-and-alias-contracts.md)). The pin must resolve
+to a `CatalogModel` dependency whose body is a blob of kind `CatalogSnapshot`
+with a matching digest — an unresolvable pin is an **invalid** revision, not a
+compatibility skew, and a revision whose enablements have lost the catalogue they
+were approved against does not converge.
 
 Five things follow, and each is worth knowing before you approve a model:
 

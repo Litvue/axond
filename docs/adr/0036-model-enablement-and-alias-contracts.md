@@ -68,6 +68,13 @@ axond.model-alias.v1:      schema, alias_id, tenant_id, project_id,
   declares it. A refresh mints a *new* snapshot; the revision that pinned the old
   one keeps pinning it, so a rollback restores the catalogue facts along with the
   manifest, and an entitlement never widens because an upstream published more.
+  The pin resolves *structurally*: the dependency must be a `CatalogModel` whose
+  body is a blob of kind `CatalogSnapshot` with a matching digest. This is a
+  requirement on any future storage path — hydration must reconstruct a catalogue
+  resource with its blob kind and digest intact rather than rematerializing the
+  body inline, because an enablement whose pin no longer resolves is refused as
+  invalid, not tolerated as skew. A revision whose enablements have lost the
+  catalogue they were approved against must not converge.
 - **An observed price is not an approved price.** `observed_price` records what a
   catalogue publishes and is inert: nothing bills against it and no conversion
   promotes it. Only `approved_price` — an exactly-versioned reference to a price

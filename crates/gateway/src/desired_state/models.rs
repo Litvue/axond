@@ -1832,6 +1832,12 @@ fn is_typed(resource: &ResourceVersion) -> bool {
 
 /// The snapshot an enablement pins must be a snapshot this revision carries, as a
 /// declared dependency of the enablement itself.
+///
+/// The pin resolves structurally, so a storage path that reconstructs a catalogue
+/// resource must keep its blob kind and digest intact rather than rematerializing
+/// the body inline; see ADR 0036. An unresolvable pin is invalid rather than skew
+/// on purpose: a revision whose enablements have lost the catalogue they were
+/// approved against must not converge.
 fn check_snapshot_pin(
     state: &DesiredState,
     resource: &ResourceVersion,
