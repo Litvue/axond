@@ -74,6 +74,15 @@ explained in the log once per condition, backend and namespace, and at most once
 a minute thereafter: a bootstrap gap under production traffic must not turn the
 log into the outage.
 
+A cap of zero is not how a scope is closed. It is refused where the document is
+read, on both the subject and the scope-wide cap, exactly as the bootstrap file
+refuses one: it denies every request for the scope, which is a state the section
+does not express — its whole content is "spending here is finite, and this is
+the bound". Allowing it would make a fat-fingered document indistinguishable
+from a deliberate fleet-wide freeze, and would give the two layers different
+answers to the same question. Stopping a scope is tenancy's job: withdraw the
+projection, revoke the credentials.
+
 ### A hold carries the generation that granted it
 
 Every reservation and every shared concurrency lease is stamped with the

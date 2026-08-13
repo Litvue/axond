@@ -435,11 +435,28 @@ pub struct BudgetPolicy {
 }
 
 impl BudgetPolicy {
+    /// A cap of zero is refused, on either scope, exactly as the bootstrap file
+    /// refuses one ([`Config::validate_budget`](crate::config::Config)): it
+    /// denies every request for the scope, which is a state no *cap* expresses
+    /// — the section's whole content is "spending here is finite and this is the
+    /// bound", and zero says the scope is closed. Closing a scope is the
+    /// tenancy layer's job (remove the projection, revoke the credentials), and
+    /// routing it through a limit would make a fat-fingered document indistinguishable
+    /// from a deliberate fleet-wide freeze.
     pub const fn new(
         subject_limit_microdollars: u64,
         namespace_limit_microdollars: Option<u64>,
         reservation_ttl_seconds: u64,
     ) -> Result<Self, InvalidPolicy> {
+        if subject_limit_microdollars == 0 {
+            return Err(InvalidPolicy::TooSmall {
+                value: subject_limit_microdollars,
+                min: 1,
+            });
+        }
+        if let Some(0) = namespace_limit_microdollars {
+            return Err(InvalidPolicy::TooSmall { value: 0, min: 1 });
+        }
         if reservation_ttl_seconds == 0 {
             return Err(InvalidPolicy::TooSmall {
                 value: reservation_ttl_seconds,
@@ -674,12 +691,23 @@ impl PolicyBody {
         };
         let epoch = PolicyEpoch::new(record.integer(EPOCH_FIELD)?)
             .map_err(|source| bound(EPOCH_FIELD, source))?;
-        let budget = BudgetPolicy::new(
-            record.integer(BUDGET_LIMIT_FIELD)?,
-            record.optional_integer(NAMESPACE_BUDGET_LIMIT_FIELD)?,
-            record.integer(RESERVATION_TTL_FIELD)?,
-        )
-        .map_err(|source| bound(RESERVATION_TTL_FIELD, source))?;
+        let subject_limit = record.integer(BUDGET_LIMIT_FIELD)?;
+        let namespace_limit = record.optional_integer(NAMESPACE_BUDGET_LIMIT_FIELD)?;
+        let reservation_ttl = record.integer(RESERVATION_TTL_FIELD)?;
+        let budget = BudgetPolicy::new(subject_limit, namespace_limit, reservation_ttl).map_err(
+            |source| {
+                // Three fields share one bound, so the refusal names the one that
+                // broke it rather than the last one passed.
+                let field = if subject_limit == 0 {
+                    BUDGET_LIMIT_FIELD
+                } else if namespace_limit == Some(0) {
+                    NAMESPACE_BUDGET_LIMIT_FIELD
+                } else {
+                    RESERVATION_TTL_FIELD
+                };
+                bound(field, source)
+            },
+        )?;
         let max_in_flight = record.integer(MAX_IN_FLIGHT_FIELD)?;
         let lease_ttl = record.integer(LEASE_TTL_FIELD)?;
         let concurrency = ConcurrencyPolicy::new(max_in_flight, lease_ttl).map_err(|source| {
@@ -1706,14 +1734,14 @@ mod tests {
         let capped = PolicyBody::new(
             tenant_scope(),
             PolicyEpoch::FIRST,
-            BudgetPolicy::new(1_000_000, Some(0), 60).unwrap(),
+            BudgetPolicy::new(1_000_000, Some(1), 60).unwrap(),
             ConcurrencyPolicy::new(8, 30).unwrap(),
             RevocationPolicy::new(1),
         );
         assert_ne!(
             uncapped.checksum().unwrap(),
             capped.checksum().unwrap(),
-            "a scope-wide cap of zero is a different document from no cap at all"
+            "a scope-wide cap is a different document from no cap at all"
         );
         assert_eq!(
             PolicyBody::read(&capped.version(slug())).unwrap(),
@@ -1884,6 +1912,34 @@ mod tests {
                 source: InvalidPolicy::TooSmall { value: 0, min: 1 },
             })
         );
+        // A published cap of zero is refused where the operator can still fix it
+        // — reading the document — rather than activated into a scope that then
+        // 429s every request, and the refusal names the field that broke the
+        // bound rather than the last one the constructor was passed.
+        assert_eq!(
+            PolicyBody::read(&edited(|fields| {
+                set(fields, BUDGET_LIMIT_FIELD, CanonicalValue::integer(0u32));
+            })),
+            Err(PolicyError::FieldRange {
+                reference,
+                field: BUDGET_LIMIT_FIELD,
+                source: InvalidPolicy::TooSmall { value: 0, min: 1 },
+            })
+        );
+        assert_eq!(
+            PolicyBody::read(&edited(|fields| {
+                set(
+                    fields,
+                    NAMESPACE_BUDGET_LIMIT_FIELD,
+                    CanonicalValue::integer(0u32),
+                );
+            })),
+            Err(PolicyError::FieldRange {
+                reference,
+                field: NAMESPACE_BUDGET_LIMIT_FIELD,
+                source: InvalidPolicy::TooSmall { value: 0, min: 1 },
+            })
+        );
         assert!(matches!(
             PolicyBody::read(&edited(|fields| {
                 set(
@@ -1913,6 +1969,18 @@ mod tests {
         );
         assert_eq!(
             BudgetPolicy::new(1, None, 0),
+            Err(InvalidPolicy::TooSmall { value: 0, min: 1 })
+        );
+        // A cap of zero denies every request for the scope, which the bootstrap
+        // file refuses for the same reason: it is not a bound on spending, it is
+        // a closed scope wearing one. Refused on both scopes, so a published
+        // document cannot express what an authored one may not.
+        assert_eq!(
+            BudgetPolicy::new(0, None, 30),
+            Err(InvalidPolicy::TooSmall { value: 0, min: 1 })
+        );
+        assert_eq!(
+            BudgetPolicy::new(1, Some(0), 30),
             Err(InvalidPolicy::TooSmall { value: 0, min: 1 })
         );
     }
@@ -2408,8 +2476,9 @@ mod tests {
             "advancing only the epoch restates the same policy"
         );
 
-        // An absent optional cap is not a cap of zero, so the two never digest
-        // alike and one can never be carried forward as the other.
+        // An absent optional cap is a statement of its own, so a document that
+        // states one never digests like a document that has none, and neither
+        // can be carried forward as the other.
         let capped = |limit| {
             PolicyBody::new(
                 tenant_scope(),
@@ -2420,7 +2489,7 @@ mod tests {
             )
             .content()
         };
-        assert_ne!(capped(None), capped(Some(0)));
+        assert_ne!(capped(None), capped(Some(1)));
         assert_ne!(capped(Some(1)), capped(Some(2)));
     }
 
