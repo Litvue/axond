@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.31](https://github.com/Litvue/axond/compare/v0.3.30...v0.3.31) (2026-08-13)
+
+
+### Features
+
+* **status:** observe the control plane a stateful replica administers ([#307](https://github.com/Litvue/axond/issues/307)) ([6f155d7](https://github.com/Litvue/axond/commit/6f155d7edd4af9d18109989f0da82ac771e8d419))
+
 ## [0.3.30](https://github.com/Litvue/axond/compare/v0.3.29...v0.3.30) (2026-08-13)
 
 
