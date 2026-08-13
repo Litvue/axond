@@ -110,12 +110,18 @@ verify_sha256() {
     fi
 }
 
-if command -v actionlint >/dev/null 2>&1; then
-    installed="$(actionlint --version | head -n 1)"
-    if [[ $installed == "$ACTIONLINT_VERSION" ]]; then
-        exec actionlint -color
+# A binary named `actionlint` on PATH is not a pinned build: nothing but its own
+# `--version` string vouches for it, so trusting it would make the acquisition
+# below decorative on any machine that has one. It is used only when the caller
+# names it explicitly, which is an assertion that they know where it came from.
+if [[ -n ${AXOND_ACTIONLINT-} ]]; then
+    installed="$("$AXOND_ACTIONLINT" --version | head -n 1)"
+    if [[ $installed != "$ACTIONLINT_VERSION" ]]; then
+        echo "AXOND_ACTIONLINT is actionlint $installed; this gate pins $ACTIONLINT_VERSION" >&2
+        exit 1
     fi
-    echo "ignoring actionlint $installed on PATH; this gate pins $ACTIONLINT_VERSION"
+    echo "using the caller-supplied actionlint $installed ($AXOND_ACTIONLINT)"
+    exec "$AXOND_ACTIONLINT" -color
 fi
 
 if [[ -z $PLATFORM ]]; then

@@ -278,14 +278,18 @@ the same Action.
 The lane proves it still rejects those with `ops/workflow-policy.py --self-test`
 before it checks the repository, and then lints the workflows with
 [`ops/actionlint.sh`](../../ops/actionlint.sh). That script runs one pinned
-`actionlint` version, reached three ways: a matching binary already on `PATH`,
-otherwise the checksum-verified release archive for this host (Linux and macOS,
+`actionlint` version, reached two ways: the checksum-verified release archive for
+this host (Linux and macOS,
 x86-64 and arm64, each with its own checksum from the release's
 `checksums.txt`), otherwise the same version as a digest-pinned container image —
 which is the path GitHub-hosted runners take, because they answer 503 for the
 release asset, and the path any other host takes rather than downloading a binary
 it cannot execute. Bumping `actionlint` means updating the version, all four
-checksums, and the image digest together. Locally:
+checksums, and the image digest together. A binary merely sitting on `PATH` is
+deliberately *not* used — nothing but its own `--version` vouches for it, and
+trusting it would make the pinned paths decorative on any machine that has one.
+Point `AXOND_ACTIONLINT` at a build you placed yourself to skip the download; the
+script still refuses it unless it reports the pinned version. Locally:
 
 ```bash
 just workflow-policy   # pins, permissions, signer restrictions, Dependabot labels
