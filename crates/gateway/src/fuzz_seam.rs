@@ -22,6 +22,7 @@
 #![allow(dead_code)]
 
 // Keep this list identical to `main.rs`. `tests/fuzz_seam.rs` fails if it drifts.
+mod admin;
 mod admission;
 mod aliases;
 mod availability;
