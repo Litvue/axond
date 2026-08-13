@@ -869,6 +869,16 @@ mod tests {
             validate_label_value("axond.revision.rejections", "axond.revision.reason", reason)
                 .expect("every emitted rejection reason is catalogued");
         }
+        // Read from the compiler rather than from `REVISION_REASONS`, which the
+        // loop above cannot notice a compile label going missing from.
+        for reason in crate::convergence::CompileError::REASONS {
+            assert!(
+                crate::convergence::reconciler::REVISION_REASONS.contains(reason),
+                "`{reason}` is a compile refusal an alert has to be able to select"
+            );
+            validate_label_value("axond.revision.rejections", "axond.revision.reason", reason)
+                .expect("every compile refusal reason is catalogued");
+        }
         // A label the reconciler produces without asking a category for it: read
         // from the reconciler rather than from the list above, which the loop
         // over the catalogue's own constant cannot notice going missing.

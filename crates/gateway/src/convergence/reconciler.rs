@@ -159,6 +159,8 @@ pub const REVISION_REASONS: &[&str] = &[
     "secret",
     "projection",
     "validation",
+    "pricing",
+    "clock",
     "snapshot",
 ];
 
@@ -504,6 +506,17 @@ impl Reconciler {
         // never material: enough for an operator to see that a rotation's new
         // version is in service, with nothing to leak.
         let materialized = snapshot.secrets().len();
+        // Read before publication, because the snapshot is handed away whole.
+        let pricing = snapshot.pricing().map(|pricing| {
+            (
+                pricing.book(),
+                pricing.checksum(),
+                pricing.catalog(),
+                pricing.is_approved(),
+                pricing.targets().len(),
+                pricing.effective().ends(),
+            )
+        });
 
         self.sink.publish(snapshot);
         *self.active.lock().expect("not poisoned") = Some(id);
@@ -518,6 +531,23 @@ impl Reconciler {
             materialized,
             "published desired revision"
         );
+        // The identities an operator needs to answer "what was this request billed
+        // at", logged at publication because a snapshot is never mutated after it.
+        // `priced_until` is the instant this resolution stops being the answer: a
+        // rule dated after it applies to a later compilation, not to this snapshot.
+        if let Some((book, checksum, catalog, approved, targets, until)) = pricing {
+            tracing::info!(
+                revision = %id,
+                generation,
+                price_book = %book,
+                price_book_checksum = %checksum,
+                catalog = %catalog,
+                approved,
+                priced_targets = targets,
+                priced_until = until.map(|until| until.millis()),
+                "published approved pricing"
+            );
+        }
         self.export(&revision);
         Ok(id)
     }

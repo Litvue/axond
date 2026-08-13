@@ -216,6 +216,41 @@ The budget schema ([`ops/postgres/budget_v1.sql`](../ops/postgres/budget_v1.sql)
 follows the same rule, but it is gateway-internal state rather than a reporting
 interface — read it at your own risk.
 
+### Desired-state schemas and approved price books
+
+Stateful mode's desired state is versioned by schema identifier per body, not by
+one revision format. A price book declares `axond.price-book.v1`
+([ADR 0044](./adr/0044-approved-price-books.md)), and a replica reads only the
+schemas its build knows:
+
+- Adding an optional field to a body **is** a schema bump. Bodies are read
+  strictly — an unknown schema, an unknown field, a missing field, a wrong type,
+  a currency, unit, precedence, or approval state this build does not know, or a
+  rate it cannot bill is **refused**, never partially applied.
+- A refusal of that kind is reported as an **incompatibility**, not as
+  corruption, and the replica keeps serving the revision it already converged
+  onto — including the pricing that revision carried. So a rolling upgrade in
+  either direction is safe: a replica running an older build refuses the newer
+  build's revision under a named reason and continues at its previous prices,
+  rather than serving a revision it half understands or falling back to no
+  pricing.
+- Rolling *back* is republication of a prior revision. Price books are immutable
+  per version, so no rollback rewrites a historical rate, and the price book a
+  request was billed against is identified in the snapshot that served it by
+  reference, canonical checksum, catalogue content id, and effective interval.
+- What is **not** promised: nothing forces a replica to be able to read a body a
+  newer build wrote. Mixed-version fleets converge at the oldest build's schema
+  support, and staleness is the visible signal.
+
+A configuration reload cannot change any of that either: `axond.toml` describes
+no price book, so a reload keeps the pricing the replica already serves on the
+snapshot it publishes. Approved pricing changes when a revision says so.
+
+Approved pricing is separate from imported catalogue metadata by construction:
+observed models.dev rates are metadata and never activate a billed rate, and a
+target no approved book names carries *no* price in the snapshot rather than a
+zero one — an unpriced model is not a free one.
+
 ### The HTTP surface
 
 - Request and response bodies on the supported routes are the **provider's**,

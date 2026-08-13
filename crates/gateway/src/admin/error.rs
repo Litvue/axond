@@ -444,6 +444,9 @@ fn validation_rule(error: &ValidationError) -> (&'static str, Option<ResourceRef
         ValidationError::Policy(policy) => ("policy", Some(policy.reference())),
         ValidationError::Provider(_) => ("provider_connection", None),
         ValidationError::Model(_) => ("model_contract", None),
+        // #201's price books validate by their own rules, and name the book the
+        // refusal is about without quoting the rates it states.
+        ValidationError::Pricing(pricing) => ("price_book", Some(pricing.reference())),
         ValidationError::AuditMutationMismatch { .. } => ("audit_mutation_mismatch", None),
         ValidationError::Canonical(_) => ("not_canonical", None),
     }

@@ -225,6 +225,13 @@ pub enum StatusReason {
     ProjectionRejected,
     /// A candidate snapshot was refused during compilation.
     SnapshotRejected,
+    /// A published revision's approved price book could not be turned into the
+    /// rates the request path bills.
+    PricingRejected,
+    /// This replica's clock is not on the effective-dating timeline, so *which*
+    /// approved rates are in force has no answer. Replica-local, unlike every
+    /// other revision refusal: a sibling with a correct clock converges.
+    ClockUnsynchronised,
     /// A referenced secret could not be resolved.
     SecretUnresolved,
     /// The last observation is older than the staleness budget. Reported instead
@@ -255,6 +262,8 @@ impl StatusReason {
         Self::ValidationRejected,
         Self::ProjectionRejected,
         Self::SnapshotRejected,
+        Self::PricingRejected,
+        Self::ClockUnsynchronised,
         Self::SecretUnresolved,
         Self::Stale,
         Self::NotConfigured,
@@ -275,6 +284,8 @@ impl StatusReason {
             Self::ValidationRejected => "validation_rejected",
             Self::ProjectionRejected => "projection_rejected",
             Self::SnapshotRejected => "snapshot_rejected",
+            Self::PricingRejected => "pricing_rejected",
+            Self::ClockUnsynchronised => "clock_unsynchronised",
             Self::SecretUnresolved => "secret_unresolved",
             Self::Stale => "stale",
             Self::NotConfigured => "not_configured",
@@ -340,6 +351,8 @@ impl StatusReason {
             "validation" | "invalid" => Self::ValidationRejected,
             "secret" => Self::SecretUnresolved,
             "snapshot" => Self::SnapshotRejected,
+            "pricing" => Self::PricingRejected,
+            "clock" => Self::ClockUnsynchronised,
             "not_found" => Self::NotConfigured,
             "denied" => Self::PermissionDenied,
             _ => Self::Unknown,

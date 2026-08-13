@@ -559,6 +559,8 @@ fn backend_and_revision_failures_map_to_bounded_codes() {
         ("validation", StatusReason::ValidationRejected),
         ("secret", StatusReason::SecretUnresolved),
         ("snapshot", StatusReason::SnapshotRejected),
+        ("pricing", StatusReason::PricingRejected),
+        ("clock", StatusReason::ClockUnsynchronised),
         ("invalid", StatusReason::ValidationRejected),
         ("not_found", StatusReason::NotConfigured),
         ("denied", StatusReason::PermissionDenied),
@@ -581,6 +583,18 @@ fn backend_and_revision_failures_map_to_bounded_codes() {
             revision_reasons.iter().any(|(label, _)| label == reason)
                 && StatusReason::ALL.contains(&StatusReason::from_revision_reason(reason)),
             "`{reason}` is a reason the reconciler emits"
+        );
+    }
+
+    // Read from the compiler rather than from the reconciler's list, which the
+    // loop above cannot notice a compile label going missing from — and demand a
+    // code of its own, since `unknown` for a refusal an operator has to act on is
+    // the drift this guards against.
+    for reason in crate::convergence::CompileError::REASONS {
+        assert_ne!(
+            StatusReason::from_revision_reason(reason),
+            StatusReason::Unknown,
+            "`{reason}` is a compile refusal an operator reads off `/status`"
         );
     }
 }
