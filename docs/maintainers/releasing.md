@@ -166,7 +166,9 @@ fallback obsolete, and the check then says so on every subsequent run:
 ```
 release configuration note: docker-compose.yml: the pinned tag 0.3.18 publishes a
 multi-architecture image, so the amd64 fallback now only forces emulation on ARM
-hosts; switch to `platform: ${AXOND_PLATFORM-}`
+hosts; switch to `platform: ${AXOND_PLATFORM-}`. Leave LAST_AMD64_ONLY_VERSION
+alone: it names the last amd64-only release (0.3.17), and raising it to this tag
+re-asserts the fallback this note asks to drop
 ```
 
 It is a note, not a failure, because release-please bumps the pinned tag inside

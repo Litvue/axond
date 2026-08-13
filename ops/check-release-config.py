@@ -551,14 +551,7 @@ def check_compose_platform(notes: list[str]) -> list[str]:
     version = tuple(int(part) for part in pinned.group(1).split("."))
     if platform_default(version) == NATIVE_PLATFORM:
         if AMD64_FALLBACK_PLATFORM in compose:
-            notes.append(
-                f"docker-compose.yml: the pinned tag {pinned.group(1)} publishes a "
-                "multi-architecture image, so the amd64 fallback now only forces "
-                f"emulation on ARM hosts; switch to `{NATIVE_PLATFORM}`. Leave "
-                "LAST_AMD64_ONLY_VERSION alone: it names the last amd64-only "
-                f"release ({format_version(LAST_AMD64_ONLY_VERSION)}), and raising "
-                "it to this tag re-asserts the fallback this note asks to drop"
-            )
+            notes.append(f"docker-compose.yml: {fallback_obsolete_note(pinned.group(1))}")
         elif NATIVE_PLATFORM not in compose:
             failures.append(
                 "docker-compose.yml: the quickstart platform default is neither "
@@ -701,6 +694,22 @@ def check_repair_preflight(text: str) -> list[str]:
     return failures
 
 
+def fallback_obsolete_note(pinned: str) -> str:
+    """What the check says once the pinned tag outgrows the amd64 fallback.
+
+    The runbook quotes this note verbatim, and `check_platform_transition_guidance`
+    holds the quote to it, so the instruction an operator reads cannot drift from
+    the one the check emits.
+    """
+    return (
+        f"the pinned tag {pinned} publishes a multi-architecture image, so the "
+        "amd64 fallback now only forces emulation on ARM hosts; switch to "
+        f"`{NATIVE_PLATFORM}`. Leave LAST_AMD64_ONLY_VERSION alone: it names the "
+        f"last amd64-only release ({format_version(LAST_AMD64_ONLY_VERSION)}), and "
+        "raising it to this tag re-asserts the fallback this note asks to drop"
+    )
+
+
 def check_platform_transition_guidance() -> list[str]:
     """The post-release follow-up must not ask for `LAST_AMD64_ONLY_VERSION` to move.
 
@@ -731,6 +740,17 @@ def check_platform_transition_guidance() -> list[str]:
             "docs/maintainers/releasing.md: the follow-up does not name the last "
             f"amd64-only release ({format_version(LAST_AMD64_ONLY_VERSION)}), the "
             "value LAST_AMD64_ONLY_VERSION holds"
+        )
+    # The quoted note carries the instruction, so a reworded check must not leave
+    # the runbook quoting advice the check no longer gives. The pinned tag is the
+    # one part that legitimately differs: the runbook quotes the release that first
+    # published an index, while a live run names whatever tag is pinned today.
+    quoted_tail = fallback_obsolete_note("").split("publishes a", 1)[1]
+    if quoted_tail not in runbook:
+        failures.append(
+            "docs/maintainers/releasing.md: the quoted release-configuration note "
+            "no longer matches the one check_compose_platform emits, so the runbook "
+            "shows the operator an instruction the check does not give"
         )
     return failures
 
