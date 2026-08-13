@@ -512,8 +512,15 @@ impl Providers {
 
 #[cfg(test)]
 mod tests {
-    use super::super::fixtures::{project_id, resource_id, tenant, tenant_id};
+    use super::super::fixtures::{
+        candidate, project_id, resource_id, revision_id, tenant, tenant_id,
+    };
+    use super::super::mutation::ExpectedRevision;
+    use super::super::revision::{
+        BodySkew, IntegrityError, LoadedRevision, RevisionManifest, ValidationError,
+    };
     use super::*;
+    use std::time::SystemTime;
 
     fn body() -> ProviderBody {
         ProviderBody::for_tenant(
@@ -628,6 +635,66 @@ mod tests {
                 "no release wrote this marker, so it is storage to repair: {error}"
             );
         }
+    }
+
+    #[test]
+    fn a_connection_this_build_cannot_read_hydrates_as_a_skew_and_a_damaged_one_does_not() {
+        let candidate = candidate(
+            ExpectedRevision::Empty,
+            "providers",
+            state_with(body().version(slug())),
+        );
+        let manifest =
+            RevisionManifest::of(revision_id(1), None, SystemTime::UNIX_EPOCH, &candidate)
+                .expect("the fixture state is publishable");
+
+        let stored = |marker: CanonicalValue| {
+            let mut state = DesiredState::new();
+            for resource in candidate.state.resources() {
+                let resource = if resource.reference.kind == ResourceKind::Provider {
+                    let ResourceBody::Inline(CanonicalValue::Map(fields)) = &resource.body else {
+                        unreachable!("a provider body is an inline record")
+                    };
+                    let mut fields = fields.clone();
+                    fields.retain(|(name, _)| name != SCHEMA_FIELD);
+                    fields.push((SCHEMA_FIELD.to_owned(), marker.clone()));
+                    ResourceVersion {
+                        body: ResourceBody::Inline(CanonicalValue::Map(fields)),
+                        ..resource.clone()
+                    }
+                } else {
+                    resource.clone()
+                };
+                state.insert(resource).expect("distinct references");
+            }
+            LoadedRevision::assemble(manifest.clone(), state)
+                .expect_err("an unreadable connection must not hydrate")
+        };
+
+        let skew = stored(CanonicalValue::string("axond.provider-connection.v2"));
+        assert!(
+            matches!(
+                skew,
+                IntegrityError::Incompatible(BodySkew::Provider(ProviderError::Schema { .. }))
+            ),
+            "{skew}"
+        );
+        assert!(skew.is_incompatible());
+
+        let damage = stored(CanonicalValue::integer(1));
+        assert!(
+            matches!(
+                damage,
+                IntegrityError::Invalid(ValidationError::Provider(
+                    ProviderError::DamagedSchema { .. }
+                ))
+            ),
+            "{damage}"
+        );
+        assert!(
+            !damage.is_incompatible(),
+            "a marker no release wrote is storage to repair: {damage}"
+        );
     }
 
     #[test]
