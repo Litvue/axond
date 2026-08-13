@@ -51,7 +51,11 @@
 //!   withdrawing a key asks for. Deleting the credential releases the pair, so
 //!   falling back to the tenant default is something an operator states. A
 //!   `staged` key holds nothing: preparing a project's own key must not take that
-//!   project off the tenant's before the new one can serve it;
+//!   project off the tenant's before the new one can serve it. A key withdrawn
+//!   *from* staging — staged, then disabled or revoked, which is how a key that
+//!   leaked before activation is handled — does hold the pair, because a key
+//!   pulled for cause is a reason to stop serving that provider rather than to
+//!   move its traffic onto an account nobody nominated;
 //! - a credential whose owner has no projected namespace (a tenant with no
 //!   projects, or a suspended one, whose projects are deliberately not projected)
 //!   is *not* projected. It is logged by reference and skipped rather than
@@ -144,8 +148,8 @@ impl RevisionProjection for CredentialProjection {
 
         // Project-scoped credentials first, so the pairs they claim are known
         // before a tenant's defaults are considered for the same pairs. A key
-        // claims its pair once it has been in service and until it is deleted:
-        // staging is traffic-neutral, and a tombstone releases the pair.
+        // claims its pair from the moment it is more than a preparation until it
+        // is deleted: staging is traffic-neutral, a tombstone releases the pair.
         let (owned, inherited): (Vec<&ProviderCredential>, Vec<&ProviderCredential>) = credentials
             .all()
             .filter(|credential| claims(credential.body.lifecycle()))
@@ -208,6 +212,11 @@ impl RevisionProjection for CredentialProjection {
 /// pool over. `Staged` does not: preparing a project's own key must not take that
 /// project's traffic off the tenant default before the key can serve it.
 /// `Tombstoned` does not either — the material is gone.
+///
+/// `Disabled` and `Revoked` do, whether or not the key ever served: a lifecycle
+/// records what may be done with material, not a history, and withdrawing a key
+/// staged for a project is still that project saying which account this provider
+/// is paid for through. Falling back is an operator's statement — a deletion.
 const fn claims(lifecycle: SecretLifecycle) -> bool {
     match lifecycle {
         SecretLifecycle::Active | SecretLifecycle::Disabled | SecretLifecycle::Revoked => true,
@@ -661,6 +670,29 @@ mod tests {
                 projected(&state([tenant_wide(), project_own(withdrawn)])),
                 [],
                 "{withdrawn:?} must empty the pool, not fall back"
+            );
+        }
+
+        // Withdrawn straight out of staging — a key that leaked before it ever
+        // served — the pair is still the project's: pulling a key for cause is a
+        // reason to stop calling the provider, not to bill the tenant's account.
+        for withdrawn in [SecretLifecycle::Disabled, SecretLifecycle::Revoked] {
+            let body = ProviderCredentialBody::staged(
+                fixtures::resource_id(CREDENTIAL + 10),
+                SecretOwner::project(tenant(), project()),
+                fixtures::provider_id(CREDENTIAL),
+                fixtures::display_name("project-own"),
+                fixtures::secret_ref(CREDENTIAL + 10),
+            )
+            .transitioned(withdrawn)
+            .expect("staged material may be withdrawn without serving");
+            assert_eq!(
+                projected(&state([
+                    tenant_wide(),
+                    body.version(Slug::parse("project-own").expect("fixture slug")),
+                ])),
+                [],
+                "a never-activated {withdrawn:?} key still holds its pair"
             );
         }
 

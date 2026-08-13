@@ -344,7 +344,8 @@ impl ReloadSummary {
             credentials: Delta::between(
                 before_config.credential.iter().map(credential_key),
                 after_config.credential.iter().map(credential_key),
-            ),
+            )
+            .with_changed(credential_version_changes(before_config, after_config)),
             gateway_keys: Delta::between(
                 before_config
                     .gateway_key
@@ -566,6 +567,34 @@ impl ReloadSummary {
 /// `namespace/provider/label` — the pool member a credential entry declares.
 fn credential_key(c: &crate::config::Credential) -> String {
     format!("{}/{}/{}", c.namespace, c.provider, c.label())
+}
+
+/// Pool members whose material moved to another version of the same secret.
+///
+/// Rotation keeps the label — a projected credential's label is its resource
+/// slug — and moves only the version it references, so the key set alone would
+/// report an unchanged pool while every entry in it authenticates with new
+/// material. The reference is opaque, so naming it is not a disclosure.
+fn credential_version_changes(before: &Config, after: &Config) -> Vec<String> {
+    let versions = |config: &Config| -> HashMap<String, crate::desired_state::SecretRef> {
+        config
+            .credential
+            .iter()
+            .filter_map(|credential| {
+                credential
+                    .secret
+                    .map(|secret| (credential_key(credential), secret))
+            })
+            .collect()
+    };
+    let (before, after) = (versions(before), versions(after));
+    let mut changed = before
+        .iter()
+        .filter(|(key, secret)| after.get(*key).is_some_and(|current| current != *secret))
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    changed.sort();
+    changed
 }
 
 fn gateway_token_epoch_key(epoch: &crate::config::GatewayTokenEpoch) -> String {

@@ -485,8 +485,8 @@ credentials pin, and each **active** credential becomes one entry in the pool of
   pools.
 - **withdrawing a project's own key empties its pool; it does not fall back to
   the tenant's.** A project credential holds its `(namespace, provider)` pair from
-  the moment it is activated until it is deleted, so disabling or revoking it
-  makes calls
+  the moment it is more than a preparation until it is deleted, so disabling or
+  revoking it makes calls
   for that provider fail with no credential rather than quietly moving that
   traffic onto the tenant's key — which would bill another account and make a
   different key the one a leak implicates. *Deleting* (`tombstoned`) the
@@ -494,6 +494,11 @@ credentials pin, and each **active** credential becomes one entry in the pool of
   back is something an operator states, not something a withdrawal implies. A
   `staged` project credential holds nothing — the tenant's default keeps serving
   until the new key is activated, so preparing a key never interrupts traffic.
+  Withdrawing a key *out of* staging (staged, then disabled or revoked, the way a
+  key that leaked before activation is handled) does hold the pair, because
+  pulling a key for cause is a reason to stop calling that provider rather than to
+  move that traffic onto an account nobody nominated. Delete it to hand the pool
+  back to the tenant default.
 - **a pool entry names a version, never a value.** Pool status, usage records,
   logs, and metrics carry the credential's slug; the material is held as a
   reference-counted, zeroizing lease that nothing renders.
