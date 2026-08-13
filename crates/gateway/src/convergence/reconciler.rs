@@ -476,6 +476,7 @@ impl Reconciler {
         };
         self.status.observe_desired(Some(revision.id()));
         self.publish(revision, SnapshotSource::ControlPlane, started)
+            .await
             .map(Some)
             .map_err(AttemptError::from)
     }
@@ -484,7 +485,7 @@ impl Reconciler {
     ///
     /// Compilation happens before the sink is touched at all, so the failure path
     /// leaves the running snapshot exactly as it was.
-    fn publish(
+    async fn publish(
         &self,
         revision: LoadedRevision,
         source: SnapshotSource,
@@ -492,8 +493,17 @@ impl Reconciler {
     ) -> Result<RevisionId, CompileError> {
         let id = revision.id();
         let generation = self.sink.generation().saturating_add(1);
-        let snapshot = self.compiler.compile(&revision, generation)?;
+        // Includes unwrapping this candidate's secret material, which is why it
+        // awaits. A store outage or a version that will not unwrap therefore
+        // fails *here*, before the sink is touched, and the previous snapshot
+        // keeps serving.
+        let snapshot = self.compiler.compile(&revision, generation).await?;
         self.status.observe_loaded(id);
+        // How many secret versions this snapshot holds, read before it is
+        // published because publishing moves it. A count, never a reference and
+        // never material: enough for an operator to see that a rotation's new
+        // version is in service, with nothing to leak.
+        let materialized = snapshot.secrets().len();
 
         self.sink.publish(snapshot);
         *self.active.lock().expect("not poisoned") = Some(id);
@@ -505,6 +515,7 @@ impl Reconciler {
             generation,
             source = source.as_str(),
             took_ms = took.as_millis(),
+            materialized,
             "published desired revision"
         );
         self.export(&revision);
@@ -584,6 +595,7 @@ impl Reconciler {
         let started = self.clock.now();
         let id = self
             .publish(revision, SnapshotSource::LastKnownGood, started)
+            .await
             .map_err(|source| BootstrapError::Rejected {
                 source: Box::new(source),
             })?;

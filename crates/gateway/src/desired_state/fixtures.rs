@@ -414,6 +414,45 @@ pub(crate) fn state_a_pre_tenancy_build_published() -> DesiredState {
     state
 }
 
+/// [`state`], with its credential rotated onto the next version of its secret.
+///
+/// What a rotation is as desired state: the same credential identity, a new
+/// resource version, and a *different* exact secret reference — which is why
+/// publishing this revision has to leave the previous version's material alive
+/// for whatever is still serving the previous revision.
+pub(crate) fn state_with_rotated_credential() -> DesiredState {
+    let tenant_id = tenant_id(1);
+    let catalog = blob_backed_catalog(5);
+    let credential = credential_body(&tenant_id, 3, "primary")
+        .rotated()
+        .version_at(
+            Slug::parse("primary").expect("fixture slug"),
+            ResourceVersionNumber::FIRST.next(),
+        );
+    let mut state = DesiredState::new();
+    state.declare_blob(*catalog.body.blob().expect("a blob body"));
+    state
+        .insert(tenant(1, "acme"))
+        .and_then(|state| state.insert(project(&tenant_id, 2, "core")))
+        .and_then(|state| state.insert(credential.clone()))
+        .and_then(|state| state.insert(catalog.clone()))
+        .and_then(|state| {
+            // A new version of the alias too: its dependency now names the
+            // credential's new version, and a resource version is immutable.
+            state.insert(
+                ResourceVersion::new(
+                    reference(ResourceKind::Alias, 4).at(ResourceVersionNumber::FIRST.next()),
+                    ResourceScope::Tenant(tenant_id),
+                    Slug::parse("fast").expect("fixture slug"),
+                    inline("wire_family", "openai-chat"),
+                )
+                .depending_on([credential.reference, catalog.reference]),
+            )
+        })
+        .expect("fixture state is valid");
+    state
+}
+
 /// A second valid state that shares the catalogue blob with [`state`] — what a
 /// revision that changes one alias looks like.
 pub(crate) fn state_with_renamed_alias() -> DesiredState {

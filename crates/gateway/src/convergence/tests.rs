@@ -33,6 +33,10 @@ struct Replica {
     state: AppState,
     clock: ManualClock,
     reconciler: Arc<Reconciler>,
+    /// The ledger the replica's materialization registers unwrapped material in:
+    /// what a test reads to see which versions this process is holding, without
+    /// being able to read the material itself.
+    ledger: Arc<MaterialLedger>,
 }
 
 impl Replica {
@@ -52,10 +56,49 @@ impl Replica {
         Self::build(store, "openai", Some(cache))
     }
 
+    /// A replica that has a cache to fall back to and a secret store that is
+    /// down: the cold-boot case where the cache cannot rescue the boot.
+    fn with_cache_and_unresolvable_secrets(
+        store: &Arc<InMemoryControlPlane>,
+        cache: LastKnownGood,
+    ) -> Self {
+        Self::assembled(
+            store,
+            "openai",
+            Some(cache),
+            super::secrets::testing::unavailable(),
+        )
+    }
+
+    /// A replica whose projection is fine and whose secret store is down: the one
+    /// way a candidate fails on *material* rather than on its graph.
+    fn with_unresolvable_secrets(store: &Arc<InMemoryControlPlane>) -> Self {
+        Self::assembled(
+            store,
+            "openai",
+            None,
+            super::secrets::testing::unavailable(),
+        )
+    }
+
     fn build(
         store: &Arc<InMemoryControlPlane>,
         provider: &'static str,
         cache: Option<LastKnownGood>,
+    ) -> Self {
+        Self::assembled(
+            store,
+            provider,
+            cache,
+            super::secrets::testing::permissive(),
+        )
+    }
+
+    fn assembled(
+        store: &Arc<InMemoryControlPlane>,
+        provider: &'static str,
+        cache: Option<LastKnownGood>,
+        secrets: Arc<SecretMaterialization>,
     ) -> Self {
         let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
         // The boot snapshot: generation 0, serving whatever the file said. Every
@@ -68,12 +111,14 @@ impl Replica {
         )
         .expect("the bootstrap config is servable");
         let clock = ManualClock::new();
+        let ledger = Arc::clone(secrets.ledger());
         let reconciler = Arc::new(Reconciler::new(
             Arc::clone(store) as Arc<dyn ControlPlaneStore>,
-            Arc::new(RevisionCompiler::new(
+            Arc::new(RevisionCompiler::with_secrets(
                 bootstrap(),
                 env(),
                 AliasProjection { provider },
+                Arc::clone(&secrets),
             )),
             Arc::new(state.clone()),
             settings(),
@@ -85,6 +130,7 @@ impl Replica {
             state,
             clock,
             reconciler,
+            ledger,
         }
     }
 
@@ -916,4 +962,209 @@ async fn advance_until(replica: &Replica, predicate: impl Fn(&RevisionReport) ->
         "the replica never reached the expected state: {:?}",
         replica.reconciler.report()
     );
+}
+
+/// A published revision's material is held by the snapshot serving it, so it is
+/// live exactly while that snapshot is.
+#[tokio::test]
+async fn a_published_revision_holds_the_material_it_was_compiled_against() {
+    let store = control_plane();
+    publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let replica = Replica::serving(&store);
+    assert!(
+        replica.ledger.is_empty(),
+        "the boot snapshot has no typed credentials"
+    );
+
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+
+    let held = replica.ledger.retained();
+    let expected = required_secrets(&fixtures::state());
+    assert_eq!(held, expected, "the published revision's versions are held");
+    assert_eq!(
+        replica.state.config().secrets().references(),
+        expected,
+        "and the snapshot serving requests is what holds them"
+    );
+}
+
+/// A rotation is two versions at once, and the old one is released by the last
+/// request that was still using it — not by the rotation.
+#[tokio::test]
+async fn a_rotation_overlaps_versions_until_the_previous_snapshot_is_gone() {
+    let store = control_plane();
+    let first = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let replica = Replica::serving(&store);
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    let old = required_secrets(&fixtures::state());
+
+    // A request starts under the pre-rotation revision, and keeps its snapshot.
+    let in_flight = replica.state.config();
+
+    publish(
+        &store,
+        "rotated",
+        ExpectedRevision::Exactly(first),
+        fixtures::state_with_rotated_credential(),
+    )
+    .await;
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+
+    let new = required_secrets(&fixtures::state_with_rotated_credential());
+    assert_ne!(new, old, "a rotation pins a different exact version");
+    assert_eq!(
+        replica.state.config().secrets().references(),
+        new,
+        "new requests authenticate with the rotated version"
+    );
+    for reference in &old {
+        assert!(
+            replica.ledger.holds(*reference),
+            "the in-flight request's version is still live: {reference}"
+        );
+        assert!(in_flight.secrets().get(*reference).is_some());
+    }
+
+    // The request finishes. Nothing references the old version, so it is gone.
+    drop(in_flight);
+    for reference in &old {
+        assert!(
+            !replica.ledger.holds(*reference),
+            "the superseded version is zeroized once nothing serves it: {reference}"
+        );
+    }
+    assert_eq!(replica.ledger.retained(), new);
+}
+
+/// The last-known-good property, for secrets: a candidate whose material will
+/// not resolve is refused, the previous revision keeps serving with the material
+/// it already holds, and the failed candidate leaves nothing behind.
+#[tokio::test]
+async fn a_candidate_whose_material_does_not_resolve_leaves_the_previous_revision_serving() {
+    let store = control_plane();
+    let first = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let replica = Replica::serving(&store);
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    let serving = required_secrets(&fixtures::state());
+    assert_eq!(replica.ledger.retained(), serving);
+
+    // The store goes down between revisions, which is the only way a candidate
+    // can fail on material it would otherwise resolve.
+    let unavailable = Replica::with_unresolvable_secrets(&store);
+    let rotated = publish(
+        &store,
+        "rotated",
+        ExpectedRevision::Exactly(first),
+        fixtures::state_with_rotated_credential(),
+    )
+    .await;
+    let outcome = unavailable
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+
+    assert!(matches!(outcome, Outcome::Rejected { .. }), "{outcome:?}");
+    let report = unavailable.report();
+    assert_eq!(report.desired, Some(rotated));
+    assert_ne!(report.active, Some(rotated), "the candidate is not active");
+    let rejection = report.last_rejection.expect("a recorded rejection");
+    assert_eq!(rejection.reason, "secret");
+    assert!(
+        !rejection.detail.contains(super::secrets::testing::MATERIAL),
+        "the rejection names references, not material: {}",
+        rejection.detail
+    );
+    assert!(
+        unavailable.ledger.is_empty(),
+        "a refused candidate retains nothing"
+    );
+
+    // The replica that *was* serving is untouched: same generation, same aliases,
+    // same material.
+    assert_eq!(replica.generation(), 1);
+    assert!(replica.served_aliases().contains(&"fast".to_owned()));
+    assert_eq!(replica.ledger.retained(), serving);
+}
+
+/// A cold boot is stricter about material than a serving replica is, and the
+/// cache does not soften it: the cached revision pins the same versions the live
+/// one does, so restoring it while the secret store is down would publish a
+/// snapshot with holes in it. Refusing to start is the safe end of that
+/// asymmetry, and it is what `docs/operations/revision-convergence.md` documents
+/// under the `secret` rejection reason — a secret store is a boot dependency of
+/// a stateful replica, like the control plane's database.
+#[tokio::test]
+async fn a_cold_boot_whose_material_does_not_resolve_refuses_to_start() {
+    let store = control_plane();
+    let published = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let path = cache_path("cold-boot-secrets");
+
+    // A replica that could resolve material exports a cache the next boot finds.
+    let warm = Replica::with_cache(
+        &store,
+        LastKnownGood::new(&path, KEY).expect("a long enough key"),
+    );
+    warm.reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    assert!(path.exists(), "converging exported the cache");
+
+    // The next replica boots with a healthy control plane and a store that is
+    // down. Unlike a control-plane outage, this is fatal.
+    let cold = Replica::with_cache_and_unresolvable_secrets(
+        &store,
+        LastKnownGood::new(&path, KEY).expect("a long enough key"),
+    );
+    let error = cold
+        .reconciler
+        .bootstrap()
+        .await
+        .expect_err("material this replica cannot unwrap is not servable");
+
+    assert!(
+        matches!(error, BootstrapError::Rejected { .. }),
+        "a refusal, not a restore: {error:?}"
+    );
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains(super::secrets::testing::MATERIAL),
+        "the refusal names references, not material: {rendered}"
+    );
+    assert_eq!(cold.generation(), 0, "nothing was published");
+    assert_eq!(cold.report().active, None);
+    assert!(cold.ledger.is_empty(), "a refused boot retains nothing");
+
+    // The same cache boots the moment the store answers again, which is what
+    // makes waiting on it the right operational advice.
+    let recovered = Replica::with_cache(
+        &store,
+        LastKnownGood::new(&path, KEY).expect("a long enough key"),
+    );
+    assert_eq!(
+        recovered.reconciler.bootstrap().await.expect("it boots"),
+        published
+    );
+}
+
+/// Every exact version a revision's resolvable credentials pin, ordered.
+fn required_secrets(state: &DesiredState) -> Vec<crate::desired_state::secrets::SecretRef> {
+    let mut references: Vec<_> = crate::desired_state::credentials::Credentials::of(state)
+        .expect("readable fixture credentials")
+        .required_secrets()
+        .map(|(_, reference)| reference)
+        .collect();
+    references.sort_unstable();
+    references
 }
