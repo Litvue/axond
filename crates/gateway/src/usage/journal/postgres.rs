@@ -897,6 +897,12 @@ impl UsageJournal for PostgresJournal {
         .await
     }
 
+    /// Retention is measured from `observed_at`, not from the acknowledgement:
+    /// the window exists to keep an idempotency key for as long as its caller
+    /// may retry, and that clock starts when the request was served. An event
+    /// delivered after a long outage is therefore prunable sooner than a
+    /// promptly delivered one, which is the intent — its caller's retry horizon
+    /// has been running the whole time.
     async fn maintain(&self, now: SystemTime) -> Result<u64, JournalError> {
         let retain = self.settings.capacity.retain_acknowledged;
         // Comfortably longer than an append can hold a `position` open, which is

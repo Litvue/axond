@@ -87,7 +87,7 @@ Order matters: the schema exists before the writer runs.
    store section. A replica logs its mode at startup:
 
    ```text
-   INFO usage delivery mode=billing-grade durable=true journal=postgres on_undurable=refuse
+   INFO usage delivery mode=billing_grade durable=true journal=postgres on_undurable=refuse
    ```
 
 The outbox connects **at boot** and checks that its tables are readable, so a bad
@@ -202,9 +202,15 @@ own: `axond.usage.journal.lost`, `.quarantined`, and `.depth`.
 
 ## The cost of a claim
 
-Acknowledged events stay for `retain_acknowledged_seconds`, so the retained
-history is normally much larger than the backlog. A claim must not pay for it,
-and it does not: each consumer row carries a `resolved_through` floor — the
+Acknowledged events stay for `retain_acknowledged_seconds` after the request was
+observed — not after the acknowledgement, because the window is there to cover a
+caller's retry horizon and that horizon starts at the request — so the retained
+history is normally much larger than the backlog. An event that only lands after
+a long delivery outage is therefore prunable sooner than a promptly delivered
+one, and one older than the window is pruned as soon as it is acknowledged.
+
+A claim must not pay for that history, and it does not: each consumer row
+carries a `resolved_through` floor — the
 position below which everything is acknowledged, quarantined, or gone — and
 maintenance raises it after each retention pass. Both sides of the claim's
 selection are floored on it.

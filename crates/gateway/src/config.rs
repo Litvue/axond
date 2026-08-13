@@ -1212,9 +1212,11 @@ pub struct UsageJournalConfig {
     pub max_events: u64,
     /// Attempts one event gets before it is quarantined as poison.
     pub max_delivery_attempts: u32,
-    /// How long an acknowledged event is retained. Must exceed the longest
-    /// retry horizon a caller can have, because pruning forgets the idempotency
-    /// key.
+    /// How long an acknowledged event is retained, measured from when the
+    /// request was observed rather than from its acknowledgement: the horizon
+    /// it has to cover is the caller's retry horizon, and that starts at the
+    /// request. Must exceed the longest retry horizon a caller can have,
+    /// because pruning forgets the idempotency key.
     pub retain_acknowledged_seconds: u64,
     /// What a full outbox does. `refuse` is the only policy that keeps the
     /// billing-grade promise.

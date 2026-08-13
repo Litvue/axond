@@ -764,7 +764,7 @@ guide](./operations/usage-outbox.md#what-enabling-it-changes-about-your-sinks).
 | `consumer` | string | `billing` | Name the delivery state is kept under. Stable across restarts: renaming it replays everything still retained into the destinations as first deliveries, and leaves the old name registered — [delete the retired consumer row](./operations/usage-outbox.md#recovery), or retention stops pruning and the outbox fills. |
 | `max_events` | integer | `1000000` | Events the outbox holds before `capacity_policy` applies. Must be ≥ 1. |
 | `max_delivery_attempts` | integer | `8` | Attempts one event gets before it is quarantined as poison. Only a refusal the destination attributes to that event spends an attempt, so a destination-wide outage does not exhaust it ([usage outbox](./operations/usage-outbox.md#recovery)). Must be ≥ 1. |
-| `retain_acknowledged_seconds` | integer | `86400` | How long an acknowledged event is kept. Must exceed the longest retry horizon a caller has: pruning forgets the idempotency key, so a later retry of the same request would append a second copy. |
+| `retain_acknowledged_seconds` | integer | `86400` | How long an acknowledged event is kept, counted from when the request was observed rather than from its acknowledgement, because the window it has to cover is the caller's retry horizon and that starts at the request. Must exceed the longest retry horizon a caller has: pruning forgets the idempotency key, so a later retry of the same request would append a second copy. An event delivered long after a delivery outage is therefore prunable sooner than one delivered promptly. |
 | `capacity_policy` | `refuse` \| `drop-oldest` | `refuse` | What a full outbox does. `refuse` is the only policy that keeps the billing-grade promise; `drop-oldest` discards the oldest undelivered event and counts it durably. |
 | `on_undurable` | `refuse` \| `serve` | `refuse` | What a request does when its event could not be journaled. `refuse` answers `503 usage_not_durable`; `serve` answers anyway and counts the event as lost. |
 | `operation_timeout_ms` | integer | `5000` | Bound on the append a request waits for, and on every other outbox operation. Must be ≥ 1. |
@@ -779,7 +779,7 @@ schema, or a role without the right grants refuses to start rather than failing
 every request afterwards. A replica logs the mode it is running in:
 
 ```text
-INFO usage delivery mode=billing-grade durable=true journal=postgres on_undurable=refuse
+INFO usage delivery mode=billing_grade durable=true journal=postgres on_undurable=refuse
 ```
 
 `capacity_policy = "drop-oldest"` and `on_undurable = "serve"` each trade

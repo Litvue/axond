@@ -488,9 +488,10 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # # Name the delivery state is kept under. Stable across restarts — a new name
 # # replays everything still retained as first deliveries.
 # consumer = "billing"
-# # Bounds. `max_events` is the outbox's size, and retention must exceed the
-# # longest retry horizon a caller has: pruning an acknowledged event forgets
-# # its idempotency key, so a much later retry would append a second copy.
+# # Bounds. `max_events` is the outbox's size, and retention — counted from
+# # when the request was observed, not from its acknowledgement — must exceed
+# # the longest retry horizon a caller has: pruning an acknowledged event
+# # forgets its idempotency key, so a much later retry would append a copy.
 # max_events = 1_000_000
 # max_delivery_attempts = 8
 # retain_acknowledged_seconds = 86_400

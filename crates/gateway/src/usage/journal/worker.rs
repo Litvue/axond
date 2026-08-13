@@ -117,6 +117,11 @@ pub struct DrainReport {
     pub reported: bool,
     /// Whether the backlog counters were read from the journal at all.
     pub counted: bool,
+    /// Whether delivery was stopped without waiting at all, because the caller
+    /// had no budget left to wait with. Nothing overran: a report the caller
+    /// never asked for is not the same failure as a worker that would not stop,
+    /// and only the second is an error.
+    pub unwaited: bool,
 }
 
 impl DrainReport {
@@ -134,6 +139,13 @@ impl DrainReport {
     }
 
     pub fn log(&self) {
+        if self.unwaited {
+            tracing::warn!(
+                "usage journal delivery was stopped without a drain because the shutdown budget \
+                 was spent; whatever was left is durable and will be delivered after restart"
+            );
+            return;
+        }
         if !self.reported {
             // Deliberately does not print `delivered`/`failed`: a report the
             // worker never handed back knows nothing about them, and a zero
@@ -758,7 +770,10 @@ impl WorkerHandle {
     /// mid-batch, and the events are durable either way.
     pub fn abandon(self) -> DrainReport {
         let _ = self.stop.send(Some(Duration::ZERO));
-        DrainReport::default()
+        DrainReport {
+            unwaited: true,
+            ..DrainReport::default()
+        }
     }
 
     /// Stop claiming new work, spend up to `budget` finishing what is
@@ -1813,6 +1828,12 @@ mod tests {
             "a report nobody produced must claim nothing: {report:?}"
         );
         assert!(!report.drained, "{report:?}");
+        // And it must be told apart from a worker that would not stop: the
+        // caller chose not to wait, so nothing overran and nothing is an error.
+        assert!(
+            report.unwaited,
+            "a deliberate stop must not read as an overrun: {report:?}"
+        );
     }
 
     /// A destination that is healthy but slow, so a long backlog takes far longer
