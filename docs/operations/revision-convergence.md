@@ -396,7 +396,7 @@ The refusal reason is the triage key.
   staged, is sealed under a KEK this deployment no longer has, or the store is
   down. Material a serving snapshot already holds is unaffected — the replica keeps
   serving it, because a candidate is compiled in full before anything is published
-  ([ADR 0038](../adr/0038-envelope-encrypted-secret-store-and-snapshot-time-resolution.md)).
+  ([ADR 0039](../adr/0039-envelope-encrypted-secret-store-and-snapshot-time-resolution.md)).
   A *booting* replica is stricter than a serving one here, and deliberately: an
   unreachable control plane falls back to the last-known-good cache, but an
   unreachable secret store fails the boot outright, because the cached revision

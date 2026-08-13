@@ -167,7 +167,7 @@ sealed under the previous key stop unwrapping, and the material has to be
 restaged under the new one. Timeouts are inherited from `[control_plane]`, since
 encrypted Postgres is normally the same database and two independent sets of
 bounds for one server is a knob with no decision behind it. See
-[ADR 0038](./adr/0038-envelope-encrypted-secret-store-and-snapshot-time-resolution.md).
+[ADR 0039](./adr/0039-envelope-encrypted-secret-store-and-snapshot-time-resolution.md).
 
 #### `[[admin_breakglass]]`
 

@@ -1,5 +1,5 @@
 -- Axond secret store schema, version 1 — envelope-encrypted provider credential
--- material (docs/adr/0038-envelope-encrypted-secret-store-and-snapshot-time-resolution.md).
+-- material (docs/adr/0039-envelope-encrypted-secret-store-and-snapshot-time-resolution.md).
 --
 -- One row per *version* of a secret. A version is immutable: rotation inserts
 -- the next version, it never updates this row's bytes, so a revision compiled

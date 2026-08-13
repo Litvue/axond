@@ -133,7 +133,7 @@ psql "$AXOND_CONTROL_PLANE_DSN" -f ops/postgres/secret_store_v1.sql
 Rows hold ciphertext only: material is sealed under a per-version data key which is
 sealed under the deployment KEK named by `kek_env` or `kek_file`, so this table is
 safe to dump and useless without that key
-([ADR 0038](../adr/0038-envelope-encrypted-secret-store-and-snapshot-time-resolution.md)).
+([ADR 0039](../adr/0039-envelope-encrypted-secret-store-and-snapshot-time-resolution.md)).
 Back the KEK up somewhere the database's backups are not: losing it makes every
 stored version unrecoverable, and there is no recovery path but restaging material.
 Nothing here is on the request path — the store is read only while a candidate

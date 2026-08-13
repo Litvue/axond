@@ -1,4 +1,4 @@
-# 38. An envelope-encrypted secret store, and material that lives exactly as long as a snapshot
+# 39. An envelope-encrypted secret store, and material that lives exactly as long as a snapshot
 
 Date: 2026-08-13
 
@@ -80,6 +80,17 @@ reported under their own `secret` rejection label because "the candidate was fin
 but a secret was not" is the first distinction an on-call engineer needs. Nothing
 in compilation can touch the published snapshot, so last-known-good is structural
 rather than a rule the reconciler remembers.
+
+**A booting replica treats the store as a boot dependency, and says so.** The
+asymmetry is deliberate: an unreachable control plane restores the signed
+last-known-good cache ([ADR 0027](./0027-stateless-and-stateful-operating-modes.md)),
+whereas an unreachable secret store fails the boot outright. A cache cannot
+rescue this case, because the cached revision pins the same versions the live one
+does, and a replica that started without them would answer requests with nothing
+— worse than not being in the load balancer. So a stateful replica waits on its
+secret store the way it waits on the control plane's database, scale-out
+included, and a boot refused this way is reported as a `secret` rejection rather
+than as a store outage.
 
 **Material's lifetime is the snapshot's lifetime.** Unwrapped material is owned by
 the `ConfigSnapshot` compiled against it, and shared through a reference-counted

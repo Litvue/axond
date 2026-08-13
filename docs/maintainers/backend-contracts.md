@@ -166,7 +166,7 @@ bodies and the publication rules that cross-check them live in
 The one selectable implementation is `backends::secrets::postgres`: envelope-
 encrypted rows in PostgreSQL, sealed under a fresh per-version data key which is
 itself sealed under the deployment KEK `[secret_store]` references
-([ADR 0038](../adr/0038-envelope-encrypted-secret-store-and-snapshot-time-resolution.md)).
+([ADR 0039](../adr/0039-envelope-encrypted-secret-store-and-snapshot-time-resolution.md)).
 Three invariants there are what make the domain above enforceable, and a second
 implementation has to reproduce them: a version is a row written once, ownership is
 checked against the row's own owner columns on every read (another owner's row

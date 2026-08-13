@@ -97,6 +97,35 @@ fn the_two_copies_of_each_shipped_ddl_file_are_byte_identical() {
     }
 }
 
+/// An index an operator applies is an index they keep paying for on every write,
+/// so the shipped schema only carries indexes some statement actually plans
+/// against. The secret store keys every read on its primary key and verifies the
+/// owner columns the row returns, so it declares no owner index — whoever adds
+/// one (an owner-scoped administrative listing is the plausible reason) has to
+/// add the predicate that uses it, and updating this gate is the reminder.
+#[test]
+fn the_secret_store_declares_no_index_its_statements_would_not_plan_against() {
+    let (name, contents) = sql_files(&operator_dir())
+        .into_iter()
+        .find(|(name, _)| name == "secret_store_v1.sql")
+        .expect("the secret store's DDL is shipped");
+    let text = String::from_utf8(contents).unwrap_or_else(|_| panic!("{name} is not UTF-8"));
+
+    let declared: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("--"))
+        .filter(|line| line.to_ascii_uppercase().contains("CREATE INDEX"))
+        .collect();
+
+    assert!(
+        declared.is_empty(),
+        "ops/postgres/{name} declares {declared:?}. Every read keys on (secret_id, version) and \
+         checks the owner columns it read, so an unused index only costs writes: either add the \
+         statement that plans against it and say so in the header, or drop it."
+    );
+}
+
 /// A shipped DDL header is an operator's route into the reasoning behind the
 /// schema, and ADR 0009 forbids editing the file once it has been applied — so a
 /// pointer at an ADR that does not exist (a number two branches both claimed, a
