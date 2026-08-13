@@ -347,7 +347,7 @@ pub(super) fn plan(
 /// outcome: refused if the document taking over lowers something this model
 /// never lowers, drained if it strands a hold, live otherwise.
 ///
-/// Handovers are judged by value only ([`PolicyBody::displaced_by`]), because
+/// Handovers are judged by value only (`PolicyBody::displaced_by`), because
 /// the two scopes have no shared epoch history — but "by value only" is not "by
 /// the loosening values only": a token floor that falls restores tokens an
 /// operator revoked whether the document lowering it is the namespace's own or
