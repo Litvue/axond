@@ -15,9 +15,10 @@
 # path to a file. No DSN, key-encryption key, or credential is ever inlined,
 # and diagnostics name the reference rather than the value.
 #
-# Status: the control plane this bootstraps is not implemented yet. This
-# configuration parses and validates, and the process refuses to start rather
-# than serve an empty snapshot (axond #141, #142, #163).
+# Status: a replica boots against this file and serves `/admin/v1` against the
+# control plane, but it refuses inference until a published revision compiles
+# into a runtime snapshot, rather than serving an empty one (axond #142).
+# `axond check preflight` reports that refusal on its `serving` line.
 
 mode = "stateful"
 

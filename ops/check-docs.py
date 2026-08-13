@@ -152,6 +152,8 @@ def check_stale_claims(files: list[Path]) -> list[str]:
         "`POST /v1/responses`), `400 unsupported_wire`": "Responses is implemented",
         "the stateful surface is not implemented yet": "stateful mode parsing and bootstrap validation have shipped",
         "no stateful mode, `/admin/v1` route, or durable schema ships yet": "stateful bootstrap configuration ships; the control plane does not",
+        "refuses to start until the control-plane": "a stateful replica boots and serves /admin/v1; inference is what refuses",
+        "the process refuses to start rather": "a stateful replica boots and serves /admin/v1; inference is what refuses",
     }
     failures: list[str] = []
     for source in files + [
