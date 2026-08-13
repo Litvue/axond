@@ -710,14 +710,15 @@ async fn an_admin_mutation_publishes_an_audited_revision() {
         },
     });
     let publish = |key: &'static str, expected: &'static str| {
-        stateful::breakglass(
-            client.post(replica.admin_url("/tenants")),
-            "IG-05: publish an audited revision",
-        )
-        .header("idempotency-key", key)
-        .header("x-axond-expected-revision", expected)
-        .json(&document)
-        .send()
+        replica
+            .breakglass(
+                client.post(replica.admin_url("/tenants")),
+                "IG-05: publish an audited revision",
+            )
+            .header("idempotency-key", key)
+            .header("x-axond-expected-revision", expected)
+            .json(&document)
+            .send()
     };
 
     // 1. Authenticated: an anonymous mutation is refused before it is validated,
@@ -738,14 +739,15 @@ async fn an_admin_mutation_publishes_an_audited_revision() {
 
     // 2. Precondition-carrying: a mutation with no idempotency key is refused
     //    rather than published once and unrepeatably.
-    let unconditional = stateful::breakglass(
-        client.post(replica.admin_url("/tenants")),
-        "IG-05: a mutation with no preconditions",
-    )
-    .json(&document)
-    .send()
-    .await
-    .expect("a response");
+    let unconditional = replica
+        .breakglass(
+            client.post(replica.admin_url("/tenants")),
+            "IG-05: a mutation with no preconditions",
+        )
+        .json(&document)
+        .send()
+        .await
+        .expect("a response");
     assert_eq!(
         unconditional.status(),
         400,
@@ -775,16 +777,17 @@ async fn an_admin_mutation_publishes_an_audited_revision() {
 
     // 4. Durable and readable: the revision is the deployment's desired state and
     //    its history, read back from the control plane through the surface.
-    let state: serde_json::Value = stateful::breakglass(
-        client.get(replica.admin_url("/state")),
-        "IG-05: read the published state",
-    )
-    .send()
-    .await
-    .expect("a state response")
-    .json()
-    .await
-    .expect("a state document");
+    let state: serde_json::Value = replica
+        .breakglass(
+            client.get(replica.admin_url("/state")),
+            "IG-05: read the published state",
+        )
+        .send()
+        .await
+        .expect("a state response")
+        .json()
+        .await
+        .expect("a state document");
     assert_eq!(
         state["revision"], revision,
         "the published revision is the current desired state: {state}"
@@ -796,16 +799,17 @@ async fn an_admin_mutation_publishes_an_audited_revision() {
 
     // 5. Audited, and attributed to the credential that was actually used:
     //    breakglass is recorded as breakglass rather than disguised as a person.
-    let audit: serde_json::Value = stateful::breakglass(
-        client.get(replica.admin_url(&format!("/audit/{revision}"))),
-        "IG-05: read the audit trail",
-    )
-    .send()
-    .await
-    .expect("an audit response")
-    .json()
-    .await
-    .expect("an audit document");
+    let audit: serde_json::Value = replica
+        .breakglass(
+            client.get(replica.admin_url(&format!("/audit/{revision}"))),
+            "IG-05: read the audit trail",
+        )
+        .send()
+        .await
+        .expect("an audit response")
+        .json()
+        .await
+        .expect("an audit document");
     let event = &audit["events"][0];
     assert_eq!(
         event["actor"]["kind"], "breakglass",
@@ -843,16 +847,17 @@ async fn an_admin_mutation_publishes_an_audited_revision() {
         "a mutation that expects a superseded revision must conflict:\n{}",
         replica.output()
     );
-    let history: serde_json::Value = stateful::breakglass(
-        client.get(replica.admin_url("/history")),
-        "IG-05: count the revisions",
-    )
-    .send()
-    .await
-    .expect("a history response")
-    .json()
-    .await
-    .expect("a history document");
+    let history: serde_json::Value = replica
+        .breakglass(
+            client.get(replica.admin_url("/history")),
+            "IG-05: count the revisions",
+        )
+        .send()
+        .await
+        .expect("a history response")
+        .json()
+        .await
+        .expect("a history document");
     assert_eq!(
         history["revisions"].as_array().map(Vec::len),
         Some(1),

@@ -144,6 +144,9 @@ pub struct ControlPlane {
     pub schema: String,
     pub config: PathBuf,
     pub env: BTreeMap<&'static str, String>,
+    /// The breakglass credential this fixture's replica accepts, and no other
+    /// fixture's does. See [`ControlPlane::spawn`].
+    breakglass: String,
 }
 
 /// The environment variable names the fixture config refers to. References, not
@@ -152,19 +155,17 @@ pub const DSN_ENV: &str = "GW_INTEGRATION_CONTROL_PLANE_DSN";
 pub const KEK_ENV: &str = "GW_INTEGRATION_KEK";
 pub const BREAKGLASS_ENV: &str = "GW_INTEGRATION_BREAKGLASS";
 
-/// The value behind [`BREAKGLASS_ENV`]. A scenario that presents the credential
-/// needs its value, not only the name of the reference that carries it.
-pub const BREAKGLASS: &str = "integration-test-breakglass";
-
 impl ControlPlane {
     /// `None` when no test database is configured.
     pub async fn create() -> Option<Self> {
         let dsn = postgres_dsn()?;
-        let schema = format!(
-            "axond_it_{}_{}",
+        let fixture = format!(
+            "{}_{}",
             std::process::id(),
             FIXTURES.fetch_add(1, Ordering::SeqCst)
         );
+        let schema = format!("axond_it_{fixture}");
+        let breakglass = format!("integration-test-breakglass-{fixture}");
         client(&dsn)
             .await
             .batch_execute(&format!("CREATE SCHEMA {schema}"))
@@ -193,13 +194,14 @@ impl ControlPlane {
             (DSN_ENV, dsn.clone()),
             // Fixture values for references the commands only have to resolve.
             (KEK_ENV, "integration-test-kek-0123456789abcdef".to_owned()),
-            (BREAKGLASS_ENV, BREAKGLASS.to_owned()),
+            (BREAKGLASS_ENV, breakglass.clone()),
         ]);
         Some(Self {
             dsn,
             schema,
             config,
             env,
+            breakglass,
         })
     }
 
@@ -280,7 +282,12 @@ impl ControlPlane {
             command.env(key, value);
         }
         let child = command.spawn().expect("the axond binary runs");
-        let mut replica = Replica { child, bind, log };
+        let mut replica = Replica {
+            child,
+            bind,
+            log,
+            breakglass: self.breakglass.clone(),
+        };
         if replica.serving().await {
             Ok(replica)
         } else {
@@ -312,6 +319,7 @@ pub struct Replica {
     child: Child,
     bind: SocketAddr,
     log: PathBuf,
+    breakglass: String,
 }
 
 impl Replica {
@@ -332,14 +340,18 @@ impl Replica {
     /// Whether *this* child is serving, rather than whether something answers on
     /// its port.
     ///
-    /// `/healthz`, not `/readyz`: a stateful replica serves administration while
-    /// reporting itself unready for inference, so readiness is the very thing a
-    /// scenario here asserts rather than a precondition it waits on.
+    /// Liveness is necessary and not sufficient. `/healthz` is unauthenticated,
+    /// so a sibling replica that won the same port would answer it, and no wait
+    /// settles which process did: a child still parsing its config is neither
+    /// bound nor exited. The credential settles it. Each fixture's replica accepts
+    /// only its own breakglass value, so a `200` from an authenticated admin read
+    /// identifies the answerer as this child; a sibling answers `401`, and the
+    /// boot is retried on a fresh port.
     ///
-    /// A liveness answer alone would not identify the answerer, so the child's own
-    /// state is what settles it: a replica that lost its port exits on the failed
-    /// bind, and this returns `false` for a retry on a fresh one rather than
-    /// letting a scenario assert against a sibling.
+    /// An admin read rather than `/readyz`: a stateful replica serves
+    /// administration while reporting itself unready for inference, so readiness
+    /// is the very thing a scenario here asserts rather than a precondition it
+    /// waits on.
     async fn serving(&mut self) -> bool {
         let deadline = Instant::now() + Duration::from_secs(30);
         let client = reqwest::Client::new();
@@ -347,31 +359,44 @@ impl Replica {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
                 return false;
             }
-            if let Ok(response) = client.get(self.url("/healthz")).send().await
-                && response.status().is_success()
+            if let Ok(response) = self
+                .breakglass(
+                    client.get(self.admin_url("/state")),
+                    "fixture: identify the replica",
+                )
+                .send()
+                .await
             {
-                // Answered — but a child that lost the port is answered *for*,
-                // and reports the bind failure a moment later. Re-read its state
-                // once the exit would have happened before believing the answer.
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                return matches!(self.child.try_wait(), Ok(None));
+                match response.status() {
+                    reqwest::StatusCode::OK => return true,
+                    // Another process holds this port. This child will exit on its
+                    // own failed bind; the caller takes a different port.
+                    reqwest::StatusCode::UNAUTHORIZED => return false,
+                    // Still starting: nothing is listening yet, or the admin
+                    // surface is not mounted yet.
+                    _ => {}
+                }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         false
     }
-}
 
-/// Present the breakglass credential, attributed.
-///
-/// Attribution is required rather than convenient: the surface refuses an
-/// unattributed breakglass request, and the audit row records who and why — so a
-/// helper that omitted it would be a helper for a `401`.
-pub fn breakglass(request: reqwest::RequestBuilder, reason: &str) -> reqwest::RequestBuilder {
-    request
-        .bearer_auth(BREAKGLASS)
-        .header("x-axond-breakglass-operator", "integration-harness")
-        .header("x-axond-breakglass-reason", reason)
+    /// Present this replica's breakglass credential, attributed.
+    ///
+    /// Attribution is required rather than convenient: the surface refuses an
+    /// unattributed breakglass request, and the audit row records who and why — so
+    /// a helper that omitted it would be a helper for a `401`.
+    pub fn breakglass(
+        &self,
+        request: reqwest::RequestBuilder,
+        reason: &str,
+    ) -> reqwest::RequestBuilder {
+        request
+            .bearer_auth(&self.breakglass)
+            .header("x-axond-breakglass-operator", "integration-harness")
+            .header("x-axond-breakglass-reason", reason)
+    }
 }
 
 /// A replica left running would hold its schema open against the `DROP` the
