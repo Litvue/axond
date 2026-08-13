@@ -340,7 +340,7 @@ identities, observed versus approved pricing, tenant defaults against project
 overrides, and ordered single-wire-family alias targets — is
 [ADR 0042](../adr/0042-model-enablement-and-alias-contracts.md), and a change to
 what an enablement pins or to which targets an alias may name amends it;
-[ADR 0053](../adr/0053-tenant-owned-alias-names-and-the-management-catalogue.md)
+[ADR 0058](../adr/0058-tenant-owned-alias-names-and-the-management-catalogue.md)
 makes an alias name a namespace's own and states that the management catalogue is
 an administrative read of a published revision rather than anything the request
 path consults, so a change to who may see an alias or to what the catalogue

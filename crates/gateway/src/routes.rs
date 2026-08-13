@@ -779,7 +779,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
 ///
 /// 1. **Ownership.** An alias another namespace owns is not listed at all, so an
 ///    alias name is a tenant's name rather than the deployment's — even when both
-///    tenants can reach the provider behind it (ADR 0053).
+///    tenants can reach the provider behind it (ADR 0058).
 /// 2. **Alias scope.** A minted token narrowing what its bearer may name narrows
 ///    what it may enumerate, so a list never advertises what a key would be
 ///    refused for.
@@ -4774,7 +4774,7 @@ targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars
 
     /// An alias a namespace owns is that namespace's alone: another namespace
     /// neither lists it nor can invoke it, and the owner's row shadows the
-    /// deployment-wide one of the same name (ADR 0053).
+    /// deployment-wide one of the same name (ADR 0058).
     ///
     /// The isolation asserted here is the catalogue and the resolution, which is
     /// where a leak would be observable: a caller that cannot name an alias cannot

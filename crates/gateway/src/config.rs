@@ -516,7 +516,7 @@ pub struct Model {
     /// An owned alias is invisible and unroutable outside its namespace, which is
     /// what makes an alias name a *tenant's* name rather than the deployment's:
     /// two namespaces may publish `fast` over different targets, and neither can
-    /// enumerate or invoke the other's (ADR 0053). An unowned alias is the
+    /// enumerate or invoke the other's (ADR 0058). An unowned alias is the
     /// single-tenant configuration every release before this one wrote, so a file
     /// that names no namespace behaves exactly as it did.
     ///

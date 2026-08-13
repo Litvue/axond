@@ -1,4 +1,4 @@
-# 53. Tenant-owned alias names and the management catalogue
+# 58. Tenant-owned alias names and the management catalogue
 
 Date: 2026-08-13
 
