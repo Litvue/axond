@@ -1336,12 +1336,15 @@ mod tests {
         );
         // Rotating again from the stale base reference does not overwrite the
         // version somebody may already have published against.
-        assert!(matches!(
+        assert_eq!(
             store
                 .rotate(owner(), &first, SecretMaterial::new("sk-live-3".to_owned()))
-                .await,
-            Err(SecretError::Invalid(_))
-        ));
+                .await
+                .err(),
+            Some(SecretError::VersionExists {
+                reference: second.reference
+            })
+        );
         assert_eq!(
             store
                 .resolve(owner(), &second.reference)
@@ -1395,7 +1398,7 @@ mod tests {
             store
                 .rotate(owner(), &first, SecretMaterial::new("x".to_owned()))
                 .await,
-            Err(SecretError::Invalid(_) | SecretError::Lifecycle { .. })
+            Err(SecretError::VersionExists { .. } | SecretError::Lifecycle { .. })
         ));
         store
             .transition(owner(), &first, SecretLifecycle::Tombstoned)
