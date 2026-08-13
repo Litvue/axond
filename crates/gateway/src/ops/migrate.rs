@@ -927,6 +927,33 @@ mod tests {
             "the refusal names the SQLSTATE and says a retry will not help: {error}"
         );
         assert!(
+            error.to_string().contains("axond_cp_head"),
+            "the seed probe runs only once its table is confirmed, so naming it is also the proof \
+             that the relation probes answered for a role with no read on those tables: {error}"
+        );
+        assert!(
+            fixture.ledger().await.is_empty(),
+            "a refused adoption must not record a baseline"
+        );
+
+        // The same role with the ledger read taken away too, so this coverage does
+        // not depend on the shipped history ending in a seed row: whatever adoption
+        // is refused a read of, it refuses rather than advising a retry.
+        client
+            .batch_execute(&format!(
+                "REVOKE SELECT ON {}.axond_cp_schema_migration FROM {role}",
+                fixture.schema
+            ))
+            .await
+            .expect("take the ledger read away as well");
+        let error = adopt(&fixture.config, &env)
+            .await
+            .expect_err("a ledger that cannot be read is not an empty ledger");
+        assert!(
+            matches!(error, OpsError::Refused { .. }) && !error.is_retryable(),
+            "a rejected read is an operator decision at every step of adoption: {error:?}"
+        );
+        assert!(
             fixture.ledger().await.is_empty(),
             "a refused adoption must not record a baseline"
         );
