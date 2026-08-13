@@ -36,9 +36,12 @@
 //! half-apply. The reconciler's failure path records a reason and backs off; it
 //! has no rollback to perform, because there was no partial application.
 //!
-//! **Polling is correctness; notification is latency.** A Postgres notification
-//! delivered while a replica reconnects is lost, so convergence never depends on
-//! one: [`reconciler::ChangeSignal`] only shortens the wait between polls.
+//! **Polling is correctness; ordinary notification is latency.** A Postgres
+//! notification delivered while a replica reconnects is lost, so convergence
+//! never depends on one: [`reconciler::ChangeSignal`] only shortens the wait
+//! between polls for durable desired-state changes. Its explicit force-refresh
+//! form also re-runs the candidate path for runtime inputs, such as secret
+//! lifecycle state, that do not create a new revision.
 //!
 //! **An outage degrades to staleness, not unavailability.** A replica that cannot
 //! reach the control plane keeps serving its active snapshot, retries on a bounded
