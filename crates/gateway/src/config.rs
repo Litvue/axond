@@ -560,7 +560,7 @@ pub struct Target {
     /// What a request is *actually* charged at is
     /// [`RequestPrice`](crate::pricing::RequestPrice): a deployment whose serving
     /// snapshot carries an approved price book covering this target's [`catalog`]
-    /// binding is billed from the book instead (ADR 0054). These rates stay the
+    /// binding is billed from the book instead (ADR 0056). These rates stay the
     /// authority for a file-configured deployment, and for a target the book does
     /// not claim.
     ///

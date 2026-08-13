@@ -273,7 +273,7 @@ operator-chosen routing names, and guessing would bill one provider's rates for
 another's traffic), and a bound target the approved book does *not* price is
 **ineligible** rather than free — the alias stays listed by `/v1/models`, but a
 request that can only route to unpriced targets is refused
-`503 model_not_priced` ([ADR 0054](./adr/0054-request-path-pricing.md)).
+`503 model_not_priced` ([ADR 0056](./adr/0056-request-path-pricing.md)).
 
 `/v1/responses` does not use the target order at all: every Responses request,
 initial or continuation, is served only by the **first** target so a
