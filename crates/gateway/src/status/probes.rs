@@ -59,15 +59,14 @@ impl ControlPlaneProbe {
     ///   (`connect_timeout`);
     /// * and the health call itself is bounded by `operation_timeout` again.
     ///
-    /// That budgets for *one* administrative operation ahead of the probe, which
-    /// is the depth the store's fair queue reaches under the traffic an admin
-    /// API sees: publishes and migrations are operator actions, not request-path
-    /// work. Several concurrently queued slow operations would push the probe
-    /// past its timeout and publish `unavailable`/`timeout`, and that is left as
-    /// the honest reading — a control plane whose queue is deeper than a
-    /// diagnostic can wait out is one the next administrative request will also
-    /// wait behind. Budgeting for an unbounded queue instead would mean a probe
-    /// that can never report a timeout at all.
+    /// The registry's boot-time pacing reserves one administrative operation
+    /// ahead of the probe, which keeps its static settings conservative before
+    /// the first round. At runtime the Postgres store counts every operation
+    /// already holding or waiting for its serialized client, and this probe
+    /// asks it for a timeout using that live depth. Operations admitted after
+    /// the health call are behind it in the fair queue and do not extend its
+    /// budget. A deeper queue therefore delays the probe without turning a
+    /// healthy store into a synthetic `unavailable`/`timeout` observation.
     ///
     /// The refresh interval sits above that so a round cannot overlap the next,
     /// and the staleness budget above *that* so a single slow round does not
@@ -84,13 +83,10 @@ impl ControlPlaneProbe {
     /// plane is slower than a diagnostic can wait for", where silence would say
     /// nothing at all.
     pub fn pacing(settings: &ControlPlaneSettings) -> StatusSettings {
-        let bounds = settings
-            .operation_timeout
-            .saturating_mul(2)
-            .saturating_add(settings.connect_timeout)
-            // A configuration with sub-second bounds still has to leave
-            // `refresh_interval` at the one-second floor `validate` requires.
-            .max(Duration::from_secs(2));
+        // Reserve one operation ahead of the first probe. The live Postgres
+        // implementation replaces this fallback with the current queue-aware
+        // timeout on every round.
+        let bounds = settings.status_probe_timeout(1);
         let spacing = settings.connect_timeout.clamp(SPACING, MAX_SPACING);
         let refresh_interval = bounds.saturating_add(spacing).min(MAX_REFRESH_INTERVAL);
         // Still strictly below the interval, so rounds cannot overlap, and
@@ -186,6 +182,10 @@ impl ComponentProbe for ControlPlaneProbe {
         Component::ControlPlane
     }
 
+    fn probe_timeout(&self, fallback: Duration) -> Duration {
+        self.store.status_probe_timeout().unwrap_or(fallback)
+    }
+
     async fn observe(&self) -> ComponentObservation {
         match self.store.health().await {
             Ok(()) => ComponentObservation::ok(Component::ControlPlane),
@@ -261,6 +261,7 @@ mod tests {
     struct Answering {
         inner: Arc<InMemoryControlPlane>,
         health: Health,
+        probe_timeout: Option<Duration>,
     }
 
     #[async_trait]
@@ -271,6 +272,10 @@ mod tests {
 
         fn capabilities(&self) -> Capabilities {
             self.inner.capabilities()
+        }
+
+        fn status_probe_timeout(&self) -> Option<Duration> {
+            self.probe_timeout
         }
 
         async fn health(&self) -> Result<(), ControlPlaneError> {
@@ -320,6 +325,7 @@ mod tests {
         ControlPlaneProbe::new(Arc::new(Answering {
             inner: Arc::new(InMemoryControlPlane::new()),
             health,
+            probe_timeout: None,
         }))
     }
 
@@ -353,6 +359,29 @@ mod tests {
             "{:?} cuts a call the store would have completed",
             pacing.probe_timeout
         );
+    }
+
+    #[test]
+    fn the_probe_timeout_expands_for_every_operation_already_in_the_queue() {
+        let settings = ControlPlaneSettings {
+            connect_timeout: Duration::from_secs(5),
+            operation_timeout: Duration::from_secs(30),
+            ..ControlPlaneSettings::default()
+        };
+        let queued = 3;
+        let expected = settings.status_probe_timeout(queued);
+        let probe = ControlPlaneProbe::new(Arc::new(Answering {
+            inner: Arc::new(InMemoryControlPlane::new()),
+            health: healthy(),
+            probe_timeout: Some(expected),
+        }));
+
+        assert_eq!(
+            <ControlPlaneProbe as ComponentProbe>::probe_timeout(&probe, Duration::from_secs(1),),
+            expected,
+            "the health probe must budget for all queued operations, not one fixed slot"
+        );
+        assert_eq!(expected, Duration::from_secs(125));
     }
 
     /// Every derived pacing has to satisfy the registry's own invariants, or the

@@ -274,8 +274,15 @@ impl CachedStatusRegistry {
 pub trait ComponentProbe: Send + Sync {
     fn component(&self) -> Component;
 
+    /// The timeout for this probe's next observation. Most components use the
+    /// registry-wide fallback; a serialized backend may derive one from work
+    /// already queued ahead of the call.
+    fn probe_timeout(&self, fallback: Duration) -> Duration {
+        fallback
+    }
+
     /// Observe the backend. Called from the background refresher only, and
-    /// bounded by [`StatusSettings::probe_timeout`]; an implementation reports
+    /// bounded by [`Self::probe_timeout`]; an implementation reports
     /// failure as a bounded [`StatusReason`] plus an operator-facing detail
     /// rather than propagating the backend's error type.
     async fn observe(&self) -> ComponentObservation;
@@ -305,8 +312,9 @@ impl StatusRefresher {
 
     /// Observe every probe once, concurrently, each under the probe timeout.
     pub async fn refresh_once(&self) {
-        let timeout = self.registry.settings().probe_timeout;
+        let fallback = self.registry.settings().probe_timeout;
         let observations = futures::future::join_all(self.probes.iter().map(|probe| async move {
+            let timeout = probe.probe_timeout(fallback);
             match tokio::time::timeout(timeout, probe.observe()).await {
                 Ok(observation) => observation,
                 // An abandoned probe is an observation like any other, so a

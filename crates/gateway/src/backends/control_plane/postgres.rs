@@ -30,6 +30,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -111,6 +112,18 @@ impl ControlPlaneSettings {
             ..Self::from_config(control_plane)
         }
     }
+
+    /// The health-call budget for a probe with `queued_operations` already
+    /// ahead of it. Each queued operation can consume the full operation bound,
+    /// followed by one reconnect and the probe's own health call.
+    pub(crate) fn status_probe_timeout(&self, queued_operations: usize) -> Duration {
+        let operations = u32::try_from(queued_operations.saturating_add(1)).unwrap_or(u32::MAX);
+        self.operation_timeout
+            .saturating_mul(operations)
+            .saturating_add(self.connect_timeout)
+            // Keep the derived status pacing valid for sub-second settings too.
+            .max(Duration::from_secs(2))
+    }
 }
 
 impl Default for ControlPlaneSettings {
@@ -155,6 +168,10 @@ pub struct PostgresControlPlane {
     search_path: Option<String>,
     ids: Uuid7Generator,
     client: tokio::sync::Mutex<Option<Client>>,
+    /// Operations currently holding or waiting for the serialized client. A
+    /// status probe samples this before joining the queue so its timeout covers
+    /// every operation already ahead of it, not just one.
+    pending_operations: AtomicUsize,
 }
 
 /// Written by hand, and deliberately narrow: a derived one would print the
@@ -238,6 +255,7 @@ impl PostgresControlPlane {
             search_path,
             ids: Uuid7Generator::new(),
             client: tokio::sync::Mutex::new(None),
+            pending_operations: AtomicUsize::new(0),
         };
         let client = tokio::time::timeout(store.settings.connect_timeout, store.connect_client())
             .await
@@ -578,6 +596,7 @@ impl PostgresControlPlane {
             Box<dyn Future<Output = Result<T, ControlPlaneError>> + Send + 'a>,
         >,
     ) -> Result<T, ControlPlaneError> {
+        let _pending = PendingOperation::new(&self.pending_operations);
         let mut guard = self.client.lock().await;
         if guard.as_ref().is_none_or(Client::is_closed) {
             *guard = Some(
@@ -600,6 +619,25 @@ impl PostgresControlPlane {
             *guard = None;
         }
         result
+    }
+}
+
+/// Keeps the store's pending-operation count correct even when a caller drops
+/// an operation while it is waiting for the serialized client.
+struct PendingOperation<'a> {
+    count: &'a AtomicUsize,
+}
+
+impl<'a> PendingOperation<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self { count }
+    }
+}
+
+impl Drop for PendingOperation<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -716,6 +754,13 @@ impl ControlPlaneStore for PostgresControlPlane {
             Capability::IdempotentWrites,
             Capability::TransactionalAudit,
         ])
+    }
+
+    fn status_probe_timeout(&self) -> Option<Duration> {
+        Some(
+            self.settings
+                .status_probe_timeout(self.pending_operations.load(Ordering::Acquire)),
+        )
     }
 
     async fn health(&self) -> Result<(), ControlPlaneError> {
@@ -2042,6 +2087,21 @@ mod tests {
             connect_timeout: Duration::from_secs(5),
             ..ControlPlaneSettings::default()
         }
+    }
+
+    #[test]
+    fn pending_operations_count_waiters_and_release_on_drop() {
+        let count = AtomicUsize::new(0);
+        let first = PendingOperation::new(&count);
+        assert_eq!(count.load(Ordering::Acquire), 1);
+
+        let second = PendingOperation::new(&count);
+        assert_eq!(count.load(Ordering::Acquire), 2);
+        drop(second);
+        assert_eq!(count.load(Ordering::Acquire), 1);
+
+        drop(first);
+        assert_eq!(count.load(Ordering::Acquire), 0);
     }
 
     /// A second store on the same journal, as a second replica's administrator is.

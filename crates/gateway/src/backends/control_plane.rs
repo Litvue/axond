@@ -41,6 +41,8 @@ pub mod postgres;
 mod rows;
 pub mod schema;
 
+use std::time::Duration;
+
 use hydration::HydrationLimit;
 
 use async_trait::async_trait;
@@ -303,6 +305,18 @@ pub trait ControlPlaneStore: Send + Sync {
     /// Never consulted by `/readyz`: readiness reflects whether the replica
     /// holds an active snapshot, not whether the control plane is reachable.
     async fn health(&self) -> Result<(), ControlPlaneError>;
+
+    /// The timeout a status probe should use for a health call, when this store
+    /// can account for work already queued ahead of it. `None` keeps the
+    /// registry's normal component-wide timeout.
+    ///
+    /// Postgres implements this from the same serialized operation queue its
+    /// administrative methods use. A probe must not claim a healthy store is
+    /// unreachable merely because another legitimate admin operation was ahead
+    /// of it.
+    fn status_probe_timeout(&self) -> Option<Duration> {
+        None
+    }
 
     /// The newest published revision, or `None` before the first publication.
     async fn desired_revision(&self) -> Result<Option<RevisionId>, ControlPlaneError>;

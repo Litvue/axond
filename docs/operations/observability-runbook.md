@@ -23,17 +23,19 @@ points at a section of this page.
   `disabled` in both postures until the slice that owns it injects a probe.
 
   The cadence is derived from `[control_plane]`, not fixed: a probe shares the
-  single administrative connection, so it may queue behind an operation entitled
-  to the whole `operation_timeout_ms`, reconnect within `connect_timeout_ms`,
-  and then run under `operation_timeout_ms` again. The round's ceiling is that
-  sum (65s at the defaults), refreshes are one connect bound apart (70s), and
-  observations are stale after three rounds (210s). A shorter
-  `operation_timeout_ms` buys a prompter diagnostic; nothing else does, because
-  cutting a round short reports an outage the store is not having.
+  single administrative connection, so it may queue behind the operations
+  already holding or waiting for that connection, reconnect within
+  `connect_timeout_ms`, and then run under `operation_timeout_ms` again. The
+  boot-time pacing reserves one queued operation (65s at the defaults), while
+  each probe round expands its timeout from the live queue depth, so a deeper
+  legitimate admin queue does not manufacture an outage. Refreshes are one
+  connect bound apart (70s), and observations are stale after three rounds
+  (210s). A shorter `operation_timeout_ms` buys a prompter diagnostic; cutting a
+  round short still reports an outage the store is not having.
 
   The cadence is capped at two minutes even so, and the staleness budget covers
   a whole publication gap (an interval plus a round) while staying under the
-  five-minute threshold `AxondStatusObservationsStale` pages on. Both bounds
+  five-minute control-plane threshold `AxondStatusObservationsStale` pages on. Both bounds
   exist for the same reason: a refresher publishing more slowly than the
   pipeline retains its series leaves the same gap a dead one leaves, and a
   budget shorter than the gap between two healthy rounds calls a control plane
@@ -188,8 +190,8 @@ stuck and resets when one lands. So:
   the probe timeout or the refresh interval is above the staleness budget. The
   three are derived from `[control_plane]` for a stateful replica and are
   internal settings otherwise; there is no `[status]` section to edit, and the
-  rule's five-minute threshold is above the slowest round any derivation
-  permits, so this is a report about a refresher falling behind rather than a
+  control-plane rule's five-minute threshold is above the slowest capped round
+  the derivation permits, so this is a report about a refresher falling behind rather than a
   deployment that configured itself into it. What you can establish from here is
   whether the replica is saturated (`axond_admission_in_flight`) or the probes
   are timing out (`axond_status_outcome="failed"`).

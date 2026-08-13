@@ -50,13 +50,13 @@ groups:
           runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#a-dependency-is-impaired"
 
       - alert: AxondStatusObservationsStale
-        expr: "max by (axond_status_component) (axond_status_observation_age) > 300000"
+        expr: "axond_status_observation_age{axond_status_component=\"control_plane\"} > 300000"
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Cached observations for {{ $labels.axond_status_component }} are over five minutes old"
-          description: "Above the slowest round any derived pacing permits, so an age past it is a refresher falling behind rather than a generous [control_plane] operation_timeout_ms. The age is exported on its own cadence rather than only after a round, so a probe that is stuck or a round that never came climbs here; a refresher whose task is gone stops exporting entirely, which is AxondStatusRefresherStalled instead."
+          summary: "Cached control-plane observations are over five minutes old"
+          description: "The control-plane status age is above the threshold the control-plane pacing is allowed to reach. The age is exported on its own cadence rather than only after a round, so a probe that is stuck or a round that never came climbs here; a refresher whose task is gone stops exporting entirely, which is AxondStatusRefresherStalled instead."
           runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#dependency-observations-have-gone-stale"
 
       # The companion the age gauge cannot be: a refresher whose task is gone
