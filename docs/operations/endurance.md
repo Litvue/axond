@@ -4,7 +4,7 @@ What one Axond replica looks like after hours of mixed traffic, rather than
 after two minutes of it. Capacity qualification answers *how much, right now*
 ([capacity qualification](./capacity.md), [ADR 0033](../adr/0033-capacity-qualification-harness.md));
 this page answers *and what is left behind afterwards*
-([ADR 0038](../adr/0038-endurance-qualification-harness.md)) — the two failures that
+([ADR 0040](../adr/0040-endurance-qualification-harness.md)) — the two failures that
 only a long run makes visible:
 
 - a resource that never comes back: memory, descriptors, sockets, or an upstream

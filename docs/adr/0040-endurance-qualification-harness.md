@@ -1,4 +1,4 @@
-# 38. Endurance qualification: a long mixed workload, with bounded evidence
+# 40. Endurance qualification: a long mixed workload, with bounded evidence
 
 Date: 2026-08-13
 
