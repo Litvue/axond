@@ -2183,13 +2183,16 @@ impl LastKnownGoodCatalog {
             .map(|snapshot| &snapshot.source.validators)
     }
 
-    /// Whether an unchanged answer could have been asked for at all.
+    /// Whether an unchanged answer was actually asked for.
     ///
     /// A `304` is only evidence about held content when a validator went out to
-    /// be checked against. Content admitted without validators — a payload that
-    /// stated none, the compiled-in seed — leaves nothing to ask conditionally
-    /// with, so an answer of "not modified" to the unconditional request that
-    /// follows confirms nothing.
+    /// be checked against, so the question is what the request carried — not
+    /// what the catalogue happens to hold. Content admitted without validators
+    /// (a payload that stated none, the compiled-in seed) leaves nothing to ask
+    /// conditionally with, and a caller may also fetch unconditionally while
+    /// holding a perfectly good `ETag`; in both cases an answer of "not
+    /// modified" confirms nothing, and reading held state instead of
+    /// `asked_with` would credit the second case as confirmation.
     ///
     /// The validators such an answer states are discarded along with it, rather
     /// than kept for the next request: their only provenance is the answer being
@@ -2197,9 +2200,8 @@ impl LastKnownGoodCatalog {
     /// token an intermediary can keep matching, leaving the catalogue on content
     /// it never received with every signal reading confirmed. A full response
     /// establishes validators legitimately, and this state ends at the first one.
-    fn can_confirm_unchanged(&self) -> bool {
-        self.validators()
-            .is_some_and(|validators| !validators.is_empty())
+    fn can_confirm_unchanged(&self, asked_with: Option<&SourceValidators>) -> bool {
+        self.active.is_some() && asked_with.is_some_and(|validators| !validators.is_empty())
     }
 
     /// Make `snapshot`'s content active, classifying what that did.
@@ -2322,12 +2324,18 @@ impl LastKnownGoodCatalog {
     /// of a caller's diligence: a fetch failure counts, and a confirmed
     /// unchanged answer ends the run and ages the active snapshot forward.
     ///
+    /// `asked_with` is what the request that produced this answer actually
+    /// carried — [`validators`](Self::validators) for a conditional refresh,
+    /// `None` for an unconditional one — because whether a `304` confirms
+    /// anything is a property of the question, not of what happens to be held.
+    ///
     /// [`Refreshed::Refused`] is the one odd answer: a `304` nothing asked for.
-    /// That is any unchanged answer no validator could have been sent with —
-    /// before a first import there is no content to confirm, and content held
-    /// without validators (a payload that stated none, the compiled-in seed) has
-    /// nothing to have been checked against, so an answer to the unconditional
-    /// request that follows is not evidence about it. There is nothing to admit
+    /// That is any unchanged answer no validator went out with — before a first
+    /// import there is no content to confirm, content held without validators
+    /// (a payload that stated none, the compiled-in seed) has nothing to ask
+    /// conditionally with, and a caller may simply have fetched unconditionally
+    /// while holding a good one, so the answer is not evidence about the held
+    /// content in any of those cases. There is nothing to admit
     /// and nothing to age, but the import did not advance the catalogue either,
     /// so it counts as an
     /// [`RefusalReason::UnsolicitedUnchanged`] refusal rather than passing
@@ -2349,11 +2357,12 @@ impl LastKnownGoodCatalog {
     pub fn record_refresh<E: Refusable>(
         &mut self,
         refreshed: Result<CatalogRefresh, E>,
+        asked_with: Option<&SourceValidators>,
         checked_at: SystemTime,
     ) -> Result<Refreshed, (E, Option<&CatalogSnapshot>)> {
         match refreshed {
             Ok(CatalogRefresh::Unchanged { validators }) => {
-                if !self.can_confirm_unchanged() {
+                if !self.can_confirm_unchanged(asked_with) {
                     let refusal = Refusal::new(RefusalReason::UnsolicitedUnchanged);
                     self.record_refusal(refusal.clone());
                     return Ok(Refreshed::Refused(refusal));
@@ -3525,6 +3534,7 @@ mod tests {
                     content(vec![offering("openai", "gpt-4o", Some(price(1, 2)))]),
                     SourceValidators::etag("\"one\""),
                 )))),
+                None,
                 imported_at,
             )
             .expect("an admitted import");
@@ -3536,7 +3546,7 @@ mod tests {
         // A fetch that never produced a document to parse still counts.
         let unreachable = CatalogError::unavailable("test", "connection refused".to_owned());
         let (error, active) = catalogue
-            .record_refresh(Err(unreachable), imported_at)
+            .record_refresh(Err(unreachable), None, imported_at)
             .expect_err("a refused refresh");
         assert_eq!(error.refused_by().reason(), RefusalReason::Unreachable);
         assert!(
@@ -3546,11 +3556,13 @@ mod tests {
         assert_eq!(catalogue.report(imported_at).consecutive_refusals, 1);
 
         let checked_at = imported_at + Duration::from_secs(600);
+        let asked_with = catalogue.validators().cloned().expect("an active snapshot");
         let confirmed = catalogue
             .record_refresh::<CatalogError>(
                 Ok(CatalogRefresh::Unchanged {
                     validators: SourceValidators::etag("\"one\""),
                 }),
+                Some(&asked_with),
                 checked_at,
             )
             .expect("a confirmed answer");
@@ -3575,6 +3587,7 @@ mod tests {
                 Ok(CatalogRefresh::Unchanged {
                     validators: SourceValidators::etag("\"one\""),
                 }),
+                None,
                 checked_at,
             )
             .expect("an answer, not an error");
@@ -3624,6 +3637,7 @@ mod tests {
                 Ok(CatalogRefresh::Unchanged {
                     validators: SourceValidators::default(),
                 }),
+                catalogue.validators().cloned().as_ref(),
                 checked_at,
             )
             .expect("an answer, not an error");
@@ -3637,6 +3651,58 @@ mod tests {
             report.active_age(),
             Some(Duration::from_secs(3_600)),
             "so the active content keeps aging"
+        );
+        assert_eq!(
+            report.consecutive_refusals, 2,
+            "and the run continues rather than being cleared"
+        );
+    }
+
+    /// Whether a `304` confirms anything is a property of the request, not of
+    /// what the catalogue holds: a refresh made unconditionally while a good
+    /// validator is held is still a question nobody asked, so its answer cannot
+    /// buy the content a fresh age or clear a run of refusals.
+    #[test]
+    fn an_unchanged_answer_to_a_request_that_carried_no_validator_is_a_refusal() {
+        let mut catalogue = LastKnownGoodCatalog::new();
+        let imported_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        catalogue.admit_as_of(
+            snapshot(
+                content(vec![offering("openai", "gpt-4o", Some(price(1, 2)))]),
+                SourceValidators::etag("\"one\""),
+            ),
+            imported_at,
+        );
+        assert!(
+            !catalogue
+                .validators()
+                .expect("an active snapshot")
+                .is_empty(),
+            "the held state alone would have made this confirmable"
+        );
+        catalogue.record_refusal(Refusal::new(RefusalReason::Unreachable));
+
+        let checked_at = imported_at + Duration::from_secs(3_600);
+        let refreshed = catalogue
+            .record_refresh::<CatalogError>(
+                Ok(CatalogRefresh::Unchanged {
+                    validators: SourceValidators::etag("\"one\""),
+                }),
+                // The refresh went out unconditionally all the same.
+                None,
+                checked_at,
+            )
+            .expect("an answer, not an error");
+        assert_eq!(
+            refreshed.refusal().map(Refusal::reason),
+            Some(RefusalReason::UnsolicitedUnchanged),
+            "nothing was sent for the source to have checked against"
+        );
+        let report = catalogue.report(checked_at);
+        assert_eq!(
+            report.active_age(),
+            Some(Duration::from_secs(3_600)),
+            "so the content keeps aging"
         );
         assert_eq!(
             report.consecutive_refusals, 2,
@@ -3661,6 +3727,7 @@ mod tests {
         catalogue
             .record_refresh::<CatalogError>(
                 Ok(CatalogRefresh::Updated(Box::new(stated))),
+                None,
                 checked_at,
             )
             .expect("an admitted import");

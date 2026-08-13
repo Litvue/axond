@@ -195,10 +195,12 @@ and loses the active snapshot.
    `unreachable` / `denied` / `oversized` are the fetch: egress, a mirror, an
    auth-ing proxy, or a body past the ceiling. `unsolicited_unchanged` is the one
    reason with no error and no pointer behind it: the source answered "not
-   modified" while nothing has ever been imported, which an intermediary
-   answering `304` unconditionally will do — look at the cache in front of the
-   source, not at the payload. Everything else is the document itself — upstream
-   published something this schema refuses.
+   modified" to a request that carried no validator for it to check against —
+   nothing imported yet, content held that stated no `ETag`, or an
+   unconditional refresh — which an intermediary answering `304` unconditionally
+   will do. Look at the cache in front of the source, not at the payload.
+   Everything else is the document itself — upstream published something this
+   schema refuses.
 2. **Read what is active.** The authenticated deployment-scope status response
    carries `catalogue.content_id` (the short digest of the content actually
    being served), `catalogue.active_age_ms`, `catalogue.consecutive_refusals`,
