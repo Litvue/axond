@@ -161,6 +161,7 @@ fi
 
 command -v docker >/dev/null 2>&1 || fail "docker is required"
 command -v jq >/dev/null 2>&1 || fail "jq is required"
+command -v openssl >/dev/null 2>&1 || fail "openssl is required for this run's secrets"
 
 step "Starting ${image} with WAL archiving"
 docker rm --force --volumes "$container" >/dev/null 2>&1 || true

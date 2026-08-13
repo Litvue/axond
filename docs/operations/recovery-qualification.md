@@ -132,8 +132,8 @@ green.
 just restore-drill              # or: bash ops/restore-drill.sh
 ```
 
-It needs Docker, `psql`, `pg_dump`, `pg_restore`, `pg_basebackup`, `jq`, and
-`curl`; it starts `postgres:17.6-alpine` with WAL archiving, migrates it with
+It needs Docker, `psql`, `pg_dump`, `pg_restore`, `pg_basebackup`, `jq`,
+`curl`, and `openssl`; it starts `postgres:17.6-alpine` with WAL archiving, migrates it with
 `axond migrate apply`, and then does everything else the way an operator would:
 a live replica is started on the live database, a five-resource deployment is
 published through `axond admin apply --resource …`, and each recovered database
