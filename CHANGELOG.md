@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.27](https://github.com/Litvue/axond/compare/v0.3.26...v0.3.27) (2026-08-13)
+
+
+### Tests
+
+* **integration:** gate [#160](https://github.com/Litvue/axond/issues/160) on an executable stateful acceptance matrix ([#261](https://github.com/Litvue/axond/issues/261)) ([4bf73e7](https://github.com/Litvue/axond/commit/4bf73e7e6f4f20458cff52c5a9fbaec87b37be9c))
+
 ## [0.3.26](https://github.com/Litvue/axond/compare/v0.3.25...v0.3.26) (2026-08-13)
 
 

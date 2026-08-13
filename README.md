@@ -106,7 +106,7 @@ Other distribution paths:
 cargo install axond --locked
 
 # Pull the current release image. There is intentionally no `latest` tag.
-AXOND_VERSION=0.3.26 # x-release-please-version
+AXOND_VERSION=0.3.27 # x-release-please-version
 docker pull "ghcr.io/litvue/axond:${AXOND_VERSION}"
 ```
 
