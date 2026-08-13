@@ -157,7 +157,7 @@ Five rules hold for every body schema, present and future:
   validated nor refused — republish it from this build to have it checked. A
   model *enablement* has no such history, so an untyped enablement is
   `incompatible` like every other untyped body
-  ([ADR 0038](../adr/0038-model-enablement-and-alias-contracts.md)).
+  ([ADR 0040](../adr/0040-model-enablement-and-alias-contracts.md)).
 - **A body that declares a schema this build reads, and then is not one, is
   damage.** Past the identifier the field set is known, so a `v1` body missing a
   `v1` field, or carrying one whose type changed, is reported as `corrupt` and not
@@ -332,7 +332,7 @@ An enablement body names an offering by an **opaque derived identity**
 published, and pins the **catalogue snapshot** it was approved against; the
 resource depends on the blob declaring that snapshot, so a revision cannot pin a
 snapshot it does not carry ([ADR
-0038](../adr/0038-model-enablement-and-alias-contracts.md)). The pin must resolve
+0040](../adr/0040-model-enablement-and-alias-contracts.md)). The pin must resolve
 to a `CatalogModel` dependency whose body is a blob of kind `CatalogSnapshot`
 with a matching digest — an unresolvable pin is an **invalid** revision, not a
 compatibility skew, and a revision whose enablements have lost the catalogue they
