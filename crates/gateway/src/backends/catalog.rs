@@ -467,7 +467,7 @@ impl Canonical for ModelLimits {
                 fields.push((key.to_owned(), CanonicalValue::integer(value)));
             }
         }
-        CanonicalValue::Map(fields)
+        CanonicalValue::map(fields)
     }
 }
 
@@ -548,7 +548,7 @@ impl Canonical for PriceRates {
                 fields.push((key.to_owned(), rate.canonical()));
             }
         }
-        CanonicalValue::Map(fields)
+        CanonicalValue::map(fields)
     }
 }
 
@@ -852,7 +852,7 @@ impl Canonical for ModelFacts {
                 fields.push((key.to_owned(), CanonicalValue::string(value)));
             }
         }
-        CanonicalValue::Map(fields)
+        CanonicalValue::map(fields)
     }
 }
 
@@ -889,7 +889,7 @@ impl Canonical for ProviderEndpoint {
                 fields.push((key.to_owned(), CanonicalValue::string(value)));
             }
         }
-        CanonicalValue::Map(fields)
+        CanonicalValue::map(fields)
     }
 }
 
@@ -991,7 +991,7 @@ impl Canonical for CatalogProvider {
                 fields.push((key.to_owned(), CanonicalValue::string(value)));
             }
         }
-        CanonicalValue::Map(fields)
+        CanonicalValue::map(fields)
     }
 }
 
@@ -1063,7 +1063,7 @@ impl Canonical for ProviderOffering {
         if !self.endpoint.is_empty() {
             fields.push(("endpoint".to_owned(), self.endpoint.canonical()));
         }
-        CanonicalValue::Map(fields)
+        CanonicalValue::map(fields)
     }
 }
 
@@ -1128,7 +1128,7 @@ impl Canonical for CatalogModelEntry {
         if let Some(neutral) = &self.neutral {
             fields.push(("neutral".to_owned(), neutral.canonical()));
         }
-        CanonicalValue::Map(fields)
+        CanonicalValue::map(fields)
     }
 }
 
@@ -2014,6 +2014,28 @@ mod tests {
         assert_eq!(diff.counts().prices_changed, 1);
         assert_eq!(diff.counts().offerings_added, 0);
         assert_eq!(diff.counts().offerings_removed, 0);
+    }
+
+    /// Every catalogue record is built in the order it encodes in, so a record
+    /// held in memory *equals* the same record read back out of storage rather
+    /// than merely checksumming the same — otherwise comparing a fresh
+    /// catalogue against a stored one would differ on field order alone.
+    #[test]
+    fn a_catalogue_record_equals_its_own_round_trip() {
+        let content = content(vec![offering("openai", "gpt-4o", Some(price(1, 2)))]);
+        let serializer = crate::desired_state::canonical::SerializerVersion::default();
+        for record in [
+            content.providers()[0].canonical(),
+            content.models()[0].canonical(),
+            content.models()[0].offerings[0].canonical(),
+        ] {
+            let bytes = record.to_canonical_bytes().expect("canonical bytes");
+            assert_eq!(
+                serializer.decode(&bytes).expect("decode"),
+                record,
+                "a record built here must be the record storage returns"
+            );
+        }
     }
 
     /// An offering that arrives or leaves is named by the id a request would
