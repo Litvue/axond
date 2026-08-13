@@ -1384,12 +1384,18 @@ async fn serve(
         Ok(response) => {
             let usage = to_usage(&response.usage);
             let cost = served.price.cost_microdollars(usage);
-            // Recorded *before* the settlement and before the response is
-            // acknowledged: in billing-grade mode this is the durable append, and
-            // a request whose usage is not durable must not be answered `200`.
-            // In telemetry-grade mode the fan-out cannot fail, so the order is
-            // unobservable.
-            let durable = record_usage(
+            // Settled first, and not because the record does not matter: the
+            // spend was incurred upstream whether or not the record survives,
+            // and the append that follows is the first await long enough for a
+            // caller to disconnect inside. A handler dropped there would run the
+            // guard's release and hand back the whole estimate instead of the
+            // measured cost, so the charge is made while nothing can cancel it.
+            reservation.settle(cost).await;
+            // Then the record, before the response is acknowledged: in
+            // billing-grade mode this is the durable append, and a request whose
+            // usage is not durable must not be answered `200`. In
+            // telemetry-grade mode the fan-out cannot fail.
+            record_usage(
                 &state,
                 RecordArgs {
                     identity: &identity,
@@ -1410,12 +1416,7 @@ async fn serve(
                     attempts: outcome.attempts,
                 },
             )
-            .await;
-            // Settled either way: the spend was incurred upstream whether or not
-            // the record survived, and leaving the hold to expire would
-            // double-count the next request.
-            reservation.settle(cost).await;
-            durable?;
+            .await?;
             Ok(Json(response.body).into_response())
         }
         Err(err) => {

@@ -244,6 +244,14 @@ pub fn tls_connector() -> MakeRustlsConnect {
 }
 
 /// A multi-row `INSERT` with one parameter set per row.
+///
+/// `ON CONFLICT DO NOTHING` carries no target, so it is inert on the shipped DDL
+/// (which indexes `request_id` without a unique constraint) and absorbs the
+/// duplicate on a table where an operator has added the unique index
+/// `docs/usage-schema.md` describes. That is what makes this sink a legitimate
+/// destination for the billing-grade outbox, whose redelivery after a lease
+/// expiry is routine rather than exceptional: without it a duplicate either
+/// double-counts the spend or fails the batch until the event is quarantined.
 fn insert_sql(table: &str, rows: usize) -> String {
     let mut sql = String::with_capacity(64 + rows * COLUMNS.len() * 5);
     sql.push_str("INSERT INTO ");
@@ -265,6 +273,7 @@ fn insert_sql(table: &str, rows: usize) -> String {
         }
         sql.push(')');
     }
+    sql.push_str(" ON CONFLICT DO NOTHING");
     sql
 }
 
@@ -362,6 +371,13 @@ mod tests {
         assert!(sql.starts_with("INSERT INTO axond_usage (schema_version, request_id"));
         assert!(sql.contains(&format!("${}", COLUMNS.len() * 2)));
         assert!(!sql.contains(&format!("${}", COLUMNS.len() * 2 + 1)));
+    }
+
+    /// A redelivery from the billing-grade outbox is normal, so the statement
+    /// this sink writes has to be one a unique `request_id` index can absorb.
+    #[test]
+    fn the_insert_absorbs_a_duplicate_rather_than_failing_the_batch() {
+        assert!(insert_sql("axond_usage", 1).ends_with(" ON CONFLICT DO NOTHING"));
     }
 
     #[test]

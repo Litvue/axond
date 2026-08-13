@@ -93,14 +93,15 @@ CREATE UNIQUE INDEX CONCURRENTLY axond_usage_request_id_key
     ON axond_usage (request_id);
 ```
 
-Understand what that trades before you do, though: the Postgres sink inserts
-without `ON CONFLICT`, and retries a batch whose commit outcome it never learned.
-With the index in place that retry hits a duplicate key, fails the whole
-transaction, and counts the entire batch — rows that are in fact already
-committed — as `records_dropped{axond.drop_reason="sink_error"}`. So the index
-buys a table that cannot hold a duplicate row, at the cost of a false alarm on
-the metric below. Until the sink writes `ON CONFLICT (request_id) DO NOTHING`,
-deduplicating in the reader is the quieter choice.
+The sink's insert ends in `ON CONFLICT DO NOTHING`, which carries no target: it
+does nothing on the shipped DDL, and with the unique index in place it absorbs
+the duplicate a retry or an outbox redelivery presents, so the retry commits and
+nothing is counted as
+`records_dropped{axond.drop_reason="sink_error"}`. The index is therefore worth
+adding wherever the rows allow it — it is what makes the table itself
+duplicate-free rather than leaving every reader to deduplicate, and a
+billing-grade deployment (`docs/operations/usage-outbox.md`), where redelivery is
+routine, should have it.
 
 Ids are time-ordered, but by **admission**, not settlement: one is minted when the
 gateway accepts a request, and rows are written when requests end. A long stream's

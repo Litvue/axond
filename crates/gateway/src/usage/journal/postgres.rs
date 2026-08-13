@@ -1293,6 +1293,25 @@ mod tests {
     use super::super::tests::{consumer, event_for};
     use super::*;
 
+    /// [`StoredRecord`] is a hand-kept mirror of [`UsageRecord`], which cannot
+    /// itself be deserialized because `credential_source` is a `&'static str`
+    /// from a closed vocabulary. A field added to the record and forgotten here
+    /// would not be a warning: every row already written would stop decoding and
+    /// be quarantined as [`PoisonReason::Malformed`], so the mirror is asserted
+    /// as a round trip rather than trusted.
+    #[test]
+    fn a_stored_record_decodes_back_to_exactly_the_record_that_was_written() {
+        let record = crate::usage::tests::sample_record();
+        let stored: StoredRecord = serde_json::from_value(
+            serde_json::to_value(&record).expect("a usage record serializes"),
+        )
+        .expect("the stored mirror reads every field the record writes");
+        assert_eq!(
+            stored.into_record().expect("a known credential source"),
+            record
+        );
+    }
+
     fn capacity(max_events: u64, policy: CapacityPolicy) -> Capacity {
         Capacity {
             max_events,
