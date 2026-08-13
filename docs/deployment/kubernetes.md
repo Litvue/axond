@@ -123,14 +123,18 @@ here is stale by the next release. So the digest is resolved at deploy time from
 the release you verified:
 
 ```bash
-ops/pin-image-digest.sh --check          # fails while the sentinel is unresolved
+ops/pin-image-digest.sh --check          # fails while any overlay is unresolved
+ops/pin-image-digest.sh --check overlays/production   # only that overlay
 ops/pin-image-digest.sh --print 0.3.29 # x-release-please-version, prints the digest
 ops/pin-image-digest.sh 0.3.29 # x-release-please-version, rewrites the overlays
 ```
 
-Both production overlays are rewritten and both are checked: the stateful one
-pins its migration Job itself, so a helper blind to it would report a resolved
-fleet while that Job still named an image no node can pull.
+Both production overlays are rewritten, and a bare `--check` answers for both:
+the stateful one pins its migration Job itself, so a helper blind to it would
+report a resolved fleet while that Job still named an image no node can pull.
+That is the answer a repository gate wants. Name an overlay when you are rolling
+one out and want an answer about it — an unresolved sentinel in an overlay you
+are not applying is not a reason to fail your rollout.
 
 Resolution insists on the multi-architecture index, so a digest naming one
 architecture's child image — schedulable onto that architecture alone — is
@@ -139,9 +143,10 @@ about its evidence; run `ops/verify-image-evidence.sh` on the digest for the
 signature, SBOM, and provenance chain (see
 [releasing](../maintainers/releasing.md)).
 
-Run `ops/pin-image-digest.sh --check` in the job that applies the overlay. It is
-the check that separates "digest not yet resolved" from a rollout that pulls a
-placeholder.
+Run `ops/pin-image-digest.sh --check <the overlay you apply>` in the job that
+applies it. It is the check that separates "digest not yet resolved" from a
+rollout that pulls a placeholder, and scoping it keeps that answer about the
+fleet being rolled out.
 
 ### Optional autoscaling
 
@@ -218,23 +223,39 @@ fleet become wrong at once. The component answers each:
     http://127.0.0.1:8080/admin/v1/tenants
   ```
 
-  A port-forward works because its traffic originates on the node. Anything
-  else in the cluster does not: the inherited `axond-allow` policy admits only
-  the ingress controller's namespace, so a CI job or operator tool calling
-  `axond-admin` is dropped on a CNI that enforces NetworkPolicy even though the
-  Service has all three endpoints. Add its namespace to the ingress rule in
-  `overlays/production/networkpolicy.yaml` before relying on in-cluster access.
+  A port-forward works because its traffic originates on the node rather than
+  from a Pod. Nothing else reaches the Service by default, and that is the
+  boundary rather than an omission: `/admin/v1` and inference share one listener
+  on 8080, so a caller policy admits to those Pods reaches the administrative
+  surface whichever Service it resolved. The production overlay admits the
+  ingress controller's namespace to 8080 because that is how inference callers
+  arrive; on this fleet inference is refused, so that allowance would hand the
+  public ingress path the admin surface and nothing else. The component's
+  `admin-boundary.yaml` therefore *replaces* it:
 
-  Widen it deliberately, because a Service is a name for a set of endpoints and
-  not a network boundary. `/admin/v1` and inference share one listener on 8080,
-  so every caller that policy admits to those Pods can reach the administrative
-  surface whichever Service it resolved — including the ingress controller that
-  fronts inference. Deny `/admin/v1` at that ingress, or run it on an ingress
-  that requires operator identity; the only authentication in front of it today
-  is the break-glass credential in `axond-secrets`. What the manifest gate can
-  enforce, it does: `axond-admin` has to stay `ClusterIP`, and no Ingress in
-  this overlay may route to it, so the boundary is never widened by an edit
-  that never reaches a reviewer.
+  ```yaml
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              axond.dev/admin-client: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+  ```
+
+  Widen it deliberately, one client at a time: label the Pods of the CI job or
+  operator tool `axond.dev/admin-client: "true"`, or add a `namespaceSelector`
+  beside that `podSelector` for a namespace you control. To publish it, front
+  `/admin/v1` with an ingress that requires operator identity and label that
+  controller — do not restore the inference ingress rule, whose callers are
+  authenticated by nothing the gateway sees. The only authentication in front of
+  the surface itself today is the break-glass credential in `axond-secrets`.
+
+  The manifest gate holds all three edges: `axond-admin` stays `ClusterIP`, no
+  Ingress in this overlay routes to it, and no NetworkPolicy on the gateway Pods
+  admits a whole namespace to their port — so the boundary cannot be widened by
+  an edit no reviewer reads.
 
 - **Node drains.** `unhealthyPodEvictionPolicy: AlwaysAllow` on the disruption
   budget. The default (`IfHealthyBudget`) evicts an unready Pod only while the

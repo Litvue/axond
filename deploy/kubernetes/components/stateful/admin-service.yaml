@@ -12,14 +12,16 @@
 # lands, OIDC. Keep it inside the cluster, or behind an ingress that requires
 # operator identity, rather than beside the public inference Service.
 #
-# This Service is a name for a set of endpoints, not a network boundary. It adds
-# no reachability: the inherited `axond-allow` policy admits the ingress
-# controller's namespace to port 8080 on these Pods, and `/admin/v1` shares that
-# one listener with inference, so whoever that rule admits reaches the
-# administrative surface whichever Service they resolved — and nothing else
-# reaches it at all, port-forwards aside. Both directions are the operator's to
-# close: docs/deployment/kubernetes.md#stateful-mode says which selector to
-# widen, and to deny `/admin/v1` at the ingress that fronts inference.
+# This Service is a name for a set of endpoints, not a network boundary, and it
+# adds no reachability: `/admin/v1` shares one listener with inference, so who
+# reaches it is decided by policy rather than by which Service was resolved.
+# `admin-boundary.yaml` is that decision — it replaces the overlay's ingress
+# allowance, which existed to admit inference callers, with an opt-in
+# `axond.dev/admin-client: "true"` selector. So on the rendered fleet the public
+# ingress path does not reach `/admin/v1`, and nothing does until the operator
+# labels a client or port-forwards; docs/deployment/kubernetes.md#stateful-mode
+# says how to widen it, and how to front it with an ingress that requires
+# operator identity.
 apiVersion: v1
 kind: Service
 metadata:

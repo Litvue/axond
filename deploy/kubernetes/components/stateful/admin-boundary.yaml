@@ -1,0 +1,30 @@
+# Close the inference ingress path on a fleet that serves no inference.
+#
+# The production overlay admits the ingress controller's namespace to TCP 8080,
+# because that is how callers reach inference. On this fleet nothing reaches
+# inference: no replica is Ready, the `axond` Service has no endpoints, and the
+# one thing still answering on 8080 is `/admin/v1`. Leaving that allowance in
+# place would mean the ingress that fronts inference — the one public path into
+# the namespace — reaches the administrative surface, whose only credential
+# today is the break-glass secret.
+#
+# So the allowance is replaced rather than documented around: the boundary is a
+# rule the CNI enforces, not a paragraph an operator has to read. What is left
+# admits Pods the operator has labelled `axond.dev/admin-client: "true"`, which
+# is opt-in and empty until they opt in; `kubectl port-forward` reaches the
+# replicas either way, because it is the kubelet on the node rather than a Pod.
+#
+# Restore an ingress path deliberately, not by inheriting one: put `/admin/v1`
+# behind an ingress that requires operator identity, label that controller's
+# Pods (or add its `namespaceSelector` here), and see
+# docs/deployment/kubernetes.md#stateful-mode.
+- op: replace
+  path: /spec/ingress
+  value:
+    - from:
+        - podSelector:
+            matchLabels:
+              axond.dev/admin-client: "true"
+      ports:
+        - protocol: TCP
+          port: 8080

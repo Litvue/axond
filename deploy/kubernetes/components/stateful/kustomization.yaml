@@ -16,6 +16,11 @@
 #     eviction at all and every node drain blocks — `pdb.yaml` sets
 #     `unhealthyPodEvictionPolicy: AlwaysAllow`.
 #
+# A fourth follows from the first: the overlay's ingress allowance exists to let
+# callers reach inference, and on this fleet the only thing still answering on
+# that port is `/admin/v1`. `admin-boundary.yaml` replaces the allowance so the
+# public ingress path does not inherit the administrative surface.
+#
 # The forward migration is `migrate-job.yaml`, run once before the replicas that
 # read the schema, never by a booting replica: `[control_plane] migrate` stays at
 # its default of false so a rolling restart cannot have one replica migrating a
@@ -35,6 +40,7 @@ apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 resources:
   - admin-service.yaml
+  # `admin-boundary.yaml` is a patch, not a resource: see `patches:` below.
   - migrate-job.yaml
   - networkpolicy.yaml
 # Replaces the base's stateless configuration wholesale. A stateful bootstrap
@@ -51,3 +57,7 @@ generatorOptions:
 patches:
   - path: deployment.yaml
   - path: pdb.yaml
+  - path: admin-boundary.yaml
+    target:
+      kind: NetworkPolicy
+      name: axond-allow

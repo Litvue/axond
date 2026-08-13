@@ -8,12 +8,17 @@
 # digest is resolved at deploy time from the release the operator verified, and
 # this script is both halves of that:
 #
-#   ops/pin-image-digest.sh --check          # exit non-zero while unresolved
+#   ops/pin-image-digest.sh --check                       # every shipped overlay
+#   ops/pin-image-digest.sh --check overlays/production   # only that overlay
 #   ops/pin-image-digest.sh 0.3.21           # resolve that release into the overlay
 #   ops/pin-image-digest.sh --print 0.3.21   # only print the digest
 #
 # `--check` is what a rollout gate runs: it fails on a working tree that would
-# apply the placeholder. Resolution insists on the multi-architecture index, so a
+# apply the placeholder. Bare, it answers for the whole shipped fleet, which is
+# what a repository gate wants. An operator rolling out one overlay wants an
+# answer about that overlay: naming it scopes the check, so an unresolved
+# sentinel in an overlay nobody is applying does not fail the rollout that is.
+# Resolution insists on the multi-architecture index, so a
 # digest that names one architecture's child image — schedulable only onto that
 # architecture — is refused rather than pinned. Verify the evidence chain for the
 # digest with `ops/verify-image-evidence.sh` before applying it; this script
@@ -34,8 +39,27 @@ sentinel="sha256:000000000000000000000000000000000000000000000000000000000000000
 required_platforms=(linux/amd64 linux/arm64)
 
 usage() {
-  echo "usage: ops/pin-image-digest.sh [--check | [--print] [VERSION]]" >&2
+  echo "usage: ops/pin-image-digest.sh [--check [OVERLAY...] | [--print] [VERSION]]" >&2
+  echo "       OVERLAY is one of: ${overlay_names[*]}" >&2
   exit 2
+}
+
+# An operator names an overlay the way the repository does — `overlays/production`,
+# or the path to its kustomization — not by the array index it happens to have.
+resolve_overlay() {
+  local wanted="${1#"$repo_root"/}"
+  wanted="${wanted#deploy/kubernetes/}"
+  wanted="${wanted%/kustomization.yaml}"
+  wanted="${wanted%/}"
+  local index
+  for index in "${!overlay_names[@]}"; do
+    if [[ "$wanted" == "${overlay_names[$index]}" ]]; then
+      echo "${overlays[$index]}"
+      return 0
+    fi
+  done
+  echo "unknown overlay: $1 (known: ${overlay_names[*]})" >&2
+  return 1
 }
 
 current_digest() {
@@ -45,6 +69,12 @@ current_digest() {
 workspace_version() {
   sed -n 's/^version = "\([^"]*\)"$/\1/p' "${repo_root}/Cargo.toml" | head -n 1
 }
+
+overlay_names=()
+for overlay in "${overlays[@]}"; do
+  name="${overlay#"$repo_root"/deploy/kubernetes/}"
+  overlay_names+=("${name%/kustomization.yaml}")
+done
 
 mode=resolve
 case "${1:-}" in
@@ -62,11 +92,18 @@ case "${1:-}" in
   # failure rather than as the check never having run.
   --*) usage ;;
 esac
-[[ $# -le 1 ]] || usage
-[[ "$mode" != check || $# -eq 0 ]] || usage
+[[ "$mode" == check || $# -le 1 ]] || usage
 
 if [[ "$mode" == check ]]; then
-  for overlay in "${overlays[@]}"; do
+  checked=()
+  if [[ $# -eq 0 ]]; then
+    checked=("${overlays[@]}")
+  else
+    for requested in "$@"; do
+      checked+=("$(resolve_overlay "$requested")")
+    done
+  fi
+  for overlay in "${checked[@]}"; do
     digest="$(current_digest "$overlay")"
     [[ -n "$digest" ]] || {
       echo "no image digest found in ${overlay#"$repo_root"/}" >&2
