@@ -44,3 +44,10 @@ queue_capacity = 0
 queue_wait_ms = 0
 max_stream_duration_ms = 900_000
 max_stream_bytes = 33_554_432
+
+# No `[reload]`, unlike the base: nothing left in this file is live-reloadable
+# — `[server]`, `[control_plane]`, `[secret_store]`, `[[admin_breakglass]]`, and
+# `[admission]` all take effect at boot — and everything that changes day to day
+# is administered through `/admin/v1`. A watch here would observe swaps it could
+# not act on. Editing this file is therefore a rollout, and with `Recreate` that
+# is a maintenance window (docs/deployment/kubernetes.md#configuration-and-secrets).

@@ -317,6 +317,15 @@ Use a CSI secret volume and file-backed `[[gateway_key]]` or
 `[[gateway_verifier]]` when same-process key-material reload is required.
 Provider credentials and backend DSNs are environment references today.
 
+The stateful component's replacement `axond.toml` omits `[reload]` deliberately.
+What a stateful replica reads from a file is `[server]`, `[control_plane]`,
+`[secret_store]`, `[[admin_breakglass]]`, and `[admission]`; none of those is
+live-reloadable, and everything that changes day to day is administered through
+`/admin/v1` instead. So a watch would observe swaps it could not act on. Changing
+that file on a stateful fleet is a rollout, and with `strategy: Recreate` that
+takes the admin surface down for the length of it — plan it as a maintenance
+window, as you would a version upgrade.
+
 ## Probes
 
 The listener binds only after boot validation, secret resolution, and initial

@@ -116,11 +116,24 @@ command -v python3 >/dev/null 2>&1 ||
 # Outside a namespace the listener set is the host's, so it is not an invariant.
 [[ "$degraded" != 1 ]] || check_listeners=0
 
+config="$repo_root/tests/tier0/axond.tier0.toml"
+stateful_config="$repo_root/tests/tier0/axond.stateful-bootstrap.toml"
+# Read here, not beside its probe below: the degraded pre-check has to reserve
+# this port too. Taken from the config rather than a literal, so a port moved
+# there cannot leave the probe dialling a port nothing was ever going to use.
+stateful_port="$(sed -n 's/^bind = "127\.0\.0\.1:\([0-9]\+\)"$/\1/p' "$stateful_config")"
+[[ -n "$stateful_port" ]] || {
+  echo "TIER 0 INVARIANT FAILED: could not read the stateful bootstrap's bind port; the listener probe would prove nothing." >&2
+  exit 1
+}
+
 if [[ "$degraded" == 1 ]]; then
   # Outside a namespace the fixed ports are the host's, so a stale listener would
   # be mistaken for the gateway or the fake upstream. The gateway always binds
-  # 18081; 18082 is only bound when the fixture upstream runs.
-  required_free=(18081)
+  # 18081; 18082 is only bound when the fixture upstream runs. The stateful
+  # bootstrap's port belongs here as much as those: nothing is ever meant to
+  # answer on it, so a stranger's listener would read as a boot that bound one.
+  required_free=(18081 "$stateful_port")
   [[ "$check_serving" != 1 ]] || required_free+=(18082)
   if command -v ss >/dev/null 2>&1; then
     for port in "${required_free[@]}"; do
@@ -136,8 +149,6 @@ if [[ "$degraded" == 1 ]]; then
   fi
 fi
 
-config="$repo_root/tests/tier0/axond.tier0.toml"
-stateful_config="$repo_root/tests/tier0/axond.stateful-bootstrap.toml"
 upstream="$repo_root/tests/tier0/fake_upstream_serve.py"
 gateway_log="$(mktemp "$tmpdir/axond-tier0-gateway.XXXXXX.log")"
 upstream_log="$(mktemp "$tmpdir/axond-tier0-upstream.XXXXXX.log")"
@@ -336,11 +347,6 @@ fi
 # connection this namespace would have had to allow.
 stateful_log="$(mktemp "$tmpdir/axond-tier0-stateful.XXXXXX.log")"
 stateful_status=0
-# The bind address comes from the config rather than a literal, so a port moved
-# there cannot leave this probing a port nothing was ever going to use.
-stateful_port="$(sed -n 's/^bind = "127\.0\.0\.1:\([0-9]\+\)"$/\1/p' "$stateful_config")"
-[[ -n "$stateful_port" ]] ||
-  failure "could not read the stateful bootstrap's bind port; the listener probe below would prove nothing"
 env -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
   -u GW_TIER0_CONTROL_PLANE_DSN -u GW_TIER0_SECRET_STORE_KEK \
   -u GW_TIER0_ADMIN_BREAKGLASS \

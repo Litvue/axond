@@ -53,6 +53,10 @@
         },
         {
           "type": "generic",
+          "path": "deploy/kubernetes/overlays/production-stateful/kustomization.yaml"
+        },
+        {
+          "type": "generic",
           "path": "docs/deployment/kubernetes.md"
         }
       ]
