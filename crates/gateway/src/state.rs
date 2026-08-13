@@ -223,6 +223,7 @@ impl ReplicaObservability {
     }
 
     /// The stateless posture with a process-local catalogue import.
+    #[cfg(test)]
     pub fn stateless_with_catalogue(catalogue: Arc<CatalogStatus>) -> (Self, StatusRefresher) {
         let mut settings = StatusSettings::default();
         settings.enabled.push(Component::Catalogue);
