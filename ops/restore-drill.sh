@@ -224,12 +224,19 @@ EOF
 # `check-recovery-evidence.py --forbid-env` is given both variable names — not
 # their values, which would land in the process listing — so an artifact
 # carrying either fails the run.
-GW_DRILL_KEK="$(openssl rand -hex 32)"
+# The key-encryption key is base64 of 32 bytes, the shape `DeploymentKek::parse`
+# accepts: hex of the same length decodes as base64 to 48 bytes and is refused.
+GW_DRILL_KEK="$(openssl rand -base64 32)"
 GW_DRILL_BREAKGLASS="$(openssl rand -hex 24)"
 export GW_DRILL_KEK GW_DRILL_BREAKGLASS
 # `axond admin` reads its credential from the environment rather than from a flag,
 # which keeps it out of the process listing and out of this script's own output.
 export AXOND_ADMIN_TOKEN="$GW_DRILL_BREAKGLASS"
+# The shape, not the value: a key of the wrong length is refused by
+# `DeploymentKek::parse` the moment a stage stages material, and a drill that
+# only ever publishes secret *references* would not find out until then.
+[[ "$(printf '%s' "$GW_DRILL_KEK" | base64 -d 2>/dev/null | wc -c | tr -d ' ')" == 32 ]] ||
+  fail "the generated key-encryption key is not 32 bytes of base64"
 
 # Boots a replica against a database and waits for its administrative surface.
 # The replica is the verifier: every read and publication below goes through

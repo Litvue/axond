@@ -32,9 +32,15 @@ import argparse
 import json
 import sys
 import time
-import tomllib
 from pathlib import Path
 from typing import Any
+
+# `tomllib` is standard from 3.11; on the repository's 3.10 ops floor the
+# deploy lockfile supplies `tomli`, the backport it was extracted from.
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised only on Python 3.10
+    import tomli as tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "qualification/recovery/manifest.toml"
