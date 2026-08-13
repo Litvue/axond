@@ -419,11 +419,23 @@ The refusal reason is the triage key.
   fix. Reconnections during the life of a serving replica are not: the same codes
   arrive during a credential rotation the deployment is halfway through, and a
   replica already serving should wait rather than strand itself. `25006`
-  (read-only transaction) is retryable on purpose: a `dsn_env` pointed at a hot
-  standby says it, but so does a primary mid-demotion and a pooler routing to a
-  replica during a failover. A standing misconfiguration keeps saying `25006` in
-  every retried outage, so look for that code in the `secret` reason before
-  suspecting the store is down.
+  (read-only transaction) is retryable on purpose, at boot and on reconnect
+  alike: a `dsn_env` pointed at a hot standby says it, but so does a primary
+  mid-demotion and a pooler routing to a replica during a failover, and a
+  transient failover must never permanently refuse a replica.
+
+  The misconfiguration is separated out by a boot preflight instead. Once
+  connected, boot asks the server `pg_is_in_recovery()` and whether the session
+  is read-only, and logs a warning naming the endpoint before any statement
+  fails. If a later `25006` does arrive, that answer is attached to the
+  (retryable) outage: *in recovery* means the `dsn_env` names a standby and has
+  to be repointed at the primary unless a failover is under way, and *not in
+  recovery but read-only* points at `default_transaction_read_only` on the role
+  or the database, or at the pooler's routing. A server that accepted writes at
+  the preflight and refuses them now is being demoted, so the outage carries no
+  diagnostic and simply retries. A standing misconfiguration therefore repeats
+  its diagnostic in every retried outage under the `secret` reason — check there
+  before suspecting the store is down.
 - **`projection`** — a candidate this build cannot project: a resource body it
   does not read, or a bootstrap that is missing something projection may not
   supply for it (today, a default namespace). Roll the replica forward, publish a
