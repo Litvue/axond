@@ -153,10 +153,19 @@ fn a_slice_cannot_claim_a_rung_it_has_not_reached() {
                     slice.reduced_lane.is_some(),
                     "{id}: a driver that no lane runs is not a harness"
                 );
-                assert!(
-                    slice.retained.is_empty(),
-                    "{id}: it retains a run, so it is evidenced rather than harnessed"
-                );
+                // A short run may be retained here — it is how a harness shows
+                // it produces records at all. What it may not do is pass for
+                // the measurement the heavy tier exists to take.
+                if let Some(heavy) = slice.heavy_tier.as_deref() {
+                    assert!(
+                        !slice
+                            .retained
+                            .iter()
+                            .any(|relative| packet::load_record(relative).tier == heavy),
+                        "{id}: it retains a {heavy}-tier run, so it is evidenced rather \
+                         than harnessed"
+                    );
+                }
             }
             Status::Evidenced => {
                 assert!(
@@ -320,6 +329,16 @@ fn a_locally_recorded_run_is_disclosed_as_one() {
                     !record.runner_note.trim().is_empty(),
                     "{relative}: a local run without a note about the machine is \
                      an envelope nobody can reproduce"
+                );
+                // The commit too, and not only the path: a re-run rewrites the
+                // record but leaves the prose pointing at history the reader
+                // cannot check out.
+                let short = &record.source.git_commit[..7];
+                assert!(
+                    contract.contains(short),
+                    "{relative}: it was taken at {short}, which {} does not \
+                     mention \u{2014} the disclosure has drifted from the record",
+                    packet::CONTRACT_RELATIVE
                 );
             }
         }

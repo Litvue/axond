@@ -45,7 +45,7 @@ than from what it says:
 | --- | --- |
 | `unbuilt` | The question is written down. Nothing runs. |
 | `declared` | A committed manifest and contract page, kept honest by a `contract_test`, with no driver behind them. A contract test measures nothing, which is why it is not one. |
-| `harnessed` | A driver a lane runs, with no retained run of its heavy tier. |
+| `harnessed` | A driver a lane runs, with no retained run of its heavy tier. A short run may be retained here — it shows the harness produces records — but it does not promote the slice. |
 | `evidenced` | A driver, and at least one retained run in the repository — including one from the tier the slice's own manifest calls heavy (`heavy` for capacity, `soak` for endurance), because a short run is a correctness check, not a measurement of what a replica does. |
 
 ## Retained evidence
@@ -61,15 +61,16 @@ quietly describing a workload that no longer exists.
 
 | Record | Tier | Runner | Commit |
 | --- | --- | --- | --- |
-| `qualification/capacity/evidence/reduced-local.toml` | reduced | local | `9bf3b0f` |
-| `qualification/capacity/evidence/heavy-local.toml` | heavy | local | `9bf3b0f` |
+| `qualification/capacity/evidence/reduced-local.toml` | reduced | local | `c857cd6` |
+| `qualification/capacity/evidence/heavy-local.toml` | heavy | local | `c857cd6` |
 
 Both were produced on an 8 vCPU cloud VM from a **debug build**, which is what
 `cargo test` builds. They are the first envelope, not a fleet baseline: a release
 build on production-representative hardware will move every number in them, and
 `runner = "local"` is in the record so that caveat travels with the data instead
 of with this paragraph. The contract test requires a locally recorded run to be
-disclosed here by path.
+disclosed here by path and by the commit it was taken at, so re-running a tier
+without rewriting this table is a test failure rather than a stale paragraph.
 
 Write a record from a run's artifacts:
 

@@ -42,7 +42,7 @@ every rung from the slice's own fields rather than trusting the word:
 | --- | --- |
 | `unbuilt` | no manifest and no driver |
 | `declared` | a manifest, a contract page, a `contract_test`, and no driver |
-| `harnessed` | a manifest, a driver, a lane that runs it, and no retained run |
+| `harnessed` | a manifest, a driver, a lane that runs it, and no retained run of its heavy tier |
 | `evidenced` | a manifest, a driver, and a retained run of the slice's own `heavy_tier` |
 
 Closure is derived the same way, so #156 cannot be closed by editing a flag:
@@ -70,7 +70,22 @@ not determine is refused at write time rather than written with nulls.
 `runner` is part of the record because a local debug-build run is evidence about
 that machine. The packet may hold one — it is how a first envelope gets written
 — but the contract test requires the operator page to name it, so nobody reads
-it as a fleet baseline.
+it as a fleet baseline. The disclosure is checked by path *and* by commit, so a
+re-run that rewrites a record without rewriting the page fails.
+
+The heavy tier is named per slice (`heavy_tier`) rather than shared, because the
+slices do not agree on the word: capacity's long tier is `heavy`, endurance's is
+`soak`. A slice may retain a short run while still `harnessed` — that is how a
+harness shows it produces records — but only a run of its own heavy tier moves
+it to `evidenced`.
+
+### State tier
+
+Tier 0 (config-only). The packet, the records, and the writer are committed
+files and a test binary: no Redis, no Postgres, no control plane, and no change
+to the tier of any deployment. The evidence they carry is Tier 0 evidence too,
+which is exactly why the packet has to say that the stateful slices are not
+qualified.
 
 ## Consequences
 

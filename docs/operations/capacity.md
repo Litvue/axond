@@ -67,11 +67,11 @@ Intel Xeon Platinum 8559C, 31 GiB RAM, Linux 5.15.200, rustc 1.97.1, no queueing
 
 | Profile | Concurrency | Requests | Accepted req/s | p50 | p95 | p99 | TTFT p95 | Peak RSS | Peak sockets | CPU cores used |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `buffered` | 128 | 40 000 | 8 008 | 15.2 ms | 24.1 ms | 29.7 ms | — | 45 MiB | 352 | 4.9 |
-| `streaming` | 300 | 8 000 | 1 039 | 273 ms | 311 ms | 641 ms | 67 ms | 50 MiB | 738 | 3.1 |
-| `mixed` | 128 | 12 000 | 1 360 | 2.5 ms | 277 ms | 284 ms | 50 ms | 39 MiB | 280 | 2.3 |
-| `response-size` | 64 | 6 000 | 1 395 | 43.3 ms | 74.4 ms | 92.6 ms | — | 66 MiB | 159 | 4.3 |
-| `cancellation` | 300 | 8 000 | 1 690 | 267 ms | 307 ms | 476 ms | 63 ms | 54 MiB | 713 | 3.6 |
+| `buffered` | 128 | 40 000 | 8 273 | 14.7 ms | 23.1 ms | 28.7 ms | — | 44 MiB | 327 | 4.9 |
+| `streaming` | 300 | 8 000 | 1 041 | 270 ms | 292 ms | 637 ms | 59 ms | 50 MiB | 779 | 3.1 |
+| `mixed` | 128 | 12 000 | 1 363 | 2.6 ms | 277 ms | 283 ms | 51 ms | 39 MiB | 287 | 2.3 |
+| `response-size` | 64 | 6 000 | 1 318 | 45.8 ms | 77.9 ms | 94.1 ms | — | 63 MiB | 158 | 4.3 |
+| `cancellation` | 300 | 8 000 | 1 576 | 274 ms | 332 ms | 488 ms | 68 ms | 54 MiB | 712 | 3.9 |
 
 Throughput and latency move 10–25% between runs on a shared host, while the
 socket and memory columns barely move: read the first two as an order of
@@ -89,8 +89,8 @@ What the envelope says, in operator terms:
   inbound, one upstream. 300 concurrent streams held ~750 descriptors. Size
   `ulimit -n` and `admission.max_in_flight_streams` together.
 - **Resident memory is bounded by concurrency and body size, not by request
-  count.** 40 000 buffered requests cost the same ~45 MiB as 400 would; 256 KiB
-  bodies at 64 concurrent cost ~66 MiB. Bodies are buffered before dispatch
+  count.** 40 000 buffered requests cost the same ~44 MiB as 400 would; 256 KiB
+  bodies at 64 concurrent cost ~63 MiB. Bodies are buffered before dispatch
   (ADR 0030), so `admission.max_request_bytes` × concurrency is the term to
   reason about.
 - **CPU saturates before memory.** Every profile used 2.3–4.9 cores of the 8
