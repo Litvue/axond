@@ -142,6 +142,27 @@ enum AdminWrites {
     Unavailable,
 }
 
+impl Gate {
+    /// The verdict for the `readiness` gate: what the stage observed has to be
+    /// what the manifest demanded, so editing the manifest edits the verdict.
+    /// `held` carries the rest of what the stage checked.
+    const fn readiness_met(self, observed: Readiness, held: bool) -> bool {
+        matches!(
+            (self.readiness, observed),
+            (Readiness::Serves, Readiness::Serves) | (Readiness::Refuses, Readiness::Refuses)
+        ) && held
+    }
+
+    /// The same, for `admin_writes`.
+    const fn admin_writes_met(self, observed: AdminWrites, held: bool) -> bool {
+        matches!(
+            (self.admin_writes, observed),
+            (AdminWrites::Accepted, AdminWrites::Accepted)
+                | (AdminWrites::Unavailable, AdminWrites::Unavailable)
+        ) && held
+    }
+}
+
 impl Readiness {
     const fn bound(self) -> &'static str {
         match self {
@@ -633,9 +654,10 @@ async fn control_plane_outage_journal_outage() {
         "admin_writes",
         spec.gate.admin_writes.bound(),
         category,
-        spec.gate.admin_writes == AdminWrites::Unavailable
-            && BackendFailure::retryable(&refusal)
-            && category == "unavailable",
+        spec.gate.admin_writes_met(
+            AdminWrites::Unavailable,
+            BackendFailure::retryable(&refusal) && category == "unavailable",
+        ),
         "the publish was refused with a retryable category and wrote nothing",
     );
     recorder.deferred(
@@ -756,9 +778,11 @@ async fn cold_boot_valid_cache_cold_boot() {
         "readiness",
         spec.gate.readiness.bound(),
         "restored from last-known-good",
-        spec.gate.readiness == Readiness::Serves
-            && report.source == Some(SnapshotSource::LastKnownGood)
-            && report.active == Some(baseline.id),
+        spec.gate.readiness_met(
+            Readiness::Serves,
+            report.source == Some(SnapshotSource::LastKnownGood)
+                && report.active == Some(baseline.id),
+        ),
         "the booting replica reached a servable snapshot without the journal, from the cache the \
          previous replica exported",
     );
@@ -852,9 +876,10 @@ async fn cold_boot_no_cache_cold_boot() {
         "readiness",
         spec.gate.readiness.bound(),
         "refused: control plane unreachable, no cache",
-        spec.gate.readiness == Readiness::Refuses
-            && refused_for_the_journal
-            && booting.generation() == generation_before,
+        spec.gate.readiness_met(
+            Readiness::Refuses,
+            refused_for_the_journal && booting.generation() == generation_before,
+        ),
         "boot refused and published nothing, so no empty configuration reached the snapshot",
     );
     recorder.deferred(
@@ -999,7 +1024,7 @@ async fn cold_boot_invalid_cache_cold_boot() {
         "readiness",
         spec.gate.readiness.bound(),
         format!("{refusals}/3 unauthentic caches refused the boot"),
-        spec.gate.readiness == Readiness::Refuses && refusals == 3,
+        spec.gate.readiness_met(Readiness::Refuses, refusals == 3),
         "an edited record, a foreign signing key, and a truncated file each refused the boot and \
          published nothing",
     );
@@ -1218,7 +1243,7 @@ async fn recovery_convergence_journal_recovery() {
         "admin_writes",
         spec.gate.admin_writes.bound(),
         "accepted",
-        spec.gate.admin_writes == AdminWrites::Accepted,
+        spec.gate.admin_writes_met(AdminWrites::Accepted, true),
         "the publish refused during the outage succeeded against the recovered journal",
     );
     recorder.gate(
@@ -1329,6 +1354,54 @@ fn the_driver_runs_exactly_the_stages_the_manifest_calls_executable() {
     assert_eq!(
         executable, driven,
         "the manifest and the driver disagree about which stages run"
+    );
+}
+
+/// The manifest is the contract for the non-numeric bounds too: a stage records
+/// and evaluates the `readiness` and `admin_writes` it read, so editing the
+/// manifest changes the verdict rather than leaving a literal in the driver.
+///
+/// The edit here is the one that would otherwise pass silently: telling
+/// `cold-boot-no-cache` to serve, which a refusing replica cannot satisfy.
+#[test]
+fn editing_a_non_numeric_gate_changes_the_verdict() {
+    let text = std::fs::read_to_string(
+        super::evidence::workspace_root().join("qualification/recovery/manifest.toml"),
+    )
+    .expect("the recovery manifest is readable");
+    let declared = |manifest: &Manifest, id: &str| -> Gate {
+        manifest
+            .scenarios
+            .iter()
+            .find(|scenario| scenario.id == id)
+            .unwrap_or_else(|| panic!("the manifest declares `{id}`"))
+            .gate
+    };
+
+    // As the contract stands: a refusal is the bound, and observing one meets it.
+    let gate = declared(&toml_manifest(&text), "cold-boot-no-cache");
+    assert_eq!(gate.readiness.bound(), "refuses");
+    assert!(gate.readiness_met(Readiness::Refuses, true));
+    assert!(!gate.readiness_met(Readiness::Serves, true));
+
+    // Flip that one scenario's bound. The bound the artifact echoes follows the
+    // edit, and the refusal the driver observes no longer meets it.
+    let flipped = text.replacen(
+        "readiness = \"refuses\"\nadmin_writes = \"unavailable\"",
+        "readiness = \"serves\"\nadmin_writes = \"accepted\"",
+        1,
+    );
+    assert_ne!(flipped, text, "the edit must reach the first refusing gate");
+    let gate = declared(&toml_manifest(&flipped), "cold-boot-no-cache");
+    assert_eq!(gate.readiness.bound(), "serves");
+    assert_eq!(gate.admin_writes.bound(), "accepted");
+    assert!(
+        !gate.readiness_met(Readiness::Refuses, true),
+        "a stage observing a refusal must fail a manifest that demands serving"
+    );
+    assert!(
+        !gate.admin_writes_met(AdminWrites::Unavailable, true),
+        "a stage observing an unavailable write must fail a manifest that demands acceptance"
     );
 }
 
