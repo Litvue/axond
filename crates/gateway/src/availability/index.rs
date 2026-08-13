@@ -33,17 +33,20 @@
 //! 4. **Policy indeterminacy.** An undecided policy is not a permit: `unknown`.
 //! 5. **Entitlement.** The provider account's own answer. `denied` when missing or
 //!    revoked, `unknown` when never established.
-//! 6. **Runtime health.** Replica-local. An open circuit is `unavailable`, because
-//!    this replica is already skipping the target; intermittent failure short of
-//!    tripping is `unknown`, because the breaker would still attempt it (ADR 0008)
-//!    and refusing it here would deny a fleet a target that mostly works. Placed
-//!    above the evidence rung so a flaky target does not report as plainly
-//!    `available` — what this replica is living through outranks what a listing
-//!    said.
+//! 6. **An open circuit.** Replica-local, and it outranks the evidence:
+//!    `unavailable`, because this replica is already skipping the target whatever a
+//!    listing said.
 //! 7. **Discovery evidence.** `available`, `stale`, `unknown`, or `denied`, per
 //!    [`DiscoveryObservation::verdict`], and `unknown` when nothing has looked
 //!    yet — still decided by discovery, which is what distinguishes it from a key
 //!    the index does not hold at all.
+//! 8. **Runtime impairment.** Intermittent failure short of tripping is not a
+//!    refusal — the breaker would still attempt the target (ADR 0008) — so it
+//!    lowers a positive or uncertain verdict to `unknown` rather than withdrawing
+//!    the target, and a flaky target does not report as plainly `available`. It only
+//!    lowers: a conclusion the evidence reached stands, because local flakiness is
+//!    no reason to stop reporting that a complete listing no longer carries the
+//!    model.
 //!
 //! Ties are impossible by construction: exactly one rung decides, and the verdict
 //! records which one in [`Availability::decided_by`].
@@ -300,29 +303,16 @@ impl AvailabilityIndex {
             }
             Entitlement::Granted => {}
         }
-        match record.runtime {
-            RuntimeHealth::Unavailable => {
-                return Availability::decided(
-                    AvailabilityState::Unavailable,
-                    AvailabilityReason::RuntimeUnavailable,
-                    DecidedBy::Runtime,
-                );
-            }
-            // Not a refusal: an untripped target is still one the breaker would
-            // attempt (ADR 0008), so impairment lowers certainty rather than
-            // withdrawing the target. Deciding here — rather than falling through to
-            // the evidence — keeps the impairment visible instead of reporting a
-            // flaky target as plainly available.
-            RuntimeHealth::Impaired => {
-                return Availability::decided(
-                    AvailabilityState::Unknown,
-                    AvailabilityReason::RuntimeImpaired,
-                    DecidedBy::Runtime,
-                );
-            }
-            RuntimeHealth::Healthy | RuntimeHealth::Unobserved => {}
+        // An open circuit is this replica's own refusal, and it outranks the
+        // evidence: whatever a listing said, this replica is skipping the target.
+        if record.runtime == RuntimeHealth::Unavailable {
+            return Availability::decided(
+                AvailabilityState::Unavailable,
+                AvailabilityReason::RuntimeUnavailable,
+                DecidedBy::Runtime,
+            );
         }
-        match record.evidence() {
+        let evidence = match record.evidence() {
             Some((observation, last_known_good)) => observation.verdict(now, last_known_good),
             // Every authority permits and discovery simply has not run yet. Reported
             // as decided by discovery, not as [`Availability::no_record`]: "nobody
@@ -333,7 +323,21 @@ impl AvailabilityIndex {
                 AvailabilityReason::NoEvidence,
                 DecidedBy::Discovery,
             ),
+        };
+        // Impairment is not a refusal: an untripped target is still one the breaker
+        // would attempt (ADR 0008), so it lowers certainty rather than withdrawing
+        // the target — a flaky target does not report as plainly `available`. It only
+        // ever *lowers*, though: a conclusion the evidence reached is left standing,
+        // because local flakiness is not a reason to stop reporting that a provider's
+        // complete listing no longer carries the model.
+        if record.runtime == RuntimeHealth::Impaired && evidence.state.permits_attempt() {
+            return Availability::decided(
+                AvailabilityState::Unknown,
+                AvailabilityReason::RuntimeImpaired,
+                DecidedBy::Runtime,
+            );
         }
+        evidence
     }
 
     /// Every target in one scope, in target order.
@@ -391,14 +395,29 @@ impl AvailabilityIndexBuilder {
 
     /// Declare the single-valued dimensions for a key, replacing any already
     /// declared and keeping the discovery evidence held for it.
+    ///
+    /// Declared evidence is held to the same retention rule as an observed one: a
+    /// complete listing that does not carry the target discredits a retained
+    /// positive it is not older than.
     #[must_use]
     pub fn record(mut self, key: AvailabilityKey, record: AvailabilityRecord) -> Self {
         let entry = self.records.entry(key).or_default();
         let discovery = record.discovery.clone().or_else(|| entry.discovery.clone());
-        let last_known_good = record
+        let mut last_known_good = record
             .last_known_good
             .clone()
             .or_else(|| entry.last_known_good.clone());
+        // Declared evidence obeys the retention rule `observe` enforces, or a
+        // projection that declared a complete listing dropping the target would
+        // leave a retained positive behind for the next failed refresh to fall back
+        // onto.
+        if let (Some(retained), Some(current)) = (&last_known_good, &discovery)
+            && current.is_definitive()
+            && !current.is_positive()
+            && current.observed_at >= retained.observed_at
+        {
+            last_known_good = None;
+        }
         // The watermark tracks every definitive look this key has seen, so it
         // advances to cover declared evidence rather than being reset by a
         // redeclaration of the dimensions.

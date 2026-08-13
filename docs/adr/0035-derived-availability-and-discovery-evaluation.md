@@ -1,4 +1,4 @@
-# 34. Derived availability and discovery evaluation
+# 35. Derived availability and discovery evaluation
 
 Date: 2026-08-12
 
@@ -68,11 +68,18 @@ separate because each has a different authority, lifetime, and repair — "the
 operator has not enabled this", "your provider account is not entitled", and "this
 replica's circuit is open" need three different people to act. Evaluation walks
 them in a fixed order — catalogue, policy refusal, enablement, policy
-indeterminacy, entitlement, runtime, discovery — and records which rung decided, so
-the answer names who to go and talk to rather than only what the answer is. Policy
-is split across two rungs because a deployment's refusal outranks a tenant's switch
-while a deployment's *inability to decide* must not: every rung that can answer
-`unknown` sits below enablement.
+indeterminacy, entitlement, an open circuit, discovery, runtime impairment — and
+records which rung decided, so the answer names who to go and talk to rather than
+only what the answer is. Policy is split across two rungs because a deployment's
+refusal outranks a tenant's switch while a deployment's *inability to decide* must
+not: every rung that can answer `unknown` sits below enablement. Runtime health is
+split for the same reason in the other direction: an open circuit is this replica's
+refusal and outranks the evidence, while impairment short of tripping only *lowers*
+a positive or uncertain verdict to `unknown` (the breaker would still attempt the
+target, [ADR 0008](./0008-target-failover-and-circuit-scope.md)) and leaves a
+conclusion the evidence reached standing — local flakiness is no reason to stop
+reporting that a complete listing no longer carries the model, still less to make
+that target attemptable again.
 
 **Completeness is a separate question from the result, and only a complete
 negative may deny.** A `DiscoveryObservation` carries its result, its
@@ -97,7 +104,10 @@ counts, while one that predates a conclusive answer overturns nothing in either
 direction: an older negative does not discredit a later positive, and an older
 positive does not resurrect a target a later complete listing dropped. Two looks
 bearing the same instant resolve the same way whichever lands first — the negative
-holds, because two answers about one instant are not evidence of reachability.
+holds, because two answers about one instant are not evidence of reachability. The
+same rule governs *declared* evidence: a projection that hands the builder a
+complete listing which dropped the target discredits the retained positive exactly
+as an observed one would.
 
 **Uncertainty is routable only where a scope chose it.** `unknown` and `stale` are
 not refusals, but routability is a property of the whole verdict:

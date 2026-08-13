@@ -315,6 +315,74 @@ fn an_impaired_target_loses_certainty_while_an_open_circuit_refuses() {
     );
 }
 
+/// Impairment lowers a verdict and never lifts one: a replica failing on and off is
+/// no reason to stop reporting that a provider's complete listing dropped the
+/// target, and certainly not to make it attemptable again.
+#[test]
+fn an_impaired_replica_does_not_soften_a_definitive_absence() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let verdict = AvailabilityIndex::builder()
+        .record(
+            key(scope, "gpt-4o"),
+            AvailabilityRecord {
+                runtime: RuntimeHealth::Impaired,
+                ..permitting()
+            },
+        )
+        .observe(absent(scope, "gpt-4o", 100))
+        .build()
+        .evaluate(&key(scope, "gpt-4o"), at(120));
+
+    assert_eq!(
+        (verdict.state, verdict.reason, verdict.decided_by),
+        (
+            AvailabilityState::Denied,
+            AvailabilityReason::DiscoveryAbsent,
+            DecidedBy::Discovery,
+        ),
+        "a complete listing that dropped the target still decides"
+    );
+    assert!(!verdict.permits_attempt());
+}
+
+/// Declared evidence obeys the same retention rule as observed evidence: a complete
+/// listing that dropped the target discredits the retained positive, so the next
+/// failed refresh has nothing stale to fall back onto.
+#[test]
+fn a_declared_definitive_absence_discredits_the_retained_positive() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let builder = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, None))
+        .record(
+            key(scope, "gpt-4o"),
+            AvailabilityRecord {
+                discovery: Some(absent(scope, "gpt-4o", 500)),
+                ..permitting()
+            },
+        );
+    let declared = builder.clone().build();
+    let record = declared
+        .record(&key(scope, "gpt-4o"))
+        .expect("the key is held");
+    assert!(
+        record.last_known_good.is_none(),
+        "a complete listing that dropped the target leaves nothing to fall back onto"
+    );
+    assert_eq!(record.definitive_at, Some(at(500)));
+
+    let after_outage = builder
+        .observe(outage(scope, "gpt-4o", 600))
+        .build()
+        .evaluate(&key(scope, "gpt-4o"), at(700));
+    assert_ne!(
+        after_outage.state,
+        AvailabilityState::Available,
+        "a failed refresh cannot resurrect a target a complete listing dropped"
+    );
+    assert!(!after_outage.last_known_good);
+}
+
 /// A policy denial outranks a positive listing, and a catalogue absence outranks
 /// the denial: the ladder is ordered, not a set of independent vetoes.
 #[test]
