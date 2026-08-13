@@ -657,7 +657,15 @@ fn evidence(migration: &Migration) -> Option<Vec<Evidence>> {
             Statement::Table(name) | Statement::Index(name) => Evidence::Relation(name),
             Statement::Seed(name) => Evidence::Seed(name),
         };
-        if item == Evidence::Relation(MIGRATION_TABLE) || evidence.contains(&item) {
+        // Relations de-duplicate safely: the same object declared twice is one
+        // probe with one answer. A seed does not — the target having a row confirms
+        // one insert, not two — so a repeated seed stays in the list, where the
+        // shared-seed refusal can see that this table is seeded more than once.
+        let duplicate = match item {
+            Evidence::Relation(_) => evidence.contains(&item),
+            Evidence::Seed(_) => false,
+        };
+        if item == Evidence::Relation(MIGRATION_TABLE) || duplicate {
             continue;
         }
         evidence.push(item);
@@ -776,12 +784,12 @@ fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baselin
         }) {
             return Baseline::Inconsistent {
                 message: format!(
-                    "v{} `{}` seeds `{shared}`, which another shipped migration also seeds, so a \
-                     row in it proves neither of them: whether this version ran is not something \
-                     adoption can confirm. No baseline is adoptable while both ship: state the \
-                     history with `INSERT INTO {MIGRATION_TABLE} (version, name, checksum)` if you \
-                     own the change that applied it, or drop the empty ledger and apply from zero \
-                     if nothing was.",
+                    "v{} `{}` seeds `{shared}`, which the shipped history seeds more than once, \
+                     so a row in it proves at most one of those inserts and not this one: whether \
+                     this version ran is not something adoption can confirm. No baseline is \
+                     adoptable while they all ship: state the history with `INSERT INTO \
+                     {MIGRATION_TABLE} (version, name, checksum)` if you own the change that \
+                     applied it, or drop the empty ledger and apply from zero if nothing was.",
                     migration.version, migration.name,
                 ),
             };
@@ -1351,13 +1359,38 @@ mod tests {
                 panic!("a seed no row can be attributed to has no adoptable baseline");
             };
             assert!(
-                message.contains("which another shipped migration also seeds"),
+                message.contains("which the shipped history seeds more than once"),
                 "the refusal has to say why a row in it proves nothing: {message}"
             );
         }
 
-        // One migration seeding it is still evidence, so the refusal above is the
-        // second seed's doing rather than a withdrawal of seed evidence.
+        // The same table seeded twice inside one file, which a `psql -f` can stop
+        // between: the row that is there is the first insert's, so the second is
+        // unprovable for exactly the same reason and must not be de-duplicated
+        // away before the refusal can see it.
+        const TWICE: Migration = Migration {
+            version: 1,
+            name: "twice",
+            sql: "CREATE TABLE IF NOT EXISTS one (id integer);\n\
+                  INSERT INTO one (id) VALUES (1) ON CONFLICT (id) DO NOTHING;\n\
+                  INSERT INTO one (id) VALUES (2) ON CONFLICT (id) DO NOTHING;\n",
+        };
+        assert_eq!(
+            evidence(&TWICE),
+            Some(vec![one, seeded, seeded]),
+            "a repeated seed is two expectations, unlike a relation declared twice"
+        );
+        let Baseline::Inconsistent { message } = reconcile(&[TWICE], &HashSet::from([one, seeded]))
+        else {
+            panic!("a file seeding one table twice has no adoptable baseline");
+        };
+        assert!(
+            message.contains("which the shipped history seeds more than once"),
+            "the refusal has to say why a row in it proves nothing: {message}"
+        );
+
+        // One migration seeding it once is still evidence, so the refusals above
+        // are the second seed's doing rather than a withdrawal of seed evidence.
         assert_eq!(
             reconcile(&[V1], &HashSet::from([one, seeded])),
             Baseline::Applied { versions: vec![1] }

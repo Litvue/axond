@@ -174,9 +174,10 @@ ledger row for DDL it did not run:
 - A chunk of a file with no statement in it — a trailing comment, a stray `;` — is
   not an unconfirmable statement and does not withdraw adoption.
 - Seed evidence is a table having a row, which is one answer for the whole table,
-  so a second migration seeding a table an earlier one already seeds is confirmed
-  by the earlier row. Such a pair is unconfirmable and refuses the history, rather
-  than recording a version whose row `apply` would then never write.
+  so a seed into a table the shipped history seeds more than once — in another
+  migration or twice in the same file — is confirmed by whichever row is there.
+  Every such seed is unconfirmable and refuses the history, rather than recording
+  a version whose row `apply` would then never write.
 - **Reading the evidence is classified like writing the ledger, not like an
   ordinary read.** Adoption's premise is DDL applied by somebody else, plausibly as
   another role, so `42501` on a probe is a realistic failure; class 42 and `3F000`

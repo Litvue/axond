@@ -316,15 +316,16 @@ path is not evidence about this one). What it does instead of recording:
   being empty. Anything else — an `ALTER`, a backfill, a `DROP`, a non-idempotent
   `INSERT` — is both what no catalogue can report on and what a rerun would damage,
   and one such statement makes its whole migration unadoptable. A *second* seed into
-  a table an earlier migration already seeds counts as one of those: the row that is
-  there is the earlier migration's, so it proves nothing about the later one.
-  Unadoptable holds even when the same file also creates a table: `psql -f` without
-  a wrapping transaction can abort between `CREATE TABLE x` and a following
-  `ALTER TABLE y`, and "x exists" is then not evidence the file finished. Adopting
-  the versions below it is no better — the ledger would call it *pending*, so the
-  next `apply` would run it over a schema that may already have it. So a release
-  that ships one refuses every adoption while it is unrecorded — the whole history,
-  not just that version — and the baseline goes back to being an
+  a table the shipped history already seeds counts as one of those, whether it is in
+  another migration or in the same file: one row proves at most one of the inserts,
+  so it proves nothing about the rest. Unadoptable holds even when the same file
+  also creates a table: `psql -f` without a wrapping transaction can abort between
+  `CREATE TABLE x` and a following `ALTER TABLE y`, and "x exists" is then not
+  evidence the file finished. Adopting the versions below it is no better — the
+  ledger would call it *pending*, so the next `apply` would run it over a schema
+  that may already have it. So a release that ships one refuses every adoption
+  while it is unrecorded — the whole history, not just that version — and the
+  baseline goes back to being an
   `INSERT INTO axond_cp_schema_migration (version, name, checksum)` you write
   because you own the change that applied it. The refusal names the version and says
   this.
