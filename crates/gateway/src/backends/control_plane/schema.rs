@@ -84,15 +84,32 @@ enum Statement {
 /// splits a function into fragments whose keywords read as top-level DDL. Both
 /// are the fail-open direction, which is the one this design exists to close.
 /// An unterminated region runs to the end of the text: the alternative is
-/// reading its contents, and the contents are the hazard.
-fn skipped(bytes: &[u8], at: usize) -> Option<usize> {
+/// reading its contents, and the contents are the hazard. It is reported as
+/// uncertain, because *dropping* statements is only fail-closed while what is
+/// dropped might have been evidence — a region that swallows an `ALTER` and
+/// leaves the `CREATE TABLE`s above it makes an unadoptable migration look
+/// adoptable, so [`lexed`] refuses the file instead.
+fn skipped(bytes: &[u8], at: usize) -> Option<Region> {
     let after = |from: usize, needle: &[u8]| {
         (from..=bytes.len().saturating_sub(needle.len()))
             .find(|index| &bytes[*index..index + needle.len()] == needle)
-            .map_or(bytes.len(), |index| index + needle.len())
+            .map_or(
+                Region {
+                    end: bytes.len(),
+                    certain: false,
+                },
+                |index| Region {
+                    end: index + needle.len(),
+                    certain: true,
+                },
+            )
     };
     match bytes[at] {
-        b'-' if bytes.get(at + 1) == Some(&b'-') => Some(after(at + 2, b"\n")),
+        // A comment the file simply ends in is a comment, not a loose end.
+        b'-' if bytes.get(at + 1) == Some(&b'-') => Some(Region {
+            certain: true,
+            ..after(at + 2, b"\n")
+        }),
         b'/' if bytes.get(at + 1) == Some(&b'*') => {
             // Block comments nest in PostgreSQL, so the first `*/` need not be
             // this one's.
@@ -105,15 +122,32 @@ fn skipped(bytes: &[u8], at: usize) -> Option<usize> {
                     depth -= 1;
                     index += 2;
                     if depth == 0 {
-                        return Some(index);
+                        return Some(Region {
+                            end: index,
+                            certain: true,
+                        });
                     }
                 } else {
                     index += 1;
                 }
             }
-            Some(bytes.len())
+            Some(Region {
+                end: bytes.len(),
+                certain: false,
+            })
         }
-        b'\'' => Some(after(at + 1, b"'")),
+        b'\'' => {
+            let literal = after(at + 1, b"'");
+            // A backslash inside a literal is an escape under `E'...'` and a
+            // plain byte otherwise, so where the literal ends depends on syntax
+            // this parse does not track: `E'\''` would be read as closing early,
+            // and the `'` left over would open a region swallowing whatever
+            // follows.
+            Some(Region {
+                certain: literal.certain && !bytes[at..literal.end].contains(&b'\\'),
+                ..literal
+            })
+        }
         b'$' => {
             // `$tag$` or `$$`, as against a `$1` parameter, which is ordinary text.
             let tag = bytes[at + 1..]
@@ -125,6 +159,33 @@ fn skipped(bytes: &[u8], at: usize) -> Option<usize> {
         }
         _ => None,
     }
+}
+
+/// A comment or quoted region: where it ends, and whether that is where it
+/// really ends or only where the text ran out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Region {
+    end: usize,
+    certain: bool,
+}
+
+/// Whether every comment and quoted region in the file closes where this parse
+/// says it does.
+///
+/// One that does not is not a formatting quibble: it silently removes the rest
+/// of the file from the parse, and a removed `ALTER` is the difference between a
+/// migration adoption refuses and one it records.
+fn lexed(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match skipped(bytes, index) {
+            Some(region) if !region.certain => return false,
+            Some(region) => index = region.end,
+            None => index += 1,
+        }
+    }
+    true
 }
 
 /// The migration's text as statements, with comments and quoted regions ignored
@@ -145,8 +206,8 @@ fn statements(sql: &'static str) -> Vec<&'static str> {
     let mut index = 0;
     let bytes = sql.as_bytes();
     while index < bytes.len() {
-        if let Some(end) = skipped(bytes, index) {
-            index = end;
+        if let Some(region) = skipped(bytes, index) {
+            index = region.end;
             continue;
         }
         if bytes[index] == b';' {
@@ -175,11 +236,11 @@ fn words(statement: &'static str) -> Vec<&'static str> {
         // A quote or a comment marker ends the word running up to it as much as a
         // space does: `EXISTS foo--why` names `foo`, and dropping the word would
         // make the next one answer for it.
-        if let Some(end) = skipped(bytes, index) {
+        if let Some(region) = skipped(bytes, index) {
             if let Some(from) = start.take() {
                 words.push(&statement[from..index]);
             }
-            index = end;
+            index = region.end;
             continue;
         }
         if bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_' {
@@ -720,6 +781,9 @@ enum Evidence {
 /// ledger exists, so its presence is the precondition rather than evidence.
 /// Counting it would make a bare ledger look half-applied rather than untouched.
 fn evidence(migration: &Migration) -> Option<Vec<Evidence>> {
+    if !lexed(migration.sql) {
+        return None;
+    }
     let mut evidence = Vec::new();
     for statement in statements(migration.sql) {
         let item = match statement_kind(statement)? {
@@ -801,21 +865,18 @@ pub(super) async fn baseline(
 /// half-applied one, a hole, a version nothing can confirm — is decided by a
 /// function that can be examined directly.
 fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baseline {
-    // A seed is confirmed by its target not being empty, which is one answer for
-    // the whole table: two migrations seeding the same one would each be confirmed
-    // by whichever row is there, so a database that only ever had the first applied
-    // would have the second recorded and `apply` would never write its row. The
-    // second seed into a table is therefore evidence of nothing, and treated like
-    // any other statement adoption cannot confirm.
-    let seeded: Vec<&'static str> = migrations
-        .iter()
-        .filter_map(evidence)
-        .flatten()
-        .filter_map(|item| match item {
-            Evidence::Seed(name) => Some(name),
-            Evidence::Relation(_) => None,
-        })
-        .collect();
+    // Every probe answers about a thing, not about a statement: a table is there
+    // or it is not, a table has a row or it does not. So evidence two migrations
+    // both declare confirms at most one of them, and there is no telling which.
+    // A database that only ever had the first applied would have the second
+    // recorded too, and `apply` would never run it.
+    //
+    // True of a seed target seeded twice, and equally of a relation two
+    // migrations both `CREATE ... IF NOT EXISTS`. Shared evidence is therefore
+    // evidence of nothing, and treated like any other statement adoption cannot
+    // confirm. (Within one migration a repeated relation is one declaration
+    // deduplicated by `evidence`; a repeated seed is not, so it lands here.)
+    let shipped: Vec<Evidence> = migrations.iter().filter_map(evidence).flatten().collect();
     let mut adoptable: Vec<i32> = Vec::new();
     let mut absent: Option<i32> = None;
     for migration in migrations {
@@ -845,20 +906,27 @@ fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baselin
                 ),
             };
         };
-        if let Some(shared) = declared.iter().find_map(|item| match item {
-            Evidence::Seed(name) if seeded.iter().filter(|target| *target == name).count() > 1 => {
-                Some(*name)
-            }
-            _ => None,
-        }) {
+        if let Some(shared) = declared
+            .iter()
+            .find(|item| shipped.iter().filter(|other| other == item).count() > 1)
+        {
+            let (what, proves) = match shared {
+                Evidence::Seed(name) => (
+                    format!("seeds `{name}`, which the shipped history seeds more than once"),
+                    "a row in it proves at most one of those inserts and not this one",
+                ),
+                Evidence::Relation(name) => (
+                    format!("declares `{name}`, which more than one shipped migration declares"),
+                    "its presence proves at most one of those declarations and not this one",
+                ),
+            };
             return Baseline::Inconsistent {
                 message: format!(
-                    "v{} `{}` seeds `{shared}`, which the shipped history seeds more than once, \
-                     so a row in it proves at most one of those inserts and not this one: whether \
-                     this version ran is not something adoption can confirm. No baseline is \
-                     adoptable while they all ship: state the history with `INSERT INTO \
-                     {MIGRATION_TABLE} (version, name, checksum)` if you own the change that \
-                     applied it, or drop the empty ledger and apply from zero if nothing was.",
+                    "v{} `{}` {what}, so {proves}: whether this version ran is not something \
+                     adoption can confirm. No baseline is adoptable while they all ship: state \
+                     the history with `INSERT INTO {MIGRATION_TABLE} (version, name, checksum)` \
+                     if you own the change that applied it, or drop the empty ledger and apply \
+                     from zero if nothing was.",
                     migration.version, migration.name,
                 ),
             };
@@ -1517,5 +1585,97 @@ mod tests {
             reconcile(&[V1], &HashSet::from([one, seeded])),
             Baseline::Applied { versions: vec![1] }
         );
+    }
+
+    /// The same argument as the shared seed, for a relation: a table being there
+    /// proves at most one of the `CREATE TABLE IF NOT EXISTS` statements that
+    /// declare it. A later migration that only re-declares an earlier one's
+    /// objects would otherwise come out with nothing missing and be recorded as
+    /// applied over a database that never ran it, which `apply` would then never
+    /// put right.
+    #[test]
+    fn an_object_more_than_one_migration_declares_blocks_adoption() {
+        const V1: Migration = Migration {
+            version: 1,
+            name: "first",
+            sql: "CREATE TABLE IF NOT EXISTS one (id integer);\n",
+        };
+        const V2: Migration = Migration {
+            version: 2,
+            name: "re-declares",
+            sql: "CREATE TABLE IF NOT EXISTS one (id integer);\n\
+                  CREATE INDEX IF NOT EXISTS one_id ON one (id);\n",
+        };
+        let one = Evidence::Relation("one");
+        let index = Evidence::Relation("one_id");
+
+        for confirmed in [
+            HashSet::from([one, index]),
+            HashSet::from([one]),
+            HashSet::new(),
+        ] {
+            let Baseline::Inconsistent { message } = reconcile(&[V1, V2], &confirmed) else {
+                panic!("an object no version can be attributed to has no adoptable baseline");
+            };
+            assert!(
+                message.contains("`one`, which more than one shipped migration declares"),
+                "the refusal has to say why the object's presence proves nothing: {message}"
+            );
+        }
+
+        // A migration declaring it once is still evidence, and a version whose
+        // own objects are its own still adopts.
+        const V2_OWN: Migration = Migration {
+            version: 2,
+            name: "own objects",
+            sql: "CREATE TABLE IF NOT EXISTS two (id integer);\n",
+        };
+        assert_eq!(
+            reconcile(
+                &[V1, V2_OWN],
+                &HashSet::from([one, Evidence::Relation("two")])
+            ),
+            Baseline::Applied {
+                versions: vec![1, 2]
+            }
+        );
+    }
+
+    /// A comment or a literal that never closes swallows the rest of the file,
+    /// and what it swallows might have been the `ALTER` that made the migration
+    /// unadoptable — so an uncertain parse is a refusal rather than a shorter
+    /// list of evidence. The reachable case is `E'...\'...'`: the escape is
+    /// syntax this parse does not track, so the literal reads as closing early
+    /// and the leftover quote opens a region running to the next apostrophe
+    /// anywhere in the file.
+    #[test]
+    fn a_region_that_does_not_close_where_this_parse_says_makes_the_migration_unadoptable() {
+        for sql in [
+            // A backslash escape: everything from the stray quote onwards,
+            // `ALTER` included, would otherwise vanish from the evidence.
+            "CREATE TABLE IF NOT EXISTS one (id integer, note text DEFAULT E'a\\'b');\n\
+             ALTER TABLE one ADD COLUMN more text;\n",
+            "CREATE TABLE IF NOT EXISTS one (id integer);\n/* never closed\n",
+            "CREATE TABLE IF NOT EXISTS one (id integer);\nINSERT INTO one VALUES ('open);\n",
+            "CREATE FUNCTION f() RETURNS void AS $body$ BEGIN END;\n",
+        ] {
+            let unlexable = Migration {
+                version: 9,
+                name: "unlexable",
+                sql,
+            };
+            assert_eq!(
+                evidence(&unlexable),
+                None,
+                "a region this parse cannot close makes the file unconfirmable: {sql}"
+            );
+        }
+
+        // A file that simply ends in a line comment closes fine, and a `$1`
+        // parameter is not a dollar quote.
+        assert!(lexed(
+            "CREATE TABLE IF NOT EXISTS one (id integer);\n-- and that is all"
+        ));
+        assert!(lexed("CREATE POLICY p ON one USING (id = $1);\n"));
     }
 }

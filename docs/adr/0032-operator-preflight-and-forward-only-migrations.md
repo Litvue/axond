@@ -140,7 +140,11 @@ ledger row for DDL it did not run:
   rather than probed for under a name that is not one. The parse skips comments
   (`--`, nested `/* */`) and quoted regions (`'...'`, `$tag$ ... $tag$`) in both
   its statement split and its keywords, so prose or a function body cannot
-  contribute the keywords a statement is judged by. Nothing confirmed is a
+  contribute the keywords a statement is judged by; a region that does not close
+  where that parse says it does makes the file unconfirmable rather than a
+  shorter list of statements. Evidence more than one migration declares — a
+  shared seed target, or an object two files both `CREATE ... IF NOT EXISTS` —
+  confirms at most one of them and so confirms none. Nothing confirmed is a
   refusal (nothing was applied: drop the ledger and `apply`); a partly-confirmed
   migration is a refusal naming what is missing (neither applied nor unapplied
   is true). Every probe is qualified to

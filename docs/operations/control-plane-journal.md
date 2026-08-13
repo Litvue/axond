@@ -318,13 +318,20 @@ path is not evidence about this one). What it does instead of recording:
   schema-qualified `other.t` is unconfirmable for the same reason as the rest.
   Comments (`--` and nested `/* */`) and quoted regions (`'...'`, `$tag$ ... $tag$`)
   are prose or data, never statements: a `CREATE TABLE` inside a function body or
-  a block comment is not evidence that anything was created.
+  a block comment is not evidence that anything was created. A region that does
+  not close where that reading says it does — an unterminated comment or literal,
+  or a backslash escape inside `E'...'` — makes the whole file unconfirmable,
+  since what it swallows might have been the statement that blocked adoption.
   Anything else — an `ALTER`, a backfill, a `DROP`, a non-idempotent `INSERT` —
   is both what no catalogue can report on and what a rerun would damage,
   and one such statement makes its whole migration unadoptable. A *second* seed into
   a table the shipped history already seeds counts as one of those, whether it is in
   another migration or in the same file: one row proves at most one of the inserts,
-  so it proves nothing about the rest. Unadoptable holds even when the same file
+  so it proves nothing about the rest. The same holds for an object more than one
+  migration declares: a table being present proves at most one of the
+  `CREATE TABLE IF NOT EXISTS` statements that declare it, so a later migration
+  that only re-declares an earlier one's objects is unconfirmable rather than
+  adopted on their strength. Unadoptable holds even when the same file
   also creates a table: `psql -f` without a wrapping transaction can abort between
   `CREATE TABLE x` and a following `ALTER TABLE y`, and "x exists" is then not
   evidence the file finished. Adopting the versions below it is no better — the
