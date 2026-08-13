@@ -299,17 +299,19 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
         }
     }
 
-    // Waited out before the cleanup timing is read, so a row that settles its
-    // records late is not mistaken for one that released its upstream late.
+    // Timed from the instant the caller was gone, and waited out before anything
+    // else is: a release is only prompt with respect to the request that
+    // abandoned it, and a settle time measured from the end of some other wait
+    // would score a replica that held the body for seconds as if it had let go
+    // immediately. Usage settlement is a separate property, so it is waited out
+    // after this rather than inside it.
+    let caller_gone = Instant::now();
+    let (cleaned, settled_within_ms) = await_upstream_release(caller_gone, &upstream).await;
     await_usage_records(&gateway, started_at, row.expect.usage_records).await;
     let upstream_requests = upstream.state.requests().len() as u64 - upstream_before;
-    let cleanup_started = Instant::now();
-    let cleaned = await_upstream_release(&upstream).await;
-    // Both read before the process is stopped: a settle time that also contained
-    // the shutdown could not be used to spot a slow release, and a body count
-    // taken after it would be zero for a leaking row as surely as a clean one,
-    // since exiting closes whatever the replica was still holding.
-    let settled_within_ms = cleanup_started.elapsed().as_millis();
+    // Read before the process is stopped: a body count taken after it would be
+    // zero for a leaking row as surely as a clean one, since exiting closes
+    // whatever the replica was still holding.
     let open_at_end = upstream.state.open_streams();
 
     gateway.terminate();
@@ -960,18 +962,25 @@ async fn await_usage_records(gateway: &Axond, minted_after: u128, expected: u64)
 }
 
 /// Whether every upstream body the row opened was released once the caller was
-/// gone. A stalled upstream that outlives its request is a leak.
-async fn await_upstream_release(upstream: &FakeUpstream) -> bool {
-    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+/// gone, and how long after `since` that took. A stalled upstream that outlives
+/// its request is a leak, and one released seconds late is a leak for those
+/// seconds, so the wait is timed from the caller's departure rather than from
+/// whenever the harness got around to looking.
+pub async fn await_release_since(since: Instant, open: impl Fn() -> i64) -> (bool, u128) {
+    let deadline = since + CLEANUP_TIMEOUT;
     loop {
-        if upstream.state.open_streams() <= 0 {
-            return true;
+        if open() <= 0 {
+            return (true, since.elapsed().as_millis());
         }
         if Instant::now() >= deadline {
-            return false;
+            return (false, since.elapsed().as_millis());
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+async fn await_upstream_release(since: Instant, upstream: &FakeUpstream) -> (bool, u128) {
+    await_release_since(since, || upstream.state.open_streams()).await
 }
 
 fn usage_outcome(

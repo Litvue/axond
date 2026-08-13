@@ -27,6 +27,10 @@
 
 mod support;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, Instant};
+
 use serde_json::json;
 use support::fault::result::{Cleanup, Outage};
 use support::fault::{self, Fault, Outcome, Row};
@@ -408,6 +412,36 @@ fn cleanup_evidence_fails_when_the_upstream_is_released_late_or_not_at_all() {
         .collect::<Vec<_>>(),
         ["upstream_abandoned_response_tracked"],
         "a row that abandons a response must have opened one"
+    );
+}
+
+/// The gate above is only worth having if the number it judges is measured from
+/// the caller's departure. A replica that holds an abandoned body for seconds
+/// must be recorded as having taken those seconds, however much waiting the
+/// harness does for anything else in between.
+#[tokio::test]
+async fn a_delayed_release_is_timed_from_the_moment_the_caller_left() {
+    const HELD_FOR: Duration = Duration::from_millis(300);
+
+    let caller_gone = Instant::now();
+    let open = Arc::new(AtomicI64::new(1));
+    let released = Arc::clone(&open);
+    tokio::spawn(async move {
+        tokio::time::sleep(HELD_FOR).await;
+        released.store(0, Ordering::SeqCst);
+    });
+
+    // Whatever else the row waits out first — record settlement, in the driver —
+    // is time the upstream spent held, and must not be excused.
+    tokio::time::sleep(HELD_FOR / 2).await;
+    let (cleaned, settled_within_ms) =
+        fault::run::await_release_since(caller_gone, || open.load(Ordering::SeqCst)).await;
+
+    assert!(cleaned, "the body was released within the cleanup bound");
+    assert!(
+        settled_within_ms >= HELD_FOR.as_millis(),
+        "a body held for {}ms was recorded as released in {settled_within_ms}ms",
+        HELD_FOR.as_millis()
     );
 }
 
