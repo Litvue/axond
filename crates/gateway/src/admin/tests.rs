@@ -41,8 +41,9 @@ use super::service::{AdminService, MutationResult};
 use crate::config::Mode;
 use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{
-    CanonicalValue, DesiredState, ExpectedRevision, IdempotencyKey, MutationKind, ResourceBody,
-    ResourceKind, ResourceScope, ResourceVersion, Slug, Surface, ValidationError, fixtures,
+    CanonicalValue, DenialPage, DesiredState, ExpectedRevision, IdempotencyKey, MutationKind,
+    ResourceBody, ResourceKind, ResourceScope, ResourceVersion, Slug, Surface, ValidationError,
+    fixtures,
 };
 
 const HUMAN_TOKEN: &str = "oidc-assertion-for-alice";
@@ -446,7 +447,7 @@ async fn a_refusal_of_authority_is_written_to_the_denial_trail() {
 
     let denials = crate::backends::control_plane::ControlPlaneStore::denials(
         store.as_ref(),
-        Some(tenant),
+        &DenialPage::for_scope(Some(tenant)),
         10,
     )
     .await

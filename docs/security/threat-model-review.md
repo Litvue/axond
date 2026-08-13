@@ -480,7 +480,13 @@ The three risks this area exists to bound, and where each is answered:
   an OIDC pair was wrong are recorded in the denial row and never returned, so a
   caller cannot distinguish "no such tenant" from "not yours" and cannot walk the
   id space with a well-formed request. Denials are read per tenant for the same
-  reason: one tenant's refusals are not another tenant's reconnaissance.
+  reason: one tenant's refusals are not another tenant's reconnaissance. Which
+  page a caller gets is not a parameter — a `DenialPage` is built from an
+  authorization, so the deployment page, the one place another tenant's workload
+  appears as an actor, requires a decision at deployment scope that a
+  tenant-scoped principal cannot obtain. A failed publication is not an oracle
+  either: a projection refusal names the constraint that refused it and never the
+  colliding row, whose sign-in or key digest stays in the operator's log.
 - **Noisy neighbour.** Tenancy is an *authorization* boundary here, not a
   capacity one. The namespace-level fairness the data plane already has is
   trigger 2's; per-tenant admission, budgets, and availability are deliberately
@@ -527,7 +533,12 @@ so run it the way [CONTRIBUTING](../../CONTRIBUTING.md#development) documents:
 `denials_are_recorded_once_and_read_newest_first_per_tenant` for the in-memory
 oracle's agreement with it, and
 `a_session_pinned_to_one_tenant_reads_no_other_tenants_rows` for the row-level
-security behind the service layer, asserted against a role that cannot bypass it.
+security behind the service layer, asserted against a role that cannot bypass it
+— including a change recorded against the pinned tenant by another tenant's
+workload, which is that tenant's own history and stays readable. The two
+non-disclosure boundaries above are pinned by
+`only_a_deployment_scoped_decision_reads_the_unscoped_refusal_trail` and
+`a_projection_refusal_names_the_constraint_and_not_the_row_it_hit`.
 
 **Threat model and ADRs.**
 [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md) owns the mode

@@ -1375,6 +1375,59 @@ impl Authorization {
     }
 }
 
+/// The page of the refusal trail one authorization may read.
+///
+/// The trail is the one read whose *scope is the answer*: the deployment page is
+/// the only place another tenant's workload appears as an actor, so which page a
+/// caller gets cannot come from a query parameter. It comes from here, and the
+/// only way to build one is an [`Authorization`] — which is unforgeable outside
+/// this module and already refuses a tenant-scoped principal that reaches
+/// deployment scope ([`DenialReason::OutOfScope`]). So a tenant administrator
+/// cannot obtain the unscoped page: not by asking for it, and not by holding an
+/// authorization for their own tenant.
+///
+/// A project scope has no page. The trail records refusals against a tenant and
+/// against the deployment; handing a project-scoped principal its tenant's page
+/// would widen the grant it authenticated with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenialPage {
+    tenant: Option<TenantId>,
+}
+
+impl DenialPage {
+    /// The page this decision permits, or `None` if it permits no page at all.
+    ///
+    /// Not every authorization is a trail read: one for another surface, or for a
+    /// write, is not a decision about who may see refusals.
+    pub fn of(authorization: &Authorization) -> Option<Self> {
+        if authorization.request.surface != Surface::AuditTrail
+            || authorization.request.action != Action::Read
+        {
+            return None;
+        }
+        match authorization.request.scope {
+            ResourceScope::Deployment => Some(Self { tenant: None }),
+            ResourceScope::Tenant(tenant) => Some(Self {
+                tenant: Some(tenant),
+            }),
+            ResourceScope::Project { .. } => None,
+        }
+    }
+
+    /// The tenant whose refusals this page holds, or `None` for the
+    /// deployment-scoped page.
+    pub const fn tenant(&self) -> Option<TenantId> {
+        self.tenant
+    }
+
+    /// A page for a store test, where the decision is the thing being stood in
+    /// for rather than the thing under test.
+    #[cfg(test)]
+    pub(crate) const fn for_scope(tenant: Option<TenantId>) -> Self {
+        Self { tenant }
+    }
+}
+
 /// Why a request was refused.
 ///
 /// Precise for the audit trail, and never returned to the caller as-is: see
@@ -1697,6 +1750,108 @@ mod tests {
                 "{role} reads the audit trail"
             );
         }
+    }
+
+    /// Which page of the refusal trail a caller gets is a decision, not an
+    /// argument, and this is the boundary that matters: the deployment page is the
+    /// only place another tenant's workload appears as an actor.
+    ///
+    /// A tenant administrator cannot reach it — not by asking, because the page is
+    /// built from an authorization rather than from a parameter, and not by
+    /// holding one, because an authorization at deployment scope is refused to a
+    /// tenant-scoped principal. A project-scoped auditor gets no page at all: the
+    /// trail has no project granularity, and its tenant's page is wider than the
+    /// grant it authenticated with.
+    #[test]
+    fn only_a_deployment_scoped_decision_reads_the_unscoped_refusal_trail() {
+        let state = state_with_directory();
+        let (tenancy, directory) = directory(&state);
+        let tenant = tenant_id(1);
+        let read = |caller: &Caller, scope: ResourceScope| {
+            directory.authorize(
+                &tenancy,
+                caller,
+                request(Surface::AuditTrail, Action::Read, scope),
+            )
+        };
+
+        // The platform administrator, who is the only human here scoped to the
+        // deployment.
+        let platform = read(&caller_human("root"), ResourceScope::Deployment)
+            .expect("a platform administrator reads the deployment trail");
+        assert_eq!(
+            DenialPage::of(&platform).map(|page| page.tenant()),
+            Some(None),
+            "the deployment page is the unscoped one"
+        );
+
+        // The tenant administrator: their own page, and no way to the unscoped one.
+        let scoped = read(&caller_human("admin"), ResourceScope::Tenant(tenant))
+            .expect("a tenant administrator reads their own trail");
+        assert_eq!(
+            DenialPage::of(&scoped).map(|page| page.tenant()),
+            Some(Some(tenant)),
+        );
+        let denial = read(&caller_human("admin"), ResourceScope::Deployment)
+            .expect_err("a tenant administrator does not read the deployment trail");
+        assert_eq!(denial.reason, DenialReason::OutOfScope);
+
+        // A project-scoped principal that holds the surface at all: no page, and
+        // therefore not its tenant's.
+        let mut narrow = state.clone();
+        narrow
+            .supersede(
+                IdentityBody::new(
+                    principal_id(32),
+                    display_name("Auditor"),
+                    Credential::Oidc {
+                        issuer: "https://idp.example".to_owned(),
+                        subject: "dev".to_owned(),
+                    },
+                    [Role::Operator],
+                )
+                .expect("an identity granting a role")
+                .version_at(
+                    ResourceScope::Project {
+                        tenant,
+                        project: project_id(2),
+                    },
+                    Slug::parse("dev").expect("a slug"),
+                    ResourceVersionNumber::FIRST.next(),
+                ),
+            )
+            .expect("granting an existing principal a wider role is valid");
+        let narrow_tenancy = Tenancy::of(&narrow).expect("valid tenancy");
+        let narrow_directory = Directory::of(&narrow, &narrow_tenancy).expect("valid directory");
+        let project = narrow_directory
+            .authorize(
+                &narrow_tenancy,
+                &caller_human("dev"),
+                request(
+                    Surface::AuditTrail,
+                    Action::Read,
+                    ResourceScope::Project {
+                        tenant,
+                        project: project_id(2),
+                    },
+                ),
+            )
+            .expect("an operator in a project may read the surface");
+        assert_eq!(
+            DenialPage::of(&project),
+            None,
+            "a project scope has no page of the trail"
+        );
+
+        // And a decision about something else is not a decision about the trail.
+        let write = directory
+            .authorize(
+                &tenancy,
+                &caller_human("root"),
+                request(Surface::Tenant, Action::Create, ResourceScope::Deployment),
+            )
+            .expect("a platform administrator creates tenants");
+        assert_eq!(DenialPage::of(&write), None);
     }
 
     #[test]

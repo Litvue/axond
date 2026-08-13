@@ -43,9 +43,9 @@ use super::schema::{self, MINIMUM_SERVER_VERSION_NUM, SchemaStatus};
 use super::{ControlPlaneError, ControlPlaneStore};
 use crate::backends::{Capabilities, Capability};
 use crate::desired_state::{
-    AccessDenial, Action, AuditEvent, Credential, DenialReason, Directory, IntegrityError,
-    LoadedRevision, Mutation, ResourceRef, ResourceVersion, ResourceVersionNumber,
-    RevisionCandidate, RevisionId, RevisionManifest, SerializerVersion, Surface, Tenancy, TenantId,
+    AccessDenial, Action, AuditEvent, Credential, DenialPage, DenialReason, Directory,
+    IntegrityError, LoadedRevision, Mutation, ResourceRef, ResourceVersion, ResourceVersionNumber,
+    RevisionCandidate, RevisionId, RevisionManifest, SerializerVersion, Surface, Tenancy,
     Uuid7Generator,
 };
 
@@ -791,10 +791,10 @@ impl ControlPlaneStore for PostgresControlPlane {
 
     async fn denials(
         &self,
-        tenant: Option<TenantId>,
+        page: &DenialPage,
         limit: usize,
     ) -> Result<Vec<AccessDenial>, ControlPlaneError> {
-        let tenant = tenant.map(|tenant| tenant.to_string());
+        let tenant = page.tenant().map(|tenant| tenant.to_string());
         // Clamped rather than rejected: this is a page size, and an administrator
         // asking for everything gets the first page rather than an error.
         let limit = i64::try_from(limit.clamp(1, 1_000)).unwrap_or(1_000);
@@ -1533,26 +1533,47 @@ fn projection_failure(
             holder: db.constraint().map(ToOwned::to_owned),
         };
     }
+    // The constraint, and nothing the row it collided with holds. PostgreSQL's
+    // message and detail name the colliding key — `Key (issuer, subject)=(…)`,
+    // `Key (key_digest)=(sha256:…)` — and these constraints are the identity
+    // directory's, so splicing them into the refusal would tell a publisher
+    // another principal's sign-in or the digest of another workload's minted key.
+    // A refusal names the rule it broke; the values stay in the operator's log,
+    // which is the same line the wrong constraint name would be diagnosed from.
+    tracing::warn!(
+        constraint = db.constraint().unwrap_or("unnamed"),
+        detail = db.detail().unwrap_or(""),
+        message = db.message(),
+        "a projected row was refused by state this deployment already holds"
+    );
+    denied(projection_refusal(
+        noun,
+        slug,
+        *db.code() == SqlState::FOREIGN_KEY_VIOLATION,
+        db.constraint(),
+    ))
+}
+
+/// The caller-facing text of a projection refusal, built from the rule that
+/// refused it and the revision's own slug — and from nothing else, which is the
+/// point: the values in the row it collided with are not parameters here, so they
+/// cannot reach a response by an edit that forgets why.
+fn projection_refusal(noun: &str, slug: &str, ownership: bool, constraint: Option<&str>) -> String {
     let subject = if slug.is_empty() {
         format!("projecting the {noun}s of this revision")
     } else {
         format!("projecting the {noun} `{slug}`")
     };
-    let conflict = if *db.code() == SqlState::FOREIGN_KEY_VIOLATION {
+    let conflict = if ownership {
         "contradicts an ownership row this deployment already holds"
     } else {
         "collides with a row this deployment already holds"
     };
-    denied(format!(
-        "{subject} {conflict}{}: {}{}; the conflicting row stands until a revision changes it, so \
+    format!(
+        "{subject} {conflict}{}; the conflicting row stands until a revision changes it, so \
          no retry clears this",
-        db.constraint()
-            .map_or_else(String::new, |name| format!(" ({name})")),
-        db.message(),
-        // The detail names the colliding value, which the message does not.
-        db.detail()
-            .map_or_else(String::new, |detail| format!(" — {detail}")),
-    ))
+        constraint.map_or_else(String::new, |name| format!(" ({name})")),
+    )
 }
 
 fn is_unique_violation(error: &tokio_postgres::Error) -> bool {
@@ -4350,6 +4371,49 @@ mod tests {
         assert!(refusal.to_string().contains("check"), "{refusal}");
     }
 
+    /// A refusal names the rule, and never the row it collided with.
+    ///
+    /// The identity constraints carry sign-ins and key digests, and PostgreSQL's
+    /// `DETAIL` on a violation quotes the colliding key — `Key (key_digest)=(…)`.
+    /// Splicing that into the error would make a failed publication an oracle for
+    /// another principal's OIDC subject or the digest of another workload's minted
+    /// key, which is the disclosure `Denial::public_reason` prevents one layer up.
+    /// The caller is told which rule refused the revision; the values stay in the
+    /// operator's log.
+    #[test]
+    fn a_projection_refusal_names_the_constraint_and_not_the_row_it_hit() {
+        let message = projection_refusal(
+            "principal",
+            "",
+            false,
+            Some("axond_cp_principal_key_digest_unique"),
+        );
+        assert!(
+            message.contains("axond_cp_principal_key_digest_unique"),
+            "the refusal names the rule it broke: {message}"
+        );
+        assert!(
+            message.contains("no retry clears this"),
+            "and that it is not an outage: {message}"
+        );
+        for leaked in ["sha256:", "Key (", "issuer", "subject", "=("] {
+            assert!(
+                !message.contains(leaked),
+                "the refusal could carry the row it collided with ({leaked}): {message}"
+            );
+        }
+        assert!(
+            projection_refusal(
+                "project",
+                "edge",
+                true,
+                Some("axond_cp_principal_project_fkey")
+            )
+            .contains("contradicts an ownership row"),
+            "an ownership contradiction is described as one"
+        );
+    }
+
     /// Denied actions are the half of the trail successful revisions cannot hold,
     /// and they are read per tenant so one tenant's refusals are not another's
     /// reconnaissance.
@@ -4387,25 +4451,42 @@ mod tests {
             .await
             .expect("a retry is not a second attempt");
 
-        let read = store.denials(Some(tenant), 10).await.expect("read");
+        let read = store
+            .denials(&DenialPage::for_scope(Some(tenant)), 10)
+            .await
+            .expect("read");
         assert_eq!(read, vec![mine[1].clone(), mine[0].clone()]);
         assert_eq!(
-            store.denials(Some(other), 10).await.expect("read"),
+            store
+                .denials(&DenialPage::for_scope(Some(other)), 10)
+                .await
+                .expect("read"),
             vec![theirs.clone()],
             "one tenant's refusals are not another's"
         );
         // `None` is the deployment-scoped page, not a wildcard.
         assert_eq!(
-            store.denials(None, 10).await.expect("read"),
+            store
+                .denials(&DenialPage::for_scope(None), 10)
+                .await
+                .expect("read"),
             vec![deployment]
         );
         // A limit is a page size.
         assert_eq!(
-            store.denials(Some(tenant), 1).await.expect("read"),
+            store
+                .denials(&DenialPage::for_scope(Some(tenant)), 1)
+                .await
+                .expect("read"),
             vec![mine[1].clone()]
         );
         assert!(
-            store.denials(Some(tenant), 0).await.expect("read").len() == 1,
+            store
+                .denials(&DenialPage::for_scope(Some(tenant)), 0)
+                .await
+                .expect("read")
+                .len()
+                == 1,
             "a zero limit is clamped to a page rather than refused"
         );
         // A workload's refusal is attributed to its principal, not to a person.
@@ -4417,7 +4498,7 @@ mod tests {
         store.record_denial(&workload).await.expect("record");
         assert_eq!(
             store
-                .denials(Some(tenant), 1)
+                .denials(&DenialPage::for_scope(Some(tenant)), 1)
                 .await
                 .expect("read")
                 .first()
@@ -4437,7 +4518,7 @@ mod tests {
         store.record_denial(&intruder).await.expect("record");
         assert!(
             store
-                .denials(Some(tenant), 10)
+                .denials(&DenialPage::for_scope(Some(tenant)), 10)
                 .await
                 .expect("read")
                 .contains(&intruder),
@@ -4445,7 +4526,7 @@ mod tests {
         );
         assert!(
             !store
-                .denials(Some(other), 10)
+                .denials(&DenialPage::for_scope(Some(other)), 10)
                 .await
                 .expect("read")
                 .contains(&intruder),
@@ -4453,7 +4534,7 @@ mod tests {
         );
         assert!(
             !store
-                .denials(None, 10)
+                .denials(&DenialPage::for_scope(None), 10)
                 .await
                 .expect("read")
                 .contains(&intruder),
@@ -4722,6 +4803,36 @@ mod tests {
             journal,
             vec![Some(tenant_id(1).to_string())],
             "the mutation journal leaked another tenant's changes"
+        );
+
+        // And the same asymmetry the refusal trail has: a change recorded *against*
+        // this tenant is this tenant's history whoever made it. Filtering the actor
+        // on tenant-scoped rows too would hide a tenant's own change — along with
+        // its audit event and its idempotency record, which are walled through this
+        // table — because another tenant's service account attempted it.
+        store
+            .attempt(&format!(
+                "INSERT INTO axond_cp_mutation (mutation_id, actor_kind, actor_tenant_id,                  actor_principal_id, mutation_kind, scope_kind, tenant_id, idempotency_key,                  submitted_at) VALUES ('mut_00000000-0000-7000-8000-00000000f00d', 'workload',                  '{}', '{}', 'publish', 'tenant', '{}', 'theirs-against-ours', now())",
+                tenant_id(11),
+                principal_id(38),
+                tenant_id(1),
+            ))
+            .await
+            .expect("record a change against this tenant by another tenant's workload");
+        let attributed: Vec<String> = client
+            .query(
+                "SELECT mutation_id FROM axond_cp_mutation WHERE actor_kind = 'workload'                  ORDER BY mutation_id",
+                &[],
+            )
+            .await
+            .expect("read")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            attributed,
+            vec!["mut_00000000-0000-7000-8000-00000000f00d".to_owned()],
+            "a tenant cannot read a change recorded against it by another tenant's workload"
         );
         let events: i64 = client
             .query_one("SELECT count(*) FROM axond_cp_audit_event", &[])

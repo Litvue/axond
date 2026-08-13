@@ -33,9 +33,9 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 
-use super::access::AccessDenial;
+use super::access::{AccessDenial, DenialPage};
 use super::canonical::Checksum;
-use super::ids::{RevisionId, TenantId, Uuid7Generator};
+use super::ids::{RevisionId, Uuid7Generator};
 use super::mutation::{AuditEvent, IdempotencyKey};
 use super::resource::{ResourceRef, ResourceVersion};
 use super::revision::{
@@ -295,7 +295,7 @@ impl ControlPlaneStore for InMemoryControlPlane {
 
     async fn denials(
         &self,
-        tenant: Option<TenantId>,
+        page: &DenialPage,
         limit: usize,
     ) -> Result<Vec<AccessDenial>, ControlPlaneError> {
         if let Some(error) = self.outage() {
@@ -314,7 +314,7 @@ impl ControlPlaneStore for InMemoryControlPlane {
             // page at all; withholding another tenant's workload is the row-level
             // security policy's job, and only for the deployment-scoped rows it
             // shares with every pinned session.
-            .filter(|denial| denial.tenant() == tenant)
+            .filter(|denial| denial.tenant() == page.tenant())
             .cloned()
             .collect();
         denials.sort_by(|left, right| {
@@ -380,19 +380,31 @@ mod tests {
             .expect("a retry is not a second attempt");
 
         assert_eq!(
-            store.denials(Some(tenant), 10).await.expect("read"),
+            store
+                .denials(&DenialPage::for_scope(Some(tenant)), 10)
+                .await
+                .expect("read"),
             vec![later.clone(), earlier]
         );
         assert_eq!(
-            store.denials(Some(tenant), 1).await.expect("read"),
+            store
+                .denials(&DenialPage::for_scope(Some(tenant)), 1)
+                .await
+                .expect("read"),
             vec![later]
         );
         assert_eq!(
-            store.denials(Some(other), 10).await.expect("read"),
+            store
+                .denials(&DenialPage::for_scope(Some(other)), 10)
+                .await
+                .expect("read"),
             vec![elsewhere.clone()]
         );
         assert_eq!(
-            store.denials(None, 10).await.expect("read"),
+            store
+                .denials(&DenialPage::for_scope(None), 10)
+                .await
+                .expect("read"),
             vec![deployment],
             "no tenant means the deployment-scoped page, not every row"
         );
@@ -408,7 +420,7 @@ mod tests {
         store.record_denial(&intruder).await.expect("record");
         assert!(
             store
-                .denials(Some(tenant), 10)
+                .denials(&DenialPage::for_scope(Some(tenant)), 10)
                 .await
                 .expect("read")
                 .contains(&intruder),
@@ -416,7 +428,7 @@ mod tests {
         );
         assert!(
             !store
-                .denials(Some(other), 10)
+                .denials(&DenialPage::for_scope(Some(other)), 10)
                 .await
                 .expect("read")
                 .contains(&intruder),
@@ -424,7 +436,7 @@ mod tests {
         );
         assert!(
             store
-                .denials(None, 10)
+                .denials(&DenialPage::for_scope(None), 10)
                 .await
                 .expect("read")
                 .iter()
@@ -435,7 +447,12 @@ mod tests {
         // An outage is an outage for refusals too: a denial that cannot be
         // written must not be reported as written.
         store.set_unavailable(true);
-        assert!(store.denials(Some(tenant), 10).await.is_err());
+        assert!(
+            store
+                .denials(&DenialPage::for_scope(Some(tenant)), 10)
+                .await
+                .is_err()
+        );
         assert!(store.record_denial(&elsewhere).await.is_err());
     }
 
