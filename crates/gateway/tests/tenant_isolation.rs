@@ -38,7 +38,8 @@ use support::client;
 use support::tenancy::{
     ACME, ALL_ALIASES, Deployment, Durability, FALLBACK_KEY, FALLBACK_NAMESPACE, GLOBEX,
     PLATFORM_ALIAS, PLATFORM_CREDENTIAL_ID, PLATFORM_UPSTREAM_KEY, TENANTS, Tenant, boot,
-    boot_that_fails_after_starting, connect, function_exists, postgres_dsn, relation_exists,
+    boot_that_fails_after_creating_outbox, boot_that_fails_after_starting, connect,
+    function_exists, postgres_dsn, relation_exists, schema_exists,
 };
 
 /// A minimal chat request; the fake upstream answers every alias from the same
@@ -524,6 +525,20 @@ async fn a_boot_that_fails_after_starting_still_drops_what_it_created() {
     assert!(
         !function_exists(&dsn, &fence).await,
         "the failed boot left the function {fence} behind"
+    );
+}
+
+/// The outbox schema is created before the child starts, so a setup failure in
+/// that window must still be cleaned up by the already-live `Objects` guard.
+#[tokio::test]
+async fn a_boot_that_fails_after_creating_outbox_still_drops_its_schema() {
+    let Some(schema) = boot_that_fails_after_creating_outbox() else {
+        return;
+    };
+    let dsn = postgres_dsn().expect("a configured DSN, since the boot ran");
+    assert!(
+        !schema_exists(&dsn, &schema).await,
+        "the failed setup left the outbox schema {schema} behind"
     );
 }
 

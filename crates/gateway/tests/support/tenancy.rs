@@ -197,6 +197,40 @@ pub fn boot_that_fails_after_starting(durability: Durability) -> Option<Names> {
     Some(names)
 }
 
+/// Run the outbox setup far enough to create its schema, then fail before any
+/// later setup step can construct a deployment. The `Objects` guard must own
+/// the schema already, or this deliberately arranged failure leaves it behind.
+pub fn boot_that_fails_after_creating_outbox() -> Option<String> {
+    postgres_dsn()?;
+    let suffix = unique_suffix();
+    let schema = names(&suffix).outbox_schema;
+    let outcome = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the failing outbox boot")
+            .block_on(async move {
+                start(Durability::Outbox, &suffix, Fate::FailAfterOutboxSchema)
+                    .await
+                    .is_some()
+            })
+    })
+    .join();
+    let Err(failure) = outcome else {
+        panic!("the arranged outbox boot returned instead of failing");
+    };
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        message.contains(FAILED_BOOT),
+        "the outbox boot failed for the arranged setup reason, not another: {message}"
+    );
+    Some(schema)
+}
+
 /// The per-boot object names, derived from the run's suffix so a caller can know
 /// them without holding the boot that creates them.
 pub struct Names {
@@ -219,6 +253,8 @@ enum Fate {
     Serve,
     /// Panic once the gateway is up, the way a post-boot check would.
     Fail,
+    /// Panic immediately after creating the outbox schema, before later setup.
+    FailAfterOutboxSchema,
 }
 
 async fn start(durability: Durability, suffix: &str, fate: Fate) -> Option<Deployment> {
@@ -232,6 +268,16 @@ async fn start(durability: Durability, suffix: &str, fate: Fate) -> Option<Deplo
         outbox_schema,
     } = names(suffix);
 
+    // Before the boot, not after it: the child creates these objects as it comes
+    // up, so a setup failure after any one is created must still take it with it.
+    // In particular, this guard has to exist before the outbox schema below.
+    let objects = dsn.as_ref().map(|dsn| Objects {
+        dsn: dsn.clone(),
+        usage_table: usage_table.clone(),
+        budget_table: budget_table.clone(),
+        outbox_schema: matches!(durability, Durability::Outbox).then(|| outbox_schema.clone()),
+    });
+
     // The child applies the outbox DDL itself (`create_schema = true`), but the
     // schema it applies it into has to exist first, and it is this boot's own so
     // concurrent runs do not share an outbox.
@@ -241,6 +287,10 @@ async fn start(durability: Durability, suffix: &str, fate: Fate) -> Option<Deplo
             .batch_execute(&format!("CREATE SCHEMA {outbox_schema}"))
             .await
             .expect("a schema for this boot's outbox");
+    }
+
+    if fate == Fate::FailAfterOutboxSchema {
+        panic!("{FAILED_BOOT}");
     }
 
     let upstream = FakeUpstream::start().await;
@@ -276,14 +326,6 @@ async fn start(durability: Durability, suffix: &str, fate: Fate) -> Option<Deplo
         env.push(("AXOND_ISOLATION_DSN".to_owned(), dsn.clone()));
     }
 
-    // Before the boot, not after it: the child creates these objects as it comes
-    // up, so a boot that panics half-created must still take them with it.
-    let objects = dsn.map(|dsn| Objects {
-        dsn,
-        usage_table: usage_table.clone(),
-        budget_table: budget_table.clone(),
-        outbox_schema: matches!(durability, Durability::Outbox).then(|| outbox_schema.clone()),
-    });
     let gateway = Axond::start_custom(&render, &env).await;
 
     if fate == Fate::Fail {
@@ -317,6 +359,19 @@ pub async fn relation_exists(dsn: &str, name: &str) -> bool {
         )
         .await
         .expect("a relation lookup");
+    row.get::<_, i64>(0) > 0
+}
+
+/// Whether a schema of this boot's name exists in the shared test database.
+pub async fn schema_exists(dsn: &str, name: &str) -> bool {
+    let client = connect(dsn).await;
+    let row = client
+        .query_one(
+            "SELECT count(*) FROM pg_namespace WHERE nspname = $1",
+            &[&name],
+        )
+        .await
+        .expect("a schema lookup");
     row.get::<_, i64>(0) > 0
 }
 
