@@ -325,9 +325,11 @@ fi
 
 # Stateful bootstrap validates without a database: the same namespace that
 # denies egress is where a config-parse connection attempt would fail, so a
-# clean refusal here is evidence that parsing connects to nothing. The process
-# must also refuse to serve while the control plane is unimplemented, and its
-# diagnostic must name references rather than values (ADR 0027).
+# clean refusal here is evidence that parsing connects to nothing. A stateful
+# replica does boot and serve `/admin/v1` now, so what this asserts is the Tier 0
+# invariant only: with every referenced env var unset, the refusal comes from an
+# unresolved *reference* — named, never with its value (ADR 0027) — rather than
+# from a connection this namespace would have had to allow.
 stateful_log="$(mktemp "$tmpdir/axond-tier0-stateful.XXXXXX.log")"
 stateful_status=0
 env -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
@@ -336,11 +338,15 @@ env -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
   AXOND_CONFIG="$stateful_config" RUST_LOG=warn \
   timeout 10 "$bin" >"$stateful_log" 2>&1 || stateful_status=$?
 [[ "$stateful_status" != 0 ]] ||
-  failure "a stateful process started while the control plane is unimplemented; it must refuse rather than serve an empty snapshot"
+  failure "a stateful process started with its control-plane, KEK, and breakglass references unset; it must refuse rather than serve an unadministrable deployment"
 [[ "$stateful_status" != 124 ]] ||
   failure "a stateful process kept running instead of refusing at boot"
 grep -q 'stateful' "$stateful_log" ||
   failure "stateful refusal did not explain the mode"
+# Without this the gate would pass on any boot failure, including a datastore
+# connection the namespace denied — the opposite of what it claims to prove.
+grep -q 'GW_TIER0_' "$stateful_log" ||
+  failure "stateful refusal did not name the unresolved reference, so it is not evidence that boot stopped at the reference rather than at a connection"
 if grep -Eq 'postgres(ql)?://|dbname=' "$stateful_log"; then
   failure "stateful diagnostics must name references, never a resolved DSN"
 fi
@@ -357,7 +363,7 @@ if [[ "$check_serving" == 1 ]]; then
 else
   echo "serving: DEGRADED, fixture upstream path not checked"
 fi
-echo "stateful: bootstrap validates with no datastore, then refuses to serve"
+echo "stateful: bootstrap validates with no datastore, then refuses on an unresolved reference"
 if [[ "$degraded" == 1 || "$check_listeners" != 1 || "$check_serving" != 1 ]]; then
   echo "Tier 0 boot and serve passed (DEGRADED: a runner prerequisite was unavailable, so the assertions marked DEGRADED above were not proven)"
 else

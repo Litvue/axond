@@ -1,7 +1,7 @@
 # A complete stateful bootstrap, used by ops/tier0-gate.sh inside the
 # network-denied namespace: validating it must not resolve a DSN or reach
-# Postgres, and the process must refuse to start rather than serve an empty
-# snapshot while the control plane is unimplemented (ADR 0027).
+# Postgres, and with the referenced env vars unset the process must refuse at
+# boot naming the unresolved reference rather than opening anything (ADR 0027).
 #
 # The referenced env vars are deliberately left unset by the gate: a
 # reference is a name, and nothing here reads its value.
