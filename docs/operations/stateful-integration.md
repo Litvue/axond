@@ -74,10 +74,13 @@ wave 4              #156 qualification evidence over the integrated system
 A wave-1 slice that slips does not block the whole of wave 2 on paper — the gates
 below name their own dependencies, and each is wired and qualified as soon as
 *its* dependencies land. It does block it in practice when the slice edits the
-same seam: #302, #311 and #318 each change `crates/gateway/src/main.rs`,
-`crates/gateway/src/state.rs`, or the compiler, which is exactly where IG-03's
-wiring goes, and #312 changes this page's harness. Integration therefore waits
-for that seam to settle rather than rebasing a fourth patch through it.
+same seam. At the time of writing, #302, #311 and #318 were each proposing
+changes to `crates/gateway/src/main.rs`, `crates/gateway/src/state.rs`, or the
+compiler — which is exactly where IG-03's wiring goes — and #312 to this page's
+harness. That is a reading of unmerged branches rather than of this tree, so it is
+provisional and worth re-checking; what is not provisional is the consequence.
+Integration waits for that seam to settle rather than rebasing a fourth patch
+through it.
 
 ## Acceptance matrix
 
@@ -134,19 +137,19 @@ project aliases (#255), on top of the wave-0 journal, convergence loop, and
 last-known-good cache. Runtime policy activation (#276) was the last contract a
 compiled snapshot could not resolve, and it has landed with the usage outbox
 (#249): no gate waiting on IG-03 waits on a contract slice any more. IG-03 waits
-on integration alone. Two gates still name a slice of their own — IG-05 the admin
-OIDC authenticator, IG-11 the qualification epic (#156) — and neither is
-downstream of compilation.
+on integration alone. Two gates still name a slice of their own: IG-05 the admin
+OIDC authenticator, which is not downstream of compilation, and IG-11 the
+qualification epic (#156), which is — it waits on IG-03 … IG-08 as well.
 
 What it waits on is not a contract but a seam. The reconciler, the compiler, the
 last-known-good cache and the status registry are all on main and all unreachable
 from `serve` — `crates/gateway/src/main.rs` still declares `convergence` and
 `status` `#[allow(dead_code)]` and `qualification` `#[cfg(test)]`, because nothing
-constructs them at boot. Wiring that is a single edit to `main.rs` and
-`state.rs`, which is where #302, #311 and #318 are also editing, and #302 and
-#318 change the compiler it has to call. Landing IG-03 before those merge means
-resolving the same conflict three times, in the file where a bad resolution
-silently changes what a replica serves.
+constructs them at boot — that much this tree proves. Wiring it is a single edit
+to `main.rs` and `state.rs`, the files the in-flight slices above were last seen
+touching. If they still touch them when they land, IG-03 written first resolves
+the same conflict once per slice, in the file where a bad resolution silently
+changes what a replica serves.
 
 So the next integration pull request is IG-03, opened once that seam settles —
 not against those branches, and not duplicating the compilation a contract slice
