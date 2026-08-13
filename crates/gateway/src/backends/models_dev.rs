@@ -114,7 +114,10 @@ pub enum ModelsDevError {
     UnsupportedEndpoint { url: String },
     #[error("the payload is not JSON: {message}")]
     NotJson { message: String },
-    #[error("the payload is not a models.dev catalogue document: {message}")]
+    #[error(
+        "the payload is not a models.dev catalogue document{}: {message}",
+        pointer.as_ref().map_or_else(String::new, |pointer| format!(" at `{pointer}`"))
+    )]
     Schema {
         /// Where the deserializer was when it refused, when it was anywhere: a
         /// document that is not an object at all is refused before any field.
@@ -2250,6 +2253,20 @@ mod tests {
                     error.refusal().pointer(),
                     Some(pointer),
                     "`{name}`'s refusal must name where it was decided"
+                );
+                // And so does the text, which is all a log line built from
+                // `Display` — or a `CatalogError` flattened from this one —
+                // has to go on.
+                let message = error.to_string();
+                assert!(
+                    message.contains(pointer.as_str()),
+                    "`{name}`'s message must read where it was decided: {message}"
+                );
+                assert!(
+                    CatalogError::from(error.clone())
+                        .to_string()
+                        .contains(pointer.as_str()),
+                    "`{name}` must keep that location on the way out of the module"
                 );
             }
         }
