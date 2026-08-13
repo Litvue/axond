@@ -243,6 +243,12 @@ rollout:
 faults:
     AXOND_FAULT_MATRIX=1 cargo test --locked --all-features --test faults -- --nocapture --test-threads=1
 
+# Check the stateless provider and transport rows after a fault run. CI passes
+# its lane-start timestamp too, so an old artifact cannot satisfy the gate.
+fault-evidence:
+    python3 ops/check-fault-evidence.py --self-test
+    python3 ops/check-fault-evidence.py
+
 # Run the gateway against ./axond.toml (copy axond.example.toml first).
 run:
     cargo run -p axond
