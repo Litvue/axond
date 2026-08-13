@@ -1,4 +1,4 @@
-# 41. Snapshot-pinned model enablements and ordered project aliases
+# 42. Snapshot-pinned model enablements and ordered project aliases
 
 Date: 2026-08-13
 
@@ -99,6 +99,12 @@ axond.model-alias.v1:      schema, alias_id, tenant_id, project_id,
   not know is a typed refusal. Across versions of one resource, identity, owner,
   wire family, and — for an enablement — offering and pinned snapshot never
   change: a new offering or a new snapshot is a new resource, not an edit.
+- **A sub-record is held to its schema too.** `observed_price`,
+  `approved_price`, and each alias target define their own field sets, so a key a
+  newer release added inside one is an unknown field rather than a value read past
+  and dropped. Every refusal inside a sub-record names its path —
+  `approved_price.effective_from`, `targets.weight` — so an operator is told which
+  value to fix and which of two `version` fields is meant.
 
 ### State tier
 
@@ -128,12 +134,14 @@ rather than taste:
   would stop an existing revision from hydrating on upgrade. Such a row is
   neither validated nor refused by these rules, which
   [revision convergence](../operations/revision-convergence.md#resource-body-schemas)
-  states as the one exception to the untyped-body rule. The skip is a property of
-  reading a revision, so it applies wherever a revision is read — hydration and
-  publication alike. That is wider than the upgrade it exists for: the admin slice
-  that authors these bodies should refuse to *write* an untyped alias even though
-  reading one is tolerated, so the accommodation stays limited to rows that
-  already exist.
+  states as the one exception to the untyped-body rule. The exception is keyed on
+  the field being *absent*: a body that carries a `schema` which is not text is
+  refused, because a damaged marker is not an older release's writing and reading
+  it as one would let the row skip the scope, target, reach, and wire-family
+  rules with nothing reported. These rules run wherever a revision is read, so
+  they hold at publication as well as at hydration; refusing to *author* a new
+  untyped alias belongs to the slice that writes these bodies, which keeps the
+  accommodation limited to rows already in the journal.
 - An **enablement** body with no `schema` field is refused as `incompatible`. No
   release ever wrote one, so there is no upgrade to accommodate, and skipping it
   would be an entitlement hole rather than a compatibility allowance: a row

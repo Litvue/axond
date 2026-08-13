@@ -52,6 +52,7 @@ unnoticed one.
 | `backends/catalog.rs`, `aliases.rs`, `availability/`, `desired_state/models.rs`, `/v1/models`, alias scope, wire families, pricing | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
 | `ops/postgres/`, `crates/gateway/sql/`, `usage/`, `telemetry/`, control-plane journal | [Persistence, migrations, telemetry, and usage](#5-persistence-migrations-telemetry-and-usage) |
 | `.github/workflows/`, `ops/publish-crates.sh`, `install.sh`, `install.ps1`, `Dockerfile`, `deny.toml` | [Actions, release permissions, attestations, and signing](#6-actions-release-permissions-attestations-and-signing) |
+| `desired_state/access.rs`, `desired_state/tenancy.rs`, control-plane tenancy/principal projection, `/admin/v1` authorization, denial records | [Control-plane tenancy, principals, and administrative authorization](#7-control-plane-tenancy-principals-and-administrative-authorization) |
 
 A change can fire more than one trigger; a credential-delivery change that also
 adds a Postgres table fires two, and owes both sets.
@@ -224,8 +225,8 @@ rather than only in the changelog.
 patterns in `crates/gateway/src/aliases.rs`, alias-to-target mapping and wire
 families, the `/v1/models` projection, catalogue ingestion in
 `crates/gateway/src/backends/catalog.rs`, derived availability and discovery
-evaluation in `crates/gateway/src/availability/`, the durable enablement and alias
-bodies and their publication rules in
+evaluation in `crates/gateway/src/availability/`, the durable enablement and
+alias bodies and their publication rules in
 `crates/gateway/src/desired_state/models.rs`, pricing metadata, and any new route
 that exposes model or provider metadata.
 
@@ -270,7 +271,7 @@ and [ADR 0012](../adr/0012-native-provider-routes.md) bound wire families and
 native routes; the durable entitlement contract — opaque snapshot-pinned offering
 identities, observed versus approved pricing, tenant defaults against project
 overrides, and ordered single-wire-family alias targets — is
-[ADR 0041](../adr/0041-model-enablement-and-alias-contracts.md), and a change to
+[ADR 0042](../adr/0042-model-enablement-and-alias-contracts.md), and a change to
 what an enablement pins or to which targets an alias may name amends it; `CatalogSource`'s background-only placement is in
 [backend contracts](../maintainers/backend-contracts.md). Item 2 of the security
 review's accepted-risk section is why `/v1/models` is authenticated and scoped —
@@ -416,6 +417,105 @@ renaming an artifact, or changing the signer identity, breaks existing
 verification commands and is a documented, changelog-visible break — and an MSRV
 or public-API change is a minor release per the
 [compatibility contract](../compatibility.md).
+
+## 7. Control-plane tenancy, principals, and administrative authorization
+
+**Fires on** any change to who a stateful deployment's administrators are and
+what they may reach: the identity and role vocabulary in
+`crates/gateway/src/desired_state/access.rs`, tenant lifecycle and project
+ownership in `crates/gateway/src/desired_state/tenancy.rs`, the authorization
+decision an `/admin/v1` handler consumes, the tenancy and principal projection
+written by `crates/gateway/src/backends/control_plane/postgres.rs`, the
+row-level-security policies and tenant-scoped constraints in
+`crates/gateway/sql/control_plane_0002_tenancy_access.sql`, and the denied-action
+record. A new administrative surface or action fires this trigger even when the
+handler is downstream work: the matrix is exhaustive, so a surface with no
+decided action is a hole rather than an omission.
+
+The three risks this area exists to bound, and where each is answered:
+
+- **Confused deputy.** The control plane acts on a caller's behalf, so a request
+  naming another tenant's resource must be refused *before* it is persisted, not
+  filtered afterwards. Scope containment is one-directional — a project-scoped
+  caller does not reach its tenant, and a tenant-scoped caller does not reach the
+  deployment — and a role cannot be granted at a scope it does not mean. The
+  database holds the same rule independently: a projected row cannot name a
+  tenant nothing declared or a project another tenant owns, so a service-layer
+  bug is a failed transaction rather than a cross-tenant write.
+- **Identifier enumeration.** A refusal tells the caller `forbidden` and nothing
+  else. Whether a tenant exists, whether a principal resolved, and which half of
+  an OIDC pair was wrong are recorded in the denial row and never returned, so a
+  caller cannot distinguish "no such tenant" from "not yours" and cannot walk the
+  id space with a well-formed request. Denials are read per tenant for the same
+  reason: one tenant's refusals are not another tenant's reconnaissance.
+- **Noisy neighbour.** Tenancy is an *authorization* boundary here, not a
+  capacity one. The namespace-level fairness the data plane already has is
+  trigger 2's; per-tenant admission, budgets, and availability are deliberately
+  not decided by this layer and remain the downstream work of dynamic limits and
+  availability evaluation. Section 8 of the
+  [security review](../security-review-2026-08-05.md) records that tenant
+  availability is not defended by the scoping boundary, and this layer does not
+  change that: nothing here may become an admission or request-path dependency,
+  because a control-plane lookup on the hot path is exactly how one tenant's
+  administrative load becomes another tenant's latency.
+
+**Regression tests.** The matrix is pinned exactly rather than sampled:
+`the_authorization_matrix_is_exactly_the_intended_one`,
+`only_a_platform_admin_creates_tenants_and_only_admins_grant_roles`, and
+`a_role_is_grantable_only_at_the_scopes_it_means` — a widened cell fails the
+first of those, so a grant cannot be broadened silently. Isolation and
+containment: `a_caller_of_one_tenant_cannot_reach_another`,
+`a_project_scoped_caller_cannot_reach_its_tenant_and_a_narrow_role_cannot_widen`,
+`scope_containment_is_one_way`, and
+`a_directory_refuses_a_cross_tenant_or_unscoped_identity`. Non-disclosure:
+`an_unresolvable_caller_is_refused_without_saying_which_half_was_wrong`,
+`a_denial_is_recorded_with_its_reason_and_no_caller_supplied_bytes`, and
+`a_denial_carries_no_secret_material`. Identity: `one_person_is_one_principal`,
+`a_minted_key_is_shown_once_hashed_at_rest_and_verified_in_constant_time`, and
+`a_workload_authenticates_by_digest_and_a_revoked_one_authenticates_with_nothing`
+— key material is shown once and stored as a digest, so this trigger fires
+trigger 3's obligations too. Lifecycle and the mode boundary:
+`a_disabled_tenant_is_administrable_and_a_deleted_one_is_not`,
+`breakglass_is_allowed_everything_and_recorded_as_itself`,
+`breakglass_and_the_gateway_recover_the_deployment_not_a_deleted_tenant` — the
+recovery path is deployment-scoped on purpose: an undeclared or deleted tenant
+refuses every caller, breakglass included, and getting one back means publishing
+a revision that declares it again rather than reaching into a tombstone with a
+tenant-scoped call —
+`the_gateways_own_work_reads_anywhere_and_writes_only_its_catalogues`, and
+`a_deployment_with_no_published_directory_grants_nothing_but_breakglass` for the
+fail-closed floor: an empty directory authorizes nobody but the static
+breakglass operator. The durable half runs against Postgres and skips without it,
+so run it the way [CONTRIBUTING](../../CONTRIBUTING.md#development) documents:
+`publishing_a_revision_projects_the_owners_and_the_directory_it_declares`,
+`a_tenant_lifecycle_transition_is_a_row_update_and_never_a_delete`,
+`a_projected_row_cannot_name_an_absent_tenant_or_another_tenants_project`,
+`denied_actions_are_recorded_and_read_back_per_tenant_newest_first`,
+`denials_are_recorded_once_and_read_newest_first_per_tenant` for the in-memory
+oracle's agreement with it, and
+`a_session_pinned_to_one_tenant_reads_no_other_tenants_rows` for the row-level
+security behind the service layer, asserted against a role that cannot bypass it.
+
+**Threat model and ADRs.**
+[ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md) owns the mode
+boundary — a directory exists only in stateful mode, and stateless deployments
+keep the namespace boundary of trigger 2 unchanged — and
+[ADR 0017](../adr/0017-state-tiers-and-optional-backends.md) owns the tier a
+durable directory implies. Sections 6 and 8 of the security review are the
+isolation argument and the recorded non-goals; a change that makes the boundary
+weaker, or that makes an inference request depend on a control-plane read,
+contradicts both and needs an ADR rather than a configuration key. Row-level
+security is defence in depth and never the only check: a change that moves an
+authorization decision *into* SQL supersedes that position explicitly.
+
+**Release impact.** A role, surface, or action rename is an administrative
+contract change and a schema change at once: the projected role vocabulary is a
+`CHECK` constraint, so name the DDL an operator applies and whether a mixed-
+version fleet may run, per the [upgrade guide](../operations/upgrades.md) and the
+[control-plane journal](../operations/control-plane-journal.md). New tenant-scoped
+constraints on existing history are ordered work: a constraint added `NOT VALID`
+needs the backfill named before it is validated, and that belongs in a follow-up
+issue rather than in the migration that could not enforce it yet.
 
 ## Recording the review
 

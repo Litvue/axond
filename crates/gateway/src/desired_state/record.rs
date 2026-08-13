@@ -16,7 +16,7 @@
 
 use std::fmt;
 
-use super::canonical::CanonicalValue;
+use super::canonical::{CanonicalValue, Checksum};
 use super::ids::{InvalidId, ProjectId, ResourceId, TenantId};
 use super::resource::{ResourceBody, ResourceKind, ResourceRef, ResourceVersion};
 use super::tenancy::{DisplayName, InvalidDisplayName};
@@ -50,6 +50,20 @@ pub(super) trait BodyError: Sized {
     fn field_type(reference: ResourceRef, field: &'static str) -> Self;
     fn malformed_id(reference: ResourceRef, field: &'static str, source: InvalidId) -> Self;
     fn identity_mismatch(reference: ResourceRef, declared: String, identity: ResourceId) -> Self;
+
+    /// A field that must be a set of strings and is not.
+    ///
+    /// Defaulted to the wrong-type refusal, because "a set was expected here" is
+    /// a wrong type; a schema that has a better word for it says so by overriding
+    /// this.
+    fn field_set(reference: ResourceRef, field: &'static str) -> Self {
+        Self::field_type(reference, field)
+    }
+
+    /// A field that must be a digest and is not one.
+    fn malformed_checksum(reference: ResourceRef, field: &'static str) -> Self {
+        Self::field_type(reference, field)
+    }
 }
 
 /// What a schema whose bodies carry a [`DisplayName`] must additionally say.
@@ -93,6 +107,35 @@ impl<'a, E: BodyError> Record<'a, E> {
         known: &[&str],
         reserved: &[&str],
     ) -> Result<Self, E> {
+        Self::open_any_reserving(resource, kind, &[schema], known, reserved)
+            .map(|(record, _)| record)
+    }
+
+    /// Open a record whose schema may be any of `schemas`, returning the one it
+    /// declared.
+    ///
+    /// More than one identifier is accepted for exactly one reason: a field set
+    /// only *some* states of a resource need — a tenant's lifecycle — is a second
+    /// schema, and a build that reads both keeps reading the revisions written
+    /// before that field existed. `expected` in a refusal is the last of them,
+    /// which callers list as the kind's base schema: it is what nearly every row
+    /// carries, so it is the useful half of "expected X, found Y".
+    pub(super) fn open_any(
+        resource: &'a ResourceVersion,
+        kind: ResourceKind,
+        schemas: &[&'static str],
+        known: &[&str],
+    ) -> Result<(Self, &'static str), E> {
+        Self::open_any_reserving(resource, kind, schemas, known, &[])
+    }
+
+    fn open_any_reserving(
+        resource: &'a ResourceVersion,
+        kind: ResourceKind,
+        schemas: &[&'static str],
+        known: &[&str],
+        reserved: &[&str],
+    ) -> Result<(Self, &'static str), E> {
         let reference = resource.reference;
         if reference.kind != kind {
             return Err(E::kind(reference, kind, reference.kind));
@@ -109,9 +152,16 @@ impl<'a, E: BodyError> Record<'a, E> {
             error: std::marker::PhantomData,
         };
         let declared = record.string(SCHEMA_FIELD)?;
-        if declared != schema {
-            return Err(E::schema(reference, schema, declared.to_owned()));
-        }
+        let schema = *schemas
+            .iter()
+            .find(|candidate| **candidate == declared)
+            .ok_or_else(|| {
+                E::schema(
+                    reference,
+                    schemas.last().copied().unwrap_or(""),
+                    declared.to_owned(),
+                )
+            })?;
         // A reserved name is refused before the unknown-field rule, so the
         // boundary it marks is reported as itself rather than as a version skew.
         if let Some((field, _)) = fields
@@ -126,7 +176,7 @@ impl<'a, E: BodyError> Record<'a, E> {
         {
             return Err(E::unknown_field(reference, schema, field.clone()));
         }
-        Ok(record)
+        Ok((record, schema))
     }
 
     /// The resource this record is the body of, for a refusal a schema builds
@@ -150,6 +200,25 @@ impl<'a, E: BodyError> Record<'a, E> {
             .find(|(name, _)| name == field)
             .map(|(_, value)| value)
             .ok_or_else(|| E::missing_field(self.reference, field))
+    }
+
+    pub(super) fn string(&self, field: &'static str) -> Result<&'a str, E> {
+        match self.value(field)? {
+            CanonicalValue::String(text) => Ok(text),
+            _ => Err(E::field_type(self.reference, field)),
+        }
+    }
+
+    /// A field a schema defines but a body need not carry.
+    ///
+    /// Absence and a wrong type stay distinct: an optional field is optional,
+    /// never a place a non-string may live.
+    pub(super) fn optional_string(&self, field: &'static str) -> Result<Option<&'a str>, E> {
+        match self.fields.iter().find(|(name, _)| name == field) {
+            None => Ok(None),
+            Some((_, CanonicalValue::String(text))) => Ok(Some(text)),
+            Some(_) => Err(E::field_type(self.reference, field)),
+        }
     }
 
     /// A nested record inside `field`, read as strictly as the body around it.
@@ -187,23 +256,29 @@ impl<'a, E: BodyError> Record<'a, E> {
         })
     }
 
-    pub(super) fn string(&self, field: &'static str) -> Result<&'a str, E> {
-        match self.value(field)? {
-            CanonicalValue::String(text) => Ok(text),
-            _ => Err(E::field_type(self.reference, field)),
-        }
+    /// A set-valued field of strings, refusing a list — order would be meaning —
+    /// or a member that is not a string.
+    pub(super) fn string_set(&self, field: &'static str) -> Result<Vec<&'a str>, E> {
+        let CanonicalValue::Set(members) = self.value(field)? else {
+            return Err(E::field_set(self.reference, field));
+        };
+        members
+            .iter()
+            .map(|member| match member {
+                CanonicalValue::String(text) => Ok(text.as_str()),
+                _ => Err(E::field_set(self.reference, field)),
+            })
+            .collect()
     }
 
-    /// A field a schema defines but a body need not carry.
-    ///
-    /// Absence and a wrong type stay distinct: an optional field is optional,
-    /// never a place a non-string may live.
-    pub(super) fn optional_string(&self, field: &'static str) -> Result<Option<&'a str>, E> {
-        match self.fields.iter().find(|(name, _)| name == field) {
-            None => Ok(None),
-            Some((_, CanonicalValue::String(text))) => Ok(Some(text)),
-            Some(_) => Err(E::field_type(self.reference, field)),
-        }
+    /// An optional digest field, parsed through [`Checksum`] so a stored value
+    /// that is not a digest is a refusal rather than one nothing will ever match.
+    pub(super) fn optional_checksum(&self, field: &'static str) -> Result<Option<Checksum>, E> {
+        self.optional_string(field)?
+            .map(|text| {
+                Checksum::parse(text).map_err(|_| E::malformed_checksum(self.reference, field))
+            })
+            .transpose()
     }
 
     /// A non-negative integer field, read as `u64`.

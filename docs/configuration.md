@@ -74,10 +74,14 @@ exclusive: there is no per-resource migration state, and therefore no merge
 policy between a file and a database. It is a bootstrap property, so a reload
 cannot switch a serving process between modes — that needs a restart.
 
-**The control plane this bootstraps is not implemented yet.** Stateful
-configuration parses and validates today, and a stateful process then refuses to
-start rather than serve an empty snapshot. Read the ADR's ownership and failure
-matrices before planning a deployment.
+**A stateful replica administers today and serves inference later.** It boots,
+opens the control plane, and serves `/admin/v1` — see
+[administering a stateful deployment](./operations/admin-api.md) — but a
+published revision cannot be compiled into a runtime snapshot yet, so `/readyz`
+stays `503` and every `/v1` route answers `503 inference_unavailable` rather than
+an empty configuration. Serve inference from `mode = "stateless"` until
+[revision convergence](./operations/revision-convergence.md) ships, and read the
+ADR's ownership and failure matrices before planning a deployment.
 
 ### Stateful bootstrap
 

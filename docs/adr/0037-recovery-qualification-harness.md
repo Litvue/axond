@@ -71,11 +71,9 @@ and when a slice #219 waits on is named by no scenario at all. The second-to-las
 is how an unrelated dependency creeps in; the last is how a scenario quietly
 disappears — the issue it needed goes unclaimed.
 
-**"Executable" is a claim about code.** A scenario's `status` is cross-checked
-against `Capability::is_implemented`, so flipping a manifest entry without
-writing a driver fails, and writing a driver without flipping the entry fails
-too. Today every capability reports unimplemented, and the suite asserts exactly
-that rather than skipping.
+**"Executable" is a claim about code.** A `status` is cross-checked against the
+driver, so flipping a manifest entry without writing a driver fails, and writing
+a driver without flipping the entry fails too.
 
 **The subject will be real.** When the driver lands it runs against real
 PostgreSQL and real replica processes — the outage is the database becoming
@@ -96,10 +94,10 @@ default suite stays runnable with no datastore.
 - The scenarios are settled while nobody is under delivery pressure to shrink
   them. When a slice lands, the question is "write this driver", not "decide what
   recovery means".
-- A reader is told plainly that Axond has no recovery evidence yet. The
-  [operations page](../operations/recovery-qualification.md) is labelled a
-  contract, and the manifest marks every scenario blocked, so the file cannot be
-  cited as a passing qualification.
+- A reader is told plainly how much has been observed. The
+  [operations page](../operations/recovery-qualification.md) states which stages
+  run and which are declared, and no scenario is executable, so neither file can
+  be cited as a passing qualification.
 - The contract will be wrong in places, and that is the cheaper direction of
   error: a gate written against a surface that does not exist may need
   correcting, and correcting it is a reviewed change to a committed file rather
@@ -110,3 +108,55 @@ default suite stays runnable with no datastore.
   no new dependency and takes milliseconds, and its only job is to make the
   waiting visible: as long as the harness is blocked, the suite says so on every
   run.
+
+## Amendment: stages, and the driver that runs today
+
+Date: 2026-08-13
+
+The original decision treated a scenario as one indivisible claim, which turned
+out to be wrong in a way worth recording: the two halves of a recovery scenario
+become executable at different times. Losing the journal under a converged
+replica, cold-booting from the signed cache, and converging when it returns are
+all reachable against a real database *now*. Offering inference across the same
+window is not, and will not be until a replica can serve a projected revision.
+Under the original shape, the honest status for those scenarios was `blocked`,
+which hid five runnable outages behind a slice they do not need.
+
+**A scenario is split into stages.** Each stage carries its own status,
+evidence, blockers, and prose; a scenario is executable exactly when all of its
+stages are. Nothing about the gate changes: the gate stays whole and
+scenario-level, and each stage evaluates the fields it is in a position to
+measure and records the others as `not_evaluated` with the reason. A partially
+executable scenario therefore cannot report a whole gate as met.
+
+**The outage is a cut, not an injected error.** The replica reaches Postgres
+through a loopback link the harness owns; severing it drops the live connection
+and refuses reconnection, so the replica meets a dead socket and its reconnect
+path runs. A store wrapper returning `Unavailable` would have qualified the
+wrapper — and, more importantly, the database keeps its rows through the cut,
+which is what makes the recovery half mean anything.
+
+**The driver lives in the crate, not in `tests/`.** Unlike capacity and soak,
+which qualify a process from outside, a recovery stage has to hold a replica's
+reconciler, its signed cache, and a real `PostgresControlPlane` at once and then
+take the database away from underneath them. None of that is reachable from
+outside the binary while stateful boot is not wired to `serve`. The cost is
+recorded in the artifacts: the cold-boot stages note that the store handle is
+built before the cut, because `connect` against an unreachable database fails
+before a reconciler exists. When stateful `serve` lands, the serving stages
+bring the driver back out to a process.
+
+**No database, no evidence.** A run without `AXOND_TEST_POSTGRES_DSN` writes no
+artifact rather than falling back to an in-process control plane, which is the
+original decision's rule applied to the driver that now exists.
+
+Consequences of the amendment:
+
+- Five stages produce machine-readable evidence under `target/recovery/`, one
+  JSON document per stage, carrying the build and schema identity, the timeline,
+  the observations, and a verdict per gate field.
+- No scenario is qualified end to end, and the operations page and manifest both
+  say so. The change is that they now also say which halves *are* observed.
+- Landing #148 and #149 unblocks the serving stages of scenarios whose
+  control-plane stages already pass, so those scenarios flip to executable
+  without their outage behaviour being re-litigated.

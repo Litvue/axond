@@ -6,10 +6,12 @@
 
 use std::time::{Duration, SystemTime};
 
+use super::access::{Credential, IdentityBody, Role, WorkloadKey};
 use super::canonical::{CanonicalValue, Checksum};
 use super::credentials::ProviderCredentialBody;
 use super::ids::{
-    AuditEventId, MutationId, ProjectId, ResourceId, RevisionId, SecretId, Slug, TenantId, Uuid7,
+    AuditEventId, MutationId, PrincipalId, ProjectId, ResourceId, RevisionId, SecretId, Slug,
+    TenantId, Uuid7,
 };
 use super::models::{
     AliasTarget, ApprovedPrice, CatalogOffering, ModelAliasBody, ModelEnablementBody, ModelOwner,
@@ -504,6 +506,174 @@ pub(crate) fn state_with_second_tenant() -> DesiredState {
         .insert(tenant(11, "globex"))
         .and_then(|state| state.insert(other.clone()))
         .and_then(|state| state.insert(alias(&tenant_id(11), 14, "steady", &[other.reference])))
+        .expect("two tenants that reference nothing of each other's are valid");
+    state
+}
+
+pub(crate) fn principal_id(seed: u64) -> PrincipalId {
+    PrincipalId::new(uuid(seed))
+}
+
+/// A human principal: an OIDC subject at one issuer, with the roles given.
+///
+/// The seed is the principal id *and* the resource id, the binding
+/// [`IdentityBody::read`] enforces.
+pub(crate) fn human(
+    seed: u64,
+    subject: &str,
+    scope: ResourceScope,
+    roles: &[Role],
+) -> ResourceVersion {
+    identity(
+        seed,
+        subject,
+        scope,
+        roles,
+        Credential::Oidc {
+            issuer: "https://idp.example".to_owned(),
+            subject: subject.to_owned(),
+        },
+    )
+}
+
+/// A workload key of the shape [`WorkloadKey::parse`] accepts, seeded so it is
+/// the same string in every run.
+///
+/// Deterministic rather than minted, because a test that asserts on a stored
+/// digest cannot use fresh randomness — and because a fixture must not need the
+/// system CSPRNG to build a state.
+pub(crate) fn workload_key(seed: u8) -> String {
+    let mut key = String::from(WorkloadKey::PREFIX);
+    for _ in 0..32 {
+        key.push_str(&format!("{seed:02x}"));
+    }
+    key
+}
+
+/// A workload principal whose key digest is the digest of `key`, or which has no
+/// key at all — a workload whose key was revoked and not replaced.
+pub(crate) fn workload(
+    seed: u64,
+    slug: &str,
+    scope: ResourceScope,
+    roles: &[Role],
+    key: Option<&str>,
+) -> ResourceVersion {
+    identity(
+        seed,
+        slug,
+        scope,
+        roles,
+        Credential::MintedKey {
+            digest: key.map(|key| Checksum::of(key.as_bytes())),
+        },
+    )
+}
+
+fn identity(
+    seed: u64,
+    slug: &str,
+    scope: ResourceScope,
+    roles: &[Role],
+    credential: Credential,
+) -> ResourceVersion {
+    IdentityBody::new(
+        principal_id(seed),
+        display_name(&capitalize(slug)),
+        credential,
+        roles.iter().copied(),
+    )
+    .expect("fixture identities grant a role")
+    .version(scope, Slug::parse(slug).expect("fixture slug"))
+}
+
+/// [`state`] plus a directory: a platform administrator, a tenant administrator,
+/// an operator scoped into one project, and a workload of the tenant.
+///
+/// One state that every authorization case can be decided against, so a test
+/// asserts on the decision rather than on a hand-built directory.
+pub(crate) fn state_with_directory() -> DesiredState {
+    directory_state(true)
+}
+
+/// [`state_with_directory`] with the workload no longer declared: what publishing
+/// a revocation looks like, since a revision is the whole directory rather than a
+/// change to it.
+pub(crate) fn state_with_revoked_workload() -> DesiredState {
+    directory_state(false)
+}
+
+fn directory_state(with_workload: bool) -> DesiredState {
+    let tenant = tenant_id(1);
+    let project = project_id(2);
+    let mut state = state();
+    state
+        .insert(human(
+            30,
+            "root",
+            ResourceScope::Deployment,
+            &[Role::PlatformAdmin],
+        ))
+        .and_then(|state| {
+            state.insert(human(
+                31,
+                "admin",
+                ResourceScope::Tenant(tenant),
+                &[Role::TenantAdmin],
+            ))
+        })
+        .and_then(|state| {
+            state.insert(human(
+                32,
+                "dev",
+                ResourceScope::Project { tenant, project },
+                &[Role::Developer],
+            ))
+        })
+        .expect("a directory over declared tenants and projects is valid");
+    if with_workload {
+        state
+            .insert(workload(
+                33,
+                "deployer",
+                ResourceScope::Tenant(tenant),
+                &[Role::Operator],
+                Some(&workload_key(0xd0)),
+            ))
+            .expect("a workload of a declared tenant is valid");
+    }
+    state
+}
+
+/// Two tenants, each with its own administrator and its own project.
+///
+/// What an isolation case needs that [`state_with_directory`] cannot give it: a
+/// second tenant's principals and grants to *fail* to see. Neither tenant's
+/// resources reference the other's, so the state is valid for the same reason
+/// [`state_with_second_tenant`] is.
+pub(crate) fn two_tenant_directory_state() -> DesiredState {
+    let other = tenant_id(11);
+    let mut state = state_with_directory();
+    state
+        .insert(tenant(11, "globex"))
+        .and_then(|state| state.insert(project(&other, 12, "core")))
+        .and_then(|state| {
+            state.insert(human(
+                40,
+                "their-admin",
+                ResourceScope::Tenant(other),
+                &[Role::TenantAdmin],
+            ))
+        })
+        .and_then(|state| {
+            state.insert(workload(
+                41,
+                "their-deployer",
+                ResourceScope::Tenant(other),
+                &[Role::Operator],
+                Some(&workload_key(0xe1)),
+            ))
+        })
         .expect("two tenants that reference nothing of each other's are valid");
     state
 }

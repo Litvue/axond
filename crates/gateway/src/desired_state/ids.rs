@@ -359,6 +359,18 @@ typed_id!(
     "sct_"
 );
 
+typed_id!(
+    /// A principal: a human administrator or a workload service account.
+    ///
+    /// Axond-owned even for a human, whose *authentication* identity is an
+    /// issuer-scoped OIDC subject: the pair `(issuer, subject)` names who signs
+    /// in, and this names the durable object their grants hang off, so a subject
+    /// that is renamed at the identity provider does not become a second
+    /// principal with its own history.
+    PrincipalId,
+    "prn_"
+);
+
 /// A readable, scope-unique name for a resource.
 ///
 /// Deliberately restrictive and ASCII-only: a slug appears in URLs, config, log
@@ -405,6 +417,7 @@ impl Slug {
         MutationId::PREFIX,
         AuditEventId::PREFIX,
         SecretId::PREFIX,
+        PrincipalId::PREFIX,
     ];
 
     pub fn parse(input: &str) -> Result<Self, InvalidSlug> {

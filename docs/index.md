@@ -71,19 +71,31 @@ and operate it.
 - [Endurance qualification](./operations/endurance.md) — the twelve-hour mixed
   workload, what a long run leaves behind, and the leak and accounting
   properties it gates on.
+- [Rollout qualification](./operations/rollout.md) — the rolling upgrade executed
+  against a real fleet: drain, readiness removal, replacement, mixed-version
+  windows, rollback limits, and the evidence a run leaves behind.
 - [Usage schema](./usage-schema.md) — durable row contract and delivery
   guarantees.
+- [Administering a stateful deployment](./operations/admin-api.md) — the
+  `/admin/v1` routes and `axond admin`, their preconditions, and what a stateful
+  replica serves before revision convergence ships.
 - [Control-plane revision journal](./operations/control-plane-journal.md) — the
   stateful mode's Postgres schema, migrations, schema-status refusals, and
   outage behaviour.
 - [Revision convergence](./operations/revision-convergence.md) — how a published
   revision reaches replicas, convergence targets, what a replica reports, and
   the signed last-known-good cache.
+- [Stateful integration](./operations/stateful-integration.md) — the #160
+  release gates, who owns each slice, and the harness scenario that proves each
+  gate.
 - [Deployment security model](./security/deployment-model.md) — trust
   boundaries, TLS termination, secret delivery, and image verification.
 - [Secret material in the stateful control plane](./security/secret-material.md)
   — what a stored secret reference guarantees, and the regression suite that
   proves material stays out of state, responses, logs, and telemetry.
+- [Tenant isolation evidence](./security/tenant-isolation-evidence.md) — which
+  layer enforces each part of isolation, the test that proves it, and what is
+  not covered yet.
 - [Security policy](../SECURITY.md) — private vulnerability reporting, the
   supported-version window, response targets, and how a fix and advisory ship.
 

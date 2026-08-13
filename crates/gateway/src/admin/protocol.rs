@@ -25,7 +25,7 @@ use axum::http::HeaderMap;
 use super::error::AdminError;
 use crate::desired_state::{
     ExpectedRevision, IdempotencyKey, InvalidIdempotencyKey, MutationKind, ResourceScope,
-    RevisionId,
+    RevisionId, Surface,
 };
 
 /// The route prefix the administrative surface is mounted under. Disjoint from
@@ -190,6 +190,10 @@ fn parse_expected_revision(value: &str) -> Result<ExpectedRevision, AdminError> 
 pub struct MutationRequest {
     pub preconditions: MutationPreconditions,
     pub kind: MutationKind,
+    /// The surface a refusal of this mutation is recorded against in the denial
+    /// trail. A resource document names its own; a rollback republishes the
+    /// deployment's journal and names [`Surface::AuditTrail`].
+    pub surface: Surface,
     /// The scope the change is attributed to, which must be the scope the
     /// caller's grant covers.
     pub scope: ResourceScope,

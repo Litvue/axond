@@ -33,8 +33,9 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 
+use super::access::AccessDenial;
 use super::canonical::Checksum;
-use super::ids::{RevisionId, Uuid7Generator};
+use super::ids::{RevisionId, TenantId, Uuid7Generator};
 use super::mutation::{AuditEvent, IdempotencyKey};
 use super::resource::{ResourceRef, ResourceVersion};
 use super::revision::{
@@ -58,6 +59,10 @@ struct Storage {
     /// single-caller test double and is *not* the contract: per-caller scoping
     /// and expiry are required of a durable store, per [`IdempotencyKey`].
     applied: BTreeMap<IdempotencyKey, (RevisionId, Checksum)>,
+    /// Refused administrative actions, in the order they were refused. Not keyed
+    /// by revision: a denial published nothing, which is the whole reason it is
+    /// recorded separately from the audit trail.
+    denials: Vec<AccessDenial>,
 }
 
 /// A `ControlPlaneStore` whose transaction is a mutex.
@@ -273,6 +278,48 @@ impl ControlPlaneStore for InMemoryControlPlane {
             .cloned()
             .ok_or(ControlPlaneError::RevisionNotFound(id))
     }
+
+    async fn record_denial(&self, denial: &AccessDenial) -> Result<(), ControlPlaneError> {
+        if let Some(error) = self.outage() {
+            return Err(error);
+        }
+        let mut storage = self.locked();
+        // Written once per id, as a primary key makes it: recording the same
+        // refusal twice would double-count an incident.
+        if storage.denials.iter().any(|stored| stored.id == denial.id) {
+            return Ok(());
+        }
+        storage.denials.push(denial.clone());
+        Ok(())
+    }
+
+    async fn denials(
+        &self,
+        tenant: Option<TenantId>,
+        limit: usize,
+    ) -> Result<Vec<AccessDenial>, ControlPlaneError> {
+        if let Some(error) = self.outage() {
+            return Err(error);
+        }
+        let storage = self.locked();
+        // Ordered and clamped the way the durable store is, or the oracle would
+        // agree with Postgres only for stores small enough that insertion order
+        // happened to be timestamp order.
+        let mut denials: Vec<AccessDenial> = storage
+            .denials
+            .iter()
+            .filter(|denial| denial.tenant() == tenant)
+            .cloned()
+            .collect();
+        denials.sort_by(|left, right| {
+            right
+                .recorded_at
+                .cmp(&left.recorded_at)
+                .then(right.id.cmp(&left.id))
+        });
+        denials.truncate(limit.clamp(1, 1_000));
+        Ok(denials)
+    }
 }
 
 #[cfg(test)]
@@ -288,6 +335,68 @@ mod tests {
     use super::super::tenancy::TenancyError;
     use super::*;
     use crate::backends::{BackendFailure, FailureCategory};
+
+    /// The oracle answers denial reads the way the durable store does, because a
+    /// test that passes here and fails against Postgres is worse than no oracle.
+    #[tokio::test]
+    async fn denials_are_recorded_once_and_read_newest_first_per_tenant() {
+        use super::super::access::{Action, DenialReason, Surface};
+        use super::super::ids::AuditEventId;
+        use super::super::resource::ResourceScope;
+
+        let store = InMemoryControlPlane::new();
+        let tenant = tenant_id(1);
+        let other = tenant_id(11);
+        let denial = |seed: u64, scope: ResourceScope, offset: u64| AccessDenial {
+            id: AuditEventId::new(super::super::ids::Uuid7::from_parts(seed, 0, seed).expect("id")),
+            actor: Actor::Human {
+                issuer: "https://idp.example".to_owned(),
+                subject: "dev".to_owned(),
+            },
+            surface: Surface::Credential,
+            action: Action::Rotate,
+            scope,
+            reason: DenialReason::OutOfScope,
+            recorded_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(offset),
+        };
+        // Recorded out of order, so the read order is the timestamp's rather than
+        // the insertion's.
+        let later = denial(2, ResourceScope::Tenant(tenant), 200);
+        let earlier = denial(1, ResourceScope::Tenant(tenant), 100);
+        let elsewhere = denial(3, ResourceScope::Tenant(other), 300);
+        let deployment = denial(4, ResourceScope::Deployment, 400);
+        for record in [&later, &earlier, &elsewhere, &deployment] {
+            store.record_denial(record).await.expect("record");
+        }
+        store
+            .record_denial(&later)
+            .await
+            .expect("a retry is not a second attempt");
+
+        assert_eq!(
+            store.denials(Some(tenant), 10).await.expect("read"),
+            vec![later.clone(), earlier]
+        );
+        assert_eq!(
+            store.denials(Some(tenant), 1).await.expect("read"),
+            vec![later]
+        );
+        assert_eq!(
+            store.denials(Some(other), 10).await.expect("read"),
+            vec![elsewhere.clone()]
+        );
+        assert_eq!(
+            store.denials(None, 10).await.expect("read"),
+            vec![deployment],
+            "no tenant means the deployment-scoped page, not every row"
+        );
+
+        // An outage is an outage for refusals too: a denial that cannot be
+        // written must not be reported as written.
+        store.set_unavailable(true);
+        assert!(store.denials(Some(tenant), 10).await.is_err());
+        assert!(store.record_denial(&elsewhere).await.is_err());
+    }
 
     #[tokio::test]
     async fn publication_is_a_chain_of_immutable_revisions() {

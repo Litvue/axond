@@ -59,9 +59,11 @@
 //! tenant-scoped enablement applies to every project of that tenant, and a
 //! project-scoped one for the same offering replaces it for that project.
 //! [`Models::effective_for`] states the resolution once, so no consumer invents a
-//! second precedence rule, and two enablements at the *same* scope for one
-//! offering are refused ([`ModelError::DuplicateOffering`]) rather than resolved
-//! by iteration order.
+//! second precedence rule, and two *enabled* enablements at the same scope for
+//! one offering are refused ([`ModelError::DuplicateOffering`]) rather than
+//! resolved by iteration order. A disabled one resolves to nothing and so holds
+//! no offering — which is what makes replacing an enablement reachable, since a
+//! new snapshot is a new enablement and desired state never forgets the old.
 //!
 //! # What is checked, and where
 //!
@@ -115,7 +117,7 @@
 //! a tenancy or credential one; what a refusal *means* stays here, in
 //! [`ModelError::is_incompatible`].
 //!
-//! The operator-facing statement of all of this is `docs/adr/0041-model-enablement-and-alias-contracts.md`,
+//! The operator-facing statement of all of this is `docs/adr/0042-model-enablement-and-alias-contracts.md`,
 //! with the schema table and the untyped-alias exception in
 //! `docs/operations/revision-convergence.md`.
 
@@ -525,7 +527,7 @@ impl fmt::Display for ModelOwner {
 /// deliberately inert: nothing bills against it, no conversion turns it into an
 /// [`ApprovedPrice`], and [`ModelEnablementBody::billable_price`] does not look at
 /// it. A catalogue refresh may change what an upstream publishes at any time
-/// without human action (ADR 0041), so treating an observed rate as an effective
+/// without human action (ADR 0042), so treating an observed rate as an effective
 /// one would let an upstream edit change what a deployment charges.
 ///
 /// Integers, in micro-dollars, because desired state has no floating-point
@@ -1678,11 +1680,9 @@ impl Models {
     /// once per scope, and that every alias resolves — in order, within its own
     /// reach, and in one wire family.
     ///
-    /// An *alias* row whose body carries no `schema` key at all is skipped rather
-    /// than refused, because such rows predate this slice; a row that carries the
-    /// key is read strictly however its value is spelled, and an untyped
-    /// *enablement* is refused, because none was ever published. See the module
-    /// documentation.
+    /// An *alias* row whose body declares no `schema` is skipped rather than
+    /// refused, because such rows predate this slice; an untyped *enablement* is
+    /// refused, because none was ever published. See the module documentation.
     pub fn of(state: &DesiredState) -> Result<Self, ModelError> {
         let mut models = Self::default();
         for resource in state.resources() {
@@ -1698,7 +1698,7 @@ impl Models {
                         },
                     );
                 }
-                ResourceKind::Alias if !predates_this_slice(resource) => {
+                ResourceKind::Alias if is_typed(resource) => {
                     let body = ModelAliasBody::read(resource)?;
                     models.aliases.insert(
                         body.alias(),
@@ -1726,6 +1726,14 @@ impl Models {
                     approved.reference(),
                     enablement.body.owner(),
                 )?;
+            }
+            // Only what resolves can be ambiguous. A disabled enablement is
+            // never returned to anyone, so holding an offering it no longer
+            // serves would make a refreshed snapshot unreachable: a new snapshot
+            // is a new enablement, and the enablement it replaces can only be
+            // disabled — this state has no way to forget a resource.
+            if !enablement.body.is_enabled() {
+                continue;
             }
             let owner = enablement.body.owner();
             let offering = enablement.body.offering().offering;
@@ -1851,35 +1859,13 @@ impl Models {
     }
 }
 
-/// Whether an alias row is one a build predating this slice wrote, and is
-/// therefore skipped rather than read: a body carrying no `schema` key, of any
-/// shape a build before these bodies were typed could have written.
-///
-/// A body that carries a `schema` key at all is this slice's to read, whatever
-/// that value turns out to be: an integer or a list there is damage, and the
-/// shared reader refuses it by naming the field, which is the refusal an operator
-/// needs. Treating an unreadable marker as a row from before this slice would let
-/// a damaged alias skip the scope, target, reach, and wire-family rules with
-/// nothing reported, which for an entitlement body is worse than refusing the
-/// revision.
-///
-/// A body that is not an inline record at all is the exemption rather than a
-/// refusal, and that is deliberate: it carries no targets, no scope, and no wire
-/// family, so it grants nothing, and it never enters [`Models::aliases`] for
-/// anything to resolve through. The rules above constrain what an alias *grants*,
-/// so a row that grants nothing needs none of them — where an *enablement* is
-/// itself the grant, which is why an untyped one is refused.
-///
-/// This is consulted wherever a revision is *read*, so it holds at publication as
-/// well as at hydration, which is wider than the upgrade it exists for. Refusing
-/// to *author* an untyped alias belongs to the slice that writes these bodies, so
-/// that the accommodation stays limited to rows already in the journal; see
-/// ADR 0041.
-fn predates_this_slice(resource: &ResourceVersion) -> bool {
+/// Whether an alias body declares a schema at all, and is therefore a body this
+/// slice reads strictly rather than a row written before it.
+fn is_typed(resource: &ResourceVersion) -> bool {
     let ResourceBody::Inline(CanonicalValue::Map(fields)) = &resource.body else {
-        return true;
+        return false;
     };
-    !fields.iter().any(|(field, _)| field == SCHEMA_FIELD)
+    fields.iter().any(|(field, _)| field == SCHEMA_FIELD)
 }
 
 /// The snapshot an enablement pins must be a snapshot this revision carries, as a
@@ -1887,7 +1873,7 @@ fn predates_this_slice(resource: &ResourceVersion) -> bool {
 ///
 /// The pin resolves structurally, so a storage path that reconstructs a catalogue
 /// resource must keep its blob kind and digest intact rather than rematerializing
-/// the body inline; see ADR 0041. An unresolvable pin is invalid rather than skew
+/// the body inline; see ADR 0042. An unresolvable pin is invalid rather than skew
 /// on purpose: a revision whose enablements have lost the catalogue they were
 /// approved against must not converge.
 fn check_snapshot_pin(
@@ -2241,6 +2227,71 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    /// The replacement path: an offering a disabled enablement used to serve is
+    /// free for the enablement that replaces it. Without this a refreshed
+    /// snapshot could never be enabled, since a new snapshot is a new enablement
+    /// and desired state has no way to drop the old one.
+    #[test]
+    fn a_disabled_enablement_does_not_hold_the_offering_that_replaces_it() {
+        let replacement = enablement_body(33, owner_tenant(), "gpt-4o").version(
+            Slug::parse("gpt-4o-refreshed").unwrap(),
+            catalog_reference(),
+        );
+        let mut state = state_with_models();
+        let retired = state
+            .resources()
+            .find(|resource| {
+                ModelEnablementBody::read(resource)
+                    .is_ok_and(|body| body.offering().offering == offering_id("gpt-4o"))
+            })
+            .cloned()
+            .expect("the state enables gpt-4o");
+        let body = ModelEnablementBody::read(&retired)
+            .expect("an enablement body")
+            .transitioned(ModelLifecycle::Disabled);
+        let disabled = body.version_at(
+            retired.slug.clone(),
+            retired.reference.version.next(),
+            catalog_reference(),
+        );
+        let disabled_reference = disabled.reference;
+        state
+            .supersede(disabled)
+            .expect("disabling advances the enablement");
+        // Every alias that named the enablement follows it to the version that
+        // disabled it, exactly as an administrative edit carries dependents.
+        let dependents: Vec<ResourceVersion> = state
+            .resources()
+            .filter(|resource| resource.depends_on.contains(&retired.reference))
+            .cloned()
+            .collect();
+        for dependent in dependents {
+            let alias = ModelAliasBody::read(&dependent).expect("an alias body");
+            let targets: Vec<AliasTarget> = alias
+                .targets()
+                .iter()
+                .map(|target| {
+                    if target.enablement == disabled_reference.id {
+                        AliasTarget::new(target.enablement, disabled_reference.version)
+                    } else {
+                        *target
+                    }
+                })
+                .collect();
+            state
+                .supersede(
+                    alias
+                        .retargeted(targets)
+                        .version_at(dependent.slug.clone(), dependent.reference.version.next()),
+                )
+                .expect("the alias follows its target");
+        }
+        state.insert(replacement).expect("a distinct reference");
+        state
+            .validate()
+            .expect("only what resolves can be ambiguous");
     }
 
     #[test]
@@ -2772,17 +2823,7 @@ mod tests {
             "fast",
             &[reference_of(30)],
         );
-        let extended = with_fields(&alias, |fields| {
-            let (_, value) = fields
-                .iter_mut()
-                .find(|(name, _)| name == TARGETS_FIELD)
-                .expect("a typed alias carries targets");
-            let CanonicalValue::List(targets) = value else {
-                panic!("targets is a list");
-            };
-            let CanonicalValue::Map(target) = &mut targets[0] else {
-                panic!("a target is a nested record");
-            };
+        let extended = with_first_target(&alias, |target| {
             target.push(("weight".to_owned(), CanonicalValue::integer(1)));
         });
         let error = ModelAliasBody::read(&extended).expect_err("an extended target");
@@ -2931,20 +2972,6 @@ mod tests {
     }
 
     #[test]
-    fn alias_rows_published_before_this_slice_still_load() {
-        // `state` carries an untyped alias, as a build predating typed model
-        // bodies wrote it: skipped rather than refused, so an existing revision
-        // keeps hydrating on upgrade.
-        let state = state();
-        state
-            .validate()
-            .expect("an untyped alias body is not this build's to read");
-        let models = Models::of(&state).unwrap();
-        assert_eq!(models.aliases().len(), 0);
-        assert_eq!(models.enablements().len(), 0);
-    }
-
-    #[test]
     fn an_alias_whose_schema_marker_is_damaged_is_refused_rather_than_skipped() {
         // The upgrade accommodation is a body with no `schema` key at all. A key
         // that is present but is not text is damage, so reading it as a row
@@ -2993,6 +3020,20 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn alias_rows_published_before_this_slice_still_load() {
+        // `state` carries an untyped alias, as a build predating typed model
+        // bodies wrote it: skipped rather than refused, so an existing revision
+        // keeps hydrating on upgrade.
+        let state = state();
+        state
+            .validate()
+            .expect("an untyped alias body is not this build's to read");
+        let models = Models::of(&state).unwrap();
+        assert_eq!(models.aliases().len(), 0);
+        assert_eq!(models.enablements().len(), 0);
     }
 
     #[test]

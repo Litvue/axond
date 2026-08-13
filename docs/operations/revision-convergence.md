@@ -129,7 +129,7 @@ scope, and slug. Six schemas exist today:
 | `axond.model-enablement.v1` | a tenant's or project's permission to use one catalogue offering | `schema`, `enablement_id`, `tenant_id`, `project_id` (a project's only), `offering_id`, `catalog_snapshot`, `wire_family`, `state`, `observed_price` (optional), `approved_price` (optional) |
 | `axond.model-alias.v1` | a project-scoped name for an ordered list of enablements | `schema`, `alias_id`, `tenant_id`, `project_id`, `wire_family`, `state`, `targets` |
 
-Five rules hold for every body schema, present and future:
+Six rules hold for every body schema, present and future:
 
 - **The identifier is inside the checksummed body.** A replica reads the schema
   before it reads anything else, so a revision cannot be interpreted under a
@@ -154,13 +154,23 @@ Five rules hold for every body schema, present and future:
   `schema` field is *skipped* by the model rules instead of refused, because
   untyped alias rows exist in revisions already stored and refusing one would
   stop an existing revision from hydrating on upgrade. Such a row is neither
-  validated nor refused — republish it from this build to have it checked. The
-  exception is exactly that shape: an alias whose `schema` field is *present* is
-  read strictly, so a marker that is not text is `incompatible` rather than a row
-  that quietly skips the alias rules. A
+  validated nor refused — republish it from this build to have it checked. A
   model *enablement* has no such history, so an untyped enablement is
   `incompatible` like every other untyped body
-  ([ADR 0041](../adr/0041-model-enablement-and-alias-contracts.md)).
+  ([ADR 0042](../adr/0042-model-enablement-and-alias-contracts.md)). The
+  exception is the *absence* of the field and nothing else: an alias body that
+  carries a `schema` whose value is not text is read strictly and refused, so a
+  damaged marker cannot skip the alias rules unreported. Reads accommodate rows
+  already in the journal; the slice that gains an authoring path is where
+  refusing to *write* a new untyped alias belongs.
+- **A sub-record is part of its schema.** `observed_price` and `approved_price`
+  in an enablement, and each entry of an alias's `targets`, define their own field
+  sets (`input_micros_per_million`/`output_micros_per_million`,
+  `price_id`/`version`, `enablement_id`/`version`). A key a newer release added
+  inside one is an unknown field — named by its path, as
+  `approved_price.effective_from` — and is the same `incompatible` refusal an
+  extra top-level field is, rather than a value read past and dropped. A value
+  that is missing or wrongly typed inside a sub-record is named by its path too.
 - **A body that declares a schema this build reads, and then is not one, is
   damage.** Past the identifier the field set is known, so a `v1` body missing a
   `v1` field, or carrying one whose type changed, is reported as `corrupt` and not
@@ -168,13 +178,9 @@ Five rules hold for every body schema, present and future:
   is pointed at storage rather than away from it. (A *display name* this build will
   not take is the exception, and is `incompatible`: validation rules can tighten
   within one schema — this build refuses an invisible byte-order mark an earlier
-  one accepted.) A tenancy, credential, policy, or model *enablement* body that is
-  not an inline record, or that sits under a kind it does not match, is damage for
-  the same reason: every release that has written one wrote an inline record, so no
-  skew produces a scalar or a blob there. An **alias** row is the exception again
-  and for the same reason as above: a body that is not an inline record carries no
-  targets, no scope, and no wire family, so it grants nothing and is skipped rather
-  than refused, the way an untyped one is.
+  one accepted.) A body that is not an inline record, or that sits under a kind it
+  does not match, is damage for the same reason: every release that has written a
+  tenancy body wrote an inline record, so no skew produces a scalar or a blob there.
 - **A change to a field's presence or meaning is a new identifier.** `v1` bodies
   never change shape, so a checksum computed by one release is computed the same
   way by every release that accepts it. Adding a field, renaming one, or changing
@@ -339,7 +345,7 @@ An enablement body names an offering by an **opaque derived identity**
 published, and pins the **catalogue snapshot** it was approved against; the
 resource depends on the blob declaring that snapshot, so a revision cannot pin a
 snapshot it does not carry ([ADR
-0041](../adr/0041-model-enablement-and-alias-contracts.md)). The pin must resolve
+0042](../adr/0042-model-enablement-and-alias-contracts.md)). The pin must resolve
 to a `CatalogModel` dependency whose body is a blob of kind `CatalogSnapshot`
 with a matching digest — an unresolvable pin is an **invalid** revision, not a
 compatibility skew, and a revision whose enablements have lost the catalogue they
@@ -457,15 +463,48 @@ The refusal reason is the triage key.
   the secret store while the candidate was compiled: the version is withdrawn
   (`disabled`, `revoked`, or `tombstoned`), belongs to another owner, was never
   staged, is sealed under a KEK this deployment no longer has, or the store is
-  down. Material a serving snapshot already holds is unaffected — the replica keeps
-  serving it, because a candidate is compiled in full before anything is published
+  down. A credential whose own body records the withdrawal is *skipped* rather
+  than resolved, so the revision that withdraws material still compiles; the
+  rejection above is the disagreement — a body that says `active` over a store row
+  that says otherwise. Material a serving snapshot already holds is unaffected —
+  the replica keeps serving it, because a candidate is compiled in full before
+  anything is published
   ([ADR 0039](../adr/0039-envelope-encrypted-secret-store-and-snapshot-time-resolution.md)).
   A *booting* replica is stricter than a serving one here, and deliberately: an
   unreachable control plane falls back to the last-known-good cache, but an
   unreachable secret store fails the boot outright, because the cached revision
   needs the same material the live one does and a replica that started without it
   would serve nothing. Treat a secret store as a boot dependency of a stateful
-  replica, like the control plane's database — scale-out waits on it.
+  replica, like the control plane's database — scale-out waits on it. A boot that
+  cannot prepare the store's schema refuses *permanently* only for a `SQLSTATE`
+  an operator has to clear (class `42` access/undefined-object apart from the
+  duplicate-object codes, `3F` invalid schema name), and its message names the
+  grant or the DDL to apply. A server that
+  is starting up, out of connections, deadlocked, or racing a sibling replica's
+  `CREATE TABLE IF NOT EXISTS` (`23505`, `42P07`, `42710`) stays retryable, so a
+  whole fleet booting at once does not turn a hiccup into a permanent refusal.
+  The boot *connection* is classified the same way — a wrong role or password
+  (`28*`) or an absent database (`3D*`) refuses and names the `dsn_env` string to
+  fix. Reconnections during the life of a serving replica are not: the same codes
+  arrive during a credential rotation the deployment is halfway through, and a
+  replica already serving should wait rather than strand itself. `25006`
+  (read-only transaction) is retryable on purpose, at boot and on reconnect
+  alike: a `dsn_env` pointed at a hot standby says it, but so does a primary
+  mid-demotion and a pooler routing to a replica during a failover, and a
+  transient failover must never permanently refuse a replica.
+
+  The misconfiguration is separated out by a boot preflight instead. Once
+  connected, boot asks the server `pg_is_in_recovery()` and whether the session
+  is read-only, and logs a warning naming the endpoint before any statement
+  fails. If a later `25006` does arrive, that answer is attached to the
+  (retryable) outage: *in recovery* means the `dsn_env` names a standby and has
+  to be repointed at the primary unless a failover is under way, and *not in
+  recovery but read-only* points at `default_transaction_read_only` on the role
+  or the database, or at the pooler's routing. A server that accepted writes at
+  the preflight and refuses them now is being demoted, so the outage carries no
+  diagnostic and simply retries. A standing misconfiguration therefore repeats
+  its diagnostic in every retried outage under the `secret` reason — check there
+  before suspecting the store is down.
 - **`projection`** — a candidate this build cannot project: a resource body it
   does not read, or a bootstrap that is missing something projection may not
   supply for it (today, a default namespace). Roll the replica forward, publish a
