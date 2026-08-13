@@ -48,8 +48,11 @@ use crate::principals::constant_time_eq;
 /// has needs to be told the surfaces are disjoint, not that its token expired.
 pub const INFERENCE_TOKEN_PREFIX: &str = "axt1.";
 
-/// The inference API-key header. Accepted nowhere on `/admin/v1`; its presence
-/// is treated as an inference credential being offered, for the same reason.
+/// The inference API-key header. Never a credential on `/admin/v1`: it is not
+/// read, and when it is the *only* thing presented the refusal names it, for the
+/// same reason. Alongside a bearer token it is ignored rather than fatal — a
+/// stray header from a shared client must not unauthenticate an administrator
+/// who did present an administrative credential.
 pub const INFERENCE_KEY_HEADER: &str = "x-api-key";
 
 /// Who is using the breakglass credential.
@@ -71,9 +74,11 @@ impl fmt::Debug for AdminCredential {
 impl AdminCredential {
     /// The bearer token an administrative request presented.
     ///
-    /// Only `Authorization: Bearer`. The inference `x-api-key` header is refused
-    /// as an inference credential rather than ignored, so a caller that guessed
-    /// the surfaces share credentials gets an explanation.
+    /// Only `Authorization: Bearer`. A caller that presented nothing else but an
+    /// inference `x-api-key`, or a bearer token that is a minted inference
+    /// token, is refused as having offered an inference credential rather than
+    /// none, so a caller that guessed the surfaces share credentials gets an
+    /// explanation instead of a bare `401`.
     pub fn from_headers(headers: &HeaderMap) -> Result<Self, AdminAuthError> {
         let bearer = headers
             .get(AUTHORIZATION)

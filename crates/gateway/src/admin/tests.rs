@@ -510,6 +510,31 @@ async fn a_stray_attribution_header_does_not_reject_an_administrator() {
     assert_eq!(AdminError::from(error).code(), "admin_unauthenticated");
 }
 
+#[tokio::test]
+async fn a_stray_inference_key_does_not_reject_an_administrator() {
+    // `x-api-key` names the refusal when it is all a caller offered, because
+    // then it is what the caller meant to authenticate with. Alongside an
+    // administrative bearer token it is a stray header from a shared client, and
+    // it is ignored rather than fatal — it is never read, so it grants nothing
+    // either way.
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {HUMAN_TOKEN}")).unwrap(),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static(INFERENCE_KEY_HEADER),
+        HeaderValue::from_static("sk-gateway-inference-key"),
+    );
+
+    let presented = AdminPresented::from_headers(&headers).expect("a presented OIDC credential");
+    let identity = authenticator()
+        .authenticate(&presented)
+        .await
+        .expect("a stray inference key does not unauthenticate a human");
+    assert_eq!(identity, human());
+}
+
 // ---------------------------------------------------------------------------
 // Preconditions
 // ---------------------------------------------------------------------------

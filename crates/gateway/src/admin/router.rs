@@ -58,6 +58,7 @@
 //! [`AdminIdentity`]: super::auth::AdminIdentity
 //! [`MutationPreconditions`]: super::protocol::MutationPreconditions
 
+use std::error::Error as _;
 use std::sync::Arc;
 
 use axum::Router;
@@ -66,6 +67,7 @@ use axum::http::HeaderMap;
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::Response;
 use axum::routing::MethodRouter;
+use tracing::warn;
 
 use super::auth::{
     AdminAction, AdminAuthenticator, AdminAuthorizer, AdminGrant, AdminIdentity, AdminPresented,
@@ -196,7 +198,23 @@ async fn admin_authenticate(
     mut request: Request,
     next: Next,
 ) -> Result<Response, AdminError> {
-    let identity = api.authenticate(&headers).await?;
+    let identity = match api.authenticate(&headers).await {
+        Ok(identity) => identity,
+        Err(error) => {
+            // The body says only that authentication failed, deliberately. The
+            // operator still needs the distinction — most of all when breakglass
+            // was refused for want of its two attribution headers, during the
+            // incident that is the reason breakglass exists — and no
+            // `AdminAuthError` has anywhere to put presented material, so the
+            // cause is safe to log even though it is not safe to return.
+            warn!(
+                code = error.code(),
+                cause = error.source().map(ToString::to_string).as_deref(),
+                "administrative authentication failed"
+            );
+            return Err(error);
+        }
+    };
     if action.mutates() {
         let preconditions = MutationPreconditions::from_headers(&headers)?;
         request.extensions_mut().insert(preconditions);
