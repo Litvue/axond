@@ -207,11 +207,13 @@ and loses the active snapshot.
 3. **Find the location.** The refusal's log line carries the typed error the
    parser produced, and a JSON Pointer into the payload whenever the refusal was
    decided at one location: that pointer is the whole diagnosis for a `price`,
-   `identifier`, `id_mismatch`, or modality/status refusal. A `not_json`,
-   `schema`, or `content` refusal names no single location — the deserializer's
-   line and column in the message text is the lead there. The pointer is
-   deliberately absent from metrics and from the status response, where it would
-   be unbounded.
+   `identifier`, `id_mismatch`, or modality/status refusal, and for a `schema`
+   refusal decided inside a record — a field that went missing or changed type
+   is named at the record or field it happened at, not by a byte offset. Only a
+   `not_json` refusal, a `schema` refusal of the document root, and a `content`
+   refusal name no single location; the message text is the lead there. The
+   pointer is deliberately absent from metrics and from the status response,
+   where it would be unbounded.
 4. **Decide by age, not by the alert.** Age is when this gateway last confirmed
    the content current — an import or a `304`, not a retrieval time the document
    claims — so a freshly imported offline seed reads as fresh

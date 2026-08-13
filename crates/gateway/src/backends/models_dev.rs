@@ -115,7 +115,12 @@ pub enum ModelsDevError {
     #[error("the payload is not JSON: {message}")]
     NotJson { message: String },
     #[error("the payload is not a models.dev catalogue document: {message}")]
-    Schema { message: String },
+    Schema {
+        /// Where the deserializer was when it refused, when it was anywhere: a
+        /// document that is not an object at all is refused before any field.
+        pointer: Option<JsonPointer>,
+        message: String,
+    },
     #[error("`{pointer}` is keyed `{key}` but its `id` is `{id}`")]
     IdMismatch {
         pointer: JsonPointer,
@@ -173,6 +178,14 @@ pub enum ModelsDevError {
 }
 
 impl ModelsDevError {
+    /// A schema refusal decided at a known location in the payload.
+    fn schema_at(pointer: JsonPointer, message: impl Into<String>) -> Self {
+        Self::Schema {
+            pointer: Some(pointer),
+            message: message.into(),
+        }
+    }
+
     fn identifier(pointer: &JsonPointer, source: InvalidCatalogId) -> Self {
         Self::Identifier {
             pointer: pointer.clone(),
@@ -192,7 +205,10 @@ impl Refusable for ModelsDevError {
         match self {
             Self::UnsupportedEndpoint { .. } => Refusal::new(RefusalReason::UnsupportedEndpoint),
             Self::NotJson { .. } => Refusal::new(RefusalReason::NotJson),
-            Self::Schema { .. } => Refusal::new(RefusalReason::Schema),
+            Self::Schema { pointer, .. } => pointer.clone().map_or_else(
+                || Refusal::new(RefusalReason::Schema),
+                |pointer| Refusal::at(RefusalReason::Schema, pointer),
+            ),
             Self::IdMismatch { pointer, .. } => {
                 Refusal::at(RefusalReason::IdMismatch, pointer.clone())
             }
@@ -303,17 +319,26 @@ impl ModelsDevAdapter {
         let text = std::str::from_utf8(payload).map_err(|error| ModelsDevError::NotJson {
             message: error.to_string(),
         })?;
-        let document: WireCatalog = serde_json::from_str(text).map_err(|error| {
-            if error.is_syntax() || error.is_eof() {
-                ModelsDevError::NotJson {
-                    message: error.to_string(),
+        // Deserialized through a path-tracking wrapper so that a missing field
+        // or a changed type is refused *at a pointer*, like every other refusal:
+        // serde's own line and column describe the bytes, and an operator
+        // diagnosing drift needs the field.
+        let mut deserializer = serde_json::Deserializer::from_str(text);
+        let document: WireCatalog =
+            serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
+                let pointer = json_pointer(error.path());
+                let inner = error.into_inner();
+                if inner.is_syntax() || inner.is_eof() {
+                    ModelsDevError::NotJson {
+                        message: inner.to_string(),
+                    }
+                } else {
+                    ModelsDevError::Schema {
+                        pointer,
+                        message: inner.to_string(),
+                    }
                 }
-            } else {
-                ModelsDevError::Schema {
-                    message: error.to_string(),
-                }
-            }
-        })?;
+            })?;
         let content = normalize(&document)?;
         let source = source_snapshot(
             self.source_url.clone(),
@@ -805,6 +830,35 @@ fn normalize(document: &WireCatalog) -> Result<CatalogContent, ModelsDevError> {
     CatalogContent::new(providers, models).map_err(|source| ModelsDevError::Content { source })
 }
 
+/// The deserializer's position, as a JSON Pointer into the payload.
+///
+/// `None` where the path names nothing — a payload that is not an object is
+/// refused before any field, and there is no location to hand an operator.
+/// `Segment::Unknown` is dropped rather than rendered: a segment the tracker
+/// could not name cannot be pointed at.
+fn json_pointer(path: &serde_path_to_error::Path) -> Option<JsonPointer> {
+    let mut pointer = JsonPointer::new("");
+    let mut named = false;
+    for segment in path.iter() {
+        match segment {
+            serde_path_to_error::Segment::Seq { index } => {
+                pointer = pointer.child(&index.to_string());
+                named = true;
+            }
+            serde_path_to_error::Segment::Map { key } => {
+                pointer = pointer.child(key);
+                named = true;
+            }
+            serde_path_to_error::Segment::Enum { variant } => {
+                pointer = pointer.child(variant);
+                named = true;
+            }
+            serde_path_to_error::Segment::Unknown => {}
+        }
+    }
+    named.then_some(pointer)
+}
+
 /// The payload location a field was read from, so an override points at the
 /// provider's own value rather than at the offering as a whole.
 fn field_pointer(offering: &JsonPointer, field: ModelField) -> JsonPointer {
@@ -992,8 +1046,11 @@ fn price(
         let tier_pointer = pointer.child("tiers").child(&index.to_string());
         let threshold = match tier.tier.kind.as_str() {
             "context" => PriceTierThreshold::ContextOver {
-                tokens: tier.tier.size.ok_or_else(|| ModelsDevError::Schema {
-                    message: format!("`{tier_pointer}/tier` states no `size`"),
+                tokens: tier.tier.size.ok_or_else(|| {
+                    ModelsDevError::schema_at(
+                        tier_pointer.child("tier"),
+                        "a `context` tier states no `size`",
+                    )
                 })?,
             },
             kind => {
@@ -1635,6 +1692,9 @@ mod tests {
             "price-type" => include_str!("fixtures/models_dev/drift.price-type.json"),
             "price-partial" => include_str!("fixtures/models_dev/drift.price-partial.json"),
             "tier-type" => include_str!("fixtures/models_dev/drift.tier-type.json"),
+            "tier-without-size" => {
+                include_str!("fixtures/models_dev/drift.tier-without-size.json")
+            }
             "tier-duplicate" => include_str!("fixtures/models_dev/drift.tier-duplicate.json"),
             "model-id-mismatch" => include_str!("fixtures/models_dev/drift.model-id-mismatch.json"),
             "model-id-case" => include_str!("fixtures/models_dev/drift.model-id-case.json"),
@@ -2002,14 +2062,41 @@ mod tests {
             ("top-level-array", |error| {
                 matches!(error, ModelsDevError::Schema { .. })
             }),
+            // A required field missing from the document root is refused before
+            // the deserializer is anywhere, so there is no location to name and
+            // the message is the whole diagnosis.
             ("missing-providers", |error| {
-                matches!(error, ModelsDevError::Schema { .. })
+                matches!(error, ModelsDevError::Schema { pointer: None, .. })
             }),
+            // A field missing from a record is refused *at that record*: which
+            // of six thousand offerings dropped `name` is the diagnosis, and the
+            // deserializer's line and column is not it.
             ("missing-model-name", |error| {
-                matches!(error, ModelsDevError::Schema { .. })
+                matches!(
+                    error,
+                    ModelsDevError::Schema { pointer: Some(pointer), .. }
+                        if pointer.as_str() == "/providers/hpc-ai/models/openai~1gpt-5.5"
+                )
             }),
+            // A type change is refused at the field that changed type.
             ("limit-type", |error| {
-                matches!(error, ModelsDevError::Schema { .. })
+                matches!(
+                    error,
+                    ModelsDevError::Schema { pointer: Some(pointer), .. }
+                        if pointer.as_str()
+                            == "/providers/hpc-ai/models/openai~1gpt-5.5/limit/context"
+                )
+            }),
+            // The tier's own pointer, not the offering's: the code that refuses
+            // it already knows which tier, and "a tier states no size" without
+            // saying which is not a diagnosis.
+            ("tier-without-size", |error| {
+                matches!(
+                    error,
+                    ModelsDevError::Schema { pointer: Some(pointer), .. }
+                        if pointer.as_str()
+                            == "/providers/hpc-ai/models/openai~1gpt-5.5/cost/tiers/0/tier"
+                )
             }),
             (
                 "unknown-status",
@@ -2144,6 +2231,20 @@ mod tests {
                 expected(&error),
                 "`{name}` produced the wrong error: {error}"
             );
+            // The refusal an operator sees carries the same location the error
+            // decided at: a pointer the classifier drops on the way out is a
+            // pointer nobody can act on.
+            if let ModelsDevError::Schema {
+                pointer: Some(pointer),
+                ..
+            } = &error
+            {
+                assert_eq!(
+                    error.refusal().pointer(),
+                    Some(pointer),
+                    "`{name}`'s refusal must name where it was decided"
+                );
+            }
         }
     }
 
