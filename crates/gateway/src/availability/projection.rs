@@ -38,10 +38,11 @@
 //!
 //! The same holds in the other direction, for a key an *earlier* revision
 //! described and this one does not — a rollback that dropped an enablement, a
-//! project that was deleted, a catalogue snapshot no longer in hand. Its record
-//! keeps the evidence discovery paid for and loses every dimension, so it reads
-//! `unavailable (catalogue_absent)` rather than the permit the previous revision
-//! derived, and it is counted in [`ProjectedAvailability::undescribed`].
+//! project that was deleted, a catalogue snapshot no longer in hand. Its
+//! evidence is detached from the live index, counted in
+//! [`ProjectedAvailability::undescribed`], and handed to the owning writer as
+//! orphan-GC work. It therefore cannot outlive the desired key set or make the
+//! index grow monotonically through enablement churn.
 //!
 //! # Four durable dimensions and one that is not
 //!
@@ -58,8 +59,8 @@
 //! # Evidence survives the projection
 //!
 //! A projection *re-derives the dimensions*; it does not re-derive evidence. It
-//! starts from the previous index's evidence alone
-//! ([`AvailabilityIndexBuilder::carrying_evidence`]), so
+//! starts from the previous index's evidence for keys the new revision still
+//! describes ([`AvailabilityIndexBuilder::carrying_evidence_for`]), so
 //! discovery evidence, the retained last-known-good look, and the definitive
 //! watermark are carried across every publication — a revision that changes a
 //! price does not reset what discovery established, and a discovery outage
@@ -361,6 +362,7 @@ pub struct ProjectedAvailability {
     index: AvailabilityIndex,
     unnameable: usize,
     undescribed: usize,
+    orphaned: Vec<AvailabilityKey>,
     skewed: usize,
     superseded: usize,
     misfiled: usize,
@@ -390,11 +392,19 @@ impl ProjectedAvailability {
         self.unnameable
     }
 
-    /// Keys the previous index held evidence for that this revision no longer
-    /// describes. Their records survive for the evidence, under fail-closed
-    /// dimensions: nothing a revision withdrew keeps reporting as permitted.
+    /// Number of keys the previous index held evidence for that this revision
+    /// no longer describes. Their evidence is detached from the live index and
+    /// returned through [`orphaned`](Self::orphaned) for durable cleanup.
     pub const fn undescribed(&self) -> usize {
         self.undescribed
+    }
+
+    /// Keys whose evidence was detached because the current revision stopped
+    /// describing them. A writer that owns the old evidence should clear these
+    /// keys from durable storage; a replica with only an empty projected record
+    /// does not own or clear anything.
+    pub fn orphaned(&self) -> &[AvailabilityKey] {
+        &self.orphaned
     }
 
     /// Enablements pinned to a superseded catalogue snapshot. Not a failure — an
@@ -450,8 +460,8 @@ impl<'a> AvailabilityProjection<'a> {
         let credentials = Credentials::of(state)?;
         let policies = PolicySet::of(state)?;
 
-        let mut builder = AvailabilityIndexBuilder::carrying_evidence(previous);
         let mut described = BTreeSet::new();
+        let mut declarations = Vec::new();
         let mut unnameable = 0;
         let mut skewed = 0;
 
@@ -478,27 +488,36 @@ impl<'a> AvailabilityProjection<'a> {
             };
             let key = AvailabilityKey::new(scope, target);
             described.insert(key.clone());
+            declarations.push((key, record));
+        }
+
+        let mut builder = AvailabilityIndexBuilder::carrying_evidence_for(previous, &described);
+        for (key, record) in declarations {
             builder = builder.record(key, record);
         }
 
         for observation in observations {
-            builder = builder.observe(observation);
+            if described.contains(&observation.key()) {
+                builder = builder.observe(observation);
+            }
         }
 
-        // Keys the revision in hand does not describe kept their evidence and lost
-        // their dimensions, so they read `unavailable` rather than the permit an
-        // earlier revision derived. Counted, because a target that stops being
-        // described is an operator-visible change — a rollback that dropped an
-        // enablement, or a catalogue snapshot this deployment no longer holds.
-        let undescribed = previous
+        // Evidence for a key the revision no longer describes is an orphan, not
+        // another live record with fail-closed dimensions. Keeping it would make
+        // the index grow monotonically as enablements churn; returning the exact
+        // keys gives the durable writer a bounded GC lifecycle as well.
+        let orphaned: Vec<AvailabilityKey> = previous
             .records()
             .filter(|(key, record)| record.holds_evidence() && !described.contains(*key))
-            .count();
+            .map(|(key, _)| key.clone())
+            .collect();
+        let undescribed = orphaned.len();
 
         Ok(ProjectedAvailability {
             derivation: 0,
             unnameable,
             undescribed,
+            orphaned,
             skewed,
             superseded: builder.superseded(),
             misfiled: builder.misfiled(),
@@ -599,6 +618,10 @@ pub struct AvailabilityEvidence {
     catalogue: Mutex<Arc<Catalogue>>,
     index: Mutex<Arc<AvailabilityIndex>>,
     pending: Mutex<Vec<DiscoveryObservation>>,
+    /// Keys detached by projection and awaiting the writer that owns their old
+    /// evidence. An empty record never enters this set, which is what keeps a
+    /// replica that has not looked from deleting another replica's rows.
+    orphaned: Mutex<BTreeSet<AvailabilityKey>>,
     /// What the last derivation was told, so a later look can be folded in
     /// without waiting for a revision that may never come.
     ///
@@ -639,6 +662,7 @@ pub struct AvailabilityEvidence {
 struct Superseded {
     derivation: u64,
     index: Arc<AvailabilityIndex>,
+    orphaned: BTreeSet<AvailabilityKey>,
     derived_from: Option<(Arc<DesiredState>, CredentialReadiness)>,
     looks: Vec<DiscoveryObservation>,
 }
@@ -650,6 +674,7 @@ impl AvailabilityEvidence {
             catalogue: Mutex::new(Arc::new(catalogue)),
             index: Mutex::new(Arc::new(AvailabilityIndex::empty())),
             pending: Mutex::new(Vec::new()),
+            orphaned: Mutex::new(BTreeSet::new()),
             derived_from: Mutex::new(None),
             deriving: Mutex::new(()),
             replaced: Mutex::new(None),
@@ -703,11 +728,16 @@ impl AvailabilityEvidence {
     /// holds.
     ///
     /// Written by whatever owns discovery, off the request path. Carries no
-    /// operator detail and no dimension a revision states, and names the keys it
-    /// holds *no* evidence for as well as those it does — a look a definitive
-    /// conclusion discredited must not outlive the process that discredited it.
+    /// operator detail and no dimension a revision states. Only keys this
+    /// replica previously held evidence for are eligible for orphan cleanup;
+    /// empty projected records do not claim a key.
     pub fn persistable(&self) -> EvidenceWrite {
-        EvidenceWrite::of_index(&self.index())
+        let orphaned = self
+            .lock(&self.orphaned)
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        EvidenceWrite::of_index(&self.index()).clearing(orphaned)
     }
 
     /// Project `state` over the evidence held, publish the result, and return it.
@@ -747,12 +777,19 @@ impl AvailabilityEvidence {
             *derivations += 1;
             *derivations
         };
+        let orphaned = projected
+            .orphaned()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         *self.lock(&self.replaced) = Some(Superseded {
             derivation,
             index: previous,
+            orphaned: self.lock(&self.orphaned).clone(),
             derived_from: self.lock(&self.derived_from).clone(),
             looks: pending,
         });
+        self.lock(&self.orphaned).extend(orphaned);
         *self.lock(&self.index) = Arc::new(projected.index().clone());
         *self.lock(&self.derived_from) = Some((Arc::new(state.clone()), readiness.clone()));
         Ok(ProjectedAvailability {
@@ -787,6 +824,7 @@ impl AvailabilityEvidence {
         };
         drop(held);
         *self.lock(&self.index) = replaced.index;
+        *self.lock(&self.orphaned) = replaced.orphaned;
         *self.lock(&self.derived_from) = replaced.derived_from;
         let mut queued = self.lock(&self.pending);
         let since: Vec<DiscoveryObservation> = queued.drain(..).collect();

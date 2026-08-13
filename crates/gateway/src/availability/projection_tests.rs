@@ -508,9 +508,9 @@ fn evidence_survives_the_next_projection() {
 }
 
 /// The other half of that rule: a key the revision in hand no longer describes
-/// loses the permit the previous one derived. It keeps its evidence — the look
-/// was still taken — but every dimension is re-stated by the revision or not at
-/// all, so the answer falls to a refusal rather than outliving its authority.
+/// loses the permit the previous one derived and is detached from the live
+/// index. Its old evidence becomes explicit orphan-GC work rather than a record
+/// that grows forever as enablements churn.
 #[test]
 fn a_target_the_revision_stopped_describing_stops_being_permitted() {
     let deployment = Deployment::new().entitled().governed();
@@ -548,19 +548,62 @@ fn a_target_the_revision_stopped_describing_stops_being_permitted() {
         .expect("the revision projects again");
 
     assert_eq!(again.undescribed(), 1);
+    assert_eq!(again.orphaned(), &[deployment.key()]);
     let verdict = verdict(&again, &deployment.key(), 100);
-    assert_eq!(verdict.state, AvailabilityState::Unavailable);
-    assert_eq!(verdict.decided_by, DecidedBy::Catalogue);
+    assert_eq!(verdict, Availability::no_record());
     assert!(!verdict.permits_attempt());
-    assert!(
-        again
-            .index()
-            .record(&deployment.key())
-            .expect("the evidence outlives the description")
-            .discovery
-            .is_some(),
-        "the look was still taken, and a later revision may describe the target again"
+    assert!(again.index().record(&deployment.key()).is_none());
+}
+
+/// Orphan evidence is detached once and does not accumulate when a target is
+/// repeatedly removed and reintroduced.
+#[test]
+fn removed_targets_have_a_bounded_orphan_evidence_lifecycle() {
+    let deployment = Deployment::new().entitled().governed();
+    let evidence = AvailabilityEvidence::new(catalogue());
+    evidence.observe(DiscoveryObservation::new(
+        deployment.scope(),
+        target(),
+        DiscoveryResult::Present,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        at(90),
+    ));
+    evidence
+        .derive(&deployment.state, &resolved(40))
+        .expect("the target projects");
+
+    let empty = DesiredState::new();
+    for _ in 0..32 {
+        let removed = evidence
+            .derive(&empty, &resolved(40))
+            .expect("removing the target projects");
+        assert!(removed.index().is_empty());
+        assert_eq!(removed.orphaned(), &[deployment.key()]);
+        assert_eq!(evidence.index().len(), 0);
+
+        evidence.observe(DiscoveryObservation::new(
+            deployment.scope(),
+            target(),
+            DiscoveryResult::Present,
+            DiscoveryCompleteness::Complete,
+            DiscoverySource::ProviderListing,
+            at(100),
+        ));
+        let restored = evidence
+            .derive(&deployment.state, &resolved(40))
+            .expect("reintroducing the target projects");
+        assert_eq!(restored.index().len(), 1);
+        assert!(restored.index().record(&deployment.key()).is_some());
+    }
+
+    let write = evidence.persistable();
+    assert_eq!(
+        write.rows().len(),
+        2,
+        "the reintroduced target owns its current and fallback slots"
     );
+    assert_eq!(write.cleared(), &[deployment.key()]);
 }
 
 /// A key nobody ever learned anything about leaves nothing behind: only evidence

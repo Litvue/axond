@@ -111,7 +111,7 @@
 //!
 //! [`ConfigSnapshot::with_availability`]: crate::state::ConfigSnapshot::with_availability
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use super::dimensions::{
@@ -475,11 +475,34 @@ impl AvailabilityIndexBuilder {
     /// rather than its former permit, and a key that held no evidence at all
     /// simply ceases to exist.
     pub fn carrying_evidence(index: &AvailabilityIndex) -> Self {
+        Self::carrying_evidence_where(index, |_, record| record.holds_evidence())
+    }
+
+    /// Start from an existing index's evidence, keeping only the keys the
+    /// current revision still describes.
+    ///
+    /// Evidence belongs to a target while that target is part of the current
+    /// desired view. Once the view stops naming it, the projection owns the
+    /// orphan-GC decision; retaining it here would make the index grow forever
+    /// as enablements churn.
+    pub fn carrying_evidence_for(
+        index: &AvailabilityIndex,
+        keys: &BTreeSet<AvailabilityKey>,
+    ) -> Self {
+        Self::carrying_evidence_where(index, |key, record| {
+            keys.contains(key) && record.holds_evidence()
+        })
+    }
+
+    fn carrying_evidence_where(
+        index: &AvailabilityIndex,
+        keep: impl Fn(&AvailabilityKey, &AvailabilityRecord) -> bool,
+    ) -> Self {
         Self {
             records: index
                 .records
                 .iter()
-                .filter(|(_, record)| record.holds_evidence())
+                .filter(|(key, record)| keep(key, record))
                 .map(|(key, record)| {
                     let evidence = AvailabilityRecord {
                         discovery: record.discovery.clone(),

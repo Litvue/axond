@@ -683,6 +683,30 @@ fn refused_or_unavailable(operation: &str, error: &tokio_postgres::Error) -> Con
     ))
 }
 
+/// Classify an observation write's SQLSTATE by whether the statement can ever
+/// succeed unchanged. Integrity and data exceptions are permanent input/schema
+/// refusals; connection and transaction failures remain retryable outages.
+fn observation_write_failure(operation: &str, error: &tokio_postgres::Error) -> ControlPlaneError {
+    let Some(db) = error.as_db_error() else {
+        return unavailable(operation, error);
+    };
+    if is_permanent_observation_sqlstate(db.code()) {
+        return denied(format!(
+            "{operation} was permanently refused: {} (SQLSTATE {}); no retry of the same evidence clears it",
+            db.message(),
+            db.code().code()
+        ));
+    }
+    unavailable(operation, error)
+}
+
+/// SQLSTATEs an evidence write cannot retry away without changing the row or
+/// the schema. Keep this explicit: a foreign-key violation against a removed
+/// tenant/project must not become an availability outage.
+fn is_permanent_observation_sqlstate(code: &SqlState) -> bool {
+    matches!(code.code().get(..2), Some("22" | "23"))
+}
+
 /// Report a Postgres failure as an outage, naming the operation and SQLSTATE.
 ///
 /// SQLSTATE is included because "connection reset" and "deadlock detected" are
@@ -1115,7 +1139,9 @@ impl ObservationStore for PostgresControlPlane {
                             ],
                         )
                         .await
-                        .map_err(|error| unavailable("replace discovery evidence", &error))?;
+                        .map_err(|error| {
+                            observation_write_failure("replace discovery evidence", &error)
+                        })?;
                 }
                 for row in &rows {
                     // `detail` is dropped at the boundary rather than filtered on
@@ -1142,7 +1168,9 @@ impl ObservationStore for PostgresControlPlane {
                             ],
                         )
                         .await
-                        .map_err(|error| unavailable("record discovery evidence", &error))?;
+                        .map_err(|error| {
+                            observation_write_failure("record discovery evidence", &error)
+                        })?;
                 }
                 transaction
                     .commit()
@@ -5194,6 +5222,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn observation_integrity_sqlstates_are_permanent() {
+        for code in [
+            &SqlState::FOREIGN_KEY_VIOLATION,
+            &SqlState::UNIQUE_VIOLATION,
+            &SqlState::CHECK_VIOLATION,
+            &SqlState::NOT_NULL_VIOLATION,
+            &SqlState::EXCLUSION_VIOLATION,
+        ] {
+            assert!(
+                is_permanent_observation_sqlstate(code),
+                "{code:?} must not be classified as an outage"
+            );
+        }
+        assert!(!is_permanent_observation_sqlstate(
+            &SqlState::CONNECTION_FAILURE
+        ));
+        assert!(!is_permanent_observation_sqlstate(
+            &SqlState::T_R_SERIALIZATION_FAILURE
+        ));
+    }
+
     /// A journal row refused by 0004's ownership key is a refusal, not weather —
     /// nothing clears it by waiting — and it names the key rather than the tenant
     /// the key refused.
@@ -5970,15 +6020,97 @@ mod tests {
             "a cleared key does not survive the process that cleared it"
         );
 
-        // And an index that describes the key without holding a look asks for the
-        // same thing, so the writer does not have to remember which keys emptied.
+        // A definitive watermark is explicit ownership of a key whose looks were
+        // discredited, so an index asks for the same cleanup without a separate
+        // caller-side ledger.
         let write = EvidenceWrite::of_index(
             &AvailabilityIndex::builder()
-                .record(key.clone(), AvailabilityRecord::enabled())
+                .record(
+                    key.clone(),
+                    AvailabilityRecord {
+                        definitive_at: Some(instant(100)),
+                        ..AvailabilityRecord::enabled()
+                    },
+                )
                 .build(),
         );
         assert!(write.rows().is_empty());
         assert_eq!(write.cleared(), &[key]);
+    }
+
+    /// A replica that has only projected an empty record does not own that
+    /// evidence key. Its durable write must not clear a look another replica
+    /// recorded for the same scope and target.
+    #[tokio::test]
+    async fn an_empty_replica_write_does_not_clear_another_replicas_evidence() {
+        let Some((store, dsn, schema)) = journal().await else {
+            return;
+        };
+        store
+            .publish_revision(candidate(ExpectedRevision::Empty, "state", state()))
+            .await
+            .expect("a tenant exists to own evidence");
+
+        let scope = ScopeRef::tenant(tenant_id(1));
+        let key = AvailabilityKey::new(scope, observation_target());
+        store
+            .save(&EvidenceWrite::of_rows(vec![StoredObservation {
+                key: key.clone(),
+                slot: ObservationSlot::Current,
+                observation: look(
+                    scope,
+                    DiscoveryResult::Present,
+                    DiscoveryCompleteness::Complete,
+                    instant(100),
+                ),
+                definitive_at: Some(instant(100)),
+            }]))
+            .await
+            .expect("replica A writes its look");
+
+        let replica_b = second_store(&dsn, &schema).await;
+        let empty_projection = AvailabilityIndex::builder()
+            .record(key.clone(), AvailabilityRecord::enabled())
+            .build();
+        replica_b
+            .save(&EvidenceWrite::of_index(&empty_projection))
+            .await
+            .expect("replica B has no owned evidence to replace");
+
+        let rows = store.load(Some(scope)).await.expect("read evidence");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, key);
+        assert_eq!(rows[0].observation.result, DiscoveryResult::Present);
+    }
+
+    /// A stale discovery writer naming a tenant the journal no longer owns is a
+    /// permanent FK refusal, not a retryable control-plane outage.
+    #[tokio::test]
+    async fn an_observation_foreign_key_failure_is_permanent_not_unavailable() {
+        let Some((store, _dsn, _schema)) = journal().await else {
+            return;
+        };
+        let scope = ScopeRef::tenant(tenant_id(999));
+        let error = store
+            .save(&EvidenceWrite::of_rows(vec![StoredObservation {
+                key: AvailabilityKey::new(scope, observation_target()),
+                slot: ObservationSlot::Current,
+                observation: look(
+                    scope,
+                    DiscoveryResult::Present,
+                    DiscoveryCompleteness::Complete,
+                    instant(100),
+                ),
+                definitive_at: Some(instant(100)),
+            }]))
+            .await
+            .expect_err("the observation FK refuses a missing tenant");
+
+        assert!(matches!(error, ControlPlaneError::Denied { .. }));
+        assert!(
+            !error.retryable(),
+            "an FK violation is not cleared by retrying"
+        );
     }
 
     /// Availability is entitlement, and entitlement is a tenant's: which models

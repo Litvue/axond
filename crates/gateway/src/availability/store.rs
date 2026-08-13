@@ -108,8 +108,8 @@ impl StoredObservation {
     }
 }
 
-/// One write of a replica's evidence: the looks it holds, and the keys it holds
-/// none for.
+/// One single-writer replacement of a replica's evidence: the looks it owns,
+/// and explicit keys whose old evidence it owns and is clearing.
 ///
 /// Both halves, because a row set alone cannot say that a key *stopped* having
 /// evidence. A record whose looks were all discredited emits no row, and a write
@@ -117,10 +117,11 @@ impl StoredObservation {
 /// place for the next restart to believe — the evidence a complete listing
 /// removed would come back every time the process did.
 ///
-/// [`of_index`](Self::of_index) derives both from one index, so the answer to
-/// "which keys were cleared" is a fact of the index rather than bookkeeping a
-/// caller has to keep: a key the replica knows about and holds no look for must
-/// not have a stored look.
+/// [`of_index`](Self::of_index) derives rows from one index. It only derives an
+/// implicit clear for a key with a definitive watermark and no remaining look;
+/// an empty projected record has no evidence-key ownership and therefore cannot
+/// delete another replica's row. Orphaned keys are passed through
+/// [`clearing`](Self::clearing) by the replica that detached evidence it owned.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EvidenceWrite {
     rows: Vec<StoredObservation>,
@@ -128,20 +129,17 @@ pub struct EvidenceWrite {
 }
 
 impl EvidenceWrite {
-    /// Everything an index says about durable evidence: its looks, and the keys
-    /// it describes without any.
+    /// Everything an index says about durable evidence: its looks, and keys
+    /// whose definitive conclusion discredited every held look.
     pub fn of_index(index: &AvailabilityIndex) -> Self {
         Self {
             rows: StoredObservation::of_index(index),
             cleared: index
                 .records()
-                // Holding *a look* rather than holding evidence: a record whose
-                // looks a later definitive conclusion discredited keeps its
-                // watermark and emits no row, so asking the broader question
-                // would leave exactly the discredited rows this half exists to
-                // remove.
                 .filter(|(_, record)| {
-                    record.discovery.is_none() && record.last_known_good.is_none()
+                    record.definitive_at.is_some()
+                        && record.discovery.is_none()
+                        && record.last_known_good.is_none()
                 })
                 .map(|(key, _)| key.clone())
                 .collect(),
@@ -161,6 +159,8 @@ impl EvidenceWrite {
     #[must_use]
     pub fn clearing(mut self, keys: impl IntoIterator<Item = AvailabilityKey>) -> Self {
         self.cleared.extend(keys);
+        self.cleared.sort();
+        self.cleared.dedup();
         self
     }
 
