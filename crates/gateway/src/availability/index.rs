@@ -21,22 +21,26 @@
 //!    to be entitled to; `unavailable`, and no other dimension is consulted,
 //!    because entitlement or discovery evidence about a model this deployment does
 //!    not carry is meaningless.
-//! 2. **Policy.** A deployment-level refusal outranks everything a tenant has
-//!    enabled or is entitled to. `denied` when refused, and `unknown` when the
-//!    policy could not be decided — an undecided policy is not a permit.
-//! 3. **Enablement.** The scope's own switch. `denied` when not enabled, so
-//!    "unknown or stale evidence is routable only under explicit enablement" is
-//!    structural: a verdict of `unknown` or `stale` from any later rung is only
-//!    reachable past this one. Checked before entitlement because a target the
-//!    scope never asked for should say so, rather than reporting whatever its
-//!    account happens to be entitled to.
-//! 4. **Entitlement.** The provider account's own answer. `denied` when missing or
+//! 2. **Policy refusal.** A deployment-level refusal outranks everything a tenant
+//!    has enabled or is entitled to: `denied`.
+//! 3. **Enablement.** The scope's own switch. `denied` when not enabled. Every rung
+//!    that can answer `unknown` sits *below* this one — including an undecided
+//!    policy, which is why policy is split across rungs 2 and 4 — so "unknown or
+//!    stale evidence is routable only under explicit enablement" is structural
+//!    rather than a rule a caller has to remember. Checked before entitlement
+//!    because a target the scope never asked for should say so, rather than
+//!    reporting whatever its account happens to be entitled to.
+//! 4. **Policy indeterminacy.** An undecided policy is not a permit: `unknown`.
+//! 5. **Entitlement.** The provider account's own answer. `denied` when missing or
 //!    revoked, `unknown` when never established.
-//! 5. **Runtime health.** Replica-local: an open circuit is `unavailable`. Placed
-//!    above evidence uncertainty deliberately — an operator who can see requests
-//!    failing right now is better served by `unavailable` than by `unknown`, and
-//!    both are non-routable-by-default anyway.
-//! 6. **Discovery evidence.** `available`, `stale`, `unknown`, or `denied`, per
+//! 6. **Runtime health.** Replica-local. An open circuit is `unavailable`, because
+//!    this replica is already skipping the target; intermittent failure short of
+//!    tripping is `unknown`, because the breaker would still attempt it (ADR 0008)
+//!    and refusing it here would deny a fleet a target that mostly works. Placed
+//!    above the evidence rung so a flaky target does not report as plainly
+//!    `available` — what this replica is living through outranks what a listing
+//!    said.
+//! 7. **Discovery evidence.** `available`, `stale`, `unknown`, or `denied`, per
 //!    [`DiscoveryObservation::verdict`], and `unknown` when nothing has looked
 //!    yet — still decided by discovery, which is what distinguishes it from a key
 //!    the index does not hold at all.
@@ -58,9 +62,13 @@
 //! - a definitive *negative* look clears last-known-good, because a complete
 //!   listing that no longer carries the target is precisely the evidence that the
 //!   retained positive is wrong;
-//! - an observation older than the one already held is ignored, so a late arrival
-//!   from a slow probe cannot rewind the index and evaluation does not depend on
-//!   the order observations arrive in;
+//! - the current slot always holds the newest look, so an older arrival from a slow
+//!   probe cannot rewind it, and the retained positive is displaced only by
+//!   evidence newer than itself. The two age independently, which is what makes
+//!   the index independent of the order observations arrive in: a definitive
+//!   positive that lands after a newer inconclusive look is still retained as
+//!   last-known-good, and a definitive negative that predates the retained
+//!   positive does not discredit it;
 //! - nothing ever infers a positive from a non-definitive look. Certainty only
 //!   rises when definitive evidence arrives, which is what
 //!   [`AvailabilityState::certainty`] makes testable.
@@ -223,28 +231,27 @@ impl AvailabilityIndex {
             }
             CataloguePresence::Present => {}
         }
-        match record.policy {
-            PolicyDecision::Denied => {
-                return Availability::decided(
-                    AvailabilityState::Denied,
-                    AvailabilityReason::PolicyDenied,
-                    DecidedBy::Policy,
-                );
-            }
-            PolicyDecision::Indeterminate => {
-                return Availability::decided(
-                    AvailabilityState::Unknown,
-                    AvailabilityReason::PolicyIndeterminate,
-                    DecidedBy::Policy,
-                );
-            }
-            PolicyDecision::Permitted => {}
+        if record.policy == PolicyDecision::Denied {
+            return Availability::decided(
+                AvailabilityState::Denied,
+                AvailabilityReason::PolicyDenied,
+                DecidedBy::Policy,
+            );
         }
+        // Above every rung that can answer `unknown`, so uncertainty is only ever
+        // reported for a target a scope switched on.
         if !record.enablement.is_enabled() {
             return Availability::decided(
                 AvailabilityState::Denied,
                 AvailabilityReason::NotEnabled,
                 DecidedBy::Enablement,
+            );
+        }
+        if record.policy == PolicyDecision::Indeterminate {
+            return Availability::decided(
+                AvailabilityState::Unknown,
+                AvailabilityReason::PolicyIndeterminate,
+                DecidedBy::Policy,
             );
         }
         match record.entitlement {
@@ -279,9 +286,14 @@ impl AvailabilityIndex {
                     DecidedBy::Runtime,
                 );
             }
+            // Not a refusal: an untripped target is still one the breaker would
+            // attempt (ADR 0008), so impairment lowers certainty rather than
+            // withdrawing the target. Deciding here — rather than falling through to
+            // the evidence — keeps the impairment visible instead of reporting a
+            // flaky target as plainly available.
             RuntimeHealth::Impaired => {
                 return Availability::decided(
-                    AvailabilityState::Unavailable,
+                    AvailabilityState::Unknown,
                     AvailabilityReason::RuntimeImpaired,
                     DecidedBy::Runtime,
                 );
@@ -375,15 +387,33 @@ impl AvailabilityIndexBuilder {
 
     /// Record a discovery observation.
     ///
-    /// The last-known-good rules are in the module docs; the short version is that
-    /// only definitive evidence changes what is retained, and an out-of-order
-    /// arrival changes nothing at all.
+    /// The two slots age independently, which is what makes the result independent
+    /// of arrival order: the current slot keeps the newest observation, and the
+    /// retained positive is only ever displaced by evidence newer than *itself*.
+    /// The rest of the rules are in the module docs.
     #[must_use]
     pub fn observe(mut self, observation: DiscoveryObservation) -> Self {
         let entry = self.records.entry(observation.key()).or_default();
-        // Against the newest evidence held, current *or* retained: a record whose
-        // last-known-good was declared without a current observation would
-        // otherwise let an older look re-adopt evidence it predates.
+        // Judged against the retained positive alone. A definitive look that
+        // predates it says nothing about it — the provider's answer at an earlier
+        // instant cannot discredit a later one — while a slow definitive positive
+        // that lands after a newer inconclusive look is still the best evidence
+        // held, and dropping it would cost the very fallback an outage needs.
+        let outranks_retained = entry
+            .last_known_good
+            .as_ref()
+            .is_none_or(|retained| observation.observed_at >= retained.observed_at);
+        if outranks_retained {
+            if observation.is_positive() {
+                entry.last_known_good = Some(observation.clone());
+            } else if observation.is_definitive() {
+                // A complete look that no longer carries the target is the one thing
+                // that discredits retained positive evidence.
+                entry.last_known_good = None;
+            }
+        }
+        // The current slot is the newest look, whatever it said, so an older
+        // arrival can never become the evidence a verdict reads first.
         let newest_held = entry
             .discovery
             .iter()
@@ -394,18 +424,13 @@ impl AvailabilityIndexBuilder {
             self.superseded += 1;
             return self;
         }
-        if observation.is_positive() {
-            entry.last_known_good = Some(observation.clone());
-        } else if observation.is_definitive() {
-            // A complete look that no longer carries the target is the one thing
-            // that discredits retained positive evidence.
-            entry.last_known_good = None;
-        }
         entry.discovery = Some(observation);
         self
     }
 
-    /// How many observations were ignored as older than what was already held.
+    /// How many observations did not advance the current slot because something
+    /// newer was already held. Such an arrival may still have been retained as
+    /// last-known-good, if it was the newest positive evidence held.
     pub fn superseded(&self) -> usize {
         self.superseded
     }

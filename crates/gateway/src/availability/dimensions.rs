@@ -160,7 +160,8 @@ impl PolicyDecision {
 pub enum RuntimeHealth {
     /// Recent requests succeeded.
     Healthy,
-    /// Failing intermittently, but not tripped.
+    /// Failing intermittently, but not tripped. Lowers certainty rather than
+    /// refusing: the breaker would still attempt the target.
     Impaired,
     /// The circuit is open: this replica is skipping the target.
     Unavailable,

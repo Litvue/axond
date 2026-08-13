@@ -262,11 +262,16 @@ and [ADR 0012](../adr/0012-native-provider-routes.md) bound wire families and
 native routes; `CatalogSource`'s background-only placement is in
 [backend contracts](../maintainers/backend-contracts.md). Item 2 of the security
 review's accepted-risk section is why `/v1/models` is authenticated and scoped —
-re-read it before changing that projection. Derived availability needs no new
-reasoning: it is a projection beside an immutable snapshot, which
+re-read it before changing that projection. The availability stance is a decision
+of its own and is written down as
+[ADR 0034](../adr/0034-derived-availability-and-discovery-evaluation.md): five
+states, the precedence ladder, expiry in both directions, last-known-good
+retention, and the rule that uncertainty is routable only where a scope chose it.
+It inherits rather than revises the snapshot reasoning of
 [ADR 0002](../adr/0002-stateless-by-default-stateful-by-opt-in.md) and
-[ADR 0011](../adr/0011-config-hot-reload.md) already bound, and it is evaluated per
-tenancy scope, which trigger 2's isolation reasoning already covers.
+[ADR 0011](../adr/0011-config-hot-reload.md), and its per-scope evaluation is
+covered by trigger 2's isolation reasoning; the slice that wires evaluation into
+admission owes this trigger again on its own merits.
 
 **Release impact.** Availability contracts are inert on their own: nothing
 constructs an index, `/v1/models` and readiness are unchanged, and no request

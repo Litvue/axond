@@ -199,6 +199,15 @@ fn precedence_is_deterministic_and_names_the_dimension_that_decided() {
             AvailabilityReason::RuntimeUnavailable,
             DecidedBy::Runtime,
         ),
+        (
+            AvailabilityRecord {
+                runtime: RuntimeHealth::Impaired,
+                ..permitting()
+            },
+            AvailabilityState::Unknown,
+            AvailabilityReason::RuntimeImpaired,
+            DecidedBy::Runtime,
+        ),
     ];
 
     for (record, state, reason, decided_by) in cases {
@@ -215,6 +224,95 @@ fn precedence_is_deterministic_and_names_the_dimension_that_decided() {
             "record {record:?}"
         );
     }
+}
+
+/// Enablement outranks every rung that can answer `unknown`, an undecided policy
+/// included: a target a scope never switched on is denied, not reported as an
+/// attemptable uncertainty, however badly the deployment's own policy evaluation is
+/// going.
+#[test]
+fn an_undecided_policy_cannot_make_an_unenabled_target_attemptable() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let verdict = AvailabilityIndex::builder()
+        .record(
+            key(scope, "gpt-4o"),
+            AvailabilityRecord {
+                policy: PolicyDecision::Indeterminate,
+                enablement: Enablement::NotEnabled,
+                ..permitting()
+            },
+        )
+        .observe(present(scope, "gpt-4o", 100, None))
+        .build()
+        .evaluate(&key(scope, "gpt-4o"), at(120));
+
+    assert_eq!(
+        (verdict.state, verdict.reason, verdict.decided_by),
+        (
+            AvailabilityState::Denied,
+            AvailabilityReason::NotEnabled,
+            DecidedBy::Enablement
+        )
+    );
+    assert!(!verdict.permits_attempt());
+}
+
+/// A deployment refusal still outranks the switch, so the two policy rungs are not
+/// interchangeable: a denied policy decides even for an unenabled target.
+#[test]
+fn a_policy_refusal_outranks_the_scope_switch() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let verdict = AvailabilityIndex::builder()
+        .record(
+            key(scope, "gpt-4o"),
+            AvailabilityRecord {
+                policy: PolicyDecision::Denied,
+                enablement: Enablement::NotEnabled,
+                ..permitting()
+            },
+        )
+        .build()
+        .evaluate(&key(scope, "gpt-4o"), at(120));
+
+    assert_eq!(verdict.reason, AvailabilityReason::PolicyDenied);
+    assert_eq!(verdict.decided_by, DecidedBy::Policy);
+}
+
+/// An open circuit and intermittent failure are different answers. This replica
+/// skipping the target is a refusal; a target that merely fails on and off is one
+/// the breaker would still attempt (ADR 0008), so it stays routable and only loses
+/// certainty.
+#[test]
+fn an_impaired_target_loses_certainty_while_an_open_circuit_refuses() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let verdict_for = |runtime| {
+        AvailabilityIndex::builder()
+            .record(
+                key(scope, "gpt-4o"),
+                AvailabilityRecord {
+                    runtime,
+                    ..permitting()
+                },
+            )
+            .observe(present(scope, "gpt-4o", 100, None))
+            .build()
+            .evaluate(&key(scope, "gpt-4o"), at(120))
+    };
+
+    let impaired = verdict_for(RuntimeHealth::Impaired);
+    assert_eq!(impaired.state, AvailabilityState::Unknown);
+    assert!(
+        impaired.permits_attempt(),
+        "a flaky target the breaker has not tripped is still worth attempting"
+    );
+
+    let open = verdict_for(RuntimeHealth::Unavailable);
+    assert_eq!(open.state, AvailabilityState::Unavailable);
+    assert!(!open.permits_attempt());
+    assert!(
+        impaired.state.certainty() < verdict_for(RuntimeHealth::Healthy).state.certainty(),
+        "impairment may lower certainty and may never raise it"
+    );
 }
 
 /// A policy denial outranks a positive listing, and a catalogue absence outranks
@@ -485,6 +583,38 @@ fn unknown_and_stale_evidence_is_never_silently_upgraded() {
         .evaluate(&key(scope, "gpt-4o"), at(200));
     assert_eq!(after_outage.state, AvailabilityState::Stale);
     assert!(after_outage.last_known_good);
+}
+
+/// Which of two overlapping probes finishes first must not decide whether a model
+/// stays reachable. A definitive positive that lands after a newer inconclusive look
+/// is still the best evidence held, so it is retained either way.
+#[test]
+fn overlapping_probes_produce_the_same_index_whichever_lands_first() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let conclusive = present(scope, "gpt-4o", 100, None);
+    let inconclusive = outage(scope, "gpt-4o", 300);
+
+    let in_order = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(conclusive.clone())
+        .observe(inconclusive.clone());
+    let reversed = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(inconclusive)
+        .observe(conclusive);
+    assert_eq!(
+        reversed.superseded(),
+        1,
+        "the late look did not become current"
+    );
+
+    let expected = in_order.build().evaluate(&key(scope, "gpt-4o"), at(400));
+    assert_eq!(
+        reversed.build().evaluate(&key(scope, "gpt-4o"), at(400)),
+        expected
+    );
+    assert_eq!(expected.state, AvailabilityState::Available);
+    assert!(expected.last_known_good);
 }
 
 /// Retained evidence counts as "held" for the out-of-order guard too: a record

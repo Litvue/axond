@@ -440,6 +440,11 @@ impl ConfigSnapshot {
     /// to publication rather than mutated underneath a reader holding the `Arc`.
     /// Nothing else about the snapshot changes — the config, the credential graph,
     /// and the circuits are the ones compilation produced.
+    ///
+    /// Because [`ConfigSnapshot::build`] always yields an empty index, a reload
+    /// carries availability forward only if it re-projects it — deliberately, so a
+    /// slice that reloads configuration cannot inherit evidence it did not decide to
+    /// keep. The projection slice owns that choice.
     #[must_use]
     #[allow(dead_code)]
     pub fn with_availability(mut self, availability: Arc<AvailabilityIndex>) -> Self {
