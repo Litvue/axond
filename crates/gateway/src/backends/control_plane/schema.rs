@@ -77,6 +77,16 @@ struct Expectation {
     /// version does not have it either. A migration therefore needs at least one
     /// thing present to be adoptable at all.
     present: bool,
+    /// Whether having this thing says *this* version is what put it there.
+    ///
+    /// `false` for something the migration drops and creates again, which is how
+    /// a file replaces a definition an earlier version installed: afterwards the
+    /// object is there, but it was there before too, so its presence cannot tell
+    /// the two apart. v2 replaces v1's `..._actor_attribution` constraints that
+    /// way, and reading them as proof would have every v1-only database refused
+    /// as half-way through v2. Still checked — a v2 database missing one is
+    /// partly applied — just never counted as evidence the version ran.
+    proof: bool,
 }
 
 /// Where the lexical region starting at `at` ends, when one starts there: a `--`
@@ -353,6 +363,7 @@ fn expectations(statement: &str) -> Option<Vec<Expectation>> {
         Some(vec![Expectation {
             what,
             present: true,
+            proof: true,
         }])
     };
     if keyword(0, "CREATE") && keyword(1, "TABLE") {
@@ -390,6 +401,7 @@ fn expectations(statement: &str) -> Option<Vec<Expectation>> {
         return Some(vec![Expectation {
             what: Evidence::Policy(table, policy),
             present: keyword(0, "CREATE"),
+            proof: true,
         }]);
     }
     if keyword(0, "ALTER") && keyword(1, "TABLE") {
@@ -429,7 +441,13 @@ fn altered(table: &str, clause: &str) -> Option<Expectation> {
                 .zip(expected)
                 .all(|(word, expected)| word.eq_ignore_ascii_case(expected))
     };
-    let flag = |what: Evidence, present: bool| Some(Expectation { what, present });
+    let flag = |what: Evidence, present: bool| {
+        Some(Expectation {
+            what,
+            present,
+            proof: true,
+        })
+    };
     if phrase(&["ENABLE", "ROW", "LEVEL", "SECURITY"]) {
         return flag(Evidence::Guarded(table.to_owned()), true);
     }
@@ -1155,6 +1173,12 @@ fn evidence(migration: &Migration) -> Option<Vec<Expectation>> {
                 .find(|prior| prior.what == expectation.what)
             {
                 Some(prior) if !matches!(expectation.what, Evidence::Seed(_)) => {
+                    // Touched twice in opposite directions is a replacement: the
+                    // file dropped what was there and put its own version back,
+                    // which leaves a database that had the earlier version and
+                    // one that had this one holding the same object. Required
+                    // still, but no longer proof of which version wrote it.
+                    prior.proof = prior.proof && prior.present == expectation.present;
                     prior.present = expectation.present;
                 }
                 _ => evidence.push(expectation),
@@ -1425,9 +1449,15 @@ fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baselin
         // from what it took away: a database that never had it is missing the
         // things it dropped too, so counting those would read an untouched
         // database as half-way through the migration.
+        // Nor from something it replaced: a `DROP` followed by a `CREATE` of the
+        // same object leaves what an earlier version installed indistinguishable
+        // from what this one did, so a database holding only v1 is not half-way
+        // through v2 for holding the constraint v2 would have rewritten. Such a
+        // statement is also the one kind that is safe to reach a second time,
+        // which is what makes leaving the version to `apply` the right answer.
         let left = declared
             .iter()
-            .filter(|item| item.present && confirmed.contains(&item.what))
+            .filter(|item| item.present && item.proof && confirmed.contains(&item.what))
             .count();
         if left == 0 {
             absent = absent.or(Some(migration.version));
@@ -1534,6 +1564,17 @@ mod tests {
         Expectation {
             what,
             present: true,
+            proof: true,
+        }
+    }
+
+    /// Something a fixture dropped and put back: required, but not proof of which
+    /// version wrote it.
+    fn replaced(what: Evidence) -> Expectation {
+        Expectation {
+            what,
+            present: true,
+            proof: false,
         }
     }
 
@@ -1542,6 +1583,7 @@ mod tests {
         Expectation {
             what,
             present: false,
+            proof: true,
         }
     }
 
@@ -1864,7 +1906,9 @@ mod tests {
             present(index("axond_cp_tenant_slug_idx")),
             present(column("axond_cp_mutation", "actor_tenant_id")),
             present(column("axond_cp_audit_event", "actor_principal_id")),
-            present(constraint(
+            // Dropped and added again under v1's own name, so it is required of a
+            // v2 database without being evidence v2 is what wrote it.
+            replaced(constraint(
                 "axond_cp_mutation",
                 "axond_cp_mutation_actor_attribution",
             )),
@@ -1874,7 +1918,7 @@ mod tests {
                 "axond_cp_mutation",
                 "axond_cp_mutation_actor_kind_check",
             )),
-            present(policy("axond_cp_tenant", "axond_cp_tenant_isolation")),
+            replaced(policy("axond_cp_tenant", "axond_cp_tenant_isolation")),
         ] {
             assert!(
                 declared.contains(&expected),
@@ -1897,7 +1941,7 @@ mod tests {
             for expected in [
                 present(Evidence::Guarded(guarded.to_owned())),
                 present(Evidence::Forced(guarded.to_owned())),
-                present(policy(guarded, &format!("{guarded}_isolation"))),
+                replaced(policy(guarded, &format!("{guarded}_isolation"))),
             ] {
                 assert!(
                     declared.contains(&expected),
@@ -2032,11 +2076,12 @@ mod tests {
                 present(column("one", "note")),
                 present(column("one", "more")),
                 // Dropped and recreated under the same name: what the file leaves
-                // behind is the last thing it did to each one.
-                present(constraint("one", "one_note_ck")),
+                // behind is the last thing it did to each one, and a database that
+                // held the earlier definition holds this name too.
+                replaced(constraint("one", "one_note_ck")),
                 present(Evidence::Guarded("one".to_owned())),
                 present(Evidence::Forced("one".to_owned())),
-                present(policy("one", "one_isolation")),
+                replaced(policy("one", "one_isolation")),
             ])
         );
 
@@ -2099,6 +2144,46 @@ mod tests {
             "the constraint v2 adds, with the one it drops gone, is v2 applied"
         );
 
+        // The shape v2 uses on v1's constraints: dropped, then added again under
+        // the same name. A v1 database and a v2 database both hold `one_note_ck`
+        // afterwards, so its presence cannot say which of them wrote it — read as
+        // proof, it would refuse every v1-only database as half-way through v2.
+        const REWRITES: Migration = Migration {
+            version: 2,
+            name: "rewrites",
+            sql: "ALTER TABLE one\n\
+                      DROP CONSTRAINT IF EXISTS one_note_ck,\n\
+                      ADD CONSTRAINT one_note_ck CHECK (note IS NOT NULL),\n\
+                      ADD COLUMN IF NOT EXISTS more text NULL;\n",
+        };
+        let v1_only = HashSet::from([table("one"), constraint("one", "one_note_ck")]);
+        assert_eq!(
+            reconcile(&[CREATES, REWRITES], &v1_only),
+            Baseline::Applied { versions: vec![1] },
+            "a constraint v1 leaves behind too is not evidence v2 rewrote it"
+        );
+        let mut applied = v1_only.clone();
+        applied.insert(column("one", "more"));
+        assert_eq!(
+            reconcile(&[CREATES, REWRITES], &applied),
+            Baseline::Applied {
+                versions: vec![1, 2]
+            },
+            "the column only v2 adds is what says v2 ran"
+        );
+        // Not being proof is not the same as not being checked: a database v2 ran
+        // on that is missing the rewritten constraint is still partly applied.
+        let Baseline::Inconsistent { message } = reconcile(
+            &[CREATES, REWRITES],
+            &HashSet::from([table("one"), column("one", "more")]),
+        ) else {
+            panic!("v2's own constraint has to be required of a database v2 ran on");
+        };
+        assert!(
+            message.contains("`one`'s `one_note_ck` constraint is not present"),
+            "the refusal has to name the constraint that is missing: {message}"
+        );
+
         // A clause the catalogue cannot answer for, and an `ADD` without the
         // `COLUMN` keyword — where the word after `ADD` is a name in one form and a
         // keyword in the next — are unconfirmable rather than read as a guess.
@@ -2156,9 +2241,11 @@ mod tests {
             Some(vec![
                 present(table("one")),
                 present(Evidence::Guarded("one".to_owned())),
-                present(policy("one", "one_isolation")),
+                // Each policy is dropped before it is created, so it is required
+                // afterwards without saying which version wrote it.
+                replaced(policy("one", "one_isolation")),
                 present(Evidence::Guarded("two".to_owned())),
-                present(policy("two", "two_isolation")),
+                replaced(policy("two", "two_isolation")),
             ]),
             "the loop's evidence is its templates rendered for its own names"
         );

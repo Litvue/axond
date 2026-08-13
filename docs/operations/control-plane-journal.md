@@ -295,7 +295,19 @@ confirmed — each table, index, column, named constraint, row-security flag and
 policy where the file leaves it, and each idempotent seed row written — in
 the schema this configuration writes to (the one `[control_plane] schema` names, or
 the first on the DSN's own search path; a second install's journal further down that
-path is not evidence about this one). What it does instead of recording:
+path is not evidence about this one).
+
+A baseline can be shorter than the shipped history, and that is the ordinary state
+for an operator who hand-applied v1 before the tenancy migration existed: `adopt`
+records v1, reports v2 as still pending, and **exits non-zero**, because a database
+with a migration outstanding is not one to serve. `axond migrate apply` then runs v2
+once, from the ledger — the point of adopting the prefix rather than the whole
+history. Objects v2 would *rewrite* under a name v1 already used (the
+`..._actor_attribution` constraints) do not make that database look part-way through
+v2: what a file drops and creates again is required of a database it ran on, but is
+never read as proof of which version wrote it.
+
+What it does instead of recording:
 
 - **No object present.** Nothing was applied out of band, so there is no baseline.
   Refused, naming the schema it looked in and the way forward — drop the empty
@@ -324,8 +336,9 @@ path is not evidence about this one). What it does instead of recording:
   column, constraint, flags and policy being there. A `DROP` of any of those is
   confirmed by the thing being gone, so the constraint v2 replaces is expected
   *absent* on a v2 database — but a version that only takes things away proves
-  nothing, because a database that never had it looks the same. The shipped v1 and
-  v2 files are confirmable in full, tenancy included: the `DO $$ ... $$` block that
+  nothing, because a database that never had it looks the same, and neither does
+  something the version dropped and created again under the same name. The shipped
+  v1 and v2 files are confirmable in full, tenancy included: the `DO $$ ... $$` block that
   guards the chained tables is read by rendering its own `format()` templates for
   its own list of tables, so each of those tables' RLS flags and `..._isolation`
   policy is checked, and a change to that block's shape makes it unconfirmable

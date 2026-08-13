@@ -145,7 +145,16 @@ ledger row for DDL it did not run:
   a constraint v1 created) but never evidence *for* a version on its own: whether a
   version ran is read from what it left behind, so a version that only removes
   things is unconfirmable, and an untouched database is untouched rather than half
-  way through the version above it. Each form names its object unqualified, so an
+  way through the version above it. Nor is something the version *replaced*: a
+  `DROP` and a `CREATE` of the same object in one file — how v2 rewrites v1's
+  `..._actor_attribution` constraints, and how it re-declares every `..._isolation`
+  policy — leaves a database that ran the earlier version holding the same object
+  as one that ran this one, so its presence is required of an applied database and
+  is never read as proof of which version wrote it. Otherwise every deployment
+  hand-applied only as far as v1 would be refused as half-way through v2, and such
+  a statement is also the one kind it is safe to reach a second time, which is what
+  makes leaving that version to `apply` the right answer rather than a risk. Each
+  form names its object unqualified, so an
   unnamed `CREATE INDEX ON t (c)`, an unnamed constraint PostgreSQL names for
   itself, or a schema-qualified `other.t` is unconfirmable rather than probed for
   under a name that is not one; an `ALTER TABLE`'s clause list is read clause by
@@ -196,9 +205,14 @@ ledger row for DDL it did not run:
   rather than a surprise in the field;
   `the_tenancy_migrations_columns_constraints_and_policies_are_all_confirmable`
   holds the shipped v1+v2 history to it, object by object, including the six tables
-  the tenancy migration's `DO` block guards; and
+  the tenancy migration's `DO` block guards;
   `a_statement_whose_effect_cannot_be_confirmed_makes_its_migration_unadoptable`
-  pins the mixed create-and-alter shape specifically.
+  pins the mixed create-and-alter shape specifically; and the two manual states an
+  operator can actually be in are each adopted against a real database — both files
+  applied by `a_hand_applied_schema_is_adopted_as_the_baseline_its_objects_prove`,
+  v1 alone by
+  `a_schema_hand_applied_only_as_far_as_v1_adopts_v1_and_leaves_v2_pending`, which
+  records v1, reports v2 pending with a non-zero exit, and leaves v2 to `apply`.
 - **It executes no migration SQL at all**, which is what makes it safe against a
   database that already has the objects, whether or not the shipped statements are
   idempotent — the property the hand-`INSERT` path shared but the drop-and-replay

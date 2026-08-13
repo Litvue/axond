@@ -362,6 +362,7 @@ mechanically by `every_revision_rejection_reason_is_catalogued`,
 The control-plane ledger is the record of what DDL ran, so the writes to it are
 gated too: `an_empty_ledger_is_refused_rather_than_migrated_from_zero`,
 `a_hand_applied_schema_is_adopted_as_the_baseline_its_objects_prove`,
+`a_schema_hand_applied_only_as_far_as_v1_adopts_v1_and_leaves_v2_pending`,
 `a_partly_applied_schema_is_refused_without_recording_anything`,
 `adoption_refuses_every_schema_that_is_not_an_empty_ledger`,
 `concurrent_adoptions_record_the_baseline_once`,

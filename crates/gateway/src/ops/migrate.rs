@@ -576,8 +576,14 @@ mod tests {
         /// The database an operator gets from `psql -f`: every object the shipped
         /// migration declares, including the ledger table, and no ledger row.
         async fn hand_applied(&self) {
+            self.hand_applied_through(schema::MIGRATIONS.len()).await;
+        }
+
+        /// The same, stopped after `versions` files: the database of an operator
+        /// who hand-applied what shipped at the time and never ran the rest.
+        async fn hand_applied_through(&self, versions: usize) {
             let client = self.observe().await;
-            for migration in schema::MIGRATIONS.iter() {
+            for migration in schema::MIGRATIONS.iter().take(versions) {
                 client
                     .batch_execute(migration.sql)
                     .await
@@ -1583,6 +1589,71 @@ mod tests {
         assert!(
             !fixture.relation_exists("axond_cp_idempotency").await,
             "applying after an adoption replayed the shipped migration SQL"
+        );
+    }
+
+    /// The other empty ledger an operator can be holding: v1 applied by hand
+    /// before v2 shipped, and v2 never run. The baseline is v1, v2 stays pending,
+    /// and `apply` is what runs it — which is the whole point of adopting a prefix
+    /// rather than the history, and of the exit code being non-zero until it is
+    /// done.
+    ///
+    /// Worth a database rather than a unit test because v2 rewrites two of v1's
+    /// own constraints under their original names: they are present here without
+    /// v2 having run, and reading them as evidence would refuse every deployment
+    /// in this state as half-way through v2.
+    #[tokio::test]
+    async fn a_schema_hand_applied_only_as_far_as_v1_adopts_v1_and_leaves_v2_pending() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        fixture.hand_applied_through(1).await;
+        assert!(
+            !fixture.relation_exists("axond_cp_tenant").await,
+            "v2's objects must not be there: this is the pre-tenancy manual state"
+        );
+
+        let report = adopt(&fixture.config, &fixture.env)
+            .await
+            .expect("v1's objects are all present, so v1 is adoptable");
+        assert_eq!(
+            report.state(),
+            Some(&State::Adopted {
+                adopted: named(&[1]),
+                pending: named(&[2]),
+            }),
+            "{report}"
+        );
+        assert!(
+            report.is_ok() && !report.is_settled(),
+            "a baseline with a migration still pending is not a schema to serve: {report}"
+        );
+        assert_eq!(
+            fixture.ledger().await,
+            vec![(
+                1,
+                schema::MIGRATIONS[0].name.to_owned(),
+                schema::MIGRATIONS[0].checksum().to_string()
+            )],
+            "only the version the objects account for may be recorded"
+        );
+
+        // And the recorded prefix is one `apply` extends, which is what makes the
+        // adoption of a prefix safe: v2 runs once, from the ledger, rather than
+        // being replayed over a schema that already had it.
+        let applied = apply(&fixture.config, &fixture.env)
+            .await
+            .expect("an adopted prefix is behind, so an apply runs the rest");
+        assert_eq!(
+            applied.state(),
+            Some(&State::Applied {
+                applied: named(&[2])
+            }),
+            "{applied}"
+        );
+        assert!(
+            fixture.relation_exists("axond_cp_tenant").await,
+            "the apply that followed the adoption has to have run v2"
         );
     }
 
