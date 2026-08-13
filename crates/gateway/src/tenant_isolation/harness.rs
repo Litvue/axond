@@ -35,6 +35,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ring::rand::{SecureRandom, SystemRandom};
 use tokio_postgres::{Client, Config};
 
 use crate::backends::control_plane::postgres::{ControlPlaneSettings, PostgresControlPlane};
@@ -43,12 +44,20 @@ use crate::desired_state::{
     DesiredState, ExpectedRevision, LoadedRevision, RevisionId, TenantId, fixtures,
 };
 
-/// The password the scenario roles are created with.
+/// A password for one fixture's roles, from the system generator.
 ///
-/// A literal, and deliberately not a secret: the role exists for the length of
-/// one test against a test database, and a generated password would only make
-/// the fixture look like it was protecting something.
-const ROLE_PASSWORD: &str = "isolation";
+/// Nothing in a scenario needs the password to be knowable, and a literal in
+/// the source would be: [`Drop`] is the only thing that removes these roles, so
+/// a killed test process (CI cancellation, OOM) leaves a `LOGIN` role behind on
+/// a shared database. Left behind with a password nobody has, it is unusable
+/// rather than an open door.
+fn role_password() -> String {
+    let mut bytes = [0u8; 24];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .expect("the system random generator");
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 /// The tenant every scenario calls as: `acme`, seed 1 of the domain fixtures.
 pub(crate) fn caller() -> TenantId {
@@ -151,6 +160,8 @@ pub(crate) struct Journal {
     schema: String,
     /// The login roles this fixture created, so [`Drop`] can remove them.
     roles: Mutex<Vec<String>>,
+    /// The password this fixture's roles were created with, generated per run.
+    password: String,
 }
 
 impl Journal {
@@ -169,7 +180,7 @@ impl Journal {
                 .expect("a monotonic wall clock")
                 .as_nanos()
         );
-        connect(&dsn, None)
+        connect(&dsn)
             .await
             .batch_execute(&format!("CREATE SCHEMA {schema}"))
             .await
@@ -190,6 +201,7 @@ impl Journal {
             dsn,
             schema,
             roles: Mutex::new(Vec::new()),
+            password: role_password(),
         })
     }
 
@@ -253,10 +265,11 @@ impl Journal {
     ) -> Client {
         let role = format!("{}_{label}", self.schema);
         let schema = &self.schema;
-        connect(&self.dsn, None)
+        let password = &self.password;
+        connect(&self.dsn)
             .await
             .batch_execute(&format!(
-                "CREATE ROLE {role} LOGIN PASSWORD '{ROLE_PASSWORD}'; \
+                "CREATE ROLE {role} LOGIN PASSWORD '{password}'; \
                  GRANT USAGE ON SCHEMA {schema} TO {role}; \
                  GRANT {privileges} ON ALL TABLES IN SCHEMA {schema} TO {role}"
             ))
@@ -264,7 +277,7 @@ impl Journal {
             .expect("a scenario role");
         self.roles.lock().expect("the role list").push(role.clone());
 
-        let client = connect(&self.dsn, Some(&role)).await;
+        let client = connect_as(&self.dsn, &role, password).await;
         let pin = match tenant {
             Some(tenant) => format!("SET axond.tenant_id = '{tenant}'"),
             None => String::from("RESET axond.tenant_id"),
@@ -279,7 +292,7 @@ impl Journal {
     /// One text column of a query, run as the migrating role: what is *actually*
     /// stored, whatever a pinned session can see of it.
     pub(crate) async fn stored(&self, sql: &str) -> Vec<String> {
-        let client = connect(&self.dsn, None).await;
+        let client = connect(&self.dsn).await;
         client
             .batch_execute(&format!("SET search_path TO {}", self.schema))
             .await
@@ -313,7 +326,7 @@ impl Drop for Journal {
                 .build()
                 .expect("a cleanup runtime");
             runtime.block_on(async {
-                let client = connect(&dsn, None).await;
+                let client = connect(&dsn).await;
                 let mut left_behind = Vec::new();
                 for role in roles {
                     if let Err(error) = client
@@ -343,13 +356,20 @@ impl Drop for Journal {
     }
 }
 
-/// A connection to the test database, as `role` or as the configured user.
-async fn connect(dsn: &str, role: Option<&str>) -> Client {
+/// A connection to the test database as the DSN's own user.
+async fn connect(dsn: &str) -> Client {
+    open(dsn.parse().expect("a parseable test DSN")).await
+}
+
+/// A connection to the test database as one of a fixture's scenario roles.
+async fn connect_as(dsn: &str, role: &str, password: &str) -> Client {
     let mut config: Config = dsn.parse().expect("a parseable test DSN");
+    config.user(role).password(password);
+    open(config).await
+}
+
+async fn open(mut config: Config) -> Client {
     config.connect_timeout(Duration::from_secs(5));
-    if let Some(role) = role {
-        config.user(role).password(ROLE_PASSWORD);
-    }
     let (client, connection) = config
         .connect(crate::usage::tls_connector())
         .await
