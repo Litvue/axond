@@ -226,6 +226,10 @@ pub enum SecretError {
     /// is how an operator comes to re-issue a good one.
     #[error("secret {reference} is already stored, so it cannot be minted again")]
     VersionExists { reference: SecretRef },
+    /// Stored metadata cannot be interpreted. This is a store problem, not a
+    /// refusal of material presented by the caller.
+    #[error("secret store metadata is corrupt: {detail}")]
+    Corrupt { detail: String },
     #[error("invalid secret request: {0}")]
     Invalid(String),
     #[error("secret store `{backend}` refused the operation: {message}")]
@@ -246,6 +250,7 @@ impl BackendFailure for SecretError {
             // The caller's request lost to a rotation that already happened,
             // which is what a conflict is: replaying it cannot win.
             Self::VersionExists { .. } => FailureCategory::Conflict,
+            Self::Corrupt { .. } => FailureCategory::Corrupt,
             Self::Invalid(_) => FailureCategory::Invalid,
             Self::Lifecycle { .. } | Self::Transition { .. } | Self::Denied { .. } => {
                 FailureCategory::Denied

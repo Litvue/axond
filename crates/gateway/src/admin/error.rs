@@ -205,8 +205,8 @@ pub enum AdminError {
     )]
     SecretVersionExists { reference: SecretRef },
     /// The material presented is not storable — empty, or otherwise refused by
-    /// the store before anything was sealed. The detail is logged rather than
-    /// returned, for the reason every detail here is.
+    /// the store before anything was sealed. The detail is retained only for
+    /// internal classification; secret-operation logging deliberately drops it.
     #[error("the presented secret material was refused")]
     SecretMaterialRefused { detail: String },
     /// Stored material this replica cannot unwrap, or a store that refused the
@@ -419,6 +419,7 @@ impl AdminError {
             // and reporting a good key as bad is how an operator comes to
             // re-issue one that was never at fault.
             SecretError::VersionExists { reference } => Self::SecretVersionExists { reference },
+            SecretError::Corrupt { detail } => Self::SecretStoreUnusable { detail },
             SecretError::Invalid(detail) => Self::SecretMaterialRefused { detail },
             SecretError::Unwrap { reference, kek } => Self::SecretStoreUnusable {
                 // The KEK *reference* is a configured name, not key material.

@@ -367,7 +367,7 @@ impl AdminAction {
             | Self::ReadAudit
             | Self::ReadConvergence
             | Self::ReadAvailability => Action::Read,
-            | Self::ReadSecrets => Action::Read,
+            Self::ReadSecrets => Action::Read,
             Self::Publish | Self::Rollback => Action::Update,
             Self::WriteSecrets => Action::Rotate,
         }

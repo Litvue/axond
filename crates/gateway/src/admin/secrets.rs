@@ -82,6 +82,35 @@ fn actor_label(identity: &AdminIdentity) -> String {
     }
 }
 
+/// The operational record for a secret lifecycle call.
+///
+/// This type intentionally has no material-bearing field. It is the boundary
+/// between the secret operation and its process log: the log can say who acted,
+/// on which opaque reference, for which owner, and what state resulted, but it
+/// cannot be handed plaintext by construction. These are operational records,
+/// not durable audit events.
+fn log_secret_operation(
+    operation: &'static str,
+    grant: &AdminGrant,
+    reference: SecretRef,
+    owner: SecretOwner,
+    lifecycle: SecretLifecycle,
+    changed: Option<bool>,
+    base: Option<SecretRef>,
+) {
+    tracing::info!(
+        target: "axond.admin.secrets",
+        operation,
+        actor = actor_label(grant.identity()),
+        base = ?base,
+        reference = %reference,
+        owner = %owner,
+        lifecycle = lifecycle.as_str(),
+        changed = ?changed,
+        "secret lifecycle operation"
+    );
+}
+
 /// Material presented for storage.
 ///
 /// A `String` on the way in and nothing on the way out: [`Debug`] is written by
@@ -221,7 +250,7 @@ impl AdminService {
     ) -> Result<(), AdminError> {
         if grant.action() != action {
             return Err(AdminError::Forbidden(AdminAuthError::ActionNotPermitted {
-                action: grant.action(),
+                action,
             }));
         }
         let scope = owner.scope();
@@ -251,15 +280,14 @@ impl AdminService {
         Self::permits_material(grant, AdminAction::WriteSecrets, owner)?;
         let store = self.secret_store()?;
         let descriptor = store.stage(owner, material).await.map_err(log_secret)?;
-        // Reference and lifecycle only. This is the line an operator reads back
-        // to confirm a rotation, and it has to be safe to paste into a ticket.
-        tracing::info!(
-            target: "axond.admin.secrets",
-            actor = actor_label(grant.identity()),
-            reference = %descriptor.reference,
-            owner = %descriptor.owner,
-            lifecycle = descriptor.lifecycle.as_str(),
-            "secret material staged"
+        log_secret_operation(
+            "stage",
+            grant,
+            descriptor.reference,
+            descriptor.owner,
+            descriptor.lifecycle,
+            None,
+            None,
         );
         Ok(SecretVersionView::of(descriptor))
     }
@@ -278,14 +306,14 @@ impl AdminService {
             .rotate(owner, &reference, material)
             .await
             .map_err(log_secret)?;
-        tracing::info!(
-            target: "axond.admin.secrets",
-            actor = actor_label(grant.identity()),
-            from = %reference,
-            reference = %descriptor.reference,
-            owner = %descriptor.owner,
-            lifecycle = descriptor.lifecycle.as_str(),
-            "secret material rotated"
+        log_secret_operation(
+            "rotate",
+            grant,
+            descriptor.reference,
+            descriptor.owner,
+            descriptor.lifecycle,
+            None,
+            Some(reference),
         );
         Ok(SecretVersionView::of(descriptor))
     }
@@ -320,14 +348,14 @@ impl AdminService {
             .transition(owner, &reference, next)
             .await
             .map_err(log_secret)?;
-        tracing::info!(
-            target: "axond.admin.secrets",
-            actor = actor_label(grant.identity()),
-            reference = %reference,
-            owner = %owner,
-            lifecycle = transition.state().as_str(),
-            changed = transition.changed(),
-            "secret lifecycle moved"
+        log_secret_operation(
+            "lifecycle",
+            grant,
+            reference,
+            owner,
+            transition.state(),
+            Some(transition.changed()),
+            None,
         );
         Ok(SecretTransitionView {
             reference: reference.to_string(),
@@ -482,8 +510,50 @@ pub(super) fn material_of(
 
 #[cfg(test)]
 mod tests {
-    use super::{lifecycle_of, owner_of, reference_of, secret_of};
+    use std::sync::{Arc, Mutex};
+
+    use super::{
+        AdminAction, AdminGrant, AdminIdentity, AdminService, lifecycle_of, owner_of, reference_of,
+        secret_of,
+    };
     use crate::admin::error::AdminError;
+    use crate::backends::fakes::InMemorySecrets;
+    use crate::backends::secrets::SecretMaterial;
+    use crate::desired_state::ResourceScope;
+    use crate::desired_state::fixtures;
+    use crate::desired_state::oracle::InMemoryControlPlane;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn rendered(&self) -> String {
+            String::from_utf8(self.0.lock().expect("not poisoned").clone()).expect("utf-8 logs")
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("not poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     fn withholds(error: &AdminError, presented: &str) {
         assert!(!error.to_string().contains(presented));
@@ -528,6 +598,71 @@ mod tests {
             )
             .expect_err("not a project"),
             "sk-live-must-not-echo",
+        );
+    }
+
+    #[test]
+    fn a_missing_material_permission_names_the_requested_action() {
+        let owner = crate::desired_state::secrets::SecretOwner::tenant(fixtures::tenant_id(1));
+        let grant = AdminGrant::granted(
+            AdminIdentity::Human {
+                issuer: "https://idp.example".to_owned(),
+                subject: "operator@example".to_owned(),
+            },
+            AdminAction::Publish,
+            ResourceScope::Tenant(fixtures::tenant_id(1)),
+        );
+
+        let error = AdminService::permits_material(&grant, AdminAction::WriteSecrets, owner)
+            .expect_err("publishing authority does not administer secret material");
+        match error {
+            AdminError::Forbidden(super::AdminAuthError::ActionNotPermitted { action }) => {
+                assert_eq!(action, AdminAction::WriteSecrets);
+            }
+            other => panic!("unexpected refusal: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_material_is_absent_from_operational_logs() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(logs.clone()),
+        );
+        crate::telemetry::testing::keep_callsites_answerable();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _default = tracing::dispatcher::set_default(&dispatch);
+
+        let store = Arc::new(InMemoryControlPlane::new());
+        let secrets = Arc::new(InMemorySecrets::new());
+        let service = AdminService::stateful(store).with_secrets(secrets);
+        let owner = crate::desired_state::secrets::SecretOwner::tenant(fixtures::tenant_id(1));
+        let grant = AdminGrant::granted(
+            AdminIdentity::Human {
+                issuer: "https://idp.example".to_owned(),
+                subject: "operator@example".to_owned(),
+            },
+            AdminAction::WriteSecrets,
+            ResourceScope::Tenant(fixtures::tenant_id(1)),
+        );
+        let presented = "sk-live-must-not-enter-operational-logs";
+
+        service
+            .stage_secret(&grant, owner, SecretMaterial::new(presented.to_owned()))
+            .await
+            .expect("secret is staged");
+
+        let rendered = logs.rendered();
+        assert!(
+            rendered.contains("secret lifecycle operation"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("operation=\"stage\""), "{rendered}");
+        assert!(
+            !rendered.contains(presented),
+            "material reached a log: {rendered}"
         );
     }
 }

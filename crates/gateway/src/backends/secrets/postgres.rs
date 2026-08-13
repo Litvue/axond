@@ -362,10 +362,10 @@ impl PostgresSecrets {
         // A state a newer release wrote is not a state this build may guess at:
         // treating an unknown lifecycle as resolvable would put material in
         // service that an administrator withdrew.
-        let lifecycle = SecretLifecycle::parse(&stored).ok_or_else(|| {
-            SecretError::Invalid(format!(
+        let lifecycle = SecretLifecycle::parse(&stored).ok_or_else(|| SecretError::Corrupt {
+            detail: format!(
                 "secret {reference} is stored in state `{stored}`, which this build does not read"
-            ))
+            ),
         })?;
         Ok(SecretDescriptor {
             reference: *reference,
@@ -478,7 +478,7 @@ impl SecretStore for PostgresSecrets {
                 if inserted != 1 {
                     // A time-ordered UUIDv7 collision. Reported rather than
                     // overwritten: the row that exists is somebody's material.
-                    return Err(SecretError::Invalid(format!("{reference} already exists")));
+                    return Err(SecretError::VersionExists { reference });
                 }
                 transaction
                     .commit()
@@ -648,10 +648,10 @@ impl SecretStore for PostgresSecrets {
                     let version = u64::try_from(stored)
                         .ok()
                         .and_then(SecretVersion::new)
-                        .ok_or_else(|| {
-                            SecretError::Invalid(format!(
+                        .ok_or_else(|| SecretError::Corrupt {
+                            detail: format!(
                                 "secret {secret} holds version `{stored}`, which is not a version"
-                            ))
+                            ),
                         })?;
                     let reference = SecretRef::new(secret, version);
                     match Self::descriptor_of(row, owner, &reference) {
@@ -709,9 +709,11 @@ fn sealed_of(row: &Row, reference: &SecretRef) -> Result<SealedSecret, SecretErr
 /// material belong to" — and none of them is retryable.
 fn unwrap_error(error: EnvelopeError, reference: &SecretRef, kek: KekRef) -> SecretError {
     match error {
-        EnvelopeError::UnknownScheme { found } => SecretError::Invalid(format!(
-            "secret {reference} is sealed with scheme `{found}`, which this build does not read"
-        )),
+        EnvelopeError::UnknownScheme { found } => SecretError::Corrupt {
+            detail: format!(
+                "secret {reference} is sealed with scheme `{found}`, which this build does not read"
+            ),
+        },
         EnvelopeError::Random | EnvelopeError::Unopenable | EnvelopeError::Malformed { .. } => {
             SecretError::Unwrap {
                 reference: *reference,

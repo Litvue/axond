@@ -38,6 +38,7 @@ use super::protocol::{
 use super::reads::{HistoryLimit, HistoryRequest, StateView};
 use super::router::{AdminApi, AdminRouteSpec, mount};
 use super::service::{AdminService, MutationResult};
+use crate::backends::secrets::SecretError;
 use crate::config::Mode;
 use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{
@@ -1727,6 +1728,19 @@ fn every_declared_code_is_reachable_distinct_and_prose_free() {
         );
         assert!(admin.operator_detail().is_some());
     }
+}
+
+#[test]
+fn corrupt_secret_metadata_is_a_store_failure_not_a_material_refusal() {
+    let detail = "secret sct_00000000-0000-7000-8000-000000000001 holds invalid metadata";
+    let error = AdminError::from_secret(SecretError::Corrupt {
+        detail: detail.to_owned(),
+    });
+
+    assert_eq!(error.code(), "secret_store_unusable");
+    assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!error.to_string().contains("presented secret material"));
+    assert_eq!(error.operator_detail(), Some(detail));
 }
 
 #[tokio::test]

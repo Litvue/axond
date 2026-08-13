@@ -782,8 +782,14 @@ impl AdminService {
 /// and the operator learns the cause.
 pub(super) fn log_secret(error: crate::backends::secrets::SecretError) -> AdminError {
     let error = AdminError::from_secret(error);
-    if let Some(detail) = error.operator_detail() {
-        warn!(code = error.code(), detail, "secret-store operation failed");
+    // Material refusals are deliberately not operational diagnostics: their
+    // backend detail is caller-adjacent input and must never become a log field.
+    // Secret lifecycle logs below carry only references and ownership metadata;
+    // audit attribution remains a separate durable control-plane concern.
+    if !matches!(error, AdminError::SecretMaterialRefused { .. }) {
+        if let Some(detail) = error.operator_detail() {
+            warn!(code = error.code(), detail, "secret-store operation failed");
+        }
     }
     error
 }

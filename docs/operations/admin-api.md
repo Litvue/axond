@@ -157,6 +157,14 @@ preconditions is the shape of the operations — staging mints a fresh version
 rather than overwriting one, and a lifecycle move to the state a version already
 holds answers `"changed": false`, so a retry is not a second change.
 
+The versions read is intentionally bounded to the caller-named tenant (and
+project, when present) and secret. It returns store metadata only — opaque
+references, version numbers, lifecycle, and lifecycle-only `resolvable` status;
+it does not unwrap material, consult desired state, or report provider
+reachability. An absent or foreign secret returns the same empty version list,
+so this rotation-status view is not a cross-tenant existence or control-plane
+calibration endpoint.
+
 An availability read names which authority refused — the catalogue, the
 enablement, the tenant's entitlement, policy, discovery, or this replica's own
 health — and never claims a model is available because the catalogue carries it
@@ -168,12 +176,14 @@ query always names a tenant, so it is the caller's authority that decides this,
 not the scope asked about. Asking about a project answers with what the project
 inherits from its tenant as well as what it overrides, because a project's
 enablements are overrides rather than a catalogue of its own.
- 
+
 Because they publish no revision, they also write no `AuditEvent`: a successful
-stage, rotation, activation, revocation, or destruction is recorded on the
-`axond.admin.secrets` log target rather than in the control plane, so retain
-those logs if you need to answer "who destroyed this version" later. Refusals of
-authority still record durably, as every other denial does.
+stage, rotation, activation, revocation, or destruction is recorded as an
+operational event on the `axond.admin.secrets` log target rather than in the
+control plane. Those events contain only actor, owner, opaque reference, and
+lifecycle metadata; retain them if you need to answer "who destroyed this
+version" later. Refusals of authority still record durably, as every other
+denial does.
 
 Refusals from these routes describe the shape a field wants and never quote what
 was presented — a provider key pasted into `reference`, `secret`, `tenant`, or

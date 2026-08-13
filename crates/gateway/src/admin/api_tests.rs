@@ -118,7 +118,11 @@ impl Deployment {
                 runtime,
             })),
         );
-        Self { api, store }
+        Self {
+            api,
+            store,
+            secrets: Arc::new(InMemorySecrets::new()),
+        }
     }
 
     /// A deployment whose availability reader is attached and derives nothing:
@@ -137,7 +141,11 @@ impl Deployment {
                 runtime: RuntimeObservations::none(),
             })),
         );
-        Self { api, store }
+        Self {
+            api,
+            store,
+            secrets: Arc::new(InMemorySecrets::new()),
+        }
     }
 
     /// The same control plane, read through a narrower grant: what a tenant
@@ -1889,7 +1897,11 @@ async fn an_availability_read_reaches_no_control_plane() {
             runtime: RuntimeObservations::none(),
         })),
     );
-    let deployment = Deployment { api, store };
+    let deployment = Deployment {
+        api,
+        store,
+        secrets: Arc::new(InMemorySecrets::new()),
+    };
 
     let (status, body) = deployment
         .get(&format!("/availability?tenant={}", mine.tenant))
@@ -2107,6 +2119,8 @@ async fn an_availability_read_a_caller_already_holds_answers_not_modified() {
     assert_eq!(status, StatusCode::NOT_MODIFIED);
     assert_eq!(repeat.as_deref(), Some(validator.as_str()));
     assert!(body_again.is_empty(), "a 304 carries no body");
+}
+
 // ---------------------------------------------------------------------------
 // The credential lifecycle: `/admin/v1/secrets`
 // ---------------------------------------------------------------------------
@@ -2340,6 +2354,62 @@ async fn the_versions_read_answers_the_conditional_contract() {
     carries_no_material(&versions);
 }
 
+/// Version listing is an operational rotation projection, not a control-plane
+/// or provider calibration endpoint: it returns only store metadata for the
+/// tenant the caller named and does not load desired state or unwrap material.
+#[tokio::test]
+async fn the_versions_read_is_tenant_scoped_metadata_only() {
+    let control_plane = Arc::new(InMemoryControlPlane::new());
+    let counting = Arc::new(CountingStore::new(control_plane));
+    let secrets = Arc::new(InMemorySecrets::new());
+    let tenant = fixtures::tenant_id(1);
+    let reference = fixtures::secret_ref(1);
+    secrets.seed(
+        crate::desired_state::secrets::SecretOwner::tenant(tenant),
+        reference,
+        MATERIAL,
+        crate::desired_state::SecretLifecycle::Active,
+    );
+    let api = Arc::new(AdminApi::new(
+        Arc::new(AdminService::stateful(counting.clone()).with_secrets(secrets)),
+        Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
+        Arc::new(FakeAdminAuthorizer::permissive()),
+    ));
+
+    let response = router(api)
+        .oneshot(
+            Request::get(format!(
+                "{ADMIN_PREFIX}/secrets/{}?tenant={tenant}",
+                reference.secret
+            ))
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .expect("a request"),
+        )
+        .await
+        .expect("a response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("a body")
+        .to_bytes();
+    let body: Value = serde_json::from_slice(&body).expect("a projection");
+
+    assert_eq!(body["secret"], reference.secret.to_string());
+    assert_eq!(body["owner"], tenant.to_string());
+    assert_eq!(body["versions"][0]["reference"], reference.to_string());
+    assert_eq!(body["versions"][0]["lifecycle"], "active");
+    assert_eq!(body["versions"][0]["resolvable"], true);
+    carries_no_material(&body);
+    assert_eq!(
+        counting.calls(),
+        0,
+        "version listing consulted the control plane"
+    );
+}
+
 #[tokio::test]
 async fn moving_a_version_to_the_state_it_already_holds_is_not_a_second_change() {
     let deployment = Deployment::new();
@@ -2451,7 +2521,14 @@ async fn one_tenants_administrator_cannot_reach_another_tenants_material() {
         .get(&format!("/secrets/{secret}?tenant={ours}"))
         .await;
     assert_eq!(status, StatusCode::OK, "{versions}");
-    assert_eq!(versions["versions"].as_array().expect("versions").len(), 0);
+    assert_eq!(
+        versions,
+        json!({
+            "secret": secret,
+            "owner": ours,
+            "versions": [],
+        })
+    );
     let (status, refusal) = deployment
         .post_material(
             "/secrets/lifecycle",
