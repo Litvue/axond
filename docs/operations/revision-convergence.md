@@ -479,13 +479,16 @@ credentials pin, and each **active** credential becomes one entry in the pool of
   `revoked`, and `tombstoned` credentials are absent from the next snapshot's
   pools.
 - **withdrawing a project's own key empties its pool; it does not fall back to
-  the tenant's.** A project credential holds its `(namespace, provider)` pair for
-  as long as it exists, in any lifecycle, so disabling or revoking it makes calls
+  the tenant's.** A project credential holds its `(namespace, provider)` pair from
+  the moment it is activated until it is deleted, so disabling or revoking it
+  makes calls
   for that provider fail with no credential rather than quietly moving that
   traffic onto the tenant's key — which would bill another account and make a
   different key the one a leak implicates. *Deleting* (`tombstoned`) the
   credential releases the pair, and the tenant's default serves it again: falling
-  back is something an operator states, not something a withdrawal implies.
+  back is something an operator states, not something a withdrawal implies. A
+  `staged` project credential holds nothing — the tenant's default keeps serving
+  until the new key is activated, so preparing a key never interrupts traffic.
 - **a pool entry names a version, never a value.** Pool status, usage records,
   logs, and metrics carry the credential's slug; the material is held as a
   reference-counted, zeroizing lease that nothing renders.

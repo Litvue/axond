@@ -49,7 +49,9 @@
 //!   silently promoting the tenant's, because a key that quietly starts billing
 //!   another account — and would be the one a leak implicated — is not what
 //!   withdrawing a key asks for. Deleting the credential releases the pair, so
-//!   falling back to the tenant default is something an operator states;
+//!   falling back to the tenant default is something an operator states. A
+//!   `staged` key holds nothing: preparing a project's own key must not take that
+//!   project off the tenant's before the new one can serve it;
 //! - a credential whose owner has no projected namespace (a tenant with no
 //!   projects, or a suspended one, whose projects are deliberately not projected)
 //!   is *not* projected. It is logged by reference and skipped rather than
@@ -136,12 +138,12 @@ impl RevisionProjection for CredentialProjection {
         let namespaces = ProjectedNamespaces::index(bootstrap);
 
         // Project-scoped credentials first, so the pairs they claim are known
-        // before a tenant's defaults are considered for the same pairs. A
-        // tombstoned credential is gone — the pair it held is released — but every
-        // other lifecycle is still a declaration that the project owns its key.
+        // before a tenant's defaults are considered for the same pairs. A key
+        // claims its pair once it has been in service and until it is deleted:
+        // staging is traffic-neutral, and a tombstone releases the pair.
         let (owned, inherited): (Vec<&ProviderCredential>, Vec<&ProviderCredential>) = credentials
             .all()
-            .filter(|credential| credential.body.lifecycle() != SecretLifecycle::Tombstoned)
+            .filter(|credential| claims(credential.body.lifecycle()))
             .partition(|credential| credential.body.project().is_some());
 
         let mut claimed: HashSet<(String, String)> = HashSet::new();
@@ -192,6 +194,19 @@ impl RevisionProjection for CredentialProjection {
             }
         }
         Ok(config)
+    }
+}
+
+/// Whether a credential in `lifecycle` holds the pool it names.
+///
+/// Total, so a new lifecycle cannot be added without deciding whether it takes a
+/// pool over. `Staged` does not: preparing a project's own key must not take that
+/// project's traffic off the tenant default before the key can serve it.
+/// `Tombstoned` does not either — the material is gone.
+const fn claims(lifecycle: SecretLifecycle) -> bool {
+    match lifecycle {
+        SecretLifecycle::Active | SecretLifecycle::Disabled | SecretLifecycle::Revoked => true,
+        SecretLifecycle::Staged | SecretLifecycle::Tombstoned => false,
     }
 }
 
@@ -643,6 +658,19 @@ mod tests {
                 "{withdrawn:?} must empty the pool, not fall back"
             );
         }
+
+        // Preparing that key claims nothing: the tenant's default keeps serving
+        // until the project's own key is activated, so staging is traffic-neutral.
+        assert_eq!(
+            projected(&state([
+                tenant_wide(),
+                project_own(SecretLifecycle::Staged)
+            ]))
+            .iter()
+            .map(|entry| (entry.0.clone(), entry.2.clone()))
+            .collect::<Vec<_>>(),
+            [("acme/core".to_owned(), "tenant-wide".to_owned())],
+        );
 
         // Deleted, the claim is released and the tenant's default serves again.
         assert_eq!(
