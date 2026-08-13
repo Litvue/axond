@@ -868,6 +868,9 @@ fn an_older_look_cannot_displace_retained_evidence_declared_without_a_current_on
     let scope = ScopeRef::tenant(tenant(1));
     let declared = AvailabilityRecord {
         last_known_good: Some(present(scope, "gpt-4o", 300, None)),
+        // The watermark a derived record carries alongside its retained look, so the
+        // fixture is the shape a projection actually hands over.
+        definitive_at: Some(at(300)),
         ..permitting()
     };
     let builder = AvailabilityIndex::builder()
