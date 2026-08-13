@@ -1,4 +1,4 @@
-# 40. Multi-replica rollout qualification and its result artifact
+# 41. Multi-replica rollout qualification and its result artifact
 
 Date: 2026-08-13
 
