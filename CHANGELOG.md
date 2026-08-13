@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.3.22](https://github.com/Litvue/axond/compare/v0.3.21...v0.3.22) (2026-08-13)
+
+
+### Features
+
+* **desired-state:** fence policy on the document, not the publication ([0e87f16](https://github.com/Litvue/axond/commit/0e87f16c6dd7196e674ee4716ab0edb5b4d77e81))
+* **desired-state:** type axond.policy.v1 documents, generations, and transitions ([6c6a8da](https://github.com/Litvue/axond/commit/6c6a8da7ca200626d3efe812a9fe14ea078830cf))
+* **desired-state:** type axond.policy.v1 documents, generations, and transitions ([36a84c6](https://github.com/Litvue/axond/commit/36a84c6abed8fa147fea30e8ef96f6fa455ce624)), closes [#208](https://github.com/Litvue/axond/issues/208)
+* **secrets:** envelope-encrypted secret store with snapshot-time resolution ([#275](https://github.com/Litvue/axond/issues/275)) ([be0a846](https://github.com/Litvue/axond/commit/be0a8462abdd3f370b9fbce2ae67680b88a0105e))
+
+
+### Bug Fixes
+
+* **api-compat:** read the published baseline from styled cargo output ([24d0d21](https://github.com/Litvue/axond/commit/24d0d21aac87481ba99953b7da64ae2e4b5a15a3))
+* **api-compat:** read the published baseline from styled cargo output ([9a765ad](https://github.com/Litvue/axond/commit/9a765ad16f4465ba6914acf6fb3f9a43733c9fc3))
+* **api-compat:** strip every CSI sequence, not only colour ([2beeb9f](https://github.com/Litvue/axond/commit/2beeb9f617414dab412d4d269803c54ab231b859))
+* **desired-state:** name the concurrency field that broke its bound ([5a58a62](https://github.com/Litvue/axond/commit/5a58a623de59b46c3692aa3c2f2f9449375b9813))
+
+
+### Refactors
+
+* **desired-state:** read policy through the shared strict reader ([e744d14](https://github.com/Litvue/axond/commit/e744d146cb5380b9b8770b0b7a0655629bac4cf1))
+
+
+### Documentation
+
+* **adr:** renumber recovery qualification ADR to 0037 ([79f7c6b](https://github.com/Litvue/axond/commit/79f7c6bd4c5a2b4a938ff83f36012ab88195571f))
+* **adr:** renumber the policy ADR around 0035 ([997b12e](https://github.com/Litvue/axond/commit/997b12e20895d5b2e083004ea9cb6c9665595a28))
+* **desired-state:** drop a redundant intra-doc link target ([9941c57](https://github.com/Litvue/axond/commit/9941c5715daf7dbda9f87d324ca5165ea1c0c90a))
+* **desired-state:** state that a fence is a fence on one document ([5e4d7ca](https://github.com/Litvue/axond/commit/5e4d7ca187fb8c60ed4a1e4ea39c88a8d7ef2e94))
+* **operations:** commit the recovery qualification contract and dependency map ([ff0328a](https://github.com/Litvue/axond/commit/ff0328add653ecd297cc4fe288a0a115413039ec))
+* **operations:** note that a refusing scenario's serving gate is vacuous ([f4bb49f](https://github.com/Litvue/axond/commit/f4bb49f9ae1f6aec3b14ffef4132b274a1563ce2))
+* **operations:** recovery qualification contract and dependency map ([#219](https://github.com/Litvue/axond/issues/219)) ([e006489](https://github.com/Litvue/axond/commit/e00648924748ef0fd3b3b414bb80df9527160a54))
+
+
+### Tests
+
+* **qualification:** add the mixed-workload endurance soak harness ([#273](https://github.com/Litvue/axond/issues/273)) ([e62c8de](https://github.com/Litvue/axond/commit/e62c8dede29cc7e95da1194d51ee98bc1dc179f5))
+* **recovery:** pair the serving gate with serving evidence in both directions ([8664f3c](https://github.com/Litvue/axond/commit/8664f3cc6f0dd91d1b052edc9e7d6acb39a642e2))
+
 ## [0.3.21](https://github.com/Litvue/axond/compare/v0.3.20...v0.3.21) (2026-08-13)
 
 
