@@ -184,6 +184,12 @@ impl Drop for Deployment {
         let Some(dsn) = self.dsn.clone() else {
             return;
         };
+        // The child first: it holds a Postgres pool, batches usage every 50ms
+        // and settles detached, so dropping the tables under a live process
+        // either waits on its lock or fails its next insert against a relation
+        // that is no longer there. A field's own `Drop` runs after this body,
+        // which would be too late.
+        self.gateway.shutdown();
         let objects = vec![
             format!("TABLE IF EXISTS {}_reservation", self.budget_table),
             format!("TABLE IF EXISTS {}_namespace", self.budget_table),

@@ -365,12 +365,20 @@ impl Axond {
     /// ends the readers, and joining them settles the record. For the abandoned
     /// boot whose output is about to become a failure message.
     fn final_output(&mut self) -> String {
+        self.shutdown();
+        self.output()
+    }
+
+    /// End the process and settle its output, ahead of the drop that would do
+    /// it anyway. For a harness that must know the child is gone — because what
+    /// it does next, dropping the tables the child writes to, would otherwise
+    /// race the writes still in flight.
+    pub fn shutdown(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
         for reader in self.readers.drain(..) {
             let _ = reader.join();
         }
-        self.output()
     }
 
     /// The usage records the process has emitted on its stdout sink — the
