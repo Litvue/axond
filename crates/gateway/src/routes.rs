@@ -6450,6 +6450,13 @@ max_ttl = "15m"
     const LEAKY_DETAIL: &str = "connection to postgres://axond:s3cr3t-password@db.internal:5432/axond failed: FATAL: password authentication failed";
 
     fn status_state(observability: ReplicaObservability) -> AppState {
+        status_state_with_revocation(observability, Box::new(crate::revocation::NoDenylist))
+    }
+
+    fn status_state_with_revocation(
+        observability: ReplicaObservability,
+        revocation: Box<dyn crate::revocation::RevocationStore>,
+    ) -> AppState {
         let config = Config::from_toml_str(STATUS_CONFIG).expect("status config");
         let env = HashMap::from([
             ("AXOND_OPERATOR_KEY".to_owned(), OPERATOR_KEY.to_owned()),
@@ -6466,7 +6473,7 @@ max_ttl = "15m"
             UsageFanout::new(sinks),
             Box::new(NoBudget),
             Box::new(NoLimit),
-            Box::new(crate::revocation::NoDenylist),
+            revocation,
             observability,
         )
         .expect("status state")
@@ -6636,6 +6643,37 @@ max_ttl = "15m"
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["scope"], "namespace");
         assert!(body.get("revision").is_none(), "{body}");
+    }
+
+    /// The handler probes nothing, but authentication is not free for a *minted*
+    /// caller: a token carries a `jti`, and checking it against the revocation
+    /// store is a backend call that fails closed. So a revocation-store outage
+    /// takes the minted view of status with it, while the operator's static key —
+    /// which has no `jti` to check — keeps answering. That is the reason the
+    /// runbook says to triage with an operator key rather than a minted one.
+    #[tokio::test]
+    async fn a_revocation_outage_leaves_only_the_operator_key_reading_status() {
+        let unavailable = || {
+            status_state_with_revocation(
+                ReplicaObservability {
+                    status: observed_registry(),
+                    revision: None,
+                },
+                Box::new(FakeRevocation {
+                    mode: FakeRevocationMode::Unavailable,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+            )
+        };
+
+        let (status, body) = status_response(unavailable(), Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["scope"], "deployment", "{body}");
+
+        let token = scoped_token_for("test-audience", Some(vec!["status"]));
+        let (status, body) = status_response(unavailable(), Some(&token)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["type"], "revocation_unavailable", "{body}");
     }
 
     /// The redaction assertion, made against the serialized bytes rather than

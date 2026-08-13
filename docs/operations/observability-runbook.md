@@ -66,6 +66,13 @@ the revision summary, while any other caller sees only request-path components
 with reasons coarsened to `unavailable`. Use an operator key when triaging, and
 do not add a query parameter hoping to widen the view — there is none.
 
+Use a *static* operator key rather than a minted token, and not only for the
+wider view. The handler reads a cache, but authenticating a minted token means
+checking its `jti` against the revocation store, which fails closed: during a
+revocation-store outage a minted token gets `503 revocation_unavailable` from
+every route including this one, while a static key — which has no `jti` to check
+— still answers.
+
 ## Failure modes
 
 ### A dependency is impaired
