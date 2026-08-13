@@ -256,13 +256,18 @@ fn selectors(expr: &str) -> Result<Expression, String> {
     let mut pending: Vec<String> = Vec::new();
     let mut open: Vec<Scope> = Vec::new();
     let mut depth = 0usize;
+    // Set when the `(` about to be read is a call's argument list rather than the
+    // body a closed modifier list modifies: `on(...) group_left() metric` puts an
+    // empty argument list between the labels and what they apply to.
+    let mut argument_list = false;
 
     while index < bytes.len() {
         let character = bytes[index];
         match character {
             '(' => {
                 depth += 1;
-                if !pending.is_empty() {
+                let body = !std::mem::take(&mut argument_list);
+                if body && !pending.is_empty() {
                     open.push(Scope {
                         labels: std::mem::take(&mut pending),
                         body_depth: depth,
@@ -328,6 +333,8 @@ fn selectors(expr: &str) -> Result<Expression, String> {
                 if opens_a_call(&word, &bytes[index..]) {
                     if MODIFIERS.contains(&word.as_str()) {
                         grouping_depth = Some(depth + 1);
+                    } else {
+                        argument_list = true;
                     }
                     continue;
                 }

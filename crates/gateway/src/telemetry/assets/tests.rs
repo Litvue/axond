@@ -509,18 +509,24 @@ fn a_metric_matched_against_another_vector_is_still_validated() {
     );
     // The label list still binds: vector matching on a label the left-hand
     // instrument does not declare is the same drift as an undeclared grouping.
-    let failures =
-        dashboard_failures("axond_status_refreshes / on(axond_namespace) axond_request_count");
-    assert!(
-        matches!(
-            failures.as_slice(),
-            [AssetError::Catalog {
-                source: catalog::CatalogError::UndeclaredLabel { metric, key },
-                ..
-            }] if metric == "axond.status.refreshes" && key == "axond_namespace"
-        ),
-        "{failures:?}"
-    );
+    // Including across a `group_left()`, whose empty argument list sits between
+    // the labels and the series they apply to and must not absorb them.
+    for expr in [
+        "axond_status_refreshes / on(axond_namespace) axond_request_count",
+        "axond_status_refreshes / on(axond_namespace) group_left() axond_request_count",
+    ] {
+        let failures = dashboard_failures(expr);
+        assert!(
+            matches!(
+                failures.as_slice(),
+                [AssetError::Catalog {
+                    source: catalog::CatalogError::UndeclaredLabel { metric, key },
+                    ..
+                }] if metric == "axond.status.refreshes" && key == "axond_namespace"
+            ),
+            "{expr}: {failures:?}"
+        );
+    }
 }
 
 /// A Prometheus name is ASCII. A stray letter from somewhere else has to be a
