@@ -74,6 +74,13 @@ CREATE TABLE IF NOT EXISTS axond_cp_tenant (
 -- restores immediate checking once every row is written (`SET CONSTRAINTS ALL
 -- IMMEDIATE`), so the refusal still arrives inside the projection rather than at
 -- commit, where it could not be attributed.
+--
+-- The index this replaces is dropped rather than left beside the constraint: an
+-- index cannot be deferred, so a deployment that applied an earlier 0002 by hand
+-- would keep refusing the name swaps the constraint exists to allow, and no retry
+-- would clear it.
+DROP INDEX IF EXISTS axond_cp_tenant_slug_idx;
+
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -396,32 +403,35 @@ CREATE POLICY axond_cp_principal_isolation ON axond_cp_principal
         OR tenant_id = current_setting('axond.tenant_id', true)
     );
 
--- A refusal is filtered by the tenant it named *and* by the tenant whose
--- workload attempted it. A deployment-scoped denial names no tenant, so the row
--- itself is shared state — but when a workload made the attempt the row carries
--- that workload's tenant and principal id, and a session pinned to one tenant
--- reading those would learn which service accounts of every other tenant tried
--- to administer the deployment and what they tried. A tenant-scoped row attempted
--- by another tenant's workload is filtered for the same reason: the tenant that
--- was targeted may read that it refused something, and not the attacker's
--- identifiers. `ControlPlaneStore::denials` applies this predicate itself, so the
--- read API and the wall behind it state one rule rather than two; the unpinned
--- publisher — and the platform-scoped read — still sees every actor.
+-- A refusal this tenant was the target of is this tenant's row, whoever attempted
+-- it: it is the event the trail exists for, and withholding it would record a
+-- cross-tenant probe that the tenant it was aimed at can never read.
+--
+-- The attribution filter applies to the one class of row a pinned session reads
+-- that is not its own: a deployment-scoped denial names no tenant, so the row is
+-- shared state — but when a workload made the attempt it carries that workload's
+-- tenant and principal id, and a pinned session reading those would learn which
+-- service accounts of every other tenant tried to administer the deployment and
+-- what they tried. So: rows scoped to this tenant unconditionally, plus the
+-- deployment-scoped rows no other tenant's workload attempted. The unpinned
+-- publisher sees every row.
 ALTER TABLE axond_cp_access_denial ENABLE ROW LEVEL SECURITY;
 ALTER TABLE axond_cp_access_denial FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS axond_cp_access_denial_isolation ON axond_cp_access_denial;
 CREATE POLICY axond_cp_access_denial_isolation ON axond_cp_access_denial
     USING (
         coalesce(current_setting('axond.tenant_id', true), '') = ''
+        OR tenant_id = current_setting('axond.tenant_id', true)
         OR (
-            (tenant_id IS NULL OR tenant_id = current_setting('axond.tenant_id', true))
+            tenant_id IS NULL
             AND (actor_tenant_id IS NULL OR actor_tenant_id = current_setting('axond.tenant_id', true))
         )
     )
     WITH CHECK (
         coalesce(current_setting('axond.tenant_id', true), '') = ''
+        OR tenant_id = current_setting('axond.tenant_id', true)
         OR (
-            (tenant_id IS NULL OR tenant_id = current_setting('axond.tenant_id', true))
+            tenant_id IS NULL
             AND (actor_tenant_id IS NULL OR actor_tenant_id = current_setting('axond.tenant_id', true))
         )
     );

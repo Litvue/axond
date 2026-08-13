@@ -308,18 +308,13 @@ impl ControlPlaneStore for InMemoryControlPlane {
         let mut denials: Vec<AccessDenial> = storage
             .denials
             .iter()
-            // Scope *and* attribution, as the durable store and its row-level
-            // security both filter: a tenant-scoped read does not hand back the
-            // tenant and principal ids of another tenant's workload, and the
-            // platform-scoped read still sees every actor.
-            .filter(|denial| {
-                denial.tenant() == tenant
-                    && (tenant.is_none()
-                        || denial
-                            .actor
-                            .tenant()
-                            .is_none_or(|actor| Some(actor) == tenant))
-            })
+            // Scope, exactly as the durable store filters: a page names one
+            // scope and returns every refusal against it, whoever attempted it.
+            // Filtering the actor too would leave a cross-tenant attempt on no
+            // page at all; withholding another tenant's workload is the row-level
+            // security policy's job, and only for the deployment-scoped rows it
+            // shares with every pinned session.
+            .filter(|denial| denial.tenant() == tenant)
             .cloned()
             .collect();
         denials.sort_by(|left, right| {
@@ -403,9 +398,8 @@ mod tests {
         );
 
         // A refusal against this tenant attempted by another tenant's workload is
-        // not part of this tenant's page, as the durable store and its row-level
-        // security both have it: the targeted tenant may read that it refused
-        // something, not who by.
+        // on this tenant's page, as it is in the durable store: no other page
+        // would return it, and it is the event the trail exists for.
         let mut intruder = denial(5, ResourceScope::Tenant(tenant), 500);
         intruder.actor = Actor::Workload {
             tenant: other,
@@ -413,12 +407,20 @@ mod tests {
         };
         store.record_denial(&intruder).await.expect("record");
         assert!(
-            !store
+            store
                 .denials(Some(tenant), 10)
                 .await
                 .expect("read")
                 .contains(&intruder),
-            "a tenant's page named another tenant's workload"
+            "a refusal against this tenant is unreadable by anyone"
+        );
+        assert!(
+            !store
+                .denials(Some(other), 10)
+                .await
+                .expect("read")
+                .contains(&intruder),
+            "the attempting tenant's page is not where a refusal against another one belongs"
         );
         assert!(
             store

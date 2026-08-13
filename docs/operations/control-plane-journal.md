@@ -64,7 +64,10 @@ Two properties worth knowing before you plan capacity or retention:
   record through the mutation it replays. A refusal or a change that names *no*
   tenant is shared state, but its actor is not: a deployment-scoped row attributed
   to a workload is filtered by that workload's tenant too, so a pinned session
-  cannot read which service accounts of other tenants attempted what.
+  cannot read which service accounts of other tenants attempted what. A row that
+  names *this* tenant is this tenant's whoever attempted it — a refused
+  cross-tenant attempt is the event the trail is for, and hiding it from the
+  tenant it was aimed at would leave it readable by no one.
 
   The publication chain — `axond_cp_head`, `axond_cp_revision`,
   `axond_cp_revision_entry`, `axond_cp_revision_blob`, `axond_cp_blob`,

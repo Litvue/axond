@@ -391,14 +391,17 @@ pub trait ControlPlaneStore: Send + Sync {
     /// tenant's. Deployment-scoped denials — refusals that named no tenant — are
     /// read with `None`, which only a platform-scoped caller may ask for.
     ///
-    /// Attribution is filtered with scope, not just alongside it: a tenant-scoped
-    /// read omits refusals attempted by *another* tenant's workload, because that
-    /// workload's tenant and principal ids are the other tenant's identifiers and
-    /// a refusal is not consent to publish them to the tenant it named. Refusals
-    /// with no tenant actor — human, breakglass, the gateway — are returned, and
-    /// the platform-scoped read sees every actor. This is the same rule the
-    /// row-level-security policy on the durable table applies to a pinned session,
-    /// stated once so a store and its wall cannot disagree.
+    /// Scope-exact, and every refusal against the scope asked for is returned
+    /// whoever attempted it — including the cross-tenant attempt, which is the
+    /// event the trail exists for. Filtering the actor here as well would put such
+    /// a refusal on no page at all: not the targeted tenant's, by actor; not the
+    /// attempting tenant's, by scope; and not the deployment page, which is only
+    /// the rows that named no tenant.
+    ///
+    /// Withholding another tenant's workload identifiers is the row-level-security
+    /// policy's job, because the wall is the only layer that hands a pinned session
+    /// a row it is not the subject of: it shares the deployment-scoped refusals, so
+    /// it withholds the ones another tenant's workload attempted.
     async fn denials(
         &self,
         tenant: Option<TenantId>,

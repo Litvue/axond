@@ -804,15 +804,22 @@ impl ControlPlaneStore for PostgresControlPlane {
                 // denials rather than every row: a refusal that named no tenant is
                 // a platform-scoped read, not a wildcard.
                 //
-                // Attribution is filtered as well as scope, and for a reason the
-                // targeted tenant does not get to override: the actor of a refused
-                // cross-tenant attempt is another tenant's workload, and its tenant
-                // and principal ids are that tenant's identifiers. A refusal by a
-                // human, by breakglass, or by the gateway has no actor tenant and
-                // stays readable, and the platform-scoped read — which is the
-                // unpinned session the policy leaves unrestricted — still sees
-                // every actor. The predicate is the row-level-security policy on
-                // this table, so the two layers state one rule.
+                // Scope alone, and deliberately: this read is scope-*exact*, so
+                // every row it returns is a refusal against the tenant that was
+                // asked for, whoever attempted it. Filtering the actor here as
+                // well would make a cross-tenant attempt — a refusal scoped to A
+                // attempted by a workload of B — returnable by no page at all:
+                // not A's, because of the actor; not B's, because of the scope;
+                // and not the deployment page, which is only the rows that named
+                // no tenant. That row is the one the trail exists for.
+                //
+                // Attribution is filtered one layer down, where it is the only
+                // place it can leak: the row-level-security policy shares
+                // *deployment-scoped* refusals with every pinned session, so it
+                // withholds the ones another tenant's workload attempted. A read
+                // that names a tenant is answering for that tenant, and a caller
+                // that may ask about a tenant at all is a caller that may know
+                // who was refused against it.
                 let rows = client
                     .query(
                         "SELECT denial_id, actor_kind, actor_issuer, actor_subject, \
@@ -820,7 +827,6 @@ impl ControlPlaneStore for PostgresControlPlane {
                          scope_kind, tenant_id, project_id, reason, recorded_at \
                          FROM axond_cp_access_denial \
                          WHERE tenant_id IS NOT DISTINCT FROM $1 \
-                         AND ($1::text IS NULL OR actor_tenant_id IS NULL OR actor_tenant_id = $1) \
                          ORDER BY recorded_at DESC, denial_id DESC LIMIT $2",
                         &[&tenant, &limit],
                     )
@@ -3665,6 +3671,76 @@ mod tests {
         );
     }
 
+    /// The rule an in-place upgrade is left with is the deferred one.
+    ///
+    /// An earlier 0002 held a tenant's name in a partial unique *index*, and an
+    /// index cannot be deferred. A deployment that applied that version by hand and
+    /// then applies this one would, if the index survived, keep refusing exactly the
+    /// swap above — permanently, because the constraint the projection defers is
+    /// checked beside an index that is not. So the migration drops it, and this
+    /// asserts the drop by recreating the old index first.
+    #[tokio::test]
+    async fn an_upgraded_deployment_keeps_no_rule_the_projection_cannot_defer() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        store
+            .attempt(
+                "CREATE UNIQUE INDEX axond_cp_tenant_slug_idx ON axond_cp_tenant (slug) \
+                 WHERE lifecycle <> 'deleted'",
+            )
+            .await
+            .expect("the rule an earlier 0002 left behind");
+
+        let tenancy = schema::MIGRATIONS
+            .iter()
+            .find(|migration| migration.name.contains("tenancy"))
+            .expect("the tenancy migration ships");
+        store
+            .attempt(tenancy.sql)
+            .await
+            .expect("re-applying the tenancy migration must not fail");
+        assert_eq!(
+            store
+                .column(
+                    "SELECT indexname::text FROM pg_indexes \
+                     WHERE schemaname = current_schema() \
+                     AND indexname = 'axond_cp_tenant_slug_idx'"
+                )
+                .await,
+            Vec::<String>::new(),
+            "an index the projection cannot defer outlived the migration that replaced it"
+        );
+
+        // And the swap the deferred constraint exists to allow still publishes.
+        let slug = |slug: &str| Slug::parse(slug).expect("a slug");
+        let mut before = state();
+        before
+            .insert(tenant(11, "globex"))
+            .expect("two tenants are valid");
+        let first = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "named", before.clone()))
+            .await
+            .expect("the original names publish");
+        let second = ResourceVersionNumber::FIRST.next();
+        let mut swapped = before;
+        swapped
+            .supersede(tenant_body(1, "Acme").version_at(slug("globex"), second))
+            .and_then(|state| {
+                state.supersede(tenant_body(11, "Globex").version_at(slug("acme"), second))
+            })
+            .expect("a state in which names are exchanged is valid");
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(first.id),
+                "swap",
+                swapped,
+                91,
+            ))
+            .await
+            .expect("an upgraded deployment must accept a traded name too");
+    }
+
     /// Two administrators exchanging sign-ins, and two workloads exchanging keys,
     /// in one revision. Like a traded name this is valid desired state — the
     /// directory refuses a *shared* identity, not a reassigned one — so it must not
@@ -4258,10 +4334,9 @@ mod tests {
         );
 
         // And a refusal *against* this tenant attempted by another tenant's
-        // workload is not part of this tenant's page: it may read that something
-        // was refused, and not the other tenant's identifiers. The platform read
-        // still sees the actor, and so does the row-level-security policy's
-        // unpinned session.
+        // workload is on this tenant's page, actor included. It is the event the
+        // trail exists for, and every other page excludes it by scope: dropping
+        // it here as well would record a cross-tenant probe that no read returns.
         let mut intruder = denial(95, ResourceScope::Tenant(tenant), DenialReason::CrossTenant);
         intruder.actor = Actor::Workload {
             tenant: other,
@@ -4269,19 +4344,28 @@ mod tests {
         };
         store.record_denial(&intruder).await.expect("record");
         assert!(
-            !store
+            store
                 .denials(Some(tenant), 10)
                 .await
                 .expect("read")
                 .contains(&intruder),
-            "a tenant's page named another tenant's workload"
+            "a refusal against this tenant is unreadable by anyone"
         );
         assert!(
-            store
-                .column("SELECT denial_id FROM axond_cp_access_denial")
+            !store
+                .denials(Some(other), 10)
                 .await
-                .contains(&intruder.id.to_string()),
-            "the refusal is still recorded — it is the read that is scoped"
+                .expect("read")
+                .contains(&intruder),
+            "the attempting tenant's page is not where a refusal against another one belongs"
+        );
+        assert!(
+            !store
+                .denials(None, 10)
+                .await
+                .expect("read")
+                .contains(&intruder),
+            "the deployment page is the rows that named no tenant"
         );
     }
 
