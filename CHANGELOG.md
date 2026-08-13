@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.32](https://github.com/Litvue/axond/compare/v0.3.31...v0.3.32) (2026-08-13)
+
+
+### Documentation
+
+* **integration:** retire the last IG-03 contract dependency and name the seam it waits on ([#317](https://github.com/Litvue/axond/issues/317)) ([42a1233](https://github.com/Litvue/axond/commit/42a1233fbd9d6bf5403992b936175bbbb6c0a71e))
+
 ## [0.3.31](https://github.com/Litvue/axond/compare/v0.3.30...v0.3.31) (2026-08-13)
 
 
