@@ -289,7 +289,7 @@ pub trait ComponentProbe: Send + Sync {
     }
 
     /// Observe the backend. Called from the background refresher only, and
-    /// bounded by [`Self::probe_timeout`]; an implementation reports
+    /// bounded by the duration returned from [`Self::begin`]; an implementation reports
     /// failure as a bounded [`StatusReason`] plus an operator-facing detail
     /// rather than propagating the backend's error type.
     async fn observe(&self) -> ComponentObservation;
