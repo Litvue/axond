@@ -1,4 +1,4 @@
-# 36. Derived availability and discovery evaluation
+# 37. Derived availability and discovery evaluation
 
 Date: 2026-08-12
 
@@ -113,7 +113,9 @@ the outage that follows, has a complete listing which dropped the target discred
 the retained positive, and cannot adopt a look older than the one already held.
 Declared evidence is judged against the conclusion the *index* has reached rather
 than the one the record carries itself, so a record read out of one index survives
-being declared into another and an ordinary refresh reports nothing out of order.
+being declared into another — including the ordinary shape where the current look
+*is* the retained positive, which stays current evidence rather than being demoted
+to a fallback — and an ordinary refresh reports nothing out of order.
 
 **Uncertainty is routable only where a scope chose it.** `unknown` and `stale` are
 not refusals, but routability is a property of the whole verdict:

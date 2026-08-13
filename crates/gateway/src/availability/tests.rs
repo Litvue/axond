@@ -489,6 +489,41 @@ fn a_declared_listing_is_retained_for_the_outage_that_follows_it() {
     );
 }
 
+/// The shape every freshly confirmed target has — the current look *is* the retained
+/// positive — must survive a hand-over as current evidence, not be demoted to a
+/// fallback.
+#[test]
+fn a_freshly_confirmed_record_is_declared_as_current_evidence_not_a_fallback() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let confirmed = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, None))
+        .build();
+    let carried = confirmed
+        .record(&key(scope, "gpt-4o"))
+        .expect("the key is held")
+        .clone();
+    assert_eq!(
+        carried.discovery, carried.last_known_good,
+        "the current look is the retained positive"
+    );
+
+    let builder = AvailabilityIndex::builder().record(key(scope, "gpt-4o"), carried.clone());
+    assert_eq!(builder.superseded(), 0);
+
+    let index = builder.build();
+    assert_eq!(index.record(&key(scope, "gpt-4o")), Some(&carried));
+    let verdict = index.evaluate(&key(scope, "gpt-4o"), at(200));
+    assert_eq!(
+        (verdict.state, verdict.reason),
+        (AvailabilityState::Available, AvailabilityReason::Observed)
+    );
+    assert!(
+        !verdict.last_known_good,
+        "it is resting on a current look, not a fallback"
+    );
+}
+
 /// A refresh that reads an index into a builder and redeclares what it read has not
 /// received anything out of order, so the counter must stay quiet.
 #[test]

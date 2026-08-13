@@ -7,7 +7,7 @@
 //! the provider account is entitled to, what policy permits, what discovery
 //! observed, and how this replica's own requests have been going. This module
 //! defines what that derivation *is*, so the slices that will feed it cannot each
-//! invent their own answer. The decision it implements is ADR 0036.
+//! invent their own answer. The decision it implements is ADR 0037.
 //!
 //! # The shape of the domain
 //!

@@ -406,9 +406,11 @@ impl AvailabilityIndexBuilder {
     ///
     /// It is judged against the conclusion the *index* has already reached, never
     /// against the one the declaration carries itself, so a record read out of one
-    /// index survives being declared into another; a slot that already holds the
-    /// declared look is left untouched, so an ordinary refresh that redeclares what it
-    /// read reports no out-of-order arrivals.
+    /// index survives being declared into another — including the ordinary shape where
+    /// the current look *is* the retained positive, which stays current evidence
+    /// rather than being demoted to a fallback. A slot that already holds the declared
+    /// look is left untouched, so an ordinary refresh that redeclares what it read
+    /// reports no out-of-order arrivals.
     #[must_use]
     pub fn record(mut self, key: AvailabilityKey, record: AvailabilityRecord) -> Self {
         let entry = self.records.entry(key).or_default();
@@ -424,20 +426,21 @@ impl AvailabilityIndexBuilder {
             definitive_at: entry.definitive_at,
             ..record
         };
-        // Retained first, then current: a record carries the look it fell back to
-        // alongside a newer current one, so applying them in that order is what an
-        // index that saw them in that order would have done. A look a slot already
-        // holds is left alone — a refresh that redeclares what it read discarded
-        // nothing, so it is not an out-of-order arrival.
-        if let Some(retained) = retained
-            && entry.last_known_good.as_ref() != Some(&retained)
-            && !Self::retain(entry, &retained)
-        {
-            self.superseded += 1;
-        }
+        // Current first, then retained: the current look is the newest thing the
+        // declaration knows, and judging it first is what keeps a record whose newest
+        // look *is* the retained positive — the ordinary shape after a complete
+        // listing — from having its own conclusion refuse it. A look a slot already
+        // holds is left alone, so a refresh that redeclares what it read discarded
+        // nothing and reports no out-of-order arrival.
         if let Some(current) = current
             && entry.discovery.as_ref() != Some(&current)
             && !Self::admit(entry, current)
+        {
+            self.superseded += 1;
+        }
+        if let Some(retained) = retained
+            && entry.last_known_good.as_ref() != Some(&retained)
+            && !Self::retain(entry, &retained)
         {
             self.superseded += 1;
         }
