@@ -204,7 +204,7 @@ which would retire every model.
 That holds now that something drives refresh on a schedule
 ([ADR 0051](../adr/0051-durable-catalogue-snapshots-and-refresh-orchestration.md))
 in a deployment that selects a source and a store in `[catalog]`
-([ADR 0052](../adr/0052-catalogue-imports-in-a-running-deployment.md)).
+([ADR 0053](../adr/0053-catalogue-imports-in-a-running-deployment.md)).
 `CatalogRefresher` writes an import to `CatalogStore` *before* it becomes
 active, so a deployment never serves a catalogue it could not retain; a refusal
 of any kind — upstream, parse, storage, timeout — leaves the active catalogue

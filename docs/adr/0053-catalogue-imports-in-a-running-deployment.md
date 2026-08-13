@@ -1,4 +1,4 @@
-# 52. Catalogue imports in a running deployment
+# 53. Catalogue imports in a running deployment
 
 Date: 2026-08-13
 

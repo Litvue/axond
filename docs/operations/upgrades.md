@@ -26,7 +26,7 @@ deployment unit. Read the release's `CHANGELOG.md` entry before every rollout.
    section imports nothing and needs none of it; the DDL is additive and
    idempotent, and applying it early costs two empty tables
    ([ADR 0051](../adr/0051-durable-catalogue-snapshots-and-refresh-orchestration.md),
-   [ADR 0052](../adr/0052-catalogue-imports-in-a-running-deployment.md)).
+   [ADR 0053](../adr/0053-catalogue-imports-in-a-running-deployment.md)).
 6. Complete any stop-the-fleet Redis/Postgres budget migration before starting
    namespace-cap-aware replicas.
 7. Verify ingress streaming behavior and client retries.
