@@ -630,6 +630,11 @@ async fn control_plane_outage_journal_outage() {
         .as_ref()
         .expect("a failed attempt is reported");
     recorder.observe("convergence_rejection_reason", rejection.reason);
+    // Zero, and the artifact says so rather than omitting the class the manifest
+    // promises: a replica that cannot read desired state cannot know it is
+    // behind, which is exactly why an outage is measured by failures and a
+    // recovery by elapsed time.
+    recorder.observe("convergence_lag_seconds", report.lag);
     recorder.observe(
         "consecutive_convergence_failures",
         u64::from(report.consecutive_failures),
@@ -1205,7 +1210,7 @@ async fn recovery_convergence_journal_recovery() {
     let recovery = started.elapsed();
     let worst_lag = converged.iter().copied().max().unwrap_or_default();
     recorder.observe("fleet_recovery_seconds", recovery);
-    recorder.observe("worst_convergence_lag_seconds", worst_lag);
+    recorder.observe("worst_residual_lag_seconds", worst_lag);
 
     // Nothing the journal accepted — before, during, or after the outage — was
     // lost, and the chain the fleet converged onto is the one it holds.
@@ -1230,14 +1235,19 @@ async fn recovery_convergence_journal_recovery() {
         "the baseline, two outage-window revisions, and the post-recovery head must all survive"
     );
 
+    // The bound is how long a replica may still be behind desired state after
+    // the journal returns, so the measurement is the elapsed time from the
+    // post-restore publish until every replica is at the head. `worst_lag` is
+    // the *residual* lag of an already converged replica: structurally zero, and
+    // therefore an observation rather than a gate.
     let bound = Duration::from_secs(spec.gate.max_convergence_lag_seconds);
     recorder.gate(
         "max_convergence_lag_seconds",
         spec.gate.max_convergence_lag_seconds.to_string(),
-        format!("{:.3}", worst_lag.as_secs_f64()),
-        worst_lag <= bound,
-        "both replicas converged to the head revision without intervention once the journal \
-         returned",
+        format!("{:.3}", recovery.as_secs_f64()),
+        recovery <= bound,
+        "both replicas converged to the head revision without intervention within the bound once \
+         the journal returned",
     );
     recorder.gate(
         "admin_writes",
