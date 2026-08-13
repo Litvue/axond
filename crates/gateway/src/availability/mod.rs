@@ -105,13 +105,14 @@ pub use index::{AvailabilityIndex, AvailabilityIndexBuilder, AvailabilityRecord}
 #[allow(unused_imports)]
 pub use projection::{
     AvailabilityEvidence, AvailabilityProjection, AvailabilityProjectionError, AvailabilityReader,
-    AvailabilityView, Catalogue, CatalogueListing, CredentialReadiness, ProjectedAvailability, RuntimeObservations,
+    AvailabilityView, Catalogue, CatalogueListing, CredentialReadiness, ProjectedAvailability,
+    RuntimeObservations,
 };
-#[allow(unused_imports)]
-pub use store::{ObservationSlot, ObservationStore, StoredObservation};
 #[allow(unused_imports)]
 pub use refs::{
     AvailabilityKey, CredentialRef, InvalidToken, ModelRef, ProviderRef, ScopeRef, TargetRef, Token,
 };
+#[allow(unused_imports)]
+pub use store::{ObservationSlot, ObservationStore, StoredObservation};
 #[allow(unused_imports)]
 pub use verdict::{Availability, AvailabilityReason, AvailabilityState, DecidedBy};

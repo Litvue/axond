@@ -338,7 +338,12 @@ async fn availability(
         query.project.as_deref(),
     )?;
     let grant = api
-        .authorize(&identity, AdminAction::ReadAvailability, Surface::Model, &scope)
+        .authorize(
+            &identity,
+            AdminAction::ReadAvailability,
+            Surface::Model,
+            &scope,
+        )
         .await?;
     Ok(Json(api.service.availability(
         &grant,

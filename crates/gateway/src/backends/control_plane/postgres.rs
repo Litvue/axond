@@ -1174,9 +1174,8 @@ fn observation_row(row: &Row) -> Result<StoredObservation, ControlPlaneError> {
         .map(|project| ProjectId::parse(&project))
         .transpose()
         .map_err(|error| corrupt_storage(format!("an observation names no project: {error}")))?;
-    let target = TargetRef::parse(&provider, &model).map_err(|error| {
-        corrupt_storage(format!("an observation names no target: {error}"))
-    })?;
+    let target = TargetRef::parse(&provider, &model)
+        .map_err(|error| corrupt_storage(format!("an observation names no target: {error}")))?;
     let scope = match project {
         None => ScopeRef::tenant(tenant),
         Some(project) => ScopeRef::project(tenant, project),

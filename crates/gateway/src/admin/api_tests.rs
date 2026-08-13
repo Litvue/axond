@@ -10,6 +10,9 @@
 //! complete candidate that validates, because the surface offers no other way.
 
 use std::sync::Arc;
+use std::time::SystemTime;
+
+use gateway_core::CircuitState;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -25,6 +28,11 @@ use super::protocol::{
 };
 use super::router::{ADMIN_MAX_REQUEST_BYTES, AdminApi, refusing_router, router};
 use super::service::AdminService;
+use crate::availability::{
+    AvailabilityIndex, AvailabilityKey, AvailabilityReader, AvailabilityRecord, CataloguePresence,
+    DiscoveryCompleteness, DiscoveryObservation, DiscoveryResult, DiscoverySource, Enablement,
+    Entitlement, PolicyDecision, RuntimeObservations, ScopeRef, TargetRef,
+};
 use crate::backends::control_plane::ControlPlaneStore;
 use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{ResourceScope, fixtures};
@@ -52,6 +60,28 @@ impl Deployment {
             Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
             Arc::new(authorizer),
         ));
+        Self { api, store }
+    }
+
+    /// A deployment that derives availability: the index a snapshot would carry,
+    /// and this replica's own circuits.
+    fn deriving(
+        authorizer: FakeAdminAuthorizer,
+        index: AvailabilityIndex,
+        runtime: RuntimeObservations,
+    ) -> Self {
+        let store = Arc::new(InMemoryControlPlane::new());
+        let api = Arc::new(
+            AdminApi::new(
+                Arc::new(AdminService::stateful(store.clone())),
+                Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
+                Arc::new(authorizer),
+            )
+            .with_availability(Arc::new(StaticAvailability {
+                index: Arc::new(index),
+                runtime,
+            })),
+        );
         Self { api, store }
     }
 
@@ -1476,4 +1506,194 @@ async fn a_stateless_deployment_refuses_every_administrative_route_by_mode() {
         // on a credential a stateless deployment has no way to issue.
         assert_eq!(body["error"]["retryable"], false);
     }
+}
+
+/// A replica's derived availability, as a snapshot would carry it.
+struct StaticAvailability {
+    index: Arc<AvailabilityIndex>,
+    runtime: RuntimeObservations,
+}
+
+impl AvailabilityReader for StaticAvailability {
+    fn index(&self) -> Arc<AvailabilityIndex> {
+        Arc::clone(&self.index)
+    }
+
+    fn runtime(&self) -> RuntimeObservations {
+        self.runtime.clone()
+    }
+}
+
+/// A record every authority permits, resting on the evidence it is handed.
+fn entitled(evidence: DiscoveryObservation) -> AvailabilityRecord {
+    AvailabilityRecord {
+        presence: CataloguePresence::Present,
+        enablement: Enablement::Enabled,
+        entitlement: Entitlement::Granted,
+        policy: PolicyDecision::Permitted,
+        discovery: Some(evidence),
+        ..AvailabilityRecord::default()
+    }
+}
+
+/// Two tenants' derived availability in one index, which is what a replica
+/// actually holds: the read must never widen past the scope it was asked about.
+fn two_tenant_index() -> (AvailabilityIndex, ScopeRef, ScopeRef) {
+    let mine = ScopeRef::tenant(fixtures::tenant_id(1));
+    let theirs = ScopeRef::tenant(fixtures::tenant_id(11));
+    let target = TargetRef::parse("openai", "gpt-4o").expect("a well-formed target");
+    let observation = |scope: ScopeRef| {
+        DiscoveryObservation::new(
+            scope,
+            target.clone(),
+            DiscoveryResult::Present,
+            DiscoveryCompleteness::Complete,
+            DiscoverySource::ProviderListing,
+            SystemTime::now(),
+        )
+        .detailed("listed by https://api.example.test/v1/models?key=sk-live-never-served")
+    };
+    let index = AvailabilityIndex::builder()
+        .record(
+            AvailabilityKey::new(mine, target.clone()),
+            entitled(observation(mine)),
+        )
+        .record(
+            AvailabilityKey::new(theirs, target.clone()),
+            entitled(observation(theirs)),
+        )
+        .build();
+    (index, mine, theirs)
+}
+
+/// A replica that derives no view says so, rather than answering "no models" —
+/// which reads identically to an entitlement a caller has just lost.
+#[tokio::test]
+async fn an_availability_read_distinguishes_deriving_nothing_from_finding_nothing() {
+    let deployment = Deployment::new();
+
+    let (status, body) = deployment
+        .get(&format!("/availability?tenant={}", fixtures::tenant_id(1)))
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["deriving"], json!(false));
+    assert_eq!(body["targets"], json!([]));
+
+    let (index, mine, _) = two_tenant_index();
+    let deriving = Deployment::deriving(
+        FakeAdminAuthorizer::permissive(),
+        index,
+        RuntimeObservations::none(),
+    );
+    let (status, body) = deriving
+        .get(&format!("/availability?tenant={}", mine.tenant))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["deriving"], json!(true));
+    assert_eq!(body["targets"].as_array().expect("targets").len(), 1);
+    assert_eq!(body["targets"][0]["state"], json!("available"));
+    assert_eq!(body["targets"][0]["provider"], json!("openai"));
+}
+
+/// The read is answered from the replica's own memory: an availability question
+/// asked *because* the control plane is unreachable must not need it.
+#[tokio::test]
+async fn an_availability_read_reaches_no_control_plane() {
+    let (index, mine, _) = two_tenant_index();
+    let store = Arc::new(InMemoryControlPlane::new());
+    let counting = Arc::new(CountingStore::new(store.clone()));
+    let api = Arc::new(
+        AdminApi::new(
+            Arc::new(AdminService::stateful(counting.clone())),
+            Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
+            Arc::new(FakeAdminAuthorizer::permissive()),
+        )
+        .with_availability(Arc::new(StaticAvailability {
+            index: Arc::new(index),
+            runtime: RuntimeObservations::none(),
+        })),
+    );
+    let deployment = Deployment { api, store };
+
+    let (status, body) = deployment
+        .get(&format!("/availability?tenant={}", mine.tenant))
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["deriving"], json!(true));
+    assert_eq!(
+        counting.calls(),
+        0,
+        "an availability read consulted the control plane"
+    );
+}
+
+/// One tenant's derived entitlements are not another's, and a grant that does
+/// not enclose the scope is refused rather than narrowed.
+#[tokio::test]
+async fn an_availability_read_is_confined_to_the_scope_the_grant_encloses() {
+    let (index, mine, theirs) = two_tenant_index();
+    let deployment = Deployment::deriving(
+        FakeAdminAuthorizer::permissive().within(&[ResourceScope::Tenant(mine.tenant)]),
+        index,
+        RuntimeObservations::none(),
+    );
+
+    let (status, body) = deployment
+        .get(&format!("/availability?tenant={}", mine.tenant))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["targets"].as_array().expect("targets").len(), 1);
+    // A tenant's own answer carries no discovery machinery: which listing the
+    // deployment took, and what a probe's error body said, are the operator's.
+    assert_eq!(body["targets"][0].get("source"), None);
+    let serialized = body.to_string();
+    assert!(!serialized.contains("sk-live"), "{serialized}");
+    assert!(!serialized.contains("api.example.test"), "{serialized}");
+
+    let (status, _) = deployment
+        .get(&format!("/availability?tenant={}", theirs.tenant))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Availability is a question about a tenant's models. A deployment-wide answer
+/// would be every tenant's entitlements in one document, so it is refused rather
+/// than served to the one caller who could read it.
+#[tokio::test]
+async fn an_availability_read_must_name_the_tenant_it_asks_about() {
+    let (index, _, _) = two_tenant_index();
+    let deployment = Deployment::deriving(
+        FakeAdminAuthorizer::permissive(),
+        index,
+        RuntimeObservations::none(),
+    );
+
+    let (status, body) = deployment.get("/availability").await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["type"], "admin_request_invalid");
+}
+
+/// This replica's own circuits are overlaid at the instant of the question, so
+/// two replicas answer honestly rather than one answering for the fleet.
+#[tokio::test]
+async fn an_availability_read_overlays_this_replicas_own_health() {
+    let (index, mine, _) = two_tenant_index();
+    let deployment = Deployment::deriving(
+        FakeAdminAuthorizer::permissive(),
+        index,
+        RuntimeObservations::of_circuits([("openai/gpt-4o".to_owned(), CircuitState::Open)]),
+    );
+
+    let (status, body) = deployment
+        .get(&format!("/availability?tenant={}", mine.tenant))
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["targets"][0]["state"], json!("unavailable"));
+    // Which authority refused stays with the operator: a tenant learns that the
+    // target is not being attempted, not that this replica's breaker is open.
+    assert_eq!(body["targets"][0]["decided_by"], json!("undisclosed"));
 }

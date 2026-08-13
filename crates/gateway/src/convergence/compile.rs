@@ -185,8 +185,11 @@ pub enum CompileError {
     #[error("revision {revision} could not be projected into an availability view: {source}")]
     Availability {
         revision: RevisionId,
+        /// Boxed because every other variant of this error is small and it is
+        /// returned by the compile path on the way to a refusal, never in the
+        /// common case.
         #[source]
-        source: AvailabilityProjectionError,
+        source: Box<AvailabilityProjectionError>,
     },
 }
 
@@ -437,7 +440,7 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
             .derive(revision.state(), &readiness)
             .map_err(|source| CompileError::Availability {
                 revision: id,
-                source,
+                source: Box::new(source),
             })?;
         Ok(snapshot.with_availability(Arc::new(projected.into_index())))
     }

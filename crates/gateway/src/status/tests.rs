@@ -720,6 +720,7 @@ fn backend_and_revision_failures_map_to_bounded_codes() {
         ("ungoverned", StatusReason::PolicyRejected),
         ("invalid_policy", StatusReason::PolicyRejected),
         ("invalid", StatusReason::ValidationRejected),
+        ("availability", StatusReason::ProjectionRejected),
         ("not_found", StatusReason::NotConfigured),
         ("denied", StatusReason::PermissionDenied),
         // A lost write says nothing about a component's health, so it stays

@@ -31,7 +31,7 @@
 //! and the projection cannot invent a key: an enablement whose offering no
 //! listing in hand carries produces *no record at all*, which
 //! [`AvailabilityIndex::evaluate`] answers `unknown` with
-//! [`DecidedBy::NoRecord`] — a verdict that permits no attempt. Refusals like
+//! [`DecidedBy::NoRecord`](super::DecidedBy::NoRecord) — a verdict that permits no attempt. Refusals like
 //! that are counted ([`ProjectedAvailability::unnameable`]) rather than dropped
 //! silently, because a projection that quietly stopped describing half a
 //! catalogue would otherwise look identical to a tenant that enabled nothing.
@@ -86,11 +86,13 @@ use crate::desired_state::providers::{ProviderError, Providers};
 use crate::desired_state::secrets::{SecretLifecycle, SecretRef};
 use crate::desired_state::{Checksum, DesiredState};
 
-use super::dimensions::{CataloguePresence, Enablement, Entitlement, PolicyDecision, RuntimeHealth};
+use super::dimensions::{
+    CataloguePresence, Enablement, Entitlement, PolicyDecision, RuntimeHealth,
+};
 use super::discovery::DiscoveryObservation;
 use super::index::{AvailabilityIndex, AvailabilityIndexBuilder, AvailabilityRecord};
-use super::store::{self, StoredObservation};
 use super::refs::{AvailabilityKey, CredentialRef, ScopeRef, TargetRef};
+use super::store::{self, StoredObservation};
 use super::verdict::Availability;
 
 /// Why a revision could not be projected into availability at all.
@@ -612,8 +614,8 @@ impl AvailabilityEvidence {
         let catalogue = Arc::clone(&self.lock(&self.catalogue));
         let previous = self.index();
         let pending: Vec<DiscoveryObservation> = self.lock(&self.pending).drain(..).collect();
-        let projected =
-            AvailabilityProjection::new(&catalogue, readiness).project(state, &previous, pending)?;
+        let projected = AvailabilityProjection::new(&catalogue, readiness)
+            .project(state, &previous, pending)?;
         *self.lock(&self.index) = Arc::new(projected.index().clone());
         Ok(projected)
     }
@@ -693,7 +695,11 @@ impl<'a> AvailabilityView<'a> {
     }
 
     /// Every target filed under one scope, in target order.
-    pub fn evaluate_scope(&self, scope: ScopeRef, now: SystemTime) -> Vec<(TargetRef, Availability)> {
+    pub fn evaluate_scope(
+        &self,
+        scope: ScopeRef,
+        now: SystemTime,
+    ) -> Vec<(TargetRef, Availability)> {
         self.index
             .evaluate_scope(&scope, now)
             .into_iter()
@@ -759,5 +765,53 @@ fn policy_of(policies: &PolicySet, owner: ModelOwner) -> PolicyDecision {
             PolicyDecision::Denied
         }
         Some(_) => PolicyDecision::Permitted,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    //! A catalogue carrying one offering, for tests outside this module that
+    //! need a projection to have something to name.
+
+    use super::{Catalogue, CatalogueListing};
+    use crate::backends::catalog::{
+        CatalogContent, CatalogModelEntry, CatalogProvider, JsonPointer, ModelFacts, ModelId,
+        ProviderEndpoint, ProviderId, ProviderOffering,
+    };
+    use crate::desired_state::Checksum;
+
+    /// The listing `snapshot` describes: one provider, offering one model.
+    pub(crate) fn listing(snapshot: Checksum, provider: &str, model: &str) -> CatalogueListing {
+        let id = ProviderId::parse(provider).expect("a well-formed provider id");
+        let content = CatalogContent::new(
+            vec![CatalogProvider {
+                id: id.clone(),
+                display_name: None,
+                doc_url: None,
+                endpoint: ProviderEndpoint::default(),
+                env_vars: Vec::new(),
+                pointer: JsonPointer::new("").child("providers").child(provider),
+            }],
+            vec![CatalogModelEntry {
+                id: ModelId::parse(model).expect("a well-formed model id"),
+                neutral: None,
+                offerings: vec![ProviderOffering {
+                    provider: id,
+                    model: ModelId::parse(model).expect("a well-formed model id"),
+                    published_model_id: model.to_owned(),
+                    facts: ModelFacts::default(),
+                    overrides: Vec::new(),
+                    price: None,
+                    endpoint: ProviderEndpoint::default(),
+                    pointer: JsonPointer::new("").child("models").child(model),
+                }],
+            }],
+        )
+        .expect("a catalogue with one offering");
+        CatalogueListing::of(snapshot, &content)
+    }
+
+    pub(crate) fn catalogue(snapshot: Checksum, provider: &str, model: &str) -> Catalogue {
+        Catalogue::active(listing(snapshot, provider, model))
     }
 }

@@ -68,12 +68,12 @@ use crate::availability::{AvailabilityReader, AvailabilityView, ScopeRef};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::config::Mode;
 use crate::convergence::RevisionReport;
-use crate::status::StatusScope;
 use crate::desired_state::{
     AccessDenial, AuditEvent, AuditEventId, DenialReason, DesiredState, ExpectedRevision,
     LoadedRevision, Mutation, MutationId, ResourceScope, RevisionCandidate, RevisionId, Surface,
     Uuid7Generator, ValidationError,
 };
+use crate::status::StatusScope;
 
 /// Whether a grant at `granted` may change a resource scoped to `resource`.
 ///

@@ -287,6 +287,32 @@ only where a scope chose it:
 holds that an empty or incomplete index permits nothing, because no rung examined
 the pair.
 
+Deriving that evidence from a revision is where catalogue presence could quietly
+become permission, so the projection is held by
+`a_catalogued_offering_nobody_entitled_is_denied_rather_than_available`,
+`a_credential_whose_material_did_not_resolve_is_unknown_rather_than_granted`
+(entitlement is credential *readiness*, not credential existence), and
+`a_published_revision_derives_availability_that_catalogue_presence_alone_cannot_grant`
+(the same property through the publication seam). Durable evidence carries no
+operator detail and no authority:
+`discovery_evidence_survives_a_restart_without_the_probes_own_words` and
+`restored_evidence_does_not_restore_the_authority_a_revision_withdrew` hold that a
+restored row decides nothing until a revision supplies the dimensions, while
+`restoring_a_stale_positive_cannot_resurrect_a_target_a_listing_dropped`,
+`restoring_refuses_a_row_whose_evidence_names_another_scope`,
+`saving_a_record_replaces_the_evidence_it_held`, and
+`one_tenants_discovery_evidence_is_not_another_tenants` hold the ordering,
+mis-filing, replacement, and tenant-isolation rules against the database itself.
+The read surface is scoped and answered from memory:
+`an_availability_read_is_confined_to_the_scope_the_grant_encloses`,
+`an_availability_read_must_name_the_tenant_it_asks_about`,
+`an_availability_read_reaches_no_control_plane`,
+`an_availability_read_distinguishes_deriving_nothing_from_finding_nothing`, and
+`an_availability_read_overlays_this_replicas_own_health`. A discovery outage costs
+freshness and nothing else —
+`a_discovery_outage_ages_a_verdict_without_touching_convergence` and
+`discovery_evidence_survives_the_revisions_published_over_it`.
+
 **Threat model and ADRs.** [ADR 0020](../adr/0020-alias-wire-family-validation.md)
 and [ADR 0012](../adr/0012-native-provider-routes.md) bound wire families and
 native routes; the durable entitlement contract — opaque snapshot-pinned offering
@@ -312,11 +338,23 @@ It inherits rather than revises the snapshot reasoning of
 covered by trigger 2's isolation reasoning; the slice that wires evaluation into
 admission owes this trigger again on its own merits.
 
+The projection, its durable evidence, and the scoped read that fill that contract
+are
+[ADR 0048](../adr/0048-stateful-availability-projection-and-discovery-persistence.md):
+five authorities read from five places, entitlement as resolved credential
+readiness, catalogue version kept apart from availability, replica-local health
+overlaid rather than stored, and evidence persisted without the probe's own words
+or any dimension a revision states.
+
 **Release impact.** Availability contracts are inert on their own: nothing
 constructs an index, `/v1/models` and readiness are unchanged, and no request
 reads a verdict, so a release carrying only the contracts changes no observable
-behaviour and needs no migration note. The slice that wires an evaluation into
-admission does, and it fires this trigger again.
+behaviour and needs no migration note. The projection slice adds a forward-only
+tenant-isolated control-plane migration for discovery observations and
+one authenticated administrative read, `GET /admin/v1/availability`; inference,
+`/v1/models`, and readiness are still unchanged, so the note a release owes is the
+migration rather than a behaviour change. The slice that wires an evaluation into
+admission does change behaviour, and it fires this trigger again.
 
 Entitlement changes are visible to clients: a pattern
 semantics change can silently grant or revoke access at upgrade, so it needs a

@@ -10,11 +10,9 @@ use std::time::{Duration, SystemTime};
 
 use gateway_core::CircuitState;
 
+use super::projection::testing;
 use super::*;
-use crate::backends::catalog::{
-    CatalogContent, CatalogModelEntry, CatalogProvider, ModelFacts, ModelId, ProviderEndpoint,
-    ProviderOffering, ProviderId, JsonPointer,
-};
+use crate::backends::catalog::{CatalogContent, CatalogModelEntry, ModelId};
 use crate::desired_state::credentials::ProviderCredentialBody;
 use crate::desired_state::fixtures;
 use crate::desired_state::models::{ModelLifecycle, ModelOwner, WireFamily};
@@ -35,34 +33,7 @@ fn target() -> TargetRef {
 
 /// The catalogue every fixture enablement pins, reduced to a listing.
 fn listing() -> CatalogueListing {
-    let provider = CatalogProvider {
-        id: ProviderId::parse(PROVIDER).expect("a well-formed provider id"),
-        display_name: Some("OpenAI".to_owned()),
-        doc_url: None,
-        endpoint: ProviderEndpoint::default(),
-        env_vars: Vec::new(),
-        pointer: JsonPointer::new("").child("providers").child(PROVIDER),
-    };
-    let offering = ProviderOffering {
-        provider: ProviderId::parse(PROVIDER).expect("a well-formed provider id"),
-        model: ModelId::parse(MODEL).expect("a well-formed model id"),
-        published_model_id: MODEL.to_owned(),
-        facts: ModelFacts::default(),
-        overrides: Vec::new(),
-        price: None,
-        endpoint: ProviderEndpoint::default(),
-        pointer: JsonPointer::new("").child("models").child(MODEL),
-    };
-    let content = CatalogContent::new(
-        vec![provider],
-        vec![CatalogModelEntry {
-            id: ModelId::parse(MODEL).expect("a well-formed model id"),
-            neutral: None,
-            offerings: vec![offering],
-        }],
-    )
-    .expect("a catalogue with one offering");
-    CatalogueListing::of(fixtures::catalog_snapshot(), &content)
+    testing::listing(fixtures::catalog_snapshot(), PROVIDER, MODEL)
 }
 
 fn catalogue() -> Catalogue {
@@ -473,10 +444,8 @@ fn an_open_circuit_refuses_on_this_replica_without_touching_the_index() {
         AvailabilityState::Available
     );
 
-    let tripped = RuntimeObservations::of_circuits([(
-        format!("{PROVIDER}/{MODEL}"),
-        CircuitState::Open,
-    )]);
+    let tripped =
+        RuntimeObservations::of_circuits([(format!("{PROVIDER}/{MODEL}"), CircuitState::Open)]);
     let refused = AvailabilityView::new(&index, &tripped).evaluate(&deployment.key(), at(100));
     assert_eq!(refused.state, AvailabilityState::Unavailable);
     assert_eq!(refused.decided_by, DecidedBy::Runtime);
@@ -503,10 +472,8 @@ fn a_half_open_circuit_lowers_a_positive_verdict_and_keeps_its_evidence() {
         at(90),
     );
     let index = project(&deployment, &catalogue(), &resolved(40), [observation]).into_index();
-    let impaired = RuntimeObservations::of_circuits([(
-        format!("{PROVIDER}/{MODEL}"),
-        CircuitState::HalfOpen,
-    )]);
+    let impaired =
+        RuntimeObservations::of_circuits([(format!("{PROVIDER}/{MODEL}"), CircuitState::HalfOpen)]);
 
     let verdict = AvailabilityView::new(&index, &impaired).evaluate(&deployment.key(), at(100));
     assert_eq!(verdict.state, AvailabilityState::Unknown);
@@ -662,7 +629,11 @@ fn evidence_written_down_and_read_back_is_the_evidence_that_was_held() {
     // The replica that comes back: it restores the evidence, then derives the
     // revision over it, and reaches the verdict the first one held.
     let restarted = AvailabilityEvidence::new(catalogue());
-    assert_eq!(restarted.restore(written), 0, "stored order is not disorder");
+    assert_eq!(
+        restarted.restore(written),
+        0,
+        "stored order is not disorder"
+    );
     let projected = restarted
         .derive(&deployment.state, &resolved(40))
         .expect("the restored replica projects");
@@ -702,7 +673,9 @@ fn restored_evidence_does_not_restore_the_authority_a_revision_withdrew() {
     // defaults, and a verdict read now refuses rather than reporting the
     // remembered positive.
     let restored = restarted.index();
-    let record = restored.record(&deployment.key()).expect("the key restored");
+    let record = restored
+        .record(&deployment.key())
+        .expect("the key restored");
     assert_eq!(record.presence, CataloguePresence::Absent);
     assert_eq!(record.entitlement, Entitlement::Unknown);
     assert_eq!(

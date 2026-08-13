@@ -12,7 +12,7 @@
 //! - **Evidence is not desired state.** Nothing in this module is published, and
 //!   losing the whole table costs freshness and nothing else. Restoring is
 //!   folded through the same ordering and retention path a live observation
-//!   takes ([`AvailabilityIndexBuilder::record`]), so stored evidence cannot
+//!   takes ([`AvailabilityIndexBuilder::record`](super::AvailabilityIndexBuilder::record)), so stored evidence cannot
 //!   resurrect a target a later definitive look dropped and cannot rewind a
 //!   newer look this process already holds.
 //! - **Two slots, and which is which is durable.** A record holds the look it is
@@ -58,7 +58,10 @@ impl ObservationSlot {
 
     /// The slot a stored identifier names, or `None` for text no release wrote.
     pub fn parse(input: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|slot| slot.as_str() == input)
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|slot| slot.as_str() == input)
     }
 }
 
