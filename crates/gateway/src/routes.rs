@@ -100,17 +100,9 @@ fn mount(specs: Vec<RouteSpec>, state: AppState) -> Router {
             // either: its own small ceiling bounds how many status reads run at
             // once, without letting served traffic at *its* ceiling make the
             // replica unanswerable. Applied before authentication and therefore
-            // *inside* it, which picks a side of a real trade-off: a slot is
-            // spent only once a caller has proved it may ask, so an anonymous
-            // flood cannot hold the ceiling closed against the operators it is
-            // for — but authentication itself (a signature check, and a
-            // revocation lookup for a minted token) then runs outside any
-            // bound on this route, where admission bounds it on every other
-            // authenticated one. Bounding the cheaper, later work in exchange
-            // for keeping the route answerable to a credentialled operator is
-            // the trade an emergency diagnostic wants; a bound covering
-            // authentication too has to be one that anonymous callers cannot
-            // monopolise, which is a wider change than this route.
+            // *inside* it, so a slot is spent only once a caller has proved it
+            // may ask and an anonymous flood cannot hold the ceiling closed
+            // against the operators it is for.
             let route = if spec.auth.takes_a_diagnostic_slot() {
                 route.layer(from_fn_with_state(state.clone(), diagnostic_middleware))
             } else {
@@ -120,6 +112,18 @@ fn mount(specs: Vec<RouteSpec>, state: AppState) -> Router {
                 route.layer(from_fn_with_state(
                     (state.clone(), spec.capability),
                     authenticate_middleware,
+                ))
+            } else {
+                route
+            };
+            // And a second, wider ceiling outside authentication, because the
+            // one above cannot bound the work of authenticating. Only the
+            // diagnostic needs it: every other authenticated route has
+            // admission out here doing the same job.
+            let route = if spec.auth.takes_a_diagnostic_slot() {
+                route.layer(from_fn_with_state(
+                    state.clone(),
+                    diagnostic_authentication_middleware,
                 ))
             } else {
                 route
@@ -470,6 +474,23 @@ async fn diagnostic_middleware(
     next: Next,
 ) -> Result<Response, GatewayError> {
     let _permit = state.0.admission.admit_diagnostic()?;
+    Ok(next.run(request).await)
+}
+
+/// Bound the work of *authenticating* a diagnostic read.
+///
+/// The ceiling above is inside authentication, so it bounds the answer rather
+/// than the signature verification and revocation lookup that precede it. This
+/// one is outside, and is wide enough that only a flood reaches it: the two
+/// together mean neither an anonymous flood can close the route to operators
+/// nor a credentialled one can spend the replica's CPU and revocation store
+/// without limit.
+async fn diagnostic_authentication_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, GatewayError> {
+    let _permit = state.0.admission.admit_diagnostic_authentication()?;
     Ok(next.run(request).await)
 }
 
@@ -6991,6 +7012,59 @@ max_ttl = "15m"
             StatusCode::SERVICE_UNAVAILABLE,
             "the ceiling did not apply to the caller it is for"
         );
+        drop(held);
+        let (status, _) = status_response(state, Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// The inner ceiling being inside authentication leaves authentication
+    /// itself — a signature check, and a revocation lookup for a minted token —
+    /// outside every bound, on the one authenticated route admission does not
+    /// cover. The wider outer ceiling closes that: a flood of credentials that
+    /// turn out to be worthless is refused before the replica spends anything
+    /// verifying them, and the refusal is the same typed one.
+    #[tokio::test]
+    async fn a_flood_of_invalid_credentials_is_bounded_before_it_is_verified() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let held: Vec<_> = (0..crate::admission::MAX_AUTHENTICATING_DIAGNOSTICS)
+            .map(|_| {
+                state
+                    .0
+                    .admission
+                    .admit_diagnostic_authentication()
+                    .expect("under the ceiling")
+            })
+            .collect();
+
+        // The credential is never reached, so an invalid one and the operator's
+        // own are refused alike: the bound is on the verification, not the
+        // verdict.
+        for credential in [None, Some("not-a-key"), Some(OPERATOR_KEY)] {
+            let (status, body) = status_response(state.clone(), credential).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication ran outside the ceiling: {body}"
+            );
+            assert_eq!(body["error"]["type"], "diagnostic_concurrency_exceeded");
+        }
+        // The inner ceiling is untouched by that flood: it is spent on answers,
+        // not on attempts.
+        let answering: Vec<_> = (0..crate::admission::MAX_IN_FLIGHT_DIAGNOSTICS)
+            .map(|_| {
+                state
+                    .0
+                    .admission
+                    .admit_diagnostic()
+                    .expect("the flood did not spend an answering slot")
+            })
+            .collect();
+        assert_eq!(answering.len(), crate::admission::MAX_IN_FLIGHT_DIAGNOSTICS);
+        drop(answering);
+
         drop(held);
         let (status, _) = status_response(state, Some(OPERATOR_KEY)).await;
         assert_eq!(status, StatusCode::OK);

@@ -21,7 +21,11 @@ nothing in `serve` constructs the loop that produces them.
   `convergence` module is contract-only until a projection from resource bodies
   to a servable config lands), so every `axond_revision_*` series — `lag`,
   `converged`, `consecutive_failures`, `rejections`, `attempts`,
-  `last_known_good`, `convergence_duration` — is absent too.
+  `last_known_good`, `convergence_duration` — is absent too, and the `revision`
+  summary in an operator's `GET /admin/v1/status` is `null` on every replica.
+  When the reconciler lands it must hand its own status handle to both the
+  status page and the administrative surface, or one replica would answer two
+  convergence stories.
 
 Eight shipped rules are therefore inert until those slices land:
 `AxondDependencyImpaired`, `AxondStatusObservationsStale`,
@@ -220,7 +224,8 @@ or add a replica-identifying resource attribute in the pipeline and turn
 **First response.** A brief split is convergence working: replicas converge
 independently and there is no fleet-wide barrier. A persistent split is one
 replica stuck — take that replica's identity from the series labels your scrape
-adds (`instance`, `pod`), read its `GET /admin/v1/status` revision summary, and
+adds (`instance`, `pod`), read its `GET /admin/v1/status` revision summary (once
+convergence is wired — it is `null` until then), and
 treat it as the previous failure mode. A replica whose generation lags after a
 file reload rather than a revision has a different file or environment than its
 siblings; restarting *that* replica is safe and usually the fix.
@@ -334,8 +339,9 @@ namespace's ceiling and is the caller's own concurrency. Sustained `queue`
 rejections mean under-provisioning rather than burstiness: queueing only absorbs
 short bursts. Shed requests are refused before the rate-limit store, the budget
 reservation, and the provider, so shedding costs nothing upstream. `diagnostic`
-is a different animal: it is the fixed eight-deep ceiling on `GET
-/admin/v1/status`, it is not sized by `admission.max_in_flight`, and it means
+is a different animal: it is the fixed ceiling on `GET /admin/v1/status` — eight
+reads being answered, sixty-four being authenticated — it is not sized by
+`admission.max_in_flight`, and it means
 something is polling the diagnostic rather than that the replica is out of
 capacity — served traffic is unaffected either way.
 
@@ -360,8 +366,13 @@ or shorten `max_stream_duration_ms`.
 in, including `closing`: it authenticates but sits outside admission, and takes
 no served in-flight slot, so polling a stuck replica neither is refused nor
 extends the drain it is describing. It is not unbounded, though — eight
-concurrent diagnostic reads per replica, refused beyond that with `503
-diagnostic_concurrency_exceeded`. Poll serially when scripting a fleet sweep.
+concurrent diagnostic reads per replica, and sixty-four concurrent
+authentications of them, refused beyond either with `503
+diagnostic_concurrency_exceeded`. The second ceiling is the wider one because it
+sits *outside* authentication, where an anonymous caller can reach it: it bounds
+the signature checks and revocation lookups a flood would otherwise spend, while
+the narrow one is inside, where only a caller that proved it may ask can spend a
+slot. Neither is configurable. Poll serially when scripting a fleet sweep.
 
 ## Bounded drill-down
 

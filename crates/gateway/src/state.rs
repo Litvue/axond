@@ -69,7 +69,12 @@ pub struct Inner {
     pub status: Arc<CachedStatusRegistry>,
     /// This replica's convergence state, when it converges against a control
     /// plane at all. `None` in the stateless posture, where a replica serves the
-    /// file it booted from and there is no revision to lag behind.
+    /// file it booted from and there is no revision to lag behind — and `None`
+    /// in every shipped binary today, because no release constructs a
+    /// reconciler at all (#142). The slice that does must hand *its* status
+    /// handle here and to
+    /// [`AdminApi::with_convergence`](crate::admin::router::AdminApi::with_convergence):
+    /// two instances would let one replica tell two convergence stories.
     pub revision: Option<Arc<RevisionStatus>>,
     config: ArcSwap<ConfigSnapshot>,
 }

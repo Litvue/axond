@@ -58,6 +58,24 @@ pub const RESOURCE_DIAGNOSTIC: &str = "diagnostic";
 /// traffic needs.
 pub const MAX_IN_FLIGHT_DIAGNOSTICS: usize = 8;
 
+/// Concurrent diagnostic *authentications* one replica will attempt.
+///
+/// Authenticating is the expensive half of a status read — a signature
+/// verification, and a revocation-store round trip for a minted token — and it
+/// happens before a caller has proved anything, so it cannot be bounded by the
+/// ceiling above without letting an anonymous flood hold that ceiling closed
+/// against the operators it exists for. Hence two ceilings: a wide one here
+/// covering the unauthenticated work, and the narrow one above covering the
+/// answer.
+///
+/// Wide on purpose. It is sized so that filling it takes a flood rather than a
+/// few slow credentials — the eight authenticated readers the inner ceiling
+/// allows, plus room for the verification of callers who turn out not to be
+/// any of them — while still being a number rather than the process's memory.
+/// Refusing here costs no I/O, so the refusal is cheap even when the flood is
+/// not.
+pub const MAX_AUTHENTICATING_DIAGNOSTICS: usize = 64;
+
 /// Largest ceiling a semaphore-backed bound may carry. Config validation refuses
 /// anything larger, so an absurd number is a typed boot error rather than an
 /// assertion inside the semaphore.
@@ -206,6 +224,7 @@ pub struct AdmissionControl {
     streams: Option<Arc<Semaphore>>,
     queue: Option<Arc<Semaphore>>,
     diagnostics: Arc<Semaphore>,
+    authenticating_diagnostics: Arc<Semaphore>,
     tenants: Arc<TenantTable>,
 }
 
@@ -218,6 +237,7 @@ impl AdmissionControl {
                 .map(|n| Arc::new(Semaphore::new(n))),
             queue: limits.queue_capacity.map(|n| Arc::new(Semaphore::new(n))),
             diagnostics: Arc::new(Semaphore::new(MAX_IN_FLIGHT_DIAGNOSTICS)),
+            authenticating_diagnostics: Arc::new(Semaphore::new(MAX_AUTHENTICATING_DIAGNOSTICS)),
             tenants: Arc::new(TenantTable {
                 limit: limits.max_in_flight_per_tenant,
                 max_tenants: limits.max_tenants,
@@ -278,6 +298,25 @@ impl AdmissionControl {
     /// ceiling cannot make the replica unanswerable.
     pub fn admit_diagnostic(&self) -> Result<DiagnosticPermit, AdmissionRejection> {
         let permit = Arc::clone(&self.diagnostics)
+            .try_acquire_owned()
+            .map_err(|_| reject(AdmissionRejection::Diagnostics))?;
+        metrics::record_admission_acquired(RESOURCE_DIAGNOSTIC);
+        Ok(DiagnosticPermit {
+            _permit: Some(permit),
+        })
+    }
+
+    /// Admit one diagnostic *authentication*, or shed it before any of the work
+    /// authenticating costs is done.
+    ///
+    /// The permit is held across authentication and released when the response
+    /// is, so what it bounds is concurrent signature verification and revocation
+    /// lookups on a route that admission does not cover. Refused with the same
+    /// [`AdmissionRejection::Diagnostics`] as the inner ceiling: both mean "this
+    /// replica is answering as many status reads as it will", and a caller has
+    /// no action that distinguishes them.
+    pub fn admit_diagnostic_authentication(&self) -> Result<DiagnosticPermit, AdmissionRejection> {
+        let permit = Arc::clone(&self.authenticating_diagnostics)
             .try_acquire_owned()
             .map_err(|_| reject(AdmissionRejection::Diagnostics))?;
         metrics::record_admission_acquired(RESOURCE_DIAGNOSTIC);

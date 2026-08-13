@@ -43,13 +43,22 @@ rule as the all-namespaces credential view: a scope-less static
 `[[gateway_key]]` in the default namespace sees every component, the deployment's
 reason codes, exact observation ages, and the revision summary, while every other
 caller sees only the components its own requests depend on, with reasons coarsened
-to `unavailable`, ages floored to whole seconds, and no revision summary. Which
+to `unavailable`, ages floored to whole seconds, and no revision summary. The
+summary is `null` on every replica this release ships: nothing constructs a
+convergence reconciler yet
+([#142](https://github.com/Litvue/axond/issues/142)), so an operator's view
+carries the field and
+no data until that slice hands the status page the same handle the
+administrative surface reads. Which
 components are enabled is a deployment property, so a stateless replica answers
 `200` with every component `disabled` rather than `404`. The route is bounded by
-its own fixed eight-deep diagnostic ceiling — `503
+its own fixed eight-deep diagnostic ceiling on answering — `503
 diagnostic_concurrency_exceeded` beyond it — rather than by
 `admission.max_in_flight`, so it stays answerable on a saturated or draining
-replica while still refusing an unbounded poller.
+replica while still refusing an unbounded poller. A wider sixty-four-deep
+ceiling outside authentication refuses the same way, so a flood of credentials
+that turn out to be worthless cannot spend unbounded verification and
+revocation-store work on a route admission does not cover.
 
 Responses is forwarded natively with only `model` rewritten and streaming is
 byte-faithful. **Every** `/v1/responses` request — initial calls as well as ones
