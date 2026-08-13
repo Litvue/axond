@@ -64,6 +64,18 @@ pub struct Manifest {
     pub schema_version: u32,
     #[serde(rename = "scenario")]
     pub scenarios: Vec<Scenario>,
+    /// Slices #219 stopped waiting on, kept as committed data so a retirement
+    /// is a reviewable line in the contract rather than a deleted one.
+    #[serde(rename = "retired_blocker", default)]
+    pub retired_blockers: Vec<RetiredBlocker>,
+}
+
+/// A slice that left the dependency map, and what became of the rest of it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetiredBlocker {
+    pub issue: u32,
+    pub became: String,
 }
 
 /// One recovery scenario: what happens, what makes it fail, and the stages it

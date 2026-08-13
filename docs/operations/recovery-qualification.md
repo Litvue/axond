@@ -264,7 +264,8 @@ which scenarios it unblocks.
 | --- | --- |
 | #159 | The part a recovery scenario needed — a database running with WAL archiving, and the evidence published as an artifact — is here: `ops/restore-drill.sh` runs that lane, and `ops/check-recovery-evidence.py` fails it when an executable stage leaves no artifact. The rest of #159 — disclosure, fuzzing, SDK compatibility — blocks no recovery stage, so it stays tracked on #159 itself rather than on a stage invented to wait on it. |
 
-`RETIRED_BLOCKERS` in the contract test holds the same claim, so a slice can
+The manifest carries the same list in `[[retired_blocker]]`, and
+`RETIRED_BLOCKERS` in the contract test holds the two together, so a slice can
 only leave the map by saying what became of it.
 
 ## Related

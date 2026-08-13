@@ -261,6 +261,23 @@ fn a_retired_blocker_says_what_became_of_the_slice() {
     let live: BTreeSet<u32> = BLOCKING_ISSUES.into_iter().collect();
     let contract = recovery::contract_text();
 
+    let committed: BTreeSet<u32> = manifest.retired_blockers.iter().map(|r| r.issue).collect();
+    let recorded: BTreeSet<u32> = recovery::RETIRED_BLOCKERS.iter().map(|(i, _)| *i).collect();
+    assert_eq!(
+        committed,
+        recorded,
+        "{} and RETIRED_BLOCKERS disagree about which slices were retired",
+        recovery::MANIFEST_RELATIVE
+    );
+    for retired in &manifest.retired_blockers {
+        assert!(
+            retired.became.len() > 80,
+            "#{}: the manifest has to say what became of a retired slice, not {:?}",
+            retired.issue,
+            retired.became
+        );
+    }
+
     for (issue, became) in recovery::RETIRED_BLOCKERS {
         assert!(
             !live.contains(&issue),

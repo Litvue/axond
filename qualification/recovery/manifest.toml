@@ -480,3 +480,20 @@ evidence = ["serving_behavior", "convergence_lag"]
 [[scenario.stage.blocked_on]]
 issue = 148
 needs = "a projection and the reconciler that publishes it in `serve`, so serving across a point-in-time recovery is measured rather than assumed"
+
+# Slices #219 once waited on and no longer does. Recorded rather than deleted:
+# a slice that simply disappears from the map is indistinguishable from a stage
+# that was dropped with it, so a retirement has to say what became of the rest
+# of the slice and where it stays tracked. `RETIRED_BLOCKERS` in
+# `crates/gateway/tests/support/recovery.rs` repeats this list, and the contract
+# tests hold the two together.
+
+[[retired_blocker]]
+issue = 159
+became = """
+The part a recovery scenario needed \u2014 a database running with WAL \
+archiving, and the evidence published as an artifact \u2014 is here: \
+`ops/restore-drill.sh` runs that lane, and `ops/check-recovery-evidence.py` \
+fails it when an executable stage leaves no artifact. The rest of #159 \u2014 \
+disclosure, fuzzing, SDK compatibility \u2014 blocks no recovery stage, so it \
+stays tracked on #159 itself rather than on a stage invented to wait on it."""
