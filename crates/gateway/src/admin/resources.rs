@@ -328,8 +328,16 @@ impl AdminResourceRequest for CredentialRequest {
         let provider = resource_id::<Self>("provider", &self.provider)?;
         let slug = slug::<Self>(&self.slug)?;
         let display_name = display_name::<Self>(&self.display_name)?;
-        let secret = SecretId::parse(&self.secret)
-            .map_err(|error| malformed::<Self>("secret", &error.to_string()))?;
+        // `secret` is the one field an operator can paste material into by
+        // mistake, so its refusal names the form expected rather than echoing
+        // what arrived: an error is rendered into a response, a log line and an
+        // audit trail, and a mispasted key must not reach any of them.
+        let secret = SecretId::parse(&self.secret).map_err(|_| {
+            malformed::<Self>(
+                "secret",
+                &format!("is not a `{}`-prefixed secret id", SecretId::PREFIX),
+            )
+        })?;
         // An omitted version is *unstated*, not "the first": for a credential
         // that already exists it means the version in force, resolved against
         // the state below.

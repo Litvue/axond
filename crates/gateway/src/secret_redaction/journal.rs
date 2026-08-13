@@ -42,7 +42,7 @@ use crate::usage::journal::{PostgresJournal, PostgresJournalSettings, UsageEvent
 
 /// A journal on a schema of its own, or `None` when no Postgres is configured
 /// and the suite is not running in required mode.
-async fn journal() -> Option<(PostgresControlPlane, String)> {
+pub(super) async fn journal() -> Option<(PostgresControlPlane, String)> {
     let dsn = crate::test_services::postgres_dsn()?;
     let schema = format!(
         "secret_redaction_{}",
@@ -77,7 +77,7 @@ async fn journal() -> Option<(PostgresControlPlane, String)> {
 }
 
 /// Every row of every table in the journal's schema, rendered as text.
-async fn dump(schema: &str) -> String {
+pub(super) async fn dump(schema: &str) -> String {
     let dsn = crate::test_services::postgres_dsn().expect("a configured DSN");
     let mut config: Config = dsn.parse().expect("a parseable test DSN");
     config.connect_timeout(Duration::from_secs(5));

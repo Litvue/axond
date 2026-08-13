@@ -45,7 +45,7 @@ use crate::desired_state::{
 use crate::routes::router;
 
 /// A store on a schema of its own, so a run leaves nothing for the next one.
-async fn store() -> Option<(Arc<PostgresSecrets>, String)> {
+pub(super) async fn store() -> Option<(Arc<PostgresSecrets>, String)> {
     let dsn = crate::test_services::postgres_dsn()?;
     let schema = format!(
         "axond_secret_runtime_{}",
@@ -80,7 +80,7 @@ async fn store() -> Option<(Arc<PostgresSecrets>, String)> {
     Some((Arc::new(store), schema))
 }
 
-async fn drop_schema(schema: &str) {
+pub(super) async fn drop_schema(schema: &str) {
     let Some(dsn) = crate::test_services::postgres_dsn() else {
         return;
     };
@@ -98,7 +98,7 @@ async fn drop_schema(schema: &str) {
 
 /// Every row of the store's table, rendered as text: what a backup, a dump, or a
 /// stolen replica would hold.
-async fn dump(schema: &str) -> String {
+pub(super) async fn dump(schema: &str) -> String {
     let dsn = crate::test_services::postgres_dsn().expect("a configured DSN");
     let (client, connection) = tokio_postgres::connect(&dsn, crate::usage::tls_connector())
         .await
