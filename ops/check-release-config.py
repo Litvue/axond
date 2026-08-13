@@ -631,10 +631,11 @@ def self_test() -> int:
     # The regression: bumping the constant to the first multi-architecture
     # release asks for the fallback that release removed.
     assert platform_default((0, 3, 18), (0, 3, 18)) == AMD64_FALLBACK_PLATFORM
-    # So the committed constant stays at the last amd64-only release, 0.3.17 — not
-    # at the 0.3.18 index release that made the fallback unnecessary. It moves
-    # only if the quickstart is pinned back onto a newer amd64-only release.
-    assert LAST_AMD64_ONLY_VERSION == last, LAST_AMD64_ONLY_VERSION
+
+    # The committed constant is deliberately not asserted here: it legitimately
+    # moves if the quickstart is ever pinned back onto a newer amd64-only release,
+    # and a tree where it disagrees with the pinned tag is already reported by
+    # check_compose_platform as a readable failure rather than a traceback.
 
     print("check-release-config: platform-default self-test passed")
     return 0
