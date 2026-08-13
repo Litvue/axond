@@ -194,6 +194,16 @@ pub enum AdminError {
              no longer pins it before destroying its material"
     )]
     SecretInUse { reference: SecretRef },
+    /// The version a rotation would mint is already stored, so the rotation this
+    /// request asks for has already happened — by an earlier attempt of the same
+    /// request, or by another administrator. The caller's fix is to re-read the
+    /// versions of the secret and rotate from its current one; replaying this
+    /// request cannot succeed, and the material it presented was never examined.
+    #[error(
+        "{reference} already exists, so this rotation has already been performed; re-read the \
+             secret's versions and rotate from the current one"
+    )]
+    SecretVersionExists { reference: SecretRef },
     /// The material presented is not storable — empty, or otherwise refused by
     /// the store before anything was sealed. The detail is logged rather than
     /// returned, for the reason every detail here is.
@@ -242,6 +252,7 @@ impl AdminError {
         "secret_not_found",
         "secret_lifecycle_refused",
         "secret_in_use",
+        "secret_version_exists",
         "secret_material_refused",
         "secret_store_unusable",
     ];
@@ -278,6 +289,7 @@ impl AdminError {
             Self::SecretNotFound { .. } => "secret_not_found",
             Self::SecretLifecycleRefused { .. } => "secret_lifecycle_refused",
             Self::SecretInUse { .. } => "secret_in_use",
+            Self::SecretVersionExists { .. } => "secret_version_exists",
             Self::SecretMaterialRefused { .. } => "secret_material_refused",
             Self::SecretStoreUnusable { .. } => "secret_store_unusable",
         }
@@ -305,7 +317,8 @@ impl AdminError {
             | Self::NameTaken { .. }
             | Self::ImmutableResourceVersion { .. }
             | Self::SecretLifecycleRefused { .. }
-            | Self::SecretInUse { .. } => StatusCode::CONFLICT,
+            | Self::SecretInUse { .. }
+            | Self::SecretVersionExists { .. } => StatusCode::CONFLICT,
             Self::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RevisionNotFound(_) | Self::RouteNotFound | Self::SecretNotFound { .. } => {
                 StatusCode::NOT_FOUND
@@ -373,7 +386,8 @@ impl AdminError {
         match self {
             Self::SecretNotFound { reference }
             | Self::SecretLifecycleRefused { reference, .. }
-            | Self::SecretInUse { reference } => Some(*reference),
+            | Self::SecretInUse { reference }
+            | Self::SecretVersionExists { reference } => Some(*reference),
             _ => None,
         }
     }
@@ -401,6 +415,10 @@ impl AdminError {
                 reference,
                 detail: source.to_string(),
             },
+            // Not a material refusal: nothing was examined about the material,
+            // and reporting a good key as bad is how an operator comes to
+            // re-issue one that was never at fault.
+            SecretError::VersionExists { reference } => Self::SecretVersionExists { reference },
             SecretError::Invalid(detail) => Self::SecretMaterialRefused { detail },
             SecretError::Unwrap { reference, kek } => Self::SecretStoreUnusable {
                 // The KEK *reference* is a configured name, not key material.

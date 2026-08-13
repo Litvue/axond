@@ -1673,6 +1673,9 @@ fn every_declared_code_is_reachable_distinct_and_prose_free() {
         AdminError::SecretInUse {
             reference: crate::desired_state::fixtures::secret_ref_at(1, 1),
         },
+        AdminError::SecretVersionExists {
+            reference: crate::desired_state::fixtures::secret_ref_at(1, 2),
+        },
         AdminError::SecretMaterialRefused {
             detail: "material is empty".to_owned(),
         },
@@ -2224,7 +2227,7 @@ async fn every_shipped_route_authenticates_before_it_answers_anything_about_stat
     for spec in super::router::admin_route_specs() {
         // A path parameter is filled with a syntactically plausible value, so a
         // `404` cannot stand in for the authentication this asserts.
-        let path = format!("{ADMIN_PREFIX}{}", spec.path).replace("{revision}", "not-a-revision");
+        let path = format!("{ADMIN_PREFIX}{}", super::router::concrete_path(&spec));
         let builder = if spec.action.writes() {
             Request::post(&path)
         } else {
@@ -2249,6 +2252,14 @@ fn every_shipped_row_is_scoped_to_the_admin_prefix_and_declares_its_action() {
         assert!(
             spec.path.starts_with('/') && !spec.path.starts_with(ADMIN_PREFIX),
             "a shipped path is relative to the prefix: {}",
+            spec.path
+        );
+        // Every parameter of a shipped path is one the test helper fills, so a
+        // loop over the table cannot quietly request a literal `{name}` segment.
+        let concrete = super::router::concrete_path(&spec);
+        assert!(
+            !concrete.contains('{') && !concrete.contains('}'),
+            "`concrete_path` left a parameter unfilled in {}: {concrete}",
             spec.path
         );
     }

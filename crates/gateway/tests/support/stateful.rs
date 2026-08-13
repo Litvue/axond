@@ -140,7 +140,10 @@ pub fn postgres_dsn() -> Option<String> {
 ///
 /// Every scenario owns a schema, so the journal's fixed table names do not make
 /// the suite one test, and the schema is dropped when the fixture goes out of
-/// scope, however the scenario ends.
+/// scope, however the scenario ends. The SecretStore is pointed at the same
+/// schema rather than left to its default: a replica opens it at boot, and a
+/// store on `public` would put every concurrent scenario's material in one table
+/// that no fixture's teardown removes.
 pub struct ControlPlane {
     pub dsn: String,
     pub schema: String,
@@ -202,6 +205,7 @@ impl ControlPlane {
                  [secret_store]\n\
                  backend = \"postgres\"\n\
                  kek_env = \"{KEK_ENV}\"\n\
+                 schema = \"{schema}\"\n\
                  [[admin_breakglass]]\n\
                  env = \"{BREAKGLASS_ENV}\"\n\
                  id = \"breakglass\"\n"
@@ -231,14 +235,20 @@ impl ControlPlane {
     /// test's own, so a read-only claim is checked from outside the command that
     /// made it.
     pub async fn ledger_exists(&self) -> bool {
+        self.table_exists("axond_cp_schema_migration").await
+    }
+
+    /// Whether `table` exists *in this scenario's schema*, observed the way
+    /// [`Self::ledger_exists`] is.
+    pub async fn table_exists(&self, table: &str) -> bool {
         client(&self.dsn)
             .await
             .query_one(
                 "SELECT to_regclass($1)::text",
-                &[&format!("{}.axond_cp_schema_migration", self.schema)],
+                &[&format!("{}.{table}", self.schema)],
             )
             .await
-            .expect("probe the ledger")
+            .expect("probe a table")
             .get::<_, Option<String>>(0)
             .is_some()
     }

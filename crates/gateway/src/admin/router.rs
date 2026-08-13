@@ -331,6 +331,23 @@ pub fn admin_route_specs() -> Vec<AdminRouteSpec> {
     ]
 }
 
+/// A request path for `spec`, with every path parameter filled by a value of the
+/// shape that parameter accepts.
+///
+/// The loops that assert something about *every* shipped route build a URI from
+/// [`AdminRouteSpec::path`], and a parameter left as a literal `{name}` would
+/// make them assert against a path the caller could never send: substitution
+/// therefore lives beside the table, so a spec that introduces a parameter is
+/// filled in one place rather than in each loop that forgot.
+#[cfg(test)]
+pub(super) fn concrete_path(spec: &AdminRouteSpec) -> String {
+    use crate::desired_state::fixtures;
+
+    spec.path
+        .replace("{revision}", &fixtures::revision_id(1).to_string())
+        .replace("{secret}", &fixtures::secret_id(1).to_string())
+}
+
 /// The inbound bound on an administrative document, declared rather than
 /// inherited: a handler buffers the whole body to parse it, and axum's implicit
 /// default would make the process's memory the real ceiling.

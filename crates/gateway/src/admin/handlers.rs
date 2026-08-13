@@ -643,12 +643,19 @@ async fn availability(
 
 /// Every version of one secret, with the state each is in — and no material,
 /// because the store has no method that would return any.
+///
+/// Conditional like the rest of the administrative read surface: an operator
+/// watching a staged version reach `active` polls this, and the validator turns
+/// the reads between two lifecycle moves into a header comparison. The digest is
+/// over a projection of references and states, so it discloses nothing the
+/// caller was not already authorized to read.
 async fn secret_versions(
     State(api): State<Arc<AdminApi>>,
     identity: AdminIdentity,
+    headers: HeaderMap,
     Path(secret): Path<String>,
     query: Result<Query<SecretVersionsQuery>, QueryRejection>,
-) -> Result<Json<SecretVersionsView>, AdminError> {
+) -> Result<Conditional<SecretVersionsView>, AdminError> {
     const SCHEMA: &str = "secret_versions";
     let Query(query) = query.map_err(|rejection| AdminError::RequestInvalid {
         schema: SCHEMA,
@@ -664,7 +671,8 @@ async fn secret_versions(
             &owner.scope(),
         )
         .await?;
-    Ok(Json(
+    Ok(Conditional::new(
+        &headers,
         api.service.secret_versions(&grant, owner, secret).await?,
     ))
 }

@@ -281,15 +281,16 @@ it, and do not parse it. An `If-None-Match` this surface cannot read is treated
 as absent and answered in full, because a `304` against a validator nobody
 issued would hand an operator a stale answer mid-incident.
 
-`/state`, `/history` and `/audit/{revision}` are validated strongly, by their own
-bytes. `/convergence` is the exception: it reports how long this replica has been
-behind, so while it is behind its bytes differ on every read and a digest of them
-would never match — for exactly the caller that wants it to. That read is
-validated over the convergence *state* — everything but the growing `lag_ms`:
-the desired, loaded and active revisions, the snapshot source, the generation, the
-last convergence duration, the failure count and the rejection reason — and
-answers a weak validator, `W/"…"`. A `304` there may therefore withhold a body
-whose `lag_ms` has moved on; when a `200` arrives, the lag it reports is current.
+`/state`, `/history`, `/audit/{revision}` and `/secrets/{secret}` are validated
+strongly, by their own bytes. `/convergence` is the exception: it reports how
+long this replica has been behind, so while it is behind its bytes differ on
+every read and a digest of them would never match — for exactly the caller that
+wants it to. That read is validated over the convergence *state* — everything
+but the growing `lag_ms`: the desired, loaded and active revisions, the snapshot
+source, the generation, the last convergence duration, the failure count and the
+rejection reason — and answers a weak validator, `W/"…"`.
+A `304` there may therefore withhold a body whose `lag_ms` has moved on; when a
+`200` arrives, the lag it reports is current.
 `If-None-Match` is compared weakly, so a caller sends back whatever validator it
 was given and needs no special handling.
 
@@ -381,6 +382,15 @@ candidate snapshot is compiled and never on a request. A version that cannot be
 resolved — disabled, revoked, destroyed, or unreachable — therefore **fails the
 candidate** and leaves the last-known-good snapshot serving. Cutting over to a
 version that was never activated is a failed publication, not an outage.
+
+Rotating twice from the same base reference is refused with
+`secret_version_exists` and `409`, naming the version that already holds
+material: a version is immutable, so the second call's rotation had already
+happened — by a retry of the same request, or by another administrator — and
+overwriting it would change what a credential already pinning it resolves to.
+The material presented with that call is never examined, so the refusal does not
+report it as bad; re-read `axond admin secret versions` and rotate from the
+current version.
 
 Rolling a rotation back is publishing the previous credential document again, or
 `axond admin rollback`: the old version is still there, still resolvable, until

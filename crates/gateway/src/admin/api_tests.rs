@@ -210,6 +210,34 @@ impl Deployment {
         (status, etag, body.to_vec())
     }
 
+    /// A read, with the headers the conditional contract puts on it: the
+    /// validator, and the directives that keep a per-caller projection out of a
+    /// shared cache.
+    async fn get_with_headers(
+        &self,
+        path: &str,
+        if_none_match: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut request = Request::get(format!("{ADMIN_PREFIX}{path}"))
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+        if let Some(validator) = if_none_match {
+            request = request.header(axum::http::header::IF_NONE_MATCH, validator);
+        }
+        let response = router(self.api.clone())
+            .oneshot(request.body(Body::empty()).expect("a request"))
+            .await
+            .expect("a response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("a body")
+            .to_bytes();
+        (status, headers, body.to_vec())
+    }
+
     /// Publish a document, with the preconditions a mutation must carry.
     async fn post(
         &self,
@@ -1267,7 +1295,7 @@ async fn an_unknown_administrative_path_answers_in_the_administrative_envelope()
 async fn no_route_answers_without_an_administrative_credential() {
     let deployment = Deployment::new();
     for spec in super::admin_route_specs() {
-        let path = format!("{ADMIN_PREFIX}{}", spec.path.replace("{revision}", "rev"));
+        let path = format!("{ADMIN_PREFIX}{}", super::router::concrete_path(&spec));
         let builder = if spec.action.writes() {
             Request::post(&path)
                 .header(IDEMPOTENCY_KEY_HEADER, "key-1")
@@ -1723,7 +1751,7 @@ async fn a_rollback_to_a_revision_that_does_not_exist_is_refused() {
 #[tokio::test]
 async fn a_stateless_deployment_refuses_every_administrative_route_by_mode() {
     for spec in super::admin_route_specs() {
-        let path = format!("{ADMIN_PREFIX}{}", spec.path.replace("{revision}", "rev"));
+        let path = format!("{ADMIN_PREFIX}{}", super::router::concrete_path(&spec));
         let builder = if spec.action.writes() {
             Request::post(&path)
         } else {
@@ -2195,6 +2223,121 @@ async fn a_rotation_stages_the_next_version_beside_the_one_in_service() {
         .await;
     assert_eq!(versions["versions"][0]["lifecycle"], "disabled");
     assert_eq!(versions["versions"][0]["resolvable"], false);
+}
+
+/// The rotation an operator repeats — a retried request, or a second
+/// administrator doing what the first already did — must not be reported as a
+/// bad key: the material was never examined, and an operator told their key was
+/// refused re-issues a credential that was never at fault.
+#[tokio::test]
+async fn a_repeated_rotation_is_a_conflict_rather_than_a_refusal_of_the_material() {
+    let deployment = Deployment::new();
+    let tenant = owning_tenant();
+    let first = deployment.stage(&tenant, MATERIAL).await;
+    let body = json!({ "tenant": tenant, "reference": first, "material": ROTATED });
+    let (status, rotated) = deployment.post_material("/secrets/rotate", &body).await;
+    assert_eq!(status, StatusCode::OK, "{rotated}");
+    let next = rotated["reference"]
+        .as_str()
+        .expect("a reference")
+        .to_owned();
+
+    let (status, again) = deployment.post_material("/secrets/rotate", &body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{again}");
+    assert_eq!(again["error"]["type"], "secret_version_exists");
+    assert_ne!(
+        again["error"]["type"], "secret_material_refused",
+        "the presented material was never examined, so it cannot be what was refused"
+    );
+    // Not retryable: the version this would mint exists, and replaying cannot
+    // change that — the caller re-reads the versions and rotates from the current
+    // one.
+    assert_eq!(again["error"]["retryable"], false);
+    // The refusal names the version that already exists, which is what tells the
+    // caller the rotation it wanted has happened.
+    assert_eq!(again["error"]["resource"], next);
+    carries_no_material(&again);
+
+    // And the stored version is the first rotation's, untouched: a version is
+    // immutable, so the second call could not have overwritten what a credential
+    // pinning it already resolves to.
+    let secret = rotated["secret"].as_str().expect("a secret id");
+    let (_, versions) = deployment
+        .get(&format!("/secrets/{secret}?tenant={tenant}"))
+        .await;
+    let listed = versions["versions"].as_array().expect("versions").clone();
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    assert_eq!(listed[1]["reference"], next);
+    assert_eq!(listed[1]["lifecycle"], "staged");
+}
+
+/// The versions read is polled — by an operator watching a staged version reach
+/// `active` — so it answers the same conditional contract as every other
+/// administrative projection, rather than a bare body.
+#[tokio::test]
+async fn the_versions_read_answers_the_conditional_contract() {
+    let deployment = Deployment::new();
+    let tenant = owning_tenant();
+    let reference = deployment.stage(&tenant, MATERIAL).await;
+    let secret = reference.split('@').next().expect("a secret id").to_owned();
+    let path = format!("/secrets/{secret}?tenant={tenant}");
+
+    let (status, headers, body) = deployment.get_with_headers(&path, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let validator = headers
+        .get(axum::http::header::ETAG)
+        .expect("a validator")
+        .to_str()
+        .expect("a readable validator")
+        .to_owned();
+    // Strong: this projection is validated by the bytes it answers with.
+    assert!(validator.starts_with('"'), "{validator}");
+    // Per-caller — a project-scoped grant reads a narrower projection of the same
+    // secret — so no shared cache may reuse it for another administrator.
+    assert_eq!(
+        headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("private, no-cache"),
+    );
+    assert_eq!(
+        headers
+            .get(axum::http::header::VARY)
+            .and_then(|value| value.to_str().ok()),
+        Some("authorization"),
+    );
+    assert!(!body.is_empty());
+
+    let (status, headers, body) = deployment.get_with_headers(&path, Some(&validator)).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        headers
+            .get(axum::http::header::ETAG)
+            .and_then(|value| value.to_str().ok()),
+        Some(validator.as_str()),
+    );
+    assert!(body.is_empty(), "a 304 carries no body");
+
+    // A lifecycle move is a new representation, so the validator the caller holds
+    // stops matching and the next poll is answered in full.
+    let (status, moved) = deployment
+        .post_material(
+            "/secrets/lifecycle",
+            &json!({ "tenant": tenant, "reference": reference, "lifecycle": "active" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+    let (status, headers, body) = deployment.get_with_headers(&path, Some(&validator)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(
+        headers
+            .get(axum::http::header::ETAG)
+            .and_then(|value| value.to_str().ok()),
+        Some(validator.as_str()),
+    );
+    let versions: Value = serde_json::from_slice(&body).expect("a projection");
+    assert_eq!(versions["versions"][0]["lifecycle"], "active");
+    carries_no_material(&versions);
 }
 
 #[tokio::test]

@@ -387,6 +387,16 @@ async fn stateful_boot_serves_administration_and_refuses_inference() {
     );
     let replica = control_plane.serve().await;
 
+    // 0. Boot opened the SecretStore in this scenario's own schema. A store left
+    //    on the search path's default would hold every concurrent scenario's
+    //    material in one table, and the fixture's `DROP SCHEMA` would leave it
+    //    behind.
+    assert!(
+        control_plane.table_exists("axond_secret").await,
+        "the replica's SecretStore must be the scenario's, not `public`'s:\n{}",
+        replica.output()
+    );
+
     // 1. The administrative surface is served and authenticated. An unauthorized
     //    read is the strongest evidence a scenario without an OIDC provider can
     //    state without holding a credential: `401` in the administrative error

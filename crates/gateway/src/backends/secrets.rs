@@ -217,6 +217,15 @@ pub enum SecretError {
         #[source]
         source: ForbiddenTransition,
     },
+    /// The version a rotation would mint is already stored.
+    ///
+    /// A version is immutable, so this is the outcome of rotating twice from one
+    /// base reference — the second call's work was already done, by the first or
+    /// by another administrator. Distinct from [`Self::Invalid`] because the
+    /// material presented with it was never examined: reporting it as a bad key
+    /// is how an operator comes to re-issue a good one.
+    #[error("secret {reference} is already stored, so it cannot be minted again")]
+    VersionExists { reference: SecretRef },
     #[error("invalid secret request: {0}")]
     Invalid(String),
     #[error("secret store `{backend}` refused the operation: {message}")]
@@ -234,6 +243,9 @@ impl BackendFailure for SecretError {
             // holder, from one that was never stored.
             Self::NotFound(_) | Self::Ownership { .. } => FailureCategory::NotFound,
             Self::Unwrap { .. } => FailureCategory::Corrupt,
+            // The caller's request lost to a rotation that already happened,
+            // which is what a conflict is: replaying it cannot win.
+            Self::VersionExists { .. } => FailureCategory::Conflict,
             Self::Invalid(_) => FailureCategory::Invalid,
             Self::Lifecycle { .. } | Self::Transition { .. } | Self::Denied { .. } => {
                 FailureCategory::Denied
@@ -615,7 +627,15 @@ mod tests {
             .rotate(owner(), &first, SecretMaterial::new("sk-live-3".to_owned()))
             .await
             .expect_err("a version is immutable once it is stored");
-        assert_eq!(error.category(), FailureCategory::Invalid);
+        // A conflict, not an invalid request: the presented material was never
+        // examined, so the answer must not accuse it of anything.
+        assert_eq!(
+            error,
+            SecretError::VersionExists {
+                reference: second.reference
+            }
+        );
+        assert_eq!(error.category(), FailureCategory::Conflict);
         assert_eq!(
             store
                 .resolve(owner(), &second.reference)

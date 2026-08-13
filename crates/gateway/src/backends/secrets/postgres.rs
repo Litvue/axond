@@ -534,7 +534,7 @@ impl SecretStore for PostgresSecrets {
                     // reference is a stale request rather than a second rotation:
                     // overwriting would change what a credential body already
                     // pinning `rotated` resolves to.
-                    return Err(SecretError::Invalid(format!("{rotated} already exists")));
+                    return Err(SecretError::VersionExists { reference: rotated });
                 }
                 transaction
                     .commit()

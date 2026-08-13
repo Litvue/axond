@@ -259,7 +259,7 @@ impl SecretStore for InMemorySecrets {
         // stale request rather than a second rotation: overwriting would change
         // what a credential body already pinning `rotated` resolves to.
         if entries.contains_key(&rotated) {
-            return Err(SecretError::Invalid(format!("{rotated} already exists")));
+            return Err(SecretError::VersionExists { reference: rotated });
         }
         let kek = self.kek.lock().expect("not poisoned").clone();
         entries.insert(
