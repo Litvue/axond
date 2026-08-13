@@ -83,7 +83,7 @@ pub enum ValidationError {
     /// version that re-pins one, because that is how a published alias's meaning
     /// changes underneath it — so a refresh cannot be applied to the enablements
     /// that pinned the old contents. The refusal names them, and the way through
-    /// is the one ADR 0041 describes: publish the refreshed snapshot, enable the
+    /// is the one ADR 0042 describes: publish the refreshed snapshot, enable the
     /// offerings against it, and retire the enablements that read the old one.
     ///
     /// [`ModelEnablementBody`]: super::models::ModelEnablementBody
