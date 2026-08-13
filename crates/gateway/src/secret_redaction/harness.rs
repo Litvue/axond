@@ -156,10 +156,12 @@ impl SecretResolvingCompiler {
         self.materialization.ledger()
     }
 
-    /// How many times material has been taken out of the store.
+    /// How many times material has crossed the store boundary.
     ///
-    /// The number a test asserts on to show resolution happens per compilation —
-    /// off the request path — rather than per request.
+    /// Counted in distinct secret versions unwrapped, which is what the
+    /// materialization actually reads: a version two credentials share is one
+    /// read, not two. The number a test asserts on to show resolution happens
+    /// per compilation — off the request path — rather than per request.
     pub(crate) fn resolutions(&self) -> usize {
         self.resolutions.load(Ordering::Relaxed)
     }
@@ -191,6 +193,9 @@ impl CandidateCompiler for SecretResolvingCompiler {
             .resolve(revision.state())
             .await
             .map_err(projection)?;
+        // Counted here, not per credential: the materialization unwraps each
+        // distinct version once, so two credentials pinning one version are one
+        // crossing of the store boundary and must count as one.
         self.resolutions
             .fetch_add(resolved.len(), Ordering::Relaxed);
         // Owed by #252: a projected namespace is reached by a qualified id, and
@@ -449,6 +454,42 @@ pub(crate) fn state_pinning(secret: SecretRef, version: ResourceVersionNumber) -
         .and_then(|state| state.insert(fixtures::project(&fixtures::tenant_id(1), 2, "core")))
         .and_then(|state| state.insert(provider_connection()))
         .and_then(|state| state.insert(credential))
+        .and_then(|state| state.insert(alias))
+        .expect("a valid revision");
+    state
+}
+
+/// A revision whose alias is served by two credentials pinning the *same*
+/// secret version.
+///
+/// The shape that distinguishes counting credentials from counting store
+/// reads: the materialization unwraps a version once however many bodies point
+/// at it.
+pub(crate) fn state_sharing(secret: SecretRef, version: ResourceVersionNumber) -> DesiredState {
+    let primary = credential(secret, version);
+    let secondary = ProviderCredentialBody::staged(
+        fixtures::resource_id(5),
+        owner(),
+        fixtures::provider_id(3),
+        fixtures::display_name("Secondary"),
+        secret,
+    )
+    .version_at(Slug::parse("secondary").expect("fixture slug"), version);
+    let alias = ResourceVersion::new(
+        ResourceRef::new(ResourceKind::Alias, fixtures::resource_id(4), version),
+        ResourceScope::Tenant(fixtures::tenant_id(1)),
+        Slug::parse("fast").expect("fixture slug"),
+        ResourceBody::Inline(CanonicalValue::map([(
+            "wire_family",
+            CanonicalValue::string("openai-chat"),
+        )])),
+    )
+    .depending_on([primary.reference, secondary.reference]);
+    let mut state = DesiredState::new();
+    state
+        .insert(fixtures::tenant(1, "acme"))
+        .and_then(|state| state.insert(primary))
+        .and_then(|state| state.insert(secondary))
         .and_then(|state| state.insert(alias))
         .expect("a valid revision");
     state
