@@ -345,6 +345,19 @@ typed_id!(
     AuditEventId,
     "aud_"
 );
+typed_id!(
+    /// One durable secret, independent of which of its versions is referenced.
+    ///
+    /// Deliberately *not* a [`ResourceId`]. A secret is not a resource: it is
+    /// never a row in a revision, never named by a manifest entry, and never
+    /// addressable by an operator as a versioned resource. Giving it its own type
+    /// is what stops a credential's resource id and the id of the material it
+    /// points at from being interchangeable — including in their text forms, so a
+    /// `res_…` pasted where a secret belongs is a parse error rather than a lookup
+    /// against the wrong table.
+    SecretId,
+    "sct_"
+);
 
 /// A readable, scope-unique name for a resource.
 ///
@@ -391,6 +404,7 @@ impl Slug {
         RevisionId::PREFIX,
         MutationId::PREFIX,
         AuditEventId::PREFIX,
+        SecretId::PREFIX,
     ];
 
     pub fn parse(input: &str) -> Result<Self, InvalidSlug> {

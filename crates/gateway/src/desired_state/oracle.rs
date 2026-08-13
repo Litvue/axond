@@ -284,7 +284,7 @@ mod tests {
     };
     use super::super::mutation::{Actor, ExpectedRevision};
     use super::super::resource::{ResourceBody, ResourceKind};
-    use super::super::revision::ValidationError;
+    use super::super::revision::{BodySkew, ValidationError};
     use super::super::tenancy::TenancyError;
     use super::*;
     use crate::backends::{BackendFailure, FailureCategory};
@@ -713,10 +713,10 @@ mod tests {
         assert!(
             matches!(
                 **source,
-                IntegrityError::Incompatible(TenancyError::MissingField {
+                IntegrityError::Incompatible(BodySkew::Tenancy(TenancyError::MissingField {
                     field: "schema",
                     ..
-                })
+                }))
             ),
             "{source}"
         );

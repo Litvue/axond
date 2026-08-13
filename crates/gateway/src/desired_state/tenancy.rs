@@ -82,6 +82,9 @@ use std::fmt;
 
 use super::canonical::{Canonical, CanonicalValue};
 use super::ids::{InvalidId, ProjectId, ResourceId, Slug, TenantId};
+use super::record::{
+    BodyError, DISPLAY_NAME_FIELD, PROJECT_ID_FIELD, Record, SCHEMA_FIELD, TENANT_ID_FIELD,
+};
 use super::resource::{
     ResourceBody, ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber,
 };
@@ -92,11 +95,6 @@ pub const TENANT_SCHEMA: &str = "axond.tenant.v1";
 
 /// The project body schema this build reads and writes.
 pub const PROJECT_SCHEMA: &str = "axond.project.v1";
-
-const SCHEMA_FIELD: &str = "schema";
-const TENANT_ID_FIELD: &str = "tenant_id";
-const PROJECT_ID_FIELD: &str = "project_id";
-const DISPLAY_NAME_FIELD: &str = "display_name";
 
 /// Why a tenancy body, or the tenancy graph it belongs to, was refused.
 ///
@@ -344,117 +342,77 @@ impl fmt::Display for DisplayName {
     }
 }
 
-/// A strict reader over one inline record, shared by both body schemas.
-struct Record<'a> {
-    reference: ResourceRef,
-    fields: &'a [(String, CanonicalValue)],
-}
-
-impl<'a> Record<'a> {
-    /// Open a resource's body as a record of `schema`, refusing a body of the
-    /// wrong kind, form, schema, or field set.
-    fn open(
-        resource: &'a ResourceVersion,
-        kind: ResourceKind,
-        schema: &'static str,
-        known: &[&str],
-    ) -> Result<Self, TenancyError> {
-        let reference = resource.reference;
-        if reference.kind != kind {
-            return Err(TenancyError::Kind {
-                reference,
-                expected: kind,
-                found: reference.kind,
-            });
-        }
-        let ResourceBody::Inline(value) = &resource.body else {
-            return Err(TenancyError::NotInline { reference });
-        };
-        let CanonicalValue::Map(fields) = value else {
-            return Err(TenancyError::NotARecord { reference });
-        };
-        let record = Self { reference, fields };
-        let declared = record.string(SCHEMA_FIELD)?;
-        if declared != schema {
-            return Err(TenancyError::Schema {
-                reference,
-                expected: schema,
-                found: declared.to_owned(),
-            });
-        }
-        if let Some((field, _)) = fields
-            .iter()
-            .find(|(field, _)| field != SCHEMA_FIELD && !known.contains(&field.as_str()))
-        {
-            return Err(TenancyError::UnknownField {
-                reference,
-                schema,
-                field: field.clone(),
-            });
-        }
-        Ok(record)
-    }
-
-    fn string(&self, field: &'static str) -> Result<&'a str, TenancyError> {
-        let value = self
-            .fields
-            .iter()
-            .find(|(name, _)| name == field)
-            .map(|(_, value)| value)
-            .ok_or(TenancyError::MissingField {
-                reference: self.reference,
-                field,
-            })?;
-        match value {
-            CanonicalValue::String(text) => Ok(text),
-            _ => Err(TenancyError::FieldType {
-                reference: self.reference,
-                field,
-            }),
+/// The strict reader, with tenancy's refusals in it.
+///
+/// Every check [`Record`] makes is a check tenancy needs; giving it tenancy's
+/// error type is all it takes to inherit them, and a second schema inherits the
+/// same ones rather than reimplementing them slightly differently.
+impl BodyError for TenancyError {
+    fn kind(reference: ResourceRef, expected: ResourceKind, found: ResourceKind) -> Self {
+        Self::Kind {
+            reference,
+            expected,
+            found,
         }
     }
 
-    fn tenant(&self) -> Result<TenantId, TenancyError> {
-        TenantId::parse(self.string(TENANT_ID_FIELD)?).map_err(|source| TenancyError::MalformedId {
-            reference: self.reference,
-            field: TENANT_ID_FIELD,
+    fn not_inline(reference: ResourceRef) -> Self {
+        Self::NotInline { reference }
+    }
+
+    fn not_a_record(reference: ResourceRef) -> Self {
+        Self::NotARecord { reference }
+    }
+
+    fn schema(reference: ResourceRef, expected: &'static str, found: String) -> Self {
+        Self::Schema {
+            reference,
+            expected,
+            found,
+        }
+    }
+
+    fn missing_field(reference: ResourceRef, field: &'static str) -> Self {
+        Self::MissingField { reference, field }
+    }
+
+    fn unknown_field(reference: ResourceRef, schema: &'static str, field: String) -> Self {
+        Self::UnknownField {
+            reference,
+            schema,
+            field,
+        }
+    }
+
+    fn field_type(reference: ResourceRef, field: &'static str) -> Self {
+        Self::FieldType { reference, field }
+    }
+
+    fn malformed_id(reference: ResourceRef, field: &'static str, source: InvalidId) -> Self {
+        Self::MalformedId {
+            reference,
+            field,
             source,
-        })
+        }
     }
 
-    fn project(&self) -> Result<ProjectId, TenancyError> {
-        ProjectId::parse(self.string(PROJECT_ID_FIELD)?).map_err(|source| {
-            TenancyError::MalformedId {
-                reference: self.reference,
-                field: PROJECT_ID_FIELD,
-                source,
-            }
-        })
+    fn malformed_display_name(
+        reference: ResourceRef,
+        field: &'static str,
+        source: InvalidDisplayName,
+    ) -> Self {
+        Self::MalformedDisplayName {
+            reference,
+            field,
+            source,
+        }
     }
 
-    fn display_name(&self) -> Result<DisplayName, TenancyError> {
-        DisplayName::parse(self.string(DISPLAY_NAME_FIELD)?).map_err(|source| {
-            TenancyError::MalformedDisplayName {
-                reference: self.reference,
-                field: DISPLAY_NAME_FIELD,
-                source,
-            }
-        })
-    }
-
-    fn identity(
-        &self,
-        declared: impl fmt::Display,
-        identity: ResourceId,
-    ) -> Result<(), TenancyError> {
-        if self.reference.id == identity {
-            Ok(())
-        } else {
-            Err(TenancyError::IdentityMismatch {
-                reference: self.reference,
-                declared: declared.to_string(),
-                identity: self.reference.id,
-            })
+    fn identity_mismatch(reference: ResourceRef, declared: String, identity: ResourceId) -> Self {
+        Self::IdentityMismatch {
+            reference,
+            declared,
+            identity,
         }
     }
 }
@@ -521,7 +479,7 @@ impl TenantBody {
 
     /// Read a tenant resource's body, binding it to its envelope.
     pub fn read(resource: &ResourceVersion) -> Result<Self, TenancyError> {
-        let record = Record::open(
+        let record = Record::<TenancyError>::open(
             resource,
             ResourceKind::Tenant,
             Self::SCHEMA,
@@ -634,7 +592,7 @@ impl ProjectBody {
     /// Read a project resource's body, binding it to its envelope: identity to
     /// the reference, ownership to the scope.
     pub fn read(resource: &ResourceVersion) -> Result<Self, TenancyError> {
-        let record = Record::open(
+        let record = Record::<TenancyError>::open(
             resource,
             ResourceKind::Project,
             Self::SCHEMA,
@@ -875,12 +833,12 @@ impl fmt::Display for QualifiedProject {
 mod tests {
     use super::super::canonical::{Canonical as _, SerializerVersion};
     use super::super::fixtures::{
-        alias, candidate, credential, display_name, project, project_body, project_id, reference,
-        resource_id, state, tenant, tenant_body, tenant_id,
+        alias, candidate, display_name, project, project_body, project_credential, project_id,
+        reference, resource_id, state, tenant, tenant_body, tenant_id,
     };
     use super::super::mutation::ExpectedRevision;
     use super::super::revision::{
-        IntegrityError, LoadedRevision, RevisionManifest, ValidationError,
+        BodySkew, IntegrityError, LoadedRevision, RevisionManifest, ValidationError,
     };
     use super::*;
     use std::time::SystemTime;
@@ -1266,10 +1224,10 @@ mod tests {
             .expect_err("an untyped tenancy body must not hydrate");
         assert_eq!(
             error,
-            IntegrityError::Incompatible(TenancyError::MissingField {
+            IntegrityError::Incompatible(BodySkew::Tenancy(TenancyError::MissingField {
                 reference: tenant_resource().reference,
                 field: "schema"
-            }),
+            })),
             "a legacy body is a compatibility refusal, and it names the row"
         );
         assert!(error.is_incompatible());
@@ -1299,7 +1257,7 @@ mod tests {
         assert!(
             matches!(
                 error,
-                IntegrityError::Incompatible(TenancyError::Schema { .. })
+                IntegrityError::Incompatible(BodySkew::Tenancy(TenancyError::Schema { .. }))
             ),
             "{error}"
         );
@@ -1446,13 +1404,7 @@ mod tests {
 
         // A credential filed under `globex`'s scope but inside `acme`'s project:
         // the pair is inconsistent even though each half exists.
-        let leaked = ResourceVersion {
-            scope: ResourceScope::Project {
-                tenant: other,
-                project: project_id(2),
-            },
-            ..credential(&other, 21, "leaked")
-        };
+        let leaked = project_credential(&other, &project_id(2), 21, "leaked");
         let mut mixed = state.clone();
         mixed.insert(leaked.clone()).expect("a distinct reference");
         assert_eq!(
@@ -1469,13 +1421,7 @@ mod tests {
         // is nothing here to refuse: what the scope names is unroutable, which the
         // boundary that routes says, and an older revision does not become
         // unhydratable for having said it.
-        let dangling = ResourceVersion {
-            scope: ResourceScope::Project {
-                tenant: owner,
-                project: project_id(77),
-            },
-            ..credential(&owner, 22, "dangling")
-        };
+        let dangling = project_credential(&owner, &project_id(77), 22, "dangling");
         let mut missing = state.clone();
         missing
             .insert(dangling.clone())
@@ -1485,13 +1431,7 @@ mod tests {
             .expect("a scope naming an undeclared project is unroutable, not unreadable");
 
         // The consistent pair is valid desired state.
-        let inside = ResourceVersion {
-            scope: ResourceScope::Project {
-                tenant: owner,
-                project: project_id(2),
-            },
-            ..credential(&owner, 23, "inside")
-        };
+        let inside = project_credential(&owner, &project_id(2), 23, "inside");
         let mut consistent = state;
         consistent
             .insert(inside)
