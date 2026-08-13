@@ -700,6 +700,82 @@ fn a_declared_conclusion_discredits_a_retained_positive_that_predates_it() {
     );
 }
 
+/// The same conclusion discredits an older positive still sitting in the *current*
+/// slot, not only a retained one: read as current definitive evidence it would report
+/// `available` for a target the concluding listing had dropped.
+#[test]
+fn a_declared_conclusion_discredits_an_older_positive_in_either_slot() {
+    let scope = ScopeRef::tenant(tenant(1));
+    // A declaration that carries the conclusion and no look of its own — the shape a
+    // projection produces when it has the watermark but has discarded the evidence.
+    let concluded = AvailabilityRecord {
+        definitive_at: Some(at(500)),
+        ..permitting()
+    };
+
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 300, None))
+        .record(key(scope, "gpt-4o"), concluded)
+        .build();
+    let record = index
+        .record(&key(scope, "gpt-4o"))
+        .expect("the key is held");
+    assert_eq!(record.discovery, None, "the stale positive is discredited");
+    assert_eq!(record.last_known_good, None);
+
+    let verdict = index.evaluate(&key(scope, "gpt-4o"), at(700));
+    assert_eq!(
+        (verdict.state, verdict.reason),
+        (AvailabilityState::Unknown, AvailabilityReason::NoEvidence),
+        "a positive older than the conclusion cannot report the target reachable"
+    );
+}
+
+/// One scope's evidence may never decide another's. `observe` takes the key from the
+/// look and so cannot mis-file one; a declaration is handed both halves, so it checks
+/// rather than trusting the caller — and says so, instead of dropping it silently.
+#[test]
+fn a_declaration_refuses_evidence_that_names_another_scope() {
+    let mine = ScopeRef::tenant(tenant(1));
+    let theirs = ScopeRef::tenant(tenant(2));
+    let builder = AvailabilityIndex::builder().record(
+        key(mine, "gpt-4o"),
+        AvailabilityRecord {
+            discovery: Some(present(theirs, "gpt-4o", 100, None)),
+            last_known_good: Some(present(theirs, "gpt-4o", 100, None)),
+            definitive_at: Some(at(100)),
+            ..permitting()
+        },
+    );
+
+    assert_eq!(builder.misfiled(), 2, "both looks name another tenant");
+    assert_eq!(builder.superseded(), 0, "neither is a late arrival");
+    let index = builder.build();
+    let verdict = index.evaluate(&key(mine, "gpt-4o"), at(120));
+    assert_eq!(
+        (verdict.state, verdict.reason),
+        (AvailabilityState::Unknown, AvailabilityReason::NoEvidence),
+        "nobody has looked at this tenant's target"
+    );
+    let record = index.record(&key(mine, "gpt-4o")).expect("the key is held");
+    assert_eq!(record.discovery, None);
+    assert_eq!(record.last_known_good, None);
+
+    let target_mismatch = AvailabilityIndex::builder().record(
+        key(mine, "gpt-4o"),
+        AvailabilityRecord {
+            discovery: Some(present(mine, "gpt-4o-mini", 100, None)),
+            ..permitting()
+        },
+    );
+    assert_eq!(
+        target_mismatch.misfiled(),
+        1,
+        "a look at another model is mis-filed too"
+    );
+}
+
 /// A hand-built record can carry a retained look newer than its current one, which
 /// no observed sequence produces. Evidence follows the newer of the two, or the
 /// record would report a refusal while holding newer positive evidence.

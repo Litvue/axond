@@ -46,7 +46,9 @@
 //! than remaining a denial.
 //!
 //! **Verdicts are per scope, and bounded by type.** Every record is keyed by
-//! [`ScopeRef`], so one tenant's evidence can never decide another's, and every
+//! [`ScopeRef`], so one tenant's evidence can never decide another's — an observed
+//! look is filed under the key it names, and a declared one is refused if it names
+//! another — and every
 //! field of [`Availability`] is an enum, a bool, or a timestamp — there is nowhere
 //! to put a provider error body, a policy expression, a credential, or free text.
 //! The one place free text is allowed is

@@ -401,6 +401,10 @@ pub struct AvailabilityIndexBuilder {
     /// for that key. Counted rather than dropped silently, so a projection can
     /// report that it is receiving observations out of order.
     superseded: usize,
+    /// Observations refused because they named a different scope or target than
+    /// the record they were declared under. Counted separately from disorder: a
+    /// look about the wrong key is a projection bug, not a late arrival.
+    misfiled: usize,
 }
 
 impl AvailabilityIndexBuilder {
@@ -413,6 +417,7 @@ impl AvailabilityIndexBuilder {
         Self {
             records: index.records.clone(),
             superseded: 0,
+            misfiled: 0,
         }
     }
 
@@ -435,14 +440,30 @@ impl AvailabilityIndexBuilder {
     ///
     /// The conclusion a record carries counts even when the look that reached it is
     /// gone from both slots: declaring a target a complete listing dropped discredits
-    /// an older positive the receiving index retained, exactly as the listing itself
-    /// would have.
+    /// an older positive the receiving index retained, wherever it is held, exactly as
+    /// the listing itself would have.
+    ///
+    /// Evidence that names a different scope or target than `key` is refused and
+    /// counted in [`misfiled`](Self::misfiled). [`observe`](Self::observe) derives the
+    /// key from the look itself and so cannot mis-file one; a declaration is handed
+    /// both halves and could disagree, and one scope's listing deciding another's
+    /// verdict is the one thing the keying exists to prevent.
     #[must_use]
     pub fn record(mut self, key: AvailabilityKey, record: AvailabilityRecord) -> Self {
-        let entry = self.records.entry(key).or_default();
         let declared_conclusion = record.definitive_at;
-        let retained = record.last_known_good.clone();
-        let current = record.discovery.clone();
+        let owned = |evidence: &Option<DiscoveryObservation>| {
+            evidence.clone().filter(|look| look.key() == key)
+        };
+        let retained = owned(&record.last_known_good);
+        let current = owned(&record.discovery);
+        self.misfiled += [
+            (&record.last_known_good, &retained),
+            (&record.discovery, &current),
+        ]
+        .iter()
+        .filter(|(declared, kept)| declared.is_some() && kept.is_none())
+        .count();
+        let entry = self.records.entry(key).or_default();
         // The dimensions are replaced; the evidence and the conclusion are not, so
         // that what the declaration carries can be judged against what the index has
         // already concluded rather than against itself.
@@ -491,12 +512,19 @@ impl AvailabilityIndexBuilder {
             // have discredited it. The conclusive look itself may be long gone from
             // both slots — displaced from the current one by a failed refresh — so
             // without this the watermark would rise past a positive that outlives it.
-            if entry
-                .last_known_good
-                .as_ref()
-                .is_some_and(|retained| Some(retained.observed_at) < entry.definitive_at)
-            {
+            // Both slots, not only the retained one: a positive still sitting in the
+            // current slot would otherwise be read as definitive current evidence and
+            // report `available` for a target the concluding listing had dropped.
+            let discredited = |held: &Option<DiscoveryObservation>| {
+                held.as_ref().is_some_and(|look| {
+                    look.is_positive() && Some(look.observed_at) < entry.definitive_at
+                })
+            };
+            if discredited(&entry.last_known_good) {
                 entry.last_known_good = None;
+            }
+            if discredited(&entry.discovery) {
+                entry.discovery = None;
             }
         }
         self
@@ -589,6 +617,13 @@ impl AvailabilityIndexBuilder {
     /// last-known-good, if it was the newest positive evidence held.
     pub fn superseded(&self) -> usize {
         self.superseded
+    }
+
+    /// How many declared observations were refused for naming a scope or target other
+    /// than the record they arrived with. Never zero-cost to ignore: a non-zero count
+    /// means a projection is deriving evidence against the wrong key.
+    pub fn misfiled(&self) -> usize {
+        self.misfiled
     }
 
     pub fn build(self) -> AvailabilityIndex {

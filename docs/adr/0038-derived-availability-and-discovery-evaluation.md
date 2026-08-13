@@ -124,7 +124,16 @@ Declared evidence is judged against the conclusion the *index* has reached rathe
 than the one the record carries itself, so a record read out of one index survives
 being declared into another — including the ordinary shape where the current look
 *is* the retained positive, which stays current evidence rather than being demoted
-to a fallback — and an ordinary refresh reports nothing out of order.
+to a fallback — and an ordinary refresh reports nothing out of order. The conclusion
+a record carries counts even when the look that reached it is gone from both slots, in
+which case it discredits a positive older than itself wherever the receiving index
+holds it, the current slot included: a positive left sitting there would be read as
+current definitive evidence and report a dropped target as reachable. Because a
+declaration is handed the key and the evidence separately, it also refuses evidence
+naming another scope or target — the observation path derives the key from the look
+and so cannot mis-file one — and counts the refusal, so a projection deriving evidence
+against the wrong key surfaces rather than deciding one tenant's answer from another's
+listing.
 
 **Uncertainty is routable only where a scope chose it.** `unknown` and `stale` are
 not refusals, but routability is a property of the whole verdict:
