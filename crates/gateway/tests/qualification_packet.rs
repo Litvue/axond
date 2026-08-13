@@ -155,17 +155,20 @@ fn a_slice_cannot_claim_a_rung_it_has_not_reached() {
                 );
                 // A short run may be retained here — it is how a harness shows
                 // it produces records at all. What it may not do is pass for
-                // the measurement the heavy tier exists to take.
-                if let Some(heavy) = slice.heavy_tier.as_deref() {
-                    assert!(
-                        !slice
-                            .retained
-                            .iter()
-                            .any(|relative| packet::load_record(relative).tier == heavy),
-                        "{id}: it retains a {heavy}-tier run, so it is evidenced rather \
-                         than harnessed"
-                    );
-                }
+                // the measurement the heavy tier exists to take, which is why
+                // the tier that would promote the slice has to be named even
+                // while no run of it exists.
+                let heavy = slice.heavy_tier.as_deref().unwrap_or_else(|| {
+                    panic!("{id}: a slice with a driver names the tier that would evidence it")
+                });
+                assert!(
+                    !slice
+                        .retained
+                        .iter()
+                        .any(|relative| packet::load_record(relative).tier == heavy),
+                    "{id}: it retains a {heavy}-tier run, so it is evidenced rather \
+                     than harnessed"
+                );
             }
             Status::Evidenced => {
                 assert!(
@@ -176,10 +179,9 @@ fn a_slice_cannot_claim_a_rung_it_has_not_reached() {
                     !slice.retained.is_empty(),
                     "{id}: evidence is a retained run, not a status"
                 );
-                let heavy = slice
-                    .heavy_tier
-                    .as_deref()
-                    .unwrap_or_else(|| panic!("{id}: a slice with runs names its heavy tier"));
+                let heavy = slice.heavy_tier.as_deref().unwrap_or_else(|| {
+                    panic!("{id}: a slice with a driver names the tier that evidences it")
+                });
                 assert!(
                     slice
                         .retained
