@@ -1910,3 +1910,18 @@ fn a_key_whose_looks_were_discredited_is_written_as_cleared() {
         "so the stored looks must go with them"
     );
 }
+
+#[test]
+fn clearing_same_key_keeps_the_newest_cutoff() {
+    let target_key = key(ScopeRef::tenant(tenant(1)), "gpt-4o");
+    let write = EvidenceWrite::default().clearing([
+        EvidenceClear::new(target_key.clone(), at(100)),
+        EvidenceClear::new(target_key.clone(), at(200)),
+    ]);
+
+    assert_eq!(
+        write.cleared(),
+        [EvidenceClear::new(target_key, at(200))],
+        "deduplicating cleanup must retain the maximum cutoff"
+    );
+}

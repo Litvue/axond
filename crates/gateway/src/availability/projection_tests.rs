@@ -595,6 +595,10 @@ fn removed_targets_have_a_bounded_orphan_evidence_lifecycle() {
             .expect("reintroducing the target projects");
         assert_eq!(restored.index().len(), 1);
         assert!(restored.index().record(&deployment.key()).is_some());
+        assert!(
+            evidence.persistable().cleared().is_empty(),
+            "a re-enabled target must not keep emitting orphan cleanup"
+        );
     }
 
     let write = evidence.persistable();
@@ -603,9 +607,37 @@ fn removed_targets_have_a_bounded_orphan_evidence_lifecycle() {
         2,
         "the reintroduced target owns its current and fallback slots"
     );
+    assert_eq!(write.cleared(), &[]);
+}
+
+#[test]
+fn persisted_orphan_cleanup_is_removed_after_successful_write() {
+    let deployment = Deployment::new().entitled().governed();
+    let evidence = AvailabilityEvidence::new(catalogue());
+    evidence.observe(DiscoveryObservation::new(
+        deployment.scope(),
+        target(),
+        DiscoveryResult::Present,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        at(90),
+    ));
+    evidence
+        .derive(&deployment.state, &resolved(40))
+        .expect("the target projects");
+    evidence
+        .derive(&DesiredState::new(), &resolved(40))
+        .expect("removing the target projects");
+
+    let write = evidence.persistable();
     assert_eq!(
         write.cleared(),
-        &[EvidenceClear::new(deployment.key(), at(100))]
+        &[EvidenceClear::new(deployment.key(), at(90))]
+    );
+    evidence.acknowledge_persisted(&write);
+    assert!(
+        evidence.persistable().cleared().is_empty(),
+        "successful persistence must retire the cleanup work"
     );
 }
 

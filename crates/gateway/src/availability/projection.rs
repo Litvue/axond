@@ -753,6 +753,23 @@ impl AvailabilityEvidence {
         EvidenceWrite::of_index(&self.index()).clearing(orphaned)
     }
 
+    /// Forget orphan cleanup that a writer has successfully applied.
+    ///
+    /// A newer cleanup for the same key wins over an older write that was still
+    /// in flight, so acknowledging a write cannot lose work discovered since it
+    /// was produced.
+    pub fn acknowledge_persisted(&self, write: &EvidenceWrite) {
+        let mut orphaned = self.lock(&self.orphaned);
+        for clear in write.cleared() {
+            if orphaned
+                .get(&clear.key)
+                .is_some_and(|before| *before <= clear.before)
+            {
+                orphaned.remove(&clear.key);
+            }
+        }
+    }
+
     /// Project `state` over the evidence held, publish the result, and return it.
     ///
     /// Serialised against every other derivation: the read of the index, the
@@ -800,14 +817,18 @@ impl AvailabilityEvidence {
                     .map(|before| (key.clone(), before))
             })
             .collect::<BTreeMap<_, _>>();
+        let mut pending_orphaned = self.lock(&self.orphaned);
+        let previous_orphaned = pending_orphaned.clone();
+        pending_orphaned.retain(|key, _| projected.index().record(key).is_none());
+        pending_orphaned.extend(orphaned);
+        drop(pending_orphaned);
         *self.lock(&self.replaced) = Some(Superseded {
             derivation,
             index: previous,
-            orphaned: self.lock(&self.orphaned).clone(),
+            orphaned: previous_orphaned,
             derived_from: self.lock(&self.derived_from).clone(),
             looks: pending,
         });
-        self.lock(&self.orphaned).extend(orphaned);
         *self.lock(&self.index) = Arc::new(projected.index().clone());
         *self.lock(&self.derived_from) = Some((Arc::new(state.clone()), readiness.clone()));
         Ok(ProjectedAvailability {

@@ -185,7 +185,7 @@ impl EvidenceWrite {
         self.cleared.sort_by(|left, right| left.key.cmp(&right.key));
         self.cleared.dedup_by(|left, right| {
             if left.key == right.key {
-                left.before = left.before.max(right.before);
+                right.before = right.before.max(left.before);
                 true
             } else {
                 false
