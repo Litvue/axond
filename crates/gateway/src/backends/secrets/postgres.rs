@@ -1,0 +1,1130 @@
+//! The production [`SecretStore`]: envelope-encrypted rows in PostgreSQL.
+//!
+//! The selected boundary for #145. Material is sealed in this process under a
+//! per-version data-encryption key, that key is sealed under the deployment KEK
+//! the bootstrap config *references*, and only the sealed bytes reach the
+//! database ([`envelope`](super::envelope)). So the database holds no material an
+//! operator, a backup, or a stolen replica can read, and the key is not in the
+//! database to be dumped with it.
+//!
+//! Three storage rules make the domain contract enforceable rather than
+//! aspirational:
+//!
+//! - **A version is a row, and a row is written once.** The primary key is
+//!   `(secret_id, version)`, rotation inserts the next version, and nothing
+//!   updates sealed bytes. A revision compiled against version 2 therefore keeps
+//!   resolving version 2 while version 3 is staged and proven — the overlap a
+//!   zero-downtime rotation is made of.
+//! - **Ownership is a predicate on every statement.** Reads match the tenant and
+//!   the project exactly, and a row this owner does not own answers exactly as an
+//!   absent one does ([`SecretError::NotFound`] to a caller, distinguishable only
+//!   in this process's own logs). The seal is bound to the owner as well, so a row
+//!   moved between tenants in the database does not open.
+//! - **Tombstoning destroys bytes in the transaction that records it.** The
+//!   lifecycle move and the `NULL`ing of the four sealed columns are one
+//!   statement, and the shipped DDL's check constraint refuses any other
+//!   combination, so "destroyed" cannot mean "relabelled".
+//!
+//! Nothing here is on the request path: the whole store is
+//! [`BackendPath::SnapshotCompilation`](crate::backends::BackendPath::SnapshotCompilation),
+//! so an outage stalls administration and convergence while replicas keep serving
+//! the snapshot they already hold.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use tokio_postgres::{Client, Config, Row, Transaction};
+
+use super::envelope::{DeploymentKek, EnvelopeError, SealedSecret};
+use super::{
+    ENVELOPE_CAPABILITIES, KekRef, SecretDescriptor, SecretError, SecretMaterial, SecretResolver,
+    SecretStore,
+};
+use crate::desired_state::secrets::{LifecycleTransition, SecretLifecycle, SecretOwner, SecretRef};
+use crate::desired_state::{SecretId, Uuid7Generator};
+
+const BACKEND: &str = "encrypted-postgres";
+
+/// The shipped DDL this store applies with `create_table = true`.
+const SCHEMA_DDL: &str = include_str!("../../../sql/secret_store_v1.sql");
+
+/// The columns a sealed record is read back from, in one place so `resolve` and
+/// the row decoder cannot disagree about their order.
+const MATERIAL_COLUMNS: &str = "tenant_id, project_id, lifecycle, scheme, kek_reference, wrapped_dek, dek_nonce, \
+     ciphertext, nonce";
+
+/// How the store connects, and what it may do at boot.
+#[derive(Debug, Clone)]
+pub struct SecretStoreSettings {
+    /// The PostgreSQL schema the table lives in, if not the connection's default.
+    /// Validated as an identifier, because it is interpolated into
+    /// `SET search_path`.
+    pub schema: Option<String>,
+    /// Whether boot may apply the shipped DDL. An operator who applies it out of
+    /// band leaves this off and gets a refusal instead of a schema change.
+    pub create_table: bool,
+    pub connect_timeout: Duration,
+    /// The ceiling on one secret-store operation. Generous by inference-path
+    /// standards: nothing here is called with a request in flight.
+    pub operation_timeout: Duration,
+}
+
+impl Default for SecretStoreSettings {
+    fn default() -> Self {
+        Self {
+            schema: None,
+            create_table: true,
+            connect_timeout: Duration::from_secs(10),
+            operation_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl SecretStoreSettings {
+    /// The settings a `[secret_store]` section asks for, with connection bounds
+    /// inherited from `[control_plane]`: encrypted Postgres is normally the same
+    /// database, and two independent sets of timeouts for one server is a
+    /// configuration surface with no decision behind it.
+    pub fn from_config(
+        secret_store: &crate::config::SecretStore,
+        control_plane: &crate::config::ControlPlane,
+    ) -> Self {
+        Self {
+            schema: secret_store
+                .schema
+                .as_deref()
+                .map(str::trim)
+                .filter(|schema| !schema.is_empty())
+                .map(str::to_owned),
+            create_table: secret_store.create_table,
+            connect_timeout: Duration::from_millis(control_plane.connect_timeout_ms),
+            operation_timeout: Duration::from_millis(control_plane.operation_timeout_ms),
+        }
+    }
+}
+
+/// A [`SecretStore`] holding envelope-encrypted material in `axond_secret`.
+pub struct PostgresSecrets {
+    config: Config,
+    settings: SecretStoreSettings,
+    /// Set on every connection, including reconnections: a reconnect that landed
+    /// on the default schema would silently read a different table.
+    search_path: Option<String>,
+    kek: DeploymentKek,
+    ids: Uuid7Generator,
+    client: tokio::sync::Mutex<Option<Client>>,
+}
+
+/// Written by hand, and deliberately narrow: a derived one would print the
+/// [`Config`], which carries the password from the DSN.
+impl std::fmt::Debug for PostgresSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresSecrets")
+            .field("schema", &self.search_path)
+            .field("kek", self.kek.reference())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PostgresSecrets {
+    /// Connect, optionally apply the shipped DDL, and prove the table is
+    /// readable.
+    ///
+    /// The KEK is resolved by the caller — it comes from an env var or a file
+    /// named in bootstrap config — so this takes the key rather than the
+    /// reference: a store that read the material itself would be a second place
+    /// key bytes are handled.
+    pub async fn connect(
+        dsn: &str,
+        settings: SecretStoreSettings,
+        kek: DeploymentKek,
+    ) -> Result<Self, SecretError> {
+        let mut config: Config = dsn.parse().map_err(|error| {
+            // The DSN itself is never echoed: it carries a password.
+            denied(format!("the secret-store DSN could not be parsed: {error}"))
+        })?;
+        config.connect_timeout(settings.connect_timeout);
+        config.application_name(crate::telemetry::SERVICE_NAME);
+        let search_path = settings
+            .schema
+            .as_deref()
+            .map(|schema| {
+                crate::usage::validate_table_name(schema).map_err(denied)?;
+                if schema.contains('.') {
+                    return Err(denied(format!(
+                        "`{schema}` is not a single unqualified schema name"
+                    )));
+                }
+                Ok(schema.to_owned())
+            })
+            .transpose()?;
+
+        let store = Self {
+            config,
+            settings,
+            search_path,
+            kek,
+            ids: Uuid7Generator::new(),
+            client: tokio::sync::Mutex::new(None),
+        };
+        let client = tokio::time::timeout(store.settings.connect_timeout, store.connect_client())
+            .await
+            .map_err(|_| unavailable_message("connection timed out"))?
+            .map_err(|error| unavailable("connect", &error))?;
+        store.prepare_schema(&client).await?;
+        *store.client.lock().await = Some(client);
+        Ok(store)
+    }
+
+    /// The KEK reference material is currently sealed under. A name, for the
+    /// status endpoint and for logs.
+    pub fn kek_reference(&self) -> &KekRef {
+        self.kek.reference()
+    }
+
+    /// Apply the shipped DDL when allowed, and either way establish that the
+    /// table this build writes is present and readable.
+    ///
+    /// Boot refuses rather than degrades: a missing table with
+    /// `create_table = false` is [`SecretError::Denied`], because a store that
+    /// carried on would fail every candidate revision at compile time with an
+    /// error that pointed at the wrong thing.
+    async fn prepare_schema(&self, client: &Client) -> Result<(), SecretError> {
+        if self.settings.create_table {
+            client
+                .batch_execute(SCHEMA_DDL)
+                .await
+                .map_err(|error| unavailable("apply secret-store schema", &error))?;
+        }
+        client
+            .query_one("SELECT count(*) FROM axond_secret WHERE false", &[])
+            .await
+            .map_err(|error| {
+                denied(format!(
+                    "the secret store's `axond_secret` table is not readable ({error}). Apply \
+                     `ops/postgres/secret_store_v1.sql`, or set `create_table = true` under \
+                     `[secret_store]` to let boot apply it."
+                ))
+            })?;
+        Ok(())
+    }
+
+    async fn connect_client(&self) -> Result<Client, tokio_postgres::Error> {
+        let (client, connection) = self.config.connect(crate::usage::tls_connector()).await?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::warn!(%error, "postgres secret-store connection closed");
+            }
+        });
+        if let Some(schema) = &self.search_path {
+            // Validated as an identifier at construction, so this is not an
+            // injection point; there is no parameter form of `SET`.
+            client
+                .batch_execute(&format!("SET search_path TO {schema}"))
+                .await?;
+        }
+        Ok(client)
+    }
+
+    /// Run one operation on a connected client, reconnecting a dead connection
+    /// and dropping one an outage broke. A refusal keeps the connection: it says
+    /// nothing about its health.
+    async fn run<T>(
+        &self,
+        operation: impl for<'a> FnOnce(
+            &'a mut Client,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<T, SecretError>> + Send + 'a>,
+        >,
+    ) -> Result<T, SecretError> {
+        let mut guard = self.client.lock().await;
+        if guard.as_ref().is_none_or(Client::is_closed) {
+            *guard = Some(
+                self.connect_client()
+                    .await
+                    .map_err(|error| unavailable("reconnect", &error))?,
+            );
+        }
+        let result = tokio::time::timeout(
+            self.settings.operation_timeout,
+            operation(guard.as_mut().expect("connected")),
+        )
+        .await
+        .map_err(|_| unavailable_message("operation timed out"))
+        .and_then(|result| result);
+        if matches!(result, Err(SecretError::Unavailable { .. })) {
+            *guard = None;
+        }
+        result
+    }
+
+    /// Insert one sealed version. The caller has already established that this is
+    /// a version nobody has written.
+    async fn insert(
+        client: &Transaction<'_>,
+        owner: SecretOwner,
+        reference: SecretRef,
+        sealed: &SealedSecret,
+    ) -> Result<u64, SecretError> {
+        client
+            .execute(
+                "INSERT INTO axond_secret (secret_id, version, tenant_id, project_id, lifecycle, \
+                 scheme, kek_reference, wrapped_dek, dek_nonce, ciphertext, nonce) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 ON CONFLICT (secret_id, version) DO NOTHING",
+                &[
+                    &reference.secret.to_string(),
+                    &version_of(reference),
+                    &owner.tenant.to_string(),
+                    &owner.project.map(|project| project.to_string()),
+                    &SecretLifecycle::Staged.as_str(),
+                    &sealed.scheme,
+                    &sealed.kek.0,
+                    &sealed.wrapped_dek,
+                    &sealed.dek_nonce,
+                    &sealed.ciphertext,
+                    &sealed.nonce,
+                ],
+            )
+            .await
+            .map_err(|error| unavailable("insert secret version", &error))
+    }
+
+    /// The one place a reference becomes a descriptor: unknown, then not this
+    /// owner's, in that order, so neither check can be skipped in one method.
+    fn descriptor_of(
+        row: &Row,
+        owner: SecretOwner,
+        reference: &SecretRef,
+    ) -> Result<SecretDescriptor, SecretError> {
+        let tenant: String = row.get("tenant_id");
+        let project: Option<String> = row.get("project_id");
+        if tenant != owner.tenant.to_string()
+            || project != owner.project.map(|project| project.to_string())
+        {
+            return Err(SecretError::Ownership {
+                reference: *reference,
+                owner,
+            });
+        }
+        let stored: String = row.get("lifecycle");
+        // A state a newer release wrote is not a state this build may guess at:
+        // treating an unknown lifecycle as resolvable would put material in
+        // service that an administrator withdrew.
+        let lifecycle = SecretLifecycle::parse(&stored).ok_or_else(|| {
+            SecretError::Invalid(format!(
+                "secret {reference} is stored in state `{stored}`, which this build does not read"
+            ))
+        })?;
+        Ok(SecretDescriptor {
+            reference: *reference,
+            owner,
+            lifecycle,
+        })
+    }
+
+    async fn locked_descriptor(
+        transaction: &Transaction<'_>,
+        owner: SecretOwner,
+        reference: &SecretRef,
+    ) -> Result<SecretDescriptor, SecretError> {
+        let row = transaction
+            .query_opt(
+                "SELECT tenant_id, project_id, lifecycle FROM axond_secret \
+                 WHERE secret_id = $1 AND version = $2 FOR UPDATE",
+                &[&reference.secret.to_string(), &version_of(*reference)],
+            )
+            .await
+            .map_err(|error| unavailable("read secret version", &error))?
+            .ok_or(SecretError::NotFound(*reference))?;
+        Self::descriptor_of(&row, owner, reference)
+    }
+}
+
+#[async_trait]
+impl SecretResolver for PostgresSecrets {
+    fn name(&self) -> &'static str {
+        BACKEND
+    }
+
+    fn capabilities(&self) -> crate::backends::Capabilities {
+        ENVELOPE_CAPABILITIES
+    }
+
+    async fn resolve(
+        &self,
+        owner: SecretOwner,
+        reference: &SecretRef,
+    ) -> Result<SecretMaterial, SecretError> {
+        let reference = *reference;
+        // The read and the unwrap are separate steps on purpose: the connection
+        // is released before any plaintext exists, so material is never held
+        // across a database round trip, and a slow store cannot lengthen the
+        // window a key is in memory for.
+        let sealed = self
+            .run(|client| {
+                Box::pin(async move {
+                    let row = client
+                        .query_opt(
+                            &format!(
+                                "SELECT {MATERIAL_COLUMNS} FROM axond_secret \
+                                 WHERE secret_id = $1 AND version = $2"
+                            ),
+                            &[&reference.secret.to_string(), &version_of(reference)],
+                        )
+                        .await
+                        .map_err(|error| unavailable("read secret material", &error))?
+                        .ok_or(SecretError::NotFound(reference))?;
+                    let descriptor = Self::descriptor_of(&row, owner, &reference)?;
+                    if !descriptor.permits_resolution() {
+                        return Err(SecretError::Lifecycle {
+                            reference,
+                            state: descriptor.lifecycle,
+                        });
+                    }
+                    sealed_of(&row, &reference)
+                })
+            })
+            .await?;
+        self.kek
+            .open(owner, &reference, &sealed)
+            .map_err(|error| unwrap_error(error, &reference, sealed.kek))
+    }
+
+    async fn exists(&self, owner: SecretOwner, reference: &SecretRef) -> Result<bool, SecretError> {
+        match self.describe(owner, reference).await {
+            Ok(descriptor) => Ok(descriptor.lifecycle.permits_resolution()),
+            // A reference somebody else owns answers as one that is not stored:
+            // probing must not enumerate another tenant's material.
+            Err(SecretError::NotFound(_) | SecretError::Ownership { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[async_trait]
+impl SecretStore for PostgresSecrets {
+    async fn stage(
+        &self,
+        owner: SecretOwner,
+        material: SecretMaterial,
+    ) -> Result<SecretDescriptor, SecretError> {
+        if material.is_empty() {
+            return Err(SecretError::Invalid("material is empty".to_owned()));
+        }
+        let reference = SecretRef::first(SecretId::new(self.ids.next()));
+        let sealed = self
+            .kek
+            .seal(owner, &reference, &material)
+            .map_err(|error| seal_error(error, &reference))?;
+        self.run(|client| {
+            Box::pin(async move {
+                let transaction = client
+                    .transaction()
+                    .await
+                    .map_err(|error| unavailable("begin stage", &error))?;
+                let inserted = Self::insert(&transaction, owner, reference, &sealed).await?;
+                if inserted != 1 {
+                    // A time-ordered UUIDv7 collision. Reported rather than
+                    // overwritten: the row that exists is somebody's material.
+                    return Err(SecretError::Invalid(format!("{reference} already exists")));
+                }
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| unavailable("commit stage", &error))?;
+                Ok(SecretDescriptor {
+                    reference,
+                    owner,
+                    lifecycle: SecretLifecycle::Staged,
+                })
+            })
+        })
+        .await
+    }
+
+    async fn rotate(
+        &self,
+        owner: SecretOwner,
+        reference: &SecretRef,
+        material: SecretMaterial,
+    ) -> Result<SecretDescriptor, SecretError> {
+        if material.is_empty() {
+            return Err(SecretError::Invalid("material is empty".to_owned()));
+        }
+        let reference = *reference;
+        let rotated = reference.rotated();
+        let sealed = self
+            .kek
+            .seal(owner, &rotated, &material)
+            .map_err(|error| seal_error(error, &rotated))?;
+        self.run(|client| {
+            Box::pin(async move {
+                let transaction = client
+                    .transaction()
+                    .await
+                    .map_err(|error| unavailable("begin rotation", &error))?;
+                // The base version is locked for the rotation, so two
+                // administrators rotating one secret serialize on it instead of
+                // both computing the same next version.
+                let current = Self::locked_descriptor(&transaction, owner, &reference).await?;
+                if current.lifecycle.is_terminal() {
+                    return Err(SecretError::Lifecycle {
+                        reference,
+                        state: current.lifecycle,
+                    });
+                }
+                let inserted = Self::insert(&transaction, owner, rotated, &sealed).await?;
+                if inserted != 1 {
+                    // A version is immutable, so rotating twice from one base
+                    // reference is a stale request rather than a second rotation:
+                    // overwriting would change what a credential body already
+                    // pinning `rotated` resolves to.
+                    return Err(SecretError::Invalid(format!("{rotated} already exists")));
+                }
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| unavailable("commit rotation", &error))?;
+                Ok(SecretDescriptor {
+                    reference: rotated,
+                    owner,
+                    lifecycle: SecretLifecycle::Staged,
+                })
+            })
+        })
+        .await
+    }
+
+    async fn transition(
+        &self,
+        owner: SecretOwner,
+        reference: &SecretRef,
+        next: SecretLifecycle,
+    ) -> Result<LifecycleTransition, SecretError> {
+        let reference = *reference;
+        self.run(|client| {
+            Box::pin(async move {
+                let transaction = client
+                    .transaction()
+                    .await
+                    .map_err(|error| unavailable("begin transition", &error))?;
+                let current = Self::locked_descriptor(&transaction, owner, &reference).await?;
+                let transition = current
+                    .lifecycle
+                    .transition_to(next)
+                    .map_err(|source| SecretError::Transition { reference, source })?;
+                if let LifecycleTransition::Moved { to, .. } = transition {
+                    // Tombstoning is the destruction, not a label on material
+                    // that stays: the bytes are nulled in the statement that
+                    // records the state, and the shipped constraint refuses any
+                    // other combination.
+                    let statement = if to == SecretLifecycle::Tombstoned {
+                        "UPDATE axond_secret SET lifecycle = $3, updated_at = now(), \
+                         destroyed_at = now(), wrapped_dek = NULL, dek_nonce = NULL, \
+                         ciphertext = NULL, nonce = NULL \
+                         WHERE secret_id = $1 AND version = $2"
+                    } else {
+                        "UPDATE axond_secret SET lifecycle = $3, updated_at = now() \
+                         WHERE secret_id = $1 AND version = $2"
+                    };
+                    transaction
+                        .execute(
+                            statement,
+                            &[
+                                &reference.secret.to_string(),
+                                &version_of(reference),
+                                &to.as_str(),
+                            ],
+                        )
+                        .await
+                        .map_err(|error| unavailable("record transition", &error))?;
+                }
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| unavailable("commit transition", &error))?;
+                Ok(transition)
+            })
+        })
+        .await
+    }
+
+    async fn describe(
+        &self,
+        owner: SecretOwner,
+        reference: &SecretRef,
+    ) -> Result<SecretDescriptor, SecretError> {
+        let reference = *reference;
+        self.run(|client| {
+            Box::pin(async move {
+                let row = client
+                    .query_opt(
+                        "SELECT tenant_id, project_id, lifecycle FROM axond_secret \
+                         WHERE secret_id = $1 AND version = $2",
+                        &[&reference.secret.to_string(), &version_of(reference)],
+                    )
+                    .await
+                    .map_err(|error| unavailable("describe secret version", &error))?
+                    .ok_or(SecretError::NotFound(reference))?;
+                Self::descriptor_of(&row, owner, &reference)
+            })
+        })
+        .await
+    }
+}
+
+/// A version as the column type. `bigint` is signed, and a version past
+/// `i64::MAX` is not reachable by rotation, so the conversion is saturating
+/// rather than fallible.
+fn version_of(reference: SecretRef) -> i64 {
+    i64::try_from(reference.version.get()).unwrap_or(i64::MAX)
+}
+
+/// The sealed record a row holds, or why it is not one.
+fn sealed_of(row: &Row, reference: &SecretRef) -> Result<SealedSecret, SecretError> {
+    let wrapped_dek: Option<Vec<u8>> = row.get("wrapped_dek");
+    let dek_nonce: Option<Vec<u8>> = row.get("dek_nonce");
+    let ciphertext: Option<Vec<u8>> = row.get("ciphertext");
+    let nonce: Option<Vec<u8>> = row.get("nonce");
+    let kek = KekRef(row.get::<_, String>("kek_reference"));
+    match (wrapped_dek, dek_nonce, ciphertext, nonce) {
+        (Some(wrapped_dek), Some(dek_nonce), Some(ciphertext), Some(nonce)) => Ok(SealedSecret {
+            scheme: row.get("scheme"),
+            kek,
+            wrapped_dek,
+            dek_nonce,
+            ciphertext,
+            nonce,
+        }),
+        // A live row with no bytes is storage the DDL's constraint forbids, so it
+        // is corruption rather than a lifecycle answer.
+        _ => Err(SecretError::Unwrap {
+            reference: *reference,
+            kek,
+        }),
+    }
+}
+
+/// An envelope failure while opening, as the contract's error.
+///
+/// Everything except an unimplemented scheme is [`SecretError::Unwrap`], which is
+/// `Corrupt`: a wrong or rotated KEK, a tampered row, and a record bound to
+/// another reference are one operator question — "which key does this database's
+/// material belong to" — and none of them is retryable.
+fn unwrap_error(error: EnvelopeError, reference: &SecretRef, kek: KekRef) -> SecretError {
+    match error {
+        EnvelopeError::UnknownScheme { found } => SecretError::Invalid(format!(
+            "secret {reference} is sealed with scheme `{found}`, which this build does not read"
+        )),
+        EnvelopeError::Random | EnvelopeError::Unopenable | EnvelopeError::Malformed { .. } => {
+            SecretError::Unwrap {
+                reference: *reference,
+                kek,
+            }
+        }
+    }
+}
+
+/// An envelope failure while sealing. Only the CSPRNG can fail here, and a
+/// process whose CSPRNG is unavailable cannot store material at all.
+fn seal_error(error: EnvelopeError, reference: &SecretRef) -> SecretError {
+    SecretError::Denied {
+        backend: BACKEND,
+        message: format!("secret {reference} could not be sealed: {error}"),
+    }
+}
+
+fn denied(message: impl Into<String>) -> SecretError {
+    SecretError::Denied {
+        backend: BACKEND,
+        message: message.into(),
+    }
+}
+
+fn unavailable_message(message: impl Into<String>) -> SecretError {
+    SecretError::Unavailable {
+        backend: BACKEND,
+        message: message.into(),
+    }
+}
+
+/// A Postgres failure while doing `operation`.
+///
+/// Everything is `Unavailable`: the statements here are parameterized and the
+/// only constraint they can violate is the primary key, which every caller
+/// checks by row count before it gets here. So a failing statement is a database
+/// this replica cannot use rather than a request it should not have made, and
+/// convergence retries it on a backoff.
+fn unavailable(operation: &str, error: &tokio_postgres::Error) -> SecretError {
+    SecretError::Unavailable {
+        backend: BACKEND,
+        message: format!("{operation} failed: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+
+    use super::*;
+    use crate::backends::{BackendFailure, Capability, FailureCategory};
+    use crate::desired_state::fixtures::{project_id, tenant_id};
+    use crate::desired_state::secrets::SecretVersion;
+    use crate::test_services::postgres_dsn;
+
+    const PLAINTEXT: &str = "sk-live-do-not-log";
+
+    fn kek(seed: u8) -> DeploymentKek {
+        DeploymentKek::parse(
+            KekRef("AXOND_TEST_KEK".to_owned()),
+            &STANDARD.encode([seed; 32]),
+        )
+        .expect("a 32-byte key")
+    }
+
+    fn owner() -> SecretOwner {
+        SecretOwner::tenant(tenant_id(1))
+    }
+
+    /// A store on its own schema, so tests are independent and leave nothing
+    /// behind for the next run to trip over. `None` when no Postgres is
+    /// configured, which skips the test.
+    async fn store(seed: u8) -> Option<(PostgresSecrets, String)> {
+        let dsn = postgres_dsn()?;
+        let schema = format!(
+            "axond_secret_test_{}",
+            Uuid7Generator::new().next().to_string().replace('-', "")
+        );
+        let (client, connection) = tokio_postgres::connect(&dsn, crate::usage::tls_connector())
+            .await
+            .expect("connect to the test database");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .expect("create the test schema");
+        let store = PostgresSecrets::connect(
+            &dsn,
+            SecretStoreSettings {
+                schema: Some(schema.clone()),
+                ..SecretStoreSettings::default()
+            },
+            kek(seed),
+        )
+        .await
+        .expect("the store applies its own schema");
+        Some((store, schema))
+    }
+
+    async fn drop_schema(schema: &str) {
+        let Some(dsn) = postgres_dsn() else {
+            return;
+        };
+        let (client, connection) = tokio_postgres::connect(&dsn, crate::usage::tls_connector())
+            .await
+            .expect("connect to the test database");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .await
+            .expect("drop the test schema");
+    }
+
+    #[test]
+    fn the_store_declares_envelope_encryption_and_never_the_request_path() {
+        let responsibility =
+            crate::backends::responsibility("SecretStore").expect("a declared responsibility");
+        assert!(!responsibility.path.on_request_path());
+        assert!(ENVELOPE_CAPABILITIES.has(Capability::EnvelopeEncryption));
+    }
+
+    /// A DSN that parses but points nowhere is an outage, not a refusal: the
+    /// distinction is what makes convergence retry instead of failing a revision.
+    #[tokio::test]
+    async fn an_unreachable_store_is_unavailable() {
+        let error = PostgresSecrets::connect(
+            "postgres://axond@127.0.0.1:1/axond?connect_timeout=1",
+            SecretStoreSettings {
+                connect_timeout: Duration::from_millis(200),
+                ..SecretStoreSettings::default()
+            },
+            kek(1),
+        )
+        .await
+        .expect_err("nothing listens there");
+        assert_eq!(error.category(), FailureCategory::Unavailable);
+        assert!(!error.to_string().contains("sk-"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_dsn_is_refused_without_being_echoed() {
+        let error = PostgresSecrets::connect("not a dsn", SecretStoreSettings::default(), kek(1))
+            .await
+            .expect_err("a DSN that does not parse");
+        assert_eq!(error.category(), FailureCategory::Denied);
+        assert!(!error.to_string().contains("not a dsn"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn material_round_trips_and_the_database_holds_only_ciphertext() {
+        let Some((store, schema)) = store(11).await else {
+            return;
+        };
+        let staged = store
+            .stage(owner(), SecretMaterial::new(PLAINTEXT.to_owned()))
+            .await
+            .expect("staging material");
+        assert_eq!(staged.lifecycle, SecretLifecycle::Staged);
+        assert_eq!(staged.reference.version, SecretVersion::FIRST);
+        assert_eq!(
+            store
+                .resolve(owner(), &staged.reference)
+                .await
+                .expect("staged material resolves")
+                .expose(),
+            PLAINTEXT
+        );
+        assert!(store.exists(owner(), &staged.reference).await.unwrap());
+
+        // What a dump of this table would contain.
+        let row = store
+            .run(|client| {
+                Box::pin(async move {
+                    client
+                        .query_one(
+                            "SELECT ciphertext, scheme, kek_reference FROM axond_secret \
+                             WHERE secret_id = $1",
+                            &[&staged.reference.secret.to_string()],
+                        )
+                        .await
+                        .map_err(|error| unavailable("read the row back", &error))
+                })
+            })
+            .await
+            .expect("one row");
+        let ciphertext: Vec<u8> = row.get("ciphertext");
+        assert!(!ciphertext.windows(6).any(|window| window == b"sk-liv"));
+        assert_eq!(
+            row.get::<_, String>("scheme"),
+            super::super::envelope::SCHEME
+        );
+        assert_eq!(row.get::<_, String>("kek_reference"), "AXOND_TEST_KEK");
+
+        drop_schema(&schema).await;
+    }
+
+    /// Create, rotate, disable, roll back, revoke, and destroy — the operator
+    /// sequence, against the real store.
+    #[tokio::test]
+    async fn the_lifecycle_is_what_the_domain_defines() {
+        let Some((store, schema)) = store(12).await else {
+            return;
+        };
+        let first = store
+            .stage(owner(), SecretMaterial::new(PLAINTEXT.to_owned()))
+            .await
+            .expect("staging")
+            .reference;
+        store
+            .transition(owner(), &first, SecretLifecycle::Active)
+            .await
+            .expect("staged material can be put in service");
+
+        // Rotation stages the next version and leaves the serving one alone, so
+        // both resolve: the overlap an uninterrupted rotation needs.
+        let second = store
+            .rotate(owner(), &first, SecretMaterial::new("sk-live-2".to_owned()))
+            .await
+            .expect("rotating");
+        assert_eq!(second.reference, first.rotated());
+        assert_eq!(second.lifecycle, SecretLifecycle::Staged);
+        assert_eq!(
+            store.resolve(owner(), &first).await.unwrap().expose(),
+            PLAINTEXT
+        );
+        assert_eq!(
+            store
+                .resolve(owner(), &second.reference)
+                .await
+                .unwrap()
+                .expose(),
+            "sk-live-2"
+        );
+        // Rotating again from the stale base reference does not overwrite the
+        // version somebody may already have published against.
+        assert!(matches!(
+            store
+                .rotate(owner(), &first, SecretMaterial::new("sk-live-3".to_owned()))
+                .await,
+            Err(SecretError::Invalid(_))
+        ));
+        assert_eq!(
+            store
+                .resolve(owner(), &second.reference)
+                .await
+                .unwrap()
+                .expose(),
+            "sk-live-2"
+        );
+
+        // Disabling withholds material reversibly; the rollback is the move back.
+        store
+            .transition(owner(), &first, SecretLifecycle::Disabled)
+            .await
+            .expect("disabling");
+        assert!(matches!(
+            store.resolve(owner(), &first).await,
+            Err(SecretError::Lifecycle {
+                state: SecretLifecycle::Disabled,
+                ..
+            })
+        ));
+        assert!(!store.exists(owner(), &first).await.unwrap());
+        assert_eq!(
+            store
+                .transition(owner(), &first, SecretLifecycle::Disabled)
+                .await
+                .expect("a retry is not a conflict"),
+            LifecycleTransition::Unchanged(SecretLifecycle::Disabled)
+        );
+        store
+            .transition(owner(), &first, SecretLifecycle::Active)
+            .await
+            .expect("a disabled version rolls back into service");
+        assert_eq!(
+            store.resolve(owner(), &first).await.unwrap().expose(),
+            PLAINTEXT
+        );
+
+        // Revocation is irreversible, and tombstoning destroys the bytes.
+        store
+            .transition(owner(), &first, SecretLifecycle::Revoked)
+            .await
+            .expect("revoking");
+        assert!(matches!(
+            store
+                .transition(owner(), &first, SecretLifecycle::Active)
+                .await,
+            Err(SecretError::Transition { .. })
+        ));
+        assert!(matches!(
+            store
+                .rotate(owner(), &first, SecretMaterial::new("x".to_owned()))
+                .await,
+            Err(SecretError::Invalid(_) | SecretError::Lifecycle { .. })
+        ));
+        store
+            .transition(owner(), &first, SecretLifecycle::Tombstoned)
+            .await
+            .expect("tombstoning");
+        assert_eq!(
+            store.describe(owner(), &first).await.unwrap().lifecycle,
+            SecretLifecycle::Tombstoned
+        );
+        let held = store
+            .run(|client| {
+                Box::pin(async move {
+                    client
+                        .query_one(
+                            "SELECT ciphertext IS NOT NULL AS held, destroyed_at IS NOT NULL AS \
+                             destroyed FROM axond_secret WHERE secret_id = $1 AND version = $2",
+                            &[&first.secret.to_string(), &version_of(first)],
+                        )
+                        .await
+                        .map_err(|error| unavailable("read the tombstoned row", &error))
+                })
+            })
+            .await
+            .expect("the row survives its material");
+        assert!(!held.get::<_, bool>("held"), "tombstoning destroys bytes");
+        assert!(held.get::<_, bool>("destroyed"));
+        // The record of the compromise remains; the material does not.
+        assert!(matches!(
+            store.resolve(owner(), &first).await,
+            Err(SecretError::Lifecycle {
+                state: SecretLifecycle::Tombstoned,
+                ..
+            })
+        ));
+        // A rotation cannot resurrect a tombstoned secret's line.
+        assert!(matches!(
+            store
+                .rotate(owner(), &first, SecretMaterial::new("sk-live-4".to_owned()))
+                .await,
+            Err(SecretError::Lifecycle { .. })
+        ));
+
+        drop_schema(&schema).await;
+    }
+
+    /// Another tenant — and another *project* of the same tenant — cannot resolve,
+    /// describe, probe, rotate, or move somebody else's material, and cannot tell
+    /// a foreign reference from one that was never stored.
+    #[tokio::test]
+    async fn material_is_isolated_by_owner() {
+        let Some((store, schema)) = store(13).await else {
+            return;
+        };
+        let mine = store
+            .stage(owner(), SecretMaterial::new(PLAINTEXT.to_owned()))
+            .await
+            .expect("staging")
+            .reference;
+
+        for theirs in [
+            SecretOwner::tenant(tenant_id(9)),
+            SecretOwner::project(tenant_id(1), project_id(2)),
+        ] {
+            assert!(matches!(
+                store.resolve(theirs, &mine).await,
+                Err(SecretError::Ownership { .. })
+            ));
+            assert!(!store.exists(theirs, &mine).await.unwrap());
+            assert!(matches!(
+                store.describe(theirs, &mine).await,
+                Err(SecretError::Ownership { .. })
+            ));
+            assert!(matches!(
+                store
+                    .rotate(theirs, &mine, SecretMaterial::new("sk-live-x".to_owned()))
+                    .await,
+                Err(SecretError::Ownership { .. })
+            ));
+            assert!(matches!(
+                store
+                    .transition(theirs, &mine, SecretLifecycle::Revoked)
+                    .await,
+                Err(SecretError::Ownership { .. })
+            ));
+            // Ownership is reported as absence to a caller: the category is what
+            // an `/admin/v1` response is built from.
+            assert_eq!(
+                store.describe(theirs, &mine).await.unwrap_err().category(),
+                FailureCategory::NotFound
+            );
+        }
+
+        // A reference nobody stored answers the same way a foreign one does.
+        let absent = SecretRef::first(SecretId::new(Uuid7Generator::new().next()));
+        assert!(matches!(
+            store.resolve(owner(), &absent).await,
+            Err(SecretError::NotFound(_))
+        ));
+        assert!(!store.exists(owner(), &absent).await.unwrap());
+        assert!(store.resolve(owner(), &mine).await.is_ok());
+
+        drop_schema(&schema).await;
+    }
+
+    /// Material sealed under one KEK is not readable under another: the failure
+    /// is `Corrupt`, so it pages an operator instead of being retried.
+    #[tokio::test]
+    async fn a_rotated_kek_cannot_unwrap_existing_material() {
+        let Some((store, schema)) = store(14).await else {
+            return;
+        };
+        let staged = store
+            .stage(owner(), SecretMaterial::new(PLAINTEXT.to_owned()))
+            .await
+            .expect("staging")
+            .reference;
+
+        let dsn = postgres_dsn().expect("a configured store");
+        let rotated = PostgresSecrets::connect(
+            &dsn,
+            SecretStoreSettings {
+                schema: Some(schema.clone()),
+                create_table: false,
+                ..SecretStoreSettings::default()
+            },
+            kek(15),
+        )
+        .await
+        .expect("a store with a different key still connects");
+        let error = rotated
+            .resolve(owner(), &staged)
+            .await
+            .expect_err("material does not open under another key");
+        assert!(matches!(error, SecretError::Unwrap { .. }));
+        assert_eq!(error.category(), FailureCategory::Corrupt);
+        assert!(!error.to_string().contains("sk-"), "{error}");
+
+        drop_schema(&schema).await;
+    }
+
+    /// Empty material is refused before anything is sealed or written: an empty
+    /// provider key is a credential that fails at the provider, in production,
+    /// with no local diagnosis.
+    #[tokio::test]
+    async fn empty_material_is_refused() {
+        let Some((store, schema)) = store(16).await else {
+            return;
+        };
+        assert!(matches!(
+            store
+                .stage(owner(), SecretMaterial::new(String::new()))
+                .await,
+            Err(SecretError::Invalid(_))
+        ));
+        let staged = store
+            .stage(owner(), SecretMaterial::new(PLAINTEXT.to_owned()))
+            .await
+            .expect("staging")
+            .reference;
+        assert!(matches!(
+            store
+                .rotate(owner(), &staged, SecretMaterial::new(String::new()))
+                .await,
+            Err(SecretError::Invalid(_))
+        ));
+
+        drop_schema(&schema).await;
+    }
+
+    /// An operator who applies the DDL out of band gets a refusal rather than a
+    /// schema change, and a missing table is named as the thing to fix.
+    #[tokio::test]
+    async fn a_missing_table_is_refused_rather_than_created() {
+        let Some(dsn) = postgres_dsn() else {
+            return;
+        };
+        let schema = format!(
+            "axond_secret_test_{}",
+            Uuid7Generator::new().next().to_string().replace('-', "")
+        );
+        let (client, connection) = tokio_postgres::connect(&dsn, crate::usage::tls_connector())
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .expect("create the test schema");
+
+        let error = PostgresSecrets::connect(
+            &dsn,
+            SecretStoreSettings {
+                schema: Some(schema.clone()),
+                create_table: false,
+                ..SecretStoreSettings::default()
+            },
+            kek(17),
+        )
+        .await
+        .expect_err("an empty schema with no permission to create the table");
+        assert_eq!(error.category(), FailureCategory::Denied);
+        assert!(error.to_string().contains("secret_store_v1.sql"), "{error}");
+
+        drop_schema(&schema).await;
+    }
+}

@@ -121,6 +121,25 @@ idempotent.
 Precise Postgres revocation uses `ops/postgres/revocation_v1.sql` and the table
 configured under `[revocation]`.
 
+Tenant provider credentials live in `ops/postgres/secret_store_v1.sql`, in the
+database `[secret_store]` references — normally the control plane's own. A booting
+replica applies it itself unless `create_table = false`, which is the setting for a
+deployment whose gateway role holds no DDL grant:
+
+```bash
+psql "$AXOND_CONTROL_PLANE_DSN" -f ops/postgres/secret_store_v1.sql
+```
+
+Rows hold ciphertext only: material is sealed under a per-version data key which is
+sealed under the deployment KEK named by `kek_env` or `kek_file`, so this table is
+safe to dump and useless without that key
+([ADR 0036](../adr/0036-envelope-encrypted-secret-store-and-snapshot-time-resolution.md)).
+Back the KEK up somewhere the database's backups are not: losing it makes every
+stored version unrecoverable, and there is no recovery path but restaging material.
+Nothing here is on the request path — the store is read only while a candidate
+revision is compiled — so an outage of it stalls administration and convergence
+while replicas keep serving the snapshot they hold.
+
 The control-plane journal of `mode = "stateful"` is the exception to applying DDL
 by hand: it keeps a migration ledger, so the binary can tell what a database
 contains and move it forward.

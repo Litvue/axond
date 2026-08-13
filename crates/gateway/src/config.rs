@@ -187,6 +187,25 @@ fn is_namespace_segment(segment: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
+/// A `SET search_path` argument, validated rather than forwarded.
+///
+/// Schema names reach SQL *text* — there is no parameter form of `SET` — so every
+/// configured one is an identifier this build checks at boot. The table-name
+/// validator allows one qualifying dot, which a search path cannot use, so that
+/// grammar is refused here rather than left as a gap on a value that reaches a
+/// statement.
+fn validate_schema_name(key: &str, schema: &str) -> Result<(), ConfigError> {
+    crate::usage::validate_table_name(schema)
+        .map_err(|message| ConfigError::Invalid(format!("`{key}`: {message}")))?;
+    if schema.contains('.') {
+        return Err(ConfigError::Invalid(format!(
+            "`{key}` must be a single unqualified schema name: it names the search path, not a \
+             table"
+        )));
+    }
+    Ok(())
+}
+
 /// A reference is only a reference if the environment layer leaves it alone.
 fn reject_env_override_collision(key: &str, name: &str) -> Result<(), ConfigError> {
     let Some(field) = name.strip_prefix("AXOND_") else {
@@ -265,6 +284,23 @@ pub struct SecretStore {
     /// Path to a file holding the key-encryption key.
     #[serde(default)]
     pub kek_file: Option<String>,
+    /// The PostgreSQL schema the store's table lives in, if not the connection's
+    /// default. A plain identifier, validated here because it is interpolated
+    /// into `SET search_path`.
+    #[serde(default)]
+    pub schema: Option<String>,
+    /// Whether boot may apply the shipped `secret_store_v1.sql`.
+    ///
+    /// On by default, unlike `[control_plane] migrate`: this DDL is a single
+    /// `CREATE TABLE IF NOT EXISTS`, not a migration ledger a rollout can race
+    /// on. An operator who applies it out of band turns it off and gets a
+    /// refusal at boot instead of a schema change.
+    #[serde(default = "default_secret_store_create_table")]
+    pub create_table: bool,
+}
+
+fn default_secret_store_create_table() -> bool {
+    true
 }
 
 /// Encrypted Postgres is the first — and, for now, only — `SecretStore`
@@ -2131,22 +2167,7 @@ impl Config {
             ));
         }
         if let Some(schema) = control_plane.schema.as_deref() {
-            // Interpolated into `SET search_path`, so it is an identifier this
-            // build validates rather than a string it forwards.
-            crate::usage::validate_table_name(schema).map_err(|message| {
-                ConfigError::Invalid(format!("`[control_plane] schema`: {message}"))
-            })?;
-            // That validator is written for table names, so it allows one
-            // qualifying dot. A search path takes a single schema, and accepting a
-            // grammar the statement cannot use is a validation gap on a value that
-            // reaches SQL text.
-            if schema.contains('.') {
-                return Err(ConfigError::Invalid(
-                    "`[control_plane] schema` must be a single unqualified schema name: it names \
-                     the search path, not a table"
-                        .into(),
-                ));
-            }
+            validate_schema_name("[control_plane] schema", schema)?;
         }
         reject_env_override_collision(
             "[control_plane] dsn_env",
@@ -2200,6 +2221,17 @@ impl Config {
                  connection string, or `[control_plane] dsn_env` must supply one to inherit",
                 secret_store.backend.as_str()
             )));
+        }
+        // Interpolated into `SET search_path`, so it is validated at boot rather
+        // than trusted at connection time — exactly as `[control_plane] schema`
+        // is.
+        if let Some(schema) = secret_store
+            .schema
+            .as_deref()
+            .map(str::trim)
+            .filter(|schema| !schema.is_empty())
+        {
+            validate_schema_name("[secret_store] schema", schema)?;
         }
         Ok(())
     }

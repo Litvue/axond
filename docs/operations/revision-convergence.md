@@ -389,7 +389,14 @@ The refusal reason is the triage key.
   could not be resolved: a missing environment variable, an unreadable key file,
   a secret the store does not hold. Messages name the *reference*, never the
   value. Frequently replica-specific — one replica missing an environment
-  variable while its siblings converge looks exactly like this.
+  variable while its siblings converge looks exactly like this. `secret`
+  specifically means a *typed* credential's exact version did not resolve through
+  the secret store while the candidate was compiled: the version is withdrawn
+  (`disabled`, `revoked`, or `tombstoned`), belongs to another owner, was never
+  staged, is sealed under a KEK this deployment no longer has, or the store is
+  down. Material a serving snapshot already holds is unaffected — the replica keeps
+  serving it, because a candidate is compiled in full before anything is published
+  ([ADR 0036](../adr/0036-envelope-encrypted-secret-store-and-snapshot-time-resolution.md)).
 - **`projection`** — a candidate this build cannot project: a resource body it
   does not read, or a bootstrap that is missing something projection may not
   supply for it (today, a default namespace). Roll the replica forward, publish a

@@ -61,6 +61,33 @@ impl InMemorySecrets {
         }
     }
 
+    /// Store material under an *exact* reference, in an exact state.
+    ///
+    /// [`SecretStore::stage`] mints its own id, which is right for an
+    /// administrative call and useless for a test whose fixture revision already
+    /// pins references. This is the only way to put a given version in the store,
+    /// and it is why the compilation tests can resolve the same references a
+    /// fixture's credential bodies name.
+    pub(crate) fn seed(
+        &self,
+        owner: SecretOwner,
+        reference: SecretRef,
+        material: &str,
+        lifecycle: SecretLifecycle,
+    ) {
+        let kek = self.kek.lock().expect("not poisoned").clone();
+        self.entries.lock().expect("not poisoned").insert(
+            reference,
+            Entry {
+                owner,
+                lifecycle,
+                // Tombstoned material does not exist, here as in a real store.
+                material: (lifecycle != SecretLifecycle::Tombstoned)
+                    .then(|| (material.to_owned(), kek)),
+            },
+        );
+    }
+
     pub(crate) fn set_unavailable(&self, unavailable: bool) {
         self.unavailable.store(unavailable, Ordering::Relaxed);
     }

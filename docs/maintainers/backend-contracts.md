@@ -158,11 +158,33 @@ pre-publication check cannot approve a version that will never authorize
 anything, and `describe` is where a caller asks *why*. It is not a cheap
 `resolve`: unwrappability is only provable by unwrapping, so material a rotated or
 lost KEK has made unreadable still answers `true`, and compiling a candidate
-revision is what proves material. The only implementation today is the in-memory
-fake in `backends::fakes`, which states the contract executably and is not a
-selectable backend. Provider-credential bodies and the publication rules that
-cross-check them live in `desired_state::credentials`; nothing there calls a
-store.
+revision is what proves material. The in-memory fake in `backends::fakes` states
+the contract executably and is not a selectable backend. Provider-credential
+bodies and the publication rules that cross-check them live in
+`desired_state::credentials`; nothing there calls a store.
+
+The one selectable implementation is `backends::secrets::postgres`: envelope-
+encrypted rows in PostgreSQL, sealed under a fresh per-version data key which is
+itself sealed under the deployment KEK `[secret_store]` references
+([ADR 0036](../adr/0036-envelope-encrypted-secret-store-and-snapshot-time-resolution.md)).
+Three invariants there are what make the domain above enforceable, and a second
+implementation has to reproduce them: a version is a row written once, ownership is
+a predicate on every statement (another owner's row answers as an absent one),
+and tombstoning destroys the sealed bytes in the transaction that records it. The
+seal binds the scheme, the owner, and the exact reference as associated data, so
+ciphertext moved between rows or tenants does not open.
+
+Resolution is reachable from exactly one caller:
+`convergence::secrets::SecretMaterialization`, which resolves the exact versions a
+candidate revision's resolvable credentials pin, once each, while that candidate is
+compiled. It holds a `SecretResolver` rather than a `SecretStore`, so the component
+that handles plaintext cannot stage, rotate, or transition anything. Unwrapped
+material is owned by the `ConfigSnapshot` compiled against it and shared through a
+reference-counted holder registered in a ledger of references and counts, so a
+rotation leaves both versions live and the superseded one is zeroized when the last
+snapshot holding it — and therefore the last request compiled against it — is gone.
+A resolution failure is a refused candidate (`ProjectionError::Secret`, rejection
+label `secret`) and the previously published snapshot keeps serving.
 
 ## Catalogue metadata is not activation
 

@@ -45,13 +45,28 @@
 //! - tombstoning destroys material, which is why it is reachable only from
 //!   `Revoked` and why nothing follows it.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 
-use super::{BackendFailure, BackendKind, Capabilities, FailureCategory};
+use super::{BackendFailure, BackendKind, Capabilities, Capability, FailureCategory};
 use crate::desired_state::secrets::{
     ForbiddenTransition, LifecycleTransition, SecretLifecycle, SecretOwner, SecretRef,
 };
+
+pub mod envelope;
+pub mod postgres;
+
+/// What the envelope-encrypted store can do: material is wrapped under a
+/// deployment key-encryption key, and unwrapping happens in this process.
+///
+/// [`Capability::ExternalKeyManagement`] is deliberately absent — an external
+/// manager is a second adapter behind this contract, and declaring the capability
+/// here would tell a caller unwrapping happens somewhere it does not.
+pub const ENVELOPE_CAPABILITIES: Capabilities =
+    Capabilities::new(&[Capability::EnvelopeEncryption]);
 
 /// The implementations a deployment may select for secret material.
 ///
@@ -335,6 +350,85 @@ pub trait SecretStore: SecretResolver {
         owner: SecretOwner,
         reference: &SecretRef,
     ) -> Result<SecretDescriptor, SecretError>;
+}
+
+/// Build the configured store, resolving its DSN and its KEK from the
+/// references bootstrap config names.
+///
+/// Connecting here means a misconfigured or unreachable secret store refuses to
+/// boot, rather than failing every candidate revision later with an error that
+/// points at the revision. The KEK is read at exactly this one point: the store
+/// itself is handed the key, never the reference's contents, so there is a
+/// single place in the process where key material is loaded.
+pub async fn build(
+    secret_store: &crate::config::SecretStore,
+    control_plane: &crate::config::ControlPlane,
+    env: &HashMap<String, String>,
+) -> Result<Arc<dyn SecretStore>, SecretError> {
+    match secret_store.backend {
+        crate::config::SecretStoreBackend::Postgres => {
+            let dsn = dsn(secret_store, control_plane, env)?;
+            let kek = deployment_kek(secret_store, env)?;
+            let settings = postgres::SecretStoreSettings::from_config(secret_store, control_plane);
+            Ok(Arc::new(
+                postgres::PostgresSecrets::connect(&dsn, settings, kek).await?,
+            ))
+        }
+    }
+}
+
+/// The store's connection string, from its own reference or inherited from the
+/// control plane's. Only the *name* appears in the failure: the value is a DSN.
+fn dsn(
+    secret_store: &crate::config::SecretStore,
+    control_plane: &crate::config::ControlPlane,
+    env: &HashMap<String, String>,
+) -> Result<String, SecretError> {
+    let name = secret_store
+        .dsn_env
+        .as_deref()
+        .or(control_plane.dsn_env.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            denied("no `dsn_env` names the secret store's connection string".to_owned())
+        })?;
+    env.get(name)
+        .map(|dsn| dsn.trim().to_owned())
+        .filter(|dsn| !dsn.is_empty())
+        .ok_or_else(|| denied(format!("`{name}` is unset or empty")))
+}
+
+/// Read the deployment KEK from the env var or file bootstrap config names.
+fn deployment_kek(
+    secret_store: &crate::config::SecretStore,
+    env: &HashMap<String, String>,
+) -> Result<envelope::DeploymentKek, SecretError> {
+    let (source, name) = secret_store.kek_reference().ok_or_else(|| {
+        denied("`[secret_store]` names no key-encryption key to unwrap material with".to_owned())
+    })?;
+    let reference = KekRef(format!("{source}:{name}"));
+    // Read into a value that is dropped before this function returns either way;
+    // `DeploymentKek::parse` zeroizes what it decodes from it.
+    let encoded = match source {
+        "kek_env" => env
+            .get(name)
+            .cloned()
+            .ok_or_else(|| denied(format!("`{name}` is unset")))?,
+        _ => std::fs::read_to_string(name)
+            .map_err(|error| denied(format!("`{name}` could not be read: {error}")))?,
+    };
+    // The failure names the reference and the reason, never the material.
+    envelope::DeploymentKek::parse(reference, &encoded)
+        .map_err(|error| denied(format!("the deployment KEK is unusable: {error}")))
+}
+
+/// A refusal that names the backend, and never the value it was reading.
+fn denied(message: String) -> SecretError {
+    SecretError::Denied {
+        backend: "encrypted-postgres",
+        message,
+    }
 }
 
 #[cfg(test)]
@@ -813,5 +907,187 @@ mod tests {
         let store = InMemorySecrets::new();
         assert!(store.capabilities().has(Capability::EnvelopeEncryption));
         assert!(!store.capabilities().has(Capability::ExternalKeyManagement));
+    }
+    /// A `[secret_store]` section naming the env vars this test controls.
+    fn section() -> crate::config::SecretStore {
+        crate::config::SecretStore {
+            backend: crate::config::SecretStoreBackend::Postgres,
+            dsn_env: Some("AXOND_SECRET_STORE_DSN".to_owned()),
+            kek_env: Some("AXOND_SECRET_STORE_KEK".to_owned()),
+            kek_file: None,
+            schema: None,
+            create_table: true,
+        }
+    }
+
+    fn control_plane() -> crate::config::ControlPlane {
+        crate::config::ControlPlane {
+            dsn_env: Some("AXOND_CONTROL_PLANE_DSN".to_owned()),
+            schema: None,
+            migrate: false,
+            connect_timeout_ms: 5_000,
+            operation_timeout_ms: 30_000,
+        }
+    }
+
+    /// A 32-byte key, base64, which is what an operator puts behind the
+    /// reference.
+    fn encoded_kek() -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode([7u8; envelope::KEY_LEN])
+    }
+
+    /// The store's own reference wins; the control plane's is what it falls back
+    /// to, because encrypted Postgres is normally the same database.
+    #[test]
+    fn the_connection_string_is_the_store_s_reference_or_the_control_plane_s() {
+        let env = HashMap::from([
+            (
+                "AXOND_SECRET_STORE_DSN".to_owned(),
+                "postgres://own".to_owned(),
+            ),
+            (
+                "AXOND_CONTROL_PLANE_DSN".to_owned(),
+                "postgres://inherited".to_owned(),
+            ),
+        ]);
+        assert_eq!(
+            dsn(&section(), &control_plane(), &env).expect("its own reference"),
+            "postgres://own"
+        );
+        let inheriting = crate::config::SecretStore {
+            dsn_env: None,
+            ..section()
+        };
+        assert_eq!(
+            dsn(&inheriting, &control_plane(), &env).expect("the inherited reference"),
+            "postgres://inherited"
+        );
+    }
+
+    /// An unset reference is a refusal that names the variable and never a value.
+    #[test]
+    fn an_unresolvable_connection_string_is_refused_by_name() {
+        let error = dsn(&section(), &control_plane(), &HashMap::new())
+            .expect_err("nothing is set in this environment");
+        assert_eq!(error.category(), FailureCategory::Denied);
+        assert!(
+            error.to_string().contains("AXOND_SECRET_STORE_DSN"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("postgres://"), "{error}");
+    }
+
+    /// The KEK is read from whichever source the section names, and an unusable
+    /// one is refused without the material appearing in the failure.
+    #[test]
+    fn the_kek_is_read_from_the_reference_and_never_echoed() {
+        let encoded = encoded_kek();
+        let env = HashMap::from([("AXOND_SECRET_STORE_KEK".to_owned(), encoded.clone())]);
+        let kek = deployment_kek(&section(), &env).expect("a 32-byte key");
+        assert_eq!(
+            kek.reference().to_string(),
+            "kek_env:AXOND_SECRET_STORE_KEK"
+        );
+
+        let short = HashMap::from([("AXOND_SECRET_STORE_KEK".to_owned(), {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([7u8; 16])
+        })]);
+        let error = deployment_kek(&section(), &short).expect_err("half a key is not a key");
+        assert_eq!(error.category(), FailureCategory::Denied);
+        assert!(!error.to_string().contains(&encoded), "{error}");
+
+        let missing = deployment_kek(&section(), &HashMap::new())
+            .expect_err("an unset reference cannot be unwrapped with");
+        assert!(
+            missing.to_string().contains("AXOND_SECRET_STORE_KEK"),
+            "{missing}"
+        );
+    }
+
+    /// A file-referenced KEK is read from disk, and an unreadable path is a
+    /// refusal rather than a boot that cannot decrypt anything.
+    #[test]
+    fn a_file_referenced_kek_is_read_from_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "axond-kek-{}",
+            crate::desired_state::Uuid7Generator::new().next()
+        ));
+        std::fs::write(&path, format!("{}\n", encoded_kek())).expect("write the key file");
+        let section = crate::config::SecretStore {
+            kek_env: None,
+            kek_file: Some(path.to_string_lossy().into_owned()),
+            ..section()
+        };
+        let kek =
+            deployment_kek(&section, &HashMap::new()).expect("a trailing newline is tolerated");
+        assert!(kek.reference().to_string().starts_with("kek_file:"));
+        std::fs::remove_file(&path).expect("clean up");
+
+        let error = deployment_kek(&section, &HashMap::new())
+            .expect_err("the file is gone, so the key cannot be read");
+        assert_eq!(error.category(), FailureCategory::Denied);
+    }
+
+    /// The configured store connects, applies its own schema, and serves
+    /// material: the boot path an operator's `[secret_store]` section takes.
+    #[tokio::test]
+    async fn the_configured_store_boots_and_serves_material() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let env = HashMap::from([
+            ("AXOND_SECRET_STORE_DSN".to_owned(), dsn),
+            ("AXOND_SECRET_STORE_KEK".to_owned(), encoded_kek()),
+        ]);
+        let schema = format!(
+            "axond_secret_boot_{}",
+            crate::desired_state::Uuid7Generator::new()
+                .next()
+                .to_string()
+                .replace('-', "")
+        );
+        let section = crate::config::SecretStore {
+            schema: Some(schema.clone()),
+            ..section()
+        };
+        // The schema is the operator's; the store owns only its table in it.
+        let (client, connection) = tokio_postgres::connect(
+            env.get("AXOND_SECRET_STORE_DSN").expect("the test DSN"),
+            crate::usage::tls_connector(),
+        )
+        .await
+        .expect("connect to the test database");
+        let cleanup = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .expect("create the test schema");
+
+        let store = build(&section, &control_plane(), &env)
+            .await
+            .expect("the configured store boots");
+        let staged = store
+            .stage(owner(), SecretMaterial::new("sk-live-boot".to_owned()))
+            .await
+            .expect("staging through the built store");
+        assert_eq!(
+            store
+                .resolve(owner(), &staged.reference)
+                .await
+                .expect("staged material resolves")
+                .expose(),
+            "sk-live-boot"
+        );
+
+        client
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .expect("drop the test schema");
+        drop(client);
+        cleanup.abort();
     }
 }

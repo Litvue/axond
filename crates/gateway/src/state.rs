@@ -26,6 +26,7 @@ use crate::admission::AdmissionControl;
 use crate::aliases::AliasScope;
 use crate::budget::BudgetStore;
 use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind};
+use crate::convergence::secrets::ResolvedSecrets;
 use crate::credentials::{CredentialError, Credentials};
 use crate::key_material::{self, KeyMaterialError};
 use crate::principals::{
@@ -82,6 +83,16 @@ pub struct ConfigSnapshot {
     pub gateway_minting_fingerprint: Option<String>,
     pub gateway_minting: Option<ResolvedMinting>,
     gateway_token_epochs: HashMap<String, NamespaceEpoch>,
+    /// The durable secret material this snapshot was compiled against, unwrapped
+    /// once during compilation and held for the snapshot's whole life.
+    ///
+    /// Holding it *here* is what ties material's lifetime to the revision it
+    /// belongs to. A rotation publishes a new snapshot that holds the new version
+    /// while requests still serving the old snapshot keep the old one alive, and
+    /// the material is zeroized when the last such request finishes — not when
+    /// the administrator's call returns. A request never reaches the secret store,
+    /// because everything it could ask for is already in the snapshot it holds.
+    secrets: ResolvedSecrets,
 }
 
 pub struct ResolvedMinting {
@@ -173,6 +184,21 @@ impl ConfigSnapshot {
         config: Config,
         env: &HashMap<String, String>,
         generation: u64,
+    ) -> Result<Self, SnapshotError> {
+        Self::build_with(config, env, generation, ResolvedSecrets::default())
+    }
+
+    /// [`ConfigSnapshot::build`], taking ownership of durable material a
+    /// candidate's compilation already unwrapped.
+    ///
+    /// The stateless path is the same call with an empty set: `env:` and `file:`
+    /// references resolve here exactly as they did before typed credentials
+    /// existed, so a deployment with no secret store is unaffected by any of this.
+    pub fn build_with(
+        config: Config,
+        env: &HashMap<String, String>,
+        generation: u64,
+        secrets: ResolvedSecrets,
     ) -> Result<Self, SnapshotError> {
         let gateway_token_epochs = configured_token_epochs(&config);
         let credentials = Credentials::from_env(&config, env)?;
@@ -369,7 +395,17 @@ impl ConfigSnapshot {
             gateway_minting_fingerprint,
             gateway_minting,
             gateway_token_epochs,
+            secrets,
         })
+    }
+
+    /// The durable material this snapshot holds.
+    ///
+    /// A lookup by exact reference, never a resolution: nothing here can reach a
+    /// secret store, which is what makes "no request touches the store" a property
+    /// of the type rather than a convention.
+    pub const fn secrets(&self) -> &ResolvedSecrets {
+        &self.secrets
     }
 
     pub async fn resolve_principal(
