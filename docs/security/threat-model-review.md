@@ -367,11 +367,16 @@ gated too: `an_empty_ledger_is_refused_rather_than_migrated_from_zero`,
 `concurrent_adoptions_record_the_baseline_once`,
 `objects_in_another_schema_on_the_path_are_not_evidence_of_an_applied_baseline`,
 `a_hand_applied_schema_missing_its_seed_row_is_refused_rather_than_adopted`,
-`a_statement_whose_effect_cannot_be_confirmed_makes_its_migration_unadoptable`, and
+`a_statement_whose_effect_cannot_be_confirmed_makes_its_migration_unadoptable`,
+`a_tenancy_effect_undone_by_hand_is_refused_and_named`, and
 `a_migration_no_object_can_account_for_blocks_adoption_of_the_whole_history` — a
 baseline may only be recorded for migrations whose every statement is confirmed in
 this schema, never by executing shipped DDL over a database that already has it,
-and never at all once a migration ships a statement adoption cannot confirm.
+and never at all once a migration ships a statement adoption cannot confirm. The
+tenancy migration's row-security effects are part of that evidence rather than
+assumed: a hand-applied database missing one table's `FORCE ROW LEVEL SECURITY` or
+one `..._isolation` policy is refused by name, so adoption cannot record a history
+whose tenant isolation is not actually in place.
 
 **Threat model and ADRs.** [ADR 0007](../adr/0007-telemetry-model.md),
 [ADR 0009](../adr/0009-durable-usage-sinks.md),

@@ -132,13 +132,25 @@ ledger row for DDL it did not run:
   baseline is the longest run of shipped migrations from v1 whose *every* statement
   is confirmed, parsed from each migration's own embedded SQL rather than from a
   hand-maintained list — so a statement cannot ship without adoption accounting for
-  it. Three statement forms are confirmable: `CREATE TABLE` and `CREATE INDEX` by
-  the relation being present, and `INSERT ... ON CONFLICT DO NOTHING` by the target
-  table not being empty (idempotent by construction, which is what makes a row
-  usable as evidence) — each naming its object unqualified, so an unnamed
-  `CREATE INDEX ON t (c)` or a schema-qualified `other.t` is unconfirmable too
-  rather than probed for under a name that is not one. The parse skips comments
-  (`--`, nested `/* */`) and quoted regions (`'...'`, `$tag$ ... $tag$`) in both
+  it. What is confirmable is what one catalogue question answers about one object:
+  `CREATE TABLE` and `CREATE INDEX` by the relation being present; `INSERT ... ON
+  CONFLICT DO NOTHING` by the target table not being empty (idempotent by
+  construction, which is what makes a row usable as evidence); `ADD COLUMN` by
+  `pg_attribute`; a **named** `ADD CONSTRAINT` by `pg_constraint`; `ENABLE`/`FORCE
+  ROW LEVEL SECURITY` by `pg_class.relrowsecurity` and `relforcerowsecurity`, which
+  are two separate answers because `ENABLE` alone enforces nothing against a table's
+  owner; and `CREATE POLICY` by `pg_policy`, keyed by the table as well as the
+  policy, since two tables can each carry an `..._isolation` policy. A `DROP` of any
+  of those is confirmed by the thing being *gone*, which is real evidence (v2 drops
+  a constraint v1 created) but never evidence *for* a version on its own: whether a
+  version ran is read from what it left behind, so a version that only removes
+  things is unconfirmable, and an untouched database is untouched rather than half
+  way through the version above it. Each form names its object unqualified, so an
+  unnamed `CREATE INDEX ON t (c)`, an unnamed constraint PostgreSQL names for
+  itself, or a schema-qualified `other.t` is unconfirmable rather than probed for
+  under a name that is not one; an `ALTER TABLE`'s clause list is read clause by
+  clause, and one clause outside that set voids the statement. The parse skips
+  comments (`--`, nested `/* */`) and quoted regions (`'...'`, `$tag$ ... $tag$`) in both
   its statement split and its keywords, so prose or a function body cannot
   contribute the keywords a statement is judged by; a region that does not close
   where that parse says it does makes the file unconfirmable rather than a
@@ -151,6 +163,18 @@ ledger row for DDL it did not run:
   `current_schema()` — the schema an `apply` would create these objects in — rather
   than resolved down the DSN's `search_path`, so a second install's journal in
   `public` is not read as evidence about this one.
+- **A dynamic `DO $$ ... $$` block is interpreted, never assumed.** v2 guards its
+  chained tables with a `FOREACH` over a literal array executing `format()`
+  templates, and adoption reads it by rendering the block's own templates for the
+  block's own names and parsing each result with the same parser every other
+  statement goes through. So a table added to that array is a policy adoption goes
+  looking for, and the alternative — a list of the six tables written out beside the
+  parser — is exactly the hand-maintained list this design refuses. Only that one
+  shape is read: a condition, names from a query, a template argument that is not
+  the loop variable (or the loop variable with a literal suffix, which is how
+  `<table>_isolation` is spelled), a `%L`, a placeholder without an argument, or
+  `EXECUTE` of anything but a `format()` template makes the block unconfirmable, and
+  a rendered statement is then judged on its own merits like any other.
 - **A migration containing one statement adoption cannot confirm blocks adoption of
   the database entirely,** wherever in the shipped history it sits, including the
   versions below it. That is fail-closed in both directions, and it is the position
@@ -161,14 +185,18 @@ ledger row for DDL it did not run:
   then never run the remainder. Recording only the prefix underneath is no better:
   the ledger would report the unconfirmable version as *pending*, so the next
   `apply` would run it over a schema that may already have had it applied out of
-  band. An `ALTER`, a backfill, a `DROP`, or a non-idempotent `INSERT` is both the
-  statement whose effect nothing can be asked about *and* the one whose rerun is
-  destructive, so no ledger row both accounts for the objects and keeps `apply`
-  away. Shipping such a migration therefore withdraws `adopt`, and stating that
-  history stays the operator's own `INSERT`; the refusal says so, naming the
-  version. `a_migrations_declared_tables_are_read_out_of_the_shipped_ddl` asserts
-  every shipped statement is confirmable, so this arrives as a deliberate release
-  decision rather than a surprise in the field, and
+  band. A backfill, an `UPDATE`, a non-idempotent `INSERT`, or an `ALTER` clause the
+  catalogue has no answer for is both the statement whose effect nothing can be
+  asked about *and* the one whose rerun is destructive, so no ledger row both
+  accounts for the objects and keeps `apply` away. Shipping such a migration
+  therefore withdraws `adopt`, and stating that history stays the operator's own
+  `INSERT`; the refusal says so, naming the version.
+  `a_migrations_declared_tables_are_read_out_of_the_shipped_ddl` asserts every
+  shipped statement is confirmable, so this arrives as a deliberate release decision
+  rather than a surprise in the field;
+  `the_tenancy_migrations_columns_constraints_and_policies_are_all_confirmable`
+  holds the shipped v1+v2 history to it, object by object, including the six tables
+  the tenancy migration's `DO` block guards; and
   `a_statement_whose_effect_cannot_be_confirmed_makes_its_migration_unadoptable`
   pins the mixed create-and-alter shape specifically.
 - **It executes no migration SQL at all**, which is what makes it safe against a

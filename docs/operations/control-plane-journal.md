@@ -283,14 +283,16 @@ journal is then reported as *Unrecorded* — a ledger that exists and records no
 — and `status`, `apply`, and boot all refuse it. That refusal is the point. An
 empty ledger is indistinguishable from an untouched database, and the ledger is the
 only record of what was applied, so migrating from zero would replay every shipped
-file over objects that may already be there. Today every statement is
-`IF NOT EXISTS` and that replay would survive; the first `ALTER TABLE`, backfill,
-or constraint change would not, and it would corrupt a database rather than fail.
+file over objects that may already be there. The tenancy migration is where that
+stopped being survivable: its `ADD CONSTRAINT` is not `IF NOT EXISTS`, so a replay
+fails half way through a file rather than passing over it, and the first backfill
+will do worse than fail.
 
 `axond migrate adopt` is how that state is resolved deliberately. It writes ledger
 rows and never DDL, and it records only what the database itself accounts for: the
 longest run of shipped migrations, starting at v1, whose every statement is
-confirmed — each table and index present, and each idempotent seed row written — in
+confirmed — each table, index, column, named constraint, row-security flag and
+policy where the file leaves it, and each idempotent seed row written — in
 the schema this configuration writes to (the one `[control_plane] schema` names, or
 the first on the DSN's own search path; a second install's journal further down that
 path is not evidence about this one). What it does instead of recording:
@@ -302,28 +304,44 @@ path is not evidence about this one). What it does instead of recording:
   ledger answer from a schema further down it while the objects are sought in the
   one this configuration writes to, which is where `apply` would create them.
 - **A migration only partly applied.** Some of what one file declares is there and
-  some is not — a table, an index, or the seed row the shipped file ends with, which
-  a `psql -f` outside a transaction can stop just short of. Neither "applied" nor
+  some is not — a table, an index, a column, a constraint, one of the two row
+  security flags, a policy, or the seed row a shipped file ends with, which a
+  `psql -f` outside a transaction can stop just short of. Neither "applied" nor
   "not applied" is true, so it is refused, naming the repair for each thing: an
-  object that is not present is reported as missing, and a table that is present and
-  empty is reported as having no seeded row. Finish or undo that file by hand first.
+  object that is not present is reported as missing, a table that is present and
+  empty is reported as having no seeded row, a flag that is off is reported as not
+  enabled, and something the file *drops* that is still there is reported as still
+  present. Finish or undo that file by hand first.
 - **A ledger that already records a history.** Nothing to adopt: the history is
   reported and nothing is written, so a stray `adopt` in a rollout is not a ledger
   edit.
 - **A shipped migration containing a statement adoption cannot confirm.** Adoption
-  confirms three statement forms: `CREATE TABLE` and `CREATE INDEX` by the object
-  being present, and `INSERT ... ON CONFLICT DO NOTHING` by the target table not
-  being empty — each of them naming its object unqualified, since the probe asks
-  about the configured schema. An unnamed `CREATE INDEX ON t (c)` or a
-  schema-qualified `other.t` is unconfirmable for the same reason as the rest.
+  confirms what one catalogue question answers about one object: `CREATE TABLE` and
+  `CREATE INDEX` by the object being present; `INSERT ... ON CONFLICT DO NOTHING` by
+  the target table not being empty; `ADD COLUMN`, a **named** `ADD CONSTRAINT`,
+  `ENABLE ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY` (separately — enabling
+  without forcing leaves a table's owner unfiltered), and `CREATE POLICY` by the
+  column, constraint, flags and policy being there. A `DROP` of any of those is
+  confirmed by the thing being gone, so the constraint v2 replaces is expected
+  *absent* on a v2 database — but a version that only takes things away proves
+  nothing, because a database that never had it looks the same. The shipped v1 and
+  v2 files are confirmable in full, tenancy included: the `DO $$ ... $$` block that
+  guards the chained tables is read by rendering its own `format()` templates for
+  its own list of tables, so each of those tables' RLS flags and `..._isolation`
+  policy is checked, and a change to that block's shape makes it unconfirmable
+  rather than silently "applied". Each form names its object unqualified, since the
+  probe asks about the configured schema: an unnamed `CREATE INDEX ON t (c)`, a
+  constraint added without a name, or a schema-qualified `other.t` is unconfirmable
+  for the same reason as the rest.
   Comments (`--` and nested `/* */`) and quoted regions (`'...'`, `$tag$ ... $tag$`)
   are prose or data, never statements: a `CREATE TABLE` inside a function body or
   a block comment is not evidence that anything was created. A region that does
   not close where that reading says it does — an unterminated comment or literal,
   or a backslash escape inside `E'...'` — makes the whole file unconfirmable,
   since what it swallows might have been the statement that blocked adoption.
-  Anything else — an `ALTER`, a backfill, a `DROP`, a non-idempotent `INSERT` —
-  is both what no catalogue can report on and what a rerun would damage,
+  Anything else — a backfill, an `UPDATE`, a non-idempotent `INSERT`, or an `ALTER`
+  clause no catalogue answers for such as `SET DEFAULT` — is both what no catalogue
+  can report on and what a rerun would damage,
   and one such statement makes its whole migration unadoptable. A *second* seed into
   a table the shipped history already seeds counts as one of those, whether it is in
   another migration or in the same file: one row proves at most one of the inserts,

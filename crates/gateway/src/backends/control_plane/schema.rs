@@ -47,13 +47,16 @@ impl Migration {
     /// Read from the embedded SQL rather than listed beside it, so a migration
     /// that adds a table cannot forget to say so: the evidence adoption checks
     /// for is derived from the file adoption claims was applied.
-    pub fn relations(&self) -> Vec<&'static str> {
+    pub fn relations(&self) -> Vec<String> {
         let mut relations = Vec::new();
         for statement in statements(self.sql) {
-            if let Some(Statement::Table(name)) = statement_kind(statement)
-                && !relations.contains(&name)
-            {
-                relations.push(name);
+            for expectation in expectations(statement).unwrap_or_default() {
+                if let Evidence::Table(name) = expectation.what
+                    && expectation.present
+                    && !relations.contains(&name)
+                {
+                    relations.push(name);
+                }
             }
         }
         relations
@@ -61,15 +64,19 @@ impl Migration {
 }
 
 /// What one statement of a migration did, when that is something a later
-/// connection can be asked about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Statement {
-    Table(&'static str),
-    Index(&'static str),
-    /// An `INSERT ... ON CONFLICT DO NOTHING`: a seed row, whose presence is
-    /// checked by the target table not being empty. Idempotent by construction,
-    /// which is what makes it checkable at all.
-    Seed(&'static str),
+/// connection can be asked about: the thing it acted on, and whether it left it
+/// there or took it away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Expectation {
+    what: Evidence,
+    /// `false` for a `DROP`, which is confirmed by the thing being gone.
+    ///
+    /// Absence is real evidence — a constraint an earlier version created and
+    /// this one dropped is there until this one runs — but it is never evidence
+    /// *for* a version by itself, because a database that never had the earlier
+    /// version does not have it either. A migration therefore needs at least one
+    /// thing present to be adoptable at all.
+    present: bool,
 }
 
 /// Where the lexical region starting at `at` ends, when one starts there: a `--`
@@ -200,7 +207,7 @@ fn lexed(sql: &str) -> bool {
 /// file that ends with an explanatory comment, or that has a stray `;;`, is
 /// otherwise read as a statement nothing can confirm, which would withdraw
 /// adoption from the whole history over a comment.
-fn statements(sql: &'static str) -> Vec<&'static str> {
+fn statements(sql: &str) -> Vec<&str> {
     let mut statements = Vec::new();
     let mut start = 0;
     let mut index = 0;
@@ -227,7 +234,7 @@ fn statements(sql: &'static str) -> Vec<&'static str> {
 }
 
 /// The words of a statement, with comments and quoted regions skipped.
-fn words(statement: &'static str) -> Vec<&'static str> {
+fn words(statement: &str) -> Vec<&str> {
     let mut words = Vec::new();
     let mut start: Option<usize> = None;
     let mut index = 0;
@@ -256,61 +263,106 @@ fn words(statement: &'static str) -> Vec<&'static str> {
     words
 }
 
-/// What a statement created, or `None` for one whose effect the catalogue cannot
-/// be asked about — an `ALTER`, an `UPDATE`, a backfill, a non-idempotent
-/// `INSERT`, a `DROP`.
-fn statement_kind(statement: &'static str) -> Option<Statement> {
+/// Past `IF NOT EXISTS`, `CONCURRENTLY` and `ONLY`, to the object's own name — or
+/// `None` for a form this parse cannot name the object of.
+fn past(words: &[&str], mut at: usize) -> usize {
+    for skipped in ["CONCURRENTLY", "ONLY", "IF", "NOT", "EXISTS"] {
+        if words
+            .get(at)
+            .is_some_and(|word| word.eq_ignore_ascii_case(skipped))
+        {
+            at += 1;
+        }
+    }
+    at
+}
+
+/// The name at `at`, or `None` when what is there is not one this parse can use.
+///
+/// Two such forms exist and both would otherwise yield a name that is not one.
+/// `CREATE INDEX ON t (c)` is legal and unnamed, which reads as an index called
+/// `ON`; `CREATE TABLE other.t` names a schema, and the probe asks about
+/// `current_schema()` only, so `other` is a table it would look for in the wrong
+/// place. Both are unconfirmable rather than merely absent, so the migration is
+/// unadoptable and says so, instead of the refusal naming an object no operator
+/// can go and find.
+fn named(statement: &str, words: &[&str], at: usize) -> Option<String> {
+    let at = past(words, at);
+    let name = *words.get(at)?;
+    if name.eq_ignore_ascii_case("ON") {
+        return None;
+    }
+    // The words point into the statement, so what surrounds one is readable
+    // from the offsets: a `.` on either side makes this a qualified name.
+    let from = offset(statement, name);
+    let bytes = statement.as_bytes();
+    let before = from.checked_sub(1).map(|at| bytes[at]);
+    if before == Some(b'.') || bytes.get(from + name.len()) == Some(&b'.') {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
+/// Where a word this parse took out of `text` starts in it.
+fn offset(text: &str, word: &str) -> usize {
+    word.as_ptr() as usize - text.as_ptr() as usize
+}
+
+/// `text[from..to]`, split on the commas that are not inside parentheses or a
+/// quoted region — an `ALTER TABLE`'s clause list, or a `format()` argument list,
+/// neither of which can be split on `,` alone: a `CHECK (a, b)` and a
+/// `current_setting('x', true)` both carry commas that separate nothing.
+fn split(text: &str, from: usize, to: usize) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let (mut depth, mut start, mut index) = (0usize, from, from);
+    let mut parts = Vec::new();
+    while index < to {
+        if let Some(region) = skipped(bytes, index) {
+            index = region.end;
+            continue;
+        }
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                parts.push(text[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    parts.push(text[start..to].trim());
+    parts
+}
+
+/// What a statement left behind, or `None` for one whose effect the catalogue
+/// cannot be asked about — an `UPDATE`, a backfill, a non-idempotent `INSERT`, a
+/// `DROP TABLE`, an `ALTER` this parse does not model.
+///
+/// One statement can leave more than one thing behind: an `ALTER TABLE` carries a
+/// list of clauses, and a `DO` block carries the statements it executes.
+fn expectations(statement: &str) -> Option<Vec<Expectation>> {
     let words = words(statement);
     let keyword = |position: usize, expected: &str| {
         words
             .get(position)
             .is_some_and(|word| word.eq_ignore_ascii_case(expected))
     };
-    /// Past `IF NOT EXISTS` and `CONCURRENTLY`, to the object's own name — or
-    /// `None` for a form this parse cannot name the object of.
-    ///
-    /// Two of those exist and both would otherwise yield a name that is not one.
-    /// `CREATE INDEX ON t (c)` is legal and unnamed, which reads as an index
-    /// called `ON`; `CREATE TABLE other.t` names a schema, and the probe asks
-    /// about `current_schema()` only, so `other` is a table it would look for in
-    /// the wrong place. Both are unconfirmable rather than merely absent, so the
-    /// migration is unadoptable and says so, instead of the refusal naming an
-    /// object no operator can go and find.
-    fn name(
-        statement: &'static str,
-        words: &[&'static str],
-        mut at: usize,
-    ) -> Option<&'static str> {
-        for skipped in ["CONCURRENTLY", "IF", "NOT", "EXISTS"] {
-            if words
-                .get(at)
-                .is_some_and(|word| word.eq_ignore_ascii_case(skipped))
-            {
-                at += 1;
-            }
-        }
-        let name = words.get(at).copied()?;
-        if name.eq_ignore_ascii_case("ON") {
-            return None;
-        }
-        // The words point into the statement, so what surrounds one is readable
-        // from the offsets: a `.` on either side makes this a qualified name.
-        let from = name.as_ptr() as usize - statement.as_ptr() as usize;
-        let bytes = statement.as_bytes();
-        let before = from.checked_sub(1).map(|at| bytes[at]);
-        if before == Some(b'.') || bytes.get(from + name.len()) == Some(&b'.') {
-            return None;
-        }
-        Some(name)
-    }
+    let present = |what: Evidence| {
+        Some(vec![Expectation {
+            what,
+            present: true,
+        }])
+    };
     if keyword(0, "CREATE") && keyword(1, "TABLE") {
-        return name(statement, &words, 2).map(Statement::Table);
+        return present(Evidence::Table(named(statement, &words, 2)?));
     }
     if keyword(0, "CREATE") && keyword(1, "INDEX") {
-        return name(statement, &words, 2).map(Statement::Index);
+        return present(Evidence::Index(named(statement, &words, 2)?));
     }
     if keyword(0, "CREATE") && keyword(1, "UNIQUE") && keyword(2, "INDEX") {
-        return name(statement, &words, 3).map(Statement::Index);
+        return present(Evidence::Index(named(statement, &words, 3)?));
     }
     if keyword(0, "INSERT") && keyword(1, "INTO") {
         // Only the idempotent form: a plain `INSERT` cannot be told apart from
@@ -318,11 +370,293 @@ fn statement_kind(statement: &'static str) -> Option<Statement> {
         let idempotent = words.windows(2).any(|pair| {
             pair[0].eq_ignore_ascii_case("DO") && pair[1].eq_ignore_ascii_case("NOTHING")
         });
-        return name(statement, &words, 2)
+        return named(statement, &words, 2)
             .filter(|_| idempotent)
-            .map(Statement::Seed);
+            .and_then(|table| present(Evidence::Seed(table)));
+    }
+    // A policy is named on the table it guards, so both halves are read: two
+    // tables can each have an `..._isolation` policy, and confirming one would
+    // otherwise confirm the other.
+    if keyword(1, "POLICY") && (keyword(0, "CREATE") || keyword(0, "DROP")) {
+        let at = past(&words, 2);
+        let policy = named(statement, &words, at)?;
+        if !words
+            .get(at + 1)
+            .is_some_and(|word| word.eq_ignore_ascii_case("ON"))
+        {
+            return None;
+        }
+        let table = named(statement, &words, at + 2)?;
+        return Some(vec![Expectation {
+            what: Evidence::Policy(table, policy),
+            present: keyword(0, "CREATE"),
+        }]);
+    }
+    if keyword(0, "ALTER") && keyword(1, "TABLE") {
+        let at = past(&words, 2);
+        let table = named(statement, &words, at)?;
+        let from = offset(statement, words[at]) + words[at].len();
+        return split(statement, from, statement.len())
+            .into_iter()
+            .map(|clause| altered(&table, clause))
+            .collect();
+    }
+    if keyword(0, "DO") && words.len() == 1 {
+        return unrolled(statement);
     }
     None
+}
+
+/// What one clause of an `ALTER TABLE` left behind, or `None` for a clause whose
+/// effect nothing can be asked about.
+///
+/// A column, a named constraint, and the two row-security flags are all readable
+/// out of the catalogue, which is what makes them adoptable evidence at all. A
+/// clause outside that set — a type change, a default, an unnamed constraint
+/// PostgreSQL names for itself — is not, and withdraws adoption from the
+/// migration that carries it rather than being passed over.
+fn altered(table: &str, clause: &str) -> Option<Expectation> {
+    let words = words(clause);
+    let keyword = |position: usize, expected: &str| {
+        words
+            .get(position)
+            .is_some_and(|word| word.eq_ignore_ascii_case(expected))
+    };
+    let phrase = |expected: &[&str]| {
+        words.len() == expected.len()
+            && words
+                .iter()
+                .zip(expected)
+                .all(|(word, expected)| word.eq_ignore_ascii_case(expected))
+    };
+    let flag = |what: Evidence, present: bool| Some(Expectation { what, present });
+    if phrase(&["ENABLE", "ROW", "LEVEL", "SECURITY"]) {
+        return flag(Evidence::Guarded(table.to_owned()), true);
+    }
+    if phrase(&["DISABLE", "ROW", "LEVEL", "SECURITY"]) {
+        return flag(Evidence::Guarded(table.to_owned()), false);
+    }
+    if phrase(&["FORCE", "ROW", "LEVEL", "SECURITY"]) {
+        return flag(Evidence::Forced(table.to_owned()), true);
+    }
+    if phrase(&["NO", "FORCE", "ROW", "LEVEL", "SECURITY"]) {
+        return flag(Evidence::Forced(table.to_owned()), false);
+    }
+    // `ADD c text` is legal with `COLUMN` left out, and is deliberately not read:
+    // the word after `ADD` would be a column name in that form and a keyword in
+    // every other one, so requiring the keyword is what keeps `ADD PRIMARY KEY`
+    // from being confirmed as a column called `PRIMARY`.
+    if keyword(1, "COLUMN") && (keyword(0, "ADD") || keyword(0, "DROP")) {
+        let column = named(clause, &words, 2)?;
+        return flag(
+            Evidence::Column(table.to_owned(), column),
+            keyword(0, "ADD"),
+        );
+    }
+    if keyword(1, "CONSTRAINT") && (keyword(0, "ADD") || keyword(0, "DROP")) {
+        let constraint = named(clause, &words, 2)?;
+        return flag(
+            Evidence::Constraint(table.to_owned(), constraint),
+            keyword(0, "ADD"),
+        );
+    }
+    None
+}
+
+/// The statements a `DO $$ ... $$` block executes, when the block is a loop over
+/// a literal list of names running `format()` templates and nothing else.
+///
+/// Interpreted, never assumed: the names come out of the block's own array
+/// literal and the SQL out of its own templates, rendered and then read by the
+/// same parser every other statement goes through. So a table added to the list
+/// is evidence adoption checks for, and a change this narrow reading does not
+/// recognise — a condition, a query, a template argument that is not the loop
+/// variable — makes the block unconfirmable and its migration unadoptable, which
+/// is the same fail-closed answer an `UPDATE` gets.
+///
+/// The one shape read is the one a dynamic `ALTER`/`CREATE POLICY` loop has:
+///
+/// ```sql
+/// DO $$
+/// DECLARE
+///     each text;
+/// BEGIN
+///     FOREACH each IN ARRAY ARRAY['a', 'b'] LOOP
+///         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', each);
+///     END LOOP;
+/// END
+/// $$;
+/// ```
+fn unrolled(statement: &str) -> Option<Vec<Expectation>> {
+    let body = quoted(statement)?;
+    let block = statements(body);
+    // `DECLARE one text;` `BEGIN FOREACH ... LOOP <first>;` `<rest>;` ...
+    // `END LOOP;` `END`, which is what the `;` separators leave.
+    let [declaring, opening, executed @ .., closing, ending] = block.as_slice() else {
+        return None;
+    };
+    let declared = words(declaring);
+    let [declare, variable, kind] = declared.as_slice() else {
+        return None;
+    };
+    if !(declare.eq_ignore_ascii_case("DECLARE") && kind.eq_ignore_ascii_case("text")) {
+        return None;
+    }
+    if !(words(closing) == ["END", "LOOP"] && words(ending) == ["END"]) {
+        return None;
+    }
+    // The loop's header and its first statement share a chunk, because `LOOP` is
+    // not a separator: `BEGIN FOREACH v IN ARRAY ARRAY[...] LOOP EXECUTE ...`.
+    let opened = words(opening);
+    let loops = opened
+        .iter()
+        .position(|word| word.eq_ignore_ascii_case("LOOP"))?;
+    if opened[..loops].len() != 6
+        || !opened[..loops]
+            .iter()
+            .zip(["BEGIN", "FOREACH", variable, "IN", "ARRAY", "ARRAY"])
+            .all(|(word, expected)| word.eq_ignore_ascii_case(expected))
+    {
+        return None;
+    }
+    let header = &opening[..offset(opening, opened[loops])];
+    let names = literals(header);
+    if names.is_empty() {
+        return None;
+    }
+    let body = &opening[offset(opening, opened[loops]) + opened[loops].len()..];
+    let mut expectations = Vec::new();
+    for name in &names {
+        for statement in std::iter::once(&body).chain(executed.iter()) {
+            let rendered = rendered(statement, variable, name)?;
+            expectations.extend(self::expectations(&rendered)?);
+        }
+    }
+    Some(expectations)
+}
+
+/// The body of the first `$tag$ ... $tag$` region in a statement.
+fn quoted(statement: &str) -> Option<&str> {
+    let bytes = statement.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let region = skipped(bytes, index);
+        if bytes[index] == b'$'
+            && let Some(region) = region
+        {
+            if !region.certain {
+                return None;
+            }
+            let tag = bytes[index + 1..].iter().position(|byte| *byte == b'$')? + 2;
+            return statement.get(index + tag..region.end - tag);
+        }
+        index = region.map_or(index + 1, |region| region.end);
+    }
+    None
+}
+
+/// The single-quoted literals in a fragment, in order, with a doubled quote read
+/// as the one character it stands for.
+fn literals(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut literals = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\'' {
+            index += 1;
+            continue;
+        }
+        let mut value = String::new();
+        index += 1;
+        while index < bytes.len() {
+            if bytes[index] == b'\'' {
+                if bytes.get(index + 1) == Some(&b'\'') {
+                    value.push('\'');
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+                break;
+            }
+            value.push(bytes[index] as char);
+            index += 1;
+        }
+        literals.push(value);
+    }
+    literals
+}
+
+/// One `EXECUTE format('...', ...)` rendered for one loop value, or `None` for
+/// any other statement and for any argument that is not the loop variable, the
+/// loop variable with a literal suffix, or a literal.
+///
+/// `%I` is an identifier and `%s` is text, which is all this loop shape uses;
+/// `%L` and a placeholder without an argument are not rendered, because guessing
+/// at the SQL a template would have produced is guessing at the evidence.
+fn rendered(statement: &str, variable: &str, name: &str) -> Option<String> {
+    let words = words(statement);
+    if !(words.first()?.eq_ignore_ascii_case("EXECUTE")
+        && words.get(1)?.eq_ignore_ascii_case("format"))
+    {
+        return None;
+    }
+    let open = statement.find('(')?;
+    let close = statement.rfind(')')?;
+    let arguments = split(statement, open + 1, close);
+    let (template, arguments) = arguments.split_first()?;
+    let template = match literals(template).as_slice() {
+        [only] if template.starts_with('\'') && template.ends_with('\'') => only.clone(),
+        _ => return None,
+    };
+    let mut values = Vec::new();
+    for argument in arguments {
+        let value = match self::words(argument).as_slice() {
+            // `v`, the loop value itself.
+            [only] if *only == variable && argument.trim() == variable => name.to_owned(),
+            // `v || '_suffix'`, how a derived object is named.
+            [only] if *only == variable => match literals(argument).as_slice() {
+                [suffix] if argument.contains("||") => format!("{name}{suffix}"),
+                _ => return None,
+            },
+            // A literal, which is text the template carries rather than a name.
+            [] => match literals(argument).as_slice() {
+                [only] => only.clone(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        values.push(value);
+    }
+    let mut rendered = String::new();
+    let mut values = values.iter();
+    let mut characters = template.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            rendered.push(character);
+            continue;
+        }
+        match characters.next()? {
+            '%' => rendered.push('%'),
+            'I' => {
+                let value = values.next()?;
+                // A rendered identifier this parse cannot spell is one the probe
+                // cannot ask about: `%I` quotes whatever it is given, so a value
+                // needing quotes names an object no other statement in the file
+                // could have named.
+                if value.is_empty()
+                    || !value.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+                {
+                    return None;
+                }
+                rendered.push_str(value);
+            }
+            's' => rendered.push_str(values.next()?),
+            _ => return None,
+        }
+    }
+    values.next().map_or(Some(rendered), |_| None)
 }
 
 /// Every migration this build ships, in application order.
@@ -757,15 +1091,34 @@ pub enum Baseline {
 }
 
 /// One thing a migration did that a later connection can be asked to confirm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Every variant is a question the catalogue answers about *one* object, which is
+/// what makes it evidence: an operator can go and look at the same thing, and a
+/// refusal can name it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Evidence {
-    /// A table or index the migration creates, present in this schema.
-    Relation(&'static str),
+    /// A table the migration creates, present in this schema.
+    Table(String),
+    /// An index the migration creates, present in this schema.
+    Index(String),
     /// A seed row an idempotent `INSERT ... ON CONFLICT DO NOTHING` writes,
     /// confirmed by the target table not being empty. A migration whose tables
     /// exist and whose seed row does not is a `psql` run that stopped in the
     /// middle, which is why the row counts as evidence rather than as detail.
-    Seed(&'static str),
+    Seed(String),
+    /// A column an `ALTER TABLE ... ADD COLUMN` adds, by table and name.
+    Column(String, String),
+    /// A named constraint an `ALTER TABLE ... ADD CONSTRAINT` adds. Named ones
+    /// only: a constraint PostgreSQL names for itself is not a name the file
+    /// states, so nothing in it says what to look for.
+    Constraint(String, String),
+    /// Row-level security enabled on a table (`pg_class.relrowsecurity`).
+    Guarded(String),
+    /// Row-level security forced on a table, so its owner is subject to the
+    /// policies too (`pg_class.relforcerowsecurity`).
+    Forced(String),
+    /// A policy, by the table it guards and its own name.
+    Policy(String, String),
 }
 
 /// Everything a migration must be able to show for itself to be adoptable, or
@@ -773,37 +1126,75 @@ enum Evidence {
 ///
 /// Derived from the migration's own text, so a statement cannot ship without
 /// adoption accounting for it — and the accounting is deliberately total: an
-/// `ALTER`, a backfill, a `DROP`, or a plain `INSERT` makes the whole migration
-/// unconfirmable rather than being passed over, because "every table is there"
-/// says nothing about a column or a row.
+/// `UPDATE`, a backfill, a plain `INSERT`, or an `ALTER` clause outside the set
+/// the catalogue answers for makes the whole migration unconfirmable rather than
+/// being passed over, because "every table is there" says nothing about a column
+/// or a row.
 ///
 /// The ledger table is excluded: adoption only runs against a database whose
 /// ledger exists, so its presence is the precondition rather than evidence.
 /// Counting it would make a bare ledger look half-applied rather than untouched.
-fn evidence(migration: &Migration) -> Option<Vec<Evidence>> {
+fn evidence(migration: &Migration) -> Option<Vec<Expectation>> {
     if !lexed(migration.sql) {
         return None;
     }
-    let mut evidence = Vec::new();
+    let mut evidence: Vec<Expectation> = Vec::new();
     for statement in statements(migration.sql) {
-        let item = match statement_kind(statement)? {
-            Statement::Table(name) | Statement::Index(name) => Evidence::Relation(name),
-            Statement::Seed(name) => Evidence::Seed(name),
-        };
-        // Relations de-duplicate safely: the same object declared twice is one
-        // probe with one answer. A seed does not — the target having a row confirms
-        // one insert, not two — so a repeated seed stays in the list, where the
-        // shared-seed refusal can see that this table is seeded more than once.
-        let duplicate = match item {
-            Evidence::Relation(_) => evidence.contains(&item),
-            Evidence::Seed(_) => false,
-        };
-        if item == Evidence::Relation(MIGRATION_TABLE) || duplicate {
-            continue;
+        for expectation in expectations(statement)? {
+            if expectation.what == Evidence::Table(MIGRATION_TABLE.to_owned()) {
+                continue;
+            }
+            // The last statement to touch a thing is what the file leaves behind,
+            // so a policy dropped and recreated is present and a table declared
+            // twice is one probe with one answer. A seed is the exception: the
+            // target having a row confirms one insert and not two, so a repeated
+            // seed stays in the list, where the shared-evidence refusal can see
+            // that this table is seeded more than once.
+            match evidence
+                .iter_mut()
+                .find(|prior| prior.what == expectation.what)
+            {
+                Some(prior) if !matches!(expectation.what, Evidence::Seed(_)) => {
+                    prior.present = expectation.present;
+                }
+                _ => evidence.push(expectation),
+            }
         }
-        evidence.push(item);
     }
     Some(evidence)
+}
+
+/// How a refusal names a thing the database did not agree about.
+///
+/// Named by what is actually wrong with each one: a table that is not there, a
+/// table there without its seed row, and a policy that was supposed to be dropped
+/// and is still there are different repairs, and an operator told "`axond_cp_head`
+/// is not present" about a table that exists would go looking for the wrong thing.
+fn described(expectation: &Expectation) -> String {
+    let thing = named_thing(&expectation.what);
+    match (&expectation.what, expectation.present) {
+        (Evidence::Seed(_), true) => format!("{thing} has no seeded row"),
+        (Evidence::Seed(_), false) => format!("{thing} still has its seeded row"),
+        (Evidence::Guarded(_) | Evidence::Forced(_), true) => format!("{thing} is not enabled"),
+        (Evidence::Guarded(_) | Evidence::Forced(_), false) => format!("{thing} is still enabled"),
+        (_, true) => format!("{thing} is not present"),
+        (_, false) => format!("{thing} is still present"),
+    }
+}
+
+/// What a piece of evidence is, in the words an operator would use to go and look
+/// at the same thing.
+fn named_thing(what: &Evidence) -> String {
+    match what {
+        Evidence::Table(name) | Evidence::Index(name) | Evidence::Seed(name) => format!("`{name}`"),
+        Evidence::Column(table, column) => format!("`{table}`'s `{column}` column"),
+        Evidence::Constraint(table, constraint) => {
+            format!("`{table}`'s `{constraint}` constraint")
+        }
+        Evidence::Guarded(table) => format!("row level security on `{table}`"),
+        Evidence::Forced(table) => format!("forced row level security on `{table}`"),
+        Evidence::Policy(table, policy) => format!("`{table}`'s `{policy}` policy"),
+    }
 }
 
 /// Reconcile an empty ledger against what the database can show.
@@ -816,15 +1207,24 @@ pub(super) async fn baseline(
     transaction: &Transaction<'_>,
 ) -> Result<Baseline, tokio_postgres::Error> {
     let mut confirmed: HashSet<Evidence> = HashSet::new();
-    for item in MIGRATIONS.iter().filter_map(evidence).flatten() {
+    for item in MIGRATIONS
+        .iter()
+        .filter_map(evidence)
+        .flatten()
+        .map(|expectation| expectation.what)
+    {
         // Every probe is qualified to the one schema this connection writes in —
         // the schema `[control_plane] schema` selected, or the first on the DSN's
         // own search path, which is where `apply` would have created these
         // objects. An unqualified probe would resolve down the whole search path,
         // so another install's journal sitting in `public` would be read as
         // evidence that *this* schema's DDL was applied.
-        let found: bool = match item {
-            Evidence::Relation(name) => transaction
+        //
+        // A `DROP` is probed the same way as everything else and answered the same
+        // way: this set is what the database has, and the expectation that named it
+        // says whether having it is what the migration would have left.
+        let found: bool = match &item {
+            Evidence::Table(name) | Evidence::Index(name) => transaction
                 .query_one(
                     "SELECT EXISTS (\
                        SELECT 1 FROM pg_catalog.pg_class class \
@@ -837,12 +1237,12 @@ pub(super) async fn baseline(
                 )
                 .await?
                 .get(0),
-            // The table is confirmed by its own `Relation` probe first, and a
-            // table in `current_schema()` shadows one of the same name further
-            // down the path, so the row this finds is this schema's. No table
-            // means no seed row either.
+            // The table is confirmed by its own probe first, and a table in
+            // `current_schema()` shadows one of the same name further down the
+            // path, so the row this finds is this schema's. No table means no seed
+            // row either.
             Evidence::Seed(name) => {
-                if !confirmed.contains(&Evidence::Relation(name)) {
+                if !confirmed.contains(&Evidence::Table(name.clone())) {
                     false
                 } else {
                     transaction
@@ -851,6 +1251,76 @@ pub(super) async fn baseline(
                         .get(0)
                 }
             }
+            Evidence::Column(table, column) => transaction
+                .query_one(
+                    "SELECT EXISTS (\
+                       SELECT 1 FROM pg_catalog.pg_attribute attribute \
+                         JOIN pg_catalog.pg_class class \
+                           ON class.oid = attribute.attrelid \
+                         JOIN pg_catalog.pg_namespace namespace \
+                           ON namespace.oid = class.relnamespace \
+                        WHERE class.relname = $1 \
+                          AND attribute.attname = $2 \
+                          AND attribute.attnum > 0 \
+                          AND NOT attribute.attisdropped \
+                          AND namespace.nspname = current_schema())",
+                    &[&table, &column],
+                )
+                .await?
+                .get(0),
+            Evidence::Constraint(table, constraint) => transaction
+                .query_one(
+                    "SELECT EXISTS (\
+                       SELECT 1 FROM pg_catalog.pg_constraint constraint_ \
+                         JOIN pg_catalog.pg_class class \
+                           ON class.oid = constraint_.conrelid \
+                         JOIN pg_catalog.pg_namespace namespace \
+                           ON namespace.oid = class.relnamespace \
+                        WHERE class.relname = $1 \
+                          AND constraint_.conname = $2 \
+                          AND namespace.nspname = current_schema())",
+                    &[&table, &constraint],
+                )
+                .await?
+                .get(0),
+            // Enabled and forced are two flags on the table, and the difference
+            // matters: a deployment whose application role owns its tables gets no
+            // enforcement at all from `ENABLE` alone, so a migration that asked for
+            // both is only applied when both are set.
+            Evidence::Guarded(table) | Evidence::Forced(table) => transaction
+                .query_one(
+                    &format!(
+                        "SELECT EXISTS (\
+                           SELECT 1 FROM pg_catalog.pg_class class \
+                             JOIN pg_catalog.pg_namespace namespace \
+                               ON namespace.oid = class.relnamespace \
+                            WHERE class.relname = $1 \
+                              AND class.{} \
+                              AND namespace.nspname = current_schema())",
+                        match item {
+                            Evidence::Forced(_) => "relforcerowsecurity",
+                            _ => "relrowsecurity",
+                        }
+                    ),
+                    &[&table],
+                )
+                .await?
+                .get(0),
+            Evidence::Policy(table, policy) => transaction
+                .query_one(
+                    "SELECT EXISTS (\
+                       SELECT 1 FROM pg_catalog.pg_policy policy \
+                         JOIN pg_catalog.pg_class class \
+                           ON class.oid = policy.polrelid \
+                         JOIN pg_catalog.pg_namespace namespace \
+                           ON namespace.oid = class.relnamespace \
+                        WHERE class.relname = $1 \
+                          AND policy.polname = $2 \
+                          AND namespace.nspname = current_schema())",
+                    &[&table, &policy],
+                )
+                .await?
+                .get(0),
         };
         if found {
             confirmed.insert(item);
@@ -876,14 +1346,17 @@ fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baselin
     // evidence of nothing, and treated like any other statement adoption cannot
     // confirm. (Within one migration a repeated relation is one declaration
     // deduplicated by `evidence`; a repeated seed is not, so it lands here.)
-    let shipped: Vec<Evidence> = migrations.iter().filter_map(evidence).flatten().collect();
+    let shipped: Vec<Expectation> = migrations.iter().filter_map(evidence).flatten().collect();
     let mut adoptable: Vec<i32> = Vec::new();
     let mut absent: Option<i32> = None;
     for migration in migrations {
         // A migration containing a statement whose effect nothing can be asked
-        // about — an `ALTER TABLE`, a backfill, a `DROP`, a non-idempotent
-        // `INSERT` — blocks adoption of this database wherever in the history it
-        // sits, including the versions below it.
+        // about — a backfill, an `UPDATE`, a non-idempotent `INSERT`, an `ALTER`
+        // clause the catalogue has no answer for — blocks adoption of this
+        // database wherever in the history it sits, including the versions below
+        // it. So does one that only takes things away: absence is not evidence a
+        // version ran, because a database that never had the version before it
+        // does not have them either.
         //
         // Fail-closed on purpose, in both directions. Recording it on the strength
         // of the objects it happens to create would claim a column or a row that
@@ -892,7 +1365,9 @@ fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baselin
         // database that may already have had it applied out of band. That rerun is
         // precisely the non-idempotent replay adoption exists to prevent, and no
         // ledger row both accounts for the objects and keeps `apply` away.
-        let Some(declared) = evidence(migration).filter(|declared| !declared.is_empty()) else {
+        let Some(declared) =
+            evidence(migration).filter(|declared| declared.iter().any(|item| item.present))
+        else {
             return Baseline::Inconsistent {
                 message: format!(
                     "v{} `{}` contains a statement whose effect this database cannot be asked \
@@ -906,18 +1381,24 @@ fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baselin
                 ),
             };
         };
-        if let Some(shared) = declared
-            .iter()
-            .find(|item| shipped.iter().filter(|other| other == item).count() > 1)
-        {
-            let (what, proves) = match shared {
+        if let Some(shared) = declared.iter().find(|item| {
+            shipped
+                .iter()
+                .filter(|other| other.what == item.what)
+                .count()
+                > 1
+        }) {
+            let (what, proves) = match &shared.what {
                 Evidence::Seed(name) => (
                     format!("seeds `{name}`, which the shipped history seeds more than once"),
                     "a row in it proves at most one of those inserts and not this one",
                 ),
-                Evidence::Relation(name) => (
-                    format!("declares `{name}`, which more than one shipped migration declares"),
-                    "its presence proves at most one of those declarations and not this one",
+                shared => (
+                    format!(
+                        "acts on {}, which more than one shipped migration acts on",
+                        named_thing(shared)
+                    ),
+                    "what the database shows proves at most one of them and not this one",
                 ),
             };
             return Baseline::Inconsistent {
@@ -937,13 +1418,22 @@ fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baselin
         // exists would go looking for the wrong thing.
         let missing: Vec<String> = declared
             .iter()
-            .filter(|item| !confirmed.contains(item))
-            .map(|item| match item {
-                Evidence::Relation(name) => format!("`{name}` is not present"),
-                Evidence::Seed(name) => format!("`{name}` has no seeded row"),
-            })
+            .filter(|item| confirmed.contains(&item.what) != item.present)
+            .map(described)
             .collect();
-        if !missing.is_empty() && missing.len() < declared.len() {
+        // Whether the version ran at all is read from what it left behind, never
+        // from what it took away: a database that never had it is missing the
+        // things it dropped too, so counting those would read an untouched
+        // database as half-way through the migration.
+        let left = declared
+            .iter()
+            .filter(|item| item.present && confirmed.contains(&item.what))
+            .count();
+        if left == 0 {
+            absent = absent.or(Some(migration.version));
+            continue;
+        }
+        if !missing.is_empty() {
             return Baseline::Inconsistent {
                 message: format!(
                     "v{} `{}` is only partly applied: {}, so this build cannot record it as \
@@ -955,13 +1445,13 @@ fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baselin
                 ),
             };
         }
-        match (missing.is_empty(), absent) {
+        match absent {
             // Still extending the prefix of versions the database can account for.
-            (true, None) => adoptable.push(migration.version),
+            None => adoptable.push(migration.version),
             // Objects for a version above one that is absent: the database is
             // not any prefix of this history, so nothing about it can be
             // recorded as a baseline.
-            (true, Some(hole)) => {
+            Some(hole) => {
                 return Baseline::Inconsistent {
                     message: format!(
                         "v{} `{}` declares objects that are present while v{hole} declares objects \
@@ -971,7 +1461,6 @@ fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baselin
                     ),
                 };
             }
-            (false, _) => absent = absent.or(Some(migration.version)),
         }
     }
     if adoptable.is_empty() {
@@ -1038,6 +1527,46 @@ mod tests {
             name: name.to_owned(),
             checksum: checksum.to_owned(),
         }
+    }
+
+    /// Something a fixture's statement leaves behind.
+    fn present(what: Evidence) -> Expectation {
+        Expectation {
+            what,
+            present: true,
+        }
+    }
+
+    /// Something a fixture's statement takes away, confirmed by its absence.
+    fn gone(what: Evidence) -> Expectation {
+        Expectation {
+            what,
+            present: false,
+        }
+    }
+
+    fn table(name: &str) -> Evidence {
+        Evidence::Table(name.to_owned())
+    }
+
+    fn index(name: &str) -> Evidence {
+        Evidence::Index(name.to_owned())
+    }
+
+    fn seed(name: &str) -> Evidence {
+        Evidence::Seed(name.to_owned())
+    }
+
+    fn column(table: &str, column: &str) -> Evidence {
+        Evidence::Column(table.to_owned(), column.to_owned())
+    }
+
+    fn constraint(table: &str, constraint: &str) -> Evidence {
+        Evidence::Constraint(table.to_owned(), constraint.to_owned())
+    }
+
+    fn policy(table: &str, policy: &str) -> Evidence {
+        Evidence::Policy(table.to_owned(), policy.to_owned())
     }
 
     #[test]
@@ -1291,31 +1820,91 @@ mod tests {
         assert_eq!(
             evidence(&MIGRATIONS[0]),
             Some(vec![
-                Evidence::Relation("axond_cp_blob"),
-                Evidence::Relation("axond_cp_resource_version"),
-                Evidence::Relation("axond_cp_resource_version_tenant_idx"),
-                Evidence::Relation("axond_cp_resource_dependency"),
-                Evidence::Relation("axond_cp_mutation"),
-                Evidence::Relation("axond_cp_revision"),
-                Evidence::Relation("axond_cp_revision_single_root_idx"),
-                Evidence::Relation("axond_cp_revision_entry"),
-                Evidence::Relation("axond_cp_revision_blob"),
-                Evidence::Relation("axond_cp_audit_event"),
-                Evidence::Relation("axond_cp_audit_event_revision_idx"),
-                Evidence::Relation("axond_cp_idempotency"),
-                Evidence::Relation("axond_cp_idempotency_expires_at_idx"),
-                Evidence::Relation("axond_cp_head"),
-                Evidence::Seed("axond_cp_head"),
+                present(table("axond_cp_blob")),
+                present(table("axond_cp_resource_version")),
+                present(index("axond_cp_resource_version_tenant_idx")),
+                present(table("axond_cp_resource_dependency")),
+                present(table("axond_cp_mutation")),
+                present(table("axond_cp_revision")),
+                present(index("axond_cp_revision_single_root_idx")),
+                present(table("axond_cp_revision_entry")),
+                present(table("axond_cp_revision_blob")),
+                present(table("axond_cp_audit_event")),
+                present(index("axond_cp_audit_event_revision_idx")),
+                present(table("axond_cp_idempotency")),
+                present(index("axond_cp_idempotency_expires_at_idx")),
+                present(table("axond_cp_head")),
+                present(seed("axond_cp_head")),
             ]),
             "every statement of the shipped file has to be something adoption confirms"
         );
         for migration in MIGRATIONS.iter() {
             assert!(
-                evidence(migration).is_some_and(|declared| !declared.is_empty()),
+                evidence(migration)
+                    .is_some_and(|declared| declared.iter().any(|item| item.present)),
                 "v{} contains a statement adoption cannot confirm, so no database can be adopted \
                  while it ships",
                 migration.version
             );
+        }
+    }
+
+    /// The tenancy migration, which is what the confirmable set has to cover for
+    /// `adopt` to be of any use to a v2 deployment: columns, named constraints,
+    /// both row-security flags, policies, and the six tables its `DO` block guards
+    /// dynamically. The block's list is read out of the block, so a table added to
+    /// it is a policy adoption goes looking for.
+    #[test]
+    fn the_tenancy_migrations_columns_constraints_and_policies_are_all_confirmable() {
+        let declared = evidence(&MIGRATIONS[1]).expect(
+            "v2's statements have to be confirmable, or `adopt` refuses every v2 deployment",
+        );
+        for expected in [
+            present(table("axond_cp_tenant")),
+            present(index("axond_cp_tenant_slug_idx")),
+            present(column("axond_cp_mutation", "actor_tenant_id")),
+            present(column("axond_cp_audit_event", "actor_principal_id")),
+            present(constraint(
+                "axond_cp_mutation",
+                "axond_cp_mutation_actor_attribution",
+            )),
+            // Dropped by v2, so a v2 database is one where it is *gone*: the
+            // constraint being there is what says v2's replacement has not run.
+            gone(constraint(
+                "axond_cp_mutation",
+                "axond_cp_mutation_actor_kind_check",
+            )),
+            present(policy("axond_cp_tenant", "axond_cp_tenant_isolation")),
+        ] {
+            assert!(
+                declared.contains(&expected),
+                "v2 has to be adoptable on {}: {declared:#?}",
+                named_thing(&expected.what)
+            );
+        }
+        // The `DO` block's loop: every table in its own array, with row security
+        // enabled, forced, and its `_isolation` policy present — the `DROP POLICY`
+        // before each `CREATE POLICY` being what the file ends with, not what it
+        // leaves behind.
+        for guarded in [
+            "axond_cp_head",
+            "axond_cp_revision",
+            "axond_cp_revision_entry",
+            "axond_cp_revision_blob",
+            "axond_cp_blob",
+            "axond_cp_resource_dependency",
+        ] {
+            for expected in [
+                present(Evidence::Guarded(guarded.to_owned())),
+                present(Evidence::Forced(guarded.to_owned())),
+                present(policy(guarded, &format!("{guarded}_isolation"))),
+            ] {
+                assert!(
+                    declared.contains(&expected),
+                    "the `DO` block's effect on `{guarded}` has to be evidence: {}",
+                    named_thing(&expected.what)
+                );
+            }
         }
     }
 
@@ -1336,27 +1925,34 @@ mod tests {
         assert_eq!(
             evidence(&CONFIRMABLE),
             Some(vec![
-                Evidence::Relation("first"),
-                Evidence::Relation("first_id"),
-                Evidence::Seed("first"),
+                present(table("first")),
+                present(index("first_id")),
+                present(seed("first")),
             ])
         );
 
         for sql in [
-            // A table beside an `ALTER`: the reviewed mixed case.
-            "CREATE TABLE IF NOT EXISTS first (id integer);\nALTER TABLE second ADD COLUMN n text;\n",
+            // A table beside an `ALTER` clause the catalogue has no answer for: the
+            // reviewed mixed case. A default is set or it is not, and `pg_attrdef`
+            // holds an expression, not the fact that this migration wrote it.
+            "CREATE TABLE IF NOT EXISTS first (id integer);\n\
+             ALTER TABLE first ALTER COLUMN id SET DEFAULT 1;\n",
+            // An unnamed constraint, which PostgreSQL names for itself: the file
+            // says nothing about what to look for.
+            "CREATE TABLE IF NOT EXISTS first (id integer);\n\
+             ALTER TABLE first ADD CHECK (id > 0);\n",
             // A backfill beside a table.
             "CREATE TABLE IF NOT EXISTS first (id integer);\nUPDATE second SET n = 1;\n",
             // An `INSERT` that is not idempotent: indistinguishable from one that
             // never ran, and doubling on a rerun.
             "CREATE TABLE IF NOT EXISTS first (id integer);\nINSERT INTO first (id) VALUES (1);\n",
             "DROP TABLE second;\n",
-            // A block comment is prose, so the `ALTER` after it is still an
-            // `ALTER`: read as syntax, its words would supply the missing
-            // `CREATE TABLE first` and make this migration adoptable on the
-            // strength of a table it never created.
+            // A block comment is prose, so the statement after it is what it is:
+            // read as syntax, its words would supply the missing `CREATE TABLE
+            // first` and make this migration adoptable on the strength of a table
+            // it never created.
             "/* create table first, if /* nested */ missing */\n\
-             ALTER TABLE first ADD COLUMN note text;\n",
+             UPDATE first SET note = 'x';\n",
             // A `;` inside a dollar-quoted body is not a statement boundary, so
             // the `CREATE TABLE` a trigger would run is not this migration's.
             "CREATE FUNCTION f() RETURNS trigger AS $body$\n\
@@ -1385,10 +1981,7 @@ mod tests {
                   -- Why this table exists, after the last statement.\n\
                   -- And a second line of it.\n",
         };
-        assert_eq!(
-            evidence(&COMMENTED),
-            Some(vec![Evidence::Relation("first")])
-        );
+        assert_eq!(evidence(&COMMENTED), Some(vec![present(table("first"))]));
 
         // A word ending against a quote or a `--` is still that word. Losing it
         // would have the following one answer for it: the table below would be
@@ -1405,8 +1998,199 @@ mod tests {
         };
         assert_eq!(
             evidence(&TIGHT),
-            Some(vec![Evidence::Relation("second"), Evidence::Seed("second")])
+            Some(vec![present(table("second")), present(seed("second"))])
         );
+    }
+
+    /// What an `ALTER TABLE` and a policy leave behind, clause by clause — the
+    /// evidence v2's own statements turn into. A clause list is one statement and
+    /// several answers, and a `DROP` is confirmed by the thing being gone, which is
+    /// only ever half of a story: a migration that just takes things away is
+    /// unadoptable, because a database that never had the version before it looks
+    /// exactly the same.
+    #[test]
+    fn an_alter_is_read_clause_by_clause_and_a_drop_is_confirmed_by_absence() {
+        const ALTERED: Migration = Migration {
+            version: 1,
+            name: "altered",
+            sql: "CREATE TABLE IF NOT EXISTS one (id integer);\n\
+                  ALTER TABLE one\n\
+                      ADD COLUMN IF NOT EXISTS note text NULL,\n\
+                      ADD COLUMN IF NOT EXISTS more text NULL;\n\
+                  ALTER TABLE ONLY one\n\
+                      DROP CONSTRAINT IF EXISTS one_note_ck,\n\
+                      ADD CONSTRAINT one_note_ck CHECK (note IS NULL OR more IS NULL),\n\
+                      ENABLE ROW LEVEL SECURITY,\n\
+                      FORCE ROW LEVEL SECURITY;\n\
+                  DROP POLICY IF EXISTS one_isolation ON one;\n\
+                  CREATE POLICY one_isolation ON one USING (id > 0);\n",
+        };
+        assert_eq!(
+            evidence(&ALTERED),
+            Some(vec![
+                present(table("one")),
+                present(column("one", "note")),
+                present(column("one", "more")),
+                // Dropped and recreated under the same name: what the file leaves
+                // behind is the last thing it did to each one.
+                present(constraint("one", "one_note_ck")),
+                present(Evidence::Guarded("one".to_owned())),
+                present(Evidence::Forced("one".to_owned())),
+                present(policy("one", "one_isolation")),
+            ])
+        );
+
+        // A migration that only removes things: each `DROP` is confirmable, and
+        // none of it is evidence the version ran, so there is nothing to adopt.
+        const REMOVED: Migration = Migration {
+            version: 1,
+            name: "removed",
+            sql: "ALTER TABLE one DROP COLUMN note, DISABLE ROW LEVEL SECURITY;\n\
+                  DROP POLICY one_isolation ON one;\n",
+        };
+        assert_eq!(
+            evidence(&REMOVED),
+            Some(vec![
+                gone(column("one", "note")),
+                gone(Evidence::Guarded("one".to_owned())),
+                gone(policy("one", "one_isolation")),
+            ])
+        );
+        let Baseline::Inconsistent { message } = reconcile(&[REMOVED], &HashSet::new()) else {
+            panic!("a migration that only removes things proves nothing by itself");
+        };
+        assert!(
+            message.contains("v1 `removed` contains a statement"),
+            "the refusal has to name the version nothing can account for: {message}"
+        );
+
+        // A version that both adds and removes, over a database that has neither:
+        // the removal is satisfied by an untouched schema, so counting it would
+        // read "nothing was applied" as "half of v2 was".
+        const ADDS_AND_REMOVES: Migration = Migration {
+            version: 2,
+            name: "replaces",
+            sql: "ALTER TABLE one DROP CONSTRAINT one_note_ck, ADD CONSTRAINT one_note_ck2 \
+                  CHECK (note IS NOT NULL);\n",
+        };
+        const CREATES: Migration = Migration {
+            version: 1,
+            name: "creates",
+            sql: "CREATE TABLE IF NOT EXISTS one (id integer);\n",
+        };
+        assert_eq!(
+            reconcile(&[CREATES, ADDS_AND_REMOVES], &HashSet::new()),
+            Baseline::Nothing,
+            "an untouched database is untouched, not part way through the version above it"
+        );
+        assert_eq!(
+            reconcile(&[CREATES, ADDS_AND_REMOVES], &HashSet::from([table("one")])),
+            Baseline::Applied { versions: vec![1] },
+            "v1's table is v1's baseline, with v2 still pending"
+        );
+        assert_eq!(
+            reconcile(
+                &[CREATES, ADDS_AND_REMOVES],
+                &HashSet::from([table("one"), constraint("one", "one_note_ck2")])
+            ),
+            Baseline::Applied {
+                versions: vec![1, 2]
+            },
+            "the constraint v2 adds, with the one it drops gone, is v2 applied"
+        );
+
+        // A clause the catalogue cannot answer for, and an `ADD` without the
+        // `COLUMN` keyword — where the word after `ADD` is a name in one form and a
+        // keyword in the next — are unconfirmable rather than read as a guess.
+        for sql in [
+            "ALTER TABLE one ALTER COLUMN note TYPE integer;\n",
+            "ALTER TABLE one ADD note text;\n",
+            "ALTER TABLE one ADD PRIMARY KEY (id);\n",
+            "ALTER TABLE one ADD COLUMN note text, ALTER COLUMN id DROP NOT NULL;\n",
+            "CREATE POLICY one_isolation ON other.one USING (true);\n",
+            "CREATE POLICY one_isolation FOR SELECT USING (true);\n",
+        ] {
+            let unconfirmable = Migration {
+                version: 1,
+                name: "unconfirmable",
+                sql,
+            };
+            assert_eq!(
+                evidence(&unconfirmable),
+                None,
+                "a clause nothing can be asked about voids its migration: {sql}"
+            );
+        }
+    }
+
+    /// The dynamic form v2 guards its chained tables with: a loop over a literal
+    /// list of names executing `format()` templates. Read by rendering the block's
+    /// own templates for the block's own names and parsing the result, so the
+    /// evidence follows the file — and anything outside that one shape is
+    /// unconfirmable, which is the same answer a backfill gets.
+    #[test]
+    fn a_dynamic_loop_is_evidence_for_the_statements_it_renders_and_nothing_else() {
+        const LOOPED: Migration = Migration {
+            version: 1,
+            name: "looped",
+            sql: "CREATE TABLE IF NOT EXISTS one (id integer);\n\
+                  DO $$\n\
+                  DECLARE\n\
+                      chained text;\n\
+                  BEGIN\n\
+                      FOREACH chained IN ARRAY ARRAY['one', 'two'] LOOP\n\
+                          EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', chained);\n\
+                          EXECUTE format('DROP POLICY IF EXISTS %I ON %I', chained || '_isolation', chained);\n\
+                          EXECUTE format(\n\
+                              'CREATE POLICY %I ON %I USING (%s)',\n\
+                              chained || '_isolation',\n\
+                              chained,\n\
+                              'current_setting(''axond.tenant_id'', true) IS NOT NULL'\n\
+                          );\n\
+                      END LOOP;\n\
+                  END\n\
+                  $$;\n",
+        };
+        assert_eq!(
+            evidence(&LOOPED),
+            Some(vec![
+                present(table("one")),
+                present(Evidence::Guarded("one".to_owned())),
+                present(policy("one", "one_isolation")),
+                present(Evidence::Guarded("two".to_owned())),
+                present(policy("two", "two_isolation")),
+            ]),
+            "the loop's evidence is its templates rendered for its own names"
+        );
+
+        for body in [
+            // A condition: whether the branch was taken is not in the file.
+            "IF found THEN EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', chained); END IF;",
+            // Names from a query rather than from a literal list.
+            "FOREACH chained IN ARRAY (SELECT array_agg(relname) FROM pg_class) LOOP \
+             EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', chained); END LOOP;",
+            // A template argument that is not the loop value.
+            "FOREACH chained IN ARRAY ARRAY['one'] LOOP \
+             EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', other); END LOOP;",
+            // A rendered statement that is itself unconfirmable.
+            "FOREACH chained IN ARRAY ARRAY['one'] LOOP \
+             EXECUTE format('UPDATE %I SET note = 1', chained); END LOOP;",
+            // A placeholder with no argument, and one this parse does not render.
+            "FOREACH chained IN ARRAY ARRAY['one'] LOOP \
+             EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY'); END LOOP;",
+            "FOREACH chained IN ARRAY ARRAY['one'] LOOP \
+             EXECUTE format('CREATE POLICY %I ON %L USING (true)', 'p', chained); END LOOP;",
+            // Dynamic SQL that is not a `format()` template at all.
+            "FOREACH chained IN ARRAY ARRAY['one'] LOOP \
+             EXECUTE 'ALTER TABLE one ENABLE ROW LEVEL SECURITY'; END LOOP;",
+        ] {
+            let block = format!("DO $$\nDECLARE\n chained text;\nBEGIN\n {body}\nEND\n$$");
+            assert_eq!(
+                expectations(&block),
+                None,
+                "a block outside the one shape this reads is unconfirmable: {block}"
+            );
+        }
     }
 
     /// `CREATE TABLE` with and without `IF NOT EXISTS`, a name followed by a
@@ -1469,7 +2253,7 @@ mod tests {
         const V2: Migration = Migration {
             version: 2,
             name: "backfill",
-            sql: "ALTER TABLE one ADD COLUMN note text;\n",
+            sql: "UPDATE one SET note = 'x';\n",
         };
         const V3: Migration = Migration {
             version: 3,
@@ -1477,15 +2261,15 @@ mod tests {
             sql: "CREATE TABLE IF NOT EXISTS three (id integer);\n",
         };
         let shipped = &[V1, V2, V3];
-        let one = Evidence::Relation("one");
-        let three = Evidence::Relation("three");
+        let one = table("one");
+        let three = table("three");
 
         // Every state of such a database refuses, including the one where the
         // prefix below the opaque migration is entirely accounted for.
         for confirmed in [
-            HashSet::from([one]),
-            HashSet::from([one, three]),
-            HashSet::from([three]),
+            HashSet::from([one.clone()]),
+            HashSet::from([one.clone(), three.clone()]),
+            HashSet::from([three.clone()]),
             HashSet::new(),
         ] {
             let Baseline::Inconsistent { message } = reconcile(shipped, &confirmed) else {
@@ -1535,14 +2319,14 @@ mod tests {
             name: "second seed",
             sql: "INSERT INTO one (id) VALUES (2) ON CONFLICT (id) DO NOTHING;\n",
         };
-        let one = Evidence::Relation("one");
-        let seeded = Evidence::Seed("one");
+        let one = table("one");
+        let seeded = seed("one");
 
         // Including the state where the table has a row: that row is v1's, and
         // nothing here can tell whether v2's is beside it.
         for confirmed in [
-            HashSet::from([one, seeded]),
-            HashSet::from([one]),
+            HashSet::from([one.clone(), seeded.clone()]),
+            HashSet::from([one.clone()]),
             HashSet::new(),
         ] {
             let Baseline::Inconsistent { message } = reconcile(&[V1, V2], &confirmed) else {
@@ -1567,10 +2351,15 @@ mod tests {
         };
         assert_eq!(
             evidence(&TWICE),
-            Some(vec![one, seeded, seeded]),
+            Some(vec![
+                present(one.clone()),
+                present(seeded.clone()),
+                present(seeded.clone()),
+            ]),
             "a repeated seed is two expectations, unlike a relation declared twice"
         );
-        let Baseline::Inconsistent { message } = reconcile(&[TWICE], &HashSet::from([one, seeded]))
+        let Baseline::Inconsistent { message } =
+            reconcile(&[TWICE], &HashSet::from([one.clone(), seeded.clone()]))
         else {
             panic!("a file seeding one table twice has no adoptable baseline");
         };
@@ -1606,19 +2395,19 @@ mod tests {
             sql: "CREATE TABLE IF NOT EXISTS one (id integer);\n\
                   CREATE INDEX IF NOT EXISTS one_id ON one (id);\n",
         };
-        let one = Evidence::Relation("one");
-        let index = Evidence::Relation("one_id");
+        let one = table("one");
+        let declared = index("one_id");
 
         for confirmed in [
-            HashSet::from([one, index]),
-            HashSet::from([one]),
+            HashSet::from([one.clone(), declared.clone()]),
+            HashSet::from([one.clone()]),
             HashSet::new(),
         ] {
             let Baseline::Inconsistent { message } = reconcile(&[V1, V2], &confirmed) else {
                 panic!("an object no version can be attributed to has no adoptable baseline");
             };
             assert!(
-                message.contains("`one`, which more than one shipped migration declares"),
+                message.contains("acts on `one`, which more than one shipped migration acts on"),
                 "the refusal has to say why the object's presence proves nothing: {message}"
             );
         }
@@ -1631,10 +2420,7 @@ mod tests {
             sql: "CREATE TABLE IF NOT EXISTS two (id integer);\n",
         };
         assert_eq!(
-            reconcile(
-                &[V1, V2_OWN],
-                &HashSet::from([one, Evidence::Relation("two")])
-            ),
+            reconcile(&[V1, V2_OWN], &HashSet::from([one, table("two")])),
             Baseline::Applied {
                 versions: vec![1, 2]
             }

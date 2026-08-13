@@ -1500,12 +1500,12 @@ mod tests {
         );
     }
 
-    /// The database `psql -f ops/postgres/control_plane_0001_initial.sql` leaves:
-    /// every object present, the ledger present, and nothing recorded in it. What
-    /// `adopt` is for — and the recording is on the evidence of the objects, so
-    /// afterwards the database is byte-for-byte the ledger an `apply` would have
-    /// written, which is what makes every later classification the same for both
-    /// paths.
+    /// The database the documented manual path leaves — every shipped file run
+    /// with `psql -f`, tenancy included: every object present, the ledger present,
+    /// and nothing recorded in it. What `adopt` is for — and the recording is on
+    /// the evidence of the objects, so afterwards the database is byte-for-byte
+    /// the ledger an `apply` would have written, which is what makes every later
+    /// classification the same for both paths.
     #[tokio::test]
     async fn a_hand_applied_schema_is_adopted_as_the_baseline_its_objects_prove() {
         let Some(fixture) = fixture().await else {
@@ -1751,6 +1751,117 @@ mod tests {
             fixture.ledger().await.first().map(|row| row.2.clone()),
             Some(Checksum::of(b"an edited migration").to_string()),
             "a refused adoption rewrote a recorded checksum"
+        );
+    }
+
+    /// A v2 database with one of the tenancy migration's effects put back the way
+    /// v1 left it. Each case is a schema no version describes, and each has to be
+    /// refused by name: the effects `adopt` confirms are columns, named
+    /// constraints, both row-security flags and policies, so a deployment missing
+    /// any one of them is half-way through v2 rather than at v1 or v2.
+    ///
+    /// The `ADD CONSTRAINT` case is the one that needs a database to demonstrate:
+    /// v2 drops a v1 constraint, so a schema that still has it has not had v2
+    /// applied, however complete the rest of it looks.
+    #[tokio::test]
+    async fn a_tenancy_effect_undone_by_hand_is_refused_and_named() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        fixture.hand_applied().await;
+
+        for (undo, named, redo) in [
+            (
+                "ALTER TABLE axond_cp_head NO FORCE ROW LEVEL SECURITY",
+                "forced row level security on `axond_cp_head` is not enabled",
+                "ALTER TABLE axond_cp_head FORCE ROW LEVEL SECURITY",
+            ),
+            (
+                "ALTER TABLE axond_cp_tenant DISABLE ROW LEVEL SECURITY",
+                "row level security on `axond_cp_tenant` is not enabled",
+                "ALTER TABLE axond_cp_tenant ENABLE ROW LEVEL SECURITY",
+            ),
+            // A policy the `DO` block creates dynamically, which adoption knows to
+            // look for because it reads the block's own list of tables.
+            (
+                "DROP POLICY axond_cp_blob_isolation ON axond_cp_blob",
+                "`axond_cp_blob`'s `axond_cp_blob_isolation` policy is not present",
+                "CREATE POLICY axond_cp_blob_isolation ON axond_cp_blob USING (true)",
+            ),
+            (
+                "ALTER TABLE axond_cp_mutation DROP CONSTRAINT \
+                 axond_cp_mutation_actor_attribution",
+                "`axond_cp_mutation`'s `axond_cp_mutation_actor_attribution` constraint is not \
+                 present",
+                "ALTER TABLE axond_cp_mutation ADD CONSTRAINT \
+                 axond_cp_mutation_actor_attribution CHECK (true)",
+            ),
+            // The reverse direction: something v2 takes away, still there.
+            (
+                "ALTER TABLE axond_cp_audit_event ADD CONSTRAINT \
+                 axond_cp_audit_event_actor_kind_check CHECK (true)",
+                "`axond_cp_audit_event`'s `axond_cp_audit_event_actor_kind_check` constraint is \
+                 still present",
+                "ALTER TABLE axond_cp_audit_event DROP CONSTRAINT \
+                 axond_cp_audit_event_actor_kind_check",
+            ),
+            (
+                "ALTER TABLE axond_cp_audit_event DROP COLUMN actor_principal_id",
+                "`axond_cp_audit_event`'s `actor_principal_id` column is not present",
+                // Dropping the column takes the constraint over it along with it,
+                // so putting the schema back means putting both back.
+                "ALTER TABLE axond_cp_audit_event \
+                 ADD COLUMN actor_principal_id text NULL, \
+                 ADD CONSTRAINT axond_cp_audit_event_actor_attribution CHECK (true)",
+            ),
+        ] {
+            fixture
+                .observe()
+                .await
+                .batch_execute(undo)
+                .await
+                .unwrap_or_else(|error| panic!("undo one tenancy effect ({undo}): {error}"));
+            let error = adopt(&fixture.config, &fixture.env)
+                .await
+                .expect_err("a schema missing one of v2's effects has no baseline");
+            assert!(
+                matches!(error, OpsError::Refused { .. }) && !error.is_retryable(),
+                "an operator decision, not an outage: {error:?}"
+            );
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("only partly applied") && rendered.contains(named),
+                "the refusal has to name what is wrong ({named}): {rendered}"
+            );
+            assert!(
+                fixture.ledger().await.is_empty(),
+                "a refused adoption recorded a version anyway: {undo}"
+            );
+            fixture
+                .observe()
+                .await
+                .batch_execute(redo)
+                .await
+                .unwrap_or_else(|error| panic!("put the tenancy effect back ({redo}): {error}"));
+        }
+
+        // Every effect back where the shipped files leave it, so the refusals above
+        // are each one missing effect's doing rather than v2 being unadoptable.
+        let report = adopt(&fixture.config, &fixture.env)
+            .await
+            .expect("a fully hand-applied v1+v2 schema is adoptable");
+        assert_eq!(
+            report.state(),
+            Some(&State::Adopted {
+                adopted: named(
+                    &schema::MIGRATIONS
+                        .iter()
+                        .map(|migration| migration.version)
+                        .collect::<Vec<_>>()
+                ),
+                pending: Vec::new(),
+            }),
+            "{report}"
         );
     }
 
