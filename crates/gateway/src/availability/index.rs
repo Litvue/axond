@@ -396,38 +396,69 @@ impl AvailabilityIndexBuilder {
     /// Declare the single-valued dimensions for a key, replacing any already
     /// declared and keeping the discovery evidence held for it.
     ///
-    /// Any evidence the declaration carries is judged by the same rules as an
-    /// observed look ([`observe`](Self::observe)), so declaring cannot do what
-    /// observing refuses to: a declared look that predates a conclusive answer
-    /// neither becomes the current evidence nor is retained, and a declared complete
-    /// listing that does not carry the target discredits the retained positive.
-    /// Declared retained evidence is retained, not adopted as the current look.
+    /// A declaration describes derived state rather than a fresh look, so its
+    /// evidence is judged against the conclusion the *index* has already reached and
+    /// not against the one the declaration carries itself: a record read out of one
+    /// index survives being declared into another, while a look predating what this
+    /// key has concluded is refused and counted in [`superseded`](Self::superseded)
+    /// exactly as [`observe`](Self::observe) would refuse it. A declared complete
+    /// listing that does not carry the target still discredits the retained positive.
     #[must_use]
     pub fn record(mut self, key: AvailabilityKey, record: AvailabilityRecord) -> Self {
         let entry = self.records.entry(key).or_default();
-        // The dimensions are replaced and the evidence is not: a redeclaration says
-        // what the authorities now answer, and says nothing about what has been seen.
-        // The watermark only ever advances, so redeclaring cannot forget a conclusion.
+        let concluded = entry.definitive_at;
+        let (mut last_known_good, retained_refused) = Self::declared(
+            concluded,
+            record.last_known_good.clone(),
+            entry.last_known_good.clone(),
+        );
+        let (discovery, current_refused) =
+            Self::declared(concluded, record.discovery.clone(), entry.discovery.clone());
+        // A complete listing that no longer carries the target discredits a retained
+        // positive it does not predate, however the two arrived.
+        if let (Some(retained), Some(current)) = (&last_known_good, &discovery)
+            && current.is_definitive()
+            && !current.is_positive()
+            && current.observed_at >= retained.observed_at
+        {
+            last_known_good = None;
+        }
+        // The watermark only ever advances, so no redeclaration can forget that this
+        // key once reached a conclusive answer.
+        let definitive_at = [
+            concluded,
+            record.definitive_at,
+            discovery
+                .as_ref()
+                .filter(|held| held.is_definitive())
+                .map(|held| held.observed_at),
+            last_known_good.as_ref().map(|held| held.observed_at),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
         *entry = AvailabilityRecord {
-            discovery: entry.discovery.clone(),
-            last_known_good: entry.last_known_good.clone(),
-            definitive_at: entry.definitive_at.max(record.definitive_at),
-            ..record.clone()
+            discovery,
+            last_known_good,
+            definitive_at,
+            ..record
         };
-        // Declared retained evidence is judged for retention but never becomes the
-        // current look: the caller said it is what is being fallen back on, not what
-        // was last seen.
-        if let Some(retained) = &record.last_known_good
-            && !Self::retain(entry, retained)
-        {
-            self.superseded += 1;
-        }
-        if let Some(current) = record.discovery
-            && !Self::admit(entry, current)
-        {
-            self.superseded += 1;
-        }
+        self.superseded += usize::from(retained_refused) + usize::from(current_refused);
         self
+    }
+
+    /// Which look belongs in a slot after a declaration, and whether the declared
+    /// one was refused for predating what this key has already concluded.
+    fn declared(
+        concluded: Option<SystemTime>,
+        declared: Option<DiscoveryObservation>,
+        held: Option<DiscoveryObservation>,
+    ) -> (Option<DiscoveryObservation>, bool) {
+        match declared {
+            Some(look) if !Self::overturns(concluded, &look) => (held, true),
+            Some(look) => (Some(look), false),
+            None => (held, false),
+        }
     }
 
     /// Record a discovery observation.
@@ -447,11 +478,8 @@ impl AvailabilityIndexBuilder {
         self
     }
 
-    /// Apply one look to a record, whether it was observed or declared, returning
-    /// whether it became the current evidence.
-    ///
-    /// The single place the ordering rules live, so the declaring path cannot drift
-    /// from the observing one.
+    /// Apply an arriving look to a record, returning whether it became the current
+    /// evidence.
     fn admit(entry: &mut AvailabilityRecord, observation: DiscoveryObservation) -> bool {
         let overturns_conclusion = Self::retain(entry, &observation);
         // The current slot is the newest look, whatever it said, so an older
@@ -476,12 +504,25 @@ impl AvailabilityIndexBuilder {
     /// the retained evidence and the watermark, and returning whether it overturned
     /// what was concluded.
     fn retain(entry: &mut AvailabilityRecord, observation: &DiscoveryObservation) -> bool {
-        // A look that predates a conclusive answer overturns nothing — neither an
-        // older negative discrediting a later positive, nor an older positive
-        // resurrecting a target a later complete listing dropped — while a slow
-        // definitive look that lands after a newer *inconclusive* one still counts,
-        // and dropping it would cost the fallback an outage needs.
-        let overturns_conclusion = entry.definitive_at.is_none_or(|held| {
+        let overturns_conclusion = Self::overturns(entry.definitive_at, observation);
+        if observation.is_definitive() && overturns_conclusion {
+            // A complete look that no longer carries the target is the one thing
+            // that discredits retained positive evidence.
+            entry.last_known_good = observation.is_positive().then(|| observation.clone());
+            entry.definitive_at = Some(observation.observed_at);
+        }
+        overturns_conclusion
+    }
+
+    /// Whether a look can overturn the conclusion a key has already reached.
+    ///
+    /// A look that predates one overturns nothing — neither an older negative
+    /// discrediting a later positive, nor an older positive resurrecting a target a
+    /// later complete listing dropped — while a slow definitive look that lands after
+    /// a newer *inconclusive* one still counts, and dropping it would cost the
+    /// fallback an outage needs.
+    fn overturns(concluded: Option<SystemTime>, observation: &DiscoveryObservation) -> bool {
+        concluded.is_none_or(|held| {
             if observation.is_positive() {
                 // Strictly newer, so a positive and a complete negative bearing the
                 // same instant resolve the same way whichever lands first: the
@@ -491,14 +532,7 @@ impl AvailabilityIndexBuilder {
             } else {
                 observation.observed_at >= held
             }
-        });
-        if observation.is_definitive() && overturns_conclusion {
-            // A complete look that no longer carries the target is the one thing
-            // that discredits retained positive evidence.
-            entry.last_known_good = observation.is_positive().then(|| observation.clone());
-            entry.definitive_at = Some(observation.observed_at);
-        }
-        overturns_conclusion
+        })
     }
 
     /// How many observations did not advance the current slot because something

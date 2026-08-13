@@ -424,6 +424,47 @@ fn a_declared_stale_positive_cannot_resurrect_a_target_a_newer_listing_dropped()
     );
 }
 
+/// A record read out of one index survives being declared into another: a
+/// declaration carries a conclusion of its own, and judging its evidence against
+/// that conclusion rather than against the index's would discard the very evidence
+/// it was handing over.
+#[test]
+fn a_record_round_trips_through_a_fresh_builder_with_its_evidence_intact() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let derived = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, None))
+        .observe(outage(scope, "gpt-4o", 200))
+        .build();
+    let carried = derived
+        .record(&key(scope, "gpt-4o"))
+        .expect("the key is held")
+        .clone();
+
+    let builder = AvailabilityIndex::builder().record(key(scope, "gpt-4o"), carried.clone());
+    assert_eq!(
+        builder.superseded(),
+        0,
+        "its own history is not out of order"
+    );
+    let round_tripped = builder.build();
+    assert_eq!(
+        round_tripped.record(&key(scope, "gpt-4o")),
+        Some(&carried),
+        "a redeclaration of a derived record changes nothing about it"
+    );
+    assert_eq!(
+        round_tripped.evaluate(&key(scope, "gpt-4o"), at(300)),
+        derived.evaluate(&key(scope, "gpt-4o"), at(300)),
+        "including the outage fallback the retained evidence provides"
+    );
+    assert!(
+        round_tripped
+            .evaluate(&key(scope, "gpt-4o"), at(300))
+            .last_known_good
+    );
+}
+
 /// A policy denial outranks a positive listing, and a catalogue absence outranks
 /// the denial: the ladder is ordered, not a set of independent vetoes.
 #[test]
