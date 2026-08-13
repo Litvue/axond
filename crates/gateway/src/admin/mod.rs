@@ -28,6 +28,7 @@
 //! | [`reads`] | bounded read projections: state, history, audit, convergence |
 //! | [`catalogue`] | the tenant-scoped management catalogue: what a tenant has enabled, and why a model is not routable |
 //! | [`resources`] | the typed request documents, and the edits they become |
+//! | [`mod@secrets`] | the credential lifecycle: material in, references out, never the reverse |
 //! | [`service`] | the one path a mutation takes: mode, authority, read, validate, diff, publish |
 //! | [`handlers`] | the routes themselves: parse, plan, delegate |
 //! | [`mod@router`] | the route table, its authentication layer, and its precondition layer |
@@ -91,6 +92,7 @@ pub mod reads;
 pub mod resources;
 pub mod router;
 pub mod runtime;
+pub mod secrets;
 pub mod service;
 
 #[cfg(test)]
@@ -134,6 +136,11 @@ pub use resources::{
 pub use router::{AdminApi, AdminRouteSpec, admin_route_specs, router};
 #[allow(unused_imports)]
 pub use runtime::{BreakglassAuthenticator, BreakglassAuthorizer};
+#[allow(unused_imports)]
+pub use secrets::{
+    PresentedMaterial, RotateSecretRequest, SecretLifecycleRequest, SecretTransitionView,
+    SecretVersionView, SecretVersionsView, StageSecretRequest,
+};
 #[allow(unused_imports)]
 pub use service::{
     AdminService, AvailabilityAuthority, DesiredStateEdit, MutationOutcome, MutationResult,

@@ -299,6 +299,30 @@ pub fn admin_route_specs() -> Vec<AdminRouteSpec> {
             action: AdminAction::Publish,
             router: handlers::publish_route::<PolicyRequest>,
         },
+        // Material, not documents: the four rows that make a credential
+        // rotatable without a redeploy. None of them publishes a revision, so
+        // none of them carries the mutation preconditions — see
+        // [`super::secrets`].
+        AdminRouteSpec {
+            path: "/secrets",
+            action: AdminAction::WriteSecrets,
+            router: handlers::stage_secret_route,
+        },
+        AdminRouteSpec {
+            path: "/secrets/rotate",
+            action: AdminAction::WriteSecrets,
+            router: handlers::rotate_secret_route,
+        },
+        AdminRouteSpec {
+            path: "/secrets/lifecycle",
+            action: AdminAction::WriteSecrets,
+            router: handlers::secret_lifecycle_route,
+        },
+        AdminRouteSpec {
+            path: "/secrets/{secret}",
+            action: AdminAction::ReadSecrets,
+            router: handlers::secret_versions_route,
+        },
         AdminRouteSpec {
             path: "/rollback",
             action: AdminAction::Rollback,

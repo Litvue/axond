@@ -34,6 +34,12 @@ unchanged by it. This page is the evidence for them under stateful mode.
 - **Retired material is destroyed.** Tombstoning a version removes the material
   rather than relabelling it; afterwards the version does not resolve and does
   not exist.
+- **The administrative surface takes material and never gives it back.**
+  `/admin/v1/secrets` stores, rotates, and withdraws material; every response is
+  a reference, an owner, and a lifecycle state, and the store behind it exposes
+  no method that returns material stored earlier. A malformed body that carries
+  material is refused without echoing the input, and destruction is refused with
+  `secret_in_use` while the current revision would still resolve the version.
 - **Material is not reachable from an operational surface.** Response bodies and
   headers, logs at every level, spans, usage records, and status responses are
   swept for it.
@@ -127,3 +133,18 @@ identity model. Stateful `serve` is still not wired for the same reason.
 The `/admin/v1` boundary is swept over its real route table and the real Postgres
 journal, with authentication and authorization faked — an administrator's
 identity is #252's, and no administrative response is shaped by who asked for it.
+
+The authenticated `/admin/v1` lifecycle *is* on this branch, and is asserted end
+to end over the mounted route table in `crates/gateway/src/admin/api_tests.rs`:
+storing, rotating, overlapping versions, activation, withdrawal, deletion safety
+against the current revision, cross-tenant isolation, a store outage, and a
+malformed body that carries material — each checking that neither the material
+nor a twelve-character prefix of it reaches the caller. The administrative
+*reads* that page is responsible for remain asserted at the store level
+(`load_manifest`, `load_revision`, `audit_trail`, idempotency replay), which is
+where their payloads are built.
+
+Automatic cutover is still not wired: `serve` mounts the administrative surface
+but constructs no reconciler (#142), so a published credential becomes servable
+when a compiler runs — which the convergence tests drive — rather than on a
+running replica's own loop.

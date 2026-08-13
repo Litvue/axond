@@ -1657,6 +1657,28 @@ fn every_declared_code_is_reachable_distinct_and_prose_free() {
         },
         AdminError::RouteNotFound,
         AdminError::MethodNotAllowed,
+        // The secret-store arms. Each holds a reference or a backend detail;
+        // none of them can hold material, which is what the redaction assertion
+        // below covers for the whole vocabulary at once.
+        AdminError::SecretStoreUnavailable {
+            detail: SECRET_LOOKING.to_owned(),
+        },
+        AdminError::SecretNotFound {
+            reference: crate::desired_state::fixtures::secret_ref_at(1, 1),
+        },
+        AdminError::SecretLifecycleRefused {
+            reference: crate::desired_state::fixtures::secret_ref_at(1, 1),
+            detail: "a revoked version is not resolvable".to_owned(),
+        },
+        AdminError::SecretInUse {
+            reference: crate::desired_state::fixtures::secret_ref_at(1, 1),
+        },
+        AdminError::SecretMaterialRefused {
+            detail: "material is empty".to_owned(),
+        },
+        AdminError::SecretStoreUnusable {
+            detail: SECRET_LOOKING.to_owned(),
+        },
     ];
 
     let codes: Vec<&'static str> = errors.iter().map(AdminError::code).collect();
@@ -2203,7 +2225,7 @@ async fn every_shipped_route_authenticates_before_it_answers_anything_about_stat
         // A path parameter is filled with a syntactically plausible value, so a
         // `404` cannot stand in for the authentication this asserts.
         let path = format!("{ADMIN_PREFIX}{}", spec.path).replace("{revision}", "not-a-revision");
-        let builder = if spec.action.mutates() {
+        let builder = if spec.action.writes() {
             Request::post(&path)
         } else {
             Request::get(&path)

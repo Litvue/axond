@@ -31,6 +31,7 @@ use super::service::AdminService;
 use crate::availability::AvailabilityReader;
 use crate::backends::control_plane::postgres::{ControlPlaneSettings, PostgresControlPlane};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
+use crate::backends::secrets::SecretError;
 use crate::config::{AdminBreakglass, Config, KeyMaterialSource, Mode};
 use crate::desired_state::ResourceScope;
 use crate::key_material::{self, KeyMaterialError};
@@ -56,6 +57,20 @@ pub enum BootError {
     // The reference is named, never the value: a DSN carries a password.
     #[error("the control-plane DSN reference `{name}` is unset or empty")]
     MissingDsn { name: String },
+    /// The secret store could not be opened. A stateful deployment that came up
+    /// without it would answer every credential-material call `503` and — worse
+    /// — would compile candidate revisions that resolve nothing, so the boot
+    /// fails here instead.
+    ///
+    /// The [`SecretError`] arms name references, owners, and backends, never
+    /// material or a KEK, so this is safe to print at boot.
+    #[error("the secret store could not be opened: {0}")]
+    SecretStore(#[from] SecretError),
+    #[error(
+        "`mode = \"stateful\"` requires `[secret_store]`, which configuration validation should \
+         already have required"
+    )]
+    MissingSecretStore,
 }
 
 /// Build the `/admin/v1` surface this process serves.
@@ -108,8 +123,18 @@ pub async fn surface(config: &Config, env: &HashMap<String, String>) -> Result<S
     let pacing = ControlPlaneProbe::pacing(&settings);
     let store: Arc<dyn ControlPlaneStore> =
         Arc::new(PostgresControlPlane::connect(dsn, settings).await?);
+    // Opened at boot, for the reason the control plane is: the deployment that
+    // cannot reach its material cannot rotate a credential, and finding that out
+    // during an incident is finding it out too late. Configuration validation
+    // already requires `[secret_store]` in stateful mode; this is the refusal for
+    // the case it did not run.
+    let secret_store = config
+        .secret_store
+        .as_ref()
+        .ok_or(BootError::MissingSecretStore)?;
+    let secrets = crate::backends::secrets::build(secret_store, control_plane, env).await?;
     let api = AdminApi::new(
-        Arc::new(AdminService::stateful(Arc::clone(&store))),
+        Arc::new(AdminService::stateful(Arc::clone(&store)).with_secrets(secrets)),
         Arc::new(authenticator),
         Arc::new(BreakglassAuthorizer),
     );

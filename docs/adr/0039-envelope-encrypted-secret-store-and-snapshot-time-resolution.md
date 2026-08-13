@@ -103,6 +103,39 @@ the last request compiled against it finishes. That is the strongest honest
 statement available: revocation stops *new* candidates resolving a version
 immediately, and stops the last in-flight request using it when that request ends.
 
+**The lifecycle is administered over `/admin/v1/secrets`, and material moves one
+way.** A stateful boot opens the configured store beside the control plane and
+hands it to the administrative service, which is the *only* component holding
+it: four routes take material and answer with a reference, an owner, and a
+lifecycle state, and there is no method on `SecretStore` — and so no route —
+that returns material stored earlier. This is what makes the lifecycle
+zero-redeploy: a key is stored, staged, activated, withdrawn, and destroyed
+without a TOML edit or a process restart.
+
+Three properties follow from where the routes sit rather than from a rule:
+
+- **They publish no revision**, and so carry no idempotency key and no expected
+  revision: storing material changes nothing a request can observe until a
+  credential document pins it. Retries are safe because staging mints a fresh
+  version and a lifecycle move to a state a version already holds is
+  `Unchanged`.
+- **They cannot be reached from the request path.** The store arrives through
+  the administrative service, which the inference router has no handle to.
+- **Destruction is ordered behind desired state.** `tombstoned` is refused with
+  `secret_in_use` while the current revision would still resolve the version;
+  `revoked` and `disabled` never are, because a leaked key must be withdrawable
+  at once, and withdrawing it is exactly what fails the *next* candidate while
+  the last-known-good snapshot keeps serving.
+
+**KEK rotation is an operator procedure, not a service.** The deployment KEK is
+referenced by `[secret_store]` and read once at boot, and this ADR deliberately
+ships no hosted key manager: rotating it means standing up the replacement
+reference, restaging each secret as a new version under the new key, publishing
+credentials that pin the new versions, and destroying the old ones — the same
+four operations a credential rotation uses, which is why they are the whole
+administrative surface. An external key manager is a later adapter behind the
+same trait.
+
 **Stateless mode is untouched.** `ConfigSnapshot::build` is the same call with an
 empty material set, so `[[credential]]`, `env:`, and `file:` references resolve
 exactly as they did before any of this existed, and a deployment with no secret
@@ -141,6 +174,14 @@ is what an operator applies by hand and what the deployment docs point at;
 `create_table = true`. They are byte-identical and a test enforces that. Per
 [ADR 0009](./0009-durable-usage-sinks.md), a row-shape change is a new
 `secret_store_v<N>.sql`, never an edit to this one.
+
+**The convergence loop is still not constructed by `serve`.** Compilation
+resolves material through this store wherever a `RevisionCompiler` is built, and
+the compiler already takes the store; what `serve` mounts today is the
+administrative surface, not a running reconciler (#142). Nothing here is
+conditional on that wiring — a rotation is administrable now — but a stateful
+deployment's *automatic* cutover arrives with the loop, and until then the
+boundary is stated rather than papered over with a request-path read.
 
 **Security review is triggered and narrow.** This fires threat-model trigger 3
 (`SecretStore`, credential delivery, rotation, redaction). Plaintext exists in two

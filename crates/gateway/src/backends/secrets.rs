@@ -53,6 +53,7 @@ use secrecy::zeroize::Zeroize;
 use secrecy::{ExposeSecret, SecretString};
 
 use super::{BackendFailure, BackendKind, Capabilities, Capability, FailureCategory};
+use crate::desired_state::ids::SecretId;
 use crate::desired_state::secrets::{
     ForbiddenTransition, LifecycleTransition, SecretLifecycle, SecretOwner, SecretRef,
 };
@@ -351,6 +352,23 @@ pub trait SecretStore: SecretResolver {
         owner: SecretOwner,
         reference: &SecretRef,
     ) -> Result<SecretDescriptor, SecretError>;
+
+    /// Every version of one secret this owner holds, oldest version first.
+    ///
+    /// The overlap a rotation creates is only administrable if it is visible: an
+    /// operator activating a staged version, and then withdrawing the one it
+    /// supersedes, is acting on two versions that exist at once. This is the read
+    /// that shows both, and — like [`SecretStore::describe`] — it unwraps
+    /// nothing.
+    ///
+    /// A secret another owner holds answers with no versions, exactly as one that
+    /// was never stored does, so listing is not a way to learn that a foreign
+    /// secret exists.
+    async fn versions(
+        &self,
+        owner: SecretOwner,
+        secret: SecretId,
+    ) -> Result<Vec<SecretDescriptor>, SecretError>;
 }
 
 /// Build the configured store, resolving its DSN and its KEK from the

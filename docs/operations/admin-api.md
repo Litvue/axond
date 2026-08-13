@@ -139,6 +139,23 @@ record, or a state read.
 | `/admin/v1/aliases` | `POST` | A routing alias and its ordered targets. |
 | `/admin/v1/policies` | `POST` | Budgets, concurrency limits, and token epoch for a scope. |
 | `/admin/v1/rollback` | `POST` | Republish an earlier revision's complete state as a *new* revision. |
+| `/admin/v1/secrets` | `POST` | Store credential material as a new secret's first version, staged. |
+| `/admin/v1/secrets/rotate` | `POST` | Store material as the *next* version of an existing secret, staged. |
+| `/admin/v1/secrets/lifecycle` | `POST` | Move one version: `active`, `disabled`, `revoked`, `tombstoned`. |
+| `/admin/v1/secrets/{secret}` | `GET` | Every version of one secret, with its state and whether it still resolves. |
+
+The four `secrets` rows are the only place material crosses this boundary, and
+it crosses one way: they take material and answer with a reference, an owner,
+and a lifecycle state. No route — and no method on the store behind them —
+returns material that was stored earlier, so an administrator who can rotate a
+provider key cannot read the one in service.
+
+They are also the only writes that carry no idempotency key and no expected
+revision, because they publish no revision: storing material changes nothing a
+request can observe until a credential document pins it. What stands in for the
+preconditions is the shape of the operations — staging mints a fresh version
+rather than overwriting one, and a lifecycle move to the state a version already
+holds answers `"changed": false`, so a retry is not a second change.
 
 An availability read names which authority refused — the catalogue, the
 enablement, the tenant's entitlement, policy, discovery, or this replica's own
@@ -339,6 +356,48 @@ therefore no way to hand a retired project's name to a new one — publish the n
 project under a different slug, or rename the retired project by publishing it
 with the slug you want it to keep.
 
+### Rotating a provider credential without a redeploy
+
+Material and the document that points at it are separate changes on purpose: the
+new version is stored and provable while the old one keeps serving, and the
+cutover is one ordinary publication whose rollback is another.
+
+```console
+$ printf %s "$NEW_KEY" | axond admin secret rotate --tenant ten_01J... \
+    --reference sct_01J...@v1                       # stages sct_01J...@v2
+$ axond admin secret lifecycle --tenant ten_01J... --reference sct_01J...@v2 --state active
+$ axond admin apply --resource credentials --file credential-v2.json \
+    --idempotency-key rotate-openai-1 --expected-revision rev_01J...
+$ axond admin secret lifecycle --tenant ten_01J... --reference sct_01J...@v1 --state disabled
+$ axond admin secret versions --secret sct_01J... --tenant ten_01J...
+```
+
+Material is read from a file or standard input, never from a flag, for the same
+reason `AXOND_ADMIN_TOKEN` is an environment variable.
+
+The credential document names `secret` and `secret_version`; publishing it is
+what makes the new version servable, because material is resolved while a
+candidate snapshot is compiled and never on a request. A version that cannot be
+resolved — disabled, revoked, destroyed, or unreachable — therefore **fails the
+candidate** and leaves the last-known-good snapshot serving. Cutting over to a
+version that was never activated is a failed publication, not an outage.
+
+Rolling a rotation back is publishing the previous credential document again, or
+`axond admin rollback`: the old version is still there, still resolvable, until
+it is withdrawn.
+
+Withdrawal has two strengths:
+
+- **`revoked` and `disabled`** stop the *next* candidate from resolving the
+  version and are never gated: a leaked key must be withdrawable immediately.
+  The snapshot serving requests at that moment holds its own resolved copy and
+  keeps serving until a candidate replaces it — the same last-known-good
+  behaviour every other convergence failure has.
+- **`tombstoned`** destroys the material. It is refused with `secret_in_use`
+  while the current revision still pins the version, so the order is: publish a
+  credential that no longer resolves it, then destroy. The plaintext a running
+  replica already resolved is zeroized once no active snapshot holds it.
+
 ### Refreshing a model catalogue
 
 A catalogue resource *is* its snapshot: an enablement records the digest it read
@@ -426,6 +485,19 @@ $ axond admin rollback --revision rev_01J... --summary "undo the bad alias" \
 
 A refusal is printed as the gateway sent it, typed `code` included, and exits
 non-zero.
+
+`axond admin secret` is the credential lifecycle, and reads material from
+`--material-file` or standard input:
+
+```console
+$ axond admin secret stage     --tenant ten_01J... --material-file ./key.txt
+$ axond admin secret rotate    --tenant ten_01J... --reference sct_01J...@v1 -f -
+$ axond admin secret lifecycle --tenant ten_01J... --reference sct_01J...@v2 --state active
+$ axond admin secret versions  --secret sct_01J... --tenant ten_01J...
+```
+
+One trailing newline is stripped and nothing else is, so `printf %s` and a file
+written by an editor both store the key the operator holds.
 
 ## Related
 

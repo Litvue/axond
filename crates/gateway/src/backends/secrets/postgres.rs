@@ -45,7 +45,9 @@ use super::{
     ENVELOPE_CAPABILITIES, KekRef, SecretDescriptor, SecretError, SecretMaterial, SecretResolver,
     SecretStore,
 };
-use crate::desired_state::secrets::{LifecycleTransition, SecretLifecycle, SecretOwner, SecretRef};
+use crate::desired_state::secrets::{
+    LifecycleTransition, SecretLifecycle, SecretOwner, SecretRef, SecretVersion,
+};
 use crate::desired_state::{SecretId, Uuid7Generator};
 
 const BACKEND: &str = "encrypted-postgres";
@@ -620,6 +622,47 @@ impl SecretStore for PostgresSecrets {
                     .map_err(|error| unavailable("describe secret version", &error))?
                     .ok_or(SecretError::NotFound(reference))?;
                 Self::descriptor_of(&row, owner, &reference)
+            })
+        })
+        .await
+    }
+
+    async fn versions(
+        &self,
+        owner: SecretOwner,
+        secret: SecretId,
+    ) -> Result<Vec<SecretDescriptor>, SecretError> {
+        self.run(|client| {
+            Box::pin(async move {
+                let rows = client
+                    .query(
+                        "SELECT version, tenant_id, project_id, lifecycle FROM axond_secret \
+                         WHERE secret_id = $1 ORDER BY version",
+                        &[&secret.to_string()],
+                    )
+                    .await
+                    .map_err(|error| unavailable("list secret versions", &error))?;
+                let mut descriptors = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let stored: i64 = row.get("version");
+                    let version = u64::try_from(stored)
+                        .ok()
+                        .and_then(SecretVersion::new)
+                        .ok_or_else(|| {
+                            SecretError::Invalid(format!(
+                                "secret {secret} holds version `{stored}`, which is not a version"
+                            ))
+                        })?;
+                    let reference = SecretRef::new(secret, version);
+                    match Self::descriptor_of(row, owner, &reference) {
+                        Ok(descriptor) => descriptors.push(descriptor),
+                        // Another owner's rows answer as absent ones do, so a
+                        // listing cannot be used to enumerate foreign material.
+                        Err(SecretError::Ownership { .. }) => return Ok(Vec::new()),
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(descriptors)
             })
         })
         .await
