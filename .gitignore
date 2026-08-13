@@ -10,3 +10,7 @@
 # Python bytecode from the SDK compatibility lane
 __pycache__/
 .pytest_cache/
+
+# Installed and compiled output of the TypeScript compatibility lane
+/tests/compat-ts/node_modules/
+/tests/compat-ts/build/

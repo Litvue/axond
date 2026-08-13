@@ -73,6 +73,20 @@ compat:
     target/compat-venv/bin/pip install --quiet --require-virtualenv --require-hashes -r tests/compat/requirements.txt
     AXOND_BIN="$(pwd)/target/debug/axond" target/compat-venv/bin/python -m pytest tests/compat -q
 
+# The same compatibility claim through the vendors' Node SDKs, which also
+# type-checks the calls against the SDKs' own definitions. Offline; needs the
+# Node version pinned in tests/compat-ts/.nvmrc.
+compat-ts:
+    cargo build -p axond --locked
+    ops/compat-ts-pins.py
+    cd tests/compat-ts && npm ci --ignore-scripts
+    cd tests/compat-ts && AXOND_BIN="$(git rev-parse --show-toplevel)/target/debug/axond" npm test
+
+# Pin policy for the TypeScript lane: exact versions, locked hashes, pinned Node.
+compat-ts-pins:
+    ops/compat-ts-pins.py --self-test
+    ops/compat-ts-pins.py
+
 # Refresh the hash-pinned provider-SDK lockfile, excluding releases newer than a week.
 compat-lock:
     uv pip compile --generate-hashes --universal --python-version 3.10 --exclude-newer "$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"))')" -o tests/compat/requirements.txt tests/compat/requirements.in

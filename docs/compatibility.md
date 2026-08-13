@@ -73,11 +73,36 @@ Point any OpenAI-compatible or Anthropic SDK at the gateway's base URL with a
 gateway key as its API key. Both `Authorization: Bearer <token>` and
 `x-api-key: <token>` are accepted, so an Anthropic SDK's default works unchanged.
 
-Compatibility is enforced by CI, not asserted: a required lane drives a real
-`axond` process with the vendors' own Python SDKs — `openai==2.50.0` and
-`anthropic==0.120.0`, pinned exactly — against committed wire fixtures, with no
-provider account and no network
+Compatibility is enforced by CI, not asserted: two required lanes drive a real
+`axond` process with the vendors' own SDKs against committed wire fixtures, with
+no provider account and no network
 ([ADR 0014](./adr/0014-compatibility-and-soak-harness.md)).
+
+| Runtime | SDKs | Lane |
+| --- | --- | --- |
+| Python 3.12 | `openai==2.50.0`, `anthropic==0.120.0` | [`tests/compat`](../tests/compat) |
+| Node 22 | `openai@7.4.0`, `@anthropic-ai/sdk@0.115.0` | [`tests/compat-ts`](../tests/compat-ts) |
+
+Every version above is pinned exactly, including the Node runtime, so a failure
+means a *release* changed the wire rather than that a range floated. The
+TypeScript lane is compiled with `tsc --strict` before it runs, so it also holds
+the gateway to what the SDKs' own type definitions describe — including those
+definitions themselves, since `skipLibCheck` is deliberately off: a release whose
+shipped `.d.ts` no longer type-checks is a compatibility fact about that release.
+Those two failures are not the same claim, so the lane's build labels which one
+broke — declarations, before any request was made, or a call the SDKs' types
+reject — and [`tests/compat-ts/README.md`](../tests/compat-ts/README.md) says
+what each calls for.
+
+Both lanes cover buffered and streamed chat, Responses, embeddings, native
+Anthropic Messages with thinking and tool-use blocks, the `/v1/models` catalogue,
+rejection of an unknown gateway key, and — the property no unit test can see —
+that the credential reaching the upstream is the *provider's*, never the caller's
+gateway key.
+
+**Go is deliberately not covered.** A third runtime would re-assert the same
+wire; the case for one is the stateful/admin API, which is not stable yet, so
+it is revisited when that surface is.
 
 ## Supported platforms
 
@@ -303,7 +328,7 @@ claim here cannot drift from what CI and the release actually do:
 | --- | --- | --- |
 | Supported versions for fixes | [`SECURITY.md`](../SECURITY.md) — latest `0.x` release plus the immediately previous minor, security fixes only | the release/backport process |
 | Release targets | the `binaries` matrix in [`release-please.yml`](../.github/workflows/release-please.yml), listed under [supported platforms](#supported-platforms) above: six archive targets plus the `linux/amd64` + `linux/arm64` image index | the release workflow; on every change the `binary-smoke` matrix boots each target on a runner of its own platform, the musl `static-binary` lane adds the Tier 0 network-denial gate, and `docker-smoke` covers the image |
-| Provider-SDK compatibility | [`tests/compat/requirements.in`](../tests/compat/requirements.in) (exact pins, hash-locked in `requirements.txt`) | the required `sdk-compat` lane against committed fixtures ([ADR 0014](./adr/0014-compatibility-and-soak-harness.md)) |
+| Provider-SDK compatibility | [`tests/compat/requirements.in`](../tests/compat/requirements.in) (exact pins, hash-locked in `requirements.txt`) and [`tests/compat-ts/package.json`](../tests/compat-ts/package.json) with [`.nvmrc`](../tests/compat-ts/.nvmrc) (exact pins, hash-locked in `package-lock.json`) | the required `sdk-compat` and `sdk-compat-ts` lanes against committed fixtures ([ADR 0014](./adr/0014-compatibility-and-soak-harness.md)) |
 | Rust floor and published API | `rust-version` in [`Cargo.toml`](../Cargo.toml); [`ops/api-compat-overrides.toml`](../ops/api-compat-overrides.toml) for accepted breaks | the required `msrv` and `api-compat` lanes |
 
 Adding a target, an SDK, or a supported version means editing the owner file
@@ -330,5 +355,6 @@ What is *not* covered: the hermetic Tier 0 gate applies to
 `x86_64-unknown-linux-musl` alone on every change — every Linux archive passes
 through it at release time, but there with the namespace treated as best-effort
 ([ADR 0018](./adr/0018-tier-0-hermetic-boot-gate.md)) — the smoke exercises one
-buffered fixture request rather than streaming or a real provider, and only the
-Python SDKs are exercised end to end.
+buffered fixture request rather than streaming or a real provider, and the SDKs
+exercised end to end are the Python and Node ones above — no Go SDK, and no other
+runtime.
