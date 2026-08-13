@@ -225,7 +225,10 @@ pub(super) fn plan(
             activation.live.push(*scope);
             continue;
         };
-        if current.body == published.body && current.generation == published.generation {
+        // `same_policy`, not equality: a generation names the revision that
+        // published it, and every revision restates every document, so an
+        // unrelated change would otherwise activate policy that never moved.
+        if current.body == published.body && current.generation.same_policy(&published.generation) {
             continue;
         }
         let transition = current.body.transition(&published.body);
@@ -262,10 +265,17 @@ pub(super) fn plan(
         if candidate.published().contains_key(scope) {
             continue;
         }
-        if candidate.names(&current.namespace) {
+        // A tenant document governs every one of its projects' namespaces, and
+        // one of them still being served is enough: the others going away does
+        // not make the survivor's cap withdrawable.
+        if let Some(served) = current
+            .namespaces
+            .iter()
+            .find(|namespace| candidate.names(namespace))
+        {
             return Err(ActivationRefusal::Withdrawn {
                 scope: *scope,
-                namespace: current.namespace.clone(),
+                namespace: served.clone(),
             });
         }
         activation.withdrawn.push(*scope);
@@ -516,6 +526,91 @@ mod tests {
         let activation = plan(&view(&document, 1), &empty(), shared())
             .expect("a deleted namespace is not a gap");
         assert_eq!(activation.withdrawn(), [scope()]);
+    }
+
+    /// A tenant document governs every namespace its projects have, so one of
+    /// them being deleted does not make the rest withdrawable.
+    #[test]
+    fn a_tenant_document_is_only_withdrawable_when_every_namespace_it_governs_is_gone() {
+        let document = body(scope(), 1, 1_000);
+        let policy = NamespacePolicy {
+            body: document,
+            generation: generation(&document, 1),
+        };
+        let mut both = stateful_config();
+        both.namespace.push(crate::policy::view::tests::projected(
+            "acme/core",
+            Some(policy),
+        ));
+        both.namespace.push(crate::policy::view::tests::projected(
+            "acme/edge",
+            Some(policy),
+        ));
+        let active = PolicyView::of(&both);
+
+        // One project deleted, its sibling still served and still capped by the
+        // same document: dropping the document would uncap the survivor.
+        let mut survivor = stateful_config();
+        survivor
+            .namespace
+            .push(crate::policy::view::tests::projected("acme/edge", None));
+        let refusal = plan(&active, &PolicyView::of(&survivor), shared())
+            .expect_err("a sibling namespace is still governed by this document");
+        assert_eq!(refusal.reason(), "withdrawn");
+        assert!(refusal.to_string().contains("acme/edge"), "{refusal}");
+
+        let activation = plan(&active, &empty(), shared())
+            .expect("every namespace the document governed is gone");
+        assert_eq!(activation.withdrawn(), [scope()]);
+    }
+
+    /// A revision that moved an unrelated resource restates every document under
+    /// its own id. Nothing about enforcement changed, so nothing activates.
+    #[test]
+    fn a_document_restated_by_a_later_revision_is_not_a_transition() {
+        let document = body(scope(), 1, 1_000);
+        let activation = plan(&view(&document, 1), &view(&document, 2), shared())
+            .expect("a restatement is enforceable");
+        assert!(
+            activation.is_noop(),
+            "the same policy, published again: {activation:?}"
+        );
+    }
+
+    /// Every refusal is counted and reported, so every label it produces has to
+    /// be one the metric and status vocabularies declared.
+    #[test]
+    fn every_refusal_reason_is_a_catalogued_revision_label() {
+        let refusals = [
+            ActivationRefusal::Unsupported {
+                scope: scope(),
+                detail: String::new(),
+            },
+            ActivationRefusal::Migration {
+                scope: scope(),
+                detail: String::new(),
+            },
+            ActivationRefusal::Refused {
+                scope: scope(),
+                detail: String::new(),
+            },
+            ActivationRefusal::Withdrawn {
+                scope: scope(),
+                namespace: "acme/core".to_owned(),
+            },
+        ];
+        for refusal in refusals {
+            let reason = refusal.reason();
+            assert!(
+                crate::convergence::reconciler::REVISION_REASONS.contains(&reason),
+                "`{reason}` is a label a refused publication produces"
+            );
+            assert_eq!(
+                crate::status::StatusReason::from_revision_reason(reason),
+                crate::status::StatusReason::PolicyRejected,
+                "`{reason}` reaches the status contract as a decided code"
+            );
+        }
     }
 
     /// Nothing about a stateless deployment reaches activation: there are no

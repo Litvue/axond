@@ -51,7 +51,7 @@ Reasons come from a closed list — `unavailable`, `unreachable`, `timeout`,
 `authentication_rejected`, `permission_denied`, `schema_incompatible`,
 `payload_corrupt`, `validation_rejected`, `projection_rejected`,
 `snapshot_rejected`, `pricing_rejected`, `clock_unsynchronised`,
-`secret_unresolved`, `stale`, `not_configured`, `draining`,
+`policy_rejected`, `secret_unresolved`, `stale`, `not_configured`, `draining`,
 `capacity_exhausted`, `unknown` — and treat an unrecognised one as opaque, since
 codes are added additively. There is deliberately no free-text field: connection
 strings, tokens, raw backend errors, and rejected-revision details are logged for

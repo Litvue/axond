@@ -93,8 +93,11 @@ impl ActivePolicy {
 pub(super) struct Published {
     pub(super) body: PolicyBody,
     pub(super) generation: PolicyGeneration,
-    /// The namespace this document governs, for refusals an operator reads.
-    pub(super) namespace: String,
+    /// Every namespace this document governs, for refusals an operator reads.
+    /// A tenant document governs each of its projects' namespaces, so a
+    /// withdrawal has to be judged against all of them, not against whichever
+    /// one happened to be seen last.
+    pub(super) namespaces: Vec<String>,
 }
 
 /// Every value this replica enforces, keyed the two ways it is asked for them:
@@ -126,14 +129,15 @@ impl PolicyView {
         for namespace in &config.namespace {
             let policy = match &namespace.policy {
                 Some(policy) => {
-                    published.insert(
-                        policy.body.scope(),
-                        Published {
+                    published
+                        .entry(policy.body.scope())
+                        .or_insert_with(|| Published {
                             body: policy.body,
                             generation: policy.generation,
-                            namespace: namespace.id.clone(),
-                        },
-                    );
+                            namespaces: Vec::new(),
+                        })
+                        .namespaces
+                        .push(namespace.id.clone());
                     ActivePolicy::published(&policy.body, policy.generation)
                 }
                 None if stateful && namespace.project.is_some() => ActivePolicy::default(),
@@ -161,10 +165,18 @@ impl PolicyView {
     }
 
     /// Whether this view enforces `generation` for any namespace.
+    ///
+    /// Compared with [`PolicyGeneration::same_policy`] rather than equality: a
+    /// generation names the revision that published it, and every revision
+    /// restates every document, so a revision that moved an unrelated resource
+    /// would otherwise make every hold taken before it look like the leftover of
+    /// a superseded policy.
     pub fn enforces(&self, generation: PolicyGeneration) -> bool {
-        self.by_namespace
-            .values()
-            .any(|policy| policy.generation == Some(generation))
+        self.by_namespace.values().any(|policy| {
+            policy
+                .generation
+                .is_some_and(|active| active.same_policy(&generation))
+        })
     }
 
     /// Every published document, ordered by scope.
@@ -315,5 +327,12 @@ dsn_env = "GW_BUDGET_REDIS"
         assert_eq!(policy.generation, Some(generation));
         assert!(view.enforces(generation));
         assert!(view.names("acme/core"));
+
+        // A later revision that touched something else restates this document
+        // verbatim under its own id. That is the same policy, still enforced —
+        // not a generation this replica has stopped serving.
+        let restated = crate::policy::fixtures::generation(&document, 8);
+        assert_ne!(restated, generation, "a new revision, a new generation");
+        assert!(view.enforces(restated));
     }
 }

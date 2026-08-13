@@ -68,7 +68,31 @@ Which datastore to select for what:
 
 Values are read **per admission** from the active view. A publication never
 rebuilds a store, reconnects a pool, or changes a DSN, key prefix, table, or the
-`on_unavailable` stance — those stay bootstrap-owned and unpublishable.
+`on_unavailable` stance — those stay bootstrap-owned and unpublishable. The caps
+a request is checked against and the generation stamped on its hold come from a
+single read of that view, so a publication landing mid-admission can never grant
+one document's limits under another's name.
+
+### An ungoverned namespace denies, whatever `on_unavailable` says
+
+In a stateful deployment, a projected namespace with no document has **no
+enforceable cap**, and every request for it is denied — a `503`, with the
+namespace named in the log — *regardless* of `on_unavailable`. This is
+deliberate and is the one place the fail-open stance does not apply:
+
+- `on_unavailable = "allow"` answers the question "the store that holds the
+  limits is unreachable — admit anyway?". Here the store is fine; what is
+  missing is the limit itself.
+- An unenforced cap and an infinite one are indistinguishable to a caller, and
+  only one of them is what an operator published. Admitting would spend real
+  money against a cap nobody set.
+
+So during a rollout gap — the fleet is stateful, but the revision that publishes
+the documents has not landed — a fail-open deployment still 503s the projected
+namespaces. Publish a tenant-level document as the floor **before** projecting
+namespaces to it; the preflight table's "every projected namespace is governed"
+row is that check. Namespaces the bootstrap file declares are unaffected: they
+keep being governed by the file that declared them.
 
 ## Classification: live, drain, migration, refused
 

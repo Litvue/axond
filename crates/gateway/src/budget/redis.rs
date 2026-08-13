@@ -811,13 +811,14 @@ impl BudgetStore for RedisBudget {
         // Read once, and carry what was read: the caps, and the generation that
         // stated them. A publication landing between here and the settlement
         // binds the *next* request, never this one.
-        let Some(caps) = self.settings.caps(BACKEND, &key.namespace) else {
+        let Some(governing) = self.settings.caps(BACKEND, &key.namespace) else {
             return Admission::Denied(Denial::StoreUnavailable);
         };
+        let caps = governing.caps;
         let reservation = Reservation {
             id: Reservation::next_id(),
             estimate_microdollars: estimated_microdollars,
-            generation: self.settings.generation(&key.namespace),
+            generation: governing.generation,
         };
         let ttl_ms = caps.reservation_ttl.as_millis() as u64;
         let mut invocation = self.script(&self.reserve, key);

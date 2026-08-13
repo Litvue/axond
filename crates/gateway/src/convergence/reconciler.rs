@@ -187,6 +187,12 @@ pub const REVISION_REASONS: &[&str] = &[
     "pricing",
     "clock",
     "snapshot",
+    // The refusals a published policy can draw before it is enforced
+    // ([`crate::policy::ActivationRefusal::reason`]).
+    "unsupported",
+    "migration",
+    "refused",
+    "withdrawn",
 ];
 
 /// The reason label for a store failure. Exhaustive, so a new

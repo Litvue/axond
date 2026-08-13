@@ -595,15 +595,20 @@ impl SharedSettings {
         self.namespace_scope
     }
 
-    /// The caps governing `namespace`, or `None` when this replica holds no
-    /// enforceable policy for it.
+    /// The caps governing `namespace` and the generation that stated them, or
+    /// `None` when this replica holds no enforceable policy for it.
     ///
     /// A store that cannot answer "what is the cap here" must not admit: an
     /// unenforced cap and an infinite one are indistinguishable to a caller, and
     /// only one of them is what an operator published. The layout is checked with
     /// it, so a view whose scope-wide cap disagrees with the keys this process
     /// booted on denies rather than enforcing half of each.
-    pub(crate) fn caps(&self, backend: &'static str, namespace: &str) -> Option<BudgetCaps> {
+    ///
+    /// Both come out of *one* read of the published view: a hold stamped with a
+    /// generation whose caps were never applied to it would let that
+    /// generation's drain finish while a request granted under it is still in
+    /// flight.
+    pub(crate) fn caps(&self, backend: &'static str, namespace: &str) -> Option<Governing> {
         let policy = self.ceilings.active(namespace);
         let Some(caps) = policy.budget else {
             tracing::warn!(
@@ -623,13 +628,20 @@ impl SharedSettings {
             );
             return None;
         }
-        Some(caps)
+        Some(Governing {
+            caps,
+            generation: policy.generation,
+        })
     }
+}
 
-    /// The generation governing `namespace`, for stamping a hold.
-    pub(crate) fn generation(&self, namespace: &str) -> Option<PolicyGeneration> {
-        self.ceilings.active(namespace).generation
-    }
+/// The caps one admission is checked against, and the generation that granted
+/// them — read together, so a hold cannot be accounted against a document whose
+/// caps never bound it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Governing {
+    pub(crate) caps: BudgetCaps,
+    pub(crate) generation: Option<PolicyGeneration>,
 }
 
 /// Which cap a composite reserve ran out of. Both answer the caller with the
@@ -913,8 +925,10 @@ mod tests {
             tenant: tenant_id(1),
             project: project_id(1),
         };
+        let published_body =
+            |subject_limit, epoch| detailed(scope, epoch, subject_limit, None, 300, 8, 60, 0);
         let published = |subject_limit, epoch| {
-            let body = detailed(scope, epoch, subject_limit, None, 300, 8, 60, 0);
+            let body = published_body(subject_limit, epoch);
             governed(
                 "acme/core",
                 NamespacePolicy {
@@ -930,25 +944,41 @@ mod tests {
             unavailable: UnavailablePolicy::Deny,
         };
 
+        let first = settings
+            .caps("redis", "acme/core")
+            .expect("the namespace is governed");
+        assert_eq!(first.caps.subject_microdollars, 1_000);
         assert_eq!(
-            settings
-                .caps("redis", "acme/core")
-                .expect("the namespace is governed")
-                .subject_microdollars,
-            1_000
+            first.generation,
+            Some(generation(&published_body(1_000, 1), 1))
         );
         runtime.install(PolicyView::of(&published(9_000, 2)));
+        let second = settings
+            .caps("redis", "acme/core")
+            .expect("the namespace is governed");
+        // The caps and the generation stamped on the hold come from one read, so
+        // they always name each other.
+        assert_eq!(second.caps.subject_microdollars, 9_000);
         assert_eq!(
-            settings
-                .caps("redis", "acme/core")
-                .expect("the namespace is governed")
-                .subject_microdollars,
-            9_000
+            second.generation,
+            Some(generation(&published_body(9_000, 2), 2))
         );
 
         // A namespace no document governs has no enforceable cap, and an
         // unenforced finite cap must never be served as an infinite one.
         assert!(settings.caps("redis", "unpublished").is_none());
+
+        // Deliberately not `on_unavailable`'s decision: that stance answers
+        // "the store is unreachable, admit anyway?", and here the store is fine
+        // and the *limit* is what is missing.
+        let fail_open = SharedSettings {
+            unavailable: UnavailablePolicy::Allow,
+            ..settings.clone()
+        };
+        assert!(
+            fail_open.caps("redis", "unpublished").is_none(),
+            "a fail-open deployment still cannot admit against a cap nobody published"
+        );
 
         // Nor may a document's scope-wide cap be enforced against keys that were
         // not laid out for one: that is a migration, not a value.

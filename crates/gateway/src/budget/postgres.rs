@@ -612,16 +612,19 @@ impl BudgetStore for PostgresBudget {
         // The caps and the generation are read once, before the transaction, and
         // carried on the hold: this request is priced by the document that
         // admitted it, whatever is published while it runs.
-        let Some(caps) = self.settings.caps(BACKEND, &key.namespace) else {
+        let Some(governing) = self.settings.caps(BACKEND, &key.namespace) else {
             return Admission::Denied(Denial::StoreUnavailable);
         };
         let reservation = Reservation {
             id: Reservation::next_id(),
             estimate_microdollars: estimated_microdollars,
-            generation: self.settings.generation(&key.namespace),
+            generation: governing.generation,
         };
         match self
-            .run(async |client| self.try_hold(client, key, &reservation, caps).await)
+            .run(async |client| {
+                self.try_hold(client, key, &reservation, governing.caps)
+                    .await
+            })
             .await
         {
             Ok(None) => {

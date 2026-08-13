@@ -239,6 +239,11 @@ pub enum StatusReason {
     ClockUnsynchronised,
     /// A referenced secret could not be resolved.
     SecretUnresolved,
+    /// A revision's policy document is one this replica will not start
+    /// enforcing: its backends cannot, its durable layout does not match, the
+    /// transition is not one this build performs, or it would leave a served
+    /// namespace uncapped. The replica keeps the policy it already had.
+    PolicyRejected,
     /// The last observation is older than the staleness budget. Reported instead
     /// of a stale `ok`, and deliberately not `unavailable`: a replica serving a
     /// valid snapshot through a control-plane outage is degraded, not down.
@@ -269,6 +274,7 @@ impl StatusReason {
         Self::SnapshotRejected,
         Self::PricingRejected,
         Self::ClockUnsynchronised,
+        Self::PolicyRejected,
         Self::SecretUnresolved,
         Self::Stale,
         Self::NotConfigured,
@@ -291,6 +297,7 @@ impl StatusReason {
             Self::SnapshotRejected => "snapshot_rejected",
             Self::PricingRejected => "pricing_rejected",
             Self::ClockUnsynchronised => "clock_unsynchronised",
+            Self::PolicyRejected => "policy_rejected",
             Self::SecretUnresolved => "secret_unresolved",
             Self::Stale => "stale",
             Self::NotConfigured => "not_configured",
@@ -358,6 +365,10 @@ impl StatusReason {
             "snapshot" => Self::SnapshotRejected,
             "pricing" => Self::PricingRejected,
             "clock" => Self::ClockUnsynchronised,
+            // The four ways a published policy is refused before it is
+            // enforced. One code, because the operator's next move is the same
+            // in every case: read the refusal, which names it, in the log.
+            "unsupported" | "migration" | "refused" | "withdrawn" => Self::PolicyRejected,
             "not_found" => Self::NotConfigured,
             "denied" => Self::PermissionDenied,
             _ => Self::Unknown,
