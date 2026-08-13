@@ -243,7 +243,16 @@ fn route_specs(minting_enabled: bool) -> Vec<RouteSpec> {
             path: "/admin/v1/status",
             auth: AuthPosture::Diagnostic,
             capability: Some(Capability::Status),
-            router: || get(replica_status),
+            // The one route on this router registered under the administrative
+            // prefix, and it takes that prefix's method contract with it: it
+            // shadows the nested surface's own `method_not_allowed_fallback`,
+            // so without this a `POST` here would be the single `/admin/v1`
+            // path answering axum's empty-bodied 405 instead of a declared
+            // code (`crate::admin::router::mount`).
+            router: || {
+                get(replica_status)
+                    .fallback(|| async { crate::admin::AdminError::MethodNotAllowed })
+            },
         },
         RouteSpec {
             path: "/v1/chat/completions",
@@ -7117,6 +7126,39 @@ max_ttl = "15m"
         assert!(body.contains("stateful_mode_required"), "{body}");
     }
 
+    /// Registering a path under the administrative prefix means shadowing that
+    /// surface's method fallback on it, so the one diagnostic living there has
+    /// to carry the prefix's contract itself: a client branching on
+    /// `AdminError::CODES` must never meet axum's empty-bodied 405.
+    #[tokio::test]
+    async fn a_wrong_method_on_the_status_path_is_still_a_declared_refusal() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let response = router(state)
+            .merge(crate::admin::router::refusing_router())
+            .oneshot(
+                Request::post("/admin/v1/status")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_KEY}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        // RFC 9110 requires it on a 405, and axum sets it from the method
+        // router rather than from the fallback body.
+        assert!(response.headers().contains_key(axum::http::header::ALLOW));
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value =
+            serde_json::from_slice(&bytes).expect("a typed envelope, not an empty body");
+        assert_eq!(body["error"]["type"], "admin_method_not_allowed");
+    }
+
     /// A replica that refuses inference because it cannot compile a revision is
     /// the one an operator most needs to interrogate, and the runbook sends them
     /// to this route for exactly that incident. It serves no inference surface,
@@ -7161,6 +7203,42 @@ max_ttl = "15m"
         let (status, body) = answer("/v1/models").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body.contains("inference_unavailable"), "{body}");
+
+        // The shape `main` actually builds in stateful mode: the refusal, the
+        // diagnostic, and the *real* administrative surface over the same
+        // prefix. Overlapping prefixes panic in axum when they collide, so
+        // composing it at all is half the assertion.
+        let stateful = unconverged_router("no snapshot yet")
+            .merge(diagnostic_router(status_state(ReplicaObservability {
+                status: observed_registry(),
+                revision: None,
+            })))
+            .merge(crate::admin::router::router(Arc::new(
+                crate::admin::router::AdminApi::new(
+                    Arc::new(crate::admin::service::AdminService::stateful(Arc::new(
+                        crate::desired_state::oracle::InMemoryControlPlane::new(),
+                    ))),
+                    Arc::new(crate::admin::fakes::FakeAdminAuthenticator::new()),
+                    Arc::new(crate::admin::fakes::FakeAdminAuthorizer::permissive()),
+                ),
+            )));
+        let response = stateful
+            .oneshot(
+                Request::get("/admin/v1/status")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_KEY}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the administrative surface shadowed the diagnostic"
+        );
 
         // And it is still the authenticated projection, not an open one.
         let response = unconverged_router("no snapshot yet")

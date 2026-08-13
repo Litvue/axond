@@ -309,6 +309,7 @@ const ADMISSION_RESOURCE: Label = Label::closed(
         crate::admission::RESOURCE_TENANT,
         crate::admission::RESOURCE_QUEUE,
         crate::admission::RESOURCE_DIAGNOSTIC,
+        crate::admission::RESOURCE_DIAGNOSTIC_AUTH,
     ],
 );
 

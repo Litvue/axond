@@ -47,6 +47,11 @@ pub const RESOURCE_STREAM: &str = "stream";
 pub const RESOURCE_TENANT: &str = "tenant";
 pub const RESOURCE_QUEUE: &str = "queue";
 pub const RESOURCE_DIAGNOSTIC: &str = "diagnostic";
+/// The ceiling on *authenticating* a diagnostic, which is a different ceiling
+/// with a different size: one read that reaches its handler holds one of each,
+/// so publishing both under one label would report every reader twice against a
+/// denominator that is neither bound.
+pub const RESOURCE_DIAGNOSTIC_AUTH: &str = "diagnostic_auth";
 
 /// Concurrent diagnostic reads one replica will answer.
 ///
@@ -302,6 +307,7 @@ impl AdmissionControl {
             .map_err(|_| reject(AdmissionRejection::Diagnostics))?;
         metrics::record_admission_acquired(RESOURCE_DIAGNOSTIC);
         Ok(DiagnosticPermit {
+            resource: RESOURCE_DIAGNOSTIC,
             _permit: Some(permit),
         })
     }
@@ -319,8 +325,9 @@ impl AdmissionControl {
         let permit = Arc::clone(&self.authenticating_diagnostics)
             .try_acquire_owned()
             .map_err(|_| reject(AdmissionRejection::Diagnostics))?;
-        metrics::record_admission_acquired(RESOURCE_DIAGNOSTIC);
+        metrics::record_admission_acquired(RESOURCE_DIAGNOSTIC_AUTH);
         Ok(DiagnosticPermit {
+            resource: RESOURCE_DIAGNOSTIC_AUTH,
             _permit: Some(permit),
         })
     }
@@ -362,13 +369,16 @@ fn reject(rejection: AdmissionRejection) -> AdmissionRejection {
 /// The diagnostic slot one in-flight diagnostic read holds, released on every
 /// exit path by `Drop` exactly as a served request's permit is.
 pub struct DiagnosticPermit {
+    /// The ceiling this permit came from, so it is released on the dimension it
+    /// was acquired on rather than on whichever one is named at the drop site.
+    resource: &'static str,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl Drop for DiagnosticPermit {
     fn drop(&mut self) {
         if self._permit.take().is_some() {
-            metrics::record_admission_released(RESOURCE_DIAGNOSTIC);
+            metrics::record_admission_released(self.resource);
         }
     }
 }

@@ -82,7 +82,7 @@ pub mod service;
 #[cfg(test)]
 mod api_tests;
 #[cfg(test)]
-mod fakes;
+pub(crate) mod fakes;
 #[cfg(test)]
 mod tests;
 

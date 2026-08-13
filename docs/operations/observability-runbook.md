@@ -328,7 +328,8 @@ under-sized `max_subjects`, and it is per replica by design.
 ### The replica is shedding load
 
 **Signal.** `axond_admission_rejections` split by `axond_admission_resource`
-(`request`, `stream`, `tenant`, `queue`, `diagnostic`) and `axond_error_type`, with
+(`request`, `stream`, `tenant`, `queue`, `diagnostic`, `diagnostic_auth`) and
+`axond_error_type`, with
 `axond_admission_in_flight` as the leading indicator.
 
 **Alert.** `AxondAdmissionShedding`, `AxondAdmissionSaturated`.
@@ -343,7 +344,12 @@ is a different animal: it is the fixed ceiling on `GET /admin/v1/status` — eig
 reads being answered, sixty-four being authenticated — it is not sized by
 `admission.max_in_flight`, and it means
 something is polling the diagnostic rather than that the replica is out of
-capacity — served traffic is unaffected either way.
+capacity — served traffic is unaffected either way. The two ceilings hold
+capacity under separate `axond_admission_in_flight` resources, `diagnostic` and
+`diagnostic_auth`, because one read holds a slot in each: summing them would
+report every reader twice against a denominator that is neither bound. A
+`diagnostic_auth` series near sixty-four with `diagnostic` near zero is a flood
+of credentials that are not being accepted, not eight busy operators.
 
 ### A replica is stuck draining
 
