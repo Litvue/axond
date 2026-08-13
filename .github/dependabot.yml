@@ -1,0 +1,35 @@
+version: 2
+
+# Every Action is pinned to a commit SHA (ops/workflow-policy.py enforces it),
+# which means nothing updates itself: a fix upstream only reaches this repository
+# through a reviewed pin bump. Dependabot proposes those bumps, keeping the SHA
+# and the version comment in step, so the pins stay current without anyone
+# watching upstream releases by hand.
+#
+# Cargo dependencies are deliberately not managed here: `deny.toml` plus the
+# `dependency-policy` lane and the scheduled `dependency-audit.yml` run cover
+# them, and a lockfile bump has to go through `cargo update` and the full test
+# matrix rather than a per-crate PR.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    # One PR for the whole set: the pins are reviewed together, and Actions
+    # bumps otherwise consume the whole review queue.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
+    # Only labels that already exist on the repository: Dependabot fails the
+    # whole configuration on an unknown one.
+    labels:
+      - area:operations
+    # `pr-title.yml` requires a Conventional Commit title, and this prefix is
+    # what Dependabot builds the PR title from.
+    commit-message:
+      prefix: ci

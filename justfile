@@ -5,7 +5,7 @@ default:
 
 # Format, lint (warnings = errors), test, docs, supply-chain, and release
 # packaging — the CI gates.
-check: fmt-check clippy test docs deny publish-dry-run msrv api-compat
+check: fmt-check clippy test docs deny publish-dry-run msrv api-compat workflow-policy
 
 fmt:
     cargo fmt --all
@@ -56,6 +56,19 @@ api-compat:
 # The parts of the API gate that need neither network nor cargo-semver-checks.
 api-compat-self-test:
     ops/api-compat.py --self-test
+
+# Workflow supply-chain policy: SHA-pinned Actions, least-privilege permissions,
+# and the release signer restriction. `actionlint` additionally lints the
+# workflow definitions; it is downloaded at a pinned, checksummed version.
+workflow-policy:
+    ops/workflow-policy.py --self-test
+    ops/workflow-policy.py
+    ops/dependabot-labels.sh --self-test
+    ops/dependabot-labels.sh
+
+actionlint:
+    ops/actionlint.sh --self-test
+    ops/actionlint.sh
 
 # Supply-chain policy: advisories, licenses, sources (see deny.toml).
 deny:
