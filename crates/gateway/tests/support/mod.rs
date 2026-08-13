@@ -10,6 +10,7 @@
 pub mod capacity;
 pub mod endurance;
 pub mod gateway;
+pub mod packet;
 pub mod recovery;
 pub mod rollout;
 pub mod stateful;

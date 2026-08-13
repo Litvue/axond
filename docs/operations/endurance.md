@@ -13,7 +13,9 @@ only a long run makes visible:
   it is a bill.
 
 This page qualifies the **stateless request path only** — a Tier 0 process with
-no Redis, no Postgres, and no control plane.
+no Redis, no Postgres, and no control plane. Where it sits in what production
+qualification has and has not measured — the soak tier has not been dispatched —
+is the [qualification packet](./qualification.md).
 
 ## What the harness runs
 

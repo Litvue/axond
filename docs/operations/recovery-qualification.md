@@ -192,3 +192,5 @@ which scenarios it unblocks.
   migrations, backup guidance, and the outage behaviour being qualified.
 - [Capacity qualification](./capacity.md) — the stateless load harness this one
   is modelled on.
+- [Qualification packet](./qualification.md) — where this contract sits in what
+  production qualification has and has not measured.

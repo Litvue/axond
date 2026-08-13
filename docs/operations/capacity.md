@@ -11,7 +11,9 @@ and usage-record reconciliation — is
 
 This page qualifies the **stateless request path only** — a Tier 0 process with
 no Redis, no Postgres, and no control plane. It is not evidence about stateful
-serving, revision convergence, or any store-backed control.
+serving, revision convergence, or any store-backed control. Where that leaves
+production qualification as a whole, and which runs are retained as evidence, is
+the [qualification packet](./qualification.md).
 
 ## What the harness runs
 
@@ -55,18 +57,23 @@ stored result, check out its `environment.source.git_commit` (with
 
 ## Initial capacity envelopes
 
-Heavy tier, one replica, **debug build** — `cargo test` builds unoptimized, so
-these understate release throughput substantially. Host: 8 vCPU Intel Xeon
-Platinum 8175M @ 2.50 GHz, 31 GiB RAM, Linux 5.15, rustc 1.97.1, no queueing
+This table is the retained record
+[`qualification/capacity/evidence/heavy-local.toml`](../../qualification/capacity/evidence/heavy-local.toml),
+read in operator units; the record is the source, and a table that drifts from
+it is a bug — `ops/check-docs.py` reads both and fails when they disagree, so a
+re-run that stops at the numbers below leaves the rules of thumb under them
+failing too. Heavy tier, one replica, **debug build** — `cargo test` builds
+unoptimized, so these understate release throughput substantially. Host: 8 vCPU
+Intel Xeon Platinum 8559C, 31 GiB RAM, Linux 5.15.200, rustc 1.97.1, no queueing
 (`admission.queue_capacity = 0`), the fake upstream on loopback.
 
 | Profile | Concurrency | Requests | Accepted req/s | p50 | p95 | p99 | TTFT p95 | Peak RSS | Peak sockets | CPU cores used |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `buffered` | 128 | 40 000 | 4 498 | 27.6 ms | 42.0 ms | 50.4 ms | — | 43 MiB | 315 | 4.6 |
-| `streaming` | 300 | 8 000 | 637 | 459 ms | 521 ms | 837 ms | 129 ms | 51 MiB | 753 | 4.8 |
-| `mixed` | 128 | 12 000 | 1 190 | 8.2 ms | 313 ms | 326 ms | 58 ms | 38 MiB | 279 | 4.0 |
-| `response-size` | 64 | 6 000 | 460 | 131 ms | 226 ms | 271 ms | — | 66 MiB | 151 | 4.1 |
-| `cancellation` | 300 | 8 000 | 893 | 370 ms | 621 ms | 784 ms | 151 ms | 57 MiB | 726 | 4.4 |
+| `buffered` | 128 | 40 000 | 7 675 | 15.9 ms | 25.0 ms | 30.6 ms | — | 44 MiB | 344 | 4.6 |
+| `streaming` | 300 | 8 000 | 1 034 | 275 ms | 299 ms | 669 ms | 62 ms | 49 MiB | 733 | 3.1 |
+| `mixed` | 128 | 12 000 | 1 360 | 2.7 ms | 279 ms | 293 ms | 51 ms | 38 MiB | 283 | 2.3 |
+| `response-size` | 64 | 6 000 | 1 371 | 44.2 ms | 75.0 ms | 92.4 ms | — | 67 MiB | 156 | 4.1 |
+| `cancellation` | 300 | 8 000 | 1 668 | 270 ms | 303 ms | 479 ms | 65 ms | 54 MiB | 720 | 3.5 |
 
 Throughput and latency move 10–25% between runs on a shared host, while the
 socket and memory columns barely move: read the first two as an order of
@@ -81,14 +88,14 @@ buffered and streamed requests in one distribution.
 What the envelope says, in operator terms:
 
 - **Sockets scale with concurrency, roughly two per in-flight stream** — one
-  inbound, one upstream. 300 concurrent streams held ~750 descriptors. Size
+  inbound, one upstream. 300 concurrent streams held ~730 descriptors. Size
   `ulimit -n` and `admission.max_in_flight_streams` together.
 - **Resident memory is bounded by concurrency and body size, not by request
-  count.** 40 000 buffered requests cost the same ~45 MiB as 400 would; 256 KiB
+  count.** 40 000 buffered requests cost the same ~44 MiB as 400 would; 256 KiB
   bodies at 64 concurrent cost ~67 MiB. Bodies are buffered before dispatch
   (ADR 0030), so `admission.max_request_bytes` × concurrency is the term to
   reason about.
-- **CPU saturates before memory.** Every profile used 3.4–4.4 cores of the 8
+- **CPU saturates before memory.** Every profile used 2.3–4.6 cores of the 8
   available at these concurrencies. On this workload shape, a replica is
   CPU-bound; scale on CPU, and remember `[admission]` ceilings are *per replica*.
 

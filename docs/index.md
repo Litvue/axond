@@ -66,6 +66,9 @@ and operate it.
 - [Backup, restore, and PITR](./operations/backup-and-recovery.md) — what is
   durable, the recovery objectives, the archiving and dump mechanisms, and the
   drill that proves a restore lands where it was aimed.
+- [Qualification packet](./operations/qualification.md) — what production
+  qualification has measured, what is only declared, what is unbuilt, and the
+  retained evidence behind each.
 - [Capacity qualification](./operations/capacity.md) — per-replica envelopes,
   candidate SLOs, the committed load profiles, and what a capacity run gates on.
 - [Recovery qualification](./operations/recovery-qualification.md) — the
