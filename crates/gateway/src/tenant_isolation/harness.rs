@@ -88,6 +88,22 @@ pub(crate) fn two_tenant_state() -> DesiredState {
     state
 }
 
+/// [`two_tenant_state`] with the neighbour left out, and otherwise identical:
+/// the caller's tenant, project, directory and policy, and nothing else.
+///
+/// The comparison half of a "a neighbour changes nothing" scenario. It has to be
+/// this state minus the neighbour rather than some other single-tenant fixture,
+/// or the two projections differ by more than the neighbour and the assertion
+/// stops being about isolation the moment either fixture grows a field the
+/// projection reads.
+pub(crate) fn one_tenant_state() -> DesiredState {
+    let mut state = fixtures::state_with_directory();
+    state
+        .insert(fixtures::tenant_policy(1, 1))
+        .expect("one tenant's own policy over its own tenant is valid");
+    state
+}
+
 /// [`two_tenant_state`] plus each tenant's own catalogue: one tenant-wide
 /// enablement and one typed project alias resolving to it, per tenant.
 ///

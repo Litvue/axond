@@ -28,7 +28,7 @@
 
 use std::collections::BTreeMap;
 
-use super::harness::{Journal, caller, other};
+use super::harness::{Journal, caller, one_tenant_state, other};
 use crate::config::{Config, Namespace};
 use crate::convergence::compile::RevisionProjection;
 use crate::convergence::tenancy::TenancyProjection;
@@ -104,6 +104,11 @@ async fn each_tenants_project_is_its_own_namespace_and_borrows_nothing() {
 /// namespace it becomes is identical. Without this, "no cross-tenant influence"
 /// would be a claim about the projection's *code* rather than about its output:
 /// an ordering or a shared-name bug would show up exactly here.
+///
+/// The two states differ by the neighbour and by nothing else
+/// ([`one_tenant_state`] is [`super::harness::two_tenant_state`] with the second
+/// tenant left out), so a projection that grows a section this fixture feeds does
+/// not turn the comparison into an assertion about the fixture pair.
 #[tokio::test]
 async fn a_neighbour_changes_nothing_about_a_tenants_own_namespace() {
     let Some(journal) = Journal::open().await else {
@@ -112,7 +117,7 @@ async fn a_neighbour_changes_nothing_about_a_tenants_own_namespace() {
     journal.publish_two_tenants().await;
     let together = project(journal.hydrated().await.state());
 
-    let alone = project(&fixtures::state_with_directory());
+    let alone = project(&one_tenant_state());
     assert_eq!(
         namespaces(&alone).keys().copied().collect::<Vec<_>>(),
         vec!["acme/core", "platform"],
