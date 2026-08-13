@@ -230,6 +230,49 @@ groups:
           description: "Spend and audit data no retry recovers. sink_error is the sink, buffer_full is volume the sink cannot keep up with, shutdown means the termination flush could not write what it held."
           runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#usage-records-are-being-lost"
 
+      # Billing-grade only: a telemetry-grade deployment emits no journal
+      # instruments at all, so these stay silent there rather than firing on an
+      # absent series.
+      - alert: AxondUsageJournalLoss
+        expr: "sum by (axond_usage_journal, axond_journal_loss_reason) (increase(axond_usage_journal_lost[15m])) > 0"
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A billing-grade deployment gave up a usage event ({{ $labels.axond_journal_loss_reason }})"
+          description: "The only data-loss counter of billing-grade mode: on_undurable = serve, capacity_policy = drop-oldest, a terminal path, or an append refused after the caller had already hung up. The event is not in the outbox and no retry brings it back."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#a-billing-grade-deployment-is-losing-usage"
+
+      - alert: AxondUsageJournalRefusingAppends
+        expr: "sum by (axond_usage_journal) (rate(axond_usage_journal_appends{axond_journal_outcome=~\"at_capacity|backend|conflict|invalid_event\"}[5m])) > 0"
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Billing-grade requests are being refused with 503 usage_not_durable"
+          description: "Appends are failing, so served requests are refused rather than reported as billable. at_capacity is a full outbox behind stalled delivery; backend is the database itself."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#the-usage-outbox-is-filling-or-refusing"
+
+      - alert: AxondUsageJournalBacklogAging
+        expr: "max by (axond_usage_journal, axond_usage_journal_consumer) (axond_usage_journal_oldest_pending_age) > 900"
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The oldest undelivered usage event is over fifteen minutes old"
+          description: "Delivery is falling behind its destinations. Nothing is lost yet - the backlog is durable - but at max_events the default policy starts refusing requests. Compare axond_usage_journal_depth against axond_usage_journal_capacity."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#the-usage-outbox-is-filling-or-refusing"
+
+      - alert: AxondUsageJournalQuarantined
+        expr: "max by (axond_usage_journal, axond_usage_journal_consumer) (axond_usage_journal_quarantined_events) > 0"
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Usage events are quarantined and waiting on a decision"
+          description: "Poison was set aside so it would stop blocking its ordering key. The rows are still on disk, they hold part of max_events, and only a human decides what they are worth."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#usage-events-are-quarantined"
+
       - alert: AxondReplicaStuckDraining
         expr: "max(axond_shutdown_phase) >= 1"
         for: 15m
