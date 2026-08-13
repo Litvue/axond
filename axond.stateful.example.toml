@@ -36,6 +36,8 @@ bind = "0.0.0.0:8080"
 #
 #   axond migrate status --config /etc/axond/axond.toml   # read-only
 #   axond migrate apply  --config /etc/axond/axond.toml   # forward-only
+#   axond migrate adopt  --config /etc/axond/axond.toml   # only if the DDL was
+#                                                        # applied out of band
 #   axond check preflight --config /etc/axond/axond.toml  # read-only rehearsal
 #
 # docs/operations/control-plane-journal.md has the ordering for a fresh install

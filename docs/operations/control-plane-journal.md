@@ -154,7 +154,7 @@ material it was published against — see
 
 ## Operator commands
 
-Three commands run *before* replicas do, all with the same grammar —
+Four commands run *before* replicas do, all with the same grammar —
 `axond <command> <action> --config PATH`. `--config` may be omitted when
 `AXOND_CONFIG` is set.
 
@@ -163,6 +163,7 @@ Three commands run *before* replicas do, all with the same grammar —
 | `axond check preflight --config PATH` | No | Would a replica boot against this? Config ownership and mode, every reference a boot resolves (control plane, secret-store KEK, breakglass, inbound keys and verifiers, provider credentials, opt-in stores — including a reference a store inherits from the Redis budget), control-plane reachability, schema compatibility. |
 | `axond migrate status --config PATH` | No | What schema does this database have, and what would an apply do? |
 | `axond migrate apply --config PATH` | Yes | Apply the pending migrations, forward only. |
+| `axond migrate adopt --config PATH` | Yes (ledger rows only) | This schema was applied out of band — record the baseline its objects account for. Executes no migration file. |
 
 The command surface, the forward-only policy, and the refusal to migrate at boot
 are [ADR 0032](../adr/0032-operator-preflight-and-forward-only-migrations.md).
@@ -170,17 +171,22 @@ are [ADR 0032](../adr/0032-operator-preflight-and-forward-only-migrations.md).
 `preflight` and `status` cannot change a database, and not merely by convention:
 they open the control plane on a maintenance path that does not prepare a schema,
 with migration permission forced off, and read the ledger inside a `READ ONLY`
-transaction, so the *server* rejects a write. `apply` is the only mutation, and it
-is explicit.
+transaction, so the *server* rejects a write. `apply` and `adopt` are the only
+mutations, both are explicit, and they write different things: `apply` runs
+migration files and records them, `adopt` records ledger rows for migrations it
+verified are already applied and runs no DDL at all.
 
 Exit codes make these usable as deployment gates: `preflight` exits non-zero if
 any check failed, `status` exits non-zero while a migration is outstanding or the
-schema is refused, and `apply` exits non-zero if the schema was refused. Output
-names environment variables, never DSNs.
+schema is refused, and `apply` exits non-zero if the schema was refused. `adopt`
+exits non-zero if it refused, or if the baseline it recorded still leaves a
+migration to apply. Output names environment variables, never DSNs.
 
 `apply` against a database that is already current is a no-op rather than a
 re-run: it reports the current version and rolls its transaction back without
-executing a migration file.
+executing a migration file. `adopt` against a database whose ledger already
+records a history is the same kind of no-op — it reports that history and writes
+nothing.
 
 In stateless mode there is no control plane, so `preflight` reports the database
 checks as skipped and `migrate` has nothing to do. Neither command requires
@@ -252,13 +258,17 @@ simultaneous applies are one migration. A replica configured with
 because one apply before a rollout is the order that cannot have replicas
 migrating a database their peers are reading.
 
-Applying the DDL with `psql` still works and stays supported for operators who
-own schema changes out of band:
+### Applied out of band: `psql`, then `adopt`
+
+Applying the DDL with `psql` still works and stays supported for operators who own
+schema changes out of band:
 
 ```bash
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0001_initial.sql
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0002_tenancy_access.sql
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0003_tenancy_constraints.sql
+axond migrate adopt  --config /etc/axond/axond.toml  # record the baseline that applied
+axond migrate status --config /etc/axond/axond.toml  # now Current
 ```
 
 0003 is where the deferrable name, identity, and ownership rules live, and it
@@ -268,23 +278,138 @@ forward migration rather than an edit to 0002 for the reason the *Drifted* row
 below states: the ledger compares a recorded checksum against the shipped file,
 so an applied migration is immutable. Re-applying it is a no-op.
 
-That path does not write the ledger row, so the journal is then reported as
-*Unrecorded* — a ledger table that exists and records nothing — and both `status`
-and `apply` refuse it. An empty ledger is indistinguishable from an untouched
-database, and the ledger is the only record of what was applied, so migrating from
-zero would replay every shipped file over objects that may already be there;
-that survives only while every statement is `IF NOT EXISTS`. Either drop the
-empty `axond_cp_schema_migration` table if nothing was applied, or state the
-baseline the DDL corresponds to:
+The `psql` path creates the ledger table without recording anything in it, so the
+journal is then reported as *Unrecorded* — a ledger that exists and records nothing
+— and `status`, `apply`, and boot all refuse it. That refusal is the point. An
+empty ledger is indistinguishable from an untouched database, and the ledger is the
+only record of what was applied, so migrating from zero would replay every shipped
+file over objects that may already be there. The tenancy migration is where that
+stopped being survivable: its `ADD CONSTRAINT` is not `IF NOT EXISTS`, so a replay
+fails half way through a file rather than passing over it, and the first backfill
+will do worse than fail.
 
-```bash
-psql "$GW_CONTROL_PLANE_DSN" -c "INSERT INTO axond_cp_schema_migration (version, name, checksum)
-  VALUES (1, 'control_plane_0001_initial', '<checksum>')"
-```
+`axond migrate adopt` is how that state is resolved deliberately. It writes ledger
+rows and never DDL, and it records only what the database itself accounts for: the
+longest run of shipped migrations, starting at v1, whose every statement is
+confirmed — each table, index, column, named constraint, row-security flag and
+policy where the file leaves it, and each idempotent seed row written — in
+the schema this configuration writes to (the one `[control_plane] schema` names, or
+the first on the DSN's own search path; a second install's journal further down that
+path is not evidence about this one).
 
-The refusal prints the exact statement, checksum included, for every migration
-this build ships. Prefer `axond migrate apply`, which records what it applied and
-never leaves this state behind.
+A baseline can be shorter than the shipped history, and that is the ordinary state
+for an operator who hand-applied v1 before the tenancy migration existed: `adopt`
+records v1, reports v2 as still pending, and **exits non-zero**, because a database
+with a migration outstanding is not one to serve. `axond migrate apply` then runs v2
+once, from the ledger — the point of adopting the prefix rather than the whole
+history. Objects v2 would *rewrite* under a name v1 already used (the
+`..._actor_attribution` constraints) do not make that database look part-way through
+v2: what a file drops and creates again is required of a database it ran on, but is
+never read as proof of which version wrote it.
+
+A later migration also *takes away* what an earlier one left — v3 drops the unique
+indexes v2 created and replaces them with deferrable constraints — so the baseline
+is read with the whole shipped history in view: the last version to act on a thing
+decides whether a database that reached the top of a prefix should still have it.
+One of those indexes still being present says v2 ran and v3 did not; its absence
+alongside v3's constraints says both ran; and the state in between — the index gone
+and the constraint that replaces it never added — is a file stopped in the middle,
+refused rather than recorded as the version below. v3's other two shapes are read
+the same way: an add wrapped in `IF NOT EXISTS (SELECT ... )` is confirmed by the
+constraint it names being there, whichever way the guard went, and a loop that drops
+the constraints PostgreSQL named for itself — names no file can state, which is why
+the loop exists — is confirmed by its own query naming nothing afterwards, asked
+again in this schema, allowing for the constraints the same file goes on to declare
+by name.
+
+What it does instead of recording:
+
+- **No object present.** Nothing was applied out of band, so there is no baseline.
+  Refused, naming the schema it looked in and the way forward — drop the empty
+  `axond_cp_schema_migration` table and run `axond migrate apply`. The schema is
+  worth reading: a DSN whose `search_path` has more than one entry can have the
+  ledger answer from a schema further down it while the objects are sought in the
+  one this configuration writes to, which is where `apply` would create them.
+- **A migration only partly applied.** Some of what one file declares is there and
+  some is not — a table, an index, a column, a constraint, one of the two row
+  security flags, a policy, or the seed row a shipped file ends with, which a
+  `psql -f` outside a transaction can stop just short of. Neither "applied" nor
+  "not applied" is true, so it is refused, naming the repair for each thing: an
+  object that is not present is reported as missing, a table that is present and
+  empty is reported as having no seeded row, a flag that is off is reported as not
+  enabled, and something the file *drops* that is still there is reported as still
+  present. Finish or undo that file by hand first.
+- **A ledger that already records a history.** Nothing to adopt: the history is
+  reported and nothing is written, so a stray `adopt` in a rollout is not a ledger
+  edit.
+- **A shipped migration containing a statement adoption cannot confirm.** Adoption
+  confirms what one catalogue question answers about one object: `CREATE TABLE` and
+  `CREATE INDEX` by the object being present; `INSERT ... ON CONFLICT DO NOTHING` by
+  the target table not being empty; `ADD COLUMN`, a **named** `ADD CONSTRAINT`,
+  `ENABLE ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY` (separately — enabling
+  without forcing leaves a table's owner unfiltered), and `CREATE POLICY` by the
+  column, constraint, flags and policy being there. A `DROP` of any of those is
+  confirmed by the thing being gone, so the constraint v2 replaces is expected
+  *absent* on a v2 database — but a version that only takes things away proves
+  nothing, because a database that never had it looks the same, and neither does
+  something the version dropped and created again under the same name. The shipped
+  v1 and v2 files are confirmable in full, tenancy included: the `DO $$ ... $$` block that
+  guards the chained tables is read by rendering its own `format()` templates for
+  its own list of tables, so each of those tables' RLS flags and `..._isolation`
+  policy is checked, and a change to that block's shape makes it unconfirmable
+  rather than silently "applied". Each form names its object unqualified, since the
+  probe asks about the configured schema: an unnamed `CREATE INDEX ON t (c)`, a
+  constraint added without a name, or a schema-qualified `other.t` is unconfirmable
+  for the same reason as the rest.
+  Comments (`--` and nested `/* */`) and quoted regions (`'...'`, `$tag$ ... $tag$`)
+  are prose or data, never statements: a `CREATE TABLE` inside a function body or
+  a block comment is not evidence that anything was created. A region that does
+  not close where that reading says it does — an unterminated comment or literal,
+  or a backslash escape inside `E'...'` — makes the whole file unconfirmable,
+  since what it swallows might have been the statement that blocked adoption.
+  Anything else — a backfill, an `UPDATE`, a non-idempotent `INSERT`, or an `ALTER`
+  clause no catalogue answers for such as `SET DEFAULT` — is both what no catalogue
+  can report on and what a rerun would damage,
+  and one such statement makes its whole migration unadoptable. A *second* seed into
+  a table the shipped history already seeds counts as one of those, whether it is in
+  another migration or in the same file: one row proves at most one of the inserts,
+  so it proves nothing about the rest. The same holds for an object more than one
+  migration declares: a table being present proves at most one of the
+  `CREATE TABLE IF NOT EXISTS` statements that declare it, so a later migration
+  that only re-declares an earlier one's objects is unconfirmable rather than
+  adopted on their strength — and so is a migration whose every effect another one
+  acts on, including one a later version takes away again, since the object's state
+  proves at most one of them. Unadoptable holds even when the same file
+  also creates a table: `psql -f` without a wrapping transaction can abort between
+  `CREATE TABLE x` and a following `ALTER TABLE y`, and "x exists" is then not
+  evidence the file finished. Adopting the versions below it is no better — the
+  ledger would call it *pending*, so the next `apply` would run it over a schema
+  that may already have it. So a release that ships one refuses every adoption
+  while it is unrecorded — the whole history, not just that version — and the
+  baseline goes back to being an
+  `INSERT INTO axond_cp_schema_migration (version, name, checksum)` you write
+  because you own the change that applied it. The refusal names the version and says
+  this.
+
+The role running `adopt` must be able to *read* the objects the out-of-band apply
+created, not just the ledger: a rejected probe (`42501`, or a missing schema) is
+reported as a refusal naming the SQLSTATE rather than as an outage, so a gate stops
+and the grant gets made instead of the gate retrying.
+
+It is one transaction under the same advisory lock `apply` takes, so a refusal
+leaves no partial baseline and two simultaneous adoptions are one adoption.
+Adopting a prefix below the required version reports what is still pending and
+exits non-zero, exactly as `status` does — the baseline was recorded and the
+database is still not one a replica may serve; the next command is
+`axond migrate apply`, which migrates forward from the adopted baseline.
+
+Adoption is deliberately narrow. It cannot repair a *Drifted*, *Incomplete*,
+*Renamed*, *Ahead*, or *Malformed* history: each of those is a recorded history
+that disagrees with this build, which is a different question from an unrecorded
+one, and each stays a refusal. Writing the baseline rows by hand still works and is
+classified identically — `adopt` is the checked version of that `INSERT`. Prefer
+`axond migrate apply` for a fresh install: it records what it applied and never
+leaves this state behind.
 
 ## Schema status, and what each state means
 
@@ -296,7 +421,7 @@ never leaves this state behind.
 | --- | --- | --- |
 | Current | The applied history is exactly the required one | Nothing |
 | Behind | Migrations are missing | `axond migrate apply` |
-| Unrecorded | The ledger table exists and records nothing: the DDL was applied out of band, or every row was deleted | Drop the empty ledger if nothing was applied, or record the baseline the database corresponds to (the refusal prints the statement); never migrate it from zero |
+| Unrecorded | The ledger table exists and records nothing: the DDL was applied out of band, or every row was deleted | `axond migrate adopt` if the DDL was applied — it records the baseline the objects account for, and refuses if they do not account for one; drop the empty ledger and `apply` if nothing was applied; never migrate it from zero |
 | Ahead | The database records a migration this build does not know | Deploy the newer build; do not downgrade the schema |
 | Drifted | An applied migration's recorded checksum is not this build's file | Restore the file, or add a new migration — never edit in place |
 | Incomplete | The applied versions are not a complete prefix (`v3` without `v2`, or a deleted ledger row) | Find out what applied out of order or removed the row; the maximum version alone is not evidence the history is intact |

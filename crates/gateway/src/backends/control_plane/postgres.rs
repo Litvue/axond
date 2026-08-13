@@ -39,7 +39,7 @@ use tokio_postgres::{Client, Config, Row, Transaction};
 
 use super::hydration::{self, HydrationLimits};
 use super::rows;
-use super::schema::{self, MINIMUM_SERVER_VERSION_NUM, SchemaStatus};
+use super::schema::{self, Baseline, MINIMUM_SERVER_VERSION_NUM, SchemaStatus};
 use super::{ControlPlaneError, ControlPlaneStore};
 use crate::backends::{Capabilities, Capability};
 use crate::desired_state::{
@@ -124,6 +124,26 @@ impl Default for ControlPlaneSettings {
             hydration: HydrationLimits::default(),
         }
     }
+}
+
+/// What adopting an empty migration ledger did, or found already done.
+///
+/// Two outcomes rather than one, because "recorded a baseline" and "there was
+/// already a history" are different things for an operator to read: the first
+/// changed a database and names what it now claims was applied, and the second
+/// changed nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Adoption {
+    /// These versions are now recorded as applied, on the evidence of the tables
+    /// they declare. `status` is what the schema classifies as afterwards —
+    /// current when the whole shipped history was adopted, behind when an `apply`
+    /// still has versions to add.
+    Recorded {
+        versions: Vec<i32>,
+        status: SchemaStatus,
+    },
+    /// The ledger already recorded a history, so nothing was written.
+    AlreadyRecorded { status: SchemaStatus },
 }
 
 /// A [`ControlPlaneStore`] backed by the revision journal in `ops/postgres/`.
@@ -294,6 +314,131 @@ impl PostgresControlPlane {
                     .await
                     .map_err(|error| unavailable("commit schema transaction", &error))?;
                 Ok(pending)
+            })
+        })
+        .await
+    }
+
+    /// Adopt a hand-applied schema: record the baseline an empty ledger cannot.
+    ///
+    /// The one write that exists for a [`SchemaStatus::Unrecorded`] database, and
+    /// the only one anywhere that inserts a ledger row for DDL it did not run.
+    /// It writes what the database itself accounts for and nothing else: the
+    /// longest prefix of shipped migrations whose every statement is confirmed —
+    /// tables and indexes present, idempotent seed rows written
+    /// ([`schema::baseline`]). A prefix that is empty, one interrupted by a
+    /// half-applied migration, one that is not a prefix at all, and any history
+    /// containing a statement whose effect cannot be confirmed are refused with
+    /// [`ControlPlaneError::Denied`] rather than recorded, because a recorded
+    /// version is afterwards indistinguishable from an applied one — an adoption
+    /// that guessed would launder a guess into the history every later decision
+    /// reads.
+    ///
+    /// Never a migration: no shipped SQL runs here, so adopting cannot execute a
+    /// file against a database that already has it. A ledger that already records
+    /// a history is left exactly as it is and reported back, which is what makes a
+    /// second `adopt` a no-op rather than a second baseline.
+    pub async fn adopt_ledger(&self) -> Result<Adoption, ControlPlaneError> {
+        self.run(|client| {
+            Box::pin(async move {
+                // Read committed and the journal's advisory lock, for the reasons
+                // `apply_migrations` pins both: the status has to be the winner's
+                // committed history, and an adoption racing an apply must be one
+                // decision rather than two.
+                let transaction = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(|error| unavailable("begin schema transaction", &error))?;
+                transaction
+                    .query_one("SELECT pg_advisory_xact_lock($1::bigint)", &[&SCHEMA_LOCK])
+                    .await
+                    .map_err(|error| unavailable("acquire schema lock", &error))?;
+                let status = schema::status(&transaction)
+                    .await
+                    .map_err(|error| unavailable("read schema status", &error))?;
+                match status {
+                    // A ledger that already answers the question adoption exists to
+                    // answer. Reported rather than refused: the operator asked for a
+                    // recorded history and there is one, so `adopt` is idempotent
+                    // and re-running it after an apply is a no-op.
+                    SchemaStatus::Current { .. } | SchemaStatus::Behind { .. } => {
+                        let _ = transaction.rollback().await;
+                        return Ok(Adoption::AlreadyRecorded { status });
+                    }
+                    SchemaStatus::Unrecorded => {}
+                    // Every other status is a decision that is not adoption's:
+                    // absent has nothing to adopt (and `apply` is the command for
+                    // it), and the rest are histories this build must not touch.
+                    refused => {
+                        return Err(denied(format!(
+                            "adoption reconciles an existing but empty migration ledger, and this \
+                             database has something else: {refused}"
+                        )));
+                    }
+                }
+                // Classified like the writes rather than like an ordinary read:
+                // this reads the objects an out-of-band `psql` created, plausibly
+                // as a different role, so `42501` on the seed probe is a realistic
+                // failure and no retry clears it.
+                let baseline = schema::baseline(&transaction).await.map_err(|error| {
+                    refused_or_unavailable("reconciling the empty ledger", &error)
+                })?;
+                let versions = match baseline {
+                    Baseline::Applied { versions } => versions,
+                    Baseline::Nothing => {
+                        // Naming the schema it looked in, because a DSN with a
+                        // multi-entry `search_path` can have the ledger answer from
+                        // one schema and the objects be sought in the one this
+                        // connection writes to. "Nothing is present" without a
+                        // *where* would read as a claim about the whole database.
+                        let searched: String = transaction
+                            .query_one("SELECT current_schema()", &[])
+                            .await
+                            .map_err(|error| {
+                                refused_or_unavailable("reading the current schema", &error)
+                            })?
+                            .get(0);
+                        return Err(denied(format!(
+                            "no shipped migration's tables are present in schema `{searched}`, so \
+                             this database has no applied schema to adopt there; drop the empty \
+                             `{}` table and run `axond migrate apply`",
+                            schema::MIGRATION_TABLE
+                        )));
+                    }
+                    Baseline::Inconsistent { message } => return Err(denied(message)),
+                };
+                // Named for what it is: adoption runs no migration, so a rejected
+                // ledger write must not send the operator looking at DDL.
+                schema::record_baseline(&transaction, &versions)
+                    .await
+                    .map_err(|error| {
+                        refused_or_unavailable("recording the adopted baseline", &error)
+                    })?;
+                // The recorded baseline has to classify as a history this build
+                // can extend, or it is not a baseline: adopting must leave the
+                // database in a state `status` and `apply` already understand.
+                let adopted = schema::status(&transaction)
+                    .await
+                    .map_err(|error| unavailable("re-read schema status", &error))?;
+                if !matches!(
+                    adopted,
+                    SchemaStatus::Current { .. } | SchemaStatus::Behind { .. }
+                ) {
+                    return Err(denied(format!(
+                        "a baseline was recorded but the schema is still not one this build can \
+                         extend: {adopted}"
+                    )));
+                }
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| unavailable("commit schema transaction", &error))?;
+                Ok(Adoption::Recorded {
+                    versions,
+                    status: adopted,
+                })
             })
         })
         .await
@@ -470,13 +615,20 @@ fn denied(message: impl Into<String>) -> ControlPlaneError {
 }
 
 /// Classify a failure to run the migration DDL by whether a retry could clear it.
+fn migration_refused_or_unavailable(error: &tokio_postgres::Error) -> ControlPlaneError {
+    refused_or_unavailable("applying migrations", error)
+}
+
+/// Classify a schema operation's failure by whether a retry could clear it.
 ///
-/// The realistic failures here are the server rejecting a statement, not the
-/// server being unreachable: `3F000` when the configured `[control_plane] schema`
-/// does not exist (`SET search_path` accepts a missing schema, so the refusal
-/// arrives at the first `CREATE TABLE`) and `42501` when the role may not create
-/// objects. Both need an operator, and reporting them as an outage would tell a
-/// rollout gate to retry a thing that cannot start working.
+/// The realistic failures on these paths are the server rejecting a statement,
+/// not the server being unreachable: `3F000` when the configured
+/// `[control_plane] schema` does not exist (`SET search_path` accepts a missing
+/// schema, so the refusal arrives at the first `CREATE TABLE`), and class `42` —
+/// `42501` when the role may not create the objects or read the ones an
+/// out-of-band apply left behind, `42P01` when one of them is not there after all.
+/// Every one of those needs an operator, and reporting them as an outage would
+/// tell a rollout gate to retry a thing that cannot start working.
 ///
 /// The transient classes stay outages so they keep their retryable
 /// classification: connection exceptions (08), transaction rollbacks including
@@ -484,21 +636,21 @@ fn denied(message: impl Into<String>) -> ControlPlaneError {
 /// object not in a prerequisite state such as an unavailable lock (55), operator
 /// intervention including a cancelled statement or a shutdown (57), and system
 /// errors (58). An error with no SQLSTATE never reached the server at all.
-fn migration_refused_or_unavailable(error: &tokio_postgres::Error) -> ControlPlaneError {
+fn refused_or_unavailable(operation: &str, error: &tokio_postgres::Error) -> ControlPlaneError {
     const TRANSIENT: [&str; 6] = ["08", "40", "53", "55", "57", "58"];
     let Some(db) = error.as_db_error() else {
-        return unavailable("apply migrations", error);
+        return unavailable(operation, error);
     };
     let code = db.code().code();
     if code
         .get(..2)
         .is_some_and(|class| TRANSIENT.contains(&class))
     {
-        return unavailable("apply migrations", error);
+        return unavailable(operation, error);
     }
     denied(format!(
-        "applying migrations failed: {} (SQLSTATE {code}); the server rejected the statement, so \
-         no retry clears it — check that the configured schema exists and that the role may \
+        "{operation} failed: {} (SQLSTATE {code}); the server rejected the statement, so no retry \
+         clears it — check that the configured schema exists and that the role may read and \
          create objects in it",
         db.message()
     ))

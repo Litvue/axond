@@ -10,10 +10,10 @@
 //!   control-plane database is reachable, and what its schema is relative to the
 //!   version this build requires.
 //! - [`migrate`] answers "what schema does this database have, and what would
-//!   this build apply to it?", and applies it on request. Forward-only: a journal
-//!   a newer build owns, one whose applied migration was edited in place, and one
-//!   whose recorded history has a hole in it are reported and refused rather than
-//!   written over.
+//!   this build apply to it?", applies it on request, and adopts a schema that
+//!   was applied out of band. Forward-only: a journal a newer build owns, one
+//!   whose applied migration was edited in place, and one whose recorded history
+//!   has a hole in it are reported and refused rather than written over.
 //!
 //! Three properties are the point, and each is enforced rather than intended:
 //!
@@ -22,10 +22,12 @@
 //!    which does not prepare a schema, with `migrate` forced off, and they read
 //!    the ledger inside a `READ ONLY` transaction. A status command an operator
 //!    runs against production is a thing that *cannot* write to production.
-//! 2. **`migrate apply` is the only mutation**, it is explicit, and it is
-//!    idempotent: it takes the journal's advisory lock, re-reads the ledger under
-//!    it, applies only the versions above the recorded prefix, and commits once.
-//!    Running it twice, or from two hosts at once, is not two migrations.
+//! 2. **`migrate apply` and `migrate adopt` are the only mutations**, both are
+//!    explicit, and both are idempotent: each takes the journal's advisory lock
+//!    and re-reads the ledger under it, `apply` then applies only the versions
+//!    above the recorded prefix, and `adopt` records only the versions whose
+//!    objects an empty-ledger database already holds — executing no migration SQL
+//!    at all. Running either twice, or from two hosts at once, is not two writes.
 //! 3. **Nothing here serves.** No snapshot is compiled, no request path reads the
 //!    control plane, and the existing refusal to serve statefully is untouched:
 //!    these commands are what an operator runs *around* that refusal, and lifting
