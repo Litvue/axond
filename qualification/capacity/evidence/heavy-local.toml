@@ -1,0 +1,162 @@
+# A retained capacity run: what one replica did, and on what.
+#
+# Written by ops/qualification-evidence.py from the artifacts of a single
+# run; see docs/operations/qualification.md for how a record is read and
+# docs/operations/capacity.md for what the numbers mean. Two records may
+# only be compared when their provenance matches — the digests and the
+# hardware below are what makes that checkable rather than assumed.
+#
+# The digests are the record's identity: binary.sha256, inputs.
+# manifest_sha256, and each profile's config_sha256 are content-addressed
+# and outlive any rewriting of history. source.git_commit is the branch
+# commit the run happened on, which a squash merge does not land — read
+# it as a note about the run, not as something to check out.
+
+schema_version = 1
+slice = "capacity"
+tier = "heavy"
+runner = "local"
+runner_note = "8 vCPU Intel Xeon Platinum 8559C cloud VM, debug build (cargo test), unshared"
+
+[source]
+git_commit = "c5a35c6539c4f599a37e3e8279c50af2ab794a76"
+git_dirty = false
+crate_version = "0.3.24"
+
+[binary]
+sha256 = "32503505f8106428fd69b14a707fd7358651b04bafe49b027b82bfe5f93c92ae"
+version = "0.3.24"
+cargo_profile = "debug"
+rustc = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+
+[inputs]
+manifest = "qualification/capacity/manifest.toml"
+manifest_sha256 = "9f6e690cb8323bb51c28db5ca7f63113f29cdb9b828bbd20f3d7dd9a24a6515f"
+fixtures = 8
+
+[hardware]
+os = "linux"
+arch = "x86_64"
+kernel = "5.15.200"
+cpu_model = "INTEL(R) XEON(R) PLATINUM 8559C"
+cpus = 8
+total_memory_kib = 32881112
+containerized = false
+
+[[profile]]
+id = "buffered"
+concurrency = 128
+config_sha256 = "59d5fcee0fc90aeff0c39109970f302f9bb5b89417d057ccba8825c121429a12"
+requests = 40000
+offered = 40000
+accepted = 40000
+rejected = 0
+errors = 0
+elapsed_ms = 5211
+accepted_rps = 7674.7
+latency_p50_ms = 15.93
+latency_p95_ms = 24.99
+latency_p99_ms = 30.59
+peak_rss_kib = 44968
+rss_growth_kib = 23328
+peak_sockets = 344
+cpu_seconds = 23.99
+missing_usage_records = 0
+leaked_upstream_streams = 0
+verdicts = 6
+passed = true
+
+[[profile]]
+id = "cancellation"
+concurrency = 300
+config_sha256 = "59d5fcee0fc90aeff0c39109970f302f9bb5b89417d057ccba8825c121429a12"
+requests = 8000
+offered = 8000
+accepted = 8000
+rejected = 0
+errors = 0
+elapsed_ms = 4796
+accepted_rps = 1668.0
+latency_p50_ms = 269.86
+latency_p95_ms = 303.13
+latency_p99_ms = 479.39
+ttft_p95_ms = 64.82
+peak_rss_kib = 55348
+rss_growth_kib = 33724
+peak_sockets = 720
+cpu_seconds = 16.92
+missing_usage_records = 0
+leaked_upstream_streams = 0
+verdicts = 6
+passed = true
+
+[[profile]]
+id = "mixed"
+concurrency = 128
+config_sha256 = "4987ee22aad394470dbe908b3d22b7c4491bc324f9817081f672859b0beed049"
+requests = 12000
+offered = 12000
+accepted = 12000
+rejected = 0
+errors = 0
+elapsed_ms = 8824
+accepted_rps = 1359.9
+latency_p50_ms = 2.69
+latency_p95_ms = 279.16
+latency_p99_ms = 292.68
+ttft_p95_ms = 50.97
+peak_rss_kib = 39400
+rss_growth_kib = 17736
+peak_sockets = 283
+cpu_seconds = 20.23
+missing_usage_records = 0
+leaked_upstream_streams = 0
+verdicts = 6
+passed = true
+
+[[profile]]
+id = "response-size"
+concurrency = 64
+config_sha256 = "59d5fcee0fc90aeff0c39109970f302f9bb5b89417d057ccba8825c121429a12"
+requests = 6000
+offered = 6000
+accepted = 6000
+rejected = 0
+errors = 0
+elapsed_ms = 4376
+accepted_rps = 1370.9
+latency_p50_ms = 44.15
+latency_p95_ms = 74.95
+latency_p99_ms = 92.41
+peak_rss_kib = 68316
+rss_growth_kib = 46584
+peak_sockets = 156
+cpu_seconds = 17.92
+missing_usage_records = 0
+leaked_upstream_streams = 0
+verdicts = 6
+passed = true
+
+[[profile]]
+id = "streaming"
+concurrency = 300
+config_sha256 = "59d5fcee0fc90aeff0c39109970f302f9bb5b89417d057ccba8825c121429a12"
+requests = 8000
+offered = 8000
+accepted = 8000
+rejected = 0
+errors = 0
+elapsed_ms = 7733
+accepted_rps = 1034.5
+latency_p50_ms = 274.67
+latency_p95_ms = 299.03
+latency_p99_ms = 668.99
+ttft_p95_ms = 61.59
+peak_rss_kib = 50480
+rss_growth_kib = 28668
+peak_sockets = 733
+cpu_seconds = 23.76
+missing_usage_records = 0
+leaked_upstream_streams = 0
+verdicts = 6
+passed = true
