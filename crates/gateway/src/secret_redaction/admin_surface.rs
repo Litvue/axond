@@ -336,7 +336,6 @@ async fn no_administrative_response_discloses_the_material_a_credential_names() 
     // publication-time validation. The refusal names the required form, but
     // never copies the endpoint that was pasted into the admin request.
     let mut mispasted_endpoint = provider_document();
-    mispasted_endpoint["resource"]["provider"] = json!(fixtures::resource_id(99).to_string());
     // Keep this fixture distinct from the provider published above so the
     // endpoint validation is the refusal that the assertion exercises.
     mispasted_endpoint["resource"]["slug"] = json!("mispasted-endpoint");
