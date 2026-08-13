@@ -70,8 +70,23 @@ impl Sentinel {
 
     /// The first encoding of this sentinel present in `haystack`, if any.
     fn found_in(&self, haystack: &str) -> Option<&'static str> {
+        self.whole_in(haystack).or_else(|| {
+            self.needles
+                .iter()
+                .find(|(_, needle)| haystack.contains(needle.as_str()))
+                .map(|(encoding, _)| *encoding)
+        })
+    }
+
+    /// As [`Self::found_in`], but only whole-value encodings count.
+    ///
+    /// Fragments are what makes the *absence* check strict and the *identity*
+    /// check useless: sentinels that share a readable prefix share fragments, so
+    /// a twelve-character window proves some sentinel was there, never which.
+    fn whole_in(&self, haystack: &str) -> Option<&'static str> {
         self.needles
             .iter()
+            .filter(|(encoding, _)| *encoding != "fragment")
             .find(|(_, needle)| haystack.contains(needle.as_str()))
             .map(|(encoding, _)| *encoding)
     }
@@ -113,11 +128,18 @@ impl LeakSweep {
     /// failure report: the material itself must not be printed by the assertion
     /// that catches it, or CI logs become the leak.
     pub(crate) fn assert_absent(&self, surface: &str, rendered: &str) {
-        if let Some((label, encoding)) = self
+        // Whole values first, so a leak of one sentinel is not reported under
+        // the label of another that happens to share a fragment with it.
+        let found = self
             .sentinels
             .iter()
-            .find_map(|sentinel| Some((sentinel.label, sentinel.found_in(rendered)?)))
-        {
+            .find_map(|sentinel| Some((sentinel.label, sentinel.whole_in(rendered)?)))
+            .or_else(|| {
+                self.sentinels
+                    .iter()
+                    .find_map(|sentinel| Some((sentinel.label, sentinel.found_in(rendered)?)))
+            });
+        if let Some((label, encoding)) = found {
             panic!(
                 "{surface} discloses the `{label}` sentinel ({encoding} encoding); \
                  {} bytes of surface were swept and the material is deliberately not printed",
@@ -152,6 +174,11 @@ impl LeakSweep {
     /// Used on the one surface that legitimately holds the material — the fake
     /// upstream's `Authorization` header, the store's own resolution — so a test
     /// proves its detector fires before asserting that it does not.
+    ///
+    /// Whole-value encodings only. A tripwire's job is to say *this* key was
+    /// presented, and a shared fragment of two sentinels would let it accept the
+    /// other one — which is exactly the confusion (an upstream authenticated
+    /// with the pre-rotation key) these tests exist to catch.
     pub(crate) fn assert_present(&self, surface: &str, label: &str, rendered: &str) {
         let sentinel = self
             .sentinels
@@ -159,7 +186,7 @@ impl LeakSweep {
             .find(|sentinel| sentinel.label == label)
             .unwrap_or_else(|| panic!("no `{label}` sentinel in this sweep"));
         assert!(
-            sentinel.found_in(rendered).is_some(),
+            sentinel.whole_in(rendered).is_some(),
             "{surface} does not carry the `{label}` sentinel, so a redaction assertion \
              against it would pass for the wrong reason"
         );
@@ -234,6 +261,27 @@ mod tests {
             sweep.assert_absent_bytes("a binary column", &bytes);
         });
         assert!(caught.is_err(), "a leak in non-UTF-8 bytes went undetected");
+    }
+
+    /// Sentinels are readable on purpose, so they overlap; the tripwire has to
+    /// distinguish them anyway.
+    #[test]
+    fn the_tripwire_does_not_accept_a_sentinel_that_merely_looks_similar() {
+        let sweep = LeakSweep::of([
+            ("provider", "sk-axond-sentinel-provider-6f21a9d0c7b4"),
+            ("rotated", "sk-axond-sentinel-rotated-b48c37e1590a"),
+        ]);
+        let caught = std::panic::catch_unwind(move || {
+            sweep.assert_present(
+                "an upstream presented the wrong key",
+                "provider",
+                "Bearer sk-axond-sentinel-rotated-b48c37e1590a",
+            );
+        });
+        assert!(
+            caught.is_err(),
+            "a shared prefix let the tripwire accept a different sentinel"
+        );
     }
 
     #[test]
