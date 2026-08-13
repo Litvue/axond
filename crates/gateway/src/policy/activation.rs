@@ -331,10 +331,39 @@ pub(super) fn plan(
         }
         let transition = current.body.transition(&published.body);
         match transition.class() {
-            TransitionClass::Live => activation.live.push(*scope),
-            TransitionClass::Drain => activation
-                .draining
-                .push((*scope, transition.reasons().to_vec())),
+            // The document moved, and what it governs may have moved with it:
+            // this publication can edit a project's caps *and* pull a namespace
+            // onto them from a looser document in the same revision. Both are
+            // changes to what that namespace enforces, so the scope is
+            // classified against their union — otherwise editing a document
+            // upwards would report `live` while the namespace it took over
+            // stranded the holds the looser one admitted. Namespaces this
+            // scope's own document already governed are filtered out; their
+            // move is the transition above.
+            class @ (TransitionClass::Live | TransitionClass::Drain) => {
+                let mut reasons = match class {
+                    TransitionClass::Drain => transition.reasons().to_vec(),
+                    _ => Vec::new(),
+                };
+                if let Some(inherited) = handover(
+                    *scope,
+                    published
+                        .namespaces
+                        .iter()
+                        .filter_map(|namespace| active.governing(namespace))
+                        .filter(|inherited| **inherited != current.body)
+                        .map(|inherited| inherited.displaced_by(&published.body)),
+                )? {
+                    reasons.extend(inherited);
+                }
+                if reasons.is_empty() {
+                    activation.live.push(*scope);
+                } else {
+                    reasons.sort_unstable();
+                    reasons.dedup();
+                    activation.draining.push((*scope, reasons));
+                }
+            }
             TransitionClass::MigrationRequired => {
                 return Err(ActivationRefusal::Migration {
                     scope: *scope,
@@ -900,6 +929,50 @@ mod tests {
         let activation = plan(&with(&projects), &with(&projects), shared())
             .expect("republishing changes nothing");
         assert!(activation.is_noop(), "{activation:?}");
+    }
+
+    /// The two halves in one revision: the project's own document is *raised*,
+    /// which alone binds immediately, while a namespace enforcing the tenant's
+    /// wider cap moves onto it. The move strands what the wider cap admitted,
+    /// so the scope drains rather than reporting the raise as live.
+    #[test]
+    fn a_document_that_is_edited_while_taking_a_namespace_over_drains_for_both() {
+        let tenant = body(scope(), 1, 10_000);
+        let before = body(project(), 1, 500);
+        let raised = body(project(), 2, 900);
+        let with = |projects: &crate::desired_state::policy::PolicyBody,
+                    core: &crate::desired_state::policy::PolicyBody| {
+            let mut config = stateful_config();
+            config.namespace.push(crate::policy::view::tests::projected(
+                "acme/edge",
+                Some(NamespacePolicy {
+                    body: *projects,
+                    generation: generation(projects, 2),
+                }),
+            ));
+            config.namespace.push(crate::policy::view::tests::projected(
+                "acme/core",
+                Some(NamespacePolicy {
+                    body: *core,
+                    generation: generation(core, 2),
+                }),
+            ));
+            PolicyView::of(&config)
+        };
+
+        let activation = plan(&with(&before, &tenant), &with(&raised, &raised), shared())
+            .expect("raising a cap and taking a namespace over is not a refusal");
+        assert!(
+            activation
+                .draining()
+                .contains(&(project(), vec![TransitionReason::BudgetLowered])),
+            "the edit raised the cap, but the namespace it took over was \
+             enforcing 10_000: {activation:?}"
+        );
+        assert!(
+            !activation.live().contains(&project()),
+            "a scope that stranded a hold is not live: {activation:?}"
+        );
     }
 
     /// A project of a tenant that has one, for handover tests.
