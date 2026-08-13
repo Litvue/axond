@@ -271,8 +271,11 @@ and loses the active snapshot.
 2. **Read what is active.** The authenticated deployment-scope status response
    carries `catalogue.content_id` (the short digest of the content actually
    being served), `catalogue.active_age_ms`, `catalogue.consecutive_refusals`,
-   and `catalogue.last_refusal`. Tenant-scoped responses do not: a tenant sees
-   only that the `catalogue` component is healthy or degraded.
+   `catalogue.last_refusal`, and `catalogue.last_diff` when a content-changing
+   import has succeeded. `last_diff` contains only bounded counts for provider,
+   model, offering, lifecycle, capability, metadata, and observed-price changes;
+   it contains no model ids or price amounts. Tenant-scoped responses do not: a
+   tenant sees only that the `catalogue` component is healthy or degraded.
 3. **Find the location.** The refusal's log line carries the typed error the
    parser produced, and a JSON Pointer into the payload whenever the refusal was
    decided at one location: that pointer is the whole diagnosis for a `price`,

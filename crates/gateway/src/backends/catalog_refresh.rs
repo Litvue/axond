@@ -195,6 +195,8 @@ pub enum RefreshError {
     Store(#[from] CatalogStoreError),
     #[error(transparent)]
     Stored(#[from] HydrationError),
+    #[error("the catalogue refresh returned an inconsistent import: {message}")]
+    InvalidImport { refusal: Refusal, message: String },
     #[error("the refresh did not finish within {timeout:?}")]
     TimedOut { timeout: Duration },
 }
@@ -205,6 +207,7 @@ impl Refusable for RefreshError {
             Self::Source(error) => error.refusal(),
             Self::Store(error) => error.refusal(),
             Self::Stored(error) => error.refusal(),
+            Self::InvalidImport { refusal, .. } => refusal.clone(),
             // An upstream that did not answer in time is an upstream that did
             // not answer: the same reason a transport failure carries, because
             // an operator's next step is the same one.
@@ -500,6 +503,24 @@ impl<S: CatalogSource, T: CatalogStore> CatalogRefresher<S, T> {
     ) -> Result<(CatalogRefresh, Option<Retention>), RefreshError> {
         match refresh {
             CatalogRefresh::Updated { snapshot, payload } => {
+                if snapshot.source.content_id != snapshot.content.content_id() {
+                    return Err(RefreshError::InvalidImport {
+                        refusal: Refusal::new(RefusalReason::Content),
+                        message: format!(
+                            "snapshot metadata names {}, but normalized content is {}",
+                            snapshot.source.content_id,
+                            snapshot.content.content_id(),
+                        ),
+                    });
+                }
+                snapshot
+                    .source
+                    .raw
+                    .verify(payload.as_bytes())
+                    .map_err(|error| RefreshError::InvalidImport {
+                        refusal: Refusal::new(RefusalReason::Content),
+                        message: error.to_string(),
+                    })?;
                 let import = RetainedCatalog {
                     source: snapshot.source.clone(),
                     payload,
@@ -885,6 +906,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_import_with_a_payload_that_does_not_match_its_metadata_is_refused() {
+        let (snapshot, _) = imported(CATALOGUE, SourceValidators::etag("\"one\""));
+        let source = ScriptedSource::new([Ok(CatalogRefresh::Updated {
+            snapshot: Box::new(snapshot),
+            payload: RawPayload::new(&b"not-the-payload"[..]),
+        })]);
+        let store = InMemoryCatalogStore::new();
+        let mut refresher = refresher(source, &store);
+        refresher.restore(at(10)).await.expect("restore");
+
+        let RefreshOutcome::Refused { refusal, .. } =
+            refresher.refresh(RefreshTrigger::Manual, at(20)).await
+        else {
+            panic!("an inconsistent payload is refused");
+        };
+        assert_eq!(refusal.reason(), RefusalReason::Content);
+        assert!(refresher.active().is_none());
+        assert_eq!(store.retained_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_import_with_a_content_id_that_does_not_match_its_content_is_refused() {
+        let (mut snapshot, payload) = imported(CATALOGUE, SourceValidators::etag("\"one\""));
+        snapshot.source.content_id = super::super::catalog::CatalogContentId::from_checksum(
+            crate::desired_state::Checksum::of(b"a different catalogue"),
+        );
+        let source = ScriptedSource::new([Ok(CatalogRefresh::Updated {
+            snapshot: Box::new(snapshot),
+            payload,
+        })]);
+        let store = InMemoryCatalogStore::new();
+        let mut refresher = refresher(source, &store);
+        refresher.restore(at(10)).await.expect("restore");
+
+        let RefreshOutcome::Refused { refusal, .. } =
+            refresher.refresh(RefreshTrigger::Manual, at(20)).await
+        else {
+            panic!("inconsistent snapshot metadata is refused");
+        };
+        assert_eq!(refusal.reason(), RefusalReason::Content);
+        assert!(refresher.active().is_none());
+        assert_eq!(store.retained_count(), 0);
+    }
+
     /// The whole point of retention: a replica that restarts serves what it
     /// imported, at the age it was last confirmed, without asking the upstream.
     #[tokio::test]
@@ -1019,6 +1085,14 @@ mod tests {
             matches!(changes[0], CatalogChange::PriceChanged { .. }),
             "the diff names the price, not merely a difference: {:?}",
             changes[0]
+        );
+        assert_eq!(
+            refresher
+                .report(at(4_000))
+                .last_diff
+                .expect("the refresh report keeps the classification")
+                .prices_changed,
+            1
         );
         assert_eq!(
             store.retained_count(),

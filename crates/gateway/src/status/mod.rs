@@ -74,7 +74,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::backends::FailureCategory;
-use crate::backends::catalog::CatalogReport;
+use crate::backends::catalog::{CatalogDiffCounts, CatalogReport};
 use crate::convergence::{RevisionReport, SnapshotSource};
 use crate::shutdown::Phase;
 
@@ -656,6 +656,11 @@ pub struct CatalogueSummary {
     /// [`RefusalReason`](crate::backends::catalog::RefusalReason).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_refusal: Option<&'static str>,
+    /// Bounded semantic counts from the most recent content-changing import.
+    /// This reports what changed without exposing model ids, payload text, or
+    /// any tenant's pinned enablements.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_diff: Option<CatalogDiffCounts>,
     /// Whether refusals have persisted across more than one import. The same
     /// condition the alert fires on, so the page and the surface agree.
     pub persistent_refusal: bool,
@@ -670,6 +675,7 @@ impl CatalogueSummary {
                 .map(|active| u64::try_from(active.age.as_millis()).unwrap_or(u64::MAX)),
             consecutive_refusals: report.consecutive_refusals,
             last_refusal: report.last_refusal.map(|reason| reason.as_str()),
+            last_diff: report.last_diff,
             persistent_refusal: report.persistent_refusal(),
         }
     }
