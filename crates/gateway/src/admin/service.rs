@@ -356,12 +356,13 @@ impl AdminService {
         // 1. Mode, before a backend is looked for.
         let store = self.store()?;
 
-        // 2. Authority: a mutating grant, for the scope this mutation claims.
-        if !grant.action().mutates() {
-            return Err(AdminError::Forbidden(AdminAuthError::ActionNotPermitted {
-                action: grant.action(),
-            }));
-        }
+        // 2. Authority: the grant for *this* mutation, at the scope it claims.
+        //
+        // The verb the request performs, not merely some mutating verb: a
+        // rollback grant is not a publication grant, and the service is the place
+        // that cannot be bypassed by a handler asking its authorizer for the
+        // wrong one.
+        Self::permits(grant, AdminAction::for_mutation(request.kind))?;
         if grant.scope() != &request.scope {
             return Err(AdminError::Forbidden(AdminAuthError::ScopeNotPermitted));
         }

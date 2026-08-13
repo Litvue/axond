@@ -370,6 +370,31 @@ async fn a_grant_cannot_be_spent_on_another_action_or_another_scope() {
         .expect_err("a read grant is not a write grant");
     assert_eq!(error.code(), "admin_forbidden");
 
+    // Nor can a grant for one mutating verb be spent on another: rollback
+    // authority is not publication authority.
+    let error = service
+        .apply(
+            &grant(AdminAction::Rollback),
+            &request("key-1", ExpectedRevision::Empty, WriteMode::Apply),
+            &replace_with(fixtures::state()),
+        )
+        .await
+        .expect_err("a rollback grant does not author new state");
+    assert_eq!(error.code(), "admin_forbidden");
+
+    let mut rollback = request("key-1", ExpectedRevision::Empty, WriteMode::Apply);
+    rollback.kind = MutationKind::Rollback;
+    let error = service
+        .apply(
+            &grant(AdminAction::Publish),
+            &rollback,
+            &replace_with(fixtures::state()),
+        )
+        .await
+        .expect_err("a publication grant does not republish an earlier revision");
+    assert_eq!(error.code(), "admin_forbidden");
+    assert_eq!(store.published_revisions(), 0);
+
     // A grant for one tenant cannot publish a mutation attributed to another.
     let mut elsewhere = request("key-2", ExpectedRevision::Empty, WriteMode::Apply);
     elsewhere.scope = ResourceScope::Tenant(fixtures::tenant_id(11));

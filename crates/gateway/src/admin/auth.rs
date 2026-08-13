@@ -40,7 +40,7 @@ use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::desired_state::{Actor, ResourceScope};
+use crate::desired_state::{Actor, MutationKind, ResourceScope};
 use crate::principals::constant_time_eq;
 
 /// The prefix every minted inference token carries. Presented to `/admin/v1` it
@@ -290,6 +290,22 @@ impl AdminAction {
     /// idempotency key and an expected revision.
     pub const fn mutates(self) -> bool {
         matches!(self, Self::Publish | Self::Rollback)
+    }
+
+    /// The action that publishing `kind` requires authority for.
+    ///
+    /// Rollback is separate authority rather than a flavour of publication:
+    /// republishing an earlier revision is the operation an incident responder
+    /// may be trusted with while not being trusted to author new state, and the
+    /// reverse. A grant is therefore only good for the verb it names.
+    pub const fn for_mutation(kind: MutationKind) -> Self {
+        match kind {
+            MutationKind::Rollback => Self::Rollback,
+            MutationKind::Create
+            | MutationKind::Update
+            | MutationKind::Delete
+            | MutationKind::Rotate => Self::Publish,
+        }
     }
 }
 
