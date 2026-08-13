@@ -140,6 +140,22 @@ fn mount(specs: Vec<RouteSpec>, state: AppState) -> Router {
             } else {
                 route
             };
+            // A path under the administrative prefix takes that prefix's method
+            // contract with it: it shadows the nested surface's own
+            // `method_not_allowed_fallback`, so without this a `POST` here
+            // would be the single `/admin/v1` path answering axum's
+            // empty-bodied 405 instead of a declared code
+            // (`crate::admin::router::mount`). Registered outside every layer
+            // above, because `MethodRouter::layer` wraps the fallback too and a
+            // wrong method is answerable without an identity — the neighbouring
+            // administrative paths answer it before authentication, and
+            // answering `401` to a protocol mistake would send a caller looking
+            // for a credential that would not have helped.
+            let route = if spec.path.starts_with("/admin/v1") {
+                route.fallback(|| async { crate::admin::AdminError::MethodNotAllowed })
+            } else {
+                route
+            };
             router.route(spec.path, route)
         })
         .with_state(state)
@@ -243,16 +259,7 @@ fn route_specs(minting_enabled: bool) -> Vec<RouteSpec> {
             path: "/admin/v1/status",
             auth: AuthPosture::Diagnostic,
             capability: Some(Capability::Status),
-            // The one route on this router registered under the administrative
-            // prefix, and it takes that prefix's method contract with it: it
-            // shadows the nested surface's own `method_not_allowed_fallback`,
-            // so without this a `POST` here would be the single `/admin/v1`
-            // path answering axum's empty-bodied 405 instead of a declared
-            // code (`crate::admin::router::mount`).
-            router: || {
-                get(replica_status)
-                    .fallback(|| async { crate::admin::AdminError::MethodNotAllowed })
-            },
+            router: || get(replica_status),
         },
         RouteSpec {
             path: "/v1/chat/completions",
@@ -501,18 +508,21 @@ async fn diagnostic_middleware(
 /// to their own share and cannot fill the share that resolves in memory: the
 /// operator's static key is the credential the runbook sends through a
 /// revocation outage, and a store that is slow rather than down must not be
-/// able to refuse it.
+/// able to refuse it. Callers presenting nothing at all are held to a third
+/// share for the same reason — a flood needs no credential to mount.
 async fn diagnostic_authentication_middleware(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, GatewayError> {
-    let credential =
-        presented_credential(request.headers()).map_or(DiagnosticCredential::Local, |credential| {
+    let credential = presented_credential(request.headers()).map_or(
+        DiagnosticCredential::Anonymous,
+        |credential| {
             state
                 .config()
                 .diagnostic_credential(&Presented { credential })
-        });
+        },
+    );
     let _permit = state
         .0
         .admission
@@ -7072,6 +7082,10 @@ max_ttl = "15m"
                 DiagnosticCredential::Local,
                 crate::admission::MAX_AUTHENTICATING_DIAGNOSTIC_KEYS,
             ),
+            (
+                DiagnosticCredential::Anonymous,
+                crate::admission::MAX_AUTHENTICATING_DIAGNOSTIC_ANONYMOUS,
+            ),
         ] {
             for _ in 0..capacity {
                 held.push(
@@ -7117,11 +7131,13 @@ max_ttl = "15m"
     }
 
     /// The pre-authentication ceiling is partitioned rather than pooled,
-    /// because its two halves cost different things: a minted token is a
-    /// revocation-store round trip, a static key a comparison in memory. Pooled,
-    /// a store that is *slow* rather than down would park every permit in token
-    /// verifications and refuse the operator's static key — the credential the
-    /// runbook sends through exactly that outage.
+    /// because its shares cost different things: a minted token is a
+    /// revocation-store round trip, a static key a comparison in memory, an
+    /// anonymous caller nothing at all. Pooled, a store that is *slow* rather
+    /// than down would park every permit in token verifications and refuse the
+    /// operator's static key — the credential the runbook sends through exactly
+    /// that outage — and a flood needing no credential at all would do the same
+    /// for free.
     #[tokio::test]
     async fn a_token_flood_cannot_close_the_route_to_a_static_key() {
         let state = status_state(ReplicaObservability {
@@ -7168,6 +7184,29 @@ max_ttl = "15m"
         // shares the same share of the ceiling.
         let (status, _) = status_response(state.clone(), Some("not-a-key")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Nor can a flood that presents nothing at all, which needs no
+        // credential to mount and so would otherwise be the cheapest way to
+        // hold the route shut.
+        let anonymous: Vec<_> = (0..crate::admission::MAX_AUTHENTICATING_DIAGNOSTIC_ANONYMOUS)
+            .map(|_| {
+                state
+                    .0
+                    .admission
+                    .admit_diagnostic_authentication(DiagnosticCredential::Anonymous)
+                    .expect("under the anonymous share")
+            })
+            .collect();
+        let (status, body) = status_response(state.clone(), None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let (status, body) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a credential-less flood held the route closed against a static key: {body}"
+        );
+
+        drop(anonymous);
         drop(flood);
     }
 
@@ -7234,37 +7273,38 @@ max_ttl = "15m"
                 status: observed_registry(),
                 revision: None,
             });
-            let response = router(state)
-                .merge(surface)
-                .oneshot(
-                    Request::post("/admin/v1/status")
-                        .header(
-                            axum::http::header::AUTHORIZATION,
-                            format!("Bearer {OPERATOR_KEY}"),
-                        )
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                response.status(),
-                StatusCode::METHOD_NOT_ALLOWED,
-                "{posture}"
-            );
-            // RFC 9110 requires it on a 405, and axum sets it from the method
-            // router rather than from the fallback body.
-            assert!(
-                response.headers().contains_key(axum::http::header::ALLOW),
-                "{posture}"
-            );
-            let bytes = response.into_body().collect().await.unwrap().to_bytes();
-            let body: Value = serde_json::from_slice(&bytes)
-                .unwrap_or_else(|_| panic!("{posture}: a typed envelope, not an empty body"));
-            assert_eq!(
-                body["error"]["type"], "admin_method_not_allowed",
-                "{posture}"
-            );
+            let app = router(state).merge(surface);
+            // With a credential and without one alike: a wrong method is a
+            // protocol mistake, and every neighbouring administrative path
+            // answers it before authentication, so answering `401` here would
+            // send a caller looking for a credential that would not have
+            // helped.
+            for credential in [Some(format!("Bearer {OPERATOR_KEY}")), None] {
+                let case = format!(
+                    "{posture}/{}",
+                    credential.as_ref().map_or("anonymous", |_| "operator")
+                );
+                let mut request = Request::post("/admin/v1/status");
+                if let Some(credential) = credential {
+                    request = request.header(axum::http::header::AUTHORIZATION, credential);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{case}");
+                // RFC 9110 requires it on a 405, and axum sets it from the
+                // method router rather than from the fallback body.
+                assert!(
+                    response.headers().contains_key(axum::http::header::ALLOW),
+                    "{case}"
+                );
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let body: Value = serde_json::from_slice(&bytes)
+                    .unwrap_or_else(|_| panic!("{case}: a typed envelope, not an empty body"));
+                assert_eq!(body["error"]["type"], "admin_method_not_allowed", "{case}");
+            }
         }
     }
 

@@ -80,36 +80,48 @@ pub const MAX_IN_FLIGHT_DIAGNOSTICS: usize = 8;
 /// Refusing here costs no I/O, so the refusal is cheap even when the flood is
 /// not.
 ///
-/// Partitioned rather than pooled: see
-/// [`MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS`].
-pub const MAX_AUTHENTICATING_DIAGNOSTICS: usize = 64;
+/// Partitioned rather than pooled, by what the credential costs and by whether
+/// one was presented at all: see [`MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS`].
+pub const MAX_AUTHENTICATING_DIAGNOSTICS: usize = MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS
+    + MAX_AUTHENTICATING_DIAGNOSTIC_KEYS
+    + MAX_AUTHENTICATING_DIAGNOSTIC_ANONYMOUS;
 
 /// How much of that ceiling a credential whose verification does *I/O* may hold.
 ///
 /// A minted token costs a revocation-store round trip; a static key costs a
 /// constant-time comparison in memory. Pooled, the slow half decides the fast
-/// half's fate: a revocation store that is slow rather than down parks sixty-four
-/// token verifications in the pool and the operator's static key — the one
+/// half's fate: a revocation store that is slow rather than down parks every
+/// permit in the pool on a token verification, and the operator's static key — the one
 /// credential that reads status *through* a revocation outage, which is the
 /// runbook's whole triage instruction — is refused behind them.
 ///
 /// So the pool is partitioned by what the credential will cost, which is legible
 /// from its shape before any of it is spent. Tokens may fill this much of it and
-/// no more; the remainder
-/// ([`MAX_AUTHENTICATING_DIAGNOSTIC_KEYS`]) is reachable only by credentials that
-/// resolve in memory, so a slow store cannot close the route on the credential
-/// that outlives it.
+/// no more; the rest is reachable only by callers who present something else
+/// ([`MAX_AUTHENTICATING_DIAGNOSTIC_KEYS`]) or nothing at all
+/// ([`MAX_AUTHENTICATING_DIAGNOSTIC_ANONYMOUS`]), so a slow store cannot close
+/// the route on the credential that outlives it.
 pub const MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS: usize = 48;
 
-/// The rest of the ceiling, held out for credentials that resolve in memory.
+/// Held out for callers that present a credential resolving in memory.
 ///
-/// A flood of *garbage* lands here too — an unparseable credential is refused
-/// without I/O, so it cannot be told from a static key before it is checked —
-/// but these permits are held for microseconds rather than for a store's
-/// timeout, so the partition drains at the speed of a memcmp no matter who is
-/// flooding it. What it excludes is precisely the work that can block.
-pub const MAX_AUTHENTICATING_DIAGNOSTIC_KEYS: usize =
-    MAX_AUTHENTICATING_DIAGNOSTICS - MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS;
+/// A flood of *garbage* lands here too — a credential of no known shape is
+/// refused without I/O, so it cannot be told from a static key before it is
+/// checked — but these permits are held for the length of a comparison in
+/// memory rather than for a store's timeout, so the partition drains at that
+/// speed no matter who is flooding it. What it excludes is precisely the work
+/// that can block, and the callers who present nothing at all.
+pub const MAX_AUTHENTICATING_DIAGNOSTIC_KEYS: usize = 16;
+
+/// What a caller presenting no credential at all may hold.
+///
+/// Anonymous is a shape like any other, and the cheapest one: there is nothing
+/// to verify, so the permit is held only long enough to answer `401`. It gets a
+/// partition rather than sharing the one above because a flood needs no
+/// credential to mount — the operator's static key would otherwise queue behind
+/// callers who presented nothing — and it is small because nothing legitimate
+/// arrives here: every request that belongs on this route carries a credential.
+pub const MAX_AUTHENTICATING_DIAGNOSTIC_ANONYMOUS: usize = 8;
 
 /// What authenticating this credential will cost, as far as it can be known
 /// before it is spent: the credential's shape, and nothing about who presented
@@ -119,8 +131,11 @@ pub enum DiagnosticCredential {
     /// A `axt1.` minted token: signature verification plus a revocation-store
     /// lookup, so it can block on a backend.
     Minted,
-    /// Anything else, including nothing at all: resolved from memory.
+    /// A credential of some other shape: resolved from memory, so it cannot
+    /// block on a backend however wrong it turns out to be.
     Local,
+    /// No credential at all: nothing to verify, and nothing that can be served.
+    Anonymous,
 }
 
 /// Largest ceiling a semaphore-backed bound may carry. Config validation refuses
@@ -287,6 +302,7 @@ pub struct AdmissionControl {
     /// credential's verification will cost.
     authenticating_tokens: Arc<Semaphore>,
     authenticating_keys: Arc<Semaphore>,
+    authenticating_anonymous: Arc<Semaphore>,
     tenants: Arc<TenantTable>,
 }
 
@@ -301,6 +317,9 @@ impl AdmissionControl {
             diagnostics: Arc::new(Semaphore::new(MAX_IN_FLIGHT_DIAGNOSTICS)),
             authenticating_tokens: Arc::new(Semaphore::new(MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS)),
             authenticating_keys: Arc::new(Semaphore::new(MAX_AUTHENTICATING_DIAGNOSTIC_KEYS)),
+            authenticating_anonymous: Arc::new(Semaphore::new(
+                MAX_AUTHENTICATING_DIAGNOSTIC_ANONYMOUS,
+            )),
             tenants: Arc::new(TenantTable {
                 limit: limits.max_in_flight_per_tenant,
                 max_tenants: limits.max_tenants,
@@ -392,6 +411,7 @@ impl AdmissionControl {
         let partition = match credential {
             DiagnosticCredential::Minted => &self.authenticating_tokens,
             DiagnosticCredential::Local => &self.authenticating_keys,
+            DiagnosticCredential::Anonymous => &self.authenticating_anonymous,
         };
         let permit = Arc::clone(partition)
             .try_acquire_owned()

@@ -341,18 +341,18 @@ rejections mean under-provisioning rather than burstiness: queueing only absorbs
 short bursts. Shed requests are refused before the rate-limit store, the budget
 reservation, and the provider, so shedding costs nothing upstream. `diagnostic`
 is a different animal: it is the fixed ceiling on `GET /admin/v1/status` — eight
-reads being answered, sixty-four being authenticated — it is not sized by
+reads being answered, seventy-two being authenticated — it is not sized by
 `admission.max_in_flight`, and it means
 something is polling the diagnostic rather than that the replica is out of
 capacity — served traffic is unaffected either way. The two ceilings hold
 capacity under separate `axond_admission_in_flight` resources, `diagnostic` and
 `diagnostic_auth`, because one read holds a slot in each: summing them would
 report every reader twice against a denominator that is neither bound. A
-`diagnostic_auth` series near sixty-four with `diagnostic` near zero is a flood
+`diagnostic_auth` series near seventy-two with `diagnostic` near zero is a flood
 of credentials that are not being accepted, not eight busy operators — and one
 pinned at forty-eight is that flood arriving as minted tokens, which is the share
-they are held to precisely so the remaining sixteen stay reachable by a static
-key.
+they are held to precisely so the sixteen for credentials that resolve in memory,
+and the eight for callers presenting none, stay reachable by a static key.
 
 ### A replica is stuck draining
 
@@ -375,7 +375,7 @@ or shorten `max_stream_duration_ms`.
 in, including `closing`: it authenticates but sits outside admission, and takes
 no served in-flight slot, so polling a stuck replica neither is refused nor
 extends the drain it is describing. It is not unbounded, though — eight
-concurrent diagnostic reads per replica, and sixty-four concurrent
+concurrent diagnostic reads per replica, and seventy-two concurrent
 authentications of them, refused beyond either with `503
 diagnostic_concurrency_exceeded`. The second ceiling is the wider one because it
 sits *outside* authentication, where an anonymous caller can reach it: it bounds
@@ -383,13 +383,17 @@ the signature checks and revocation lookups a flood would otherwise spend, while
 the narrow one is inside, where only a caller that proved it may ask can spend a
 slot.
 
-That outer ceiling is split by what the credential costs to check: minted tokens
-may hold at most forty-eight of the sixty-four, and the remaining sixteen are
-reachable only by credentials that resolve in memory. So a revocation store that
+That outer ceiling is split three ways by what the credential costs to check:
+forty-eight permits for minted tokens, sixteen for credentials that resolve in
+memory, and eight for callers presenting none at all. So a revocation store that
 is *slow* rather than down cannot park every permit in token verifications and
 refuse the static operator key — which matters because that key is what the
-revocation-outage entry above tells you to triage with. Neither number is
-configurable. Poll serially when scripting a fleet sweep.
+revocation-outage entry above tells you to triage with — and neither can a flood
+that needs no credential to mount. What the shares cannot separate is a wrong
+static key from a right one, since telling them apart *is* the check; that costs
+a comparison in memory, so the sixteen drain at that speed however hard they are
+being hit. None of the numbers is configurable. Poll serially when scripting a
+fleet sweep.
 
 ## Bounded drill-down
 

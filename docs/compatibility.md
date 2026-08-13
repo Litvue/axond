@@ -55,14 +55,15 @@ components are enabled is a deployment property, so a stateless replica answers
 its own fixed eight-deep diagnostic ceiling on answering — `503
 diagnostic_concurrency_exceeded` beyond it — rather than by
 `admission.max_in_flight`, so it stays answerable on a saturated or draining
-replica while still refusing an unbounded poller. A wider sixty-four-deep
+replica while still refusing an unbounded poller. A wider seventy-two-deep
 ceiling outside authentication refuses the same way, so a flood of credentials
 that turn out to be worthless cannot spend unbounded verification and
 revocation-store work on a route admission does not cover. That wider ceiling is
-split by what checking the credential costs — minted tokens may hold at most
-forty-eight of it, the other sixteen being reachable only by credentials that
-resolve in memory — so a slow revocation store cannot refuse the static operator
-key that reads status through its outage.
+split by what checking the credential costs — forty-eight permits for minted
+tokens, sixteen for credentials that resolve in memory, eight for callers
+presenting none — so neither a slow revocation store nor a flood that needs no
+credential can refuse the static operator key that reads status through an
+outage.
 
 Responses is forwarded natively with only `model` rewritten and streaming is
 byte-faithful. **Every** `/v1/responses` request — initial calls as well as ones
