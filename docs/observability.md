@@ -109,7 +109,12 @@ the usage record instead.
 `axond.http.*` covers every HTTP request — including ones that never reach a
 provider — with low-cardinality dimensions. `axond.request.*` /
 `axond.upstream.*` are emitted from the single canonical usage record, so a
-metric and a usage row can never disagree.
+metric never reports a different value than the usage row it came from. They
+count what the upstream actually did, which is also what the budget was charged:
+a billing-grade request whose event could not be journaled is counted here and
+refused to the caller, so `axond.request.count` can exceed the usage rows a
+destination receives by exactly what the refusals in
+`axond.usage.journal.appends` and `axond.usage.journal.lost` report.
 
 | Instrument | Type | Dimensions | Use it for |
 | --- | --- | --- | --- |

@@ -11,7 +11,7 @@ This page is the operator's view of the other mode. With
 a durable outbox **before the request is answered**, and a delivery worker
 replays it into the configured sinks until they acknowledge it. Nothing here is
 constructed unless you turn it on; the rationale and its boundaries are
-[ADR 0034](../adr/0034-billing-grade-usage-outbox.md).
+[ADR 0035](../adr/0035-billing-grade-usage-outbox.md).
 
 ## The two modes
 
