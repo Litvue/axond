@@ -67,11 +67,11 @@ Intel Xeon Platinum 8559C, 31 GiB RAM, Linux 5.15.200, rustc 1.97.1, no queueing
 
 | Profile | Concurrency | Requests | Accepted req/s | p50 | p95 | p99 | TTFT p95 | Peak RSS | Peak sockets | CPU cores used |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `buffered` | 128 | 40 000 | 6 898 | 17.8 ms | 27.7 ms | 33.9 ms | — | 44 MiB | 316 | 4.8 |
-| `streaming` | 300 | 8 000 | 1 006 | 278 ms | 303 ms | 695 ms | 61 ms | 49 MiB | 727 | 3.5 |
-| `mixed` | 128 | 12 000 | 1 363 | 3.0 ms | 279 ms | 285 ms | 51 ms | 39 MiB | 272 | 2.5 |
-| `response-size` | 64 | 6 000 | 1 093 | 54.8 ms | 96.0 ms | 117 ms | — | 66 MiB | 150 | 4.2 |
-| `cancellation` | 300 | 8 000 | 1 567 | 282 ms | 327 ms | 492 ms | 72 ms | 55 MiB | 712 | 3.9 |
+| `buffered` | 128 | 40 000 | 7 101 | 17.3 ms | 26.9 ms | 32.9 ms | — | 44 MiB | 349 | 4.8 |
+| `streaming` | 300 | 8 000 | 1 010 | 277 ms | 309 ms | 634 ms | 66 ms | 49 MiB | 773 | 3.5 |
+| `mixed` | 128 | 12 000 | 1 363 | 2.8 ms | 278 ms | 284 ms | 51 ms | 38 MiB | 279 | 2.5 |
+| `response-size` | 64 | 6 000 | 1 117 | 53.8 ms | 94.7 ms | 115 ms | — | 70 MiB | 152 | 4.3 |
+| `cancellation` | 300 | 8 000 | 1 610 | 274 ms | 341 ms | 395 ms | 67 ms | 54 MiB | 643 | 4.0 |
 
 Throughput and latency move 10–25% between runs on a shared host, while the
 socket and memory columns barely move: read the first two as an order of
@@ -86,11 +86,11 @@ buffered and streamed requests in one distribution.
 What the envelope says, in operator terms:
 
 - **Sockets scale with concurrency, roughly two per in-flight stream** — one
-  inbound, one upstream. 300 concurrent streams held ~730 descriptors. Size
+  inbound, one upstream. 300 concurrent streams held ~770 descriptors. Size
   `ulimit -n` and `admission.max_in_flight_streams` together.
 - **Resident memory is bounded by concurrency and body size, not by request
   count.** 40 000 buffered requests cost the same ~44 MiB as 400 would; 256 KiB
-  bodies at 64 concurrent cost ~66 MiB. Bodies are buffered before dispatch
+  bodies at 64 concurrent cost ~70 MiB. Bodies are buffered before dispatch
   (ADR 0030), so `admission.max_request_bytes` × concurrency is the term to
   reason about.
 - **CPU saturates before memory.** Every profile used 2.5–4.8 cores of the 8
