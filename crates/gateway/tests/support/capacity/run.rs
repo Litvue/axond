@@ -64,6 +64,38 @@ max_stream_duration_ms = 0
 max_stream_bytes = 0
 ";
 
+/// The transport bounds a `backend-limits` profile moves down to the value it
+/// holds upstreams to. All three, because the profile stalls upstreams before
+/// headers and mid-body, and a bound left at the shared default would end the
+/// request on a number the profile did not declare.
+const UPSTREAM_BOUNDS: [&str; 3] = [
+    "response_header_timeout_ms",
+    "buffered_body_timeout_ms",
+    "stream_idle_timeout_ms",
+];
+
+/// `tuning` with the value of `key` replaced.
+///
+/// A string rewrite that silently finds nothing is worse than no rewrite at
+/// all: the profile would boot at the shared default while its artifact
+/// recorded the ceiling or bound the manifest asked for, and the run would
+/// pass without ever reaching the limit it exists to measure. So a key the
+/// tuning does not declare panics rather than no-ops.
+pub fn retuned(tuning: &str, key: &str, value: u64) -> String {
+    let assignment = format!("{key} = ");
+    let declared = tuning
+        .lines()
+        .find(|line| line.starts_with(&assignment))
+        .unwrap_or_else(|| panic!("the capacity tuning declares no `{key}` for a profile to move"));
+    tuning.replace(declared, &format!("{key} = {value}"))
+}
+
+/// The bounds every capacity profile shares, for a suite checking that the
+/// keys a profile moves are keys this declares.
+pub fn tuning() -> &'static str {
+    TUNING
+}
+
 /// The admission queue the profiles are served with. Queueing is a separate
 /// question from capacity — a queue converts shedding into latency the caller
 /// cannot see — so it is off, and recorded as off.
@@ -445,15 +477,11 @@ fn deployment(profile: &Profile) -> (String, Vec<(String, String)>) {
                 .max_in_flight
                 .expect("a shedding profile declares the ceiling it sheds at");
             (
-                TUNING
-                    .replace(
-                        "max_in_flight = 8192",
-                        &format!("max_in_flight = {ceiling}"),
-                    )
-                    .replace(
-                        "max_in_flight_streams = 8192",
-                        &format!("max_in_flight_streams = {ceiling}"),
-                    ),
+                retuned(
+                    &retuned(TUNING, "max_in_flight", ceiling),
+                    "max_in_flight_streams",
+                    ceiling,
+                ),
                 Vec::new(),
             )
         }
@@ -462,19 +490,11 @@ fn deployment(profile: &Profile) -> (String, Vec<(String, String)>) {
                 .upstream_timeout_ms
                 .expect("a backend-limits profile declares the bound it holds upstreams to");
             (
-                TUNING
-                    .replace(
-                        "response_header_timeout_ms = 30000",
-                        &format!("response_header_timeout_ms = {bound}"),
-                    )
-                    .replace(
-                        "buffered_body_timeout_ms = 30000",
-                        &format!("buffered_body_timeout_ms = {bound}"),
-                    )
-                    .replace(
-                        "stream_idle_timeout_ms = 30000",
-                        &format!("stream_idle_timeout_ms = {bound}"),
-                    ),
+                UPSTREAM_BOUNDS
+                    .iter()
+                    .fold(TUNING.to_owned(), |tuning, key| {
+                        retuned(&tuning, key, bound)
+                    }),
                 Vec::new(),
             )
         }
@@ -807,19 +827,14 @@ fn verdicts(result: &CapacityResult) -> Vec<Verdict> {
         [
             thresholds
                 .max_rejections
-                .map(|bound| ("max_rejections", result.throughput.rejected, bound)),
+                .map(|bound| ("max_rejections", Some(result.throughput.rejected), bound)),
             thresholds
                 .max_errors
-                .map(|bound| ("max_errors", result.throughput.errors, bound)),
+                .map(|bound| ("max_errors", Some(result.throughput.errors), bound)),
             thresholds.max_untyped_errors.map(|bound| {
                 (
                     "max_untyped_errors",
-                    result
-                        .outcomes
-                        .errors_by_error_type
-                        .get("untyped")
-                        .copied()
-                        .unwrap_or_default(),
+                    Some(untyped_errors(&result.outcomes)),
                     bound,
                 )
             }),
@@ -829,7 +844,7 @@ fn verdicts(result: &CapacityResult) -> Vec<Verdict> {
                     result
                         .deadlines
                         .as_ref()
-                        .map_or(0, |deadlines| deadlines.over_bound),
+                        .map(|deadlines| deadlines.over_bound),
                     bound,
                 )
             }),
@@ -839,7 +854,7 @@ fn verdicts(result: &CapacityResult) -> Vec<Verdict> {
                     result
                         .tenancy
                         .as_ref()
-                        .map_or(0, |tenancy| tenancy.foreign_credential_uses),
+                        .map(|tenancy| tenancy.foreign_credential_uses),
                     bound,
                 )
             }),
@@ -849,21 +864,24 @@ fn verdicts(result: &CapacityResult) -> Vec<Verdict> {
                     result
                         .tenancy
                         .as_ref()
-                        .map_or(0, |tenancy| tenancy.misattributed_usage_records),
+                        .map(|tenancy| tenancy.misattributed_usage_records),
                     bound,
                 )
             }),
             thresholds.max_unserved_after_load.map(|bound| {
                 (
                     "max_unserved_after_load",
-                    u64::from(!result.recovery.as_ref().is_some_and(|probe| probe.served)),
+                    result
+                        .recovery
+                        .as_ref()
+                        .map(|probe| u64::from(!probe.served)),
                     bound,
                 )
             }),
         ]
         .into_iter()
         .flatten()
-        .map(|(name, value, bound)| Verdict::at_most(name, value as f64, bound as f64)),
+        .map(|(name, measured, bound)| measured_verdict(name, measured, bound)),
     );
     verdicts.extend(
         [
@@ -893,6 +911,33 @@ fn verdicts(result: &CapacityResult) -> Vec<Verdict> {
         .flatten(),
     );
     verdicts
+}
+
+/// A threshold against a measurement the run may not have taken.
+///
+/// A threshold whose measurement is absent must not read as a threshold that
+/// was met: a profile declaring `max_foreign_credential_uses` while producing
+/// no tenancy block measured no isolation, and a verdict of zero would retain
+/// the claim anyway. The absence is recorded as its own failed verdict, the
+/// same way a lost resource sample is.
+pub fn measured_verdict(threshold: &str, measured: Option<u64>, bound: u64) -> Verdict {
+    match measured {
+        Some(value) => Verdict::at_most(threshold, value as f64, bound as f64),
+        None => Verdict::at_most(&format!("{threshold}_unmeasured"), 1.0, 0.0),
+    }
+}
+
+/// Failures that carry no typed body: an error the gateway answered without
+/// one, and a request that ended at the transport with no answer at all. The
+/// second is the more serious of the two — a caller that got a reset cannot be
+/// told why — so a profile bounding untyped failures bounds both.
+pub fn untyped_errors(outcomes: &Outcomes) -> u64 {
+    outcomes
+        .errors_by_error_type
+        .get("untyped")
+        .copied()
+        .unwrap_or_default()
+        + outcomes.transport_failures
 }
 
 /// What a run's resource sampling is worth as a gate.

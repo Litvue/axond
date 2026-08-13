@@ -174,6 +174,75 @@ fn the_tenant_rotation_accounts_for_every_offered_request() {
     }
 }
 
+/// A profile that moves a bound moves it in the config the process boots. A
+/// string rewrite that matched nothing would leave the shared default in place
+/// while the artifact recorded the ceiling the manifest asked for — a run that
+/// never reached its own limit, retained as evidence that it did.
+#[test]
+fn a_profile_can_only_retune_a_bound_the_shared_tuning_declares() {
+    let tuning = capacity::tuning();
+    let moved = capacity::retuned(tuning, "max_in_flight", 8);
+    assert!(
+        moved.contains("\nmax_in_flight = 8\n"),
+        "the ceiling moves:\n{moved}"
+    );
+    assert!(
+        moved.contains("\nmax_in_flight_streams = 8192\n"),
+        "and the key that merely starts the same does not:\n{moved}"
+    );
+
+    for key in [
+        "max_in_flight",
+        "max_in_flight_streams",
+        "response_header_timeout_ms",
+        "buffered_body_timeout_ms",
+        "stream_idle_timeout_ms",
+    ] {
+        assert_ne!(
+            capacity::retuned(tuning, key, 1),
+            tuning,
+            "{key} is a bound a profile moves, so the tuning has to declare it"
+        );
+    }
+
+    let renamed = std::panic::catch_unwind(|| capacity::retuned(tuning, "max_in_flite", 8));
+    assert!(
+        renamed.is_err(),
+        "a bound the tuning does not declare must fail loudly rather than \
+         leaving the profile at the default it meant to move"
+    );
+}
+
+/// Two ways a threshold could be met by measuring nothing, and neither may
+/// pass: a failure with no answer at all is the most untyped failure there is,
+/// and a threshold whose measurement block is absent measured no property.
+#[test]
+fn a_threshold_cannot_be_satisfied_by_an_absent_measurement() {
+    let outcomes = |untyped: u64, transport: u64| support::capacity::result::Outcomes {
+        by_status: BTreeMap::new(),
+        rejections_by_error_type: BTreeMap::new(),
+        errors_by_error_type: BTreeMap::from([("untyped".to_owned(), untyped)]),
+        client_cancelled: 0,
+        transport_failures: transport,
+    };
+    assert_eq!(capacity::untyped_errors(&outcomes(0, 0)), 0);
+    assert_eq!(
+        capacity::untyped_errors(&outcomes(0, 3)),
+        3,
+        "a request that ended at the transport carries no typed body either"
+    );
+    assert_eq!(capacity::untyped_errors(&outcomes(2, 3)), 5);
+
+    let measured = capacity::measured_verdict("max_over_deadline", Some(0), 0);
+    assert!(measured.passed && measured.threshold == "max_over_deadline");
+    let unmeasured = capacity::measured_verdict("max_over_deadline", None, 0);
+    assert!(
+        !unmeasured.passed && unmeasured.threshold == "max_over_deadline_unmeasured",
+        "a declared threshold with no measurement behind it is a failure, not a \
+         zero: {unmeasured:?}"
+    );
+}
+
 async fn qualify(tier: Tier) {
     let (manifest, text) = capacity::manifest::load();
     let mut failures = Vec::new();

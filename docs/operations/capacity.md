@@ -159,10 +159,15 @@ depends on how fast the runner was:
 
 - every offered request accepted (`min_accepted_fraction`) — except where the
   profile exists to be refused, where the refusal itself is bounded instead
-  (`min_rejected_fraction`, `max_rejected_fraction`, `max_error_fraction`),
+  (`min_rejected_fraction`, `max_rejected_fraction`, `max_error_fraction`) and
+  the floor on what was still served is a count (`min_accepted`), because a
+  replica behind a ceiling serves what the ceiling allows however many callers
+  arrive,
 - nothing shed (`max_rejections`) and no errors (`max_errors`),
 - no request outliving the bound the replica declares (`max_over_deadline`) and
-  no untyped failure (`max_untyped_errors`),
+  no untyped failure (`max_untyped_errors`, counting both an error answered
+  without a typed body and a request that ended at the transport with no answer
+  at all),
 - no tenant served with a credential it does not own
   (`max_foreign_credential_uses`) and no charge filed against a namespace that
   did not send the request (`max_misattributed_usage_records`),
@@ -172,6 +177,9 @@ depends on how fast the runner was:
   cancelled streams settling as `client_cancelled`,
 - no upstream response body still open once every client is gone
   (`max_leaked_upstream_streams`),
+- and, for any of these, the measurement itself: a threshold whose measurement
+  block is absent from the artifact fails as `<threshold>_unmeasured` rather
+  than passing as a zero,
 - bounded resident-memory growth over the run (`max_rss_growth_kib`), measured
   from the baseline to whichever is higher of the sampled peak and the settled
   reading taken after the load stops.

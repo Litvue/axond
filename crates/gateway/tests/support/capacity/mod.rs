@@ -14,6 +14,7 @@ pub use manifest::{Manifest, Profile, Tier, Workload};
 pub use probe::{ResourceReport, Span};
 pub use result::CapacityResult;
 pub use run::{
-    Gauges, Tenant, cancels, expected_cancellations, memory_verdict, offered_per_tenant,
-    offered_to_healthy_backend, output_events, run, tenants,
+    Gauges, Tenant, cancels, expected_cancellations, measured_verdict, memory_verdict,
+    offered_per_tenant, offered_to_healthy_backend, output_events, retuned, run, tenants, tuning,
+    untyped_errors,
 };
