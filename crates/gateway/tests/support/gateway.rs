@@ -19,6 +19,10 @@ use super::upstream::target;
 /// The inbound gateway key every test authenticates with. A fixture value, not
 /// a secret: the fake upstream is the only thing it can reach.
 pub const GATEWAY_KEY: &str = "test-inbound-key";
+/// The environment variable carrying a boot's private inbound key. Its value is
+/// unique per boot, which is what lets a readiness probe tell this child apart
+/// from a sibling test process serving the same loopback port.
+const BOOT_KEY_ENV: &str = "GW_BOOT_KEY";
 /// Upstream credentials the gateway is expected to inject, asserted on the
 /// fake upstream's recorded requests.
 pub const OPENAI_KEY: &str = "test-upstream-openai-key";
@@ -80,6 +84,9 @@ const BOOT_ATTEMPTS: u32 = 4;
 
 pub struct Axond {
     pub base_url: String,
+    /// This boot's private inbound key: no other process has it, so a route that
+    /// fails closed accepts it only from this child.
+    boot_key: String,
     /// The config the process was booted with, kept so a harness can record
     /// exactly what it qualified.
     pub config: String,
@@ -113,20 +120,22 @@ impl Axond {
     /// One boot attempt: `None` when the process never became healthy, which on
     /// a loopback port means someone else won the bind.
     async fn try_start(upstream_base_url: &str, tuning: &str) -> Option<Self> {
-        let dir = std::env::temp_dir().join(format!(
-            "axond-compat-{}-{}",
-            std::process::id(),
-            CONFIGS.fetch_add(1, Ordering::SeqCst)
-        ));
+        // One reservation, used for both the config directory and the boot key:
+        // re-reading the counter could hand two concurrent boots the same value,
+        // and the key has to be unique by construction, not by timing.
+        let boot = CONFIGS.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("axond-compat-{}-{boot}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("test config directory");
         let addr = free_addr();
         let path = dir.join(format!("axond-{}.toml", addr.port()));
+        let boot_key = format!("test-boot-key-{}-{boot}", std::process::id());
         let config = config_toml(addr, upstream_base_url, tuning);
         std::fs::write(&path, &config).expect("test config is written");
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_axond"))
             .env("AXOND_CONFIG", &path)
             .env("GW_INBOUND_KEY", GATEWAY_KEY)
+            .env(BOOT_KEY_ENV, &boot_key)
             .env("GW_FAKE_OPENAI_KEY", OPENAI_KEY)
             .env("GW_FAKE_ANTHROPIC_KEY", ANTHROPIC_KEY)
             .env(OPENAI_SECONDARY_ENV, OPENAI_KEY_SECONDARY)
@@ -164,6 +173,7 @@ impl Axond {
 
         let mut gateway = Self {
             base_url: format!("http://{addr}"),
+            boot_key,
             config,
             child,
             lines,
@@ -191,9 +201,11 @@ impl Axond {
                 .await
                 && response.status().is_success()
             {
-                // The probe only proves something serves the port. Anything this
-                // child logged about the bind, and its own exit, decide whose.
-                return !self.lost_the_port() && matches!(self.child.try_wait(), Ok(None));
+                // Health only proves *something* serves the port. Readiness is
+                // this child's only if the server also accepts this boot's
+                // private key, which no sibling was given.
+                let base_url = self.base_url.clone();
+                return self.answers_for_this_boot(&client, &base_url).await;
             }
             if let Ok(Some(_)) = self.child.try_wait() {
                 // The process is gone. A refused config is a test bug rather
@@ -209,6 +221,30 @@ impl Axond {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         false
+    }
+
+    /// Whether the process serving this port is this child. `/v1/models` fails
+    /// closed on an unknown gateway key, and this boot's key exists only in this
+    /// child's environment, so a sibling that won the port answers 401 — the
+    /// window between `spawn` and the child's own bind failure, where nothing has
+    /// been logged yet, is covered by asking the server who it is rather than by
+    /// waiting for this child to complain.
+    async fn answers_for_this_boot(&mut self, client: &reqwest::Client, base_url: &str) -> bool {
+        let identified = client
+            .get(format!("{base_url}/v1/models"))
+            .bearer_auth(&self.boot_key)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success());
+        identified && !self.lost_the_port() && matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Whether `base_url` is served by this child, as `await_ready` decides it.
+    /// Exposed so the identity rule can be tested against a foreign server
+    /// deterministically, instead of only when the port race is actually lost.
+    pub async fn serves_this_boot(&mut self, base_url: &str) -> bool {
+        let client = reqwest::Client::new();
+        self.answers_for_this_boot(&client, base_url).await
     }
 
     /// Whether this child reported that its listener address was taken. The
@@ -387,6 +423,12 @@ id = "fake-anthropic-primary"
 
 [[gateway_key]]
 env = "GW_INBOUND_KEY"
+namespace = "platform"
+
+# Unique to this boot, so a request carrying it can only be answered by the
+# process the harness started; the suites authenticate with GW_INBOUND_KEY.
+[[gateway_key]]
+env = "GW_BOOT_KEY"
 namespace = "platform"
 
 {tuning}
