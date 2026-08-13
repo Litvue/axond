@@ -61,7 +61,11 @@
 //! provider *id*. The bridge is the provider resource's slug, and the deployment
 //! must declare a `[[provider]]` with that id — endpoints and wire families are
 //! still bootstrap-owned, because projecting provider connections is its own
-//! slice. A credential naming a provider the deployment cannot dial is refused
+//! slice. The two declarations must agree on more than the id: a credential
+//! whose provider resource speaks one wire family while the `[[provider]]` of
+//! that id is declared as another is refused, because presenting a key in a wire
+//! family its account does not belong to is a key sent to the wrong upstream.
+//! A credential naming a provider the deployment cannot dial is refused
 //! rather than dropped: it is an operator-actionable mismatch between a published
 //! revision and a file, and silently serving traffic with no credential for that
 //! provider is the failure mode it would otherwise become.
@@ -75,10 +79,10 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::compile::{ProjectionError, RevisionProjection};
 use super::tenancy::TenancyProjection;
-use crate::config::{Config, Credential, ProjectIdentity};
+use crate::config::{Config, Credential, ProjectIdentity, ProviderWire};
 use crate::desired_state::credentials::{Credentials, ProviderCredential};
 use crate::desired_state::providers::Providers;
-use crate::desired_state::{DesiredState, SecretLifecycle, SecretOwner};
+use crate::desired_state::{DesiredState, SecretLifecycle, SecretOwner, WireFamily};
 
 /// Projects a revision's active provider credentials onto `[[credential]]`,
 /// leaving every other section as it was given.
@@ -221,7 +225,7 @@ fn provider_id(
                 ),
             })?;
     let slug = declared.slug.as_str();
-    if !config.provider.iter().any(|provider| provider.id == slug) {
+    let Some(bootstrap) = config.provider.iter().find(|provider| provider.id == slug) else {
         return Err(ProjectionError::Incomplete {
             detail: format!(
                 "{} authenticates to provider `{slug}`, which this deployment does not declare: a \
@@ -230,8 +234,34 @@ fn provider_id(
                 credential.reference
             ),
         });
+    };
+    // The slug matching is not enough: the two declarations must also agree on
+    // what they are talking to. A key presented in the wrong wire family's
+    // request is a credential leaked to the wrong upstream account, so the
+    // mismatch is refused for the same reason an undeclared provider is.
+    let wire = wire(declared.body.wire_family());
+    if bootstrap.kind.wire() != wire {
+        return Err(ProjectionError::Incomplete {
+            detail: format!(
+                "{} authenticates to provider `{slug}`, which this revision speaks {} to while \
+                 this deployment declares it as {}: a credential must not be presented in a wire \
+                 family its account does not belong to",
+                credential.reference,
+                wire,
+                bootstrap.kind.wire()
+            ),
+        });
     }
     Ok(slug.to_owned())
+}
+
+/// The wire a family is spoken over. Total, so a new family cannot be added
+/// without deciding what this projection does with it.
+const fn wire(family: WireFamily) -> ProviderWire {
+    match family {
+        WireFamily::OpenaiChat => ProviderWire::Openai,
+        WireFamily::AnthropicMessages => ProviderWire::Anthropic,
+    }
 }
 
 /// The projected namespaces of a config, indexed by what they *are* rather than
@@ -666,6 +696,45 @@ mod tests {
 
         let Err(error) = RuntimeProjection.project(&bootstrap(), &state) else {
             panic!("a credential for an undeclared provider must refuse the candidate");
+        };
+        assert!(
+            matches!(error, ProjectionError::Incomplete { .. }),
+            "{error:?}"
+        );
+    }
+
+    /// And matching the id is not enough. A revision whose provider speaks
+    /// Anthropic, projected onto the OpenAI-kind `[[provider]]` of that id, would
+    /// present an Anthropic key in an OpenAI-shaped request: the key goes to an
+    /// account it does not belong to, so the candidate is refused instead.
+    #[test]
+    fn a_credential_whose_provider_speaks_another_wire_family_refuses() {
+        let mut state = DesiredState::new();
+        let mismatched = ProviderBody::for_tenant(
+            fixtures::provider_id(CREDENTIAL),
+            tenant(),
+            fixtures::display_name("OpenAI"),
+            WireFamily::AnthropicMessages,
+            "https://api.openai.com/v1",
+        )
+        .version(Slug::parse("openai").expect("fixture slug"));
+        state
+            .insert(fixtures::tenant(TENANT, "acme"))
+            .and_then(|state| state.insert(fixtures::project(&tenant(), PROJECT, "core")))
+            .and_then(|state| state.insert(mismatched))
+            .and_then(|state| {
+                state.insert(credential(
+                    CREDENTIAL,
+                    "primary",
+                    SecretOwner::project(tenant(), project()),
+                    fixtures::secret_ref(CREDENTIAL),
+                    SecretLifecycle::Active,
+                ))
+            })
+            .expect("a valid revision");
+
+        let Err(error) = RuntimeProjection.project(&bootstrap(), &state) else {
+            panic!("a wire family mismatch must refuse the candidate");
         };
         assert!(
             matches!(error, ProjectionError::Incomplete { .. }),
