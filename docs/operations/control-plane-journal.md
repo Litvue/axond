@@ -340,6 +340,12 @@ What it does instead of recording:
   empty is reported as having no seeded row, a flag that is off is reported as not
   enabled, and something the file *drops* that is still there is reported as still
   present. Finish or undo that file by hand first.
+- **A version applied out of order, or one skipped.** Everything a later file
+  leaves of its own is present while an earlier file's objects are not, so the
+  database is not a prefix of the shipped history and no baseline states it.
+  Refused naming that later version, rather than recorded as the prefix
+  underneath — which would claim a history this database does not have and leave
+  `apply` to run the skipped file over objects that are already there.
 - **A ledger that already records a history.** Nothing to adopt: the history is
   reported and nothing is written, so a stray `adopt` in a rollout is not a ledger
   edit.
