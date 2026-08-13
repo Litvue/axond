@@ -33,7 +33,8 @@ use serde_json::{Value, json};
 use support::client;
 use support::tenancy::{
     ACME, ALL_ALIASES, Deployment, Durability, FALLBACK_KEY, FALLBACK_NAMESPACE, GLOBEX,
-    PLATFORM_ALIAS, PLATFORM_CREDENTIAL_ID, PLATFORM_UPSTREAM_KEY, TENANTS, Tenant, boot, connect,
+    PLATFORM_ALIAS, PLATFORM_CREDENTIAL_ID, PLATFORM_UPSTREAM_KEY, TENANTS, Tenant, boot,
+    boot_that_fails_after_starting, connect, function_exists, postgres_dsn, relation_exists,
 };
 
 /// A minimal chat request; the fake upstream answers every alias from the same
@@ -403,6 +404,36 @@ async fn one_tenants_exhausted_budget_does_not_deny_another() {
     assert!(
         globex_spend > 0 && globex_spend < i64::try_from(cap).expect("a small cap"),
         "globex's ledger holds only its own single request: {spend:?}"
+    );
+}
+
+/// A boot the suite abandons half-way still takes its objects with it, so a
+/// failing run does not silently accumulate tables in a shared database and the
+/// evidence's cleanup claim covers the runs that need it most.
+#[tokio::test]
+async fn a_boot_that_fails_after_starting_still_drops_what_it_created() {
+    let Some(names) = boot_that_fails_after_starting(Durability::Postgres {
+        namespace_cap_microdollars: 1_000,
+    }) else {
+        return;
+    };
+    let dsn = postgres_dsn().expect("a configured DSN, since the boot ran");
+
+    for relation in [
+        names.usage_table.clone(),
+        names.budget_table.clone(),
+        format!("{}_namespace", names.budget_table),
+        format!("{}_reservation", names.budget_table),
+    ] {
+        assert!(
+            !relation_exists(&dsn, &relation).await,
+            "the failed boot left {relation} behind"
+        );
+    }
+    let fence = format!("{}_namespace_fence", names.budget_table);
+    assert!(
+        !function_exists(&dsn, &fence).await,
+        "the failed boot left the function {fence} behind"
     );
 }
 

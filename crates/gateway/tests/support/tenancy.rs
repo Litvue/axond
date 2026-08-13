@@ -141,13 +141,84 @@ pub enum Durability {
 /// Boot the deployment. `Durability::Postgres` yields `None` when no test
 /// Postgres is configured, which is how the stateful cases skip.
 pub async fn boot(durability: Durability) -> Option<Deployment> {
+    start(durability, &unique_suffix(), Fate::Serve).await
+}
+
+/// The message the deliberately failed boot panics with, so the regression
+/// cannot pass on some other panic.
+const FAILED_BOOT: &str = "a post-boot check failed";
+
+/// Run a boot that dies after the gateway came up, and report the names it
+/// created so a caller can prove they did not outlive it. `None` when no test
+/// Postgres is configured.
+///
+/// This is the failure the cleanup exists for: the child creates its usage and
+/// budget objects while starting, so anything that panics between that and a
+/// `Deployment` existing would leave them behind if the `Deployment` were what
+/// owned them.
+pub fn boot_that_fails_after_starting(durability: Durability) -> Option<Names> {
+    postgres_dsn()?;
+    let suffix = unique_suffix();
+    let names = names(&suffix);
+    // On a thread with a runtime of its own, because the boot has to unwind
+    // without taking the calling test with it, and the caller's runtime cannot
+    // be re-entered.
+    let outcome = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the failing boot")
+            // Dropped inside the runtime either way, so nothing of a boot that
+            // unexpectedly succeeded outlives this.
+            .block_on(async move { start(durability, &suffix, Fate::Fail).await.is_some() })
+    })
+    .join();
+    let Err(failure) = outcome else {
+        panic!("the arranged boot returned instead of failing");
+    };
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        message.contains(FAILED_BOOT),
+        "the boot failed for the reason the regression arranged, not another: {message}"
+    );
+    Some(names)
+}
+
+/// The per-boot object names, derived from the run's suffix so a caller can know
+/// them without holding the boot that creates them.
+pub struct Names {
+    pub usage_table: String,
+    pub budget_table: String,
+}
+
+fn names(suffix: &str) -> Names {
+    Names {
+        usage_table: format!("axond_usage_iso_{suffix}"),
+        budget_table: format!("axond_budget_iso_{suffix}"),
+    }
+}
+
+/// How far a boot is meant to get.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fate {
+    Serve,
+    /// Panic once the gateway is up, the way a post-boot check would.
+    Fail,
+}
+
+async fn start(durability: Durability, suffix: &str, fate: Fate) -> Option<Deployment> {
     let dsn = match durability {
         Durability::None => None,
         Durability::Postgres { .. } => Some(postgres_dsn()?),
     };
-    let suffix = unique_suffix();
-    let usage_table = format!("axond_usage_iso_{suffix}");
-    let budget_table = format!("axond_budget_iso_{suffix}");
+    let Names {
+        usage_table,
+        budget_table,
+    } = names(suffix);
 
     let upstream = FakeUpstream::start().await;
     let render = |addr: SocketAddr| {
@@ -190,11 +261,49 @@ pub async fn boot(durability: Durability) -> Option<Deployment> {
     });
     let gateway = Axond::start_custom(&render, &env).await;
 
+    if fate == Fate::Fail {
+        let dsn = objects
+            .as_ref()
+            .map(|objects| objects.dsn.clone())
+            .expect("a failing boot is only arranged for a stateful one");
+        assert!(
+            relation_exists(&dsn, &usage_table).await,
+            "the child created its objects before the boot failed, or the case proves nothing"
+        );
+        // `objects` and `gateway` are still locals, so the unwind is what has to
+        // clean up — the point of the case.
+        panic!("{FAILED_BOOT}");
+    }
+
     Some(Deployment {
         gateway,
         upstream,
         objects,
     })
+}
+
+/// Whether a relation of this name exists, for asserting on what a boot left.
+pub async fn relation_exists(dsn: &str, name: &str) -> bool {
+    let client = connect(dsn).await;
+    let row = client
+        .query_one(
+            "SELECT count(*) FROM pg_class WHERE relname = $1 AND relkind = 'r'",
+            &[&name],
+        )
+        .await
+        .expect("a relation lookup");
+    row.get::<_, i64>(0) > 0
+}
+
+/// Whether a function of this name exists: the budget DDL names one after its
+/// table, and dropping the table does not take it.
+pub async fn function_exists(dsn: &str, name: &str) -> bool {
+    let client = connect(dsn).await;
+    let row = client
+        .query_one("SELECT count(*) FROM pg_proc WHERE proname = $1", &[&name])
+        .await
+        .expect("a function lookup");
+    row.get::<_, i64>(0) > 0
 }
 
 /// End the process before its tables are dropped: it holds a Postgres pool,
