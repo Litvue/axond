@@ -126,14 +126,21 @@ fn words(statement: &'static str) -> Vec<&'static str> {
         match byte {
             b'\n' if commented => commented = false,
             _ if commented => {}
+            // A quote or a comment marker ends the word running up to it as much
+            // as a space does: `EXISTS foo--why` names `foo`, and dropping the
+            // word would make the next one answer for it.
             b'\'' => {
+                if let Some(from) = start.take() {
+                    words.push(&statement[from..index]);
+                }
                 quoted = !quoted;
-                start = None;
             }
             _ if quoted => {}
             b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                if let Some(from) = start.take() {
+                    words.push(&statement[from..index]);
+                }
                 commented = true;
-                start = None;
             }
             _ if word => start = start.or(Some(index)),
             _ => {
@@ -1240,6 +1247,24 @@ mod tests {
         assert_eq!(
             evidence(&COMMENTED),
             Some(vec![Evidence::Relation("first")])
+        );
+
+        // A word ending against a quote or a `--` is still that word. Losing it
+        // would have the following one answer for it: the table below would be
+        // looked for under the name of its column, and the seed would read as a
+        // plain `INSERT` and withdraw adoption from the whole history.
+        const TIGHT: Migration = Migration {
+            version: 4,
+            name: "tight",
+            sql: "CREATE TABLE IF NOT EXISTS second--the only row holder\n\
+                  (id integer PRIMARY KEY, note text);\n\
+                  INSERT INTO second (id, note) VALUES (1, 'only')\n\
+                  ON CONFLICT (id) DO NOTHING--idempotent by construction\n\
+                  ;\n",
+        };
+        assert_eq!(
+            evidence(&TIGHT),
+            Some(vec![Evidence::Relation("second"), Evidence::Seed("second")])
         );
     }
 
