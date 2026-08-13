@@ -367,6 +367,18 @@ impl UsageJournal for PostgresJournal {
                 let mut dropped = 0;
                 let stored = stored_events(&tx, &gate, capacity.max_events).await?;
                 if stored >= capacity.max_events {
+                    if gate.refusing() {
+                        // A recent append already established that this backlog
+                        // holds nothing anybody may delete. Refusing on that
+                        // costs nothing, which is the point: the probe below is
+                        // an ordered walk to the limit-th newest position, and a
+                        // request that is going to be turned away must not run
+                        // it once per attempt while the outbox stays full.
+                        return Err(OpError::Journal(JournalError::AtCapacity {
+                            pending: stored,
+                            capacity,
+                        }));
+                    }
                     // `stored` is trusted only for *whether* the outbox is at its
                     // limit, never for how far over it is: a count stops at
                     // `max_events + 1` and a cached one lags deletions, so
@@ -398,10 +410,28 @@ impl UsageJournal for PostgresJournal {
                     }
                     if surplus.is_some() {
                         // Everything left is either undelivered or somebody's
-                        // quarantined evidence, so there is no room to make. The
-                        // measurement is kept: the next append refuses on it
-                        // rather than measuring a backlog that is still there,
-                        // and it expires on its own inside a second.
+                        // quarantined evidence, so there is no room to make.
+                        if reclaimed > 0 || dropped > 0 {
+                            // Whatever room this attempt did make is committed
+                            // even though the append itself fails: rolling it
+                            // back would make every refused request re-delete
+                            // the same rows and write the same WAL for nothing.
+                            tx.commit().await?;
+                            if dropped > 0 {
+                                crate::telemetry::metrics::record_usage_journal_lost(
+                                    BACKEND,
+                                    "capacity_drop",
+                                    dropped,
+                                );
+                            }
+                        } else {
+                            // Nothing was freed, so nothing until a deletion can
+                            // change the answer: the verdict is remembered and
+                            // the next append refuses on it without probing.
+                            // It expires on its own inside a second, so a
+                            // refusal cannot outlive the backlog that caused it.
+                            gate.unreclaimable();
+                        }
                         return Err(OpError::Journal(JournalError::AtCapacity {
                             pending: stored,
                             capacity,
@@ -1324,6 +1354,9 @@ struct CapacityGate {
 struct GateState {
     measured: Option<Measured>,
     at: Option<Instant>,
+    /// When an append last found the outbox full with nothing it could give
+    /// up. See [`CapacityGate::refusing`].
+    unreclaimable: Option<Instant>,
 }
 
 /// What a bounded count established about the span it was taken against.
@@ -1370,16 +1403,39 @@ impl CapacityGate {
         } else {
             Measured::Gaps(span.saturating_sub(counted))
         };
-        *self.state.lock().expect("capacity gate") = GateState {
-            measured: Some(measured),
-            at: Some(Instant::now()),
-        };
+        let mut state = self.state.lock().expect("capacity gate");
+        state.measured = Some(measured);
+        state.at = Some(Instant::now());
+    }
+
+    /// Whether an append may refuse without probing the outbox again.
+    ///
+    /// A full outbox that had nothing to give up stays that way until something
+    /// deletes a row, and finding out costs an ordered walk to the limit-th
+    /// newest position — which is exactly the work a refused request cannot
+    /// afford to do while the database is already the bottleneck. So the verdict
+    /// is remembered for a window instead: refusals inside it are free, the
+    /// window is the same [`COUNT_REFRESH`] that bounds how long a count is
+    /// trusted, and any deletion this replica makes clears it early.
+    fn refusing(&self) -> bool {
+        self.state
+            .lock()
+            .expect("capacity gate")
+            .unreclaimable
+            .is_some_and(|at| at.elapsed() < COUNT_REFRESH)
+    }
+
+    /// Record that the outbox is full of events nothing may delete.
+    fn unreclaimable(&self) {
+        self.state.lock().expect("capacity gate").unreclaimable = Some(Instant::now());
     }
 
     /// Forget the measurement: something deleted rows, so the next append has to
     /// count again rather than refuse on a number that is now too high.
     fn invalidate(&self) {
-        self.state.lock().expect("capacity gate").at = None;
+        let mut state = self.state.lock().expect("capacity gate");
+        state.at = None;
+        state.unreclaimable = None;
     }
 }
 
@@ -1970,6 +2026,81 @@ mod tests {
         let stats = journal.stats(&billing).await.expect("stats");
         assert_eq!(stats.pending, 1, "{stats:?}");
         assert_eq!(stats.dropped, 0, "a reclaim is not a loss: {stats:?}");
+    }
+
+    /// A refusal is the common case while the outbox is full, and the probe that
+    /// decides how far over the limit it is walks to the limit-th newest
+    /// position. Neither that walk nor the reclamation it feeds may be repeated
+    /// per refused request: the room this append made is committed even though
+    /// it fails, and the verdict is remembered so the next one costs nothing.
+    #[test]
+    fn a_refusal_that_freed_nothing_is_remembered_until_something_is_deleted() {
+        let gate = CapacityGate::new();
+        assert!(!gate.refusing(), "an outbox with room refuses nothing");
+        gate.unreclaimable();
+        assert!(gate.refusing(), "the backlog cannot have changed by itself");
+        gate.invalidate();
+        assert!(
+            !gate.refusing(),
+            "a deletion made room, so the next append has to look again"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_room_a_refused_append_made_is_kept_rather_than_rolled_back() {
+        let Some((dsn, journal)) =
+            outbox("refused_reclaim", capacity(8, CapacityPolicy::Refuse)).await
+        else {
+            return;
+        };
+        for _ in 0..8 {
+            journal
+                .append(&event_for("GW_INBOUND_ACME_KEY"))
+                .await
+                .expect("append");
+        }
+        let billing = consumer("billing");
+        let claimed = journal
+            .claim(
+                &billing,
+                claim_at(1, Duration::from_secs(30), SystemTime::now()),
+            )
+            .await
+            .expect("claim");
+        journal.ack(&claimed[0].id).await.expect("ack");
+
+        // Lowering the limit puts six rows beyond it, of which only the
+        // acknowledged one may be given up: the append still has to refuse.
+        let lowered = PostgresJournal::connect(
+            &dsn,
+            settings(
+                "axond_outbox_refused_reclaim",
+                false,
+                capacity(2, CapacityPolicy::Refuse),
+            ),
+        )
+        .await
+        .expect("connect");
+        let error = lowered
+            .append(&event_for("GW_INBOUND_ACME_KEY"))
+            .await
+            .expect_err("an outbox of undelivered events refuses");
+        assert!(
+            matches!(error, JournalError::AtCapacity { .. }),
+            "{error:?}"
+        );
+
+        let stored = client(&dsn, Some("axond_outbox_refused_reclaim"))
+            .await
+            .query_one("SELECT count(*) FROM axond_usage_outbox", &[])
+            .await
+            .expect("count")
+            .get::<_, i64>(0);
+        assert_eq!(
+            stored, 7,
+            "the reclaim rode out on the refusal instead of being rolled back \
+             for the next request to redo"
+        );
     }
 
     #[tokio::test]

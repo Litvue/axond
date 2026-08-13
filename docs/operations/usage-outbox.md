@@ -241,6 +241,12 @@ are arriving and nothing is acknowledging them. Look at
 `axond.usage.journal.oldest_pending_age` and the sinks before raising
 `max_events`.
 
+Refusing is cheap, deliberately: a full outbox whose backlog holds nothing that
+may be given up is remembered for a second, so the requests refused inside that
+window answer without touching the outbox at all — the database is already the
+bottleneck when this happens. Any room an append does manage to free is committed
+even though that append is refused, so the next request does not repeat the work.
+
 Two policies change this, and both are a deliberate trade against accounting:
 
 - `on_undurable = "serve"` — answer the request anyway and count the event as
@@ -306,6 +312,22 @@ the record's own `request_id` ties it to the request it came from.
 `consumer` name: delivery state is per consumer, so a fresh name starts from the
 beginning of everything still retained. That is a replay of the retained window,
 not of all history, and the destination sees each event as a first delivery.
+
+**Retiring a consumer name.** Retention waits on *every* registered consumer, and
+a consumer is registered by its first claim and never unregistered. So a name you
+stop using — the old one after a rename, or a replay consumer you are finished
+with — holds the retention window open forever: nothing is pruned, the outbox
+fills to `max_events`, and the default `capacity_policy = "refuse"` then answers
+`503 usage_not_durable` on the request path. Delete the retired row once no
+replica is configured with that name:
+
+```sql
+DELETE FROM axond_usage_outbox_consumer WHERE consumer = 'old-name';
+DELETE FROM axond_usage_outbox_delivery  WHERE consumer = 'old-name';
+```
+
+`axond.usage.journal.depth` staying flat while `deliveries` keeps rising is what
+this looks like before the outbox fills.
 
 ## Upgrades and version skew
 
