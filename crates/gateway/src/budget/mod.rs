@@ -608,16 +608,19 @@ impl SharedSettings {
     /// generation whose caps were never applied to it would let that
     /// generation's drain finish while a request granted under it is still in
     /// flight.
-    pub(crate) fn caps(&self, backend: &'static str, namespace: &str) -> Option<Governing> {
+    /// `store` is the `axond.policy.store` this store denies under: the
+    /// responsibility and the backend, because the concurrency store is commonly
+    /// the same backend and the two denials are different operator problems.
+    pub(crate) fn caps(&self, store: &'static str, namespace: &str) -> Option<Governing> {
         let policy = self.ceilings.active(namespace);
         let Some(caps) = policy.budget else {
             // Every one of these denials is counted; the explanation is sampled,
             // because the condition belongs to the published view and repeating
             // it per request scales the log with traffic rather than with the
             // problem.
-            if denied(Unenforceable::Ungoverned, backend, namespace) {
+            if denied(Unenforceable::Ungoverned, store, namespace) {
                 tracing::warn!(
-                    backend,
+                    store,
                     namespace,
                     "no policy governs this namespace, so its spend cap cannot be enforced; \
                      denying every request for it until one is published"
@@ -626,9 +629,9 @@ impl SharedSettings {
             return None;
         };
         if caps.namespace_microdollars.is_some() != self.namespace_scope {
-            if denied(Unenforceable::Layout, backend, namespace) {
+            if denied(Unenforceable::Layout, store, namespace) {
                 tracing::error!(
-                    backend,
+                    store,
                     namespace,
                     namespace_scope = self.namespace_scope,
                     "the active policy's scope-wide cap disagrees with the key layout this \
@@ -1004,7 +1007,7 @@ mod tests {
         };
 
         let first = settings
-            .caps("redis", "acme/core")
+            .caps(crate::policy::ungoverned::BUDGET_REDIS, "acme/core")
             .expect("the namespace is governed");
         assert_eq!(first.caps.subject_microdollars, 1_000);
         assert_eq!(
@@ -1013,7 +1016,7 @@ mod tests {
         );
         runtime.install(PolicyView::of(&published(9_000, 2)));
         let second = settings
-            .caps("redis", "acme/core")
+            .caps(crate::policy::ungoverned::BUDGET_REDIS, "acme/core")
             .expect("the namespace is governed");
         // The caps and the generation stamped on the hold come from one read, so
         // they always name each other.
@@ -1025,7 +1028,11 @@ mod tests {
 
         // A namespace no document governs has no enforceable cap, and an
         // unenforced finite cap must never be served as an infinite one.
-        assert!(settings.caps("redis", "unpublished").is_none());
+        assert!(
+            settings
+                .caps(crate::policy::ungoverned::BUDGET_REDIS, "unpublished")
+                .is_none()
+        );
 
         // Deliberately not `on_unavailable`'s decision: that stance answers
         // "the store is unreachable, admit anyway?", and here the store is fine
@@ -1035,7 +1042,9 @@ mod tests {
             ..settings.clone()
         };
         assert!(
-            fail_open.caps("redis", "unpublished").is_none(),
+            fail_open
+                .caps(crate::policy::ungoverned::BUDGET_REDIS, "unpublished")
+                .is_none(),
             "a fail-open deployment still cannot admit against a cap nobody published"
         );
 
@@ -1045,7 +1054,11 @@ mod tests {
             namespace_scope: true,
             ..settings
         };
-        assert!(mismatched.caps("redis", "acme/core").is_none());
+        assert!(
+            mismatched
+                .caps(crate::policy::ungoverned::BUDGET_REDIS, "acme/core")
+                .is_none()
+        );
     }
 
     #[tokio::test]

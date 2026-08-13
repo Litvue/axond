@@ -8,8 +8,13 @@
 //! denial is counted on `axond.policy.unenforceable_denials`; only the
 //! explanation is sampled.
 //!
-//! One report per condition, backend and namespace, then at most one more every
+//! One report per condition, store and namespace, then at most one more every
 //! [`REPORT_EVERY`], for as long as the condition lasts.
+//!
+//! A store is named by its *responsibility* and its backend — `budget:redis`,
+//! not `redis` — because the spend store and the concurrency store are commonly
+//! the same backend, and a namespace missing both a cap and a ceiling is two
+//! problems an operator fixes separately.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -20,7 +25,7 @@ use crate::telemetry::metrics;
 /// How often a namespace that stays ungoverned is re-reported.
 const REPORT_EVERY: Duration = Duration::from_secs(60);
 
-/// How many (condition, backend, namespace) triples are remembered before the record is
+/// How many (condition, store, namespace) triples are remembered before the record is
 /// dropped and rebuilt. A namespace comes from a projection, so the set is
 /// bounded by the fleet's configuration rather than by traffic; the cap is there
 /// so a pathological one cannot grow this map without bound.
@@ -34,16 +39,28 @@ static REPORTED: LazyLock<Mutex<Reported>> = LazyLock::new(|| Mutex::new(Reporte
 ///
 /// Counting and sampling live together so a caller cannot take the sampled log
 /// line without the unsampled count.
-pub(crate) fn denied(condition: Unenforceable, backend: &'static str, namespace: &str) -> bool {
-    metrics::record_policy_unenforceable_denial(condition.label(), backend);
+pub(crate) fn denied(condition: Unenforceable, store: &'static str, namespace: &str) -> bool {
+    metrics::record_policy_unenforceable_denial(condition.label(), store);
     let mut reported = match REPORTED.lock() {
         Ok(reported) => reported,
         // A poisoned record is a record, not a reason to go quiet or to panic on
         // the request path: report and carry on with what it holds.
         Err(poisoned) => poisoned.into_inner(),
     };
-    reported.should_report(condition, backend, namespace, Instant::now())
+    reported.should_report(condition, store, namespace, Instant::now())
 }
+
+/// Every `axond.policy.store` a denial is reported under: the responsibility
+/// first, because two of them share a backend.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const STORES: &[&str] = &[BUDGET_REDIS, BUDGET_POSTGRES, RATE_LIMIT_REDIS];
+
+/// The spend store, when it is Redis.
+pub(crate) const BUDGET_REDIS: &str = "budget:redis";
+/// The spend store, when it is Postgres.
+pub(crate) const BUDGET_POSTGRES: &str = "budget:postgres";
+/// The concurrency store, which only Redis provides.
+pub(crate) const RATE_LIMIT_REDIS: &str = "rate_limit:redis";
 
 /// Why a store cannot enforce a namespace. Reported separately, because they
 /// call for different operator action.
@@ -72,11 +89,11 @@ impl Reported {
     fn should_report(
         &mut self,
         condition: Unenforceable,
-        backend: &'static str,
+        store: &'static str,
         namespace: &str,
         now: Instant,
     ) -> bool {
-        if let Some(last) = self.0.get_mut(&(condition, backend, namespace.to_owned())) {
+        if let Some(last) = self.0.get_mut(&(condition, store, namespace.to_owned())) {
             if now.duration_since(*last) < REPORT_EVERY {
                 return false;
             }
@@ -86,8 +103,7 @@ impl Reported {
         if self.0.len() >= REMEMBERED {
             self.0.clear();
         }
-        self.0
-            .insert((condition, backend, namespace.to_owned()), now);
+        self.0.insert((condition, store, namespace.to_owned()), now);
         true
     }
 }
@@ -120,18 +136,31 @@ mod tests {
     }
 
     #[test]
-    fn each_condition_backend_and_namespace_is_explained_on_its_own() {
+    fn each_condition_store_and_namespace_is_explained_on_its_own() {
         let mut reported = Reported::default();
         let start = Instant::now();
 
-        assert!(reported.should_report(Unenforceable::Ungoverned, "redis", "alpha", start));
-        assert!(reported.should_report(Unenforceable::Ungoverned, "redis", "beta", start));
+        assert!(reported.should_report(Unenforceable::Ungoverned, "budget:redis", "alpha", start));
+        assert!(reported.should_report(Unenforceable::Ungoverned, "budget:redis", "beta", start));
         // Two stores denying the same namespace are two different operator
         // problems: the budget cap and the concurrency ceiling are published
         // separately.
-        assert!(reported.should_report(Unenforceable::Ungoverned, "postgres", "alpha", start));
+        assert!(reported.should_report(
+            Unenforceable::Ungoverned,
+            "budget:postgres",
+            "alpha",
+            start
+        ));
+        // Including when they are the same backend, which is the ordinary
+        // deployment: a store is its responsibility, not its technology.
+        assert!(reported.should_report(
+            Unenforceable::Ungoverned,
+            "rate_limit:redis",
+            "alpha",
+            start
+        ));
         // As are two different reasons one store cannot enforce it.
-        assert!(reported.should_report(Unenforceable::Layout, "redis", "alpha", start));
+        assert!(reported.should_report(Unenforceable::Layout, "budget:redis", "alpha", start));
     }
 
     #[test]
@@ -140,7 +169,7 @@ mod tests {
         // explanation is suppressed is still visible to the counter an operator
         // alerts on — and the label it carries is one the catalogue declares.
         for condition in [Unenforceable::Ungoverned, Unenforceable::Layout] {
-            for store in ["redis", "postgres"] {
+            for store in STORES {
                 crate::telemetry::catalog::validate_label_value(
                     "axond.policy.unenforceable_denials",
                     "axond.policy.condition",

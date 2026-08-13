@@ -534,8 +534,16 @@ impl RateLimiter for RedisRateLimiter {
             // Sampled, not per request: the namespace is ungoverned until a
             // publication governs it, so the log would otherwise grow with the
             // traffic being denied rather than with the condition.
-            if denied(Unenforceable::Ungoverned, self.name(), &key.namespace) {
+            // Named for the responsibility, not for `self.name()`: the spend
+            // store is usually Redis too, and a namespace missing a cap and a
+            // ceiling is two problems, reported and counted apart.
+            if denied(
+                Unenforceable::Ungoverned,
+                crate::policy::ungoverned::RATE_LIMIT_REDIS,
+                &key.namespace,
+            ) {
                 tracing::warn!(
+                    store = crate::policy::ungoverned::RATE_LIMIT_REDIS,
                     namespace = %key.namespace,
                     "no policy governs this namespace, so its concurrency limit cannot be \
                      enforced; denying every request for it until one is published"

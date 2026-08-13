@@ -37,6 +37,11 @@ use crate::usage::validate_table_name;
 
 const BACKEND: &str = "postgres";
 
+/// What this store denies under when it cannot enforce a namespace: the spend
+/// responsibility, not just the technology, so a dashboard separates it from
+/// the concurrency store's denials.
+const POLICY_STORE: &str = crate::policy::ungoverned::BUDGET_POSTGRES;
+
 /// The DDL for the current schema version, shared with operators who apply it
 /// themselves.
 // Embedded from the package-local copy of `ops/postgres/budget_v1.sql`; see
@@ -612,7 +617,7 @@ impl BudgetStore for PostgresBudget {
         // The caps and the generation are read once, before the transaction, and
         // carried on the hold: this request is priced by the document that
         // admitted it, whatever is published while it runs.
-        let Some(governing) = self.settings.caps(BACKEND, &key.namespace) else {
+        let Some(governing) = self.settings.caps(POLICY_STORE, &key.namespace) else {
             return Admission::Denied(Denial::StoreUnavailable);
         };
         let reservation = Reservation {

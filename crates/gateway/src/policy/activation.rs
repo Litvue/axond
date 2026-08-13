@@ -152,6 +152,7 @@ impl ActivationRefusal {
     /// A refusal reaches an operator as a *compile* refusal, so these labels are
     /// spliced into [`CompileError::REASONS`](crate::convergence::CompileError::REASONS)
     /// and checked against the metric catalogue and the status vocabulary there.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub const REASONS: &'static [&'static str] = &[
         "unsupported",
         "migration",
@@ -1187,9 +1188,7 @@ mod tests {
         // noticed too: the list is a vocabulary, not an archive.
         for reason in ActivationRefusal::REASONS {
             assert!(
-                refusals
-                    .iter()
-                    .any(|refusal| &refusal.reason() == reason),
+                refusals.iter().any(|refusal| &refusal.reason() == reason),
                 "`{reason}` is declared but no refusal produces it"
             );
         }

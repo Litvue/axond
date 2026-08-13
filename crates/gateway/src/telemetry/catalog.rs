@@ -735,7 +735,13 @@ pub const CATALOG: &[MetricSpec] = &[
         unit: None,
         labels: &[
             Label::closed("axond.policy.condition", &["ungoverned", "layout"]),
-            Label::closed("axond.policy.store", &["redis", "postgres"]),
+            // Responsibility first: the spend store and the concurrency store
+            // are usually the same backend, and the two denials are separate
+            // operator problems.
+            Label::closed(
+                "axond.policy.store",
+                &["budget:redis", "budget:postgres", "rate_limit:redis"],
+            ),
         ],
     },
     MetricSpec {

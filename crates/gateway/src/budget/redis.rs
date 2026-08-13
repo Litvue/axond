@@ -55,6 +55,11 @@ use crate::telemetry::metrics;
 
 const BACKEND: &str = "redis";
 
+/// What this store denies under when it cannot enforce a namespace: the spend
+/// responsibility, not just the technology, because the concurrency store is
+/// Redis too and the two are different operator problems.
+const POLICY_STORE: &str = crate::policy::ungoverned::BUDGET_REDIS;
+
 /// Value of the layout marker once the namespace-scoped layout is in force.
 const LAYOUT_V2: &str = "v2";
 /// Value of the layout marker while a migration is carrying spend across. Stamped
@@ -812,7 +817,7 @@ impl BudgetStore for RedisBudget {
         // Read once, and carry what was read: the caps, and the generation that
         // stated them. A publication landing between here and the settlement
         // binds the *next* request, never this one.
-        let Some(governing) = self.settings.caps(BACKEND, &key.namespace) else {
+        let Some(governing) = self.settings.caps(POLICY_STORE, &key.namespace) else {
             return Admission::Denied(Denial::StoreUnavailable);
         };
         let caps = governing.caps;

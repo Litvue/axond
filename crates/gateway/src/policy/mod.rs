@@ -50,7 +50,7 @@
 
 mod activation;
 mod source;
-mod ungoverned;
+pub(crate) mod ungoverned;
 pub(crate) mod view;
 
 pub use activation::{Activation, ActivationRefusal, BackendSupport};
