@@ -14,12 +14,16 @@ points at a section of this page.
 no release yet constructs a status refresher, so `axond_status_component_state`,
 `axond_status_observation_age`, and `axond_status_refreshes` are not produced on
 any deployment — stateless or not — and `GET /admin/v1/status` answers with every
-component `disabled`. Three shipped rules are therefore inert until a future
+component `disabled`. Four shipped rules are therefore inert until a future
 slice injects a refresher for the backend it owns: `AxondDependencyImpaired`,
-`AxondStatusObservationsStale`, and `AxondStatusRefreshesFailing`, together with
-the *Dependency state*, *Observation age*, and *Refresh outcomes* panels on the
-fleet dashboard. Everything else — served traffic, latency, convergence,
-providers, capacity, lifecycle — is live now.
+`AxondStatusObservationsStale`, `AxondStatusRefreshesFailing`, and
+`AxondStatusRefresherStalled`, together with the *Dependency state*, *Observation
+age*, and *Refresh outcomes* panels on the fleet dashboard. The stall rule is
+inert rather than perpetually firing on purpose: it asks for an absent refresh
+series **and** a status gauge that has existed within the last six hours, so
+"never wired" is silent and only "was observing, then stopped" pages. Nothing
+here needs to be disabled at import. Everything else — served traffic, latency,
+convergence, providers, capacity, lifecycle — is live now.
 
 So do not read a flat dependency panel as a healthy dependency: until that
 wiring lands, use `axond_config_reloads`, `axond_revision_*`, and the fail-closed
@@ -114,8 +118,9 @@ every probe — an abandoned probe publishes a synthetic `timeout` observation t
   small value rather than climbing, and the refresh series simply stops. That is
   what `AxondStatusRefresherStalled` watches for. Everything the status surface
   reports is now as old as the stall, including the `ok` components. (A replica
-  with no refresher wired reports every component `disabled` and alerts here
-  too.)
+  that never wired a refresher emits no status instruments at all, and the rule's
+  second arm keeps it silent there rather than paging for a stall that never
+  happened.)
 - **probes keep failing.** Refreshes are recorded with
   `axond_status_outcome="failed"`, the state is honest, and the dependency — not
   the replica — is the thing to fix.

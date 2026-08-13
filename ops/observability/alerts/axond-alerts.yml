@@ -63,14 +63,19 @@ groups:
       # each round, so a refresher that stops leaves the age frozen at a small
       # value rather than growing. What does change is that nothing is published
       # at all, and an absent refresh series says so.
+      #
+      # The second arm is what keeps "absent" meaning "stopped" rather than
+      # "never started": a deployment with no refresher wired emits neither
+      # status instrument, so this stays silent instead of paging for ever, and
+      # arms itself once a refresher has observed anything at all.
       - alert: AxondStatusRefresherStalled
-        expr: "absent_over_time(axond_status_refreshes[10m])"
+        expr: "absent_over_time(axond_status_refreshes[10m]) and on() (max(max_over_time(axond_status_component_state[6h])) >= 0)"
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: "No status refresh has been recorded for ten minutes"
-          description: "The background refresher is not observing anything, so every component state and observation age is frozen at whatever was true when it stopped - including the ok ones. Also expected on a replica with no refresher wired, where GET /admin/v1/status answers with every component disabled."
+          description: "The background refresher is not observing anything, so every component state and observation age is frozen at whatever was true when it stopped - including the ok ones. Fires only where a refresher has observed something before: a deployment that never wired one emits no status instruments at all and stays silent here."
           runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#dependency-observations-have-gone-stale"
 
       - alert: AxondStatusRefreshesFailing
