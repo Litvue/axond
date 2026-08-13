@@ -19,6 +19,7 @@
 //! | [`revision`] | the complete state, the candidate that proposes it, the manifest that records it, and the integrity checks that let a replica trust it |
 //! | [`tenancy`] | the first two body schemas: what a tenant and a tenant-owned project are, and who owns what |
 //! | [`policy`] | the complete policy document of a tenant or a project, its generation, and how a change to it may be activated |
+//! | [`models`] | what a tenant may use and what a project calls it: typed model enablements and project-scoped aliases |
 //!
 //! # Three properties everything else rests on
 //!
@@ -44,11 +45,12 @@
 //!
 //! It is not wired into the request path. The runtime remains stateless: nothing
 //! here is constructed by `serve`, and no snapshot is compiled from a revision
-//! yet. It is also not a complete body model: [`tenancy`] and [`policy`] are the
-//! only schemas the domain reads, and identity, provider, catalogue, and pricing
-//! bodies remain owned by their own slices. A policy document is a contract
-//! rather than an activation: nothing enforces one, and [`PolicyTransition`]
-//! states what enforcing a change *would* require of a fleet.
+//! yet. It is also not a complete body model: [`tenancy`], [`policy`], and
+//! [`models`] are the schemas the domain reads, and identity, provider,
+//! catalogue, and pricing bodies remain owned by their own slices. A policy
+//! document is a contract rather than an activation: nothing enforces one, and
+//! [`PolicyTransition`] states what enforcing a change *would* require of a
+//! fleet.
 //!
 //! The types are the contract that #165, #166, and #142 build against, and the
 //! test-only `oracle` module is the executable statement of how a
@@ -57,6 +59,7 @@
 pub mod canonical;
 pub mod credentials;
 pub mod ids;
+pub mod models;
 pub mod mutation;
 pub mod policy;
 pub mod resource;
@@ -87,6 +90,13 @@ pub use credentials::{
 pub use ids::{
     AuditEventId, InvalidId, InvalidSlug, InvalidUuid7, MutationId, ProjectId, ResourceId,
     RevisionId, SecretId, Slug, TenantId, Uuid7, Uuid7Generator,
+};
+#[allow(unused_imports)]
+pub use models::{
+    AliasTarget, ApprovedPrice, CatalogOffering, ForbiddenModelTransition, InvalidOfferingId,
+    LifecycleChange, MODEL_ALIAS_SCHEMA, MODEL_ENABLEMENT_SCHEMA, ModelAlias, ModelAliasBody,
+    ModelEnablement, ModelEnablementBody, ModelError, ModelInvariant, ModelLifecycle, ModelOwner,
+    Models, ObservedPrice, OfferingId, WireFamily,
 };
 #[allow(unused_imports)]
 pub use mutation::{

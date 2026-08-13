@@ -28,6 +28,7 @@ use std::time::SystemTime;
 use super::canonical::{Canonical, CanonicalError, CanonicalValue, Checksum, SerializerVersion};
 use super::credentials::{CredentialError, Credentials};
 use super::ids::{AuditEventId, MutationId, RevisionId, Slug};
+use super::models::{ModelError, Models};
 use super::mutation::{AuditEvent, ExpectedRevision, Mutation};
 use super::policy::{PolicyError, PolicySet};
 use super::resource::{BlobRef, ResourceRef, ResourceScope, ResourceVersion};
@@ -77,6 +78,10 @@ pub enum ValidationError {
     Credential(#[from] CredentialError),
     #[error("this revision's policy is not valid: {0}")]
     Policy(#[from] PolicyError),
+    /// Boxed so that this error — and every `Result` that carries it — stays the
+    /// size it was before model bodies were typed.
+    #[error("this revision's model contracts are not valid: {0}")]
+    Model(Box<ModelError>),
     #[error("audit event {audit} records mutation {recorded}, not this candidate's {mutation}")]
     AuditMutationMismatch {
         audit: AuditEventId,
@@ -265,6 +270,13 @@ impl DesiredState {
         // forming a second opinion about them (#208).
         PolicySet::of(self)?;
 
+        // Model enablements and aliases state ownership the same way, and an alias
+        // reaches its own project's enablements and its tenant's defaults — which
+        // is only meaningful once tenancy has agreed the project belongs to the
+        // tenant (#205).
+        Models::of(self)?;
+
+
         Ok(())
     }
 
@@ -421,6 +433,15 @@ pub enum BodySkew {
     Credential(CredentialError),
     #[error(transparent)]
     Policy(PolicyError),
+    /// Boxed for the same reason [`ValidationError::Model`] is.
+    #[error(transparent)]
+    Model(Box<ModelError>),
+}
+
+impl From<ModelError> for ValidationError {
+    fn from(error: ModelError) -> Self {
+        Self::Model(Box::new(error))
+    }
 }
 
 impl From<TenancyError> for BodySkew {
@@ -441,6 +462,13 @@ impl From<PolicyError> for BodySkew {
     }
 }
 
+impl From<ModelError> for BodySkew {
+    fn from(error: ModelError) -> Self {
+        Self::Model(Box::new(error))
+    }
+}
+
+
 impl BodySkew {
     /// The resource the refusal is about, whichever schema refused it.
     pub const fn reference(&self) -> ResourceRef {
@@ -448,6 +476,7 @@ impl BodySkew {
             Self::Tenancy(error) => error.reference(),
             Self::Credential(error) => error.reference(),
             Self::Policy(error) => error.reference(),
+            Self::Model(error) => error.reference(),
         }
     }
 }
@@ -541,6 +570,9 @@ impl IntegrityError {
             }
             ValidationError::Policy(policy) if policy.is_incompatible() => {
                 Self::Incompatible(BodySkew::Policy(policy))
+            }
+            ValidationError::Model(model) if model.is_incompatible() => {
+                Self::Incompatible(BodySkew::Model(model))
             }
             other => Self::Invalid(other),
         }
