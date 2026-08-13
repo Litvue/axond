@@ -1797,11 +1797,19 @@ impl LastKnownGoodCatalog {
             .map(|snapshot| &snapshot.source.validators)
     }
 
+    /// Make `snapshot`'s content active, classifying what that did.
+    ///
+    /// Classification reads the content's own [`CatalogContent::content_id`],
+    /// not the id recorded beside it on the [`SourceSnapshot`]: the provenance is
+    /// a plain struct anyone may build, so a snapshot can carry an id that is not
+    /// its content's, and admitting content while reporting `Unchanged` is the one
+    /// outcome this type exists to prevent. The two agree for anything
+    /// [`source_snapshot`] built.
     pub fn admit(&mut self, snapshot: CatalogSnapshot) -> Admission {
-        let content_id = snapshot.source.content_id;
+        let content_id = snapshot.content.content_id();
         let admission = match self.active.as_ref() {
             None => Admission::Initial { content_id },
-            Some(active) if active.source.content_id == content_id => {
+            Some(active) if active.content.content_id() == content_id => {
                 Admission::Unchanged { content_id }
             }
             Some(active) => Admission::Updated {
@@ -2007,6 +2015,51 @@ mod tests {
         };
         assert_eq!(first.source.content_id, second.source.content_id);
         assert_ne!(first.source.validators, second.source.validators);
+    }
+
+    /// Provenance is a plain struct, so the id recorded beside content is a
+    /// claim: admitting different content while reporting `Unchanged` would apply
+    /// a catalogue change with nothing for an operator to review.
+    #[test]
+    fn admission_classifies_the_content_it_admits_not_the_id_beside_it() {
+        let mut catalogue = LastKnownGoodCatalog::new();
+        let before = content(vec![offering("openai", "gpt-4o", None)]);
+        let stale_id = before.content_id();
+        assert_eq!(
+            catalogue.admit(snapshot(before, SourceValidators::etag("\"one\""))),
+            Admission::Initial {
+                content_id: stale_id
+            }
+        );
+
+        let after = content(vec![offering(
+            "openai",
+            "gpt-4o",
+            Some(price(2_000_000_000, 10_000_000_000)),
+        )]);
+        let content_id = after.content_id();
+        let mislabelled = CatalogSnapshot {
+            source: SourceSnapshot {
+                content_id: stale_id,
+                ..snapshot(after.clone(), SourceValidators::etag("\"two\"")).source
+            },
+            content: after,
+        };
+
+        let Admission::Updated {
+            content_id: id,
+            diff,
+        } = catalogue.admit(mislabelled)
+        else {
+            panic!("content that differs is an update whatever the record beside it says");
+        };
+        assert_eq!(id, content_id);
+        assert!(diff.has_price_changes());
+        assert_eq!(
+            catalogue.content().map(CatalogContent::content_id),
+            Some(content_id),
+            "and the id reported is the id of what became active"
+        );
     }
 
     #[test]

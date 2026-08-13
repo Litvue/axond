@@ -93,7 +93,12 @@ offline seed and parsed through the same strict adapter as a fetched payload, so
 the seed cannot drift from the parser and an air-gapped deployment still has a
 catalogue. `crates/gateway`'s published `include` therefore carries
 `src/**/*.json`, extending ADR 0025's package boundaries; the seed is an
-excerpt, chosen for shape coverage, not a mirror of the upstream document.
+excerpt, chosen for shape coverage, not a mirror of the upstream document. It
+therefore carries a validator over its *own* content (`W/"seed-<content id>"`)
+rather than the `ETag` the excerpt was cut from: a validator only means "you
+already have this" for content actually held, and echoing the upstream's would
+let the first live refresh answer `304` and leave four providers active as if
+they were the whole catalogue.
 
 ### State tier
 

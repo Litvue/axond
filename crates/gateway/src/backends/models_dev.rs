@@ -81,10 +81,10 @@ use serde_json::value::RawValue;
 
 use super::catalog::{
     CatalogContent, CatalogContentError, CatalogError, CatalogModelEntry, CatalogProvider,
-    CatalogRefresh, CatalogSnapshot, CatalogSource, ETag, HttpDate, InvalidCatalogId, JsonPointer,
-    Modality, ModelCapability, ModelFacts, ModelField, ModelId, ModelLifecycle, ModelLimits,
-    ObservedPrice, ObservedRate, PriceRates, PriceTier, PriceTierThreshold, ProviderEndpoint,
-    ProviderOffering, SchemaVersion, SourceValidators, source_snapshot,
+    CatalogRefresh, CatalogSnapshot, CatalogSource, ETag, InvalidCatalogId, JsonPointer, Modality,
+    ModelCapability, ModelFacts, ModelField, ModelId, ModelLifecycle, ModelLimits, ObservedPrice,
+    ObservedRate, PriceRates, PriceTier, PriceTierThreshold, ProviderEndpoint, ProviderOffering,
+    SchemaVersion, SourceValidators, source_snapshot,
 };
 use super::{Capabilities, Capability};
 
@@ -1208,11 +1208,19 @@ pub fn seed_fetched_at() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_566_474)
 }
 
-/// The upstream validator the excerpt was served with.
-fn seed_validators() -> SourceValidators {
+/// The validator that identifies the *excerpt*, not the document it came from.
+///
+/// The upstream `ETag` the seed was cut from identifies the whole catalogue, and
+/// echoing it in an `If-None-Match` would have models.dev answer `304` for
+/// content the deployment does not hold: the four-provider excerpt would stay
+/// active as if it were the ~180-provider document. So the seed carries a weak
+/// tag over its own content instead. No upstream will ever match it, which is the
+/// point — the first live refresh transfers the real document — while the seed
+/// source still has a validator to answer conditionally with.
+fn seed_validators(content: &CatalogContent) -> SourceValidators {
     SourceValidators {
-        etag: Some(ETag("\"38a27321531a976c916911889525f559\"".to_owned())),
-        last_modified: Some(HttpDate("Wed, 12 Aug 2026 20:27:54 GMT".to_owned())),
+        etag: Some(ETag(format!("W/\"seed-{}\"", content.content_id()))),
+        last_modified: None,
     }
 }
 
@@ -1221,13 +1229,15 @@ fn seed_validators() -> SourceValidators {
 /// Infallible by construction — a malformed seed fails the suite — so callers do
 /// not have to decide what to do about a broken constant.
 pub fn seed_snapshot() -> CatalogSnapshot {
-    ModelsDevAdapter::default()
+    let mut snapshot = ModelsDevAdapter::default()
         .parse(
             SEED_PAYLOAD.as_bytes(),
-            seed_validators(),
+            SourceValidators::default(),
             seed_fetched_at(),
         )
-        .expect("the bundled models.dev seed parses")
+        .expect("the bundled models.dev seed parses");
+    snapshot.source.validators = seed_validators(&snapshot.content);
+    snapshot
 }
 
 /// A [`CatalogSource`] that serves the bundled seed and never uses the network.
@@ -1252,11 +1262,13 @@ impl CatalogSource for SeedCatalogSource {
         &self,
         since: Option<&SourceValidators>,
     ) -> Result<CatalogRefresh, CatalogError> {
-        let validators = seed_validators();
-        if since == Some(&validators) {
-            return Ok(CatalogRefresh::Unchanged { validators });
+        let snapshot = seed_snapshot();
+        if since == Some(&snapshot.source.validators) {
+            return Ok(CatalogRefresh::Unchanged {
+                validators: snapshot.source.validators,
+            });
         }
-        Ok(CatalogRefresh::Updated(Box::new(seed_snapshot())))
+        Ok(CatalogRefresh::Updated(Box::new(snapshot)))
     }
 }
 
@@ -1452,7 +1464,7 @@ mod tests {
     use axum::routing::get;
 
     use super::super::catalog::{
-        Admission, CatalogChange, LastKnownGoodCatalog, ModelCapability, ProviderId,
+        Admission, CatalogChange, HttpDate, LastKnownGoodCatalog, ModelCapability, ProviderId,
     };
     use super::*;
 
@@ -2146,6 +2158,34 @@ mod tests {
         assert!(
             !modes.overrides_field(ModelField::Capabilities),
             "and so it is not an override of the neutral record either"
+        );
+    }
+
+    /// The seed is an excerpt, so it must not claim to be the document it was cut
+    /// from: an upstream validator here would have models.dev answer `304` to the
+    /// first live refresh and leave four providers active as if they were ~180.
+    #[test]
+    fn the_seed_never_claims_the_upstream_document_it_was_cut_from() {
+        let snapshot = seed_snapshot();
+        let etag = snapshot
+            .source
+            .validators
+            .etag
+            .as_ref()
+            .expect("the seed identifies its own content");
+        assert_eq!(
+            etag.0,
+            format!("W/\"seed-{}\"", snapshot.content.content_id()),
+            "the tag is over the excerpt, so no upstream can match it"
+        );
+        assert!(
+            !etag.0.contains("38a27321531a976c916911889525f559"),
+            "and never the tag the fixture README records for the full document \
+             this excerpt was trimmed from"
+        );
+        assert_eq!(
+            snapshot.source.validators.last_modified, None,
+            "a date from the whole document would match conditionally too"
         );
     }
 
