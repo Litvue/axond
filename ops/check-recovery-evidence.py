@@ -18,9 +18,11 @@ carry the capability and evidence classes the contract grants it, be written in
 the schema this build understands, and hold no failed gate or check. Anything
 else exits non-zero with the reason.
 
-Secrets are checked too, with `--forbid`: an artifact is published as a CI
+Secrets are checked too, with `--forbid-env`: an artifact is published as a CI
 artifact, so the rule that it retains references and counts rather than material
-is enforced rather than trusted.
+is enforced rather than trusted. The secret is named by the environment variable
+holding it rather than passed as an argument, which would put it in the process
+listing the caller took care to keep it out of.
 
 `--self-test` runs the checker against synthetic artifacts, one per way an
 artifact can lie, because a checker that accepts everything is indistinguishable
@@ -31,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import tempfile
 import tomllib
@@ -209,12 +212,17 @@ def main() -> int:
     )
     parser.add_argument("--dir", type=Path, default=ROOT / "target/recovery")
     parser.add_argument(
-        "--forbid",
+        "--forbid-env",
         action="append",
         default=[],
-        help="a string no artifact may contain, such as the drill's credential",
+        metavar="NAME",
+        help=(
+            "an environment variable whose value no artifact may contain, such as "
+            "the drill's credential; unset or empty names are ignored"
+        ),
     )
     args = parser.parse_args()
+    forbid = [os.environ.get(name, "") for name in args.forbid_env]
     if args.self_test:
         return self_test()
     if not args.runner:
@@ -222,7 +230,7 @@ def main() -> int:
 
     problems: list[str] = []
     for scenario, stage in owed(args.runner):
-        problems.extend(check(scenario, stage, args.dir, args.runner, args.forbid))
+        problems.extend(check(scenario, stage, args.dir, args.runner, forbid))
 
     if problems:
         print(f"\nrecovery evidence is not complete for the {args.runner} lane:", file=sys.stderr)

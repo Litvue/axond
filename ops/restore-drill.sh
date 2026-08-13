@@ -85,8 +85,15 @@ evidence="${root}/ops/recovery-evidence.py"
 # check reads as the condition it states rather than as plumbing.
 log=""
 
+# The checks the stage recorded, and whether each held. A gate is a summary of
+# checks, so it is derived from these rather than asserted alongside them: an
+# artifact whose gate says `met` next to the failed check it summarises is the
+# kind of evidence this harness exists to make impossible.
+declare -A check_held=()
+
 stage() {
   log="${workdir}/$(printf '%s' "$1" | tr / .).log"
+  check_held=()
   step "Stage $1"
   python3 "$evidence" start --log "$log" --stage "$1" \
     --schema "$2" --schema-identity "$3"
@@ -103,11 +110,23 @@ require() {
   python3 "$evidence" require --log "$log" --check "$check" \
     --expected "$wanted" --observed "$got" --detail "$detail"
   if [[ "$got" == "$wanted" ]]; then
+    check_held["$check"]=held
     printf '  ok  %s = %s\n' "$check" "$got"
   else
+    check_held["$check"]=failed
     printf '  FAIL %s: expected %s, got %s\n' "$check" "$wanted" "$got"
   fi
 }
+# Whether every named check of this stage held. A name nothing recorded has not
+# held, so a renamed or dropped check cannot leave a gate quietly passing.
+held() {
+  local check
+  for check in "$@"; do
+    [[ "${check_held[$check]:-missing}" == held ]] || return 1
+  done
+}
+# `true`/`false` for the gate recorder, from the checks that decide the gate.
+verdict() { held "$@" && printf 'true' || printf 'false'; }
 # Writes the artifact, then fails the drill if the stage failed. In that order,
 # because an unexplained failure is the one an operator cannot act on.
 close() {
@@ -198,8 +217,9 @@ EOF
 # Both secrets are generated per run and never printed: a drill that shipped a
 # fixed credential in the repository is a credential someone eventually points at
 # something real, and one that echoed the generated one would put it in a CI log.
-# `check-recovery-evidence.py --forbid` is given both, so an artifact carrying
-# either fails the run.
+# `check-recovery-evidence.py --forbid-env` is given both variable names — not
+# their values, which would land in the process listing — so an artifact
+# carrying either fails the run.
 GW_DRILL_KEK="$(openssl rand -hex 32)"
 GW_DRILL_BREAKGLASS="$(openssl rand -hex 24)"
 export GW_DRILL_KEK GW_DRILL_BREAKGLASS
@@ -375,9 +395,16 @@ require "a_publication_against_the_restored_head_is_accepted" accepted \
 observe revision_after_restore "$after_restore"
 observe readiness_probe "$(curl -s -o /dev/null -w '%{http_code}' "${logical_endpoint}/readyz")"
 
-gate max_data_loss_revisions "0" true \
+restore_loss_checks=(the_restored_head_is_the_backed_up_head
+  the_restored_revision_chain_is_whole the_restored_deployment_is_whole
+  the_restored_head_checksum_matches)
+gate max_data_loss_revisions \
+  "$(held "${restore_loss_checks[@]}" && echo 0 || echo unknown)" \
+  "$(verdict "${restore_loss_checks[@]}")" \
   "every revision the backup covered is present in the restored journal, and its head checksum matches"
-gate admin_writes accepted true \
+gate admin_writes \
+  "$(held a_publication_against_the_restored_head_is_accepted && echo accepted || echo refused)" \
+  "$(verdict a_publication_against_the_restored_head_is_accepted)" \
   "a publication against the restored head was accepted by a replica booted on it"
 defer readiness \
   "the blocked \`reconvergence\` stage owns what a restored replica serves; this replica answers /admin/v1 and refuses inference, which the readiness_probe observation records"
@@ -392,7 +419,9 @@ close
 # ---------------------------------------------------------------------------
 stage backup-restore/administration logical_restore "$schema_identity"
 export AXOND_ADMIN_ENDPOINT="$logical_endpoint"
-audit="$(admin audit --revision "$live_head")"
+# A failing read is the regression this stage qualifies, so it is captured as a
+# check rather than allowed to abort the drill before `close` writes evidence.
+audit="$(admin audit --revision "$live_head" 2>/dev/null || printf '{"events":[]}')"
 mark "audit-read" "the audit trail of ${live_head} read back through the restored replica"
 observe audit_events_for_head "$(printf '%s' "$audit" | jq '.events | length')" count
 require "the_audit_trail_survives_the_restore" true \
@@ -411,7 +440,9 @@ observe unauthenticated_admin_successes "$successes" count
 gate max_unauthenticated_admin_successes "$successes" \
   "$([[ "$successes" == "0" ]] && echo true || echo false)" \
   "a restored control plane does not come back with its administrative surface open"
-gate admin_writes accepted true \
+gate admin_writes \
+  "$(held the_audit_trail_survives_the_restore && echo accepted || echo refused)" \
+  "$(verdict the_audit_trail_survives_the_restore)" \
   "the authenticated surface answered the audit read the restore is qualified by"
 defer readiness "this stage reads the administrative surface; it offers no inference traffic"
 defer max_serving_error_fraction "no traffic is offered, so the ceiling is vacuous by contract"
@@ -516,8 +547,17 @@ require "the_write_after_the_target_is_not_replayed" absent \
     jq -r --arg r "$post_target_head" 'if any(.revisions[]; .revision == $r) then "present" else "absent" end')" \
   "a recovery that replayed past its target would be useless for the incident it exists for"
 
-after_recovery="$(publish policies "${workdir}/policy.json" drill-after-recovery "$recovered_head" ||
-  echo refused)"
+# A document the recovered journal has never held, for the same reason the
+# restore stage publishes one: the probe measures writability, not what the
+# journal makes of a candidate that changes nothing.
+cat >"${workdir}/policy-after-recovery.json" <<EOF
+{"summary":"raise the cap after the recovery","resource":{
+  "tenant":"${tenant}","slug":"drill-limits","epoch":3,
+  "subject_limit_microdollars":80000000,"namespace_limit_microdollars":800000000,
+  "reservation_ttl_seconds":300,"max_in_flight_per_subject":8,"lease_ttl_seconds":60}}
+EOF
+after_recovery="$(publish policies "${workdir}/policy-after-recovery.json" \
+  drill-after-recovery "$recovered_head" || echo refused)"
 require "a_publication_against_the_recovered_head_is_accepted" accepted \
   "$([[ "$after_recovery" == refused ]] && echo refused || echo accepted)" \
   "the recovered journal takes the next change rather than needing to be rebuilt"
@@ -530,9 +570,16 @@ for table in axond_usage axond_budget axond_revocation; do
     "the recovery brings back the whole durable schema, not only the journal's tables"
 done
 
-gate max_data_loss_revisions "0" true \
+recovery_loss_checks=(the_recovered_head_is_the_pre_target_revision
+  nothing_published_before_the_target_is_lost
+  the_write_after_the_target_is_not_replayed)
+gate max_data_loss_revisions \
+  "$(held "${recovery_loss_checks[@]}" && echo 0 || echo unknown)" \
+  "$(verdict "${recovery_loss_checks[@]}")" \
   "every revision published before the target survived, and the one published after it did not"
-gate admin_writes accepted true \
+gate admin_writes \
+  "$(held a_publication_against_the_recovered_head_is_accepted && echo accepted || echo refused)" \
+  "$(verdict a_publication_against_the_recovered_head_is_accepted)" \
   "a publication against the recovered head was accepted by a replica booted on it"
 defer readiness \
   "the blocked \`reconvergence\` stage owns serving across a recovery; the readiness_probe observation records what this replica answered"
@@ -547,7 +594,7 @@ close
 # ---------------------------------------------------------------------------
 stage point-in-time-recovery/administration live "$schema_identity"
 export AXOND_ADMIN_ENDPOINT="$recovered_endpoint"
-audit="$(admin audit --revision "$pre_target_head")"
+audit="$(admin audit --revision "$pre_target_head" 2>/dev/null || printf '{"events":[]}')"
 mark "audit-read" "the audit trail of ${pre_target_head} read back through the recovered replica"
 observe audit_events_for_head "$(printf '%s' "$audit" | jq '.events | length')" count
 require "the_audit_trail_survives_the_recovery" true \
@@ -566,7 +613,10 @@ observe unauthenticated_admin_successes "$successes" count
 gate max_unauthenticated_admin_successes "$successes" \
   "$([[ "$successes" == "0" ]] && echo true || echo false)" \
   "a recovered control plane does not come back with its administrative surface open"
-gate admin_writes accepted true \
+gate admin_writes \
+  "$(held the_audit_trail_survives_the_recovery the_audit_after_the_target_is_gone &&
+    echo accepted || echo refused)" \
+  "$(verdict the_audit_trail_survives_the_recovery the_audit_after_the_target_is_gone)" \
   "the authenticated surface answered the audit reads the boundary is measured with"
 defer readiness "this stage reads the administrative surface; it offers no inference traffic"
 defer max_serving_error_fraction "no traffic is offered, so the ceiling is vacuous by contract"
@@ -577,7 +627,8 @@ close
 # ---------------------------------------------------------------------------
 step "Checking the lane retained evidence for every stage it owes"
 python3 "${root}/ops/check-recovery-evidence.py" --runner restore-drill \
-  --forbid "$GW_DRILL_BREAKGLASS" --forbid "$GW_DRILL_KEK" || fail "the evidence is incomplete"
+  --forbid-env GW_DRILL_BREAKGLASS --forbid-env GW_DRILL_KEK ||
+  fail "the evidence is incomplete"
 
 if ((${#failed_stages[@]})); then
   fail "these stages failed: ${failed_stages[*]} (their artifacts are in target/recovery/)"
