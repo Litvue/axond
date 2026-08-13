@@ -27,7 +27,7 @@ use super::result::{
 use crate::support::gateway::{
     ANTHROPIC_SECONDARY_ENV, Axond, GATEWAY_KEY, OPENAI_SECONDARY_ENV, alias, config_toml,
 };
-use crate::support::upstream::FakeUpstream;
+use crate::support::upstream::{CALLER_TAG, Dispatch, FakeUpstream, credential_digest, target};
 
 /// The bounds a capacity run is served under. The admission ceilings sit far
 /// above any manifest concurrency, so what is measured is the process rather
@@ -118,6 +118,13 @@ pub struct Tenant {
     inbound_env: &'static str,
     upstream_key: &'static str,
     upstream_env: &'static str,
+    /// This tenant's own aliases. They exist so its requests are distinguishable
+    /// from the other tenant's at the upstream: each points at the same fixture
+    /// behaviour behind a target tagged with the namespace, which is what lets
+    /// the run pair *who asked* with *which credential answered* rather than
+    /// compare two totals that a swap leaves balanced.
+    chat_alias: &'static str,
+    slow_alias: &'static str,
 }
 
 const PLATFORM: Tenant = Tenant {
@@ -126,6 +133,8 @@ const PLATFORM: Tenant = Tenant {
     inbound_env: "GW_INBOUND_KEY",
     upstream_key: crate::support::gateway::OPENAI_KEY,
     upstream_env: "GW_FAKE_OPENAI_KEY",
+    chat_alias: alias::CHAT,
+    slow_alias: alias::CHAT_SLOW,
 };
 
 const ACME: Tenant = Tenant {
@@ -134,6 +143,8 @@ const ACME: Tenant = Tenant {
     inbound_env: "GW_CAPACITY_ACME_KEY",
     upstream_key: "test-upstream-capacity-acme",
     upstream_env: "GW_CAPACITY_ACME_UPSTREAM",
+    chat_alias: "capacity-acme-chat",
+    slow_alias: "capacity-acme-chat-slow",
 };
 
 const GLOBEX: Tenant = Tenant {
@@ -142,10 +153,46 @@ const GLOBEX: Tenant = Tenant {
     inbound_env: "GW_CAPACITY_GLOBEX_KEY",
     upstream_key: "test-upstream-capacity-globex",
     upstream_env: "GW_CAPACITY_GLOBEX_UPSTREAM",
+    chat_alias: "capacity-globex-chat",
+    slow_alias: "capacity-globex-chat-slow",
 };
 
 /// The tenants a multi-tenant run serves, in rotation order.
 const TENANTS: [Tenant; 2] = [ACME, GLOBEX];
+
+impl Tenant {
+    /// The digest the upstream reports this tenant's own credential under.
+    pub fn credential(&self) -> String {
+        credential_digest(self.upstream_key)
+    }
+}
+
+/// How many upstream calls were answered by a credential belonging to someone
+/// other than the caller — including one belonging to nobody in the run.
+///
+/// Pairing is the whole point: a symmetric swap, where each tenant is served
+/// with the other's key, leaves every per-credential total exactly where an
+/// honest run would leave it.
+pub fn crossed_credential_uses(dispatches: &BTreeMap<Dispatch, u64>) -> u64 {
+    let owners: BTreeMap<String, &'static str> = TENANTS
+        .iter()
+        .chain(std::iter::once(&PLATFORM))
+        .map(|tenant| (tenant.credential(), tenant.namespace))
+        .collect();
+    dispatches
+        .iter()
+        .filter(|(dispatch, _)| {
+            // An untagged target is one the platform's own aliases routed.
+            let caller = if dispatch.caller.is_empty() {
+                PLATFORM.namespace
+            } else {
+                dispatch.caller.as_str()
+            };
+            owners.get(&dispatch.credential).copied() != Some(caller)
+        })
+        .map(|(_, calls)| *calls)
+        .sum()
+}
 
 /// The tenants a multi-tenant run serves, for a suite checking what the run
 /// recorded about them.
@@ -175,10 +222,23 @@ id = "{namespace}-openai"
 [[gateway_key]]
 env = "{inbound_env}"
 namespace = "{namespace}"
+
+[[model]]
+name = "{chat_alias}"
+targets = [ {{ provider = "fake-openai", model = "{chat_target}{CALLER_TAG}{namespace}", price = {price} }} ]
+
+[[model]]
+name = "{slow_alias}"
+targets = [ {{ provider = "fake-openai", model = "{slow_target}{CALLER_TAG}{namespace}", price = {price} }} ]
 "#,
             namespace = tenant.namespace,
             upstream_env = tenant.upstream_env,
             inbound_env = tenant.inbound_env,
+            chat_alias = tenant.chat_alias,
+            slow_alias = tenant.slow_alias,
+            chat_target = target::CHAT,
+            slow_target = target::SLOW_STREAM,
+            price = crate::support::gateway::price(),
         );
         config
     })
@@ -294,10 +354,10 @@ const SIZE_ROTATION: [Shape; 3] = [
 /// Alternating by request index rather than by worker keeps both namespaces in
 /// flight at once, which is the condition an isolation claim is about.
 const TENANT_ROTATION: [Shape; 4] = [
-    Shape::buffered(CHAT, alias::CHAT).sent_by(ACME),
-    Shape::buffered(CHAT, alias::CHAT).sent_by(GLOBEX),
-    Shape::streamed(CHAT, alias::CHAT_SLOW).sent_by(ACME),
-    Shape::streamed(CHAT, alias::CHAT_SLOW).sent_by(GLOBEX),
+    Shape::buffered(CHAT, ACME.chat_alias).sent_by(ACME),
+    Shape::buffered(CHAT, GLOBEX.chat_alias).sent_by(GLOBEX),
+    Shape::streamed(CHAT, ACME.slow_alias).sent_by(ACME),
+    Shape::streamed(CHAT, GLOBEX.slow_alias).sent_by(GLOBEX),
 ];
 
 /// One healthy answer per two unhealthy upstreams: one that never sends
@@ -595,7 +655,7 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Capacity
     let observed = await_usage_records(&gateway, expected_records).await;
     let leaked = await_closed_upstreams(&upstream).await;
     let tenancy = (profile.workload == Workload::Tenants)
-        .then(|| tenancy(&attempts, &observed, &upstream.state.credentials()));
+        .then(|| tenancy(&attempts, &observed, &upstream.state.dispatches()));
     let deadlines = profile.upstream_timeout_ms.map(|bound| Deadlines {
         bound_ms: bound,
         slack_multiple: DEADLINE_SLACK,
@@ -708,22 +768,26 @@ async fn recovery_probe(client: &reqwest::Client, base_url: &str, gauges: &Gauge
 
 /// Who was served, who was charged, and whose credential paid for it.
 ///
-/// Every count here is per namespace and exact over the whole run, and the two
-/// isolation counts are deliberately one-directional: what they measure is a
-/// tenant's credential used *more* often than that tenant dispatched, and a
-/// namespace charged for *more* requests than it sent. Fewer of either is a
-/// request that failed before it got that far — already a threshold breach of
-/// its own, and not a crossing. Inferring a crossing from any inequality would
-/// report an ordinary upstream failure as a leak between customers, which is
-/// the one finding an operator must be able to trust.
+/// The credential count is paired rather than totalled: the upstream reports
+/// each request as *who asked* and *what answered for them*, and a use is
+/// foreign when those two disagree. Two per-tenant totals cannot say this —
+/// under a rotation that offers both tenants the same number of requests, two
+/// customers served with each other's key leave both totals balanced, which is
+/// the one failure the profile exists to catch.
+///
+/// The usage count stays one-directional: a namespace charged for *more*
+/// requests than it sent is a misattribution, while fewer is a request that
+/// failed before accounting — already a threshold breach of its own, and not a
+/// crossing. Reporting an ordinary upstream failure as a leak between customers
+/// would spend the credibility this measurement exists to have.
 fn tenancy(
     attempts: &[Attempt],
     records: &[Value],
-    presented_credentials: &BTreeMap<String, u64>,
+    dispatches: &BTreeMap<Dispatch, u64>,
 ) -> Tenancy {
     let mut by_namespace = BTreeMap::new();
-    let mut foreign_credential_uses = 0;
     let mut misattributed_usage_records = 0;
+    let foreign_credential_uses = crossed_credential_uses(dispatches);
     for tenant in &TENANTS {
         let accepted = attempts
             .iter()
@@ -742,14 +806,14 @@ fn tenancy(
             .iter()
             .filter(|record| record["namespace"].as_str() == Some(tenant.namespace))
             .count() as u64;
-        // The fake sees the raw secret; the record keeps the namespace it
-        // belongs to and the count, never the value.
-        let upstream_calls: u64 = presented_credentials
+        // The upstream reports a digest, never the material, so a tally can be
+        // retained: this is how often this tenant's own key answered anyone.
+        let own = tenant.credential();
+        let upstream_calls: u64 = dispatches
             .iter()
-            .filter(|(presented, _)| presented.contains(tenant.upstream_key))
+            .filter(|(dispatch, _)| dispatch.credential == own)
             .map(|(_, calls)| *calls)
             .sum();
-        foreign_credential_uses += upstream_calls.saturating_sub(dispatched);
         misattributed_usage_records += usage_records.saturating_sub(dispatched);
         by_namespace.insert(
             tenant.namespace.to_owned(),
@@ -769,14 +833,9 @@ fn tenancy(
             },
         );
     }
-    // A credential nobody in the rotation owns, or a row filed under a
-    // namespace that sent nothing: platform fallback serving a tenant looks
-    // exactly like this, and the profile turns fallback off.
-    let known: u64 = by_namespace
-        .values()
-        .map(|counts| counts.upstream_calls)
-        .sum();
-    foreign_credential_uses += presented_credentials.values().sum::<u64>() - known;
+    // A row filed under a namespace that sent nothing: platform fallback
+    // charging a tenant looks exactly like this, and the profile turns fallback
+    // off.
     misattributed_usage_records += records
         .iter()
         .filter(|record| {

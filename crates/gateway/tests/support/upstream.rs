@@ -181,15 +181,54 @@ pub fn fixture(name: &str) -> Bytes {
     Bytes::from(std::fs::read(fixtures_dir().join(name)).expect("fixture is readable"))
 }
 
+/// The separator a target model name may carry a caller label behind, so a
+/// request that is otherwise identical to another caller's can still be told
+/// apart at the upstream. Everything before it selects the fixture behaviour;
+/// everything after it names who was routed here.
+pub const CALLER_TAG: char = '#';
+
+/// One caller reaching the upstream under one credential. Two callers whose
+/// keys were swapped with each other produce two of these, each naming the
+/// wrong pairing, where two per-credential totals would each still balance.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Dispatch {
+    /// The label behind [`CALLER_TAG`] on the target model, or empty for a
+    /// request routed by a target that carries none.
+    pub caller: String,
+    /// [`credential_digest`] of the presented material.
+    pub credential: String,
+}
+
+/// A stable, short, non-reversing name for a presented credential. The upstream
+/// keeps this rather than the material, so a tally can be printed, serialised,
+/// or retained without carrying a secret with it; a caller that knows a key
+/// recognises it by digesting its own copy.
+pub fn credential_digest(presented: &str) -> String {
+    let material = presented
+        .strip_prefix("Bearer ")
+        .unwrap_or(presented)
+        .trim();
+    let digest = ring::digest::digest(&ring::digest::SHA256, material.as_bytes());
+    digest.as_ref()[..8]
+        .iter()
+        .fold(String::with_capacity(16), |mut hex: String, byte: &u8| {
+            use std::fmt::Write;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
 pub struct UpstreamState {
     requests: Mutex<VecDeque<Recorded>>,
-    /// How many requests arrived bearing each presented credential, kept for
-    /// every request rather than only the retained ones: a multi-tenant run
+    /// How many requests arrived from each caller bearing each credential, kept
+    /// for every request rather than only the retained ones: a multi-tenant run
     /// offers more requests than [`RECORDED_LIMIT`], and "was anyone served
-    /// with someone else's key" has to be answered over all of them. The keys
-    /// are the fixture secrets the harness itself set, and stay in this
-    /// process — a caller that publishes a tally maps them to labels first.
-    credentials: Mutex<BTreeMap<String, u64>>,
+    /// with someone else's key" has to be answered over all of them — and per
+    /// request, because two callers whose keys were swapped with each other are
+    /// invisible in two separate totals. No secret is kept: the presented
+    /// material is reduced to a digest on arrival, which a caller compares
+    /// against the digest of a key it already holds.
+    dispatches: Mutex<BTreeMap<Dispatch, u64>>,
     counters: Counters,
     fixtures: Fixtures,
 }
@@ -206,10 +245,10 @@ impl UpstreamState {
             .collect()
     }
 
-    /// Every credential the gateway presented, and how many requests carried
-    /// it. Exact over the whole run.
-    pub fn credentials(&self) -> BTreeMap<String, u64> {
-        self.credentials.lock().expect("upstream lock").clone()
+    /// Who asked, what credential answered for them, and how many times. Exact
+    /// over the whole run.
+    pub fn dispatches(&self) -> BTreeMap<Dispatch, u64> {
+        self.dispatches.lock().expect("upstream lock").clone()
     }
 
     /// How many requests arrived, whether or not they were retained.
@@ -255,7 +294,7 @@ impl FakeUpstream {
     pub async fn start() -> Self {
         let state = Arc::new(UpstreamState {
             requests: Mutex::new(VecDeque::new()),
-            credentials: Mutex::new(BTreeMap::new()),
+            dispatches: Mutex::new(BTreeMap::new()),
             counters: Counters::default(),
             fixtures: Fixtures::load(),
         });
@@ -313,13 +352,20 @@ async fn handle(
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned)
     };
+    let (model, caller) = match model.split_once(CALLER_TAG) {
+        Some((target, caller)) => (target.to_owned(), caller.to_owned()),
+        None => (model, String::new()),
+    };
     state.counters.received.fetch_add(1, Ordering::SeqCst);
     if let Some(presented) = header("authorization").or_else(|| header("x-api-key")) {
         *state
-            .credentials
+            .dispatches
             .lock()
             .expect("upstream lock")
-            .entry(presented)
+            .entry(Dispatch {
+                caller,
+                credential: credential_digest(&presented),
+            })
             .or_default() += 1;
     }
     {

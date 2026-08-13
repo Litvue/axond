@@ -174,6 +174,52 @@ fn the_tenant_rotation_accounts_for_every_offered_request() {
     }
 }
 
+/// The isolation count is what an operator is asked to trust, and the shape of
+/// failure it must survive is the symmetric one: each customer served with the
+/// other's key. Two per-credential totals cannot see it — under a rotation that
+/// offers both tenants the same load, both totals balance exactly as they would
+/// on an honest run — so the count is paired, caller against credential.
+#[test]
+fn a_swap_between_two_tenants_is_not_a_clean_run() {
+    let tenants = capacity::tenants();
+    let [acme, globex] = [&tenants[0], &tenants[1]];
+    let dispatches = |pairs: [(&capacity::Tenant, &capacity::Tenant); 2]| {
+        pairs
+            .iter()
+            .map(|(caller, credential)| {
+                (
+                    upstream::Dispatch {
+                        caller: caller.namespace.to_owned(),
+                        credential: credential.credential(),
+                    },
+                    600,
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        capacity::crossed_credential_uses(&dispatches([(acme, acme), (globex, globex)])),
+        0,
+        "each tenant served with its own key is the clean run"
+    );
+    assert_eq!(
+        capacity::crossed_credential_uses(&dispatches([(acme, globex), (globex, acme)])),
+        1200,
+        "every request of a symmetric swap is a crossing, however even the totals are"
+    );
+    assert_eq!(
+        capacity::crossed_credential_uses(&BTreeMap::from([(
+            upstream::Dispatch {
+                caller: acme.namespace.to_owned(),
+                credential: upstream::credential_digest("a-key-this-run-never-configured"),
+            },
+            7,
+        )])),
+        7,
+        "a credential belonging to nobody in the run is foreign too"
+    );
+}
+
 /// A profile that moves a bound moves it in the config the process boots. A
 /// string rewrite that matched nothing would leave the shared default in place
 /// while the artifact recorded the ceiling the manifest asked for — a run that
