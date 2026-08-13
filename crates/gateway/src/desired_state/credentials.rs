@@ -716,6 +716,12 @@ impl Credentials {
     }
 
     /// One state per secret version, and one active version per secret.
+    ///
+    /// Two credentials naming the *same* active version are not refused, and the
+    /// rule is about ambiguity rather than tidiness: one version's material serves
+    /// either way, so nothing depends on which row is read. Refusing it would also
+    /// make an alias-style arrangement — two provider resources authenticating with
+    /// one key — unpublishable for no safety gain.
     fn check_lifecycles(&self) -> Result<(), CredentialError> {
         let mut states: BTreeMap<SecretRef, (SecretLifecycle, ResourceRef)> = BTreeMap::new();
         let mut active: BTreeMap<SecretId, (SecretRef, ResourceRef)> = BTreeMap::new();
@@ -1475,6 +1481,29 @@ mod tests {
             credentials
                 .get(resource_id(3))
                 .is_some_and(|credential| credential.slug.as_str() == "primary")
+        );
+
+        // Two credentials naming the *same* active version is not ambiguity: one
+        // version's material serves either way, so it publishes, and each row is
+        // required to resolve as its own owner's.
+        let shared = ProviderCredentialBody::staged(
+            resource_id(20),
+            owner(),
+            provider_id(20),
+            display_name("Shared"),
+            secret_ref(3),
+        )
+        .transitioned(SecretLifecycle::Active)
+        .unwrap();
+        let credentials = Credentials::of(&state_of([
+            active.version(slug("primary")),
+            shared.version(slug("shared")),
+        ]))
+        .expect("one version, named twice, is unambiguous");
+        assert_eq!(credentials.active().count(), 2);
+        assert_eq!(
+            credentials.required_secrets().collect::<Vec<_>>(),
+            vec![(owner(), secret_ref(3)), (owner(), secret_ref(3))]
         );
     }
 

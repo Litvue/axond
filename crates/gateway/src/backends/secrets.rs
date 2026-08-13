@@ -253,19 +253,27 @@ pub trait SecretResolver: Send + Sync {
         reference: &SecretRef,
     ) -> Result<SecretMaterial, SecretError>;
 
-    /// Whether `reference` would resolve for this owner, without unwrapping it.
+    /// Whether this owner holds `reference` in a state that may be resolved,
+    /// without unwrapping it.
     ///
     /// For `/admin/v1` reads and pre-publication checks that have no business
-    /// holding plaintext. `true` means exactly what [`SecretResolver::resolve`]
-    /// would do: material this owner holds, in a state that
-    /// [`SecretLifecycle::permits_resolution`]. Anything withdrawn — disabled,
-    /// revoked, or tombstoned — answers `false`, so a check cannot approve a
-    /// credential that will never authorize anything; a caller that wants the
-    /// *reason* asks [`SecretStore::describe`].
+    /// holding plaintext. Ownership and lifecycle, both of which a store knows
+    /// without touching the bytes: anything withdrawn — disabled, revoked, or
+    /// tombstoned — answers `false`, so a check cannot approve a credential that
+    /// will never authorize anything, and a caller that wants the *reason* asks
+    /// [`SecretStore::describe`].
     ///
-    /// Another owner's material answers `false` too, and identically, so probing
-    /// is not a way to enumerate another tenant's secrets or to tell a foreign
-    /// reference from an absent one.
+    /// It is not a substitute for [`SecretResolver::resolve`], and cannot be:
+    /// whether the material still *unwraps* — under the current KEK, from an
+    /// intact record — is only answerable by unwrapping it, so material a rotated
+    /// or lost KEK has made unreadable answers `true` here and
+    /// [`SecretError::Unwrap`] there. Compiling a candidate revision is what
+    /// proves material, and that is deliberate: `exists` exists so a caller that
+    /// must not hold plaintext does not have to.
+    ///
+    /// Another owner's material answers `false`, and identically to an absent
+    /// reference, so probing is not a way to enumerate another tenant's secrets or
+    /// to tell a foreign reference from one that was never stored.
     async fn exists(&self, owner: SecretOwner, reference: &SecretRef) -> Result<bool, SecretError>;
 }
 
@@ -520,8 +528,17 @@ mod tests {
             .expect_err("KEK is wrong");
         assert_eq!(error.category(), FailureCategory::Corrupt);
         assert!(!error.retryable());
-        // Presence is still answerable without unwrapping.
+        // Ownership and lifecycle are still answerable without unwrapping, and
+        // that is all `exists` claims: unwrappability is only provable by
+        // unwrapping, which is what compiling a candidate revision does.
         assert!(store.exists(owner(), &reference).await.unwrap());
+        assert!(
+            store
+                .describe(owner(), &reference)
+                .await
+                .unwrap()
+                .permits_resolution()
+        );
     }
 
     #[tokio::test]

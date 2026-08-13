@@ -219,6 +219,8 @@ Five things follow, and each is worth knowing before you rotate a key:
 - **Two credentials cannot disagree about one secret.** Two references to the same
   version must declare the same `lifecycle`, and at most one version of a secret
   is `active`, so which key authorizes a request never depends on iteration order.
+  Two credentials naming the *same* active version are fine — one key, used for two
+  providers, is unambiguous.
 
 A `provider_id` naming a resource the same revision does not declare is *not*
 refused, for the reason given above: such a reference is unroutable rather than

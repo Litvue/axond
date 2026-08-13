@@ -163,7 +163,9 @@ impl SecretResolver for InMemorySecrets {
         let entries = self.entries.lock().expect("not poisoned");
         match Self::describe_locked(&entries, owner, reference) {
             // Withdrawn material answers as material that is not there: the
-            // question is whether it would resolve, not whether a row exists.
+            // question is what state the material is in, not whether a row exists.
+            // Whether it still unwraps is deliberately not asked, because asking
+            // means unwrapping.
             Ok(descriptor) => Ok(descriptor.lifecycle.permits_resolution()),
             // A reference somebody else owns answers as one that is not stored:
             // probing must not enumerate another tenant's material.

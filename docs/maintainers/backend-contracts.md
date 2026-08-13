@@ -152,14 +152,17 @@ Three properties of it are enforced by types rather than by review
 
 The trait is split so that resolving cannot mint: `SecretResolver` has `resolve`
 and `exists`, and `SecretStore: SecretResolver` adds `stage`, `rotate`,
-`transition`, and `describe`. `exists` answers what `resolve` would do rather
-than whether a row is present — withdrawn material answers `false`, so a
+`transition`, and `describe`. `exists` answers ownership and lifecycle rather than
+whether a row is present — withdrawn material answers `false`, so a
 pre-publication check cannot approve a version that will never authorize
-anything, and `describe` is where a caller asks *why*. The only implementation
-today is the in-memory fake in `backends::fakes`, which states the contract
-executably and is not a selectable backend. Provider-credential bodies and the
-publication rules that cross-check them live in `desired_state::credentials`;
-nothing there calls a store.
+anything, and `describe` is where a caller asks *why*. It is not a cheap
+`resolve`: unwrappability is only provable by unwrapping, so material a rotated or
+lost KEK has made unreadable still answers `true`, and compiling a candidate
+revision is what proves material. The only implementation today is the in-memory
+fake in `backends::fakes`, which states the contract executably and is not a
+selectable backend. Provider-credential bodies and the publication rules that
+cross-check them live in `desired_state::credentials`; nothing there calls a
+store.
 
 ## Catalogue metadata is not activation
 
