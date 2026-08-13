@@ -58,18 +58,19 @@ conditional `GET` carrying the stored ETag and `Last-Modified`, `304` as
 `NotModified`, an explicit request timeout, and a body read under a ceiling
 rather than read whole and then measured.
 
-The source is the URL an operator approved, and the two constraints that keep it
-so: `source_url` must be `https://`, refused at boot rather than at the first
-refresh, and redirects are not followed. Imported metadata is what an operator
-reads to approve a price or enable a model later, so a plaintext document anyone
-on the path may rewrite is not a source worth trusting, and following a redirect
-would let the answer choose the document — and the transport — while the
-provenance every snapshot records still named the configured one. A `3xx` is
-therefore a bounded refusal that names its status and is counted as a
-misconfiguration rather than an outage: retrying an unchanged request cannot fix
-a URL only an operator can change. An HTTPS mirror stays supported; the rule is
-the transport, not the host, because an air-gapped deployment's mirror is a
-legitimate source and its hostname is not something this project can enumerate.
+The source is the URL an operator approved, and the constraints that keep it so:
+`source_url` must parse as an HTTPS URL with a host and no embedded credentials,
+refused at boot rather than at the first refresh, and redirects are not followed.
+Imported metadata is what an operator reads to approve a price or enable a model
+later, so a plaintext document anyone on the path may rewrite is not a source
+worth trusting, and following a redirect would let the answer choose the document
+— and the transport — while the provenance every snapshot records still named the
+configured one. A `3xx` is therefore a bounded refusal that names its status and
+is counted as a misconfiguration rather than an outage: retrying an unchanged
+request cannot fix a URL only an operator can change. An HTTPS mirror stays
+supported and hosts are deliberately not allowlisted, because an air-gapped
+deployment's mirror is a legitimate source and its hostname is not something this
+project can enumerate.
 
 Boot constructs the source, the store, and the refresher before the listener
 binds, adopts what is already retained, and publishes the first report. A

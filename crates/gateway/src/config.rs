@@ -3366,14 +3366,10 @@ impl Config {
             .validate()
             .map_err(|error| ConfigError::Invalid(format!("catalog: {error}")))?;
         if catalog.source == CatalogSourceBackend::ModelsDev {
-            crate::backends::models_dev::ModelsDevAdapter::new(catalog.url())
-                .map_err(|error| ConfigError::Invalid(format!("catalog.source_url: {error}")))?;
-            // Transport is part of the source's identity, not a deployment
-            // detail: catalogue metadata is what an operator later reads to
-            // approve a price, and a plaintext mirror lets whoever holds the
-            // path between them substitute it. A mirror is fine; a
-            // downgradeable one is not.
-            if !catalog.url().starts_with("https://") {
+            let source_url = reqwest::Url::parse(catalog.url()).map_err(|error| {
+                ConfigError::Invalid(format!("catalog.source_url is not a valid URL: {error}"))
+            })?;
+            if source_url.scheme() != "https" {
                 return Err(ConfigError::Invalid(format!(
                     "catalog.source_url `{}` must be `https://`: imported metadata is read for \
                      pricing and enablement decisions, so a source that can be substituted in \
@@ -3381,6 +3377,23 @@ impl Config {
                     catalog.url()
                 )));
             }
+            let has_authority = catalog
+                .url()
+                .split_once("://")
+                .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+                .is_some_and(|authority| !authority.is_empty());
+            if source_url.host_str().is_none() || !has_authority {
+                return Err(ConfigError::Invalid(
+                    "catalog.source_url must name an HTTPS host".into(),
+                ));
+            }
+            if !source_url.username().is_empty() || source_url.password().is_some() {
+                return Err(ConfigError::Invalid(
+                    "catalog.source_url must not contain embedded credentials".into(),
+                ));
+            }
+            crate::backends::models_dev::ModelsDevAdapter::new(catalog.url())
+                .map_err(|error| ConfigError::Invalid(format!("catalog.source_url: {error}")))?;
         } else if catalog.source_url.is_some() {
             return Err(ConfigError::Invalid(format!(
                 "catalog `{}`: `source_url` applies only to `models-dev`",
@@ -5870,6 +5883,38 @@ targets = [{ provider = "openai", model = "gpt-4o" }]
             config.catalog.url(),
             "https://mirror.internal.example/models.dev/catalog.json"
         );
+    }
+
+    /// A source URL is operator configuration, not a place to carry a secret or
+    /// an incomplete authority. Hosts are deliberately not allowlisted:
+    /// deployments may use an HTTPS mirror in an air-gapped network.
+    #[test]
+    fn a_catalogue_source_url_must_have_a_host_without_credentials() {
+        for rejected in [
+            "https:///catalog.json",
+            "https://user:secret@mirror.internal.example/catalog.json",
+        ] {
+            let refusal = match Config::from_toml_str(&format!(
+                "{VALID}\n[catalog]\nsource = \"models-dev\"\nsource_url = \"{rejected}\"\n"
+            )) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("`{rejected}` was accepted as a catalogue source URL"),
+            };
+            assert!(
+                refusal.contains("source_url"),
+                "the refusal must identify the source URL, said: {refusal}"
+            );
+            assert!(
+                !refusal.contains("secret"),
+                "source URL credentials must not be echoed, said: {refusal}"
+            );
+        }
+
+        let config = catalogue_config(&format!(
+            "{VALID}\n[catalog]\nsource = \"models-dev\"\nsource_url = \
+             \"https://127.0.0.1/catalog.json\"\n"
+        ));
+        assert_eq!(config.catalog.url(), "https://127.0.0.1/catalog.json");
     }
 
     /// Retention needs its DSN *by name*: the connection string stays in the

@@ -266,7 +266,8 @@ Ingestion must stay inert:
 `an_unreachable_source_is_retryable_and_never_a_boot_failure` — upstream
 catalogue data must never become an entitlement or an admission dependency. The
 source a deployment reads must also be the source it approved:
-`a_catalogue_source_url_must_be_https` and
+`a_catalogue_source_url_must_be_https`,
+`a_catalogue_source_url_must_have_a_host_without_credentials`, and
 `a_redirected_source_is_refused_rather_than_followed` — metadata an operator
 prices and enables against may not arrive over a transport that can be
 substituted, nor from wherever an answer redirected the import. The

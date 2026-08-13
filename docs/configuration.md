@@ -962,7 +962,7 @@ request.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `source` | `none` \| `models-dev` \| `seed` | `none` | Selects no import, models.dev over HTTPS, or the bundled offline excerpt. |
-| `source_url` | string | `https://models.dev/catalog.json` | The document a `models-dev` import fetches; must be `https://`, is validated at boot against the adapter, and is rejected for other sources. |
+| `source_url` | string | `https://models.dev/catalog.json` | The document a `models-dev` import fetches; must be a hosted `https://` URL without embedded credentials, is validated at boot against the adapter, and is rejected for other sources. |
 | `store` | `in-memory` \| `postgres` | `in-memory` | Where accepted snapshots are retained. `in-memory` is a development store and is refused in stateful mode, which loses every snapshot and its provenance on restart. |
 | `dsn_env` | string | — | Name of the env var holding the Postgres connection string. Inherits `[control_plane] dsn_env` when omitted. The value never appears in config or in a log line. |
 | `schema` | string | — | Schema qualifying the catalogue tables, validated as an identifier. |
@@ -976,7 +976,10 @@ request.
 | `connect_timeout_ms` | integer | `10000` | Bounded Postgres connection setup. Must be nonzero. |
 | `operation_timeout_ms` | integer | `30000` | Bounded Postgres statement timeout. Must be nonzero. |
 
-An HTTPS mirror is a supported `source_url`; a plaintext one is refused at boot.
+An HTTPS mirror is a supported `source_url`; a plaintext, hostless, or credential-
+carrying one is refused at boot. Hosts are deliberately not allowlisted: an
+operator-controlled HTTPS mirror may be deployment-local or air-gapped. The URL
+must still name the exact supported `/catalog.json` document.
 Imported metadata is what an operator later reads to approve a price or enable a
 model, so a document anyone on the path could substitute is not a source this
 gateway will trust. Redirects are not followed either: the configured URL is the
