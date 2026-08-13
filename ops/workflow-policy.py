@@ -173,11 +173,12 @@ def check_cosign_verify(text: str, relative: str) -> list[str]:
     Keyless verification without both certificate flags accepts any Fulcio
     certificate, so it proves only that *someone* signed the artifact. `--key`
     can say the same thing — the signature must verify against one named public
-    key — but only in `KEY_VERIFY_FILES`, and only for the public half of a pair
-    that file mints itself. Anywhere else, and for any key arriving from the
-    environment, the certificate flags are the only accepted restriction: a
-    script must not be able to opt out of the release contract by generating a
-    key pair next to the verify it wants excused.
+    key — but it is read only where the certificate flags are absent, and then
+    only in `KEY_VERIFY_FILES` and only for the public half of a pair that file
+    mints itself. Anywhere else, and for any key arriving from the environment,
+    the certificate flags are the only accepted restriction: a script must not
+    be able to opt out of the release contract by generating a key pair next to
+    the verify it wants excused.
     """
     failures: list[str] = []
     lines = text.splitlines()
@@ -187,6 +188,14 @@ def check_cosign_verify(text: str, relative: str) -> list[str]:
         if "cosign verify" not in line or line.lstrip().startswith("#"):
             continue
         block = command_block(lines, index)
+        # The certificate flags are the rule, so a command carrying them passes
+        # whatever else it names: `--key` is read only as an alternative for a
+        # command that offers no certificate restriction at all.
+        if (
+            "--certificate-identity-regexp" in block
+            and "--certificate-oidc-issuer" in block
+        ):
+            continue
         key = re.search(r"--key[= ]+(\S+)", block)
         if key:
             if unquote(key.group(1)) in minted:
@@ -198,11 +207,10 @@ def check_cosign_verify(text: str, relative: str) -> list[str]:
                 "--certificate-identity-regexp and --certificate-oidc-issuer"
             )
             continue
-        if "--certificate-identity-regexp" not in block or "--certificate-oidc-issuer" not in block:
-            failures.append(
-                f"{relative}:{index + 1}: `cosign verify` must pass "
-                "--certificate-identity-regexp and --certificate-oidc-issuer"
-            )
+        failures.append(
+            f"{relative}:{index + 1}: `cosign verify` must pass "
+            "--certificate-identity-regexp and --certificate-oidc-issuer"
+        )
     return failures
 
 
@@ -456,6 +464,19 @@ def self_test() -> list[str]:
                 problems.append(
                     "self-test: an unrestricted `cosign verify` was excused by a "
                     "key-based one on the next line"
+                )
+            # A command that does restrict the certificate is restricted, whatever
+            # else it names: `--key` is read only where there is no such flag.
+            canary.write_text(
+                'cosign verify --key "$RELEASE_KEY" "$IMAGE" \\\n'
+                '  --certificate-identity-regexp "$ID" \\\n'
+                "  --certificate-oidc-issuer https://token.actions.githubusercontent.com\n",
+                encoding="utf-8",
+            )
+            if check(root):
+                problems.append(
+                    f"self-test: a certificate-restricted verify naming a key was "
+                    f"rejected: {check(root)}"
                 )
             canary.unlink()
         # Another script cannot grant itself the exemption by minting a pair.
