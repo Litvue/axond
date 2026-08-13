@@ -1284,6 +1284,14 @@ pub enum PricingError {
         expected: &'static str,
         found: String,
     },
+    /// A `schema` that is present and is not text, so the identifier deciding how
+    /// to read the rest of the body is itself unreadable. No release wrote one,
+    /// so the row is damage rather than another release's writing.
+    #[error(
+        "{reference} carries a `schema` that is not an identifier, which no release wrote; \
+         restore the row or republish the resource rather than changing build"
+    )]
+    DamagedSchema { reference: ResourceRef },
     #[error("{reference} is missing the `{field}` field")]
     MissingField {
         reference: ResourceRef,
@@ -1400,6 +1408,7 @@ impl PricingError {
             | Self::NotARecord { reference }
             | Self::Uncanonicalizable { reference, .. }
             | Self::Schema { reference, .. }
+            | Self::DamagedSchema { reference }
             | Self::MissingField { reference, .. }
             | Self::UnknownField { reference, .. }
             | Self::FieldType { reference, .. }
@@ -1457,9 +1466,11 @@ impl PricingError {
     /// encodes through the canonical form, so a body that form rejects is one no
     /// release produced.
     pub fn is_incompatible(&self) -> bool {
-        // Only the schema identifier itself, as for every other body: its
-        // absence is a body written before price books had one at all.
-        if let Self::MissingField { field, .. } | Self::FieldType { field, .. } = self {
+        // Only the absence of the schema identifier, as for every other body: a
+        // body written before price books had one at all is another release's
+        // writing, while a marker that is present and unreadable is
+        // `DamagedSchema`, which no release wrote.
+        if let Self::MissingField { field, .. } = self {
             return *field == SCHEMA_FIELD;
         }
         matches!(
@@ -1751,6 +1762,10 @@ impl BodyError for PricingError {
             expected,
             found,
         }
+    }
+
+    fn damaged_schema(reference: ResourceRef) -> Self {
+        Self::DamagedSchema { reference }
     }
 
     fn missing_field(reference: ResourceRef, field: &'static str) -> Self {
@@ -2487,9 +2502,10 @@ mod tests {
         assert!(matches!(unknown, PricingError::UnknownField { .. }));
         assert!(unknown.is_incompatible());
 
-        // The schema identifier is the one field whose absence — or whose type
-        // being wrong — is a body older than the identifier, exactly as it is for
-        // the tenancy and credential bodies.
+        // The schema identifier is the one field whose *absence* is a body older
+        // than the identifier, exactly as it is for the tenancy and credential
+        // bodies. A marker that is present and unreadable is damage instead, and
+        // the test below holds it to that.
         let untyped = read_without_field(SCHEMA_FIELD).expect_err("an untyped body is refused");
         assert!(matches!(
             untyped,
@@ -2499,22 +2515,25 @@ mod tests {
             }
         ));
         assert!(untyped.is_incompatible());
-
-        let mistyped_schema = read_with_field(SCHEMA_FIELD, CanonicalValue::integer(1))
-            .expect_err("a non-string schema is refused");
-        assert!(matches!(
-            mistyped_schema,
-            PricingError::FieldType {
-                field: SCHEMA_FIELD,
-                ..
-            }
-        ));
-        assert!(mistyped_schema.is_incompatible());
     }
 
     /// And every way a body can be *wrong* rather than newer.
     #[test]
     fn bodies_no_release_would_have_written_are_invalid_state() {
+        for marker in [
+            CanonicalValue::integer(1),
+            CanonicalValue::List(vec![CanonicalValue::string(PRICE_BOOK_SCHEMA)]),
+            CanonicalValue::map([(SCHEMA_FIELD, CanonicalValue::string(PRICE_BOOK_SCHEMA))]),
+        ] {
+            let damaged = read_with_field(SCHEMA_FIELD, marker.clone())
+                .expect_err("a schema marker that is not an identifier is refused");
+            assert!(
+                matches!(damaged, PricingError::DamagedSchema { .. }),
+                "{marker:?}: {damaged}"
+            );
+            assert!(!damaged.is_incompatible(), "{damaged}");
+        }
+
         let missing = read_without_field(CURRENCY_FIELD).expect_err("a missing field is refused");
         assert!(matches!(missing, PricingError::MissingField { .. }));
         assert!(!missing.is_incompatible());

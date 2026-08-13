@@ -52,13 +52,12 @@ pub(super) trait BodyError: Sized {
     /// A body whose `schema` is present and is not text, so the identifier that
     /// decides how to read everything else is itself unreadable.
     ///
-    /// Defaulted to the wrong-type refusal, because that is what it is; a schema
-    /// whose classification of it differs from an ordinary wrong type — a model
-    /// body, where a marker no release ever wrote is damage rather than skew —
-    /// says so by overriding this.
-    fn damaged_schema(reference: ResourceRef) -> Self {
-        Self::field_type(reference, SCHEMA_FIELD)
-    }
+    /// Required rather than defaulted to the wrong-type refusal, because the two
+    /// call for opposite operator actions and every schema owes the same answer:
+    /// no release has ever written a marker that is not an identifier, so such a
+    /// row is damaged storage to restore or republish, never a build to roll
+    /// forward.
+    fn damaged_schema(reference: ResourceRef) -> Self;
 
     /// A field that must be a set of strings and is not.
     ///

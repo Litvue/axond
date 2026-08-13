@@ -64,6 +64,14 @@ pub enum ProviderError {
         expected: &'static str,
         found: String,
     },
+    /// A `schema` that is present and is not text, so the identifier deciding how
+    /// to read the rest of the body is itself unreadable. No release wrote one,
+    /// so the row is damage rather than another release's writing.
+    #[error(
+        "{reference} carries a `schema` that is not an identifier, which no release wrote; \
+         restore the row or republish the resource rather than changing build"
+    )]
+    DamagedSchema { reference: ResourceRef },
     #[error("{reference} has no `{field}`")]
     MissingField {
         reference: ResourceRef,
@@ -130,9 +138,10 @@ impl ProviderError {
             | Self::UnknownField { .. }
             | Self::UnknownWireFamily { .. }
             | Self::MalformedDisplayName { .. } => true,
-            Self::MissingField { field, .. } | Self::FieldType { field, .. } => {
-                *field == SCHEMA_FIELD
-            }
+            // Absence of the schema identifier only; a marker that is present
+            // and unreadable is `DamagedSchema`, which no release wrote.
+            Self::MissingField { field, .. } => *field == SCHEMA_FIELD,
+            Self::FieldType { .. } | Self::DamagedSchema { .. } => false,
             Self::Kind { .. }
             | Self::NotInline { .. }
             | Self::NotARecord { .. }
@@ -150,6 +159,7 @@ impl ProviderError {
             | Self::NotInline { reference }
             | Self::NotARecord { reference }
             | Self::Schema { reference, .. }
+            | Self::DamagedSchema { reference }
             | Self::MissingField { reference, .. }
             | Self::UnknownField { reference, .. }
             | Self::FieldType { reference, .. }
@@ -186,6 +196,10 @@ impl BodyError for ProviderError {
             expected,
             found,
         }
+    }
+
+    fn damaged_schema(reference: ResourceRef) -> Self {
+        Self::DamagedSchema { reference }
     }
 
     fn missing_field(reference: ResourceRef, field: &'static str) -> Self {
@@ -586,6 +600,34 @@ mod tests {
         let error = ProviderBody::read(&version).expect_err("an unknown dialect");
         assert!(matches!(error, ProviderError::UnknownWireFamily { .. }));
         assert!(error.is_incompatible());
+    }
+
+    #[test]
+    fn a_schema_marker_that_is_not_an_identifier_is_damage_not_a_skew() {
+        for marker in [
+            CanonicalValue::integer(1),
+            CanonicalValue::List(vec![CanonicalValue::string(PROVIDER_SCHEMA)]),
+            CanonicalValue::map([(SCHEMA_FIELD, CanonicalValue::string(PROVIDER_SCHEMA))]),
+        ] {
+            let mut version = body().version(slug());
+            let ResourceBody::Inline(CanonicalValue::Map(fields)) = &mut version.body else {
+                unreachable!("a provider body is an inline record")
+            };
+            for (name, value) in fields.iter_mut() {
+                if name == SCHEMA_FIELD {
+                    *value = marker.clone();
+                }
+            }
+            let error = ProviderBody::read(&version).expect_err("an unreadable marker");
+            assert!(
+                matches!(error, ProviderError::DamagedSchema { .. }),
+                "{marker:?}: {error}"
+            );
+            assert!(
+                !error.is_incompatible(),
+                "no release wrote this marker, so it is storage to repair: {error}"
+            );
+        }
     }
 
     #[test]

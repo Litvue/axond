@@ -141,7 +141,11 @@ rather than taste:
   rules with nothing reported. It is refused as `ModelError::DamagedSchema`, and
   that refusal is *not* a compatibility one: no release wrote a marker that is
   not an identifier, so the row is damaged storage and the action is to restore
-  it or republish the resource, not to roll a build forward. These rules run
+  it or republish the resource, not to roll a build forward. That classification
+  is the shared reader's rather than this slice's: every body schema — tenants,
+  projects, providers, credentials, policies, price books, and these two — has
+  the same `DamagedSchema` refusal, so one operator-facing answer covers a marker
+  a rewrite damaged wherever it is found. These rules run
   wherever a revision is read, so
   they hold at publication as well as at hydration; refusing to *author* a new
   untyped alias belongs to the slice that writes these bodies, which keeps the

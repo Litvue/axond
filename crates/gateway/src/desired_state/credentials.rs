@@ -111,6 +111,14 @@ pub enum CredentialError {
         expected: &'static str,
         found: String,
     },
+    /// A `schema` that is present and is not text, so the identifier deciding how
+    /// to read the rest of the body is itself unreadable. No release wrote one,
+    /// so the row is damage rather than another release's writing.
+    #[error(
+        "{reference} carries a `schema` that is not an identifier, which no release wrote; \
+         restore the row or republish the resource rather than changing build"
+    )]
+    DamagedSchema { reference: ResourceRef },
     #[error("{reference} has no `{field}`")]
     MissingField {
         reference: ResourceRef,
@@ -232,11 +240,11 @@ impl CredentialError {
             | Self::UnknownField { .. }
             | Self::UnknownLifecycle { .. }
             | Self::MalformedDisplayName { .. } => true,
-            // Only the schema identifier itself: its absence is a body written
-            // before provider credentials had one at all.
-            Self::MissingField { field, .. } | Self::FieldType { field, .. } => {
-                *field == SCHEMA_FIELD
-            }
+            // Absence of the schema identifier only: a body written before
+            // provider credentials had one at all is another release's writing,
+            // while a marker that is present and unreadable is `DamagedSchema`.
+            Self::MissingField { field, .. } => *field == SCHEMA_FIELD,
+            Self::FieldType { .. } | Self::DamagedSchema { .. } => false,
             Self::Kind { .. }
             | Self::NotInline { .. }
             | Self::NotARecord { .. }
@@ -259,6 +267,7 @@ impl CredentialError {
             | Self::NotInline { reference }
             | Self::NotARecord { reference }
             | Self::Schema { reference, .. }
+            | Self::DamagedSchema { reference }
             | Self::MissingField { reference, .. }
             | Self::UnknownField { reference, .. }
             | Self::FieldType { reference, .. }
@@ -300,6 +309,10 @@ impl BodyError for CredentialError {
             expected,
             found,
         }
+    }
+
+    fn damaged_schema(reference: ResourceRef) -> Self {
+        Self::DamagedSchema { reference }
     }
 
     fn missing_field(reference: ResourceRef, field: &'static str) -> Self {
@@ -1252,6 +1265,34 @@ mod tests {
             }
         );
         assert!(error.is_incompatible());
+
+        // A marker that is present and is not an identifier is the other side of
+        // that boundary: no release wrote one, so it is damage rather than another
+        // release's writing, and the operator is sent to storage.
+        for marker in [
+            CanonicalValue::integer(1),
+            CanonicalValue::List(vec![CanonicalValue::string(PROVIDER_CREDENTIAL_SCHEMA)]),
+            CanonicalValue::map([(
+                SCHEMA_FIELD,
+                CanonicalValue::string(PROVIDER_CREDENTIAL_SCHEMA),
+            )]),
+        ] {
+            let damaged = with_fields(&resource, |fields| {
+                set(fields, SCHEMA_FIELD, marker.clone());
+            });
+            let error = ProviderCredentialBody::read(&damaged).expect_err("an unreadable marker");
+            assert_eq!(
+                error,
+                CredentialError::DamagedSchema {
+                    reference: damaged.reference
+                }
+            );
+            assert!(!error.is_incompatible(), "{error}");
+            assert!(
+                error.to_string().contains("restore the row"),
+                "the alert must name the repair: {error}"
+            );
+        }
 
         // An untyped body a build predating this slice wrote: no schema at all.
         let legacy = legacy_credential(&tenant_id(1), 3, "primary");

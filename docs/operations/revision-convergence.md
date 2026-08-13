@@ -161,13 +161,19 @@ Six rules hold for every body schema, present and future:
   ([ADR 0042](../adr/0042-model-enablement-and-alias-contracts.md)). The
   exception is the *absence* of the field and nothing else: an alias body that
   carries a `schema` whose value is not text is read strictly and refused, so a
-  damaged marker cannot skip the alias rules unreported. That refusal is
-  *damage*, not skew — no release wrote a marker that is not an identifier, so
-  hydration reports it as stored state that does not add up rather than as a
-  revision this build is too old to read, and the action is to restore or
-  republish that row rather than to roll the replica's build forward. Reads
-  accommodate rows already in the journal; the slice that gains an authoring path
-  is where refusing to *write* a new untyped alias belongs.
+  damaged marker cannot skip the alias rules unreported. Reads accommodate rows
+  already in the journal; the slice that gains an authoring path is where
+  refusing to *write* a new untyped alias belongs.
+- **A `schema` marker that is present and is not an identifier is damage, in
+  every schema.** Absence of the field is a body an older release wrote, and an
+  identifier this build does not know is a body a *newer* release wrote — both
+  `incompatible`, storage intact. A marker that is present and is not text is
+  neither: no release has ever written one, so it is reported as `corrupt`, and
+  the alert names the repair ("restore the row or republish the resource rather
+  than changing build"). The rule is the shared reader's, so it is the same for a
+  tenant, a project, a provider, a credential, a policy, a price book, an
+  enablement, and an alias — an operator is never told to roll a fleet forward
+  over a row a rewrite damaged.
 - **A sub-record is part of its schema.** `observed_price` and `approved_price`
   in an enablement, and each entry of an alias's `targets`, define their own field
   sets (`input_micros_per_million`/`output_micros_per_million`,
