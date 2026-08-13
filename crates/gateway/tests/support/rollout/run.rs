@@ -932,9 +932,14 @@ fn scrub_urls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find("://") {
+        // Resume after the delimiter itself, which is one `char` rather than one
+        // byte: output carrying a non-ASCII glyph before a URL must be redacted,
+        // not panicked on.
         let scheme_start = rest[..at]
-            .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '+' && c != '-' && c != '.')
-            .map_or(0, |index| index + 1);
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !c.is_ascii_alphanumeric() && *c != '+' && *c != '-' && *c != '.')
+            .map_or(0, |(index, c)| index + c.len_utf8());
         let end = rest[at..]
             .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ')'))
             .map_or(rest.len(), |offset| at + offset);

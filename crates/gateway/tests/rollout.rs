@@ -492,6 +492,19 @@ mod artifact_redaction {
             "the URL is gone whether or not the harness knew it"
         );
     }
+
+    /// Command output is bytes a subprocess chose, not ASCII the harness picked:
+    /// a non-ASCII glyph before a URL must be redacted rather than split
+    /// mid-character.
+    #[test]
+    fn a_url_after_a_multi_byte_character_is_scrubbed_without_panicking() {
+        let output = redacted("refusing “postgresql://admin:s3cret@db:5432/axond now", &[]);
+
+        assert_eq!(
+            output, "refusing “${redacted-url} now",
+            "the text around the URL survives and the URL does not"
+        );
+    }
 }
 
 /// The usage reconciliation, exercised on hand-built ledgers: these are the

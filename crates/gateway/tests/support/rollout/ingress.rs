@@ -482,8 +482,13 @@ impl Drop for Ingress {
 /// Poll every member's `/readyz` forever. A transport failure counts as not
 /// ready: a replica that has gone away is one the balancer must stop using,
 /// whatever the reason.
+///
+/// The first pass waits one interval like every other, so a poll interval
+/// longer than a test is a way to drive readiness by hand: probing a member the
+/// instant it is added would overwrite the state such a test just set.
 async fn probe_loop(state: Arc<IngressState>, poll: Duration) {
     loop {
+        tokio::time::sleep(poll).await;
         for member in state.members() {
             let ready = state
                 .client
