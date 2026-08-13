@@ -356,6 +356,12 @@ fn a_look_about_a_key_no_record_describes_is_counted_rather_than_dropped_silentl
     let projected = project(&deployment, &catalogue(), &resolved(40), [stray]);
 
     assert_eq!(projected.undescribed_looks(), 1);
+    // Named as well as counted: a count says evidence is being thrown away, the
+    // key says which model to look at.
+    assert_eq!(
+        projected.undescribed_look_keys(),
+        [AvailabilityKey::new(unenabled, target())]
+    );
     assert_eq!(projected.misfiled(), 0);
     assert!(
         projected
@@ -380,6 +386,7 @@ fn a_look_about_a_key_no_record_describes_is_counted_rather_than_dropped_silentl
     );
     let projected = project(&deployment, &catalogue(), &resolved(40), [described]);
     assert_eq!(projected.undescribed_looks(), 0);
+    assert!(projected.undescribed_look_keys().is_empty());
     assert_eq!(
         verdict(&projected, &deployment.key(), 100).state,
         AvailabilityState::Available
@@ -411,6 +418,7 @@ fn two_enablements_naming_one_key_decide_the_same_way_in_either_order() {
         let projected = project(&deployment, &catalogue(), &resolved(40), None);
 
         assert_eq!(projected.conflicting(), 1);
+        assert_eq!(projected.conflicted(), [deployment.key()]);
         verdict(&projected, &deployment.key(), 100)
     });
 
@@ -420,6 +428,43 @@ fn two_enablements_naming_one_key_decide_the_same_way_in_either_order() {
     assert_eq!(verdicts[0].state, AvailabilityState::Denied);
     assert_eq!(verdicts[0].reason, AvailabilityReason::NotEnabled);
     assert_eq!(verdicts[0].decided_by, DecidedBy::Enablement);
+}
+
+/// A revision that can name none of the looks a discovery loop took reports every
+/// one of them in its count, and at most [`REPORTED_KEYS`] of them by name: the
+/// report of a pathological revision has to stay a report.
+///
+/// The names kept are the lowest keys in key order rather than the ones that
+/// arrived first, so two replicas draining the same looks in different orders
+/// name the same models.
+#[test]
+fn a_revision_that_can_name_no_look_at_all_reports_every_one_and_names_boundedly() {
+    let deployment = Deployment::new().entitled().governed();
+    let strays: Vec<DiscoveryObservation> = (0..u32::try_from(REPORTED_KEYS + 8)
+        .expect("a small bound"))
+        .rev()
+        .map(|nth| {
+            DiscoveryObservation::new(
+                deployment.scope(),
+                TargetRef::parse("openai", &format!("gpt-{nth:04}-unenabled"))
+                    .expect("a well-formed target"),
+                DiscoveryResult::Present,
+                DiscoveryCompleteness::Complete,
+                DiscoverySource::ProviderListing,
+                at(90),
+            )
+        })
+        .collect();
+    let arrived: Vec<AvailabilityKey> = strays.iter().map(DiscoveryObservation::key).collect();
+
+    let projected = project(&deployment, &catalogue(), &resolved(40), strays);
+
+    assert_eq!(projected.undescribed_looks(), REPORTED_KEYS + 8);
+    assert_eq!(projected.undescribed_look_keys().len(), REPORTED_KEYS);
+    let mut lowest = arrived;
+    lowest.sort();
+    lowest.truncate(REPORTED_KEYS);
+    assert_eq!(projected.undescribed_look_keys(), lowest);
 }
 
 /// One tenant's credential entitles nothing in another's scope, and one tenant's

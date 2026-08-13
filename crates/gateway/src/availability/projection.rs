@@ -39,7 +39,13 @@
 //! ([`ProjectedAvailability::undescribed_looks`]), and so is a key two
 //! enablements both name, whose dimensions are combined at their least permissive
 //! value rather than resolved by iteration order
-//! ([`ProjectedAvailability::conflicting`]).
+//! ([`ProjectedAvailability::conflicting`]). Both name the keys they refused as
+//! well as counting them ([`ProjectedAvailability::undescribed_look_keys`],
+//! [`ProjectedAvailability::conflicted`]), because a count tells an operator a
+//! discrepancy exists and a key tells them which model to look at. The named
+//! set is bounded at [`REPORTED_KEYS`] while the counters are not: a revision
+//! that lost a whole catalogue snapshot must not turn one projection into an
+//! unbounded allocation of the keys it could not describe.
 //!
 //! The same holds in the other direction, for a key an *earlier* revision
 //! described and this one does not — a rollback that dropped an enablement, a
@@ -356,6 +362,16 @@ impl RuntimeObservations {
     }
 }
 
+/// How many refused keys a projection names, per kind of refusal.
+///
+/// Enough to act on — an operator repairs the models they can see named, and a
+/// deployment whose looks are all being dropped shows it in the first few — and
+/// bounded so the report of a pathological revision stays a report. The
+/// counters beside them remain exact, and the named keys are the lowest ones in
+/// key order rather than the ones that happened to arrive first, so two replicas
+/// projecting the same revision name the same models.
+pub const REPORTED_KEYS: usize = 32;
+
 /// An index derived from a revision, with what the derivation could not describe.
 ///
 /// The counters are part of the answer. A projection that names nothing is
@@ -373,7 +389,9 @@ pub struct ProjectedAvailability {
     superseded: usize,
     misfiled: usize,
     undescribed_looks: usize,
+    undescribed_look_keys: Vec<AvailabilityKey>,
     conflicting: usize,
+    conflicted: Vec<AvailabilityKey>,
 }
 
 impl ProjectedAvailability {
@@ -444,6 +462,13 @@ impl ProjectedAvailability {
         self.undescribed_looks
     }
 
+    /// Which keys those looks named, up to [`REPORTED_KEYS`] of them in key
+    /// order. The count is exact; this is what an operator reads to find the
+    /// model whose evidence is being thrown away.
+    pub fn undescribed_look_keys(&self) -> &[AvailabilityKey] {
+        &self.undescribed_look_keys
+    }
+
     /// Keys two enablements of this revision both resolve to, whose records were
     /// combined at their least permissive value rather than resolved by
     /// iteration order.
@@ -456,6 +481,14 @@ impl ProjectedAvailability {
     /// discrepancy worth reading.
     pub const fn conflicting(&self) -> usize {
         self.conflicting
+    }
+
+    /// Which keys more than one enablement resolved to, up to [`REPORTED_KEYS`]
+    /// of them in key order. A count says a revision names one model twice; this
+    /// says which model, which is what an operator needs to retire the
+    /// enablement they meant to replace.
+    pub fn conflicted(&self) -> &[AvailabilityKey] {
+        &self.conflicted
     }
 }
 
@@ -498,6 +531,7 @@ impl<'a> AvailabilityProjection<'a> {
         let mut unnameable = 0;
         let mut skewed = 0;
         let mut conflicting = 0;
+        let mut conflicted: BTreeSet<AvailabilityKey> = BTreeSet::new();
 
         for enablement in models.enablements() {
             let pinned = enablement.body.offering();
@@ -528,6 +562,7 @@ impl<'a> AvailabilityProjection<'a> {
                 }
                 Entry::Occupied(mut held) => {
                     conflicting += 1;
+                    note(&mut conflicted, held.key().clone());
                     let combined = least_permissive(held.get(), record);
                     held.insert(combined);
                 }
@@ -543,14 +578,16 @@ impl<'a> AvailabilityProjection<'a> {
         // filed — the record it belongs to does not exist — and it has already
         // been taken off the queue. Dropped rather than queued back, since a
         // target that never returns would grow the queue without bound, but
-        // counted: it cost a provider round trip, and every other refusal in
-        // this projection is reported.
+        // counted and named: it cost a provider round trip, and every other
+        // refusal in this projection is reported.
         let mut undescribed_looks = 0;
+        let mut undescribed_look_keys: BTreeSet<AvailabilityKey> = BTreeSet::new();
         for observation in observations {
             if described.contains(&observation.key()) {
                 builder = builder.observe(observation);
             } else {
                 undescribed_looks += 1;
+                note(&mut undescribed_look_keys, observation.key());
             }
         }
 
@@ -574,7 +611,9 @@ impl<'a> AvailabilityProjection<'a> {
             superseded: builder.superseded(),
             misfiled: builder.misfiled(),
             undescribed_looks,
+            undescribed_look_keys: reported(undescribed_look_keys),
             conflicting,
+            conflicted: reported(conflicted),
             index: builder.build(),
         })
     }
@@ -1150,6 +1189,23 @@ fn least_permissive(held: &AvailabilityRecord, other: AvailabilityRecord) -> Ava
         // neither is combined here.
         ..AvailabilityRecord::default()
     }
+}
+
+/// Name one refused key, keeping the report bounded at [`REPORTED_KEYS`].
+///
+/// The lowest keys in key order are the ones kept, rather than the ones that
+/// arrived first: an operator reading two replicas' reports of one revision
+/// should see the same models named, and arrival order is a property of a
+/// discovery loop rather than of the revision.
+fn note(named: &mut BTreeSet<AvailabilityKey>, key: AvailabilityKey) {
+    named.insert(key);
+    if named.len() > REPORTED_KEYS {
+        named.pop_last();
+    }
+}
+
+fn reported(named: BTreeSet<AvailabilityKey>) -> Vec<AvailabilityKey> {
+    named.into_iter().collect()
 }
 
 fn scope_of(owner: ModelOwner) -> ScopeRef {

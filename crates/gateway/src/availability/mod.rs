@@ -106,7 +106,7 @@ pub use index::{AvailabilityIndex, AvailabilityIndexBuilder, AvailabilityRecord}
 pub use projection::{
     AvailabilityEvidence, AvailabilityProjection, AvailabilityProjectionError, AvailabilityReader,
     AvailabilityView, Catalogue, CatalogueListing, CredentialReadiness, ProjectedAvailability,
-    RuntimeObservations,
+    REPORTED_KEYS, RuntimeObservations,
 };
 #[allow(unused_imports)]
 pub use refs::{
