@@ -52,6 +52,12 @@ mod redis_support;
 mod reload;
 mod revocation;
 mod routes;
+// What the secret contracts add up to, asserted over the composition rather
+// than over the pieces: material an administrator stages reaches the provider
+// it authenticates to and no other surface, and the lifecycle around it —
+// rotation, failure, retirement — is safe for requests in flight.
+#[cfg(test)]
+mod secret_redaction;
 mod shutdown;
 mod state;
 // The authenticated status contract (#199). Contract only, like `backends` and

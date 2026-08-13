@@ -98,6 +98,31 @@ impl InMemorySecrets {
         *self.kek.lock().expect("not poisoned") = KekRef("AXOND_KEK_ROTATED".to_owned());
     }
 
+    /// Hold `material` at exactly `reference`, as a store an administrator
+    /// staged into before this process started already does.
+    ///
+    /// [`stage`](SecretStore::stage) mints the reference itself, which is right
+    /// for the store's own contract and useless to a test whose *desired state*
+    /// already pins a reference: the fixture credential names a version, so the
+    /// store has to be able to hold that version rather than one it invented.
+    pub(crate) fn seed(
+        &self,
+        owner: SecretOwner,
+        reference: SecretRef,
+        lifecycle: SecretLifecycle,
+        material: SecretMaterial,
+    ) {
+        let kek = self.kek.lock().expect("not poisoned").clone();
+        self.entries.lock().expect("not poisoned").insert(
+            reference,
+            Entry {
+                owner,
+                lifecycle,
+                material: Some((material.expose().to_owned(), kek)),
+            },
+        );
+    }
+
     /// Whether the store still holds bytes for a version: what a test asserts on
     /// to prove tombstoning destroyed material rather than only relabelling it.
     pub(crate) fn holds_material(&self, reference: &SecretRef) -> bool {

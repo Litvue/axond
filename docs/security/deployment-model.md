@@ -38,6 +38,11 @@ TOML stores structure and references, never secret values.
 - Do not put credentials in provider URLs, query strings, command arguments,
   container labels, or ConfigMaps.
 
+In stateful mode a credential resource stores an opaque secret reference and the
+material stays in the secret store; see
+[secret material in the stateful control plane](./secret-material.md) for what
+that guarantees and how it is tested.
+
 Restrict files and environment access to the service identity. Rotate by
 overlapping distinct keys, moving callers, then removing the old key. See the
 [minted-token guide](../minted-token-guide.md) for signer rotation and JTI
