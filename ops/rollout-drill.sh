@@ -155,10 +155,22 @@ step "The counterfactual: fleet-wide skew has to deadlock"
 # proves nothing.
 scoped="$(kube -n axond get deployment axond \
   -o jsonpath='{.spec.template.spec.topologySpreadConstraints}')"
-kube -n axond patch deployment axond --type=json -p='[
-  {"op":"remove","path":"/spec/template/spec/topologySpreadConstraints/1/matchLabelKeys"},
-  {"op":"replace","path":"/spec/template/metadata/annotations/axond.dev~1drill","value":"2"}
-]' >/dev/null
+# The constraint is located by its topologyKey rather than by position. The
+# manifest gate keys constraints by topologyKey and never pins their order, so a
+# reordered overlay passes it and would then abort this patch with a raw kubectl
+# error about a missing path instead of one of the drill's own failures.
+mapfile -t keys < <(kube -n axond get deployment axond \
+  -o jsonpath='{range .spec.template.spec.topologySpreadConstraints[*]}{.topologyKey}{"\n"}{end}')
+index=-1
+for i in "${!keys[@]}"; do
+  [[ "${keys[$i]}" == "kubernetes.io/hostname" ]] && index="$i"
+done
+[[ "$index" -ge 0 ]] ||
+  fail "the Deployment declares no kubernetes.io/hostname spread constraint to un-scope"
+kube -n axond patch deployment axond --type=json -p="[
+  {\"op\":\"remove\",\"path\":\"/spec/template/spec/topologySpreadConstraints/${index}/matchLabelKeys\"},
+  {\"op\":\"replace\",\"path\":\"/spec/template/metadata/annotations/axond.dev~1drill\",\"value\":\"2\"}
+]" >/dev/null
 if kube -n axond rollout status deployment/axond --timeout=90s >/dev/null 2>&1; then
   fail "a fleet-wide hard spread rolled out on a three-node cluster, so this \
 drill no longer demonstrates why the skew is scoped"

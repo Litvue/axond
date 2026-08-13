@@ -70,6 +70,9 @@ IMAGE_REPOSITORY = "ghcr.io/litvue/axond"
 SENTINEL_DIGEST = "sha256:" + "0" * 64
 SELECTOR = {"app.kubernetes.io/name": "axond"}
 PRIVATE_RANGES = {"169.254.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
+# The Redis release that added `SET … PXAT`, which the revocation write uses and
+# which is therefore what the documented floor has to say.
+REDIS_PXAT_FLOOR = "6.2"
 
 Document = dict[str, Any]
 
@@ -588,12 +591,25 @@ def check_supported_backends(
                 f"{documented_floor}, but the gateway refuses below {floor} "
                 "(MINIMUM_SERVER_VERSION_NUM)"
             )
-        if backend == "Redis" and documented_floor == "6.2" and "PXAT" not in revocation_source:
-            failures.append(
-                "docs/deployment/stateful-backends.md: the Redis 6.2 floor is justified by the "
-                "`SET … PXAT` revocation write, which is no longer in "
-                "crates/gateway/src/revocation/redis.rs"
-            )
+        if backend == "Redis":
+            # The floor is a consequence of the revocation write, not a free
+            # choice: `SET … PXAT` is 6.2. Asserting the number itself — rather
+            # than only checking the code while the number happens to read 6.2 —
+            # keeps an edit to the table from switching the check off.
+            if "PXAT" not in revocation_source:
+                failures.append(
+                    "docs/deployment/stateful-backends.md: the Redis floor is justified by the "
+                    "`SET … PXAT` revocation write, which is no longer in "
+                    "crates/gateway/src/revocation/redis.rs; re-derive the floor from whatever "
+                    "replaced it"
+                )
+            elif documented_floor != REDIS_PXAT_FLOOR:
+                failures.append(
+                    f"docs/deployment/stateful-backends.md: Redis is documented from "
+                    f"{documented_floor}, but the revocation write is `SET … PXAT`, which needs "
+                    f"{REDIS_PXAT_FLOOR}; a different floor has to follow a change in "
+                    "crates/gateway/src/revocation/redis.rs"
+                )
     return failures
 
 
@@ -954,6 +970,12 @@ def self_test() -> int:
     expect_failure(
         "Redis floor without its reason",
         check_supported_backends(backends, images, floor, revocation.replace("PXAT", "EX")),
+    )
+    expect_failure(
+        "a Redis floor below the one PXAT needs",
+        check_supported_backends(
+            backends.replace("| Redis | 6.2", "| Redis | 6.0"), images, floor, revocation
+        ),
     )
 
     production_kustomization = (PRODUCTION / "kustomization.yaml").read_text(encoding="utf-8")
