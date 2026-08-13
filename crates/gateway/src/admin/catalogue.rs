@@ -30,7 +30,8 @@
 //!
 //! # The integration seam
 //!
-//! An enablement names a [`CatalogOffering`]: an opaque [`OfferingId`] plus the
+//! An enablement names a [`CatalogOffering`](crate::desired_state::CatalogOffering):
+//! an opaque [`OfferingId`] plus the
 //! digest of the catalogue snapshot it was read from. Both are projected verbatim,
 //! which is everything a caller needs to correlate an entry with a catalogue it
 //! fetched — and is all this build can honestly say, because resolving a digest
