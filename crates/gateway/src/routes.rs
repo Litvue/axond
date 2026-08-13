@@ -91,6 +91,16 @@ pub fn router(state: AppState) -> Router {
                         authenticate_middleware,
                     ))
                     .layer(from_fn_with_state(state.clone(), admission_middleware)),
+                // Authenticated, but outside admission for the same reason the
+                // probes are: it reports the shutdown rather than taking part in
+                // it. A diagnostic that closes with admission would answer
+                // `draining` for the phase an operator most needs described, and
+                // an operator polling it would count against the in-flight tally
+                // the shutdown deadline measures.
+                AuthPosture::Diagnostic => route.layer(from_fn_with_state(
+                    (state.clone(), spec.capability),
+                    authenticate_middleware,
+                )),
             };
             router.route(spec.path, route)
         })
@@ -124,12 +134,22 @@ pub fn unconverged_router(reason: &'static str) -> Router {
         })
 }
 
-/// Whether a route is one of the two unauthenticated liveness probes or must
-/// pass inbound authentication before its handler can run.
+/// Whether a route is one of the two unauthenticated liveness probes, or must
+/// pass inbound authentication before its handler can run — and if so, whether
+/// it is served work or asked about the replica serving it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AuthPosture {
     LivenessProbe,
     Authenticated,
+    Diagnostic,
+}
+
+impl AuthPosture {
+    /// Whether the posture requires a credential. Both authenticated postures
+    /// do, which is what keeps the sweep test's floor closed over all of them.
+    fn requires_a_credential(self) -> bool {
+        !matches!(self, Self::LivenessProbe)
+    }
 }
 
 /// A route's complete registration: adding a route requires declaring its
@@ -171,7 +191,7 @@ fn route_specs(minting_enabled: bool) -> Vec<RouteSpec> {
         },
         RouteSpec {
             path: "/admin/v1/status",
-            auth: AuthPosture::Authenticated,
+            auth: AuthPosture::Diagnostic,
             capability: Some(Capability::Status),
             router: || get(replica_status),
         },
@@ -3714,7 +3734,7 @@ max_ttl = "15m"
 
         for spec in route_specs(true)
             .into_iter()
-            .filter(|spec| spec.auth == AuthPosture::Authenticated)
+            .filter(|spec| spec.auth.requires_a_credential())
         {
             let mut rejected = false;
             for method in [axum::http::Method::GET, axum::http::Method::POST] {
@@ -6723,6 +6743,41 @@ max_ttl = "15m"
             assert_eq!(entry["state"], "disabled", "{entry}");
             assert_eq!(entry["reason"], "not_configured", "{entry}");
         }
+    }
+
+    /// Status is a diagnostic, not work. Once admission closes, a served route
+    /// answers `503 draining` — but the runbook sends an operator here to
+    /// diagnose a replica stuck in exactly that phase, and a route refused by
+    /// admission could never report `closing` at all. So it authenticates
+    /// outside admission, and takes no in-flight slot the shutdown deadline
+    /// would then wait on.
+    #[tokio::test]
+    async fn status_still_answers_once_admission_has_closed() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let lifecycle = Arc::clone(state.lifecycle());
+        lifecycle.close();
+
+        let served = router(state.clone())
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_KEY}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let (status, body) = status_response(state, Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["phase"], "closing", "{body}");
+        assert_eq!(lifecycle.in_flight(), 0, "a diagnostic held the drain open");
     }
 
     /// A status read is a cache read: the handler returns the last observation

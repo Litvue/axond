@@ -58,7 +58,9 @@ curl -sS -H "Authorization: Bearer $AXOND_KEY" \
   http://replica.internal:8080/admin/v1/status | jq
 ```
 
-The caller's authority decides the answer: an operator's scope-less static
+This answers throughout a shutdown — it is a diagnostic rather than served work,
+so admission closing does not close it. The caller's authority decides the
+answer: an operator's scope-less static
 `[[gateway_key]]` in the default namespace sees every component, exact ages, and
 the revision summary, while any other caller sees only request-path components
 with reasons coarsened to `unavailable`. Use an operator key when triaging, and
@@ -281,6 +283,11 @@ orchestrator is not removing the endpoint. Sustained
 `axond_shutdown_rejected_requests` volume means callers are not honouring
 readiness; abandoned requests mean the deadline cut work, so lengthen the drain
 or shorten `max_stream_duration_ms`.
+
+`GET /admin/v1/status` still answers in both phases and reports the phase it is
+in, including `closing`: it authenticates but sits outside admission, and takes
+no in-flight slot, so polling a stuck replica neither is refused nor extends the
+drain it is describing.
 
 ## Bounded drill-down
 

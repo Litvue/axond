@@ -31,7 +31,7 @@ another ([ADR 0031](./adr/0031-bounded-status-contract.md)):
 | --- | --- | --- |
 | `GET /healthz` | none | *Is the process alive?* Answers `ok` throughout, including the shutdown drain. Restart it if this fails. |
 | `GET /readyz` | none | *Should traffic be sent here?* `ready`, or `503 draining` once termination begins. Point the load balancer here. |
-| `GET /admin/v1/status` | gateway credential with the `status` capability | *Which dependencies is this replica talking to?* Cached component states with an observation age. |
+| `GET /admin/v1/status` | gateway credential with the `status` capability | *Which dependencies is this replica talking to?* Cached component states with an observation age. Answers throughout the shutdown, including `closing`. |
 
 Neither `/healthz` nor `/readyz` observes a dependency. A store outage must not
 remove healthy replicas from service, so dependency state lives only on the
