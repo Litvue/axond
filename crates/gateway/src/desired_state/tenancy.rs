@@ -83,7 +83,8 @@ use std::fmt;
 use super::canonical::{Canonical, CanonicalValue};
 use super::ids::{InvalidId, ProjectId, ResourceId, Slug, TenantId};
 use super::record::{
-    BodyError, DISPLAY_NAME_FIELD, PROJECT_ID_FIELD, Record, SCHEMA_FIELD, TENANT_ID_FIELD,
+    BodyError, DISPLAY_NAME_FIELD, DisplayNameError, PROJECT_ID_FIELD, Record, SCHEMA_FIELD,
+    TENANT_ID_FIELD,
 };
 use super::resource::{
     ResourceBody, ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber,
@@ -484,18 +485,6 @@ impl BodyError for TenancyError {
         }
     }
 
-    fn malformed_display_name(
-        reference: ResourceRef,
-        field: &'static str,
-        source: InvalidDisplayName,
-    ) -> Self {
-        Self::MalformedDisplayName {
-            reference,
-            field,
-            source,
-        }
-    }
-
     fn identity_mismatch(reference: ResourceRef, declared: String, identity: ResourceId) -> Self {
         Self::IdentityMismatch {
             reference,
@@ -510,6 +499,20 @@ impl BodyError for TenancyError {
 
     fn malformed_checksum(reference: ResourceRef, field: &'static str) -> Self {
         Self::MalformedChecksum { reference, field }
+    }
+}
+
+impl DisplayNameError for TenancyError {
+    fn malformed_display_name(
+        reference: ResourceRef,
+        field: &'static str,
+        source: InvalidDisplayName,
+    ) -> Self {
+        Self::MalformedDisplayName {
+            reference,
+            field,
+            source,
+        }
     }
 }
 

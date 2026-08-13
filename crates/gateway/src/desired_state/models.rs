@@ -108,7 +108,14 @@
 //!
 //! A body that declares a schema is held to it exactly — an identifier this build
 //! does not read is a typed compatibility refusal ([`ModelError::Schema`]), never
-//! a field-by-field guess.
+//! a field-by-field guess. Both bodies are read through the shared strict reader
+//! in [`record`](super::record), so a model body cannot be read more loosely than
+//! a tenancy or credential one; what a refusal *means* stays here, in
+//! [`ModelError::is_incompatible`].
+//!
+//! The operator-facing statement of all of this is `docs/adr/0035-model-enablement-and-alias-contracts.md`,
+//! with the schema table and the untyped-alias exception in
+//! `docs/operations/revision-convergence.md`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -117,6 +124,7 @@ use super::canonical::{
     Canonical, CanonicalError, CanonicalValue, Checksum, InvalidChecksum, SerializerVersion,
 };
 use super::ids::{InvalidId, ProjectId, ResourceId, Slug, TenantId};
+use super::record::{BodyError, PROJECT_ID_FIELD, Record, SCHEMA_FIELD, TENANT_ID_FIELD};
 use super::resource::{
     BlobKind, ResourceBody, ResourceKind, ResourceRef, ResourceScope, ResourceVersion,
     ResourceVersionNumber,
@@ -129,9 +137,6 @@ pub const MODEL_ENABLEMENT_SCHEMA: &str = "axond.model-enablement.v1";
 /// The model-alias body schema this build reads and writes.
 pub const MODEL_ALIAS_SCHEMA: &str = "axond.model-alias.v1";
 
-const SCHEMA_FIELD: &str = "schema";
-const TENANT_ID_FIELD: &str = "tenant_id";
-const PROJECT_ID_FIELD: &str = "project_id";
 const ENABLEMENT_ID_FIELD: &str = "enablement_id";
 const ALIAS_ID_FIELD: &str = "alias_id";
 const OFFERING_ID_FIELD: &str = "offering_id";
@@ -501,9 +506,8 @@ impl fmt::Display for ModelOwner {
 /// deliberately inert: nothing bills against it, no conversion turns it into an
 /// [`ApprovedPrice`], and [`ModelEnablementBody::billable_price`] does not look at
 /// it. A catalogue refresh may change what an upstream publishes at any time
-/// without human action (ADR 0034 on catalogue imports), so treating an observed
-/// rate as an effective one would let an upstream edit change what a deployment
-/// charges.
+/// without human action (ADR 0035), so treating an observed rate as an effective
+/// one would let an upstream edit change what a deployment charges.
 ///
 /// Integers, in micro-dollars, because desired state has no floating-point
 /// representation at all (ADR 0010): a rate that entered a checksum as a float
@@ -851,207 +855,149 @@ impl ModelError {
     }
 }
 
-/// A strict reader over one inline record, shared by both body schemas.
-///
-/// Deliberately local to this module, the way [`tenancy`](super::tenancy)'s is:
-/// each schema owns its own refusals, and a reader shared across schemas is a
-/// refactor to make when a third body wants one, not a dependency to invent here.
-struct Record<'a> {
-    reference: ResourceRef,
-    fields: &'a [(String, CanonicalValue)],
+impl BodyError for ModelError {
+    fn kind(reference: ResourceRef, expected: ResourceKind, found: ResourceKind) -> Self {
+        Self::Kind {
+            reference,
+            expected,
+            found,
+        }
+    }
+
+    fn not_inline(reference: ResourceRef) -> Self {
+        Self::NotInline { reference }
+    }
+
+    fn not_a_record(reference: ResourceRef) -> Self {
+        Self::NotARecord { reference }
+    }
+
+    fn schema(reference: ResourceRef, expected: &'static str, found: String) -> Self {
+        Self::Schema {
+            reference,
+            expected,
+            found,
+        }
+    }
+
+    fn missing_field(reference: ResourceRef, field: &'static str) -> Self {
+        Self::MissingField { reference, field }
+    }
+
+    fn unknown_field(reference: ResourceRef, schema: &'static str, field: String) -> Self {
+        Self::UnknownField {
+            reference,
+            schema,
+            field,
+        }
+    }
+
+    fn field_type(reference: ResourceRef, field: &'static str) -> Self {
+        Self::FieldType { reference, field }
+    }
+
+    fn malformed_id(reference: ResourceRef, field: &'static str, source: InvalidId) -> Self {
+        Self::MalformedId {
+            reference,
+            field,
+            source,
+        }
+    }
+
+    fn identity_mismatch(reference: ResourceRef, declared: String, identity: ResourceId) -> Self {
+        Self::IdentityMismatch {
+            reference,
+            declared,
+            identity,
+        }
+    }
 }
 
-impl<'a> Record<'a> {
-    /// Open a resource's body as a record of `schema`, refusing a body of the
-    /// wrong kind, form, schema, or field set.
-    fn open(
-        resource: &'a ResourceVersion,
-        kind: ResourceKind,
-        schema: &'static str,
-        known: &[&str],
-    ) -> Result<Self, ModelError> {
-        let reference = resource.reference;
-        if reference.kind != kind {
-            return Err(ModelError::Kind {
-                reference,
-                expected: kind,
-                found: reference.kind,
-            });
-        }
-        let ResourceBody::Inline(value) = &resource.body else {
-            return Err(ModelError::NotInline { reference });
-        };
-        let CanonicalValue::Map(fields) = value else {
-            return Err(ModelError::NotARecord { reference });
-        };
-        let record = Self { reference, fields };
-        let declared = record.string(SCHEMA_FIELD)?;
-        if declared != schema {
-            return Err(ModelError::Schema {
-                reference,
-                expected: schema,
-                found: declared.to_owned(),
-            });
-        }
-        if let Some((field, _)) = fields
-            .iter()
-            .find(|(field, _)| field != SCHEMA_FIELD && !known.contains(&field.as_str()))
-        {
-            return Err(ModelError::UnknownField {
-                reference,
-                schema,
-                field: field.clone(),
-            });
-        }
-        Ok(record)
-    }
+/// One model body, read through the shared strict reader.
+type ModelRecord<'a> = Record<'a, ModelError>;
 
-    fn field(&self, field: &'static str) -> Option<&'a CanonicalValue> {
-        self.fields
-            .iter()
-            .find(|(name, _)| name == field)
-            .map(|(_, value)| value)
-    }
+/// The wire family a body declares, refused by identifier rather than guessed.
+fn wire_family(record: &ModelRecord<'_>) -> Result<WireFamily, ModelError> {
+    let declared = record.string(WIRE_FAMILY_FIELD)?;
+    WireFamily::parse(declared).ok_or_else(|| ModelError::UnknownWireFamily {
+        reference: record.reference(),
+        found: declared.to_owned(),
+    })
+}
 
-    fn required(&self, field: &'static str) -> Result<&'a CanonicalValue, ModelError> {
-        self.field(field).ok_or(ModelError::MissingField {
-            reference: self.reference,
+/// The lifecycle state a body declares.
+fn lifecycle(record: &ModelRecord<'_>) -> Result<ModelLifecycle, ModelError> {
+    let declared = record.string(STATE_FIELD)?;
+    ModelLifecycle::parse(declared).ok_or_else(|| ModelError::UnknownLifecycle {
+        reference: record.reference(),
+        found: declared.to_owned(),
+    })
+}
+
+/// A field of a nested record, named for the outer field so a refusal an operator
+/// reads names the field the schema documents.
+fn nested<'a>(
+    record: &ModelRecord<'_>,
+    value: &'a CanonicalValue,
+    field: &'static str,
+    name: &str,
+) -> Result<&'a CanonicalValue, ModelError> {
+    let CanonicalValue::Map(fields) = value else {
+        return Err(ModelError::FieldType {
+            reference: record.reference(),
+            field,
+        });
+    };
+    fields
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value)
+        .ok_or(ModelError::MissingField {
+            reference: record.reference(),
             field,
         })
-    }
+}
 
-    fn string(&self, field: &'static str) -> Result<&'a str, ModelError> {
-        match self.required(field)? {
-            CanonicalValue::String(text) => Ok(text),
-            _ => Err(ModelError::FieldType {
-                reference: self.reference,
-                field,
-            }),
-        }
-    }
-
-    fn tenant(&self) -> Result<TenantId, ModelError> {
-        TenantId::parse(self.string(TENANT_ID_FIELD)?).map_err(|source| ModelError::MalformedId {
-            reference: self.reference,
-            field: TENANT_ID_FIELD,
-            source,
-        })
-    }
-
-    fn project(&self) -> Result<ProjectId, ModelError> {
-        ProjectId::parse(self.string(PROJECT_ID_FIELD)?).map_err(|source| ModelError::MalformedId {
-            reference: self.reference,
-            field: PROJECT_ID_FIELD,
-            source,
-        })
-    }
-
-    /// The project a body names, or `None` when it names none — which is what a
-    /// tenant default looks like.
-    fn optional_project(&self) -> Result<Option<ProjectId>, ModelError> {
-        match self.field(PROJECT_ID_FIELD) {
-            None => Ok(None),
-            Some(_) => self.project().map(Some),
-        }
-    }
-
-    fn resource_id(&self, field: &'static str) -> Result<ResourceId, ModelError> {
-        ResourceId::parse(self.string(field)?).map_err(|source| ModelError::MalformedId {
-            reference: self.reference,
+fn integer(
+    record: &ModelRecord<'_>,
+    value: &CanonicalValue,
+    field: &'static str,
+) -> Result<i128, ModelError> {
+    match value {
+        CanonicalValue::Integer(number) => Ok(*number),
+        _ => Err(ModelError::FieldType {
+            reference: record.reference(),
             field,
-            source,
-        })
+        }),
     }
+}
 
-    fn wire_family(&self) -> Result<WireFamily, ModelError> {
-        let declared = self.string(WIRE_FAMILY_FIELD)?;
-        WireFamily::parse(declared).ok_or_else(|| ModelError::UnknownWireFamily {
-            reference: self.reference,
-            found: declared.to_owned(),
-        })
-    }
-
-    fn lifecycle(&self) -> Result<ModelLifecycle, ModelError> {
-        let declared = self.string(STATE_FIELD)?;
-        ModelLifecycle::parse(declared).ok_or_else(|| ModelError::UnknownLifecycle {
-            reference: self.reference,
-            found: declared.to_owned(),
-        })
-    }
-
-    /// An integer field of a nested record, read through `value` so the field
-    /// names in a refusal are the ones the schema documents.
-    fn integer(&self, value: &CanonicalValue, field: &'static str) -> Result<i128, ModelError> {
-        match value {
-            CanonicalValue::Integer(number) => Ok(*number),
-            _ => Err(ModelError::FieldType {
-                reference: self.reference,
-                field,
-            }),
-        }
-    }
-
-    fn nested<'b>(
-        &self,
-        record: &'b CanonicalValue,
-        field: &'static str,
-        name: &str,
-    ) -> Result<&'b CanonicalValue, ModelError> {
-        let CanonicalValue::Map(fields) = record else {
-            return Err(ModelError::FieldType {
-                reference: self.reference,
-                field,
-            });
-        };
-        fields
-            .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value)
-            .ok_or(ModelError::MissingField {
-                reference: self.reference,
-                field,
-            })
-    }
-
-    fn version_number(
-        &self,
-        value: &CanonicalValue,
-        field: &'static str,
-    ) -> Result<ResourceVersionNumber, ModelError> {
-        let number = self.integer(value, field)?;
-        u64::try_from(number)
-            .ok()
-            .and_then(ResourceVersionNumber::new)
-            .ok_or(ModelError::VersionZero {
-                reference: self.reference,
-                found: number,
-            })
-    }
-
-    fn micros(&self, value: &CanonicalValue, field: &'static str) -> Result<u64, ModelError> {
-        let number = self.integer(value, field)?;
-        u64::try_from(number).map_err(|_| ModelError::PriceRange {
-            reference: self.reference,
-            field,
+fn version_number(
+    record: &ModelRecord<'_>,
+    value: &CanonicalValue,
+    field: &'static str,
+) -> Result<ResourceVersionNumber, ModelError> {
+    let number = integer(record, value, field)?;
+    u64::try_from(number)
+        .ok()
+        .and_then(ResourceVersionNumber::new)
+        .ok_or(ModelError::VersionZero {
+            reference: record.reference(),
             found: number,
         })
-    }
+}
 
-    fn identity(
-        &self,
-        declared: impl fmt::Display,
-        identity: ResourceId,
-    ) -> Result<(), ModelError> {
-        if self.reference.id == identity {
-            Ok(())
-        } else {
-            Err(ModelError::IdentityMismatch {
-                reference: self.reference,
-                declared: declared.to_string(),
-                identity: self.reference.id,
-            })
-        }
-    }
+fn micros(
+    record: &ModelRecord<'_>,
+    value: &CanonicalValue,
+    field: &'static str,
+) -> Result<u64, ModelError> {
+    let number = integer(record, value, field)?;
+    u64::try_from(number).map_err(|_| ModelError::PriceRange {
+        reference: record.reference(),
+        field,
+        found: number,
+    })
 }
 
 /// A tenant's — or one of its projects' — permission to use one catalogue
@@ -1256,13 +1202,13 @@ impl ModelEnablementBody {
     /// Read an enablement resource's body, binding it to its envelope: identity to
     /// the reference, ownership to the scope.
     pub fn read(resource: &ResourceVersion) -> Result<Self, ModelError> {
-        let record = Record::open(
+        let record = ModelRecord::open(
             resource,
             ResourceKind::ModelEnablement,
             Self::SCHEMA,
             Self::KNOWN_FIELDS,
         )?;
-        let enablement = record.resource_id(ENABLEMENT_ID_FIELD)?;
+        let enablement = record.typed_id(ENABLEMENT_ID_FIELD, ResourceId::parse)?;
         record.identity(enablement, enablement)?;
         let owner = ModelOwner {
             tenant: record.tenant()?,
@@ -1289,22 +1235,22 @@ impl ModelEnablementBody {
                     source,
                 }
             })?;
-        let observed = match record.field(OBSERVED_PRICE_FIELD) {
+        let observed = match record.optional_value(OBSERVED_PRICE_FIELD) {
             None => None,
             Some(value) => {
-                let input = record.nested(value, OBSERVED_PRICE_FIELD, INPUT_MICROS_FIELD)?;
-                let output = record.nested(value, OBSERVED_PRICE_FIELD, OUTPUT_MICROS_FIELD)?;
+                let input = nested(&record, value, OBSERVED_PRICE_FIELD, INPUT_MICROS_FIELD)?;
+                let output = nested(&record, value, OBSERVED_PRICE_FIELD, OUTPUT_MICROS_FIELD)?;
                 Some(ObservedPrice::new(
-                    record.micros(input, INPUT_MICROS_FIELD)?,
-                    record.micros(output, OUTPUT_MICROS_FIELD)?,
+                    micros(&record, input, INPUT_MICROS_FIELD)?,
+                    micros(&record, output, OUTPUT_MICROS_FIELD)?,
                 ))
             }
         };
-        let approved = match record.field(APPROVED_PRICE_FIELD) {
+        let approved = match record.optional_value(APPROVED_PRICE_FIELD) {
             None => None,
             Some(value) => {
-                let price = record.nested(value, APPROVED_PRICE_FIELD, PRICE_ID_FIELD)?;
-                let version = record.nested(value, APPROVED_PRICE_FIELD, VERSION_FIELD)?;
+                let price = nested(&record, value, APPROVED_PRICE_FIELD, PRICE_ID_FIELD)?;
+                let version = nested(&record, value, APPROVED_PRICE_FIELD, VERSION_FIELD)?;
                 let CanonicalValue::String(text) = price else {
                     return Err(ModelError::FieldType {
                         reference: resource.reference,
@@ -1318,7 +1264,7 @@ impl ModelEnablementBody {
                 })?;
                 Some(ApprovedPrice::version(
                     price,
-                    record.version_number(version, VERSION_FIELD)?,
+                    version_number(&record, version, VERSION_FIELD)?,
                 ))
             }
         };
@@ -1326,8 +1272,8 @@ impl ModelEnablementBody {
             enablement,
             owner,
             offering: CatalogOffering::new(offering, snapshot),
-            wire_family: record.wire_family()?,
-            state: record.lifecycle()?,
+            wire_family: wire_family(&record)?,
+            state: lifecycle(&record)?,
             observed,
             approved,
         })
@@ -1566,13 +1512,13 @@ impl ModelAliasBody {
 
     /// Read an alias resource's body, binding it to its envelope.
     pub fn read(resource: &ResourceVersion) -> Result<Self, ModelError> {
-        let record = Record::open(
+        let record = ModelRecord::open(
             resource,
             ResourceKind::Alias,
             Self::SCHEMA,
             Self::KNOWN_FIELDS,
         )?;
-        let alias = record.resource_id(ALIAS_ID_FIELD)?;
+        let alias = record.typed_id(ALIAS_ID_FIELD, ResourceId::parse)?;
         record.identity(alias, alias)?;
         let tenant = record.tenant()?;
         let project = record.project()?;
@@ -1590,7 +1536,7 @@ impl ModelAliasBody {
                 declared: ModelOwner::project(tenant, project),
             });
         }
-        let CanonicalValue::List(targets) = record.required(TARGETS_FIELD)? else {
+        let CanonicalValue::List(targets) = record.value(TARGETS_FIELD)? else {
             return Err(ModelError::FieldType {
                 reference: resource.reference,
                 field: TARGETS_FIELD,
@@ -1599,8 +1545,8 @@ impl ModelAliasBody {
         let targets = targets
             .iter()
             .map(|target| {
-                let enablement = record.nested(target, TARGETS_FIELD, ENABLEMENT_ID_FIELD)?;
-                let version = record.nested(target, TARGETS_FIELD, VERSION_FIELD)?;
+                let enablement = nested(&record, target, TARGETS_FIELD, ENABLEMENT_ID_FIELD)?;
+                let version = nested(&record, target, TARGETS_FIELD, VERSION_FIELD)?;
                 let CanonicalValue::String(text) = enablement else {
                     return Err(ModelError::FieldType {
                         reference: resource.reference,
@@ -1615,7 +1561,7 @@ impl ModelAliasBody {
                     })?;
                 Ok(AliasTarget::new(
                     enablement,
-                    record.version_number(version, VERSION_FIELD)?,
+                    version_number(&record, version, VERSION_FIELD)?,
                 ))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1623,8 +1569,8 @@ impl ModelAliasBody {
             alias,
             tenant,
             project,
-            wire_family: record.wire_family()?,
-            state: record.lifecycle()?,
+            wire_family: wire_family(&record)?,
+            state: lifecycle(&record)?,
             targets,
         })
     }
