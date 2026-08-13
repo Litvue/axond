@@ -3151,16 +3151,24 @@ max_request_microdollars = 1000
         let state = minting_state_with_epochs(&format!(
             "[[gateway_token_epoch]]\nnamespace = \"platform\"\nsubject = \"near\"\nmin_iat = {near}"
         ));
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let (status, body) = mint_request(state.clone(), json!({"sub": "near"})).await;
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         assert_eq!(status, StatusCode::OK);
         let token = body["token"].as_str().expect("minted token");
         let exp = body["exp"].as_u64().expect("expiry");
         let expires_in = body["expires_in"].as_u64().expect("remaining lifetime");
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        assert_eq!(expires_in, exp.saturating_sub(now));
+        let issued_at = exp.saturating_sub(expires_in);
+        assert!(
+            (before..=after).contains(&issued_at),
+            "expires_in must describe an issuance time during the mint request: before={before}, issued_at={issued_at}, after={after}"
+        );
         assert!(
             state
                 .config()
