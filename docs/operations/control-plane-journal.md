@@ -331,7 +331,7 @@ domain alone, because a project has no lifecycle to publish (#191) and a
 synthesized project row could not be told apart from a declared one.
 
 0005 adds the durable discovery evidence table availability reads from
-([ADR 0052](../adr/0052-stateful-availability-projection-and-discovery-persistence.md)).
+([ADR 0053](../adr/0053-stateful-availability-projection-and-discovery-persistence.md)).
 It is additive and touches no existing table, so mixed versions may run: a replica
 that has not been upgraded neither reads nor writes it, and losing the table costs
 a deployment its discovery freshness rather than any desired state. Rolling back
