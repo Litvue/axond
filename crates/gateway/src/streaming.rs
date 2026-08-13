@@ -37,6 +37,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::admission::AdmissionPermit;
 use crate::budget::{BudgetKey, Reservation};
 use crate::credentials::{CredentialLease, CredentialSource};
+use crate::error::transport_caller_message;
 use crate::rate_limit::RateLimitPermit;
 use crate::state::AppState;
 use crate::telemetry;
@@ -494,7 +495,9 @@ impl Relay {
                                             return;
                                         }
                                         Err(open_err) => {
-                                            self.phase = Phase::Failed(open_err.to_string());
+                                            self.phase = Phase::Failed(transport_caller_message(
+                                                &open_err,
+                                            ));
                                             return;
                                         }
                                     }
@@ -544,8 +547,21 @@ impl Relay {
                         committed = self.queued_downstream,
                         "open stream exceeded a transport bound"
                     );
+                } else {
+                    // The operator keeps the whole failure, endpoint included;
+                    // the caller gets the wording below.
+                    tracing::warn!(
+                        provider = %self.accounting.ctx.target_provider,
+                        model = %self.accounting.ctx.target_model,
+                        committed = self.queued_downstream,
+                        error = %err,
+                        "open stream failed on the transport"
+                    );
                 }
-                self.phase = Phase::Failed(err.to_string());
+                // In-band and caller-facing, so it is worded the way the
+                // buffered path words it: never with the endpoint `reqwest`
+                // rendered into its message.
+                self.phase = Phase::Failed(transport_caller_message(&err));
             }
             None => self.finish_upstream(),
         }
@@ -1559,6 +1575,44 @@ targets = [{{ provider = "anthropic", model = "claude-sonnet-4-5", price = {{ in
         }
         assert!(relayed.contains("event: error"));
         assert!(relayed.ends_with("data: [DONE]\n\n"));
+
+        let record = settled(&ledger).await;
+        assert_eq!(record["status"], "upstream_error");
+    }
+
+    #[tokio::test]
+    async fn a_mid_stream_transport_failure_does_not_name_the_endpoint_it_failed_against() {
+        let ledger = Arc::new(Ledger::default());
+        let response = relay_opened(
+            state_for("http://127.0.0.1:1", ledger.clone()),
+            context(),
+            OpenAiCompatibleAdapter::openai()
+                .stream_decoder(Surface::ChatCompletions)
+                .expect("decoder"),
+            futures::stream::iter(vec![
+                Ok(Bytes::from_static(
+                    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                )),
+                Err(TransportError::Http(
+                    "error sending request for url \
+                     (http://provider.internal:9443/v1/chat/completions)"
+                        .to_owned(),
+                )),
+            ])
+            .boxed(),
+            Instant::now(),
+            Framing::OpenAiSse,
+            None,
+        );
+        let mut body = response.into_body().into_data_stream();
+        let mut relayed = String::new();
+        while let Some(chunk) = body.next().await {
+            relayed.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+        }
+        assert!(relayed.contains("upstream_stream_error"));
+        assert!(relayed.contains("upstream transport failure"));
+        assert!(!relayed.contains("provider.internal"));
+        assert!(!relayed.contains("9443"));
 
         let record = settled(&ledger).await;
         assert_eq!(record["status"], "upstream_error");
