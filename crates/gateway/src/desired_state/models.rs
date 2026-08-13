@@ -185,9 +185,10 @@ impl OfferingId {
             ("provider", CanonicalValue::string(provider)),
             ("model", CanonicalValue::string(model)),
         ]);
-        Ok(Self(Checksum::of(
-            &SerializerVersion::default().encode(&key)?,
-        )))
+        // Pinned rather than `default()`: this digest is embedded in published
+        // bodies and re-derived by importers, so a future default encoding must
+        // not re-spell an identity a revision was published against.
+        Ok(Self(Checksum::of(&SerializerVersion::V1.encode(&key)?)))
     }
 
     /// Parse the text form. Total on arbitrary input: the digits are checked by
