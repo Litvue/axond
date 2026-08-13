@@ -7130,33 +7130,63 @@ max_ttl = "15m"
     /// surface's method fallback on it, so the one diagnostic living there has
     /// to carry the prefix's contract itself: a client branching on
     /// `AdminError::CODES` must never meet axum's empty-bodied 405.
+    /// Both deployment postures, because both nest the prefix and both would
+    /// otherwise answer this one path differently from every other one under it.
     #[tokio::test]
     async fn a_wrong_method_on_the_status_path_is_still_a_declared_refusal() {
-        let state = status_state(ReplicaObservability {
-            status: observed_registry(),
-            revision: None,
-        });
-        let response = router(state)
-            .merge(crate::admin::router::refusing_router())
-            .oneshot(
-                Request::post("/admin/v1/status")
-                    .header(
-                        axum::http::header::AUTHORIZATION,
-                        format!("Bearer {OPERATOR_KEY}"),
-                    )
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-        // RFC 9110 requires it on a 405, and axum sets it from the method
-        // router rather than from the fallback body.
-        assert!(response.headers().contains_key(axum::http::header::ALLOW));
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let body: Value =
-            serde_json::from_slice(&bytes).expect("a typed envelope, not an empty body");
-        assert_eq!(body["error"]["type"], "admin_method_not_allowed");
+        for (posture, surface) in [
+            ("stateless", crate::admin::router::refusing_router()),
+            ("stateful", stateful_admin_surface()),
+        ] {
+            let state = status_state(ReplicaObservability {
+                status: observed_registry(),
+                revision: None,
+            });
+            let response = router(state)
+                .merge(surface)
+                .oneshot(
+                    Request::post("/admin/v1/status")
+                        .header(
+                            axum::http::header::AUTHORIZATION,
+                            format!("Bearer {OPERATOR_KEY}"),
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{posture}"
+            );
+            // RFC 9110 requires it on a 405, and axum sets it from the method
+            // router rather than from the fallback body.
+            assert!(
+                response.headers().contains_key(axum::http::header::ALLOW),
+                "{posture}"
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| panic!("{posture}: a typed envelope, not an empty body"));
+            assert_eq!(
+                body["error"]["type"], "admin_method_not_allowed",
+                "{posture}"
+            );
+        }
+    }
+
+    /// The administrative surface a stateful replica actually mounts, over an
+    /// in-memory control plane: the merge is only worth testing against the real
+    /// route table and its two fallbacks.
+    fn stateful_admin_surface() -> Router {
+        crate::admin::router::router(Arc::new(crate::admin::router::AdminApi::new(
+            Arc::new(crate::admin::service::AdminService::stateful(Arc::new(
+                crate::desired_state::oracle::InMemoryControlPlane::new(),
+            ))),
+            Arc::new(crate::admin::fakes::FakeAdminAuthenticator::new()),
+            Arc::new(crate::admin::fakes::FakeAdminAuthorizer::permissive()),
+        )))
     }
 
     /// A replica that refuses inference because it cannot compile a revision is
@@ -7213,15 +7243,7 @@ max_ttl = "15m"
                 status: observed_registry(),
                 revision: None,
             })))
-            .merge(crate::admin::router::router(Arc::new(
-                crate::admin::router::AdminApi::new(
-                    Arc::new(crate::admin::service::AdminService::stateful(Arc::new(
-                        crate::desired_state::oracle::InMemoryControlPlane::new(),
-                    ))),
-                    Arc::new(crate::admin::fakes::FakeAdminAuthenticator::new()),
-                    Arc::new(crate::admin::fakes::FakeAdminAuthorizer::permissive()),
-                ),
-            )));
+            .merge(stateful_admin_surface());
         let response = stateful
             .oneshot(
                 Request::get("/admin/v1/status")

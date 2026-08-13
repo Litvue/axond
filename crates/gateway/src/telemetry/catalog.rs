@@ -915,6 +915,29 @@ mod tests {
         }
     }
 
+    /// Two ceilings guard one status read — authenticating it, then answering
+    /// it — and a reader holds a slot in each at once. They therefore have to
+    /// publish on separate resources, or the gauge would report twice the
+    /// readers against a denominator that is neither ceiling.
+    #[test]
+    fn each_diagnostic_ceiling_holds_capacity_under_its_own_resource() {
+        assert_ne!(
+            crate::admission::RESOURCE_DIAGNOSTIC,
+            crate::admission::RESOURCE_DIAGNOSTIC_AUTH
+        );
+        for resource in [
+            crate::admission::RESOURCE_DIAGNOSTIC,
+            crate::admission::RESOURCE_DIAGNOSTIC_AUTH,
+        ] {
+            validate_label_value(
+                "axond.admission.in_flight",
+                "axond.admission.resource",
+                resource,
+            )
+            .expect("both diagnostic ceilings are catalogued");
+        }
+    }
+
     /// The reconciler labels a rejection with a store category or a compile
     /// reason, and every one of those has to be a value the catalogue accepts —
     /// otherwise an alert on a real rejection is refused as invalid.
