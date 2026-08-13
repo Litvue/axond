@@ -392,23 +392,28 @@ typed_id!(
 pub struct Slug(String);
 
 /// Why a slug was refused.
+///
+/// The refused text is carried but never rendered, for the reason [`InvalidId`]
+/// gives: a name field is one of the places material gets mispasted, and a
+/// refusal reaches a response body, a log line and an audit trail. What is wrong
+/// with the name is renderable; the name is not.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidSlug {
     #[error("a slug must not be empty")]
     Empty,
-    #[error("slug `{slug}` is {length} characters, over the {max}-character limit")]
+    #[error("a slug of {length} characters is over the {max}-character limit")]
     TooLong {
         slug: String,
         length: usize,
         max: usize,
     },
     #[error(
-        "slug `{slug}` contains `{character}`; only ASCII letters, digits, `-`, and `_` are allowed"
+        "a slug may not contain `{character}`; only ASCII letters, digits, `-`, and `_` are allowed"
     )]
     Character { slug: String, character: char },
-    #[error("slug `{slug}` must start and end with a letter or digit")]
+    #[error("a slug must start and end with a letter or digit")]
     Boundary { slug: String },
-    #[error("slug `{slug}` looks like an id; ids are not names")]
+    #[error("a slug may not look like an id; ids are not names")]
     IdLike { slug: String },
 }
 
@@ -605,9 +610,26 @@ mod tests {
         assert_eq!(format!("{uuid:?}"), uuid.to_string());
     }
 
-    /// An id refusal says what is wrong without repeating what arrived: these
-    /// messages reach administrative response bodies, log lines and audit
-    /// trails, and an id field is where provider material gets mispasted.
+    /// A slug is a name field, and a name field takes pasted text: the reason a
+    /// name was refused is renderable, the name itself is not.
+    #[test]
+    fn a_slug_refusal_never_repeats_the_text_it_refused() {
+        const MATERIAL: &str = "sk-live-0123456789abcdefghij";
+
+        for input in [
+            format!("{MATERIAL}!"),
+            format!("{MATERIAL}-"),
+            format!("{}{MATERIAL}", TenantId::PREFIX),
+            "a".repeat(Slug::MAX_LEN + 1),
+        ] {
+            let refusal = Slug::parse(&input).expect_err("the slug is refused");
+            assert!(
+                !refusal.to_string().contains(&input),
+                "the refusal echoed the name: {refusal}"
+            );
+        }
+    }
+
     #[test]
     fn an_id_refusal_never_repeats_the_text_it_refused() {
         const MATERIAL: &str = "sk-live-0123456789abcdefghij";

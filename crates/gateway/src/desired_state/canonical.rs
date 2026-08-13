@@ -530,11 +530,16 @@ pub const CHECKSUM_ALGORITHM: &str = "sha256";
 pub struct Checksum([u8; 32]);
 
 /// Why a checksum could not be parsed.
+///
+/// The refused text is carried but never rendered, for the same reason
+/// [`InvalidId`](super::ids::InvalidId) does not render it: a digest field is
+/// somewhere provider material gets mispasted, and a refusal reaches a response
+/// body, a log line and an audit trail.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidChecksum {
-    #[error("checksum `{0}` is not prefixed `{CHECKSUM_ALGORITHM}:`")]
+    #[error("is not prefixed `{CHECKSUM_ALGORITHM}:`")]
     Algorithm(String),
-    #[error("checksum `{0}` is not 64 lowercase hex digits")]
+    #[error("does not carry 64 lowercase hex digits")]
     Digits(String),
 }
 

@@ -47,6 +47,18 @@ unchanged by it. This page is the evidence for them under stateful mode.
   the parse failure rather than from the text: no identifier refusal anywhere —
   request field, record field, log line, or audit trail — renders the string it
   refused.
+- **The same boundary holds for every field material can be pasted into.** A
+  digest, a catalogue content address, an offering identity, and a name are all
+  refused by the form expected — wrong prefix, or a body that is not 64 lowercase
+  hex digits — and never by repeating what arrived. A closed-set field
+  (`wire_family`, a lifecycle, a state) is refused with the set *this build*
+  accepts, which is the actionable context and is composed entirely of the
+  build's own constants.
+- **The convergence read is swept against a real projection.** The
+  administrative fixture attaches a replica convergence status and records the
+  revision it published, so `/convergence` answers with revision identity,
+  generation, and source rather than with the empty report of a replica that has
+  no reconciler attached.
 
 ## How it is tested
 

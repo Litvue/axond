@@ -181,9 +181,12 @@ impl AdminResourceRequest for TenantRequest {
         let display_name = display_name::<Self>(&self.display_name)?;
         let lifecycle = match self.lifecycle.as_deref() {
             None => TenantLifecycle::Active,
-            Some(text) => {
-                TenantLifecycle::parse(text).ok_or_else(|| unknown::<Self>("lifecycle", text))?
-            }
+            Some(text) => TenantLifecycle::parse(text).ok_or_else(|| {
+                unknown::<Self>(
+                    "lifecycle",
+                    TenantLifecycle::ALL.iter().map(|state| state.as_str()),
+                )
+            })?,
         };
         // A tenant is deployment-scoped: creating one is not something a
         // tenant-scoped administrator can authorize for themselves.
@@ -355,9 +358,12 @@ impl AdminResourceRequest for CredentialRequest {
         };
         let lifecycle = match self.lifecycle.as_deref() {
             None => None,
-            Some(text) => Some(
-                SecretLifecycle::parse(text).ok_or_else(|| unknown::<Self>("lifecycle", text))?,
-            ),
+            Some(text) => Some(SecretLifecycle::parse(text).ok_or_else(|| {
+                unknown::<Self>(
+                    "lifecycle",
+                    SecretLifecycle::ALL.iter().map(|state| state.as_str()),
+                )
+            })?),
         };
         let owner = match project {
             Some(project) => SecretOwner::project(tenant, project),
@@ -512,16 +518,18 @@ impl AdminResourceRequest for ModelRequest {
             .map(project_id::<Self>)
             .transpose()?;
         let slug = slug::<Self>(&self.slug)?;
-        let offering = OfferingId::parse(&self.offering)
-            .map_err(|error| malformed::<Self>("offering", &error.to_string()))?;
+        let offering = offering::<Self>(&self.offering)?;
         let catalog = resource_id::<Self>("catalog", &self.catalog)?;
         let snapshot = checksum::<Self>("snapshot", &self.snapshot)?;
         let wire_family = wire_family::<Self>(&self.wire_family)?;
         let state = match self.state.as_deref() {
             None => ModelLifecycle::Enabled,
-            Some(text) => {
-                ModelLifecycle::parse(text).ok_or_else(|| unknown::<Self>("state", text))?
-            }
+            Some(text) => ModelLifecycle::parse(text).ok_or_else(|| {
+                unknown::<Self>(
+                    "state",
+                    ModelLifecycle::ALL.iter().map(|state| state.as_str()),
+                )
+            })?,
         };
         let observed = match (
             self.observed_input_micros_per_million,
@@ -614,9 +622,12 @@ impl AdminResourceRequest for AliasRequest {
         let wire_family = wire_family::<Self>(&self.wire_family)?;
         let lifecycle = match self.state.as_deref() {
             None => ModelLifecycle::Enabled,
-            Some(text) => {
-                ModelLifecycle::parse(text).ok_or_else(|| unknown::<Self>("state", text))?
-            }
+            Some(text) => ModelLifecycle::parse(text).ok_or_else(|| {
+                unknown::<Self>(
+                    "state",
+                    ModelLifecycle::ALL.iter().map(|state| state.as_str()),
+                )
+            })?,
         };
         // An omitted version is resolved against the enablement the state
         // actually holds, not assumed to be the first: re-posting an alias
@@ -952,6 +963,18 @@ pub(super) fn uuid_detail(error: &InvalidUuid7) -> String {
     }
 }
 
+/// A catalogue offering identity, refused by its shape rather than by its text:
+/// the field takes a long opaque `off_`-prefixed digest, so a mispaste lands here
+/// as plausibly as in a checksum field, and the refusal still separates a wrong
+/// prefix from a malformed body.
+fn offering<R: AdminResourceRequest>(text: &str) -> Result<OfferingId, AdminError> {
+    OfferingId::parse(text).map_err(|error| malformed::<R>("offering", &error.to_string()))
+}
+
+/// A digest field is where a mispasted key lands most plausibly of all — it is
+/// the one field that legitimately holds a long opaque string — so the refusal
+/// names the form expected and never the text that arrived, while still saying
+/// whether the algorithm prefix or the digits are at fault.
 fn checksum<R: AdminResourceRequest>(
     field: &'static str,
     text: &str,
@@ -962,7 +985,12 @@ fn checksum<R: AdminResourceRequest>(
 /// A wire family this build does not speak is a *compatibility* refusal, not a
 /// typo: a newer release may know it.
 fn wire_family<R: AdminResourceRequest>(text: &str) -> Result<WireFamily, AdminError> {
-    WireFamily::parse(text).ok_or_else(|| unknown::<R>("wire_family", text))
+    WireFamily::parse(text).ok_or_else(|| {
+        unknown::<R>(
+            "wire_family",
+            WireFamily::ALL.iter().map(|family| family.as_str()),
+        )
+    })
 }
 
 fn malformed<R: AdminResourceRequest>(field: &'static str, detail: &str) -> AdminError {
@@ -972,10 +1000,25 @@ fn malformed<R: AdminResourceRequest>(field: &'static str, detail: &str) -> Admi
     }
 }
 
-fn unknown<R: AdminResourceRequest>(field: &'static str, _value: &str) -> AdminError {
+/// A closed-set field refused with the set, not with the value.
+///
+/// The context an operator needs is what this build accepts, and that is a
+/// compile-time list of this build's own constants: bounded, low-cardinality and
+/// impossible to fill with caller text. Echoing the arriving value would add
+/// nothing an operator cannot read off their own request, and a document that
+/// pastes material into `lifecycle` would have it read back.
+fn unknown<R: AdminResourceRequest>(
+    field: &'static str,
+    accepted: impl IntoIterator<Item = &'static str>,
+) -> AdminError {
+    let accepted = accepted
+        .into_iter()
+        .map(|value| format!("`{value}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
     AdminError::RequestInvalid {
         schema: R::SCHEMA,
-        detail: format!("`{field}`: is not a value this build knows"),
+        detail: format!("`{field}`: is not a value this build knows; it accepts {accepted}"),
     }
 }
 
@@ -1119,5 +1162,110 @@ mod tests {
                 "{field} validation echoed pasted material: {detail}"
             );
         }
+    }
+
+    fn catalog() -> CatalogRequest {
+        CatalogRequest {
+            catalog: fixtures::resource_id(12).to_string(),
+            slug: "models-dev".to_owned(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+            size_bytes: 4_096,
+        }
+    }
+
+    fn model() -> ModelRequest {
+        ModelRequest {
+            enablement: fixtures::resource_id(13).to_string(),
+            tenant: fixtures::tenant_id(1).to_string(),
+            project: None,
+            slug: "gpt-4o".to_owned(),
+            offering: format!("off_{}", "b".repeat(64)),
+            catalog: fixtures::resource_id(12).to_string(),
+            snapshot: format!("sha256:{}", "a".repeat(64)),
+            wire_family: "openai-chat".to_owned(),
+            state: None,
+            observed_input_micros_per_million: None,
+            observed_output_micros_per_million: None,
+        }
+    }
+
+    fn detail_of<R: AdminResourceRequest>(request: R) -> String {
+        match request.plan() {
+            Ok(_) => panic!("the malformed document was accepted"),
+            Err(error) => error
+                .operator_detail()
+                .expect("a request refusal has operator detail")
+                .to_owned(),
+        }
+    }
+
+    /// A digest and an offering identity are the two document fields that
+    /// legitimately hold a long opaque string, so they are where a mispasted key
+    /// is least conspicuous. The refusal still separates a wrong prefix from a
+    /// malformed body, and neither reason repeats the text.
+    #[test]
+    fn digest_and_offering_refusals_name_the_form_and_not_the_text() {
+        let mut pasted_digest = catalog();
+        pasted_digest.digest = PASTED_MATERIAL.to_owned();
+        let detail = detail_of(pasted_digest);
+        assert_eq!(detail, "`digest`: is not prefixed `sha256:`");
+        assert!(!detail.contains(PASTED_MATERIAL));
+
+        let mut short_digest = catalog();
+        short_digest.digest = format!("sha256:{PASTED_MATERIAL}");
+        let detail = detail_of(short_digest);
+        assert_eq!(detail, "`digest`: does not carry 64 lowercase hex digits");
+        assert!(!detail.contains(PASTED_MATERIAL));
+
+        let mut pasted_offering = model();
+        pasted_offering.offering = PASTED_MATERIAL.to_owned();
+        let detail = detail_of(pasted_offering);
+        assert_eq!(detail, "`offering`: is not prefixed `off_`");
+        assert!(!detail.contains(PASTED_MATERIAL));
+
+        let mut short_offering = model();
+        short_offering.offering = format!("off_{PASTED_MATERIAL}");
+        let detail = detail_of(short_offering);
+        assert_eq!(detail, "`offering`: does not carry 64 lowercase hex digits");
+        assert!(!detail.contains(PASTED_MATERIAL));
+
+        let mut pasted_snapshot = model();
+        pasted_snapshot.snapshot = PASTED_MATERIAL.to_owned();
+        let detail = detail_of(pasted_snapshot);
+        assert_eq!(detail, "`snapshot`: is not prefixed `sha256:`");
+        assert!(!detail.contains(PASTED_MATERIAL));
+    }
+
+    /// A closed set is refused with the set: the value that arrived carries no
+    /// information an operator does not already have, and may carry material.
+    #[test]
+    fn a_closed_set_field_is_refused_with_what_this_build_accepts() {
+        let mut unknown_family = model();
+        unknown_family.wire_family = PASTED_MATERIAL.to_owned();
+        let detail = detail_of(unknown_family);
+        assert_eq!(
+            detail,
+            "`wire_family`: is not a value this build knows; \
+             it accepts `openai-chat`, `anthropic-messages`"
+        );
+        assert!(!detail.contains(PASTED_MATERIAL));
+
+        let mut unknown_state = model();
+        unknown_state.state = Some(PASTED_MATERIAL.to_owned());
+        let detail = detail_of(unknown_state);
+        assert_eq!(
+            detail,
+            "`state`: is not a value this build knows; it accepts `enabled`, `disabled`"
+        );
+        assert!(!detail.contains(PASTED_MATERIAL));
+
+        let mut unknown_lifecycle = credential();
+        unknown_lifecycle.lifecycle = Some(PASTED_MATERIAL.to_owned());
+        let detail = refusal(unknown_lifecycle);
+        assert!(
+            detail.starts_with("`lifecycle`: is not a value this build knows; it accepts `"),
+            "{detail}"
+        );
+        assert!(!detail.contains(PASTED_MATERIAL));
     }
 }

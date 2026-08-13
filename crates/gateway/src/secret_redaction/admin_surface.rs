@@ -39,7 +39,8 @@ use crate::admin::protocol::{
 use crate::admin::router::{AdminApi, router};
 use crate::admin::service::AdminService;
 use crate::backends::secrets::{SecretResolver as _, SecretStore as _};
-use crate::desired_state::{SecretLifecycle, SecretRef, fixtures};
+use crate::convergence::{RevisionStatus, SnapshotSource, SystemClock};
+use crate::desired_state::{RevisionId, SecretLifecycle, SecretRef, fixtures};
 
 const TOKEN: &str = "human-admin-token";
 const ISSUER: &str = "https://idp.example";
@@ -138,6 +139,40 @@ fn provider_document() -> Value {
     })
 }
 
+/// A catalogue snapshot document: `digest` is a long opaque content address, so
+/// it is a field a mispasted key fits without looking out of place.
+fn catalog_document() -> Value {
+    json!({
+        "summary": "pin the catalogue snapshot",
+        "mutation": "create",
+        "resource": {
+            "catalog": fixtures::resource_id(12).to_string(),
+            "slug": "models-dev",
+            "digest": format!("sha256:{}", "a".repeat(64)),
+            "size_bytes": 4_096,
+        }
+    })
+}
+
+/// A model enablement document, whose `offering` and `snapshot` are both long
+/// opaque digests.
+fn model_document() -> Value {
+    json!({
+        "summary": "enable one offering for acme",
+        "mutation": "create",
+        "resource": {
+            "enablement": fixtures::resource_id(13).to_string(),
+            "tenant": fixtures::tenant_id(1).to_string(),
+            "slug": "gpt-4o",
+            "offering": format!("off_{}", "b".repeat(64)),
+            "catalog": fixtures::resource_id(12).to_string(),
+            "snapshot": format!("sha256:{}", "a".repeat(64)),
+            "wire_family": "openai-chat",
+            "state": "enabled",
+        }
+    })
+}
+
 /// The credential an administrator publishes: a *reference* to the version that
 /// was staged in the store, and never the material behind it.
 fn credential_document(secret: &SecretRef) -> Value {
@@ -189,12 +224,20 @@ async fn no_administrative_response_discloses_the_material_a_credential_names() 
         live.expose(),
     );
 
+    // A convergence status is attached, and driven below with the revision this
+    // test actually publishes: an unreconciled replica answers `/convergence`
+    // with a projection of nothing, which would sweep clean for the wrong
+    // reason.
+    let convergence = Arc::new(RevisionStatus::new(Box::new(SystemClock)));
     let console = Console {
-        api: Arc::new(AdminApi::new(
-            Arc::new(AdminService::stateful(Arc::new(journal))),
-            Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
-            Arc::new(FakeAdminAuthorizer::permissive()),
-        )),
+        api: Arc::new(
+            AdminApi::new(
+                Arc::new(AdminService::stateful(Arc::new(journal))),
+                Arc::new(FakeAdminAuthenticator::new().with_human(TOKEN, ISSUER, SUBJECT)),
+                Arc::new(FakeAdminAuthorizer::permissive()),
+            )
+            .with_convergence(convergence.clone()),
+        ),
     };
     let credential = credential_document(&staged.reference);
 
@@ -311,6 +354,78 @@ async fn no_administrative_response_discloses_the_material_a_credential_names() 
         sweep.assert_absent(&format!("a mispasted {field} refusal"), &refusal);
     }
 
+    // The credential is not the only document with fields shaped like material.
+    // A digest, a catalogue content address and an offering identity are all long
+    // opaque strings, and a closed-set field is refused with the set this build
+    // accepts rather than with whatever arrived in it.
+    for (path, document, field, value, expected) in [
+        (
+            "/catalogs",
+            catalog_document(),
+            "digest",
+            json!(PROVIDER_MATERIAL),
+            "is not prefixed `sha256:`",
+        ),
+        (
+            "/models",
+            model_document(),
+            "offering",
+            json!(PROVIDER_MATERIAL),
+            "is not prefixed `off_`",
+        ),
+        (
+            "/models",
+            model_document(),
+            "snapshot",
+            json!(format!("sha256:{PROVIDER_MATERIAL}")),
+            "does not carry 64 lowercase hex digits",
+        ),
+        (
+            "/models",
+            model_document(),
+            "wire_family",
+            json!(PROVIDER_MATERIAL),
+            "it accepts `openai-chat`, `anthropic-messages`",
+        ),
+        (
+            "/models",
+            model_document(),
+            "state",
+            json!(PROVIDER_MATERIAL),
+            "it accepts `enabled`, `disabled`",
+        ),
+        (
+            "/tenants",
+            tenant_document(),
+            "lifecycle",
+            json!(PROVIDER_MATERIAL),
+            "it accepts `active`, `disabled`, `deleted`",
+        ),
+    ] {
+        let mut invalid = document;
+        invalid["resource"][field] = value;
+        let key = format!("mispasted-{path}-{field}");
+        let (status, refusal) = console.post(path, &key, &revision, &invalid, false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {refusal}");
+        assert!(
+            refusal.contains(expected),
+            "the {field} refusal should say {expected}: {refusal}"
+        );
+        sweep.assert_absent(&format!("a mispasted {path} {field} refusal"), &refusal);
+    }
+
+    // A reconciler's view of the revision this test published, recorded the way
+    // the convergence loop records it, so `/convergence` projects real revision
+    // identity rather than the empty report of a replica with nothing attached.
+    let converged = RevisionId::parse(&revision).expect("a published revision id");
+    convergence.observe_desired(Some(converged));
+    convergence.record_published(
+        converged,
+        1,
+        SnapshotSource::ControlPlane,
+        std::time::Duration::from_millis(120),
+    );
+
     for path in [
         "/state".to_owned(),
         "/history".to_owned(),
@@ -330,6 +445,17 @@ async fn no_administrative_response_discloses_the_material_a_credential_names() 
         state.contains("provider-credential"),
         "the state read does not describe the credential: {state}"
     );
+
+    // And the convergence read has to be about the revision that carries the
+    // credential, for the same reason.
+    let (_, body) = console.get("/convergence").await;
+    let projection: Value = serde_json::from_str(&body).expect("a JSON response");
+    assert_eq!(projection["reconciling"], json!(true), "{body}");
+    assert_eq!(projection["converged"], json!(true), "{body}");
+    assert_eq!(projection["desired"], json!(revision), "{body}");
+    assert_eq!(projection["active"], json!(revision), "{body}");
+    assert_eq!(projection["source"], json!("control-plane"), "{body}");
+    assert_eq!(projection["generation"], json!(1), "{body}");
 
     sweep.assert_absent(
         "the journal's durable rows",

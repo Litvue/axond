@@ -41,11 +41,11 @@ pub(super) fn encoding(error: CanonicalError) -> IntegrityError {
 }
 
 pub(super) fn checksum(text: &str) -> Result<Checksum, IntegrityError> {
-    Checksum::parse(text).map_err(|error| unreadable(error.to_string()))
+    Checksum::parse(text).map_err(|error| unreadable(format!("a stored checksum {error}")))
 }
 
 pub(super) fn slug(text: &str) -> Result<Slug, IntegrityError> {
-    Slug::parse(text).map_err(|error| unreadable(error.to_string()))
+    Slug::parse(text).map_err(|error| unreadable(format!("a stored slug is refused: {error}")))
 }
 
 pub(super) fn version_number(value: i64) -> Result<ResourceVersionNumber, IntegrityError> {
