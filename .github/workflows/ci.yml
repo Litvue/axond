@@ -394,6 +394,7 @@ jobs:
           python3 ops/check-docs.py
           python3 ops/check-release-config.py --self-test
           python3 ops/check-release-config.py
+          python3 ops/check-recovery-evidence.py --self-test
           shellcheck install.sh ops/publish-image-index.sh \
             ops/verify-image-evidence.sh ops/check-compose-platform.sh \
             ops/check-installer-download.sh ops/check-index-promotion.sh \
