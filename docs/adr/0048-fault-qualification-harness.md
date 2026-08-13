@@ -1,4 +1,4 @@
-# 47. Fault qualification: one process per row, ceilings only, evidence per row
+# 48. Fault qualification: one process per row, ceilings only, evidence per row
 
 Date: 2026-08-13
 
