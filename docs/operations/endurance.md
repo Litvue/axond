@@ -55,8 +55,10 @@ cargo test --locked --all-features --test endurance -- --nocapture
 AXOND_ENDURANCE=1 cargo test --locked --all-features --test endurance -- \
   --nocapture --test-threads=1
 
-# A shorter dispatched run — forty minutes here. Segments shrink to match, so
-# the run still produces the segments the trend gates are evaluated over.
+# A shorter dispatched run — forty minutes here. The override applies to the
+# soak tier alone, so the smoke tier in the same binary keeps its committed
+# fifteen seconds. Segments shrink to match, so the run still produces the
+# segments the trend gates are evaluated over.
 AXOND_ENDURANCE=1 AXOND_ENDURANCE_DURATION_MS=2400000 \
   cargo test --locked --all-features --test endurance -- \
     --nocapture --test-threads=1

@@ -101,6 +101,10 @@ const MIN_TREND_HOURS: f64 = 0.5;
 /// run instead of its first minutes.
 const RETAINED_SAMPLES: usize = 100_000;
 
+/// How often finished attempts and emitted usage records are folded into the
+/// open segment and released, independently of how long a segment lasts.
+const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Only one profile offers load at a time: two runs on one host measure each
 /// other's contention, and the artifact would still read as an envelope.
 fn load_lock() -> &'static Mutex<()> {
@@ -164,7 +168,7 @@ struct Attempt {
 pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> EnduranceResult {
     let _offering = load_lock().lock().await;
     let mut scale = *profile.scale(tier);
-    let requested = requested_duration(&scale);
+    let requested = requested_duration(&scale, tier);
     // Recorded on the artifact, not just used: a dispatched run at a shorter
     // duration is segmented to match, and the echo has to say what it was.
     scale.segment_ms = segment_ms(&scale, requested);
@@ -203,10 +207,14 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Enduranc
     let started = Instant::now();
     let deadline = started + requested.duration;
 
+    // One client across the workers, as the capacity driver does: a pool per
+    // worker would put the driver's own descriptors in the gateway's baseline
+    // and make the two harnesses' resource shapes incomparable.
+    let client = crate::support::client();
     let mut workers = Vec::with_capacity(scale.concurrency);
     for _ in 0..scale.concurrency {
         workers.push(tokio::spawn(worker(
-            crate::support::client(),
+            client.clone(),
             gateway.base_url.clone(),
             tenants.clone(),
             rotation.clone(),
@@ -225,11 +233,19 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Enduranc
     // that is killed at hour eleven has already summarised eleven hours.
     let segment = Duration::from_millis(scale.segment_ms);
     let mut boundary = started + segment;
+    // Folded on a short tick rather than on the boundary: a fifteen-minute
+    // segment of finished attempts and parsed usage records waiting in memory
+    // is the accumulation this harness exists to detect, in the harness.
+    let mut tick = started + DRAIN_INTERVAL.min(segment);
     while Instant::now() < deadline {
-        let until = boundary.min(deadline);
+        let until = tick.min(boundary).min(deadline);
         tokio::time::sleep_until(until.into()).await;
         aggregate.drain(&mut rx, &sampler, &gateway, &gauges);
-        if Instant::now() >= boundary {
+        let now = Instant::now();
+        while tick <= now {
+            tick += DRAIN_INTERVAL.min(segment);
+        }
+        if now >= boundary {
             aggregate.close_segment(started.elapsed());
             boundary += segment;
         }
@@ -240,6 +256,10 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Enduranc
     }
     let elapsed = started.elapsed();
     aggregate.drain(&mut rx, &sampler, &gateway, &gauges);
+    // The tail of the run, closed while it still counts as offered load: a
+    // duration that is not a whole number of segments would otherwise leave it
+    // in the open segment, to be mixed with the idle reading that follows.
+    aggregate.close_segment(elapsed);
 
     // Everything after the load: records still settling, upstream bodies still
     // closing, and the memory the process gives back once it is idle.
@@ -291,11 +311,14 @@ fn segment_ms(scale: &Scale, requested: Requested) -> u64 {
     scale.segment_ms.min(fitting).max(1)
 }
 
-fn requested_duration(scale: &Scale) -> Requested {
-    match std::env::var(DURATION_ENV)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-    {
+/// The override belongs to the soak alone. Both tiers live in one test binary,
+/// so honouring it for the smoke tier would make a five-hour dispatch offer
+/// five hours twice and be killed by the runner before it published anything.
+fn requested_duration(scale: &Scale, tier: Tier) -> Requested {
+    let override_ms = (tier == Tier::Soak)
+        .then(|| std::env::var(DURATION_ENV).ok())
+        .flatten();
+    match override_ms.and_then(|value| value.trim().parse::<u64>().ok()) {
         Some(ms) => Requested {
             duration: Duration::from_millis(ms),
             source: "environment",
