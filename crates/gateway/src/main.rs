@@ -14,6 +14,12 @@
 //! `[reload] watch` is on, a change to the config file) re-runs this same load +
 //! validate path and swaps the result in atomically (ADR 0011).
 
+// The `/admin/v1` protocol and service boundary (#200). Contract only, like
+// `backends` and `desired_state`: the route table is empty until the resource
+// handlers land in #143, so `serve` mounts nothing and the request path is
+// unchanged.
+#[allow(dead_code)]
+mod admin;
 mod admission;
 mod aliases;
 // Derived availability and discovery evaluation (#206). Contract only: no
