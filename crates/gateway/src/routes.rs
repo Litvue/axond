@@ -6349,9 +6349,9 @@ targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_
             _event: &journal::UsageEvent,
         ) -> Result<journal::Appended, journal::JournalError> {
             tokio::time::sleep(self.0).await;
-            Err(journal::JournalError::Backend {
-                detail: "the outbox is unreachable".to_owned(),
-            })
+            Err(journal::JournalError::Backend(
+                "the outbox is unreachable".to_owned(),
+            ))
         }
 
         async fn claim(
@@ -6385,7 +6385,14 @@ targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_
             &self,
             _consumer: &journal::ConsumerId,
         ) -> Result<journal::JournalStats, journal::JournalError> {
-            Ok(journal::JournalStats::default())
+            Ok(journal::JournalStats {
+                pending: 0,
+                in_flight: 0,
+                quarantined: 0,
+                oldest_pending_age: None,
+                dropped: 0,
+                capacity: journal::Capacity::BILLING_GRADE,
+            })
         }
     }
 
