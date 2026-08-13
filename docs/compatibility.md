@@ -16,6 +16,7 @@ breaking them is a deliberate, documented act — not that they are frozen.
 | `POST /v1/embeddings` | **supported** | OpenAI embeddings | n/a |
 | `GET /v1/models` | **supported** | the alias catalogue, gated + namespace-scoped | n/a |
 | `GET /v1/credentials` | **supported** | replica-local credential labels and circuit state, scoped | n/a |
+| `GET /admin/v1/status` | **supported** | this replica's cached dependency status, scoped and redacted | n/a |
 | `GET /healthz`, `GET /readyz` | **supported** | liveness / readiness text | n/a |
 | `POST /v1/responses` | **supported** | OpenAI Responses, native passthrough | yes |
 
@@ -29,6 +30,40 @@ admitted, while a static key in a tenant namespace and every minted token —
 including one carrying a `credentials:all` claim — receive
 `403 token_scope_insufficient`. A scoped token also needs `credentials` for the
 route. `credentials:all` remains unmintable through `POST /v1/tokens`.
+
+`GET /admin/v1/status` is authenticated, and a *scoped* caller needs the `status`
+capability — which a scope-less `POST /v1/tokens` mint does **not** confer unless
+a `[gateway_minting] scope` ceiling names it ([ADR 0031]). A static
+`[[gateway_key]]` carries no scope claim and so is admitted on its namespace
+authority alone, as it is on every other capability-gated route: a tenant key
+therefore reads its own namespace's projection, which is the tenant view
+described next rather than the operator's. Its scope follows the same
+direct-operator-authority
+rule as the all-namespaces credential view: a scope-less static
+`[[gateway_key]]` in the default namespace sees every component, the deployment's
+reason codes, exact observation ages, and the revision summary, while every other
+caller sees only the components its own requests depend on, with reasons coarsened
+to `unavailable`, ages floored to whole seconds, and no revision summary. The
+summary is `null` on every replica this release ships: nothing constructs a
+convergence reconciler yet
+([#142](https://github.com/Litvue/axond/issues/142)), so an operator's view
+carries the field and
+no data until that slice hands the status page the same handle the
+administrative surface reads. Which
+components are enabled is a deployment property, so a stateless replica answers
+`200` with every component `disabled` rather than `404`. The route is bounded by
+its own fixed eight-deep diagnostic ceiling on answering — `503
+diagnostic_concurrency_exceeded` beyond it — rather than by
+`admission.max_in_flight`, so it stays answerable on a saturated or draining
+replica while still refusing an unbounded poller. A wider seventy-two-deep
+ceiling outside authentication refuses the same way, so a flood of credentials
+that turn out to be worthless cannot spend unbounded verification and
+revocation-store work on a route admission does not cover. That wider ceiling is
+split by what checking the credential costs — forty-eight permits for minted
+tokens, sixteen for credentials that resolve in memory, eight for callers
+presenting none — so neither a slow revocation store nor a flood that needs no
+credential can refuse the static operator key that reads status through an
+outage.
 
 Responses is forwarded natively with only `model` rewritten and streaming is
 byte-faithful. **Every** `/v1/responses` request — initial calls as well as ones
@@ -191,6 +226,7 @@ stateful bootstrap surface is not under the `0.x` promise until the control plan
 it bootstraps exists; see [the reference](./configuration.md#operating-mode).
 
 [ADR 0027]: ./adr/0027-stateless-and-stateful-operating-modes.md
+[ADR 0031]: ./adr/0031-bounded-status-contract.md
 
 ### The usage schema
 
@@ -353,8 +389,10 @@ version 2 transition.
   (`503 inference_unavailable`, `/readyz` `503`) because no compiler from a
   published revision to a runtime snapshot ships yet. Neither `/admin/v1` nor the
   stateful bootstrap surface is under the `0.x` config or HTTP promise until
-  convergence exists; a stateless deployment answers every `/admin/v1` path with
-  `501 stateful_mode_required`. See
+  convergence exists; a stateless deployment answers every `/admin/v1` resource
+  path with `501 stateful_mode_required`, with `GET /admin/v1/status` the one
+  exception — it is a replica diagnostic rather than a control-plane resource, so
+  it answers in either mode. See
   [administering a stateful deployment](./operations/admin-api.md).
 
 ## Supported releases and who owns each matrix

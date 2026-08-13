@@ -1,0 +1,241 @@
+# Prometheus alerting rules for axond.
+#
+# One rule per failure mode in docs/operations/observability-runbook.md, and every
+# rule carries the runbook anchor for its first response. A test in the gateway
+# crate checks every metric name, label key, and closed-vocabulary value below
+# against the binary's canonical metric catalogue, and checks that each
+# `runbook_url` anchor exists, so these rules cannot drift from what axond emits.
+#
+# Metric names assume the collector's Prometheus exporter runs with
+# `add_metric_suffixes: false` (see ../otel-collector.yaml): dots become
+# underscores and nothing is appended.
+#
+# Thresholds and `for` windows are deliberate starting points, not claims about
+# your traffic. Tune them; keep the metric names, labels, and runbook links.
+groups:
+  - name: axond.caller-experience
+    interval: 30s
+    rules:
+      - alert: AxondServedErrorRateHigh
+        expr: "sum(rate(axond_http_server_requests{http_response_status_code=~\"5..\"}[5m])) / clamp_min(sum(rate(axond_http_server_requests[5m])), 0.001) > 0.05"
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "More than 5% of served requests are failing with 5xx"
+          description: "The caller-visible signal. Split by http_route and http_response_status_code, then follow the cause: 5xx from upstreams, 503 from a fail-closed dependency or admission control."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#served-errors-are-elevated"
+
+      - alert: AxondLatencyRegression
+        expr: "histogram_quantile(0.95, sum by (le, http_route) (rate(axond_http_server_duration_bucket[10m]))) > 30000"
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 served latency is above 30s on at least one route"
+          description: "Served latency, not provider latency. Check axond_request_time_to_first_token for the number streaming callers feel, and axond_upstream_timeouts for a stalling target."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#served-errors-are-elevated"
+
+  - name: axond.dependencies
+    interval: 30s
+    rules:
+      - alert: AxondDependencyImpaired
+        expr: "max by (axond_status_component) (axond_status_component_state) >= 2"
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dependency {{ $labels.axond_status_component }} is degraded or unavailable"
+          description: "0 disabled, 1 ok, 2 degraded, 3 unavailable. Read the reason code from GET /admin/v1/status on an affected replica. Do not remove replicas from service: readiness never observes a dependency."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#a-dependency-is-impaired"
+
+      - alert: AxondStatusObservationsStale
+        expr: "max by (axond_status_component) (axond_status_observation_age) > 120000"
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cached observations for {{ $labels.axond_status_component }} are over two minutes old"
+          description: "The age is republished each refresh round, so it only climbs past the budget when a round takes longer than the budget - a probe_timeout or refresh_interval above status.staleness_budget. A refresher that stops ticking freezes this gauge instead of raising it; AxondStatusRefresherStalled is the rule for that."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#dependency-observations-have-gone-stale"
+
+      # The companion the age gauge cannot be: every observation is republished
+      # each round, so a refresher that stops leaves the age frozen at a small
+      # value rather than growing. What does change is that nothing is published
+      # at all, and an absent refresh series says so.
+      #
+      # The second arm is what keeps "absent" meaning "stopped" rather than
+      # "never started": a deployment with no refresher wired emits neither
+      # status instrument, so this stays silent instead of paging for ever, and
+      # arms itself once a refresher has observed anything at all.
+      - alert: AxondStatusRefresherStalled
+        expr: "absent_over_time(axond_status_refreshes[10m]) and on() (max(max_over_time(axond_status_component_state[6h])) >= 0)"
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No status refresh has been recorded for ten minutes"
+          description: "The background refresher is not observing anything, so every component state and observation age is frozen at whatever was true when it stopped - including the ok ones. Fires only where a refresher has observed something before: a deployment that never wired one emits no status instruments at all and stays silent here."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#dependency-observations-have-gone-stale"
+
+      - alert: AxondStatusRefreshesFailing
+        expr: "sum by (axond_status_component) (rate(axond_status_refreshes{axond_status_outcome=\"failed\"}[5m])) > 0"
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Status refreshes for {{ $labels.axond_status_component }} keep failing"
+          description: "Every background observation of this component is failing, so its reported state is only as good as the last successful one."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#dependency-observations-have-gone-stale"
+
+      - alert: AxondFailClosedDependencyDenials
+        expr: "(sum(rate(axond_rate_limit_unavailable_denials[5m])) or vector(0)) + (sum(rate(axond_revocation_unavailable_denials[5m])) or vector(0)) > 0"
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Requests are being denied because a fail-closed store is unavailable"
+          description: "The configured on_unavailable = deny stance is doing its job: an unreachable store denies rather than admitting unmetered or un-revoked traffic. Fix the store; do not flip the stance mid-incident."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#a-fail-closed-dependency-is-denying-requests"
+
+  - name: axond.convergence
+    interval: 30s
+    rules:
+      - alert: AxondControlPlaneUnreachable
+        expr: "max(axond_status_component_state{axond_status_component=\"control_plane\"}) >= 2"
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The control plane is unreachable from at least one replica"
+          description: "Running replicas keep serving their active snapshot and converge by themselves once PostgreSQL returns. Do not restart the fleet or fail readiness: that turns a control-plane outage into an inference outage."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#the-control-plane-is-unreachable"
+
+      - alert: AxondRevisionLagAboveTarget
+        expr: "max(axond_revision_lag) > 600000"
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A replica has been behind the desired revision for over 10 minutes"
+          description: "Lag measures how long desired has differed from active. Seconds are convergence working; ten minutes is an incident. Read the rejection reason for the stage that refused."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#a-replica-will-not-converge"
+
+      - alert: AxondRevisionRejectionsSustained
+        expr: "sum by (axond_revision_reason) (rate(axond_revision_rejections[10m])) > 0"
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Revisions keep being refused with reason {{ $labels.axond_revision_reason }}"
+          description: "validation and projection refuse on every replica and need a corrected revision; secret and snapshot are usually replica-specific. A refused revision is never partly applied."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#a-replica-will-not-converge"
+
+      - alert: AxondFleetRevisionSplit
+        expr: "max(axond_config_generation) - min(axond_config_generation) > 0"
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Replicas have been serving different config generations for 15 minutes"
+          description: "A brief split is independent convergence working. A persistent one is a single stuck replica: find it by instance, read its GET /admin/v1/status revision summary, and treat it as a replica that will not converge."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#the-fleet-is-split-across-revisions"
+
+      - alert: AxondRevisionConvergenceSplit
+        expr: "max(axond_revision_converged) - min(axond_revision_converged) > 0"
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Some replicas are converged and others are not"
+          description: "The fleet is mixed for longer than one convergence takes, so at least one replica cannot accept what the others already serve."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#the-fleet-is-split-across-revisions"
+
+  - name: axond.providers
+    interval: 30s
+    rules:
+      - alert: AxondProviderCircuitOpen
+        expr: "max by (axond_target_provider, axond_target_model) (axond_upstream_circuit_state) == 2"
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit open for {{ $labels.axond_target_provider }}/{{ $labels.axond_target_model }}"
+          description: "Requests to that target are failing over on every route except /v1/responses, which is pinned to its alias's first target. A single open circuit with flat overall error rate is failover working."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#a-provider-target-is-out"
+
+      - alert: AxondUpstreamTimeouts
+        expr: "sum by (axond_target_provider, axond_timeout, axond_timeout_bound) (rate(axond_upstream_timeouts[5m])) > 0.1"
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Upstream timeouts in phase {{ $labels.axond_timeout }} for {{ $labels.axond_target_provider }}"
+          description: "connect is egress or DNS, response_headers is an overloaded provider, stream_idle is a half-dead connection, overall means the failover budget was spent before dispatch. A walk_budget bound means failover.overall_timeout_ms is too tight."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#upstream-requests-are-timing-out"
+
+  - name: axond.capacity
+    interval: 30s
+    rules:
+      - alert: AxondAdmissionShedding
+        expr: "sum by (axond_admission_resource) (rate(axond_admission_rejections[5m])) > 0"
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Admission control is shedding on resource {{ $labels.axond_admission_resource }}"
+          description: "request is the replica's own ceiling (scale out or raise it), tenant is one namespace's own concurrency, sustained queue rejections are under-provisioning rather than burstiness."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#the-replica-is-shedding-load"
+
+      - alert: AxondAdmissionSaturated
+        expr: "max(axond_admission_in_flight{axond_admission_resource=\"request\"}) > 819"
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "In-flight requests are near the replica's admission ceiling"
+          description: "Leading indicator of shedding. Set this threshold to roughly 80% of admission.max_in_flight for your deployment; the shipped 819 is 80% of the documented default of 1024. A single-namespace deployment sheds at max_in_flight_per_tenant instead, so lower it to 80% of that."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#the-replica-is-shedding-load"
+
+      - alert: AxondNamespaceBudgetExhausted
+        expr: "sum(rate(axond_budget_namespace_denials[5m])) > 0"
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A namespace-wide budget cap is spent"
+          description: "Every subject in that namespace is being denied, not one noisy caller. Raise namespace_limit_microdollars or find what is spending."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#budget-or-rate-limit-capacity-is-exhausted"
+
+      - alert: AxondBudgetCapacityExhausted
+        expr: "(sum(rate(axond_budget_capacity_denials[5m])) or vector(0)) + (sum(rate(axond_rate_limit_capacity_denials[5m])) or vector(0)) > 0"
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "In-memory budget or rate-limit capacity is refusing subjects"
+          description: "The replica has no room to track more subjects. Watch axond_budget_retained_subjects against max_subjects; these bounds are per replica by design."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#budget-or-rate-limit-capacity-is-exhausted"
+
+  - name: axond.lifecycle
+    interval: 30s
+    rules:
+      - alert: AxondUsageRecordsDropped
+        expr: "sum by (axond_usage_sink, axond_drop_reason) (rate(axond_usage_records_dropped[5m])) > 0"
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Usage records are being dropped by sink {{ $labels.axond_usage_sink }}"
+          description: "Spend and audit data no retry recovers. sink_error is the sink, buffer_full is volume the sink cannot keep up with, shutdown means the termination flush could not write what it held."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#usage-records-are-being-lost"
+
+      - alert: AxondReplicaStuckDraining
+        expr: "max(axond_shutdown_phase) >= 1"
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A replica has been draining for 15 minutes"
+          description: "Phase 1 fails readiness while still admitting; phase 2 has closed admission and answers 503 draining. Something is holding requests open, or the orchestrator is not removing the endpoint."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#a-replica-is-stuck-draining"

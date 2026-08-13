@@ -308,6 +308,8 @@ const ADMISSION_RESOURCE: Label = Label::closed(
         crate::admission::RESOURCE_STREAM,
         crate::admission::RESOURCE_TENANT,
         crate::admission::RESOURCE_QUEUE,
+        crate::admission::RESOURCE_DIAGNOSTIC,
+        crate::admission::RESOURCE_DIAGNOSTIC_AUTH,
     ],
 );
 
@@ -595,6 +597,7 @@ pub const CATALOG: &[MetricSpec] = &[
                     "gateway_overloaded",
                     "admission_queue_full",
                     "admission_queue_timeout",
+                    "diagnostic_concurrency_exceeded",
                 ],
             ),
         ],
@@ -887,6 +890,51 @@ mod tests {
         for method in recorded {
             validate_label_value("axond.http.server.requests", "http.request.method", method)
                 .expect("every recordable method is catalogued");
+        }
+    }
+
+    /// Every refusal admission can record carries both its resource and its
+    /// error code onto `axond.admission.rejections`, so both vocabularies have
+    /// to contain it: an undeclared value is one a dashboard drilling into the
+    /// shedding it caused is refused for naming.
+    #[test]
+    fn every_admission_rejection_is_catalogued_by_resource_and_code() {
+        for rejection in crate::admission::AdmissionRejection::ALL {
+            validate_label_value(
+                "axond.admission.rejections",
+                "axond.admission.resource",
+                rejection.scope(),
+            )
+            .expect("every rejection's resource is catalogued");
+            validate_label_value(
+                "axond.admission.rejections",
+                "axond.error.type",
+                rejection.code(),
+            )
+            .expect("every rejection's error code is catalogued");
+        }
+    }
+
+    /// Two ceilings guard one status read — authenticating it, then answering
+    /// it — and a reader holds a slot in each at once. They therefore have to
+    /// publish on separate resources, or the gauge would report twice the
+    /// readers against a denominator that is neither ceiling.
+    #[test]
+    fn each_diagnostic_ceiling_holds_capacity_under_its_own_resource() {
+        assert_ne!(
+            crate::admission::RESOURCE_DIAGNOSTIC,
+            crate::admission::RESOURCE_DIAGNOSTIC_AUTH
+        );
+        for resource in [
+            crate::admission::RESOURCE_DIAGNOSTIC,
+            crate::admission::RESOURCE_DIAGNOSTIC_AUTH,
+        ] {
+            validate_label_value(
+                "axond.admission.in_flight",
+                "axond.admission.resource",
+                resource,
+            )
+            .expect("both diagnostic ceilings are catalogued");
         }
     }
 

@@ -25,15 +25,13 @@ Logs are always JSON on stdout, filtered by `RUST_LOG` (default
 ## Health surfaces
 
 Three surfaces answer three different questions, and none of them substitutes for
-another ([ADR 0031](./adr/0031-bounded-status-contract.md)). Two of them ship
-today; the third is a fixed contract whose route arrives with the stateful
-slices, so treat its row as the shape to expect rather than something to curl:
+another ([ADR 0031](./adr/0031-bounded-status-contract.md)):
 
 | Surface | Authentication | Question it answers |
 | --- | --- | --- |
 | `GET /healthz` | none | *Is the process alive?* Answers `ok` throughout, including the shutdown drain. Restart it if this fails. |
 | `GET /readyz` | none | *Should traffic be sent here?* `ready`, or `503 draining` once termination begins. Point the load balancer here. |
-| `GET /admin/v1/status` **(not registered yet)** | gateway credential with the `status` capability | *Which dependencies is this replica talking to?* Cached component states with an observation age. |
+| `GET /admin/v1/status` | any gateway credential; a scoped token also needs the `status` capability | *Which dependencies is this replica talking to?* Cached component states with an observation age. Answers throughout the shutdown, including `closing`, and on a replica that refuses inference. Bounded by its own diagnostic ceilings — eight concurrent answers, seventy-two concurrent authentications — rather than by `admission.max_in_flight`. |
 
 Neither `/healthz` nor `/readyz` observes a dependency. A store outage must not
 remove healthy replicas from service, so dependency state lives only on the
@@ -62,10 +60,26 @@ authority additionally sees only the components its own traffic depends on,
 reasons coarsened to `unavailable`, ages rounded to whole seconds, and no revision
 summary.
 
-A stateless replica reports every component `disabled`; that is the correct
-answer, not a degraded one. No route serves this yet, and no component is probed:
-the contract, its redaction, and its metrics ship first, and each stateful slice
-adds the probe for the backend it owns behind them.
+A stateless replica reports every component `disabled` — that is the correct
+answer, not a degraded one — because no component is *enabled*, and an enabled
+component is one this deployment configured. **That is the answer on every
+release so far**: nothing yet constructs a `StatusRefresher`, so no component is
+observed, and the three `axond.status.*` instruments are not produced at all.
+The route, its scoping, and its redaction ship now; each stateful slice injects
+the refresher for the backend it owns through the same seam
+(`ReplicaObservability`), and neither the response shape nor the metric names
+change when it does:
+
+```bash
+curl -sS -H "Authorization: Bearer $AXOND_KEY" http://localhost:8080/admin/v1/status
+```
+
+What to reach for, in order: `/readyz` says whether traffic belongs here,
+`/admin/v1/status` says which dependency is impaired and how fresh that knowledge
+is, and the [observability runbook](./operations/observability-runbook.md) says
+what to do about it. The shipped dashboard and alert assets under
+[`ops/observability/`](../ops/observability/) are the fleet-wide view of the same
+signals.
 
 ## Traces
 
@@ -126,7 +140,7 @@ metric and a usage row can never disagree.
 | `axond.rate_limit.denials` | counter | — | Inbound concurrency admissions rejected. |
 | `axond.rate_limit.capacity_denials` | counter | — | In-memory admissions rejected because the bounded subject map is full. |
 | `axond.rate_limit.unavailable_denials` | counter | — | Redis rate-limit admissions denied because the store was unavailable. |
-| `axond.admission.in_flight` | up-down counter | `axond.admission.resource` | Admission capacity held right now, by resource: `request`, `stream`, `tenant`, `queue`. Bounded label set — no tenant, subject, or request identity. |
+| `axond.admission.in_flight` | up-down counter | `axond.admission.resource` | Admission capacity held right now, by resource: `request`, `stream`, `tenant`, `queue`, `diagnostic` (status reads being answered, ceiling eight), `diagnostic_auth` (status reads being authenticated, ceiling seventy-two, split forty-eight for minted tokens, sixteen for credentials that resolve in memory, and eight for callers presenting none — a separate dimension because one read holds one of each and the two ceilings differ). Bounded label set — no tenant, subject, or request identity. |
 | `axond.admission.rejections` | counter | `axond.admission.resource`, `axond.error.type` | Requests shed by admission control, by resource and stable error type. |
 | `axond.status.component_state` | gauge | `axond.status.component` | Last observed dependency state: `0` disabled, `1` ok, `2` degraded, `3` unavailable — a severity ladder, so `>= 2` is trouble and the stateless posture (`disabled` everywhere) sits below `ok` rather than above `unavailable`. Bounded label set — no tenant, subject, or credential identity. |
 | `axond.status.observation_age` | gauge (ms) | `axond.status.component` | Age of the cached observation behind that state; a rising age means the refresher, not the dependency, is the problem. |
@@ -146,6 +160,12 @@ readable from a scrape endpoint
 ([ADR 0031](./adr/0031-bounded-status-contract.md)).
 
 ### What to alert on
+
+The table below is the reasoning; [`ops/observability/alerts/axond-alerts.yml`](../ops/observability/alerts/axond-alerts.yml)
+is the same content as Prometheus rules, each carrying a `runbook_url` into the
+[observability runbook](./operations/observability-runbook.md). A test validates
+every expression in the shipped rules and dashboards against the catalogue, so a
+renamed instrument cannot leave an alert silently matching nothing.
 
 | Alert | Signal | Why |
 | --- | --- | --- |
@@ -263,6 +283,7 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | `429` | `tenant_concurrency_exceeded` | The caller's namespace is at `admission.max_in_flight_per_tenant` on this replica. The caller's own concurrency is the cause, so it is a `429` rather than a `503`. | Raise the per-tenant ceiling, or have the caller lower its concurrency. Carries `Retry-After: 1`. |
 | `503` | `gateway_overloaded`, `stream_capacity_exhausted` | The replica is at `admission.max_in_flight` (or `max_in_flight_streams`). Raised after authentication and before the rate-limit store, the budget reservation, and the provider, so a shed request costs nothing. | Scale out, or raise the ceilings to what one process can actually hold. `axond.admission.in_flight` says which resource ran out. |
 | `503` | `admission_queue_full`, `admission_queue_timeout` | Queueing is enabled and the queue is full, or a queued request outlived `admission.queue_wait_ms`. | Sustained shedding here means under-provisioning rather than burstiness; queueing only helps short bursts. |
+| `503` | `diagnostic_concurrency_exceeded` | Eight diagnostic reads (`GET /admin/v1/status`) were already being answered on this replica, or the share of the seventy-two pre-authentication permits its credential's shape may hold was already full — forty-eight for minted tokens, sixteen for credentials that resolve in memory, eight for callers presenting none, so neither a slow revocation store nor a credential-less flood can refuse a static key. That second ceiling sits outside authentication, which the first cannot bound without letting anonymous callers hold it closed. A fixed ceiling of its own, separate from `max_in_flight`: served traffic at its ceiling never makes the replica unanswerable, and polling the diagnostic never consumes served capacity. | Poll less often. It is not configurable, and a diagnostic answers from memory, so eight concurrent is a bound on abuse rather than a capacity dial. Carries `Retry-After: 1`. |
 | `503` | `admission_tenant_capacity_exhausted` | More distinct namespaces were in flight than `admission.max_tenants`, so the admission table itself is full. | Raise `max_tenants`. No `Retry-After` is sent: waiting will not change it. |
 | `413` | `request_too_large`, `prompt_too_large` | The body exceeded `admission.max_request_bytes` (refused by the router before it was buffered), or the estimated input exceeded `admission.max_prompt_tokens`. | Caller-side fix, or raise the bound if the workload needs it. Neither message echoes the request. |
 | `415` | `unsupported_media_type` | The request did not declare `content-type: application/json`. Unchanged in status from earlier releases; only the body is now the typed JSON envelope. | Caller-side fix: send a JSON content type. |
