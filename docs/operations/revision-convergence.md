@@ -469,13 +469,23 @@ credentials pin, and each **active** credential becomes one entry in the pool of
   tenant with no projects, a suspended one) is logged by reference and skipped: it
   is not a reason to refuse the revision.
 - **which provider** — the provider resource's slug has to match a `[[provider]]`
-  the file declares, because endpoints and wire families are still file-owned. A
-  credential for a provider the deployment cannot dial refuses the candidate with
-  reason `projection`, rather than publishing a namespace with no key.
+  the file declares, *and* the two must agree on the wire family, because
+  endpoints and wire families are still file-owned. A credential for a provider
+  the deployment cannot dial, or one whose revision speaks Anthropic where the
+  file declares OpenAI, refuses the candidate with reason `projection` rather than
+  publishing a namespace with no key or presenting a key to the wrong account.
 - **staged is not serving.** Staged material resolves — that is how you prove it
   before traffic reaches it — but only `active` material is pooled. `disabled`,
   `revoked`, and `tombstoned` credentials are absent from the next snapshot's
   pools.
+- **withdrawing a project's own key empties its pool; it does not fall back to
+  the tenant's.** A project credential holds its `(namespace, provider)` pair for
+  as long as it exists, in any lifecycle, so disabling or revoking it makes calls
+  for that provider fail with no credential rather than quietly moving that
+  traffic onto the tenant's key — which would bill another account and make a
+  different key the one a leak implicates. *Deleting* (`tombstoned`) the
+  credential releases the pair, and the tenant's default serves it again: falling
+  back is something an operator states, not something a withdrawal implies.
 - **a pool entry names a version, never a value.** Pool status, usage records,
   logs, and metrics carry the credential's slug; the material is held as a
   reference-counted, zeroizing lease that nothing renders.

@@ -44,7 +44,12 @@
 //!   tenant-wide default — *except* a `(namespace, provider)` pair where that
 //!   project has a credential of its own. Bring-your-own-key wins over the
 //!   tenant's, for the same reason a namespace does not borrow the platform's
-//!   without saying so;
+//!   without saying so. The claim is the *declaration*, not the material:
+//!   disabling or revoking a project's own key empties that pool rather than
+//!   silently promoting the tenant's, because a key that quietly starts billing
+//!   another account — and would be the one a leak implicated — is not what
+//!   withdrawing a key asks for. Deleting the credential releases the pair, so
+//!   falling back to the tenant default is something an operator states;
 //! - a credential whose owner has no projected namespace (a tenant with no
 //!   projects, or a suspended one, whose projects are deliberately not projected)
 //!   is *not* projected. It is logged by reference and skipped rather than
@@ -131,10 +136,12 @@ impl RevisionProjection for CredentialProjection {
         let namespaces = ProjectedNamespaces::index(bootstrap);
 
         // Project-scoped credentials first, so the pairs they claim are known
-        // before a tenant's defaults are considered for the same pairs.
+        // before a tenant's defaults are considered for the same pairs. A
+        // tombstoned credential is gone — the pair it held is released — but every
+        // other lifecycle is still a declaration that the project owns its key.
         let (owned, inherited): (Vec<&ProviderCredential>, Vec<&ProviderCredential>) = credentials
             .all()
-            .filter(|credential| credential.body.lifecycle() == SecretLifecycle::Active)
+            .filter(|credential| credential.body.lifecycle() != SecretLifecycle::Tombstoned)
             .partition(|credential| credential.body.project().is_some());
 
         let mut claimed: HashSet<(String, String)> = HashSet::new();
@@ -146,15 +153,28 @@ impl RevisionProjection for CredentialProjection {
             if serves.is_empty() {
                 continue;
             }
-            let provider = provider_id(&config, &providers, credential)?;
+            let active = credential.body.lifecycle() == SecretLifecycle::Active;
+            let provider = match provider_id(&config, &providers, credential) {
+                Ok(provider) => provider,
+                // A withdrawn credential for a provider this deployment cannot
+                // dial holds no pool open, and refusing the candidate for it
+                // would make disabling a key a way to stop convergence.
+                Err(_) if !active => continue,
+                Err(error) => return Err(error),
+            };
             for namespace in serves {
                 claimed.insert((namespace.to_owned(), provider.clone()));
-                config
-                    .credential
-                    .push(entry(namespace, &provider, credential));
+                if active {
+                    config
+                        .credential
+                        .push(entry(namespace, &provider, credential));
+                }
             }
         }
         for credential in &inherited {
+            if credential.body.lifecycle() != SecretLifecycle::Active {
+                continue;
+            }
             let serves = serving(&namespaces, credential);
             if serves.is_empty() {
                 continue;
@@ -162,7 +182,8 @@ impl RevisionProjection for CredentialProjection {
             let provider = provider_id(&config, &providers, credential)?;
             for namespace in serves {
                 if claimed.contains(&(namespace.to_owned(), provider.clone())) {
-                    // The project brought its own key for this provider.
+                    // The project brought its own key for this provider, whether
+                    // or not that key is currently serving.
                     continue;
                 }
                 config
@@ -586,6 +607,53 @@ mod tests {
                 ("acme/core".to_owned(), "project-own".to_owned()),
                 ("acme/labs".to_owned(), "tenant-wide".to_owned()),
             ],
+        );
+    }
+
+    /// And withdrawing that key does not hand its traffic to the tenant's. A
+    /// disabled or revoked project credential still claims its pool: the pool
+    /// empties, which fails calls loudly, rather than quietly billing the
+    /// tenant's account and putting the tenant's key on the wire. Deleting the
+    /// credential is the explicit statement that the default may take over.
+    #[test]
+    fn withdrawing_a_projects_own_credential_does_not_promote_its_tenants_default() {
+        let tenant_wide = || {
+            credential(
+                CREDENTIAL,
+                "tenant-wide",
+                SecretOwner::tenant(tenant()),
+                fixtures::secret_ref_at(CREDENTIAL, 1),
+                SecretLifecycle::Active,
+            )
+        };
+        let project_own = |lifecycle| {
+            credential(
+                CREDENTIAL + 10,
+                "project-own",
+                SecretOwner::project(tenant(), project()),
+                fixtures::secret_ref(CREDENTIAL + 10),
+                lifecycle,
+            )
+        };
+
+        for withdrawn in [SecretLifecycle::Disabled, SecretLifecycle::Revoked] {
+            assert_eq!(
+                projected(&state([tenant_wide(), project_own(withdrawn)])),
+                [],
+                "{withdrawn:?} must empty the pool, not fall back"
+            );
+        }
+
+        // Deleted, the claim is released and the tenant's default serves again.
+        assert_eq!(
+            projected(&state([
+                tenant_wide(),
+                project_own(SecretLifecycle::Tombstoned)
+            ]))
+            .iter()
+            .map(|entry| (entry.0.clone(), entry.2.clone()))
+            .collect::<Vec<_>>(),
+            [("acme/core".to_owned(), "tenant-wide".to_owned())],
         );
     }
 
