@@ -519,6 +519,7 @@ pub(crate) mod testing {
                 }
                 config.model.push(crate::config::Model {
                     name: resource.slug.as_str().to_owned(),
+                    namespace: None,
                     targets: vec![crate::config::Target {
                         provider: self.provider.to_owned(),
                         model: "gpt-4o".to_owned(),

@@ -245,6 +245,7 @@ The tenancy boundary: which credential pool a caller's requests draw from.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `name` | string | — | The name callers send (`gpt-4o`). Also what `/v1/models` lists, for callers whose namespace holds a credential for one of its targets. Credential labels are separately exposed by the scoped, replica-local `/v1/credentials` status view. |
+| `namespace` | string | — | The namespace that owns the alias. Omitted, the alias is deployment-wide: every namespace may name it. Named, only that namespace lists or invokes it, and it shadows a deployment-wide alias of the same name for that namespace alone. An undefined namespace is rejected, and one namespace may not define the same `name` twice ([ADR 0058](./adr/0058-tenant-owned-alias-names-and-the-management-catalogue.md)). |
 | `targets` | array of target | — | Concrete destinations, tried **in order** on a retryable failure. All targets must use one provider wire family: OpenAI (`openai` or `openai-compatible`) or Anthropic. An empty list is rejected. |
 
 Each target:

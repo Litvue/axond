@@ -57,6 +57,7 @@ use serde::Serialize;
 use tracing::{debug, warn};
 
 use super::auth::{AdminAction, AdminAuthError, AdminGrant, AdminIdentity};
+use super::catalogue::{CatalogueRequest, CatalogueView};
 use super::diff::SemanticDiff;
 use super::error::AdminError;
 use super::protocol::{MutationRequest, WriteMode};
@@ -368,6 +369,33 @@ impl AdminService {
         let store = self.store()?;
         let revision = store.load_desired_revision().await.map_err(log_store)?;
         StateView::of(revision.as_ref())
+    }
+
+    /// One tenant's management catalogue: the enablements in a scope, the aliases
+    /// that name them, and why a model is not routable.
+    ///
+    /// The first *scoped* read on this surface, and scoped in both directions: the
+    /// caller names the tenant or project it is asking about, and the grant must
+    /// cover it. A deployment-wide grant covers every tenant, a tenant grant its
+    /// own tenant, and a project grant its own project — the same containment
+    /// [`Self::within_scope`] applies to a mutation, so read authority and write
+    /// authority cannot disagree about what a tenant is.
+    ///
+    /// Unlike [`Self::desired_state`], the answer is bounded by the scope rather
+    /// than by the deployment: a tenant administrator cannot enumerate another
+    /// tenant's enablements, and cannot learn from this read that one exists.
+    pub async fn model_catalogue(
+        &self,
+        grant: &AdminGrant,
+        request: &CatalogueRequest,
+    ) -> Result<CatalogueView, AdminError> {
+        Self::permits(grant, AdminAction::ReadState)?;
+        if !scope_covers(grant.scope(), &request.scope()) {
+            return Err(AdminError::Forbidden(AdminAuthError::ScopeNotPermitted));
+        }
+        let store = self.store()?;
+        let revision = store.load_desired_revision().await.map_err(log_store)?;
+        CatalogueView::of(revision.as_ref(), request)
     }
 
     /// A bounded page of revision history, newest first.

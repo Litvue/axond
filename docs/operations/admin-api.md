@@ -129,6 +129,7 @@ record, or a state read.
 | `/admin/v1/audit/{revision}` | `GET` | One revision's actor, summary, and recorded changes. |
 | `/admin/v1/convergence` | `GET` | What this replica has loaded and activated, from its own cached status — never a control-plane read. |
 | `/admin/v1/availability` | `GET` | What this replica derives about one scope's models. `?tenant=` is required, `?project=` optional; answered from the snapshot it is serving and its own circuits — never a control-plane read. |
+| `/admin/v1/catalogue` | `GET` | One tenant's management catalogue: what it has enabled, the names that route to it, and why a model is not routable. `?tenant=` is required. |
 | `/admin/v1/tenants` | `POST` | A tenant and its lifecycle. |
 | `/admin/v1/projects` | `POST` | A project (namespace) inside a tenant. |
 | `/admin/v1/providers` | `POST` | A provider connection: wire family and endpoint. |
@@ -158,6 +159,64 @@ than one per knob.
 Rollback never rewinds the journal. It reads an earlier revision's complete
 state and publishes it forward, so the history that produced an incident is
 still readable after the incident is undone.
+
+## The management catalogue
+
+`GET /admin/v1/catalogue` answers what one tenant may use, read from the
+published revision — never from a provider, and never from anything the request
+path touches. It is the only read on this surface whose scope comes from the
+query rather than from the grant: `?tenant=` is required, `?project=` narrows it
+to a project, and the grant must cover the scope asked for. A tenant-scoped
+administrator therefore reads its own tenant and gets `403` for another's, with
+no evidence in either answer that another tenant's enablements exist.
+
+| Parameter | Meaning |
+| --- | --- |
+| `tenant` | Required. The tenant whose catalogue is read. |
+| `project` | Read the project's effective catalogue: its own overrides, and the tenant defaults it inherits. |
+| `state` | `enabled` or `disabled`. |
+| `wire_family` | The wire contract an offering speaks. |
+| `offering` | One offering id, for a single-model read. |
+| `billable` | `true` or `false`: whether an approved price makes the offering billable. |
+
+An unknown parameter is refused with `400 admin_request_invalid` rather than
+ignored. A caller that asked to narrow and was silently not narrowed would read
+the answer as authoritative, so the filters this build cannot yet evaluate —
+`provider`, `capability`, `modality`, `availability`, all of which need the
+catalogue-import and availability slices' metadata — are refused by the same rule,
+and the response names the same gap in `pending`:
+
+```json
+{
+  "revision": "rev_...",
+  "scope": { "kind": "tenant", "tenant": "..." },
+  "entries": [
+    {
+      "offering": "...",
+      "catalog_snapshot": "...",
+      "enablement": "...",
+      "version": 1,
+      "slug": "gpt-4o",
+      "scope": { "kind": "tenant", "tenant": "..." },
+      "wire_family": "openai-chat",
+      "state": "enabled",
+      "effective": true,
+      "routable": false,
+      "billable": false,
+      "aliases": ["default"],
+      "unavailable": ["unpriced"]
+    }
+  ],
+  "pending": ["offering-metadata", "availability"]
+}
+```
+
+`unavailable` is why a caller of this tenant cannot route to the offering:
+`disabled` (its lifecycle), `shadowed` (a project override replaces the tenant
+default this entry reports), `unpriced` (no approved price, so no request can be
+billed) or `unaliased` (no enabled alias names it). `routable` is the absence of
+all of them; a read of a project reports the tenant default beside the override
+that shadows it, so an operator can see both without a second request.
 
 ## Conditional reads
 

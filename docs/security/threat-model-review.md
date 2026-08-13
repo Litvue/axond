@@ -49,7 +49,7 @@ unnoticed one.
 | `routes.rs` authentication, `mint.rs`, `principals.rs`, `revocation/`, scopes, claims, epochs | [Authentication, claims, and authorization](#1-authentication-token-claims-and-authorization) |
 | Namespace resolution, `credentials.rs` pool lookup, `allow_platform_fallback`, budget/rate-limit keys, operator views | [Tenant and namespace scoping](#2-tenant-and-namespace-scoping) |
 | `backends/secrets.rs`, `key_material.rs`, `desired_state/secrets.rs`, `desired_state/credentials.rs`, credential injection, error and log text, rotation | [SecretStore, credential delivery, rotation, and redaction](#3-secretstore-credential-delivery-rotation-and-redaction) |
-| `backends/catalog.rs`, `aliases.rs`, `availability/`, `desired_state/models.rs`, `desired_state/pricing.rs`, `/v1/models`, alias scope, wire families, pricing | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
+| `backends/catalog.rs`, `aliases.rs`, `availability/`, `admin/catalogue.rs`, `desired_state/models.rs`, `desired_state/pricing.rs`, `/v1/models`, alias scope and ownership, wire families, pricing | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
 | `ops/postgres/`, `crates/gateway/sql/`, `usage/`, `telemetry/`, control-plane journal | [Persistence, migrations, telemetry, and usage](#5-persistence-migrations-telemetry-and-usage) |
 | `.github/workflows/`, `ops/publish-crates.sh`, `install.sh`, `install.ps1`, `Dockerfile`, `deny.toml` | [Actions, release permissions, attestations, and signing](#6-actions-release-permissions-attestations-and-signing) |
 | `desired_state/access.rs`, `desired_state/tenancy.rs`, control-plane tenancy/principal projection, `/admin/v1` authorization, denial records | [Control-plane tenancy, principals, and administrative authorization](#7-control-plane-tenancy-principals-and-administrative-authorization) |
@@ -232,7 +232,9 @@ families, the `/v1/models` projection, catalogue ingestion in
 evaluation in `crates/gateway/src/availability/`, the durable enablement and
 alias bodies and their publication rules in
 `crates/gateway/src/desired_state/models.rs`, pricing metadata, approved pricing
-in `crates/gateway/src/desired_state/pricing.rs`, and any new route that exposes
+in `crates/gateway/src/desired_state/pricing.rs`, alias ownership in
+`crates/gateway/src/config.rs`, the administrative catalogue projection in
+`crates/gateway/src/admin/catalogue.rs`, and any new route that exposes
 model or provider metadata.
 
 **Regression tests.** Pattern semantics are the entitlement boundary:
@@ -240,7 +242,25 @@ model or provider metadata.
 `an_empty_scope_permits_nothing`, and `invalid_patterns_are_rejected` — a glob
 change that broadens a match is a privilege change. Projection:
 `models_requires_a_gateway_key`, `models_lists_the_callers_aliases`, and the
-namespace intersection tests in trigger 2. Ingestion must stay inert:
+namespace intersection tests in trigger 2. An alias a namespace owns is that
+namespace's alone, in the catalogue and in resolution:
+`an_owned_alias_is_listed_and_routable_only_by_its_namespace`,
+`an_owned_alias_is_its_namespaces_own_and_shadows_the_deployments`, and
+`rejects_an_alias_owned_by_a_namespace_the_deployment_does_not_define` — a name
+one tenant publishes may not be enumerated or invoked by another, and an owner it
+cannot serve is a refused file rather than a deployment-wide alias. The
+administrative catalogue answers within one scope and says what it could not
+consult: `a_tenant_read_is_isolated_and_explains_each_entry`,
+`a_tenant_read_does_not_enumerate_a_projects_overrides`,
+`a_project_of_another_tenant_yields_nothing`,
+`a_read_names_the_facts_it_could_not_consult`,
+`the_management_catalogue_reports_what_a_tenant_published`,
+`a_catalogue_read_outside_the_grant_is_forbidden`, and
+`a_catalogue_filter_this_build_cannot_read_is_refused` — a filter this build
+cannot evaluate is refused rather than silently ignored, because an answer a
+caller believes was narrowed is an entitlement claim it did not make.
+
+Ingestion must stay inert:
 `observed_pricing_is_metadata_not_activation`,
 `the_source_is_background_only_and_declares_incremental_refresh`, and
 `an_unreachable_source_is_retryable_and_never_a_boot_failure` — upstream
@@ -319,7 +339,12 @@ native routes; the durable entitlement contract — opaque snapshot-pinned offer
 identities, observed versus approved pricing, tenant defaults against project
 overrides, and ordered single-wire-family alias targets — is
 [ADR 0042](../adr/0042-model-enablement-and-alias-contracts.md), and a change to
-what an enablement pins or to which targets an alias may name amends it; `CatalogSource`'s background-only placement is in
+what an enablement pins or to which targets an alias may name amends it;
+[ADR 0058](../adr/0058-tenant-owned-alias-names-and-the-management-catalogue.md)
+makes an alias name a namespace's own and states that the management catalogue is
+an administrative read of a published revision rather than anything the request
+path consults, so a change to who may see an alias or to what the catalogue
+reports amends it; `CatalogSource`'s background-only placement is in
 [backend contracts](../maintainers/backend-contracts.md).
 [ADR 0043](../adr/0043-catalogue-source-imports.md) holds observed rates as
 metadata and [ADR 0046](../adr/0046-approved-price-books.md) makes approval the

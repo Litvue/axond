@@ -409,8 +409,8 @@ impl ReloadSummary {
                 after_config.provider.iter().map(|p| p.id.clone()),
             ),
             models: Delta::between(
-                before_config.model.iter().map(|m| m.name.clone()),
-                after_config.model.iter().map(|m| m.name.clone()),
+                before_config.model.iter().map(model_key),
+                after_config.model.iter().map(model_key),
             ),
             credentials: Delta::between(
                 before_config.credential.iter().map(credential_key),
@@ -639,6 +639,19 @@ impl ReloadSummary {
                 "`[admission]` changed, but the admission ceilings are already serving requests; restart to apply them"
             );
         }
+    }
+}
+
+/// An alias as the reload summary names it: `namespace/name` for one a namespace
+/// owns, and the bare name for a deployment-wide one.
+///
+/// Qualified because an alias name is unique within its namespace and not across
+/// the deployment: two tenants' `fast` are two aliases, and a summary that merged
+/// them would report one tenant's withdrawal as no change at all.
+fn model_key(model: &crate::config::Model) -> String {
+    match model.namespace.as_deref() {
+        None => model.name.clone(),
+        Some(namespace) => format!("{namespace}/{}", model.name),
     }
 }
 

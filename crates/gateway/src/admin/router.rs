@@ -230,6 +230,15 @@ pub fn admin_route_specs() -> Vec<AdminRouteSpec> {
             action: AdminAction::ReadState,
             router: handlers::state_route,
         },
+        // A read of desired state, narrowed to one tenant or project: the same
+        // verb as `/state`, because a new resource kind must not widen the action
+        // vocabulary, and the scope the grant is checked against comes from the
+        // query rather than from the path.
+        AdminRouteSpec {
+            path: "/catalogue",
+            action: AdminAction::ReadState,
+            router: handlers::catalogue_route,
+        },
         AdminRouteSpec {
             path: "/history",
             action: AdminAction::ReadHistory,
