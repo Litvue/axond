@@ -14,7 +14,7 @@ connects configured backends before binding the socket.
 | `references env var ... unset or empty` | A credential, gateway key, verifier, or DSN reference is absent from the process environment. | Set it on the actual service/container and restart. |
 | `at least one gateway key` | No static `[[gateway_key]]` exists. | Add a breakglass key; minted verifiers are additive. |
 | `hold the same secret` | Two gateway-key entries resolve to one value. | Give each principal a distinct value. |
-| `usage sink configuration failed` | Postgres or OTLP configuration/connectivity failed. | Verify DSN/endpoint, DNS, TLS, schema, and credentials. |
+| `usage sink configuration failed` | Postgres or OTLP configuration/connectivity failed, or the usage outbox could not connect to or read its tables. | Verify DSN/endpoint, DNS, TLS, schema, and credentials; for `[usage_journal]`, that `ops/postgres/usage_outbox_v1.sql` is applied in the named schema and the role can read it. |
 | `budget configuration failed` | Budget backend unavailable or layout migration incomplete. | Restore the backend or complete the named migration. |
 | `rate-limit configuration failed` | Redis is unavailable or invalid. | Verify URL, TLS, DNS, and connectivity. |
 | `revocation configuration failed` | Redis/Postgres revocation store is unavailable or missing schema. | Apply DDL or restore connectivity. |
@@ -45,6 +45,7 @@ Boot errors name references and identifiers, not secret values.
 | `504 upstream_timeout` | A transport bound fired before a response could be served. | `axond.timeout` on the attempt span names the phase: `connect`, `response_headers`, `buffered_body`, `stream_idle`, or `overall`. Tune that `[transport]` bound, or `failover.overall_timeout_ms` for `overall`. |
 | `502 upstream_body_too_large` | A buffered provider body exceeded `transport.max_response_bytes`. | Whether the workload really returns bodies that size; otherwise treat the target as misbehaving. |
 | `502 invalid_request` | Provider returned a non-retryable request/auth error. | Provider credential, model deployment, and provider body. |
+| `503 usage_not_durable` | Billing-grade delivery is on and the request's usage event could not be made durable, so the gateway will not report success for a request it cannot bill. | `axond.usage.journal.appends` by outcome, and depth against capacity: a full outbox usually means delivery has stalled, not that appends are too fast — or a retired `consumer` name is still registered and holding retention open ([usage outbox](./usage-outbox.md#when-a-request-is-refused)). |
 | `503 budget_unavailable` | Shared budget backend failed under fail-closed policy. | Redis/Postgres health and latency. |
 | `503 rate_limit_unavailable` | Redis limiter failed under fail-closed policy. | Redis health, invoke saturation, connection recovery. |
 | `503 revocation_unavailable` | JTI store failed under fail-closed policy. | Redis/Postgres health and configured policy. |

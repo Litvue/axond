@@ -44,20 +44,25 @@
 //! redelivery is distinguishable from a first attempt in logs and metrics without
 //! being distinguishable as a billable event.
 //!
-//! # Not enabled here
+//! # Opt-in, and off unless configured
 //!
-//! No journal is constructed by `serve`, no configuration selects one, and the
-//! settlement order is unchanged: this slice is the contract plus its executable
-//! oracle, in the same posture as [`crate::backends`] and
-//! [`crate::desired_state`]. The Postgres outbox worker that implements it — and
-//! the append-before-settlement ordering that makes
-//! [`DeliveryMode::BillingGrade`] true rather than merely named — is the next
-//! slice.
+//! [`PostgresJournal`] implements the contract and [`DeliveryWorker`] drains it
+//! into the configured sinks, but neither exists unless `[usage_journal]` names
+//! a backend: with no such section the runtime keeps exactly the telemetry-grade
+//! path it had, and no deployment acquires a datastore dependency by upgrading.
+//! Billing-grade mode is where the append happens *before* the request is
+//! answered, which is what makes [`DeliveryMode::BillingGrade`] true rather than
+//! merely named — see [`crate::usage::UsageDelivery`].
 
 #[cfg(test)]
 pub(crate) mod oracle;
+mod postgres;
 #[cfg(test)]
 mod tests;
+mod worker;
+
+pub use postgres::{PostgresJournal, PostgresJournalSettings};
+pub use worker::{DRAIN_MARGIN, DeliveryWorker, DrainReport, WorkerHandle, WorkerSettings};
 
 use std::fmt;
 use std::time::{Duration, SystemTime};
@@ -231,6 +236,10 @@ impl UsageEvent {
     /// because that is the one a consumer may already have delivered. A store
     /// implements this as equality of the columns it wrote, not of the row it
     /// was handed.
+    // Contract surface: the conformance suite and the in-memory oracle are the
+    // only callers, because a store answers the same question in its own terms
+    // (the Postgres one compares the stored `jsonb`).
+    #[allow(dead_code)]
     pub fn is_same_fact_as(&self, other: &Self) -> bool {
         self.record == other.record
     }
@@ -385,6 +394,10 @@ pub enum Appended {
 }
 
 impl Appended {
+    /// Where the event sits in the journal, whether this append wrote it or
+    /// recognised it. Contract surface: the suite asserts a retried append
+    /// reports the *first* position.
+    #[allow(dead_code)]
     pub fn position(&self) -> u64 {
         match self {
             Self::Accepted { position } | Self::AlreadyPresent { position } => *position,
@@ -414,6 +427,9 @@ pub enum PoisonReason {
     /// from blocking every later event for the same ordering key.
     AttemptsExhausted,
 }
+
+/// Every value [`PoisonReason::as_str`] can produce, for the metric catalogue.
+pub const POISON_REASONS: &[&str] = &["malformed", "rejected", "attempts_exhausted"];
 
 impl PoisonReason {
     pub fn as_str(self) -> &'static str {
@@ -654,9 +670,17 @@ pub trait UsageJournal: Send + Sync {
     /// between the destination write and the acknowledgement must be recoverable
     /// by repeating the acknowledgement.
     ///
+    /// An acknowledgement of an event the journal no longer holds is `Ok` on the
+    /// same recovery grounds: retention, capacity reclamation, and `DropOldest`
+    /// can all remove a row while a consumer still holds a claim on it, and there
+    /// is nothing left to redeliver, so refusing would only report a redelivery
+    /// that cannot happen. [`quarantine`](Self::quarantine) is the exception —
+    /// see there.
+    ///
     /// A consumer is registered by [`claim`](Self::claim), and nothing else: an
-    /// acknowledgement from a consumer that never claimed is
-    /// [`JournalError::NotOutstanding`] and must not create delivery state for it.
+    /// acknowledgement from a consumer that never claimed — for an event the
+    /// journal still has — is [`JournalError::NotOutstanding`] and must not create
+    /// delivery state for it.
     /// Since only an event *every* registered consumer has finished with is
     /// prunable, a consumer conjured up by one stray acknowledgement would hold
     /// retention open forever.
@@ -670,6 +694,25 @@ pub trait UsageJournal: Send + Sync {
     /// ([`JournalError::Quarantined`]).
     async fn ack(&self, delivery: &DeliveryId) -> Result<(), JournalError>;
 
+    /// Acknowledge a whole claim, and answer for each delivery in order.
+    ///
+    /// Exactly [`ack`](Self::ack) per delivery, verdict for verdict — the reason
+    /// it exists is round trips. A claim is written to the destinations in one
+    /// batch, so acknowledging it one event at a time makes delivery throughput a
+    /// multiple of the journal's latency rather than the destination's, and a
+    /// gateway that appends faster than that fills its outbox and starts refusing
+    /// requests. A store that can resolve a set in one statement should.
+    ///
+    /// The default is the loop, so an implementation only overrides this if
+    /// batching actually buys it something.
+    async fn ack_all(&self, deliveries: &[DeliveryId]) -> Vec<Result<(), JournalError>> {
+        let mut verdicts = Vec::with_capacity(deliveries.len());
+        for delivery in deliveries {
+            verdicts.push(self.ack(delivery).await);
+        }
+        verdicts
+    }
+
     /// Set an event aside as poison. It stops being delivered — and stops
     /// blocking its ordering key — and is counted in
     /// [`JournalStats::quarantined`] until an operator deals with it.
@@ -680,6 +723,11 @@ pub trait UsageJournal: Send + Sync {
     /// handed to it; quarantining an already quarantined event is `Ok` and keeps
     /// the first reason.
     ///
+    /// Unlike an acknowledgement, an event the journal no longer holds cannot be
+    /// quarantined: this verdict exists to leave a poison count and a row an
+    /// operator can inspect, and a removed row leaves neither, so it is
+    /// [`JournalError::NotOutstanding`] rather than a silent `Ok`.
+    ///
     /// The two verdicts are exclusive, so an event this consumer already
     /// acknowledged cannot be condemned afterwards
     /// ([`JournalError::AlreadyAcknowledged`]).
@@ -689,7 +737,51 @@ pub trait UsageJournal: Send + Sync {
         reason: PoisonReason,
     ) -> Result<(), JournalError>;
 
+    /// Give an attempt back, because the failure said nothing about this event.
+    ///
+    /// A destination that refuses a whole batch has not judged anything in it —
+    /// it may simply be unreachable — and charging the attempt budget for that
+    /// would let an outage a few leases long condemn every event at the head of an
+    /// ordering key. A consumer that cannot attribute a refusal therefore returns
+    /// the attempt, and the event is redelivered when its lease expires with the
+    /// budget it had before.
+    ///
+    /// The lease is deliberately left alone: it is the backoff, and an immediate
+    /// redelivery would spin against a destination that is down. Gated and
+    /// idempotent on the same terms as [`ack`](Self::ack), and never below zero.
+    async fn relinquish(&self, delivery: &DeliveryId) -> Result<(), JournalError>;
+
     /// This consumer's depth, in-flight count, oldest pending age, quarantine
     /// count, and the capacity they are bounded by.
     async fn stats(&self, consumer: &ConsumerId) -> Result<JournalStats, JournalError>;
+
+    /// Forget what retention no longer holds, and report how many events that
+    /// was.
+    ///
+    /// Separate from the delivery path because it is the one operation that is
+    /// nobody's dependency: an append at [`Capacity::max_events`] reclaims what it
+    /// needs itself, so this only keeps a journal that is *not* under pressure
+    /// from growing to its limit and paying for the exact counts that go with it.
+    /// The default is the honest answer for a store that has nothing to prune.
+    async fn maintain(&self, now: SystemTime) -> Result<u64, JournalError> {
+        let _ = now;
+        Ok(0)
+    }
+
+    /// Consumers the journal is holding delivery state for that are *not*
+    /// `mine` — the names retention is also waiting on.
+    ///
+    /// A journal that prunes only what every registered consumer has finished
+    /// with cannot tell a second fleet's consumer from one that was retired: a
+    /// renamed `consumer` leaves its predecessor registered, and retention then
+    /// waits on a name nothing will ever acknowledge again, so the outbox grows
+    /// to [`Capacity::max_events`] and starts refusing appends. Only an operator
+    /// can say which it is, so the journal reports the names and the worker says
+    /// so once a maintenance tick rather than guessing and deleting state a live
+    /// consumer needs. The default is the honest answer for a store that keeps
+    /// no per-consumer state.
+    async fn consumers_besides(&self, mine: &ConsumerId) -> Result<Vec<String>, JournalError> {
+        let _ = mine;
+        Ok(Vec::new())
+    }
 }

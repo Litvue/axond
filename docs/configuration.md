@@ -36,6 +36,8 @@ egress: upstream provider calls still use the network at Tier 0.
 | `[[usage_sink]]` omitted or `kind = "stdout"` | Tier 0: one JSON line on stdout. |
 | `[[usage_sink]] kind = "otlp"` | Tier 0 state, but not hermetic: a collector is a boot-time dependency, so this is outside the hermetic Tier 0 CI lane. |
 | `[[usage_sink]] kind = "postgres"` | Tier 2: durable usage rows. |
+| `[usage_journal]` omitted or `backend = "none"` | Tier 0: telemetry-grade usage delivery, exactly as before. |
+| `[usage_journal] backend = "postgres"` | Tier 2: a durable usage outbox on the request path. |
 | `[budget] backend = "none"` or `"in-memory"` | Tier 0; in-memory state is per replica and approximate. |
 | `[budget] backend = "redis"`, `[rate_limit] backend = "redis"`, or `[revocation] backend = "redis"` | Tier 1: exact shared admission and precise token revocation through Redis. |
 | `[rate_limit] backend = "none"` or `"in-memory"` | Tier 0; in-memory state is per replica and approximate. |
@@ -668,7 +670,8 @@ or via an atomic rename is therefore reload-reachable without a process
 restart. `[[namespace]]` changes are reloadable and appear in the reported
 namespace delta, but the namespace count used for in-memory budget retention
 floors is captured at boot and does not resize until restart. `[server] bind`,
-`[transport]`, `[admission]`, `[[usage_sink]]`, `[budget]`, `[rate_limit]`, and
+`[transport]`, `[admission]`, `[[usage_sink]]`, `[usage_journal]`, `[budget]`,
+`[rate_limit]`, and
 `[revocation]` changes warn and are ignored until restart; this includes
 `limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
 
@@ -690,9 +693,9 @@ migrations, and backup/restore ownership.
 | `dsn_env` | string | — | `postgres` | *Name* of the env var holding the connection string. Required and non-empty for `postgres`. `sslmode=require` in the DSN turns on TLS (rustls + webpki roots). |
 | `table` | string | `axond_usage` | `postgres` | Destination table; `schema.table` allowed. Validated as an identifier, so it cannot carry SQL. |
 | `create_table` | bool | `false` | `postgres` | Apply the shipped DDL at boot. Off because most deployments give the gateway's role no DDL rights. |
-| `buffer_capacity` | integer | `10000` | `postgres` | Records buffered before the fan-out drops. Must be ≥ 1. |
-| `max_batch` | integer | `500` | `postgres` | Records accumulated before a flush. Must be ≥ 1 and no greater than `buffer_capacity`; the sink splits large batches across statements as needed. |
-| `flush_interval_ms` | integer | `1000` | `postgres` | How long a partial batch waits. Must be ≥ 1. |
+| `buffer_capacity` | integer | `10000` | `postgres` | Records buffered before the fan-out drops. Must be ≥ 1. Not used when the journal is enabled. |
+| `max_batch` | integer | `500` | `postgres` | Records accumulated before a flush. Must be ≥ 1 and no greater than `buffer_capacity`; the sink splits large batches across statements as needed. Not used when the journal is enabled. |
+| `flush_interval_ms` | integer | `1000` | `postgres` | How long a partial batch waits. Must be ≥ 1. Not used when the journal is enabled. |
 
 `max_batch` was previously capped by the INSERT parameter budget, which moved
 whenever a column was added; it is now bounded by `buffer_capacity` instead, so
@@ -710,6 +713,79 @@ processor does its buffering and the batching keys above do not apply.
 A configured sink connects **at boot**, so a bad DSN refuses to start rather
 than dropping records later. Afterwards the sink is off the request path and a
 stalled destination drops with a count rather than delaying a request.
+
+That last sentence is the telemetry-grade guarantee, and it is why a sink alone
+cannot be a billing source: a record it accepted is not a record it wrote. See
+[`[usage_journal]`](#usage_journal--billing-grade-usage-delivery-opt-in-tier-2)
+for the mode that makes a record durable before the request is answered.
+
+## `[usage_journal]` — billing-grade usage delivery (opt-in, Tier 2)
+
+Omit the section for the default: telemetry-grade delivery, no outbox, no
+datastore, byte-for-byte the behaviour that shipped before this section existed.
+
+With `backend = "postgres"`, every settled usage event is appended to a durable
+outbox **before the request is answered**, and a bounded delivery worker replays
+it into the configured `[[usage_sink]]`s until they acknowledge it — at-least-once,
+replayed after a restart, deduplicated by the consumer on `request_id`
+([ADR 0049](./adr/0049-billing-grade-usage-outbox.md)). The operator guide is
+[`docs/operations/usage-outbox.md`](./operations/usage-outbox.md); read it before
+enabling this, because it adds a failure mode to the request path.
+
+In billing-grade mode the sinks are written through synchronously by the worker
+instead of buffering, since the worker acknowledges on their answer. At least one
+sink is therefore required.
+
+`kind = "otlp"` is not one the worker can acknowledge on — the OTel batch
+processor confirms nothing, so an acknowledgement taken from it would forget an
+event no collector ever received. It is not rejected either, because exporting
+usage telemetry and storing it durably are things one deployment reasonably does
+at once. An OTLP sink declared beside a storing one keeps exporting: the worker
+writes it after a destination that *can* answer has accepted the events, once per
+delivery pass, and a failed export is logged rather than retried, since the event
+is already delivered. What is refused is a journal whose destinations are *all*
+OTLP, because then an acknowledgement rests on nothing.
+
+That moves buffering out of the sink and into the outbox, so a sink's
+`buffer_capacity`, `max_batch`, and `flush_interval_ms` stop applying —
+`claim_batch` and `poll_interval_ms` below replace them, and a replica that had
+set them is told at boot which ones no longer do anything. `usage.records_written`
+is then emitted by the delivery worker for records a destination accepted, and
+`usage.records_dropped` no longer counts a failed write, because a failed write is
+retried from the outbox rather than lost. The full contract is in [the operator
+guide](./operations/usage-outbox.md#what-enabling-it-changes-about-your-sinks).
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `backend` | `none` \| `postgres` | `none` | `none` keeps telemetry-grade delivery. `postgres` is the durable outbox and requires `ops/postgres/usage_outbox_v1.sql`. |
+| `dsn_env` | string | — | *Name* of the env var holding the outbox connection string. Required and non-empty for `postgres`. `sslmode=require` in the DSN turns on TLS. |
+| `schema` | string | — | Schema the outbox tables live in. One unqualified identifier: it is interpolated into `SET search_path`, so it is validated and cannot carry SQL. |
+| `create_schema` | bool | `false` | Apply the shipped outbox DDL at boot. Off, because most deployments give the gateway's role no DDL rights. |
+| `consumer` | string | `billing` | Name the delivery state is kept under. Stable across restarts: renaming it replays everything still retained into the destinations as first deliveries, and leaves the old name registered — [delete the retired consumer row](./operations/usage-outbox.md#recovery), or retention stops pruning and the outbox fills. |
+| `max_events` | integer | `1000000` | Events the outbox holds before `capacity_policy` applies. Must be ≥ 1. |
+| `max_delivery_attempts` | integer | `8` | Attempts one event gets before it is quarantined as poison. Only a refusal the destination attributes to that event spends an attempt, so a destination-wide outage does not exhaust it ([usage outbox](./operations/usage-outbox.md#recovery)). Must be ≥ 1. |
+| `retain_acknowledged_seconds` | integer | `86400` | How long an acknowledged event is kept, counted from when the request was observed rather than from its acknowledgement, because the window it has to cover is the caller's retry horizon and that starts at the request. Must exceed the longest retry horizon a caller has: pruning forgets the idempotency key, so a later retry of the same request would append a second copy. An event delivered long after a delivery outage is therefore prunable sooner than one delivered promptly. |
+| `capacity_policy` | `refuse` \| `drop-oldest` | `refuse` | What a full outbox does. `refuse` is the only policy that keeps the billing-grade promise; `drop-oldest` discards the oldest undelivered event and counts it durably. |
+| `on_undurable` | `refuse` \| `serve` | `refuse` | What a request does when its event could not be journaled. `refuse` answers `503 usage_not_durable`; `serve` answers anyway and counts the event as lost. |
+| `operation_timeout_ms` | integer | `5000` | Bound on the append a request waits for, and on every other outbox operation. Must be ≥ 1. |
+| `connect_timeout_ms` | integer | `5000` | Bound on connecting. Must be ≥ 1. |
+| `connections` | integer | `8` | Connections held open. One is reserved for the delivery worker's claims, so the rest bound how many appends a replica can have in flight — a claim waiting on a slow destination cannot hold a connection a request needs. Must be ≥ 2, and no more than the share of Postgres `max_connections` this replica may hold. |
+| `claim_batch` | integer | `256` | Events one claim takes. Must be ≥ 1. |
+| `lease_seconds` | integer | `30` | How long a claimed batch stays invisible to other claimants. Must exceed the slowest write the destinations do, and it is how long recovery from a dead worker takes. |
+| `poll_interval_ms` | integer | `250` | How long the worker waits after finding nothing to deliver. Must be ≥ 1. |
+
+The outbox connects and checks its tables **at boot**, so a bad DSN, a missing
+schema, or a role without the right grants refuses to start rather than failing
+every request afterwards. A replica logs the mode it is running in:
+
+```text
+INFO usage delivery mode=billing_grade durable=true journal=postgres on_undurable=refuse
+```
+
+`capacity_policy = "drop-oldest"` and `on_undurable = "serve"` each trade
+accounting for availability, and each is counted
+(`axond.usage.journal.lost`). A configuration that sets either one logs a warning
+at boot saying so.
 
 ## `[budget]` — opt-in budget enforcement (Tier 0, 1, or 2 by backend)
 

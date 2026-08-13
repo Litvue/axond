@@ -248,6 +248,58 @@ write what it held — check `axond_usage_flushes{axond_flush_outcome="timeout"}
 and give the drain longer. Requests are deliberately never delayed to keep the
 sink honest, so this signal is the only thing that reports the loss.
 
+### A billing-grade deployment is losing usage
+
+**Signal.** `axond_usage_journal_lost` increasing, split by
+`axond_journal_loss_reason`.
+
+**Alert.** `AxondUsageJournalLoss`.
+
+**First response.** Page. In billing-grade mode a served request is only reported
+as successful once its event is in the outbox, so this counter is the one signal
+that a billable fact exists nowhere. The reason says which trade was taken:
+`at_capacity`, `backend`, `conflict`, and `invalid_event` are appends that failed
+where the caller could not be refused — `on_undurable = "serve"`, a terminated
+request, or a caller that hung up before its refusal could be delivered — and
+`capacity_drop` is `capacity_policy = "drop-oldest"` discarding the oldest
+undelivered event to stay inside `max_events`. Reconcile from the destination,
+then fix what was full or unreachable; the sections below are the two causes.
+
+### The usage outbox is filling or refusing
+
+**Signal.** `axond_usage_journal_oldest_pending_age` climbing,
+`axond_usage_journal_depth` approaching `axond_usage_journal_capacity`, or
+`axond_usage_journal_appends` with an outcome other than `accepted` and
+`already_present`.
+
+**Alert.** `AxondUsageJournalBacklogAging`, `AxondUsageJournalRefusingAppends`.
+
+**First response.** A backlog is not loss: the events are durable and the next
+process claims them. What it becomes at `max_events` is refusal — callers get
+`503 usage_not_durable` — so treat an ageing backlog as the warning for that.
+Almost always the destination is stalled rather than the appends being too fast,
+so check the sinks the delivery worker writes to and
+`axond_usage_journal_deliveries{axond_journal_delivery="failed"}` before raising
+`max_events`. A `backend` append outcome is the outbox database itself, not
+capacity: the request path and the worker share it.
+Full procedure: [usage outbox](./usage-outbox.md#recovery).
+
+### Usage events are quarantined
+
+**Signal.** `axond_usage_journal_quarantined_events` above zero, with
+`axond_usage_journal_quarantined` naming the reason.
+
+**Alert.** `AxondUsageJournalQuarantined`.
+
+**First response.** Quarantine is deliberate: an event the destination refuses on
+its own account, or one this build cannot decode, is set aside so it stops
+blocking its ordering key and its siblings keep flowing. Nothing retries it
+again, and retention will not prune it, so it holds part of `max_events` until
+somebody decides what it is worth. The rows are on disk with their reason and
+their `request_id`; reconcile them and delete the event row, following
+[usage outbox](./usage-outbox.md#recovery) — deleting the delivery row alone
+leaves the event unprunable.
+
 ### A provider target is out
 
 **Signal.** `axond_upstream_circuit_state == 2` (open) for a

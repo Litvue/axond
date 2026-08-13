@@ -92,8 +92,8 @@ use clap::{Arg, ArgAction, Command};
 use config::Config;
 use rate_limit::RateLimiter;
 use revocation::RevocationStore;
-use state::AppState;
-use usage::UsageFanout;
+use state::{AppState, ReplicaObservability};
+use usage::UsageRuntime;
 
 fn main() -> anyhow::Result<()> {
     let matches = cli().get_matches();
@@ -494,10 +494,22 @@ async fn serve() -> anyhow::Result<()> {
     // usage sinks and shared (Redis / Postgres) budget backends are opt-in via
     // config. Both are connected here, so a misconfigured datastore fails at
     // boot rather than discarding records — or denying every request — later.
-    let usage = UsageFanout::new(
-        usage::build_sinks(&config.usage_sink, &env)
-            .await
-            .map_err(|e| anyhow::anyhow!("usage sink configuration failed: {e}"))?,
+    // A `[usage_journal]` section is what turns the best-effort path into a
+    // durable one, and it is connected here for the same reason: a deployment
+    // that asked for billing-grade usage and cannot reach its outbox must fail
+    // at boot rather than fail closed on every request (ADR 0049).
+    let UsageRuntime {
+        delivery: usage,
+        worker: usage_worker,
+    } = usage::build_runtime(&config.usage_sink, &config.usage_journal, &env)
+        .await
+        .map_err(|e| anyhow::anyhow!("usage sink configuration failed: {e}"))?;
+    tracing::info!(
+        mode = usage.mode().as_str(),
+        durable = usage.mode().is_durable(),
+        journal = config.usage_journal.backend.as_str(),
+        on_undurable = config.usage_journal.on_undurable.as_str(),
+        "usage delivery"
     );
     let budget: Box<dyn BudgetStore> =
         budget::build(&config.budget, &env, config.distinct_namespace_count())
@@ -535,9 +547,16 @@ async fn serve() -> anyhow::Result<()> {
 
     let bind = config.server.bind;
     let watching = config.reload.watch;
-    let state =
-        AppState::new_with_rate_limiter(config, &env, usage, budget, rate_limiter, revocation)
-            .map_err(|e| anyhow::anyhow!("config resolution failed: {e}"))?;
+    let state = AppState::with_resources(
+        config,
+        &env,
+        usage,
+        budget,
+        rate_limiter,
+        revocation,
+        ReplicaObservability::stateless(),
+    )
+    .map_err(|e| anyhow::anyhow!("config resolution failed: {e}"))?;
     tracing::info!(
         gateway_keys = state.config().inbound_key_count(),
         gateway_verifiers = state.config().token_verifier_count(),
@@ -628,10 +647,34 @@ async fn serve() -> anyhow::Result<()> {
     // waits above cannot spend this reserve.
     let flushed = resources.0.usage.flush(until(flush_by)).await;
     flushed.log();
+    // The journal's own drain, and a distinct report: a backlog left in a durable
+    // outbox is delivered by whichever replica claims it next, so it is undelivered
+    // work rather than lost usage and must not be logged as a drop.
+    //
+    // It gets half of what is left rather than all of it, and pays its own
+    // abandonment margin out of that share: a drain costs its caller
+    // `budget + DRAIN_MARGIN`, and a drain that spent the whole remainder — the
+    // normal case behind a backlog — would push the process past `flush_timeout`
+    // and leave the telemetry export a deadline already in the past. Under the
+    // margin there is no honest wait left to make, so the worker is stopped
+    // without one.
+    let journal_drain: Option<usage::DrainReport> = match usage_worker {
+        Some(worker) => Some(
+            match (until(flush_by) / 2).checked_sub(usage::DRAIN_MARGIN) {
+                Some(budget) => worker.drain(budget).await,
+                None => worker.abandon(),
+            },
+        ),
+        None => None,
+    };
+    if let Some(report) = journal_drain.as_ref() {
+        report.log();
+    }
     let telemetry_failures = telemetry_guard.shutdown(flush_by);
     tracing::info!(
         outcome = outcome.as_str(),
         usage_flushed = flushed.is_complete(),
+        usage_journal_drained = journal_drain.as_ref().and_then(|report| report.caught_up()),
         telemetry_flushed = telemetry_failures.is_empty(),
         "axond stopped"
     );

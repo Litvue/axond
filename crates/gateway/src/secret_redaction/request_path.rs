@@ -21,30 +21,14 @@ use tower::util::ServiceExt as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 use super::harness::{
-    FakeProvider, PROVIDER_MATERIAL, Replica, chat_request, first, live_material, owner,
-    state_pinning, sweep,
+    CapturingSink, FakeProvider, PROVIDER_MATERIAL, Replica, chat_request, first, live_material,
+    owner, state_pinning, sweep,
 };
 use crate::desired_state::{ResourceVersionNumber, SecretLifecycle};
 use crate::routes::router;
 use crate::shutdown::Phase;
 use crate::status::registry::CachedStatusRegistry;
 use crate::status::{Component, ComponentObservation, StatusReason, StatusScope};
-use crate::usage::{UsageRecord, UsageSink};
-
-/// A sink that keeps every record, so the billing surface can be swept.
-#[derive(Clone, Default)]
-struct CapturingSink(Arc<Mutex<Vec<UsageRecord>>>);
-
-#[async_trait::async_trait]
-impl UsageSink for CapturingSink {
-    fn name(&self) -> &'static str {
-        "capture"
-    }
-
-    async fn record(&self, record: &UsageRecord) {
-        self.0.lock().expect("not poisoned").push(record.clone());
-    }
-}
 
 /// Everything written to the log layer, as bytes.
 #[derive(Clone, Default)]
@@ -148,7 +132,7 @@ async fn a_served_request_leaks_its_credentials_into_nothing_it_emits() {
     assert!(!spans.is_empty(), "the request produced no spans to sweep");
     sweep.assert_absent("the request's spans", &format!("{spans:?}"));
 
-    let records = usage.0.lock().expect("not poisoned").clone();
+    let records = usage.records();
     assert_eq!(records.len(), 1, "{records:?}");
     let record = &records[0];
     sweep.assert_absent("a usage record's Debug", &format!("{record:?}"));
@@ -217,7 +201,7 @@ async fn a_failed_request_leaks_its_credentials_into_no_error_surface() {
     let sweep = sweep();
     sweep.assert_absent_bytes("an error response's body", &body);
     sweep.assert_absent_bytes("an error's log output", &logs.rendered());
-    for record in usage.0.lock().expect("not poisoned").iter() {
+    for record in usage.records() {
         sweep.assert_absent("a failed request's usage record", &format!("{record:?}"));
     }
 }

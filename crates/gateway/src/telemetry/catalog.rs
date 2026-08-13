@@ -301,6 +301,16 @@ const TARGET_LABELS: &[Label] = &[TARGET_PROVIDER, TARGET_MODEL];
 
 const USAGE_SINK: Label = Label::closed("axond.usage_sink", &["stdout", "otlp", "postgres"]);
 
+/// Which durable outbox the billing-grade path is using. `none` appears when an
+/// event could not be journaled before one was constructed.
+const USAGE_JOURNAL: Label = Label::closed("axond.usage_journal", &["none", "postgres"]);
+
+/// Configured rather than closed: the consumer name is an operator's string, and
+/// one deployment's is one series.
+const JOURNAL_CONSUMER: Label = Label::open("axond.usage_journal.consumer", LabelClass::Configured);
+
+const POISON_REASONS: &[&str] = crate::usage::journal::POISON_REASONS;
+
 const ADMISSION_RESOURCE: Label = Label::closed(
     "axond.admission.resource",
     &[
@@ -444,6 +454,105 @@ pub const CATALOG: &[MetricSpec] = &[
             USAGE_SINK,
             Label::closed("axond.flush_outcome", &["flushed", "failed", "timeout"]),
         ],
+    },
+    MetricSpec {
+        name: "axond.usage.journal.appends",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[
+            USAGE_JOURNAL,
+            Label::closed(
+                "axond.journal.outcome",
+                &[
+                    "accepted",
+                    "already_present",
+                    "at_capacity",
+                    "conflict",
+                    "invalid_event",
+                    "backend",
+                ],
+            ),
+        ],
+    },
+    MetricSpec {
+        name: "axond.usage.journal.deliveries",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[
+            USAGE_JOURNAL,
+            JOURNAL_CONSUMER,
+            Label::closed(
+                "axond.journal.delivery",
+                &["acknowledged", "redelivered", "failed"],
+            ),
+        ],
+    },
+    MetricSpec {
+        name: "axond.usage.journal.quarantined",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[
+            USAGE_JOURNAL,
+            JOURNAL_CONSUMER,
+            Label::closed("axond.journal.poison_reason", POISON_REASONS),
+        ],
+    },
+    MetricSpec {
+        name: "axond.usage.journal.undeliverable",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[
+            USAGE_JOURNAL,
+            Label::closed("axond.journal.reason", &["schema_ahead", "corrupt"]),
+        ],
+    },
+    MetricSpec {
+        name: "axond.usage.journal.lost",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[
+            USAGE_JOURNAL,
+            Label::closed(
+                "axond.journal.loss_reason",
+                &[
+                    "capacity_drop",
+                    "at_capacity",
+                    "conflict",
+                    "invalid_event",
+                    "backend",
+                ],
+            ),
+        ],
+    },
+    MetricSpec {
+        name: "axond.usage.journal.depth",
+        kind: InstrumentKind::Gauge,
+        unit: None,
+        labels: &[USAGE_JOURNAL, JOURNAL_CONSUMER],
+    },
+    MetricSpec {
+        name: "axond.usage.journal.in_flight",
+        kind: InstrumentKind::Gauge,
+        unit: None,
+        labels: &[USAGE_JOURNAL, JOURNAL_CONSUMER],
+    },
+    MetricSpec {
+        name: "axond.usage.journal.quarantined_events",
+        kind: InstrumentKind::Gauge,
+        unit: None,
+        labels: &[USAGE_JOURNAL, JOURNAL_CONSUMER],
+    },
+    MetricSpec {
+        name: "axond.usage.journal.oldest_pending_age",
+        kind: InstrumentKind::Gauge,
+        unit: Some("s"),
+        labels: &[USAGE_JOURNAL, JOURNAL_CONSUMER],
+    },
+    MetricSpec {
+        name: "axond.usage.journal.capacity",
+        kind: InstrumentKind::Gauge,
+        unit: None,
+        labels: &[USAGE_JOURNAL],
     },
     MetricSpec {
         name: "axond.shutdown.phase",

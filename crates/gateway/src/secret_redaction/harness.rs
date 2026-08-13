@@ -61,7 +61,7 @@ use crate::desired_state::{
 };
 use crate::state::{AppState, ConfigSnapshot};
 use crate::telemetry;
-use crate::usage::{UsageFanout, UsageSink};
+use crate::usage::{UsageFanout, UsageRecord, UsageSink};
 
 /// The provider key a credential's first secret version holds.
 ///
@@ -251,6 +251,29 @@ impl CandidateCompiler for SecretResolvingCompiler {
 /// Material as an administrator hands it to the store.
 pub(crate) fn material(plaintext: &str) -> SecretMaterial {
     SecretMaterial::new(plaintext.to_owned())
+}
+
+/// A sink that keeps every record, so the billing surface can be swept — in
+/// memory by [`super::request_path`], and on disk by [`super::journal`] once the
+/// same record has been through the outbox.
+#[derive(Clone, Default)]
+pub(crate) struct CapturingSink(Arc<Mutex<Vec<UsageRecord>>>);
+
+impl CapturingSink {
+    pub(crate) fn records(&self) -> Vec<UsageRecord> {
+        self.0.lock().expect("not poisoned").clone()
+    }
+}
+
+#[async_trait]
+impl UsageSink for CapturingSink {
+    fn name(&self) -> &'static str {
+        "capture"
+    }
+
+    async fn record(&self, record: &UsageRecord) {
+        self.0.lock().expect("not poisoned").push(record.clone());
+    }
 }
 
 /// A stand-in provider that records the credential it was presented with.

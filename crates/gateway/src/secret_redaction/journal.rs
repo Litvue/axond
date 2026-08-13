@@ -23,16 +23,22 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::http::StatusCode;
 use tokio_postgres::Config;
+use tower::util::ServiceExt as _;
 
 use super::harness::{
-    PROVIDER_MATERIAL, ROTATED_MATERIAL, first, live_material, state_pinning, sweep,
+    CapturingSink, FakeProvider, PROVIDER_MATERIAL, ROTATED_MATERIAL, Replica, chat_request, first,
+    live_material, owner, state_pinning, sweep,
 };
 use crate::backends::control_plane::postgres::{ControlPlaneSettings, PostgresControlPlane};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::desired_state::{
-    DesiredState, ExpectedRevision, ResourceVersionNumber, RevisionId, fixtures,
+    DesiredState, ExpectedRevision, ResourceVersionNumber, RevisionId, SecretLifecycle, fixtures,
 };
+use crate::routes::router;
+use crate::usage::ObservedRecord;
+use crate::usage::journal::{PostgresJournal, PostgresJournalSettings, UsageEvent, UsageJournal};
 
 /// A journal on a schema of its own, or `None` when no Postgres is configured
 /// and the suite is not running in required mode.
@@ -238,4 +244,100 @@ async fn no_durable_row_or_read_carries_secret_material() {
         "the credential's secret reference must be durable, or the sweep proves nothing"
     );
     drop(resolved);
+}
+
+/// A usage outbox on a schema of its own, or `None` when no Postgres is
+/// configured and the suite is not running in required mode.
+async fn outbox() -> Option<(PostgresJournal, String)> {
+    let dsn = crate::test_services::postgres_dsn()?;
+    let schema = format!(
+        "secret_redaction_outbox_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("a monotonic wall clock")
+            .as_nanos()
+    );
+    let mut config: Config = dsn.parse().expect("a parseable test DSN");
+    config.connect_timeout(Duration::from_secs(5));
+    let (client, connection) = config
+        .connect(crate::usage::tls_connector())
+        .await
+        .expect("a connection to create the test schema");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .expect("a fresh test schema");
+    let journal = PostgresJournal::connect(
+        &dsn,
+        PostgresJournalSettings {
+            schema: Some(schema.clone()),
+            create_schema: true,
+            ..PostgresJournalSettings::default()
+        },
+    )
+    .await
+    .expect("an outbox on the test schema");
+    Some((journal, schema))
+}
+
+/// The billing-grade path stores a usage record on disk, which the telemetry
+/// grade never did — so the durable sweep has to cover the outbox too, not just
+/// the control plane's journal.
+///
+/// The record is not synthesised: it is the one a request authenticated with the
+/// inbound sentinel and served with the provider sentinel actually produced, so
+/// what is swept is the row a real billing-grade deployment would keep, `record`
+/// column and all.
+#[tokio::test]
+async fn no_usage_outbox_row_carries_secret_material() {
+    let Some((outbox, schema)) = outbox().await else {
+        return;
+    };
+    let sweep = sweep();
+
+    let provider = FakeProvider::serving().await;
+    let usage = CapturingSink::default();
+    let replica = Replica::with_sinks(&provider, vec![Box::new(usage.clone())]);
+    replica
+        .secrets
+        .seed(owner(), first(), PROVIDER_MATERIAL, SecretLifecycle::Active);
+    replica
+        .publish(
+            "first",
+            state_pinning(first(), ResourceVersionNumber::FIRST),
+        )
+        .await;
+    replica.converge().await;
+
+    let response = router(replica.state.clone())
+        .oneshot(chat_request())
+        .await
+        .expect("a response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The tripwire: both sentinels were genuinely in play for the request whose
+    // record is about to be made durable.
+    sweep.assert_present(
+        "the fake provider",
+        "provider",
+        provider.presented().last().expect("a served request"),
+    );
+    let records = usage.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let request_id = records[0].request_id.clone();
+
+    for record in records {
+        let event = UsageEvent::new(ObservedRecord::now(record)).expect("a usage event");
+        outbox.append(&event).await.expect("a durable append");
+    }
+
+    let rows = dump(&schema).await;
+    sweep.assert_absent("the usage outbox's durable rows", &rows);
+    assert!(
+        rows.contains(&request_id),
+        "the event must actually be in the outbox, or the sweep proves nothing"
+    );
 }

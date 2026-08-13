@@ -109,7 +109,12 @@ the usage record instead.
 `axond.http.*` covers every HTTP request — including ones that never reach a
 provider — with low-cardinality dimensions. `axond.request.*` /
 `axond.upstream.*` are emitted from the single canonical usage record, so a
-metric and a usage row can never disagree.
+metric never reports a different value than the usage row it came from. They
+count what the upstream actually did, which is also what the budget was charged:
+a billing-grade request whose event could not be journaled is counted here and
+refused to the caller, so `axond.request.count` can exceed the usage rows a
+destination receives by exactly what the refusals in
+`axond.usage.journal.appends` and `axond.usage.journal.lost` report.
 
 | Instrument | Type | Dimensions | Use it for |
 | --- | --- | --- | --- |
@@ -126,9 +131,19 @@ metric and a usage row can never disagree.
 | `axond.upstream.errors` | counter | same | Upstream failure rate by target. |
 | `axond.upstream.timeouts` | counter | `axond.target.provider`, `axond.target.model`, `axond.timeout`, `axond.timeout.bound` | Which phase stalled — `connect`, `response_headers`, `buffered_body`, `stream_idle`, or `overall` (nothing was dispatched) — and whether the `phase` bound or the remaining `walk_budget` ended the wait. |
 | `axond.upstream.circuit_state` | gauge | `axond.target.provider`, `axond.target.model` | `0` closed, `1` half-open, `2` open. |
-| `axond.usage.records_written` | counter | `axond.usage_sink` | Records a sink acknowledged. |
-| `axond.usage.records_dropped` | counter | `axond.usage_sink`, `axond.drop_reason` | Records discarded rather than delaying a request. `shutdown` means the termination flush could not write them. |
+| `axond.usage.records_written` | counter | `axond.usage_sink` | Records a sink acknowledged. In billing-grade mode the delivery worker emits it, for records a destination accepted. |
+| `axond.usage.records_dropped` | counter | `axond.usage_sink`, `axond.drop_reason` | Records discarded rather than delaying a request. `shutdown` means the termination flush could not write them. Billing-grade mode has no buffer to drop from: a failed write stays journaled, so watch `axond.usage.journal.lost` there instead. |
 | `axond.usage.flushes` | counter | `axond.usage_sink`, `axond.flush_outcome` | Termination flushes of a buffered sink: `flushed`, `failed`, or `timeout`. |
+| `axond.usage.journal.appends` | counter | `axond.usage_journal`, `axond.journal.outcome` | Billing-grade appends. Anything but `accepted` / `already_present` is a request refused or an event lost. |
+| `axond.usage.journal.deliveries` | counter | `axond.usage_journal`, `axond.usage_journal.consumer`, `axond.journal.delivery` | Journaled events handed to their destinations. |
+| `axond.usage.journal.depth` | gauge | `axond.usage_journal`, `axond.usage_journal.consumer` | Events awaiting delivery. Read against `axond.usage.journal.capacity`. |
+| `axond.usage.journal.in_flight` | gauge | same | Events under an unexpired lease. |
+| `axond.usage.journal.oldest_pending_age` | gauge (s) | same | How far behind delivery is; a depth alone does not say. |
+| `axond.usage.journal.capacity` | gauge | `axond.usage_journal` | Configured `max_events`, so depth is readable as a fraction. |
+| `axond.usage.journal.quarantined` | counter | `axond.usage_journal`, `axond.usage_journal.consumer`, `axond.journal.poison_reason` | Events set aside as poison: `malformed`, `rejected`, `attempts_exhausted`. |
+| `axond.usage.journal.quarantined_events` | gauge | `axond.usage_journal`, `axond.usage_journal.consumer` | Quarantined events still retained, each waiting on a human. |
+| `axond.usage.journal.undeliverable` | counter | `axond.usage_journal`, `axond.journal.reason` | Rows this build declined to deliver: `schema_ahead` (a newer build wrote it) or `corrupt`. |
+| `axond.usage.journal.lost` | counter | `axond.usage_journal`, `axond.journal.loss_reason` | Events a billing-grade deployment gave up: served under `on_undurable = "serve"`, dropped for capacity, terminal, or refused after the caller had already hung up. The only data-loss counter of this mode. |
 | `axond.shutdown.phase` | gauge | — | `0` serving, `1` draining (readiness fails, still admitting), `2` admission closed. |
 | `axond.shutdown.rejected_requests` | counter | — | Requests refused with `503 draining` after admission closed. |
 | `axond.shutdown.abandoned_requests` | counter | — | Requests still in flight when the shutdown deadline cut them. |
@@ -171,6 +186,10 @@ renamed instrument cannot leave an alert silently matching nothing.
 | --- | --- | --- |
 | Usage is being lost | `axond.usage.records_dropped` rate > 0, sustained | Spend data is gone and will not come back. Buffer or destination is undersized. |
 | Spend lost at termination | `axond.usage.records_dropped{axond.drop_reason="shutdown"}` > 0, or `axond.usage.flushes{axond.flush_outcome!="flushed"}` > 0 | A replica exited before its buffered records landed. Raise `shutdown.flush_timeout_ms` (and the stopping timeout with it), or check the sink. |
+| A billing-grade deployment lost usage | `axond.usage.journal.lost` > 0 | **Page.** A billable event is gone: either `on_undurable = "serve"` or `capacity_policy = "drop-oldest"` was exercised, or a terminal path could not journal. |
+| Billing-grade requests are being refused | `axond.usage.journal.appends{axond.journal.outcome!="accepted",!="already_present"}` rising | Callers are getting `503 usage_not_durable`. Usually the outbox is full because delivery has stalled, not because appends are too fast. |
+| The outbox is filling | `axond.usage.journal.depth` above ~half `axond.usage.journal.capacity`, or `oldest_pending_age` beyond minutes | Delivery is falling behind, and at capacity the default policy starts refusing requests. Check the destinations before raising `max_events`. |
+| Usage events need reconciliation | `axond.usage.journal.quarantined_events` > 0 | Poison left the delivery path so it would stop blocking its ordering key; the rows are on disk waiting for a decision ([usage outbox](./operations/usage-outbox.md#recovery)). |
 | Rollouts are cutting streams | `axond.shutdown.abandoned_requests` > 0 per rollout | Callers hold streams longer than `shutdown.deadline_ms`; their responses end mid-stream. |
 | A replica is stuck draining | `axond.shutdown.phase` ≥ 1 for longer than `drain_grace_ms + deadline_ms + flush_timeout_ms` | The orchestrator sent `SIGTERM` but the process is not going away; expect a `SIGKILL` and lost buffered usage. |
 | A target is out | `axond.upstream.circuit_state = 2`, sustained | Every request is failing over (or failing) for that target. |
@@ -258,6 +277,13 @@ in [`docs/usage-schema.md`](./usage-schema.md).
 
 Records carry the credential's **label** (`credential_id`) and the gateway key's
 **env-var name** (`subject`) — never a secret.
+
+Delivery is telemetry-grade by default: a stalled destination drops records with
+a count rather than delaying a request, so a missing record is possible and
+visible. `[usage_journal] backend = "postgres"` opts into billing-grade delivery
+instead — durable before the response, replayed until the destinations
+acknowledge it — with its own metrics above and its own runbook in
+[billing-grade usage outbox](./operations/usage-outbox.md).
 
 ## Failure modes
 

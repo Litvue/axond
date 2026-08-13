@@ -1384,7 +1384,17 @@ async fn serve(
         Ok(response) => {
             let usage = to_usage(&response.usage);
             let cost = served.price.cost_microdollars(usage);
+            // Settled first, and not because the record does not matter: the
+            // spend was incurred upstream whether or not the record survives,
+            // and the append that follows is the first await long enough for a
+            // caller to disconnect inside. A handler dropped there would run the
+            // guard's release and hand back the whole estimate instead of the
+            // measured cost, so the charge is made while nothing can cancel it.
             reservation.settle(cost).await;
+            // Then the record, before the response is acknowledged: in
+            // billing-grade mode this is the durable append, and a request whose
+            // usage is not durable must not be answered `200`. In
+            // telemetry-grade mode the fan-out cannot fail.
             record_usage(
                 &state,
                 RecordArgs {
@@ -1406,7 +1416,7 @@ async fn serve(
                     attempts: outcome.attempts,
                 },
             )
-            .await;
+            .await?;
             Ok(Json(response.body).into_response())
         }
         Err(err) => {
@@ -1417,7 +1427,10 @@ async fn serve(
             // zero — the streamed path, which can measure what it relayed,
             // charges its partial spend.
             reservation.release().await;
-            record_usage(
+            // The upstream failure is what the caller is told about, so the
+            // record is best-effort here: a `503` about the outbox would hide the
+            // provider error that actually ended the request.
+            record_usage_terminal(
                 &state,
                 RecordArgs {
                     identity: &identity,
@@ -2520,7 +2533,78 @@ struct RecordArgs<'a> {
     attempts: u32,
 }
 
-async fn record_usage(state: &AppState, args: RecordArgs<'_>) {
+/// Build the record and hand it to usage delivery. The `Err` is billing-grade
+/// only: it means the event is not durable and the configured policy is to
+/// refuse rather than serve.
+async fn record_usage(state: &AppState, args: RecordArgs<'_>) -> Result<(), GatewayError> {
+    let (record, ttft_ms, attempts) = build_record(args);
+    telemetry::record_request(&record, ttft_ms, attempts);
+    // Fan-out delivery is a non-blocking hand-off, so it has no cancellation
+    // window worth detaching for and stays on the handler.
+    if !state.0.usage.appends() {
+        return state.0.usage.record(&record).await.map_err(|error| {
+            GatewayError::UsageNotDurable {
+                reason: error.reason,
+            }
+        });
+    }
+    // The billing-grade append is a database transaction, and hyper drops the
+    // handler future the moment the caller hangs up: a cancelled append would
+    // leave a charge already settled with no record of it anywhere and nothing
+    // counting the loss. Run as a settlement — the same tracking the streamed
+    // path uses, so shutdown waits for it — the append finishes whatever the
+    // connection does, and the handler awaits only the verdict its status code
+    // needs.
+    let (verdict, decided) = tokio::sync::oneshot::channel();
+    let recording = state.clone();
+    crate::streaming::spawn_settlement(async move {
+        // A refusal the handler is still there to receive is not a loss — the
+        // caller is told to retry and its spend is unwound. Once the handler is
+        // gone that answer reaches nobody, so an event that could not be
+        // journaled is a billable fact that no longer exists anywhere and is
+        // counted as one.
+        if let Err(Err(unheard)) = verdict.send(recording.0.usage.record(&record).await) {
+            recording.0.usage.count_unheard_refusal(&unheard);
+        }
+    });
+    match decided.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(GatewayError::UsageNotDurable {
+            reason: error.reason,
+        }),
+        // The settlement went down with the runtime, so nothing is known about
+        // the event; the honest answer is the one that does not claim it is
+        // billable.
+        Err(_) => Err(GatewayError::UsageNotDurable {
+            reason: "the durable append did not report before the runtime stopped",
+        }),
+    }
+}
+
+/// Record where the request is already ending for another reason, so a failure
+/// to journal can only be reported and counted.
+async fn record_usage_terminal(state: &AppState, args: RecordArgs<'_>) {
+    let (record, ttft_ms, attempts) = build_record(args);
+    telemetry::record_request(&record, ttft_ms, attempts);
+    if !state.0.usage.appends() {
+        state.0.usage.record_terminal(&record).await;
+        return;
+    }
+    // Detached for the same reason [`record_usage`] is: the request this
+    // describes already failed, so nothing here changes the response, but a
+    // caller hanging up must not be what decides whether the attempt was
+    // recorded. Awaited anyway while the handler lives, so an uncancelled
+    // request still reaches its sinks before it answers.
+    let (done, recorded) = tokio::sync::oneshot::channel();
+    let recording = state.clone();
+    crate::streaming::spawn_settlement(async move {
+        recording.0.usage.record_terminal(&record).await;
+        let _ = done.send(());
+    });
+    let _ = recorded.await;
+}
+
+fn build_record(args: RecordArgs<'_>) -> (UsageRecord, Option<u64>, u32) {
     let ttft_ms = args.ttft_ms;
     let attempts = args.attempts;
     let record = UsageRecord {
@@ -2545,8 +2629,7 @@ async fn record_usage(state: &AppState, args: RecordArgs<'_>) {
         latency_ms: args.latency_ms,
         attempts,
     };
-    telemetry::record_request(&record, ttft_ms, attempts);
-    state.0.usage.record(&record).await;
+    (record, ttft_ms, attempts)
 }
 
 #[cfg(test)]
@@ -2554,7 +2637,7 @@ mod tests {
     use super::*;
     use crate::aliases::AliasScope;
     use crate::budget::NoBudget;
-    use crate::config::Config;
+    use crate::config::{Config, UndurablePolicy};
     use crate::convergence::status::testing::ManualClock;
     use crate::convergence::{Rejection, RevisionStatus, SnapshotSource};
     use crate::desired_state::fixtures::revision_id;
@@ -2564,7 +2647,8 @@ mod tests {
     use crate::status::registry::{CachedStatusRegistry, StatusRefresher, StatusSettings};
     use crate::status::{Component, ComponentObservation, ComponentState, StatusReason};
     use crate::usage::identity::RequestId;
-    use crate::usage::{StdoutSink, UsageFanout, UsageSink};
+    use crate::usage::journal::{self, UsageJournal as _};
+    use crate::usage::{StdoutSink, UsageDelivery, UsageFanout, UsageSink};
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use http_body_util::BodyExt;
@@ -6035,6 +6119,328 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(records[0].target_model, "m-b");
         assert_eq!(records[0].credential_id, "cred-b");
         assert_eq!(records[0].attempts, 2);
+    }
+
+    /// One provider that answers, whose usage delivery is billing-grade over the
+    /// given outbox. Everything else is the ordinary buffered path.
+    fn billing_state(base_url: &str, journal: Arc<dyn journal::UsageJournal>) -> AppState {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "pa"
+kind = "openai"
+base_url = "{base_url}"
+
+{GATEWAY_KEY}
+
+[[credential]]
+namespace = "platform"
+provider = "pa"
+env = "KA"
+id = "cred-a"
+
+[[model]]
+name = "gpt-4o"
+targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 1000000 }} }}]
+"#
+        ))
+        .unwrap();
+        AppState::with_resources(
+            cfg,
+            &env_with([("KA", "ka")]),
+            Arc::new(UsageDelivery::billing(journal, UndurablePolicy::Refuse)),
+            Box::new(NoBudget),
+            Box::new(NoLimit),
+            Box::new(crate::revocation::NoDenylist),
+            ReplicaObservability::stateless(),
+        )
+        .unwrap()
+    }
+
+    /// The billing-grade promise as a caller sees it: a `200` means the event is
+    /// already in the outbox, so a reader of the outbox alone can reconstruct
+    /// every request that was reported as served.
+    #[tokio::test]
+    async fn a_billing_grade_request_is_answered_only_once_its_usage_is_durable() {
+        let (url, _) = controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let outbox = Arc::new(journal::oracle::InMemoryUsageJournal::new());
+        let state = billing_state(&url, outbox.clone());
+
+        let response = router(state).oneshot(chat_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let claimed = outbox
+            .claim(
+                &journal::ConsumerId::parse("billing").unwrap(),
+                journal::Claim {
+                    max_events: 8,
+                    lease: Duration::from_secs(30),
+                    now: SystemTime::now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1, "the served request is journaled");
+        let record = claimed[0].event.record();
+        assert_eq!(record.status.as_str(), "ok");
+        assert_eq!(record.target_provider, "pa");
+        RequestId::parse(&record.request_id).expect("the journaled event carries its identity");
+    }
+
+    /// The refusal that makes the promise worth anything: with nowhere durable to
+    /// put the event, the request is answered `503 usage_not_durable` rather than
+    /// `200` for spend nothing can bill. The upstream call already happened — the
+    /// gateway cannot un-spend it — so the refusal is about what it *claims*, and
+    /// a `[usage_journal] on_undurable = "serve"` deployment gets the other trade.
+    #[tokio::test]
+    async fn a_full_outbox_refuses_the_request_rather_than_reporting_unbillable_success() {
+        let (url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let outbox = Arc::new(journal::oracle::InMemoryUsageJournal::with_capacity(
+            journal::Capacity {
+                max_events: 0,
+                ..journal::Capacity::BILLING_GRADE
+            },
+        ));
+        let state = billing_state(&url, outbox.clone());
+
+        let response = router(state).oneshot(chat_request()).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "usage_not_durable");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the provider did answer");
+        assert!(
+            outbox
+                .stats(&journal::ConsumerId::parse("billing").unwrap())
+                .await
+                .unwrap()
+                .is_drained(),
+            "nothing was journaled, which is what the refusal reports"
+        );
+    }
+
+    /// A journal whose append takes long enough for a caller to hang up inside
+    /// it, which is the whole window the cancellation regression is about.
+    struct SlowAppend {
+        inner: journal::oracle::InMemoryUsageJournal,
+        append_takes: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl journal::UsageJournal for SlowAppend {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn capacity(&self) -> journal::Capacity {
+            self.inner.capacity()
+        }
+
+        fn mode(&self) -> journal::DeliveryMode {
+            self.inner.mode()
+        }
+
+        async fn append(
+            &self,
+            event: &journal::UsageEvent,
+        ) -> Result<journal::Appended, journal::JournalError> {
+            tokio::time::sleep(self.append_takes).await;
+            self.inner.append(event).await
+        }
+
+        async fn claim(
+            &self,
+            consumer: &journal::ConsumerId,
+            claim: journal::Claim,
+        ) -> Result<Vec<journal::Delivery>, journal::JournalError> {
+            self.inner.claim(consumer, claim).await
+        }
+
+        async fn ack(&self, delivery: &journal::DeliveryId) -> Result<(), journal::JournalError> {
+            self.inner.ack(delivery).await
+        }
+
+        async fn quarantine(
+            &self,
+            delivery: &journal::DeliveryId,
+            reason: journal::PoisonReason,
+        ) -> Result<(), journal::JournalError> {
+            self.inner.quarantine(delivery, reason).await
+        }
+
+        async fn relinquish(
+            &self,
+            delivery: &journal::DeliveryId,
+        ) -> Result<(), journal::JournalError> {
+            self.inner.relinquish(delivery).await
+        }
+
+        async fn stats(
+            &self,
+            consumer: &journal::ConsumerId,
+        ) -> Result<journal::JournalStats, journal::JournalError> {
+            self.inner.stats(consumer).await
+        }
+    }
+
+    /// The other half of the billing-grade promise: a caller that hangs up while
+    /// its usage is being appended does not take the record with it. The spend
+    /// was settled before the append, so a cancelled append would charge a
+    /// budget for a request no outbox reader can see — and, because the handler
+    /// is simply dropped, nothing would report it either.
+    #[tokio::test]
+    async fn a_caller_hanging_up_during_the_append_still_journals_its_usage() {
+        let (url, _) = controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let outbox = Arc::new(SlowAppend {
+            inner: journal::oracle::InMemoryUsageJournal::new(),
+            append_takes: Duration::from_millis(200),
+        });
+        let state = billing_state(&url, outbox.clone());
+
+        let mut serving = Box::pin(router(state).oneshot(chat_request()));
+        tokio::select! {
+            _ = &mut serving => panic!("the request answered before the append could be cut off"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        // The caller hangs up: hyper drops the handler future exactly like this.
+        drop(serving);
+
+        let consumer = journal::ConsumerId::parse("billing").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let stats = outbox.stats(&consumer).await.unwrap();
+            if stats.pending == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the abandoned request never reached the outbox: {stats:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A journal that refuses every append, slowly enough for the caller to
+    /// hang up inside one.
+    struct SlowRefusal(Duration);
+
+    #[async_trait::async_trait]
+    impl journal::UsageJournal for SlowRefusal {
+        fn name(&self) -> &'static str {
+            "slow-refusal"
+        }
+
+        fn capacity(&self) -> journal::Capacity {
+            journal::Capacity::BILLING_GRADE
+        }
+
+        fn mode(&self) -> journal::DeliveryMode {
+            journal::DeliveryMode::BillingGrade
+        }
+
+        async fn append(
+            &self,
+            _event: &journal::UsageEvent,
+        ) -> Result<journal::Appended, journal::JournalError> {
+            tokio::time::sleep(self.0).await;
+            Err(journal::JournalError::Backend(
+                "the outbox is unreachable".to_owned(),
+            ))
+        }
+
+        async fn claim(
+            &self,
+            _consumer: &journal::ConsumerId,
+            _claim: journal::Claim,
+        ) -> Result<Vec<journal::Delivery>, journal::JournalError> {
+            Ok(Vec::new())
+        }
+
+        async fn ack(&self, _delivery: &journal::DeliveryId) -> Result<(), journal::JournalError> {
+            Ok(())
+        }
+
+        async fn quarantine(
+            &self,
+            _delivery: &journal::DeliveryId,
+            _reason: journal::PoisonReason,
+        ) -> Result<(), journal::JournalError> {
+            Ok(())
+        }
+
+        async fn relinquish(
+            &self,
+            _delivery: &journal::DeliveryId,
+        ) -> Result<(), journal::JournalError> {
+            Ok(())
+        }
+
+        async fn stats(
+            &self,
+            _consumer: &journal::ConsumerId,
+        ) -> Result<journal::JournalStats, journal::JournalError> {
+            Ok(journal::JournalStats {
+                pending: 0,
+                in_flight: 0,
+                quarantined: 0,
+                oldest_pending_age: None,
+                dropped: 0,
+                capacity: journal::Capacity::BILLING_GRADE,
+            })
+        }
+    }
+
+    /// A refusal is only a refusal while there is somebody to refuse: the caller
+    /// gets `503`, and the event it describes comes back with the retry. Once
+    /// the caller has hung up, that answer reaches nobody while the spend stays
+    /// settled, so the failed append is a billable fact that exists nowhere —
+    /// and the one counter an operator watches for exactly that has to move.
+    #[tokio::test]
+    async fn an_append_that_fails_after_the_caller_hung_up_is_counted_as_lost() {
+        let (url, _) = controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let state = billing_state(&url, Arc::new(SlowRefusal(Duration::from_millis(200))));
+        let usage = Arc::clone(&state.0.usage);
+
+        let mut serving = Box::pin(router(state).oneshot(chat_request()));
+        tokio::select! {
+            _ = &mut serving => panic!("the request answered before the append could be cut off"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        drop(serving);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while usage.unheard_refusals() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the refusal nobody heard was never counted as a loss"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The other side of that rule: a caller still on the connection is told
+    /// `503` and can retry, so the event is not lost and must not be counted as
+    /// though it were.
+    #[tokio::test]
+    async fn a_refusal_the_caller_receives_is_not_counted_as_a_loss() {
+        let (url, _) = controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let state = billing_state(&url, Arc::new(SlowRefusal(Duration::ZERO)));
+        let usage = Arc::clone(&state.0.usage);
+
+        let response = router(state).oneshot(chat_request()).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            usage.unheard_refusals(),
+            0,
+            "a refusal the caller received is a retry, not a loss"
+        );
     }
 
     /// The identity contract as the buffered path delivers it: every settled
