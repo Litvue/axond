@@ -2199,6 +2199,7 @@ impl Config {
         self.validate_process_local_bounds()?;
         self.validate_usage_sinks()?;
         self.validate_hot_state_connectivity()?;
+        self.validate_budget_layout()?;
         self.validate_revocation()?;
         Ok(())
     }
@@ -2808,6 +2809,46 @@ impl Config {
         Ok(())
     }
 
+    /// The one budget rule a *stateful* file still owns: whether the ledger's
+    /// keys carry a scope-wide cap.
+    ///
+    /// Split out of [`Config::validate_budget`] because that gate reads values
+    /// the control plane publishes in stateful mode, so stateful boot does not
+    /// run it — and this layout claim is only meaningful in exactly that mode.
+    /// Left inside it, the check would fire only where it cannot apply, and a
+    /// stateful file declaring `namespace_scope` on a per-replica backend would
+    /// boot and then refuse every published revision instead of refusing to
+    /// start.
+    fn validate_budget_layout(&self) -> Result<(), ConfigError> {
+        let budget = &self.budget;
+        let backend = budget.backend.as_str();
+        if !budget.namespace_scope {
+            return Ok(());
+        }
+        if !budget.backend.is_shared() {
+            return Err(ConfigError::Invalid(format!(
+                "budget `{backend}`: namespace_scope is supported only by `redis` and \
+                 `postgres`, which enforce a scope-wide cap exactly across replicas"
+            )));
+        }
+        if budget.namespace_limit_microdollars.is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "budget `{backend}`: namespace_limit_microdollars already declares the \
+                 scope-wide layout, so namespace_scope restates it. Set the limit in \
+                 stateless mode, and namespace_scope in stateful mode, where the limit is \
+                 published rather than declared"
+            )));
+        }
+        if self.mode != Mode::Stateful {
+            return Err(ConfigError::Invalid(format!(
+                "budget `{backend}`: namespace_scope declares a layout whose cap the control \
+                 plane publishes, so it is only meaningful under `mode = \"stateful\"`. Set \
+                 namespace_limit_microdollars instead"
+            )));
+        }
+        Ok(())
+    }
+
     /// A budget's fields only make sense together: a cap of zero would deny
     /// every request, and a shared backend without a DSN reference cannot
     /// enforce anything.
@@ -2829,29 +2870,7 @@ impl Config {
             }
             _ => {}
         }
-        if budget.namespace_scope {
-            if !budget.backend.is_shared() {
-                return Err(ConfigError::Invalid(format!(
-                    "budget `{backend}`: namespace_scope is supported only by `redis` and \
-                     `postgres`, which enforce a scope-wide cap exactly across replicas"
-                )));
-            }
-            if budget.namespace_limit_microdollars.is_some() {
-                return Err(ConfigError::Invalid(format!(
-                    "budget `{backend}`: namespace_limit_microdollars already declares the \
-                     scope-wide layout, so namespace_scope restates it. Set the limit in \
-                     stateless mode, and namespace_scope in stateful mode, where the limit is \
-                     published rather than declared"
-                )));
-            }
-            if self.mode != Mode::Stateful {
-                return Err(ConfigError::Invalid(format!(
-                    "budget `{backend}`: namespace_scope declares a layout whose cap the control \
-                     plane publishes, so it is only meaningful under `mode = \"stateful\"`. Set \
-                     namespace_limit_microdollars instead"
-                )));
-            }
-        }
+        self.validate_budget_layout()?;
         if budget.backend == BudgetBackend::None {
             return Ok(());
         }
@@ -4813,6 +4832,30 @@ dsn_env = "AXOND_REDIS_URL"
             matches!(error, ConfigError::Invalid(ref message) if message.contains("dsn_env")),
             "{error:?}"
         );
+    }
+
+    /// `namespace_scope` is the one budget key stateful mode reads, and it is
+    /// only meaningful there — so stateful boot, which skips the value gate the
+    /// control plane owns, must still refuse a layout no per-replica backend can
+    /// hold. Otherwise the replica boots and refuses every published revision
+    /// forever, which is the same misconfiguration reported far from its cause.
+    #[test]
+    fn stateful_boot_refuses_a_scope_wide_layout_the_backend_cannot_enforce() {
+        for backend in ["none", "in-memory"] {
+            let toml =
+                format!("{STATEFUL}\n[budget]\nbackend = \"{backend}\"\nnamespace_scope = true\n");
+            let error = Config::from_toml_str(&toml)
+                .expect_err("a per-replica ledger cannot carry a fleet-wide scope");
+            assert!(
+                matches!(error, ConfigError::Invalid(ref message)
+                    if message.contains("namespace_scope is supported only by")),
+                "{backend}: {error:?}"
+            );
+        }
+        let toml = format!(
+            "{STATEFUL}\n[budget]\nbackend = \"redis\"\ndsn_env = \"AXOND_REDIS_URL\"\nnamespace_scope = true\n"
+        );
+        Config::from_toml_str(&toml).expect("a shared backend may declare the layout");
     }
 
     /// Cold boot in stateful mode requires Postgres, so a bootstrap without a
