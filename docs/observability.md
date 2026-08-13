@@ -62,13 +62,17 @@ summary.
 
 A stateless replica reports every component `disabled` — that is the correct
 answer, not a degraded one — because no component is *enabled*, and an enabled
-component is one this deployment configured. **That is the answer on every
-release so far**: nothing yet constructs a `StatusRefresher`, so no component is
-observed, and the three `axond.status.*` instruments are not produced at all.
-The route, its scoping, and its redaction ship now; each stateful slice injects
-the refresher for the backend it owns through the same seam
-(`ReplicaObservability`), and neither the response shape nor the metric names
-change when it does:
+component is one this deployment configured. A stateless replica opens no store,
+so it observes nothing and produces no `axond.status.*` series at all.
+
+A replica in `mode = "stateful"` observes **the control plane**, on the same
+connection its administrative surface was built on rather than a second pool of
+its own: a diagnostic that probed a path no administrative request takes is how
+status reports `ok` throughout an outage of the thing being asked about. That is
+the one live component today. Every other durable backend is still `disabled`
+until the slice that owns it injects a probe through the same seam
+(`ReplicaObservability::observing`), and neither the response shape nor the
+metric names change when it does:
 
 ```bash
 curl -sS -H "Authorization: Bearer $AXOND_KEY" http://localhost:8080/admin/v1/status

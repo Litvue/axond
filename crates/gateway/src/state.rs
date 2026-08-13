@@ -25,8 +25,10 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::admission::{AdmissionControl, DiagnosticCredential};
 use crate::aliases::AliasScope;
 use crate::availability::AvailabilityIndex;
+use crate::backends::control_plane::ControlPlaneStore;
 use crate::budget::BudgetStore;
 use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind};
+use crate::convergence::SystemClock;
 use crate::convergence::secrets::ResolvedSecrets;
 use crate::convergence::{RevisionReport, RevisionStatus};
 use crate::credentials::{CredentialError, Credentials};
@@ -43,7 +45,9 @@ use crate::rate_limit::NoLimit;
 use crate::rate_limit::RateLimiter;
 use crate::revocation::RevocationStore;
 use crate::shutdown::Lifecycle;
-use crate::status::registry::CachedStatusRegistry;
+use crate::status::Component;
+use crate::status::probes::ControlPlaneProbe;
+use crate::status::registry::{CachedStatusRegistry, StatusRefresher, StatusSettings};
 use crate::usage::UsageDelivery;
 #[cfg(test)]
 use crate::usage::UsageFanout;
@@ -108,6 +112,41 @@ impl ReplicaObservability {
             status: Arc::new(CachedStatusRegistry::stateless()),
             revision: None,
         }
+    }
+
+    /// The stateful posture: the control plane this replica administers against
+    /// is observed on the same store administration uses, and every component
+    /// this deployment does not have stays `disabled`.
+    ///
+    /// The refresher is returned rather than spawned so the caller owns its
+    /// lifetime: it has to stop with the process, and a task spawned out of a
+    /// constructor would outlive the drain that is supposed to end it.
+    ///
+    /// Enabling a component is what decides whether it is probed at all, so this
+    /// is also the list of what a status read can say something about — adding a
+    /// backend here without a probe would report it `unavailable`/`stale`
+    /// forever rather than `disabled`.
+    pub fn observing(control_plane: Arc<dyn ControlPlaneStore>) -> (Self, StatusRefresher) {
+        let settings = StatusSettings {
+            enabled: vec![Component::ControlPlane],
+            ..StatusSettings::default()
+        };
+        debug_assert!(settings.validate().is_ok(), "the shipped pacing is valid");
+        let status = Arc::new(CachedStatusRegistry::new(settings, Arc::new(SystemClock)));
+        let refresher = StatusRefresher::new(
+            Arc::clone(&status),
+            vec![Arc::new(ControlPlaneProbe::new(control_plane))],
+        );
+        (
+            Self {
+                status,
+                // Still `None`: no release constructs a reconciler, so there is
+                // no convergence state to report and an empty report would be a
+                // false all-clear (#142).
+                revision: None,
+            },
+            refresher,
+        )
     }
 }
 
@@ -618,7 +657,8 @@ impl AppState {
     }
 
     /// Test-only: production builds go through [`AppState::new_with_policy`],
-    /// which threads the one [`PolicyRuntime`] the backends read.
+    /// which threads the one [`PolicyRuntime`] the backends read and the
+    /// observability the mode it booted in decides.
     #[cfg(test)]
     pub fn new_with_rate_limiter(
         config: Config,

@@ -28,8 +28,8 @@ use super::auth::{
 };
 use super::router::{self, AdminApi};
 use super::service::AdminService;
-use crate::backends::control_plane::ControlPlaneError;
 use crate::backends::control_plane::postgres::{ControlPlaneSettings, PostgresControlPlane};
+use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::config::{AdminBreakglass, Config, KeyMaterialSource, Mode};
 use crate::desired_state::ResourceScope;
 use crate::key_material::{self, KeyMaterialError};
@@ -63,16 +63,23 @@ pub enum BootError {
 /// the real table over a Postgres control plane and the configured breakglass
 /// authority.
 ///
+/// The store is handed back beside the router because the replica diagnostic
+/// observes the *same* connection administration uses. A second pool opened for
+/// probing would report on a path no administrative request takes, which is the
+/// shape of bug where status says `ok` throughout an outage of the thing being
+/// asked about.
+///
 /// The router is merged into the inference router rather than served on a second
 /// listener: the surfaces are separated by authentication and state, which is
 /// what makes an inference key powerless here — a second port would only make
 /// them separated by firewall rules.
-pub async fn surface(
-    config: &Config,
-    env: &HashMap<String, String>,
-) -> Result<(Router, &'static str), BootError> {
+pub async fn surface(config: &Config, env: &HashMap<String, String>) -> Result<Surface, BootError> {
     if config.mode == Mode::Stateless {
-        return Ok((router::refusing_router(), "stateless"));
+        return Ok(Surface {
+            router: router::refusing_router(),
+            mode: "stateless",
+            control_plane: None,
+        });
     }
     let (Some(control_plane), Some(breakglass)) = (
         config.control_plane.as_ref(),
@@ -92,15 +99,30 @@ pub async fn surface(
                 .unwrap_or("dsn_env")
                 .to_owned(),
         })?;
-    let store =
+    let store: Arc<dyn ControlPlaneStore> = Arc::new(
         PostgresControlPlane::connect(dsn, ControlPlaneSettings::from_config(control_plane))
-            .await?;
+            .await?,
+    );
     let api = AdminApi::new(
-        Arc::new(AdminService::stateful(Arc::new(store))),
+        Arc::new(AdminService::stateful(Arc::clone(&store))),
         Arc::new(authenticator),
         Arc::new(BreakglassAuthorizer),
     );
-    Ok((router::router(Arc::new(api)), "stateful"))
+    Ok(Surface {
+        router: router::router(Arc::new(api)),
+        mode: "stateful",
+        control_plane: Some(store),
+    })
+}
+
+/// What administration brought up, and what the diagnostic may observe.
+pub struct Surface {
+    pub router: Router,
+    /// The posture this process booted in, for the log line that records it.
+    pub mode: &'static str,
+    /// The store administration was built on, or `None` in stateless mode where
+    /// no store is opened at all.
+    pub control_plane: Option<Arc<dyn ControlPlaneStore>>,
 }
 
 /// Authenticates the one configured breakglass credential.

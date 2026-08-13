@@ -46,14 +46,22 @@
 //! identifier in any scope, so there is no cross-tenant metadata to leak in the
 //! first place.
 //!
-//! # Contract only
+//! # What is observed
 //!
-//! No probe implementations live here and nothing in `serve` constructs a
-//! registry: the backends whose health this would report are themselves contract
-//! only ([`crate::backends`], [`crate::convergence`]). This slice is the shape,
-//! the redaction, and the tests — wiring it to live backends is the stateful
-//! runtime landing, not a second status design.
+//! One component, today: a replica in `mode = "stateful"` probes the control
+//! plane ([`probes::ControlPlaneProbe`]) on the store its administrative surface
+//! was built on, wired in
+//! [`ReplicaObservability::observing`](crate::state::ReplicaObservability::observing).
+//! A stateless replica opens no store and observes nothing.
+//!
+//! Every other component reports [`ComponentState::Disabled`] until the slice
+//! that owns its backend adds a probe and enables it — the two go together, since
+//! an enabled component with no probe is one that never gets observed and ages
+//! into `unavailable`. Convergence is the other half and is still absent: no
+//! release constructs a reconciler, so [`StatusResponse::revision`] is `null`
+//! everywhere (#142).
 
+pub mod probes;
 pub mod registry;
 
 #[cfg(test)]

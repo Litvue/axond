@@ -10,13 +10,17 @@ dashboards and alert rules under [`ops/observability/`](../../ops/observability/
 are the same signals as assets you can import, and every rule's `runbook_url`
 points at a section of this page.
 
-**What is live today.** Two families are not produced by any release yet, because
-nothing in `serve` constructs the loop that produces them.
+**What is live today.** One family is partly live and one is not produced at all.
 
-* **Status.** No status refresher is constructed, so
-  `axond_status_component_state`, `axond_status_observation_age`, and
-  `axond_status_refreshes` are absent on every deployment — stateless or not —
-  and `GET /admin/v1/status` answers with every component `disabled`.
+* **Status.** A replica in `mode = "stateful"` runs a refresher over exactly one
+  component, the **control plane**, observed on the connection its
+  administrative surface was built on. So `axond_status_component_state`,
+  `axond_status_observation_age`, and `axond_status_refreshes` exist on a
+  stateful replica, carrying `axond_status_component="control_plane"` and
+  nothing else. A stateless replica opens no store, runs no refresher, and
+  produces none of the three; `GET /admin/v1/status` answers there with every
+  component `disabled`. Every durable backend other than the control plane is
+  `disabled` in both postures until the slice that owns it injects a probe.
 * **Revision convergence.** No reconciler is constructed either (the
   `convergence` module is contract-only until a projection from resource bodies
   to a servable config lands), so every `axond_revision_*` series — `lag`,
@@ -27,16 +31,19 @@ nothing in `serve` constructs the loop that produces them.
   status page and the administrative surface, or one replica would answer two
   convergence stories.
 
-Eight shipped rules are therefore inert until those slices land:
-`AxondDependencyImpaired`, `AxondStatusObservationsStale`,
-`AxondStatusRefreshesFailing`, `AxondStatusRefresherStalled`, and
-`AxondControlPlaneUnreachable` on the status side; `AxondRevisionLagAboveTarget`,
-`AxondRevisionRejectionsSustained`, and `AxondRevisionConvergenceSplit` on the
-convergence side. So are the *Dependency state*, *Observation age*, *Refresh
-outcomes*, *Revision lag*, *Revision rejections*, *Convergence attempts*, and
-*Convergence duration* panels on the fleet dashboard. Read the two convergence
-failure modes below as the contract they will report against, not as coverage you
-have now.
+The five status-side rules — `AxondDependencyImpaired`,
+`AxondStatusObservationsStale`, `AxondStatusRefreshesFailing`,
+`AxondStatusRefresherStalled`, and `AxondControlPlaneUnreachable` — are live on a
+stateful deployment and report on the control plane; on a stateless one they stay
+silent, since the series never appear. The same holds for the *Dependency state*,
+*Observation age*, and *Refresh outcomes* panels: expect one series each.
+
+The three convergence rules — `AxondRevisionLagAboveTarget`,
+`AxondRevisionRejectionsSustained`, and `AxondRevisionConvergenceSplit` — are
+still inert, as are the *Revision lag*, *Revision rejections*, *Convergence
+attempts*, and *Convergence duration* panels. Read the two convergence failure
+modes below as the contract they will report against, not as coverage you have
+now.
 
 `AxondFleetRevisionSplit` is the one rule in the convergence group that works
 today, because `axond_config_generation` comes from the file/environment reload
