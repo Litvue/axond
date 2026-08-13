@@ -686,7 +686,7 @@ fn unavailable_message(message: impl Into<String>) -> SecretError {
 /// A boot-time failure while doing `operation`, split by who has to act.
 ///
 /// A `SQLSTATE` the operator has to answer — a missing table, a missing grant, a
-/// read-only transaction — is [`SecretError::Denied`] and carries `remedy`,
+/// database that is not there — is [`SecretError::Denied`] and carries `remedy`,
 /// because retrying it forever changes nothing. Everything else is
 /// [`SecretError::Unavailable`]: an error with no `SQLSTATE` never reached a
 /// server, and a server *can* answer with a transient code (it is starting up,
@@ -712,11 +712,10 @@ fn boot_failure(
 /// Whether a `SQLSTATE` names a condition only the operator can clear.
 ///
 /// Class `42` (access rule violated, undefined object), `3F` (invalid schema
-/// name), `28` (invalid authorization), `3D` (invalid catalog name) and `25006`
-/// (read-only transaction) describe a deployment that is configured wrong: the
-/// role lacks a grant, the schema or database is absent, the password is not the
-/// one the server wants, the endpoint is a replica. No amount of waiting fixes
-/// any of them. Every other class —
+/// name), `28` (invalid authorization) and `3D` (invalid catalog name) describe a
+/// deployment that is configured wrong: the role lacks a grant, the schema or
+/// database is absent, the password is not the one the server wants. No amount of
+/// waiting fixes any of them. Every other class —
 /// notably `08` connection, `53` insufficient resources, `57` operator
 /// intervention, `40` rollback, `55` object in use, and the `23505` two
 /// concurrently booting replicas race on — clears on its own.
@@ -726,6 +725,14 @@ fn boot_failure(
 /// can surface the collision as `42P07`/`42710` rather than `23505`. The next
 /// attempt finds the object already there, so those are the sibling replica
 /// winning, not a deployment to fix.
+///
+/// `25006` (read-only transaction) is the deliberate near miss. A `dsn_env`
+/// pointed at a hot standby answers with it and needs an operator, but so does a
+/// primary that is being demoted and a pooler routing to a replica for the length
+/// of a failover, and those clear by themselves. Refusing a replica that started
+/// mid-failover, with a remedy naming a grant it already has, is the worse of the
+/// two mistakes: a standing misconfiguration still says `25006` in every retried
+/// outage, where a permanent refusal is not recoverable without a human.
 fn operator_must_act(code: &SqlState) -> bool {
     if matches!(
         *code,
@@ -734,7 +741,6 @@ fn operator_must_act(code: &SqlState) -> bool {
         return false;
     }
     matches!(code.code().get(..2), Some("42" | "3F" | "28" | "3D"))
-        || *code == SqlState::READ_ONLY_SQL_TRANSACTION
 }
 
 /// A Postgres failure while doing `operation`.
@@ -772,7 +778,6 @@ mod tests {
             SqlState::INVALID_SCHEMA_NAME,
             SqlState::INVALID_PASSWORD,
             SqlState::INVALID_CATALOG_NAME,
-            SqlState::READ_ONLY_SQL_TRANSACTION,
         ] {
             assert!(
                 operator_must_act(&permanent),
@@ -794,6 +799,9 @@ mod tests {
             SqlState::DUPLICATE_TABLE,
             SqlState::DUPLICATE_OBJECT,
             SqlState::CONNECTION_FAILURE,
+            // A demotion or a failover window answers with this one, and the
+            // hot-standby DSN it also names stays visible in the retried outage.
+            SqlState::READ_ONLY_SQL_TRANSACTION,
         ] {
             assert!(
                 !operator_must_act(&transient),

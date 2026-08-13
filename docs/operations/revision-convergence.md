@@ -409,8 +409,8 @@ The refusal reason is the triage key.
   replica, like the control plane's database — scale-out waits on it. A boot that
   cannot prepare the store's schema refuses *permanently* only for a `SQLSTATE`
   an operator has to clear (class `42` access/undefined-object apart from the
-  duplicate-object codes, `3F` invalid schema name, `25006` read-only
-  transaction), and its message names the grant or the DDL to apply. A server that
+  duplicate-object codes, `3F` invalid schema name), and its message names the
+  grant or the DDL to apply. A server that
   is starting up, out of connections, deadlocked, or racing a sibling replica's
   `CREATE TABLE IF NOT EXISTS` (`23505`, `42P07`, `42710`) stays retryable, so a
   whole fleet booting at once does not turn a hiccup into a permanent refusal.
@@ -418,7 +418,12 @@ The refusal reason is the triage key.
   (`28*`) or an absent database (`3D*`) refuses and names the `dsn_env` string to
   fix. Reconnections during the life of a serving replica are not: the same codes
   arrive during a credential rotation the deployment is halfway through, and a
-  replica already serving should wait rather than strand itself.
+  replica already serving should wait rather than strand itself. `25006`
+  (read-only transaction) is retryable on purpose: a `dsn_env` pointed at a hot
+  standby says it, but so does a primary mid-demotion and a pooler routing to a
+  replica during a failover. A standing misconfiguration keeps saying `25006` in
+  every retried outage, so look for that code in the `secret` reason before
+  suspecting the store is down.
 - **`projection`** — a candidate this build cannot project: a resource body it
   does not read, or a bootstrap that is missing something projection may not
   supply for it (today, a default namespace). Roll the replica forward, publish a
