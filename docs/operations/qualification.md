@@ -71,6 +71,10 @@ build on production-representative hardware will move every number in them, and
 of with this paragraph. The contract test requires a locally recorded run to be
 disclosed here by path and by the commit it was taken at, so re-running a tier
 without rewriting this table is a test failure rather than a stale paragraph.
+That commit is the branch commit the run happened on; this repository
+squash-merges, so it is provenance rather than something to check out. What
+makes a record reproducible is the digests it carries — manifest, binary, and
+per-profile config — and those survive the squash.
 
 Write a record from a run's artifacts:
 

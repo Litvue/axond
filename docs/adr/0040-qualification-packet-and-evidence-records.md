@@ -93,9 +93,17 @@ The report on #156 is now a file that can be wrong in a way CI notices, rather
 than a claim in a comment. The docs' envelope table is a retained record read in
 operator units, and drift between them is visible.
 
+A record's `git_commit` is the branch commit the run was taken at, and this
+repository squash-merges, so once a packet PR lands that commit is not on
+`main`. The record is still reproducible — the manifest digest, the binary
+digest, and the config digests are the anchors a comparison actually needs, and
+they survive the squash — but the hash is provenance rather than a checkout
+instruction. Nothing resolves it against git, deliberately: a check that did
+would fail on every squash and teach people to delete records.
+
 The cost is real: every manifest edit forces a re-run of the tiers that have
 retained records, and a rebase that changes the commit a record names leaves the
-record pointing at history that no longer exists, so it wants re-taking. That
+record pointing at a commit that was never pushed, so it wants re-taking. That
 friction is the point — it is what stops the numbers from quietly outliving
 their inputs — but it makes the heavy tier something a change to the manifest
 must budget for.
