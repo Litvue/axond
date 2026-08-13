@@ -103,7 +103,7 @@ fn a_target_with_fresh_complete_positive_evidence_is_available() {
     assert_eq!(verdict.observed_at, Some(at(100)));
     assert_eq!(verdict.expires_at, Some(at(160)));
     assert!(!verdict.last_known_good);
-    assert!(verdict.state.permits_attempt());
+    assert!(verdict.permits_attempt());
 }
 
 /// The ladder, one rung at a time: each dimension in turn is the only one that
@@ -253,6 +253,35 @@ fn a_key_the_index_does_not_hold_is_unknown_rather_than_available_or_denied() {
     assert_eq!(verdict.state, AvailabilityState::Unknown);
     assert_eq!(verdict.reason, AvailabilityReason::NoEvidence);
     assert_eq!(verdict.decided_by, DecidedBy::NoRecord);
+    assert!(
+        !verdict.permits_attempt(),
+        "an index that holds nothing permits nothing: no rung examined this pair, so \
+         the uncertainty is not a scope's accepted risk"
+    );
+}
+
+/// The two kinds of `unknown` are not the same answer. A scope that is catalogued,
+/// enabled, and entitled but not yet looked at has passed every authority and is
+/// waiting on discovery; a key nothing describes has passed nothing. Only the first
+/// is routable.
+#[test]
+fn a_permitted_target_awaiting_discovery_is_distinct_from_a_key_nothing_describes() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let awaiting = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .build()
+        .evaluate(&key(scope, "gpt-4o"), at(200));
+
+    assert_eq!(awaiting.state, AvailabilityState::Unknown);
+    assert_eq!(awaiting.reason, AvailabilityReason::NoEvidence);
+    assert_eq!(
+        awaiting.decided_by,
+        DecidedBy::Discovery,
+        "an operator is sent to the discovery mechanism, not told nothing is known"
+    );
+    assert!(awaiting.permits_attempt());
+    assert_ne!(awaiting, Availability::no_record());
+    assert!(!Availability::no_record().permits_attempt());
 }
 
 /// Only a complete negative denies. A partial listing that does not mention the
@@ -323,7 +352,7 @@ fn expiry_downgrades_positive_evidence_to_stale_and_a_denial_to_unknown() {
         Some(at(160)),
         "a stale verdict still says which evidence expired and when"
     );
-    assert!(at_expiry.state.permits_attempt());
+    assert!(at_expiry.permits_attempt());
 
     let denial = AvailabilityIndex::builder()
         .record(key(scope, "gpt-4o"), permitting())
@@ -458,6 +487,27 @@ fn unknown_and_stale_evidence_is_never_silently_upgraded() {
     assert!(after_outage.last_known_good);
 }
 
+/// Retained evidence counts as "held" for the out-of-order guard too: a record
+/// whose last-known-good was declared without a current observation must not let an
+/// older look re-adopt evidence it predates.
+#[test]
+fn an_older_look_cannot_displace_retained_evidence_declared_without_a_current_one() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let declared = AvailabilityRecord {
+        last_known_good: Some(present(scope, "gpt-4o", 300, None)),
+        ..permitting()
+    };
+    let builder = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), declared)
+        .observe(absent(scope, "gpt-4o", 100));
+    assert_eq!(builder.superseded(), 1);
+
+    let verdict = builder.build().evaluate(&key(scope, "gpt-4o"), at(400));
+    assert_eq!(verdict.state, AvailabilityState::Available);
+    assert!(verdict.last_known_good);
+    assert_eq!(verdict.observed_at, Some(at(300)));
+}
+
 #[test]
 fn an_observation_older_than_the_one_held_is_ignored() {
     let scope = ScopeRef::tenant(tenant(1));
@@ -512,11 +562,13 @@ fn evidence_never_crosses_a_tenant_or_a_project_boundary() {
         index.evaluate(&key(globex, "gpt-4o"), at(200)).state,
         AvailabilityState::Available
     );
+    let inherited = index.evaluate(&key(acme_core, "gpt-4o"), at(200));
     assert_eq!(
-        index.evaluate(&key(acme_core, "gpt-4o"), at(200)),
-        Availability::no_record(),
+        (inherited.state, inherited.reason),
+        (AvailabilityState::Unknown, AvailabilityReason::NoEvidence),
         "a project scope inherits no evidence from its tenant in this contract"
     );
+    assert!(!inherited.state.is_definitive());
 
     // A scoped read reaches one scope's targets and no other's.
     let scoped = index.evaluate_scope(&globex, at(200));

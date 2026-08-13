@@ -251,7 +251,11 @@ grants nor revokes), `a_discovery_outage_preserves_the_last_known_good_state`
 `a_namespace_scoped_verdict_coarsens_operator_only_reasons` (a verdict carries no
 provider body, credential, or discovery mechanism a tenant may read), and
 `projecting_availability_leaves_the_config_untouched` (an index is projected
-beside a snapshot and can never enlarge what is served).
+beside a snapshot and can never enlarge what is served). Uncertainty is routable
+only where a scope chose it:
+`a_permitted_target_awaiting_discovery_is_distinct_from_a_key_nothing_describes`
+holds that an empty or incomplete index permits nothing, because no rung examined
+the pair.
 
 **Threat model and ADRs.** [ADR 0020](../adr/0020-alias-wire-family-validation.md)
 and [ADR 0012](../adr/0012-native-provider-routes.md) bound wire families and

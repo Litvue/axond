@@ -27,8 +27,10 @@
 //! [`AvailabilityState::Unknown`]. Defaulting such a case open would route traffic
 //! at a target nobody established exists; defaulting it closed would let one
 //! failed refresh deny a fleet. `unknown` is routable only where the scope
-//! explicitly enabled the target, which is the [`index`] ladder's job to
-//! guarantee.
+//! explicitly *chose* it: [`Availability::permits_attempt`] refuses a
+//! [`DecidedBy::NoRecord`] verdict, so an index that is empty or missing a key
+//! permits nothing, and every other `unknown` is one the [`index`] ladder let past
+//! its enablement and policy rungs.
 //!
 //! **A discovery outage costs freshness, not access.** The last definitive
 //! positive observation is retained across non-definitive ones, so an outage

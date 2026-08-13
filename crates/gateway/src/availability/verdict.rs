@@ -83,15 +83,17 @@ impl AvailabilityState {
         }
     }
 
-    /// Whether an attempt against the target is allowed to be made at all.
+    /// Whether this state alone refuses an attempt against the target.
     ///
-    /// `Unknown` and `Stale` are permitted *because a verdict of either already
-    /// required explicit enablement and a permitting policy*: enablement and
-    /// policy are checked before evidence in
-    /// [`AvailabilityIndex::evaluate`](super::AvailabilityIndex::evaluate), so a
-    /// scope that never enabled the target is `Denied` and never reaches here.
-    /// Which of the permitted states a deployment actually routes to is a
-    /// routing decision, not this contract's.
+    /// Not the routability question on its own — use
+    /// [`Availability::permits_attempt`], which is the whole verdict and knows
+    /// whether any dimension was actually consulted. `Unknown` here means only
+    /// "this state is not a refusal": an `Unknown` that passed the enablement and
+    /// policy rungs is a scope's accepted risk, and an `Unknown` from
+    /// [`Availability::no_record`] is ignorance no rung has examined.
+    ///
+    /// Which of the permitted states a deployment actually routes to is a routing
+    /// decision, not this contract's.
     pub const fn permits_attempt(self) -> bool {
         matches!(self, Self::Available | Self::Unknown | Self::Stale)
     }
@@ -382,6 +384,19 @@ impl Availability {
         self.source = Some(source);
         self.last_known_good = last_known_good;
         self
+    }
+
+    /// Whether an attempt against the target is allowed to be made at all.
+    ///
+    /// Both halves matter. The state must not be a refusal, *and* some dimension
+    /// must have decided: a [`DecidedBy::NoRecord`] verdict is `Unknown` because
+    /// nothing was consulted — no catalogue entry was checked, no enablement, no
+    /// policy — so an index that is empty, still loading, or missing a key must not
+    /// be mistaken for a scope that explicitly accepted the risk of routing on
+    /// uncertain evidence. Uncertainty is routable where a scope *chose* it, never
+    /// by default.
+    pub const fn permits_attempt(&self) -> bool {
+        self.state.permits_attempt() && !matches!(self.decided_by, DecidedBy::NoRecord)
     }
 
     /// This verdict as the given scope may see it.

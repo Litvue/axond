@@ -37,8 +37,9 @@
 //!    failing right now is better served by `unavailable` than by `unknown`, and
 //!    both are non-routable-by-default anyway.
 //! 6. **Discovery evidence.** `available`, `stale`, `unknown`, or `denied`, per
-//!    [`DiscoveryObservation::verdict`].
-//! 7. Nothing objected and there is definitive positive evidence: `available`.
+//!    [`DiscoveryObservation::verdict`], and `unknown` when nothing has looked
+//!    yet — still decided by discovery, which is what distinguishes it from a key
+//!    the index does not hold at all.
 //!
 //! Ties are impossible by construction: exactly one rung decides, and the verdict
 //! records which one in [`Availability::decided_by`].
@@ -289,7 +290,15 @@ impl AvailabilityIndex {
         }
         match record.evidence() {
             Some((observation, last_known_good)) => observation.verdict(now, last_known_good),
-            None => Availability::no_record(),
+            // Every authority permits and discovery simply has not run yet. Reported
+            // as decided by discovery, not as [`Availability::no_record`]: "nobody
+            // has looked at a target this scope may use" and "nothing describes this
+            // pair" send an operator to different places.
+            None => Availability::decided(
+                AvailabilityState::Unknown,
+                AvailabilityReason::NoEvidence,
+                DecidedBy::Discovery,
+            ),
         }
     }
 
@@ -372,11 +381,16 @@ impl AvailabilityIndexBuilder {
     #[must_use]
     pub fn observe(mut self, observation: DiscoveryObservation) -> Self {
         let entry = self.records.entry(observation.key()).or_default();
-        if entry
+        // Against the newest evidence held, current *or* retained: a record whose
+        // last-known-good was declared without a current observation would
+        // otherwise let an older look re-adopt evidence it predates.
+        let newest_held = entry
             .discovery
-            .as_ref()
-            .is_some_and(|held| held.observed_at > observation.observed_at)
-        {
+            .iter()
+            .chain(entry.last_known_good.iter())
+            .map(|held| held.observed_at)
+            .max();
+        if newest_held.is_some_and(|held| held > observation.observed_at) {
             self.superseded += 1;
             return self;
         }
