@@ -808,7 +808,7 @@ fn a_replicas_dsn_carries_awkward_credentials_intact() {
 /// cut, and a gate must stop listening when the run that made it ends.
 #[tokio::test]
 async fn a_gate_cuts_what_it_joined_and_stops_when_it_is_dropped() {
-    use stateful_endurance::gate::{Gate, Mode};
+    use stateful_endurance::gate::{AcceptBackoff, Gate, Mode};
 
     // The cut is subscribed to before the outage is read, so an outage declared
     // while a connection is being joined to the backend is not missed. A race
@@ -835,6 +835,47 @@ async fn a_gate_cuts_what_it_joined_and_stops_when_it_is_dropped() {
     assert!(
         !source.contains("while let Ok((inbound, _)) = listener.accept().await"),
         "one transient accept error would stop the gate forwarding"
+    );
+
+    // The real listener error is an OS event and cannot be injected reliably
+    // into Tokio's `TcpListener`. Exercise the retry state deterministically:
+    // failures back off, the delay is capped, and a successful accept resets
+    // the next transient failure to the short initial delay.
+    let mut backoff = AcceptBackoff::default();
+    assert_eq!(
+        backoff.on_error(),
+        std::time::Duration::from_millis(5),
+        "the first retry is short"
+    );
+    assert_eq!(
+        backoff.on_error(),
+        std::time::Duration::from_millis(10),
+        "the retry delay grows after consecutive errors"
+    );
+    assert_eq!(
+        backoff.on_error(),
+        std::time::Duration::from_millis(20),
+        "the retry delay is exponential"
+    );
+    for expected in [40, 80, 160, 250] {
+        assert_eq!(
+            backoff.on_error(),
+            std::time::Duration::from_millis(expected),
+            "the retry delay follows the capped exponential progression"
+        );
+    }
+    for _ in 0..4 {
+        assert_eq!(
+            backoff.on_error(),
+            std::time::Duration::from_millis(250),
+            "the retry delay stays capped"
+        );
+    }
+    backoff.on_success();
+    assert_eq!(
+        backoff.on_error(),
+        std::time::Duration::from_millis(5),
+        "a successful accept resets the retry delay"
     );
 
     let backend = tokio::net::TcpListener::bind("127.0.0.1:0")

@@ -24,10 +24,41 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
+
+const ACCEPT_RETRY_INITIAL_MS: u64 = 5;
+const ACCEPT_RETRY_MAX_MS: u64 = 250;
+const ACCEPT_RETRY_MAX_SHIFT: u32 = 6;
+
+/// Backoff for an accept failure. The gate keeps retrying until it is dropped,
+/// because an accept error is allowed to be transient for the whole run; only
+/// the delay is bounded so a persistent error cannot busy-loop the runtime.
+#[derive(Debug, Default)]
+pub(crate) struct AcceptBackoff {
+    consecutive_errors: u32,
+}
+
+impl AcceptBackoff {
+    pub(crate) fn on_success(&mut self) {
+        self.consecutive_errors = 0;
+    }
+
+    pub(crate) fn on_error(&mut self) -> Duration {
+        self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+        let shift = self
+            .consecutive_errors
+            .saturating_sub(1)
+            .min(ACCEPT_RETRY_MAX_SHIFT);
+        let millis = ACCEPT_RETRY_INITIAL_MS
+            .saturating_mul(1_u64 << shift)
+            .min(ACCEPT_RETRY_MAX_MS);
+        Duration::from_millis(millis)
+    }
+}
 
 /// What the gate is doing to the backend behind it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,9 +131,11 @@ impl Gate {
 
         let serving = state.clone();
         let accepting = tokio::spawn(async move {
+            let mut accept_backoff = AcceptBackoff::default();
             loop {
                 match listener.accept().await {
                     Ok((inbound, _)) => {
+                        accept_backoff.on_success();
                         let state = serving.clone();
                         tokio::spawn(async move { serve(inbound, state).await });
                     }
@@ -114,7 +147,7 @@ impl Gate {
                     // deployment refusing every request rather than as the
                     // harness having stopped forwarding.
                     Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        tokio::time::sleep(accept_backoff.on_error()).await;
                     }
                 }
             }
