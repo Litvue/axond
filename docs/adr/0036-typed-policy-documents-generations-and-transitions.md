@@ -77,7 +77,12 @@ minimum_token_epoch
   Adoption is monotonic in what is enforced: onto a higher epoch of the same scope,
   or onto the active document as a later revision restates it, never onto a
   different document. A fence that could be walked onto another scope's document
-  would then deny every writer the scope actually has.
+  would then deny every writer the scope actually has. A fence is therefore a fence
+  on one *document*: while a project has none of its own, it and its tenant are
+  fenced by the tenant's single generation, and publishing the project's first own
+  document changes which document governs the project rather than advancing that
+  generation — so a later slice takes the new fence from the new snapshot instead of
+  walking the old one forward.
 - **A change is classified by what activating it would require.** `live` (looser
   limits, longer TTLs, a higher token floor, or a republication that changes
   nothing), `drain` (tighter caps, shorter TTLs — safe once what was admitted

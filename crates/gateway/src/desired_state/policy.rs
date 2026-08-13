@@ -1426,11 +1426,28 @@ impl PolicySnapshot {
     /// The generation of the document that actually governs it: a project with no
     /// document of its own is fenced by its tenant's generation, because that is
     /// the document being enforced.
+    ///
+    /// So the generation a project is fenced by names its *tenant* while the
+    /// project has no document, and names the project once it has one. Publishing a
+    /// project's first own document therefore does not advance a generation, it
+    /// replaces the governing document with a different one, and a fence built on
+    /// the tenant's document refuses to adopt it
+    /// ([`PolicyFence::adopt`] returns [`NotAnAdvance`]). That is the intended
+    /// contract: a fence is a fence on one document, and a change of which document
+    /// governs a scope is not an epoch advance any writer holding the old one may be
+    /// carried across. An activation slice takes the new fence from the new snapshot
+    /// rather than walking the old one forward, which is also why writers of a
+    /// project and of its tenant hold *one* generation while the tenant's document
+    /// governs both — they are enforcing one document, and there is nothing to tell
+    /// apart.
     pub fn generation(&self, scope: PolicyScope) -> Option<PolicyGeneration> {
         Some(self.effective(scope)?.generation(self.source))
     }
 
-    /// The fence a writer for `scope` must pass.
+    /// The fence a writer for `scope` must pass, from this snapshot.
+    ///
+    /// Taken per snapshot, not advanced across snapshots that change which document
+    /// governs `scope` — see [`generation`](Self::generation).
     pub fn fence(&self, scope: PolicyScope) -> Option<PolicyFence> {
         Some(PolicyFence::new(self.generation(scope)?))
     }
@@ -2217,6 +2234,52 @@ mod tests {
                 elsewhere, active
             )))),
             "and a writer holding it is wired wrong rather than late or early"
+        );
+    }
+
+    #[test]
+    fn a_project_taking_its_tenants_document_is_fenced_on_that_document() {
+        // A project with no document of its own is governed by its tenant's, so it
+        // is fenced by the tenant's generation: one document, one fence, and
+        // nothing to tell a project writer from a tenant writer while both enforce
+        // it.
+        let mut with_tenant_only = state();
+        with_tenant_only
+            .insert(tenant_policy_body(1, 1).version(slug()))
+            .expect("a tenant document");
+        let inherited = PolicySet::of(&with_tenant_only)
+            .unwrap()
+            .snapshot(revision_id(1));
+        let fallback = inherited.generation(project_scope()).unwrap();
+        assert_eq!(fallback.scope(), tenant_scope());
+        assert_eq!(fallback, inherited.generation(tenant_scope()).unwrap());
+
+        // Publishing the project's first own document does not advance that
+        // generation, it replaces which document governs the project. So the
+        // inherited fence refuses to move onto it, and an activation slice takes
+        // the new fence from the new snapshot rather than walking the old one
+        // forward.
+        let mut with_project = state();
+        with_project
+            .insert(tenant_policy_body(1, 1).version(slug()))
+            .and_then(|state| state.insert(project_policy_body(1, 2, 1).version(slug())))
+            .expect("one document per scope");
+        let own = PolicySet::of(&with_project)
+            .unwrap()
+            .snapshot(revision_id(2))
+            .generation(project_scope())
+            .unwrap();
+        assert_eq!(own.scope(), project_scope());
+
+        let mut fence = inherited.fence(project_scope()).unwrap();
+        assert_eq!(
+            fence.adopt(own),
+            Err(NotAnAdvance(Box::new(Offered::new(own, fallback))))
+        );
+        assert_eq!(
+            fence.active(),
+            fallback,
+            "and it keeps enforcing the document it has"
         );
     }
 
