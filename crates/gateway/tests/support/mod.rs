@@ -9,6 +9,7 @@
 
 pub mod capacity;
 pub mod gateway;
+pub mod recovery;
 pub mod upstream;
 
 use std::time::Duration;
