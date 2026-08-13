@@ -17,7 +17,12 @@ pub const MANIFEST_RELATIVE: &str = "qualification/endurance/manifest.toml";
 
 /// The result-artifact schema version. Bumped when a field changes meaning, so
 /// a stored artifact is never reinterpreted under a newer contract.
-pub const RESULT_SCHEMA_VERSION: u32 = 1;
+///
+/// 2: `profile.duration_ms` is the duration the run was offered rather than the
+/// one the manifest commits, which moved to `profile.manifest_duration_ms`. A
+/// version-1 artifact of a dispatched run states the manifest's duration
+/// beside that run's numbers, so the two may not be read the same way.
+pub const RESULT_SCHEMA_VERSION: u32 = 2;
 
 /// The manifest schema this harness understands.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;

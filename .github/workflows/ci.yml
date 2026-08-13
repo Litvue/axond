@@ -127,13 +127,16 @@ jobs:
           path: target/capacity/**/*.json
           if-no-files-found: warn
       # The endurance smoke tier, likewise: the same driver and assertions the
-      # `Endurance` workflow runs for twelve hours, at seconds.
+      # `Endurance` workflow runs for twelve hours, at seconds. The smoke
+      # directory alone — the sequential regression also publishes a soak-tier
+      # artifact of a twenty-second run, and a bundle of smoke evidence is not
+      # where a soak-tier file should be found.
       - name: Publish the endurance smoke results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: endurance-results-smoke
-          path: target/endurance/**/*.json
+          path: target/endurance/smoke/*.json
           if-no-files-found: warn
 
   # The pull-request half of the fuzzing program (`fuzz/`, issue #212). The

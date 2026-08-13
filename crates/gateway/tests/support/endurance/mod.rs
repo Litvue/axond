@@ -12,6 +12,7 @@
 //! What differs between them is duration, concurrency, and which drift gates
 //! apply; the workload, the plan, and the artifact are the same.
 
+pub mod ledger;
 pub mod manifest;
 pub mod plan;
 pub mod result;
@@ -20,4 +21,4 @@ pub mod sampler;
 
 pub use manifest::{Ending, Manifest, Profile, Tier};
 pub use result::EnduranceResult;
-pub use run::{DURATION_ENV, requested_duration, run, trend};
+pub use run::{DURATION_ENV, Dispatch, drain_interval, requested_duration, run, run_with, trend};
