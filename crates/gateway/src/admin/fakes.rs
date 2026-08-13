@@ -25,7 +25,8 @@ use crate::backends::Capabilities;
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{
-    AuditEvent, LoadedRevision, ResourceScope, RevisionCandidate, RevisionId, RevisionManifest,
+    AccessDenial, AuditEvent, LoadedRevision, ResourceScope, RevisionCandidate, RevisionId,
+    RevisionManifest, TenantId,
 };
 
 /// An authenticator over two hard-coded credential populations: OIDC-issued
@@ -219,6 +220,18 @@ impl ControlPlaneStore for FlakyStore {
     async fn audit_trail(&self, id: RevisionId) -> Result<Vec<AuditEvent>, ControlPlaneError> {
         self.inner.audit_trail(id).await
     }
+
+    async fn record_denial(&self, denial: &AccessDenial) -> Result<(), ControlPlaneError> {
+        self.inner.record_denial(denial).await
+    }
+
+    async fn denials(
+        &self,
+        tenant: Option<TenantId>,
+        limit: usize,
+    ) -> Result<Vec<AccessDenial>, ControlPlaneError> {
+        self.inner.denials(tenant, limit).await
+    }
 }
 
 /// The in-memory oracle, plus a count of how many times it was consulted.
@@ -285,5 +298,19 @@ impl ControlPlaneStore for CountingStore {
     async fn audit_trail(&self, id: RevisionId) -> Result<Vec<AuditEvent>, ControlPlaneError> {
         self.count();
         self.inner.audit_trail(id).await
+    }
+
+    async fn record_denial(&self, denial: &AccessDenial) -> Result<(), ControlPlaneError> {
+        self.count();
+        self.inner.record_denial(denial).await
+    }
+
+    async fn denials(
+        &self,
+        tenant: Option<TenantId>,
+        limit: usize,
+    ) -> Result<Vec<AccessDenial>, ControlPlaneError> {
+        self.count();
+        self.inner.denials(tenant, limit).await
     }
 }

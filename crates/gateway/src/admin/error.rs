@@ -380,6 +380,9 @@ fn validation_rule(error: &ValidationError) -> (&'static str, Option<ResourceRef
             ("duplicate_resource_version", Some(*reference))
         }
         ValidationError::MultipleVersions { first, .. } => ("multiple_versions", Some(*first)),
+        ValidationError::VersionNotAdvanced { proposed, .. } => {
+            ("version_not_advanced", Some(*proposed))
+        }
         ValidationError::DuplicateSlug { first, .. } => ("duplicate_slug", Some(*first)),
         ValidationError::ScopeMismatch { reference, .. } => ("scope_mismatch", Some(*reference)),
         ValidationError::DanglingResourceReference { from, .. } => {

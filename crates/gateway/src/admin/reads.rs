@@ -137,6 +137,10 @@ pub struct ActorView {
     pub subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub component: Option<String>,
+    /// The owning tenant of a workload principal, carried so an audit row stays
+    /// attributable without hydrating the revision that declared it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 impl ActorView {
@@ -147,18 +151,28 @@ impl ActorView {
                 issuer: Some(issuer.clone()),
                 subject: Some(subject.clone()),
                 component: None,
+                tenant: None,
             },
             Actor::Breakglass => Self {
                 kind: "breakglass",
                 issuer: None,
                 subject: None,
                 component: None,
+                tenant: None,
+            },
+            Actor::Workload { tenant, principal } => Self {
+                kind: "workload",
+                issuer: None,
+                subject: Some(principal.to_string()),
+                component: None,
+                tenant: Some(tenant.to_string()),
             },
             Actor::System { component } => Self {
                 kind: "system",
                 issuer: None,
                 subject: None,
                 component: Some(component.clone()),
+                tenant: None,
             },
         }
     }
