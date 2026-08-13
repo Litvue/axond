@@ -143,6 +143,7 @@ pub const BOOTSTRAP_OWNED_FIELDS: &[&str] = &[
     "create_table",
     "dsn_env",
     "key_prefix",
+    "namespace_scope",
     "on_unavailable",
     "table",
 ];
