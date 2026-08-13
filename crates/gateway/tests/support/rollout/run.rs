@@ -565,7 +565,10 @@ impl Harness {
     /// cannot route it away — and return once the upstream has seen it, which is
     /// what makes "in flight" a fact rather than a hope.
     async fn pin(&self, base_url: &str, alias: &str, stream: bool) -> Pinned {
-        let seen = self.fleet.upstream.state.requests().len();
+        // The exact arrival count, not the retained-request list: that list is
+        // capped, so at heavy scale its length stops growing and a wait on it
+        // could never be satisfied.
+        let seen = self.fleet.upstream.state.received();
         let client = self.client.clone();
         let url = format!("{base_url}/v1/chat/completions");
         let payload = body(alias, stream);
@@ -591,7 +594,7 @@ impl Harness {
             (Some(status), bytes, Instant::now())
         });
         let deadline = Instant::now() + IN_FLIGHT_WAIT;
-        while self.fleet.upstream.state.requests().len() <= seen {
+        while self.fleet.upstream.state.received() <= seen {
             assert!(
                 Instant::now() < deadline,
                 "the pinned `{alias}` request never reached the upstream, so the drain would not \
