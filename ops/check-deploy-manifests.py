@@ -368,7 +368,9 @@ def check_telemetry_egress(documents: list[Document], telemetry_source: str) -> 
 
     Axond exports OTLP over HTTP only, so an allowance for the gRPC receiver is a
     policy that permits a flow that never happens while denying the one that does
-    — telemetry then stops with no error the cluster reports.
+    — telemetry then stops with no error the cluster reports. A deleted or
+    renamed allowance fails the same way, so the rule is required rather than
+    merely constrained when it happens to be present.
     """
     if 'Some("http/protobuf")' not in telemetry_source:
         return [
@@ -386,7 +388,13 @@ def check_telemetry_egress(documents: list[Document], telemetry_source: str) -> 
             if "opentelemetry-collector" not in selectors:
                 continue
             allowed |= {port.get("port") for port in rule.get("ports", [])}
-    if allowed and allowed != {4318}:
+    if not allowed:
+        failures.append(
+            "overlays/production: no egress rule reaches a Pod labelled "
+            "app.kubernetes.io/name: opentelemetry-collector, so the default-deny policy drops "
+            "every OTLP export while the cluster reports nothing"
+        )
+    elif allowed != {4318}:
         failures.append(
             f"overlays/production: telemetry egress allows {sorted(allowed)}, but axond exports "
             "OTLP/HTTP only, whose receiver is 4318; a gRPC allowance drops every export"
@@ -819,6 +827,24 @@ def self_test() -> int:
     expect_failure(
         "telemetry egress on a port axond cannot dial",
         check_telemetry_egress(grpc, telemetry),
+    )
+    unreachable = copy.deepcopy(production)
+    for policy in of_kind(unreachable, "NetworkPolicy"):
+        egress = policy["spec"].get("egress")
+        if not egress:
+            continue
+        policy["spec"]["egress"] = [
+            rule
+            for rule in egress
+            if all(
+                peer.get("podSelector", {}).get("matchLabels", {}).get("app.kubernetes.io/name")
+                != "opentelemetry-collector"
+                for peer in rule.get("to", [])
+            )
+        ]
+    expect_failure(
+        "telemetry egress deleted altogether",
+        check_telemetry_egress(unreachable, telemetry),
     )
     expect_failure(
         "telemetry egress derived from a protocol the gateway no longer names",
