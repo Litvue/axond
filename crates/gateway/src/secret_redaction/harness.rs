@@ -474,6 +474,10 @@ pub(crate) fn state_sharing(secret: SecretRef, version: ResourceVersionNumber) -
         fixtures::display_name("Secondary"),
         secret,
     )
+    // Active like the primary: two bodies pointing at one version must agree
+    // about its state, and it is serving material the count is about.
+    .transitioned(SecretLifecycle::Active)
+    .expect("staged material may be activated")
     .version_at(Slug::parse("secondary").expect("fixture slug"), version);
     let alias = ResourceVersion::new(
         ResourceRef::new(ResourceKind::Alias, fixtures::resource_id(4), version),
@@ -488,6 +492,8 @@ pub(crate) fn state_sharing(secret: SecretRef, version: ResourceVersionNumber) -
     let mut state = DesiredState::new();
     state
         .insert(fixtures::tenant(1, "acme"))
+        .and_then(|state| state.insert(fixtures::project(&fixtures::tenant_id(1), 2, "core")))
+        .and_then(|state| state.insert(provider_connection()))
         .and_then(|state| state.insert(primary))
         .and_then(|state| state.insert(secondary))
         .and_then(|state| state.insert(alias))
