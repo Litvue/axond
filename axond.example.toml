@@ -472,7 +472,7 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # (namespace, subject), deduplicated by the consumer on `request_id`. Apply
 # ops/postgres/usage_outbox_v1.sql first, and read
 # docs/operations/usage-outbox.md — this adds a failure mode to the request
-# path. See docs/adr/0042-billing-grade-usage-outbox.md.
+# path. See docs/adr/0043-billing-grade-usage-outbox.md.
 
 # [usage_journal]
 # # none (default) | postgres.
