@@ -26,15 +26,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_postgres::Config;
 
 use super::harness::{
-    PROVIDER_MATERIAL, ROTATED_MATERIAL, first, material, owner, state_pinning, sweep,
+    PROVIDER_MATERIAL, ROTATED_MATERIAL, first, live_material, state_pinning, sweep,
 };
 use crate::backends::control_plane::postgres::{ControlPlaneSettings, PostgresControlPlane};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
-use crate::backends::fakes::InMemorySecrets;
-use crate::backends::secrets::SecretResolver as _;
 use crate::desired_state::{
-    DesiredState, ExpectedRevision, ResourceVersionNumber, RevisionId, SecretLifecycle, SecretRef,
-    fixtures,
+    DesiredState, ExpectedRevision, ResourceVersionNumber, RevisionId, fixtures,
 };
 
 /// A journal on a schema of its own, or `None` when no Postgres is configured
@@ -116,35 +113,6 @@ async fn dump(schema: &str) -> String {
         }
     }
     dumped
-}
-
-/// Stage each `(reference, plaintext)` pair into a store and resolve it back,
-/// returning the plaintext the store handed over.
-///
-/// The store is dropped; the material is not. What the caller holds is the same
-/// thing the runtime holds between a compilation and a publication — a resolved
-/// key, alive in the process that is talking to the journal — which is the only
-/// state in which "the journal never saw it" is a claim with content.
-async fn live_material(pairs: &[(SecretRef, &'static str)]) -> Vec<String> {
-    let secrets = InMemorySecrets::new();
-    let mut resolved = Vec::with_capacity(pairs.len());
-    for (reference, plaintext) in pairs {
-        secrets.seed(
-            owner(),
-            *reference,
-            SecretLifecycle::Active,
-            material(plaintext),
-        );
-        resolved.push(
-            secrets
-                .resolve(owner(), reference)
-                .await
-                .expect("active material resolves")
-                .expose()
-                .to_owned(),
-        );
-    }
-    resolved
 }
 
 async fn publish(

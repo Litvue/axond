@@ -48,7 +48,7 @@ use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{
     CanonicalValue, DesiredState, ExpectedRevision, LoadedRevision, ResourceBody, ResourceId,
     ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber, RevisionId,
-    SecretOwner, SecretRef, Slug, fixtures,
+    SecretLifecycle, SecretOwner, SecretRef, Slug, fixtures,
 };
 use crate::state::{AppState, ConfigSnapshot};
 use crate::telemetry;
@@ -522,4 +522,35 @@ pub(crate) fn chat_request() -> Request<Body> {
         )
         .body(Body::from(r#"{"model":"fast","messages":[]}"#))
         .expect("a valid request")
+}
+
+/// Stage each `(reference, plaintext)` pair into a store and resolve it back,
+/// returning the plaintext the store handed over.
+///
+/// The store is dropped; the material is not. What the caller holds is the same
+/// thing the runtime holds between a compilation and a publication — a resolved
+/// key, alive in the process under test — which is the only state in which "the
+/// surface never carried it" is a claim with content. A test whose scenario
+/// never resolves anything (a refusal, a durable-state sweep) uses this to put
+/// the material in the process anyway, so its sweep can fail.
+pub(crate) async fn live_material(pairs: &[(SecretRef, &'static str)]) -> Vec<String> {
+    let secrets = InMemorySecrets::new();
+    let mut resolved = Vec::with_capacity(pairs.len());
+    for (reference, plaintext) in pairs {
+        secrets.seed(
+            owner(),
+            *reference,
+            SecretLifecycle::Active,
+            material(plaintext),
+        );
+        resolved.push(
+            secrets
+                .resolve(owner(), reference)
+                .await
+                .expect("active material resolves")
+                .expose()
+                .to_owned(),
+        );
+    }
+    resolved
 }

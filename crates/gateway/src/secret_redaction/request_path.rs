@@ -21,8 +21,8 @@ use tower::util::ServiceExt as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 use super::harness::{
-    FakeProvider, PROVIDER_MATERIAL, Replica, chat_request, first, material, owner, state_pinning,
-    sweep,
+    FakeProvider, PROVIDER_MATERIAL, Replica, chat_request, first, live_material, material, owner,
+    state_pinning, sweep,
 };
 use crate::desired_state::{ResourceVersionNumber, SecretLifecycle};
 use crate::routes::router;
@@ -287,7 +287,11 @@ async fn the_status_response_reports_a_secret_failure_without_disclosing_anythin
             state_pinning(first(), ResourceVersionNumber::FIRST),
         )
         .await;
-    // No material was ever staged, so the candidate cannot resolve.
+    // The candidate cannot resolve: nothing was staged in the replica's store.
+    // The material is live in the process regardless, so the sweep below has
+    // something to find if the projection ever starts rendering it.
+    let live = live_material(&[(first(), PROVIDER_MATERIAL)]).await;
+    sweep().assert_present("the material resolved out of a store", "provider", &live[0]);
     replica.converge().await;
     let report = replica.reconciler.report();
     assert_eq!(
@@ -323,4 +327,5 @@ async fn the_status_response_reports_a_secret_failure_without_disclosing_anythin
     let revision = deployment.revision.expect("an operator sees convergence");
     assert!(!revision.converged);
     assert_eq!(revision.reason, Some(StatusReason::SecretUnresolved.code()));
+    drop(live);
 }
