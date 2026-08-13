@@ -378,9 +378,13 @@ impl PostgresControlPlane {
                         )));
                     }
                 }
-                let baseline = schema::baseline(&transaction)
-                    .await
-                    .map_err(|error| unavailable("reconcile the empty ledger", &error))?;
+                // Classified like the writes rather than like an ordinary read:
+                // this reads the objects an out-of-band `psql` created, plausibly
+                // as a different role, so `42501` on the seed probe is a realistic
+                // failure and no retry clears it.
+                let baseline = schema::baseline(&transaction).await.map_err(|error| {
+                    refused_or_unavailable("reconciling the empty ledger", &error)
+                })?;
                 let versions = match baseline {
                     Baseline::Applied { versions } => versions,
                     Baseline::Nothing => {
@@ -595,13 +599,20 @@ fn denied(message: impl Into<String>) -> ControlPlaneError {
 }
 
 /// Classify a failure to run the migration DDL by whether a retry could clear it.
+fn migration_refused_or_unavailable(error: &tokio_postgres::Error) -> ControlPlaneError {
+    refused_or_unavailable("applying migrations", error)
+}
+
+/// Classify a schema operation's failure by whether a retry could clear it.
 ///
-/// The realistic failures here are the server rejecting a statement, not the
-/// server being unreachable: `3F000` when the configured `[control_plane] schema`
-/// does not exist (`SET search_path` accepts a missing schema, so the refusal
-/// arrives at the first `CREATE TABLE`) and `42501` when the role may not create
-/// objects. Both need an operator, and reporting them as an outage would tell a
-/// rollout gate to retry a thing that cannot start working.
+/// The realistic failures on these paths are the server rejecting a statement,
+/// not the server being unreachable: `3F000` when the configured
+/// `[control_plane] schema` does not exist (`SET search_path` accepts a missing
+/// schema, so the refusal arrives at the first `CREATE TABLE`), and class `42` —
+/// `42501` when the role may not create the objects or read the ones an
+/// out-of-band apply left behind, `42P01` when one of them is not there after all.
+/// Every one of those needs an operator, and reporting them as an outage would
+/// tell a rollout gate to retry a thing that cannot start working.
 ///
 /// The transient classes stay outages so they keep their retryable
 /// classification: connection exceptions (08), transaction rollbacks including
@@ -609,21 +620,21 @@ fn denied(message: impl Into<String>) -> ControlPlaneError {
 /// object not in a prerequisite state such as an unavailable lock (55), operator
 /// intervention including a cancelled statement or a shutdown (57), and system
 /// errors (58). An error with no SQLSTATE never reached the server at all.
-fn migration_refused_or_unavailable(error: &tokio_postgres::Error) -> ControlPlaneError {
+fn refused_or_unavailable(operation: &str, error: &tokio_postgres::Error) -> ControlPlaneError {
     const TRANSIENT: [&str; 6] = ["08", "40", "53", "55", "57", "58"];
     let Some(db) = error.as_db_error() else {
-        return unavailable("apply migrations", error);
+        return unavailable(operation, error);
     };
     let code = db.code().code();
     if code
         .get(..2)
         .is_some_and(|class| TRANSIENT.contains(&class))
     {
-        return unavailable("apply migrations", error);
+        return unavailable(operation, error);
     }
     denied(format!(
-        "applying migrations failed: {} (SQLSTATE {code}); the server rejected the statement, so \
-         no retry clears it — check that the configured schema exists and that the role may \
+        "{operation} failed: {} (SQLSTATE {code}); the server rejected the statement, so no retry \
+         clears it — check that the configured schema exists and that the role may read and \
          create objects in it",
         db.message()
     ))

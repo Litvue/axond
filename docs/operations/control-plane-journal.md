@@ -322,6 +322,11 @@ path is not evidence about this one). What it does instead of recording:
   checksum)` you write because you own the change that applied it. The refusal names
   the version and says this.
 
+The role running `adopt` must be able to *read* the objects the out-of-band apply
+created, not just the ledger: a rejected probe (`42501`, or a missing schema) is
+reported as a refusal naming the SQLSTATE rather than as an outage, so a gate stops
+and the grant gets made instead of the gate retrying.
+
 It is one transaction under the same advisory lock `apply` takes, so a refusal
 leaves no partial baseline and two simultaneous adoptions are one adoption.
 Adopting a prefix below the required version reports what is still pending and

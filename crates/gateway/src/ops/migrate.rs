@@ -862,6 +862,66 @@ mod tests {
         );
     }
 
+    /// A role that may read the ledger but not the objects the out-of-band apply
+    /// created is an operator's to fix, not an outage to retry.
+    ///
+    /// Adoption's premise is DDL applied by somebody else, plausibly as another
+    /// role, so `42501` while reading the evidence is a realistic failure rather
+    /// than a theoretical one. Reported as retryable it would have a rollout gate
+    /// loop forever on a grant nobody is going to make from a retry.
+    #[tokio::test]
+    async fn a_role_that_cannot_read_the_evidence_refuses_rather_than_advising_a_retry() {
+        let Some(fixture) = fixture().await else {
+            return;
+        };
+        fixture.hand_applied().await;
+
+        // A login role with the ledger and the schema, and no read on the rest.
+        let role = format!("{}_probe", fixture.schema);
+        let client = client(&fixture.dsn).await;
+        if client
+            .batch_execute(&format!(
+                "CREATE ROLE {role} LOGIN PASSWORD 'adopt-probe';
+                 GRANT USAGE ON SCHEMA {} TO {role};
+                 GRANT SELECT, INSERT ON {}.axond_cp_schema_migration TO {role}",
+                fixture.schema, fixture.schema
+            ))
+            .await
+            .is_err()
+        {
+            // Not a superuser: this database cannot host the case.
+            return;
+        }
+        let Some((scheme, rest)) = fixture.dsn.split_once("://") else {
+            panic!("a DSN with a scheme");
+        };
+        let host = rest.split_once('@').map_or(rest, |(_, host)| host);
+        let env = HashMap::from([(
+            "GW_CONTROL_PLANE_DSN".to_owned(),
+            format!("{scheme}://{role}:adopt-probe@{host}"),
+        )]);
+
+        let error = adopt(&fixture.config, &env)
+            .await
+            .expect_err("evidence that cannot be read is not evidence");
+        assert!(
+            matches!(error, OpsError::Refused { .. }),
+            "the server rejected the read, which is a grant to make: {error:?}"
+        );
+        assert!(
+            !error.is_retryable(),
+            "a rollout gate must stop rather than loop: {error}"
+        );
+        assert!(
+            error.to_string().contains("42501") && error.to_string().contains("no retry clears it"),
+            "the refusal names the SQLSTATE and says a retry will not help: {error}"
+        );
+        assert!(
+            fixture.ledger().await.is_empty(),
+            "a refused adoption must not record a baseline"
+        );
+    }
+
     /// Another install's journal on the same search path is not evidence about
     /// *this* schema.
     ///

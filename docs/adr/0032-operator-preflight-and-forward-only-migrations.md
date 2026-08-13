@@ -171,6 +171,11 @@ ledger row for DDL it did not run:
   adoption.
 - An adopted baseline below the required version reports what is still pending and
   exits non-zero; `apply` then migrates forward from it, unchanged.
+- **Reading the evidence is classified like writing the ledger, not like an
+  ordinary read.** Adoption's premise is DDL applied by somebody else, plausibly as
+  another role, so `42501` on a probe is a realistic failure; class 42 and `3F000`
+  are refusals naming the SQLSTATE rather than outages, because a rollout gate told
+  to retry a grant loops forever.
 
 Unchanged: `preflight` and `status` still cannot write, the classifications are the
 same, an empty ledger is still a refusal for `status`, `apply`, and boot, and
