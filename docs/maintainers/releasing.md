@@ -95,8 +95,12 @@ Commit types on `main`:
 
 | What landed | Bump |
 | --- | --- |
-| `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `build`, `ci`, `chore` | patch |
 | A breaking commit (`feat!`/`fix!` or a `BREAKING CHANGE` footer) | minor |
+| Anything else release-please collects, `feat` included | patch |
+
+`chore` is `hidden` in the changelog sections, so it stays out of the notes; a
+`main` that has nothing but hidden commits on it may not open a release PR at
+all, which is not a classification to audit but an absence of one.
 
 A feature riding in a patch is therefore the configured behaviour, not a
 misclassification: `0.x` gives a patch no compatibility promise a minor keeps, so
