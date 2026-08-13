@@ -42,6 +42,7 @@
 //! minimal so those slices can extend them without a rewrite.
 
 pub mod catalog;
+pub mod catalog_pins;
 pub mod catalog_projection;
 pub mod catalog_refresh;
 pub mod catalog_store;
