@@ -492,6 +492,40 @@ impl DeliveryWorker {
                 "usage journal retention pass failed"
             ),
         }
+        self.report_other_consumers().await;
+    }
+
+    /// Say so when the journal holds delivery state for a consumer this
+    /// deployment is not running.
+    ///
+    /// Retention waits on every registered consumer, so a name that was retired —
+    /// the predecessor of a renamed `consumer`, or a replay consumer somebody
+    /// finished with — stops the outbox pruning at all, and a bounded outbox that
+    /// cannot prune eventually refuses appends. Nothing here deletes the state:
+    /// the same row is what a second fleet delivering from this outbox depends on,
+    /// and only an operator knows which it is. Reported once a maintenance tick,
+    /// alongside the depth gauge that says whether it is costing anything yet.
+    async fn report_other_consumers(&self) {
+        match self
+            .journal
+            .consumers_besides(&self.settings.consumer)
+            .await
+        {
+            Ok(others) if !others.is_empty() => tracing::warn!(
+                journal = self.journal.name(),
+                consumer = %self.settings.consumer,
+                others = others.join(","),
+                "the usage journal is holding delivery state for consumers this deployment is \
+                 not running, and retention waits on every one of them; if they are retired \
+                 names, delete their rows, or the outbox grows to its limit and refuses appends"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::debug!(
+                journal = self.journal.name(),
+                error = %error,
+                "usage journal consumers could not be listed"
+            ),
+        }
     }
 }
 

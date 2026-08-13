@@ -326,8 +326,11 @@ DELETE FROM axond_usage_outbox_consumer WHERE consumer = 'old-name';
 DELETE FROM axond_usage_outbox_delivery  WHERE consumer = 'old-name';
 ```
 
-`axond.usage.journal.depth` staying flat while `deliveries` keeps rising is what
-this looks like before the outbox fills.
+The worker says so once a maintenance tick when the outbox holds state for a
+consumer this deployment is not running (`consumers this deployment is not
+running`), because it cannot tell a retired name from a second fleet's live one —
+so it names them and deletes nothing. `axond.usage.journal.depth` staying flat
+while `deliveries` keeps rising is what this looks like before the outbox fills.
 
 ## Upgrades and version skew
 

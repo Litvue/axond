@@ -735,4 +735,21 @@ pub trait UsageJournal: Send + Sync {
         let _ = now;
         Ok(0)
     }
+
+    /// Consumers the journal is holding delivery state for that are *not*
+    /// `mine` — the names retention is also waiting on.
+    ///
+    /// A journal that prunes only what every registered consumer has finished
+    /// with cannot tell a second fleet's consumer from one that was retired: a
+    /// renamed `consumer` leaves its predecessor registered, and retention then
+    /// waits on a name nothing will ever acknowledge again, so the outbox grows
+    /// to [`Capacity::max_events`] and starts refusing appends. Only an operator
+    /// can say which it is, so the journal reports the names and the worker says
+    /// so once a maintenance tick rather than guessing and deleting state a live
+    /// consumer needs. The default is the honest answer for a store that keeps
+    /// no per-consumer state.
+    async fn consumers_besides(&self, mine: &ConsumerId) -> Result<Vec<String>, JournalError> {
+        let _ = mine;
+        Ok(Vec::new())
+    }
 }

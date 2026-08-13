@@ -840,6 +840,26 @@ impl UsageJournal for PostgresJournal {
         }
         Ok(pruned)
     }
+
+    async fn consumers_besides(&self, mine: &ConsumerId) -> Result<Vec<String>, JournalError> {
+        let name = mine.as_str().to_owned();
+        self.run("consumers", Lane::Delivery, move |client| {
+            let name = name.clone();
+            Box::pin(async move {
+                // One row per consumer that has ever claimed, so this is a small
+                // table however large the backlog it gates.
+                let rows = client
+                    .query(
+                        "SELECT consumer FROM axond_usage_outbox_consumer WHERE consumer <> $1 \
+                         ORDER BY consumer",
+                        &[&name],
+                    )
+                    .await?;
+                Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
+            })
+        })
+        .await
+    }
 }
 
 impl PostgresJournal {
@@ -2101,6 +2121,51 @@ mod tests {
             "the reclaim rode out on the refusal instead of being rolled back \
              for the next request to redo"
         );
+    }
+
+    /// Retention waits on every registered consumer, so a retired name stalls it
+    /// forever. Deleting the row is the operator's call — a second fleet's
+    /// consumer looks exactly the same — so the journal's job is to name it.
+    #[tokio::test]
+    async fn a_consumer_this_deployment_is_not_running_is_reported_not_deleted() {
+        let Some((dsn, journal)) = outbox("others", capacity(16, CapacityPolicy::Refuse)).await
+        else {
+            return;
+        };
+        let mine = consumer("billing");
+        assert!(
+            journal
+                .consumers_besides(&mine)
+                .await
+                .expect("consumers")
+                .is_empty(),
+            "nothing has claimed yet"
+        );
+        journal
+            .append(&event_for("GW_INBOUND_ACME_KEY"))
+            .await
+            .expect("append");
+        let now = SystemTime::now();
+        for name in ["billing", "retired"] {
+            journal
+                .claim(&consumer(name), claim_at(8, Duration::from_secs(30), now))
+                .await
+                .expect("claim");
+        }
+
+        assert_eq!(
+            journal.consumers_besides(&mine).await.expect("consumers"),
+            vec!["retired".to_owned()],
+            "the name retention is also waiting on"
+        );
+        // Reported, never reaped: the row may belong to a live consumer.
+        let registered: i64 = client(&dsn, Some("axond_outbox_others"))
+            .await
+            .query_one("SELECT count(*) FROM axond_usage_outbox_consumer", &[])
+            .await
+            .expect("count")
+            .get(0);
+        assert_eq!(registered, 2);
     }
 
     #[tokio::test]
