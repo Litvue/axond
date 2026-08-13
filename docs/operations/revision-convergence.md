@@ -396,7 +396,7 @@ The refusal reason is the triage key.
   staged, is sealed under a KEK this deployment no longer has, or the store is
   down. Material a serving snapshot already holds is unaffected — the replica keeps
   serving it, because a candidate is compiled in full before anything is published
-  ([ADR 0036](../adr/0036-envelope-encrypted-secret-store-and-snapshot-time-resolution.md)).
+  ([ADR 0038](../adr/0038-envelope-encrypted-secret-store-and-snapshot-time-resolution.md)).
 - **`projection`** — a candidate this build cannot project: a resource body it
   does not read, or a bootstrap that is missing something projection may not
   supply for it (today, a default namespace). Roll the replica forward, publish a

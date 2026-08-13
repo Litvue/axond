@@ -1,4 +1,4 @@
-# 36. An envelope-encrypted secret store, and material that lives exactly as long as a snapshot
+# 38. An envelope-encrypted secret store, and material that lives exactly as long as a snapshot
 
 Date: 2026-08-13
 
