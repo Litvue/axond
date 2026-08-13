@@ -98,6 +98,9 @@ bench = false
 name = "provider_error"
 path = "fuzz_targets/provider_error.rs"
 required-features = ["libfuzzer"]
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "catalog_import"

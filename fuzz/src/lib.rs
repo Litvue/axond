@@ -24,6 +24,7 @@
 //! synthetic key material, so a fuzz run is hermetic and holds no real secret.
 
 mod wire;
+
 use std::sync::OnceLock;
 
 use arbitrary::Arbitrary;
@@ -34,6 +35,7 @@ pub use wire::{
     UpstreamFailure, assert_disclosure_check_survives_escaping, assert_valid_fixtures_are_stable,
     provider_error, provider_stream, sse_decode, sse_decode_at_limit, sse_events,
 };
+
 /// The ceiling a catalogue refusal's operator-facing text stays under.
 ///
 /// Generous next to the excerpts the parser emits and tiny next to the 64 MiB a
