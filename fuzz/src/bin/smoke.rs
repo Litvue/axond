@@ -566,6 +566,7 @@ fn main() {
     );
 
     let mut minted_classes: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut minted_scenarios_asserted = 0_usize;
     for (label, input) in minted_scenarios() {
         let input_started = Instant::now();
         let class = axond_fuzz::token_verify(&input);
@@ -573,6 +574,7 @@ fn main() {
             .iter()
             .find(|(scenario, _)| *scenario == label)
         {
+            minted_scenarios_asserted += 1;
             assert_eq!(
                 class, *expected,
                 "minted scenario {label} reached {class} rather than {expected}, so the check it \
@@ -587,6 +589,15 @@ fn main() {
         );
         inputs += 1;
     }
+    // A pin nothing looks up is a check nobody runs, and the class count below
+    // can be satisfied by a different scenario, so renaming one has to fail here.
+    assert_eq!(
+        minted_scenarios_asserted,
+        EXPECTED_MINTED_CLASSES.len(),
+        "only {minted_scenarios_asserted} of the {} pinned minted scenarios were asserted; a \
+         pinned label no longer appears in `minted_scenarios`",
+        EXPECTED_MINTED_CLASSES.len()
+    );
     assert!(
         minted_classes.len() >= MINIMUM_MINTED_CLASSES,
         "minted scenarios reached {} outcome classes, fewer than the {MINIMUM_MINTED_CLASSES} required",
