@@ -205,6 +205,23 @@ impl GatewayError {
     }
 }
 
+/// What a caller is told about a transport failure, on the buffered path and
+/// in a stream's in-band terminal event alike.
+///
+/// `reqwest` renders the endpoint it failed against into its message, and
+/// `redact_url` only takes that URL's credential-bearing parts off. The
+/// endpoint itself belongs in the operator's logs and on the attempt span,
+/// where the full `Display` still goes — not in the caller's answer, which
+/// would name a provider host, port, and path the caller never chose. Every
+/// other transport failure names its phase and no endpoint (ADR 0028), so it is
+/// relayed as it stands.
+pub fn transport_caller_message(error: &TransportError) -> String {
+    match error {
+        TransportError::Http(_) => "upstream transport failure".to_owned(),
+        other => other.to_string(),
+    }
+}
+
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
         let status = self.status();
@@ -224,6 +241,7 @@ impl IntoResponse for GatewayError {
         let message = match &self {
             Self::TokenUnauthorized(_) => "token authentication failed".to_owned(),
             Self::TokenForbidden(_) => "token authorization failed".to_owned(),
+            Self::Transport(error) => transport_caller_message(error),
             _ => self.to_string(),
         };
         let body = json!({
@@ -406,6 +424,25 @@ mod tests {
             body["error"]["message"],
             "request body exceeds the configured inbound limit"
         );
+    }
+
+    #[tokio::test]
+    async fn a_transport_failure_does_not_name_the_endpoint_it_failed_against() {
+        let error = GatewayError::Transport(TransportError::Http(
+            "error sending request for url (http://provider.internal:9443/v1/chat/completions)"
+                .to_owned(),
+        ));
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "upstream_transport");
+        assert_eq!(body["error"]["message"], "upstream transport failure");
     }
 
     #[tokio::test]

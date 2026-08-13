@@ -132,6 +132,40 @@ impl Output {
     }
 }
 
+/// Everything a boot may vary beyond the upstream it talks to.
+#[derive(Clone, Copy, Default)]
+pub struct Options<'a> {
+    /// The `[failover]`/`[transport]` sections.
+    pub tuning: &'a str,
+    /// TOML appended to the generated config: extra providers, aliases, or
+    /// state-tier sections a suite wants the shipped process to parse.
+    pub extra_config: &'a str,
+    /// Extra environment, applied last — so a suite can point a `dsn_env`
+    /// reference at a fixture it controls. Values are referenced by name from
+    /// the config, never inlined into it.
+    pub env: &'a [(&'a str, &'a str)],
+}
+
+impl<'a> Options<'a> {
+    pub fn new(tuning: &'a str) -> Self {
+        Self {
+            tuning,
+            extra_config: "",
+            env: &[],
+        }
+    }
+
+    pub fn with_config(mut self, extra_config: &'a str) -> Self {
+        self.extra_config = extra_config;
+        self
+    }
+
+    pub fn with_env(mut self, env: &'a [(&'a str, &'a str)]) -> Self {
+        self.env = env;
+        self
+    }
+}
+
 pub struct Axond {
     pub base_url: String,
     /// This boot's private inbound key: no other process has it, so a route that
@@ -160,13 +194,20 @@ impl Axond {
     /// Boot with `tuning` — TOML replacing the default `[failover]` section and
     /// carrying any `[transport]` bounds the suite wants to exercise.
     pub async fn start_with(upstream_base_url: &str, tuning: &str) -> Self {
+        Self::start_with_options(upstream_base_url, Options::new(tuning)).await
+    }
+
+    /// Boot with everything a suite may need to vary: the tuning sections, extra
+    /// config appended to the generated file, and extra environment the process
+    /// resolves its own references from.
+    pub async fn start_with_options(upstream_base_url: &str, options: Options<'_>) -> Self {
         // `free_addr` closes its listener before the binary binds it, so a
         // sibling test process can take the port in between. That race is the
         // ephemeral-port allocator's, not the gateway's, so a lost boot is
         // retried on a fresh port rather than failing the suite.
         let mut last = String::new();
         for _ in 0..BOOT_ATTEMPTS {
-            match Self::try_start(upstream_base_url, tuning).await {
+            match Self::try_start(upstream_base_url, &options).await {
                 Ok(gateway) => return gateway,
                 Err(output) => last = output,
             }
@@ -202,8 +243,24 @@ impl Axond {
     /// One boot attempt. The error is everything that attempt's child wrote,
     /// which on a loopback port usually means someone else won the bind — and
     /// when it means something else, it is the only account of what.
-    async fn try_start(upstream_base_url: &str, tuning: &str) -> Result<Self, String> {
-        Self::try_start_custom(&|addr| config_toml(addr, upstream_base_url, tuning), &[]).await
+    async fn try_start(upstream_base_url: &str, options: &Options<'_>) -> Result<Self, String> {
+        let env: Vec<(String, String)> = options
+            .env
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        Self::try_start_custom(
+            &|addr| {
+                config_toml(
+                    addr,
+                    upstream_base_url,
+                    options.tuning,
+                    options.extra_config,
+                )
+            },
+            &env,
+        )
+        .await
     }
 
     async fn try_start_custom(
@@ -223,10 +280,7 @@ impl Axond {
         std::fs::write(&path, &config).expect("test config is written");
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_axond"));
-        for (name, value) in extra_env {
-            command.env(name, value);
-        }
-        let mut child = command
+        command
             .env("AXOND_CONFIG", &path)
             .env("GW_INBOUND_KEY", GATEWAY_KEY)
             .env(BOOT_KEY_ENV, &boot_key)
@@ -237,9 +291,13 @@ impl Axond {
             .env("RUST_LOG", "warn")
             .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("the axond binary starts");
+            .stderr(Stdio::piped());
+        // Last, so a harness that wants a collector endpoint or a louder filter
+        // than the default gets it rather than the default it was removing.
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
+        let mut child = command.spawn().expect("the axond binary starts");
 
         let output = Arc::new(Mutex::new(Output::default()));
         let mut readers = Vec::new();
@@ -538,7 +596,7 @@ fn free_addr() -> SocketAddr {
 /// The config a boot with these arguments is given. Public so a harness can
 /// preflight the exact bytes a replica will be started from *before* starting
 /// it, which is the order a deployment gate runs in.
-pub fn config_toml(bind: SocketAddr, upstream: &str, tuning: &str) -> String {
+pub fn config_toml(bind: SocketAddr, upstream: &str, tuning: &str, extra: &str) -> String {
     let price = format!(
         "{{ input_microdollars_per_million = {INPUT_PRICE}, output_microdollars_per_million = {OUTPUT_PRICE} }}"
     );
@@ -589,6 +647,8 @@ env = "GW_BOOT_KEY"
 namespace = "platform"
 
 {tuning}
+
+{extra}
 
 {chat}{chat_sized_small}{chat_sized_medium}{chat_sized_large}{chat_no_headers}{chat_late_headers}{chat_slow_body}{chat_huge_body}{chat_huge_error}{chat_stall}{chat_stall_after_bytes}{chat_long}{chat_slow}{chat_drop}{chat_fail}{messages}{messages_slow}{messages_drop}{embeddings}{responses}"#,
         chat = model(alias::CHAT, "fake-openai", target::CHAT),

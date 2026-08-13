@@ -9,6 +9,7 @@
 
 pub mod capacity;
 pub mod endurance;
+pub mod fault;
 pub mod gateway;
 pub mod packet;
 pub mod recovery;

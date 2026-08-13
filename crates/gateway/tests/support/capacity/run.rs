@@ -281,8 +281,13 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Capacity
         .strip_prefix("http://")
         .expect("a loopback base URL")
         .to_owned();
-    let environment =
-        Environment::collect(&gateway.config, &bind, &upstream.base_url, manifest_text);
+    let environment = Environment::collect(
+        &gateway.config,
+        &bind,
+        &upstream.base_url,
+        super::manifest::MANIFEST_RELATIVE,
+        manifest_text,
+    );
 
     let client = crate::support::client();
     let gauges = Arc::new(Gauges::default());
