@@ -510,7 +510,7 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Capacity
     let upstream = FakeUpstream::start().await;
     let upstream_base = upstream.base_url.clone();
     let gateway = Axond::start_custom(
-        &|addr| config_toml(addr, &upstream_base, &tuning),
+        &|addr| config_toml(addr, &upstream_base, &tuning, ""),
         &extra_env,
     )
     .await;
