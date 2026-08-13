@@ -1388,20 +1388,33 @@ pub enum CatalogChange {
     NeutralDropped {
         model: ModelId,
     },
+    /// An offering's lifecycle moved.
+    ///
+    /// Every changed-offering variant names `published` for the same reason
+    /// [`Self::OfferingAdded`] does: the offering that changed is
+    /// `(provider, published)`, so a provider publishing two aliases of one
+    /// model would otherwise report two changes an operator cannot tell apart.
+    /// When the published id is itself what changed, the id named is the current
+    /// one — the id requests must use from now on — and
+    /// [`ModelField::PublishedModelId`] in the accompanying
+    /// [`Self::MetadataChanged`] says that is what moved.
     LifecycleChanged {
         model: ModelId,
         provider: ProviderId,
+        published: String,
         from: ModelLifecycle,
         to: ModelLifecycle,
     },
     CapabilitiesChanged {
         model: ModelId,
         provider: ProviderId,
+        published: String,
         fields: Vec<ModelField>,
     },
     MetadataChanged {
         model: ModelId,
         provider: ProviderId,
+        published: String,
         fields: Vec<ModelField>,
     },
     /// Boxed because an observed price carries every published rate and tier,
@@ -1409,6 +1422,7 @@ pub enum CatalogChange {
     PriceChanged {
         model: ModelId,
         provider: ProviderId,
+        published: String,
         from: Option<Box<ObservedPrice>>,
         to: Option<Box<ObservedPrice>>,
     },
@@ -1457,9 +1471,12 @@ impl CatalogChange {
     /// The id a request would have used, for the changes that name one.
     pub fn published(&self) -> Option<&str> {
         match self {
-            Self::OfferingAdded { published, .. } | Self::OfferingRemoved { published, .. } => {
-                Some(published)
-            }
+            Self::OfferingAdded { published, .. }
+            | Self::OfferingRemoved { published, .. }
+            | Self::LifecycleChanged { published, .. }
+            | Self::CapabilitiesChanged { published, .. }
+            | Self::MetadataChanged { published, .. }
+            | Self::PriceChanged { published, .. } => Some(published),
             _ => None,
         }
     }
@@ -1724,6 +1741,7 @@ fn offering_changes(
         changes.push(CatalogChange::LifecycleChanged {
             model: model.clone(),
             provider: current.provider.clone(),
+            published: current.published_model_id.clone(),
             from: previous.facts.lifecycle,
             to: current.facts.lifecycle,
         });
@@ -1737,6 +1755,7 @@ fn offering_changes(
         changes.push(CatalogChange::CapabilitiesChanged {
             model: model.clone(),
             provider: current.provider.clone(),
+            published: current.published_model_id.clone(),
             fields: capability_fields,
         });
     }
@@ -1749,6 +1768,7 @@ fn offering_changes(
         changes.push(CatalogChange::MetadataChanged {
             model: model.clone(),
             provider: current.provider.clone(),
+            published: current.published_model_id.clone(),
             fields: metadata_fields,
         });
     }
@@ -1756,6 +1776,7 @@ fn offering_changes(
         changes.push(CatalogChange::PriceChanged {
             model: model.clone(),
             provider: current.provider.clone(),
+            published: current.published_model_id.clone(),
             from: previous.price.clone().map(Box::new),
             to: current.price.clone().map(Box::new),
         });
@@ -2007,6 +2028,49 @@ mod tests {
         assert_eq!(diff.counts().prices_changed, 1);
         assert_eq!(diff.counts().offerings_added, 0);
         assert_eq!(diff.counts().offerings_removed, 0);
+        assert_eq!(
+            diff.changes()[0].published(),
+            Some("gpt-4o-latest"),
+            "and the report names which of the provider's ids got dearer"
+        );
+    }
+
+    /// A change to an offering names the id it is published under, so a provider
+    /// repricing both of its aliases of one model is two changes an operator can
+    /// act on separately rather than two identical-looking reports.
+    #[test]
+    fn a_change_to_one_alias_is_distinguishable_from_a_change_to_the_other() {
+        let mut first = offering("openai", "gpt-4o", Some(price(1, 2)));
+        first.published_model_id = "gpt-4o-2024".to_owned();
+        let mut second = offering("openai", "gpt-4o", Some(price(1, 2)));
+        second.published_model_id = "gpt-4o-latest".to_owned();
+        let before = content(vec![first.clone(), second.clone()]);
+
+        let mut first_dearer = first;
+        first_dearer.price = Some(price(1, 3));
+        let mut second_deprecated = second;
+        second_deprecated.facts.lifecycle = ModelLifecycle::Deprecated;
+        let after = content(vec![first_dearer, second_deprecated]);
+
+        let diff = after.diff(&before);
+        let named: Vec<Option<&str>> = diff
+            .changes()
+            .iter()
+            .map(CatalogChange::published)
+            .collect();
+        assert_eq!(
+            named,
+            [Some("gpt-4o-latest"), Some("gpt-4o-2024")],
+            "each report names its own callable id"
+        );
+        assert!(matches!(
+            diff.changes()[0],
+            CatalogChange::LifecycleChanged { .. }
+        ));
+        assert!(matches!(
+            diff.changes()[1],
+            CatalogChange::PriceChanged { .. }
+        ));
     }
 
     /// Content identity is over stated values, so two catalogues differing only
@@ -2032,12 +2096,27 @@ mod tests {
     /// catalogue against a stored one would differ on field order alone.
     #[test]
     fn a_catalogue_record_equals_its_own_round_trip() {
-        let content = content(vec![offering("openai", "gpt-4o", Some(price(1, 2)))]);
+        // Several capabilities and modalities, and in an order that is not the
+        // order they encode in: a set of one member round-trips whatever the
+        // constructor does with it, so it would pin nothing.
+        let mut described = offering("openai", "gpt-4o", Some(price(1, 2)));
+        described.facts.capabilities = [
+            ModelCapability::ToolCall,
+            ModelCapability::Attachment,
+            ModelCapability::Reasoning,
+        ]
+        .into_iter()
+        .collect();
+        described.facts.input_modalities = [Modality::Text, Modality::Image, Modality::Audio]
+            .into_iter()
+            .collect();
+        let content = content(vec![described]);
         let serializer = crate::desired_state::canonical::SerializerVersion::default();
         for record in [
             content.providers()[0].canonical(),
             content.models()[0].canonical(),
             content.models()[0].offerings[0].canonical(),
+            content.canonical(),
         ] {
             let bytes = record.to_canonical_bytes().expect("canonical bytes");
             assert_eq!(
@@ -2385,6 +2464,7 @@ mod tests {
                 CatalogChange::MetadataChanged {
                     model: ModelId::parse("gpt-4o").expect("fixture id"),
                     provider: ProviderId::parse("openai").expect("fixture id"),
+                    published: "gpt-4o".to_owned(),
                     fields: vec![ModelField::Endpoint],
                 },
             ),
@@ -2394,6 +2474,9 @@ mod tests {
                 CatalogChange::MetadataChanged {
                     model: ModelId::parse("gpt-4o").expect("fixture id"),
                     provider: ProviderId::parse("openai").expect("fixture id"),
+                    // The id in effect after the change, which is the one
+                    // requests must use from here on.
+                    published: "gpt-4o-2024-11-20".to_owned(),
                     fields: vec![ModelField::PublishedModelId],
                 },
             ),
