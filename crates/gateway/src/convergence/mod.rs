@@ -47,7 +47,8 @@
 //!
 //! # Not wired to `serve` yet
 //!
-//! Stateful boot still refuses to start, and deliberately. Two of the projections
+//! A stateful replica boots and serves `/admin/v1`, but it refuses *inference*
+//! ([`crate::ops::inference_refusal`]), and deliberately. Two of the projections
 //! a snapshot needs exist — [`tenancy`], which makes a project a namespace, and
 //! [`credentials`], which makes an active provider credential the pool a call
 //! leases from — but a servable snapshot also needs the catalogue, pricing, and

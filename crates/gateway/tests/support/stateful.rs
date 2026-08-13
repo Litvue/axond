@@ -6,9 +6,11 @@
 //! gates are properties of a deployment rather than of a function.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// Distinguishes the fixtures of tests running in the same process.
 static FIXTURES: AtomicU64 = AtomicU64::new(0);
@@ -212,6 +214,44 @@ impl ControlPlane {
             .is_some()
     }
 
+    /// A replica of this deployment, running until the fixture is dropped.
+    ///
+    /// The control plane must already be migrated: a replica opens it at boot,
+    /// so an unprepared schema is a boot failure rather than a scenario.
+    pub async fn serve(&self) -> Replica {
+        let bind = free_addr();
+        let log = self
+            .config
+            .parent()
+            .expect("the fixture config has a directory")
+            .join("replica.log");
+        // A file rather than a pipe: a replica outlives the assertions made
+        // against it, and a full pipe nobody is draining would block its next
+        // log line and hang the scenario on an unrelated write.
+        let sink = std::fs::File::create(&log).expect("the replica's log is writable");
+        let mut command = Command::new(axond());
+        command
+            .env_clear()
+            .env("AXOND_CONFIG", &self.config)
+            // The fixture config binds port 0 so it never collides; a scenario
+            // has to know the port to make a request against it.
+            .env("AXOND_SERVER__BIND", bind.to_string())
+            .stdout(sink.try_clone().expect("the log handle is shareable"))
+            .stderr(sink);
+        for key in ["PATH", "TMPDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+        let child = command.spawn().expect("the axond binary runs");
+        let replica = Replica { child, bind, log };
+        replica.await_liveness().await;
+        replica
+    }
+
     /// The applied migration versions, in order.
     pub async fn applied_versions(&self) -> Vec<i32> {
         client(&self.dsn)
@@ -228,6 +268,57 @@ impl ControlPlane {
             .iter()
             .map(|row| row.get::<_, i32>(0))
             .collect()
+    }
+}
+
+/// A running replica, with the address to reach it and the log to explain it.
+pub struct Replica {
+    child: Child,
+    bind: SocketAddr,
+    log: PathBuf,
+}
+
+impl Replica {
+    pub fn url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.bind)
+    }
+
+    /// Everything the replica has reported so far, for a failure message.
+    pub fn output(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Wait until the process answers its liveness probe.
+    ///
+    /// `/healthz`, not `/readyz`: a stateful replica serves administration while
+    /// reporting itself unready for inference, so readiness is the very thing a
+    /// scenario here asserts rather than a precondition it waits on.
+    async fn await_liveness(&self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let client = reqwest::Client::new();
+        loop {
+            if let Ok(response) = client.get(self.url("/healthz")).send().await
+                && response.status().is_success()
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the replica never answered /healthz on {}:\n{}",
+                self.bind,
+                self.output()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// A replica left running would hold its schema open against the `DROP` the
+/// control-plane fixture performs, and outlive the suite that started it.
+impl Drop for Replica {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

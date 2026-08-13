@@ -171,14 +171,19 @@ never overridden by a datastore. See the
 [stateful deployment guide](./docs/deployment/stateful-backends.md) and
 [ADR 0017](./docs/adr/0017-state-tiers-and-optional-backends.md).
 
-Tiers describe dependencies; *operating modes* describe ownership. Stateful
-bootstrap configuration is shipped, but the durable control plane is not.
-Stateless remains the default, where TOML is the authority. The accepted design
-for an opt-in stateful mode — durable resources in Postgres, `/admin/v1`
-administration, and inference still served from one immutable in-memory
+Tiers describe dependencies; *operating modes* describe ownership. Stateless
+remains the default, where TOML is the authority. The design for the opt-in
+stateful mode — durable resources in Postgres, `/admin/v1` administration, and
+inference still served from one immutable in-memory
 snapshot — is [ADR 0027](./docs/adr/0027-stateless-and-stateful-operating-modes.md).
-The stateful bootstrap currently validates its references and then refuses to
-start until the control-plane implementation is available.
+
+A stateful replica boots and administers: it opens the control plane and serves
+`/admin/v1` — authenticated by the `[[admin_breakglass]]` credential until OIDC
+lands — which is how durable desired state is written at all. What it cannot do
+yet is *serve inference*: a published revision does not compile into a runtime
+snapshot until convergence lands, so `/readyz` and every inference path answer
+`503` per request instead of the process refusing to start, and `axond check
+preflight` reports that same refusal on its `serving` line.
 
 ## Security model
 

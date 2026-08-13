@@ -38,9 +38,10 @@ The same namespace also runs a committed stateful bootstrap configuration
 ([ADR 0027](./0027-stateless-and-stateful-operating-modes.md)) with its
 referenced env vars unset. Validating it must not resolve a DSN or reach
 Postgres, so a clean refusal inside a network-denied namespace is the mechanical
-evidence that stateful bootstrap parsing connects to nothing — and that a
-stateful process refuses to start rather than serve an empty snapshot while the
-control plane is unimplemented. The gate also fails if that diagnostic contains
+evidence that stateful bootstrap parsing connects to nothing. The refusal must
+name the unresolved reference: a stateful replica does boot and serve `/admin/v1`
+now, so a boot failure that named nothing could be a denied connection instead —
+the opposite of what this proves. The gate also fails if that diagnostic contains
 a connection string rather than a reference name.
 
 The gate deliberately does **not** claim that loopback is a network boundary.
