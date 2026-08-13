@@ -1,4 +1,4 @@
-# 34. Fuzzing the untrusted-input parsers
+# 35. Fuzzing the untrusted-input parsers
 
 Date: 2026-08-12
 

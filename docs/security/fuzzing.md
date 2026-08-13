@@ -9,7 +9,7 @@ result is required CI evidence rather than a dashboard nobody reads.
 The project lives in [`fuzz/`](https://github.com/Litvue/axond/tree/main/fuzz),
 which is its own Cargo workspace: the targets need a nightly toolchain and a
 sanitizer runtime, so nothing at the repository root builds, lints, or packages
-them. [ADR 0034](../adr/0034-fuzzing-the-untrusted-input-parsers.md) records why
+them. [ADR 0035](../adr/0035-fuzzing-the-untrusted-input-parsers.md) records why
 the project sits outside the workspace, why the seam is a cfg rather than a Cargo
 feature, and what that costs.
 
