@@ -187,13 +187,22 @@ is unwrapped only while a snapshot is compiled, and is never in the journal, a
 manifest, an audit event, or a log line ([ADR
 0034](../adr/0034-typed-provider-credentials-and-secret-lifecycle.md)).
 
-Four things follow, and each is worth knowing before you rotate a key:
+Five things follow, and each is worth knowing before you rotate a key:
 
 - **A revision pins one exact version.** Rotating stages a *new* version of the
   same secret and publishes a new version of the credential; the revision that
   pinned the old version keeps pinning it, so a rollback restores the material as
   well as the manifest. A rotation therefore does not take effect until the
   credential naming it is published and activated.
+- **A rotation that must not interrupt service is authored as two credentials.**
+  One credential resource names one version, so repointing the serving credential
+  is the cut-over, not the overlap. Stage the new version under a *second*
+  credential beside the serving one, prove it by compiling a candidate against it,
+  then publish one revision that activates the new credential and withdraws
+  (`disabled` or `revoked`) the old one. Activating the new version while the old
+  one is still `active` is refused, and publishing only the repointed body leaves
+  the revision with no active version until a further move — which is exactly why
+  the overlap is two rows.
 - **`lifecycle` says what may be done with the material**, and moves
   deterministically: `staged` (loaded, resolvable, so a candidate can be compiled
   against it) → `active` (in service) ⇄ `disabled` (withdrawn, reversible); any of
@@ -213,11 +222,21 @@ Four things follow, and each is worth knowing before you rotate a key:
 
 A `provider_id` naming a resource the same revision does not declare is *not*
 refused, for the reason given above: such a reference is unroutable rather than
-unreadable. A credential body written before this schema existed — no
-`schema` field — is `incompatible` rather than corrupt, as an untyped tenant or
-project body is; republish the affected credentials from a build that writes typed
-bodies. A `lifecycle` identifier this build does not know is the same refusal, so
-a newer release may add a state without older replicas reporting damage.
+unreadable. Two classes of refusal follow from that, and they page an operator
+differently:
+
+| Refusal | Classified | What it means |
+| --- | --- | --- |
+| no `schema` field, an unknown `schema`, an unknown field, an unknown `lifecycle` | `incompatible` | storage is intact; run or roll forward to a build that reads the body |
+| contradictory readable rows — one secret with two owners, an unreachable provider, two states for one version, two active versions | invalid, reported `Corrupt` | real repair work on stored rows |
+
+A credential body written before this schema existed — no `schema` field — is
+therefore `incompatible` rather than corrupt, as an untyped tenant or project body
+is; republish the affected credentials from a build that writes typed bodies, and
+a `lifecycle` identifier this build does not know is the same refusal, so a newer
+release may add a state without older replicas reporting damage. The second class
+cannot be produced by publishing through the gateway — the same rules run before a
+revision is stored — so a stored revision that hits one was written out of band.
 
 ### How a project becomes a namespace
 

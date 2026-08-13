@@ -134,7 +134,11 @@ Three properties of it are enforced by types rather than by review
 - **Opaque and exact.** `SecretId` (`sct_…`) is deliberately not a `ResourceId`,
   so a credential's id and the id of its material are not interchangeable in a
   call or in text, and every reference carries a one-based `SecretVersion`.
-  Rotation mints `SecretRef::rotated`; it never rewrites a version.
+  Rotation mints `SecretRef::rotated`; it never rewrites a version, and a store
+  refuses a rotation whose next version is already stored. A credential resource
+  names one version, so an admin surface that must not interrupt service stages
+  the new version under a second credential and withdraws the old one after the
+  cut-over; `ProviderCredentialBody::rotated` alone *is* the cut-over.
 - **Owned.** Every `SecretResolver`/`SecretStore` method takes a `SecretOwner`
   (tenant, optionally project), derived from the resource's scope by
   `SecretOwner::from_scope`, so scoping is an argument rather than a check a

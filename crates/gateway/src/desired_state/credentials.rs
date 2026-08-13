@@ -1043,6 +1043,85 @@ mod tests {
         );
     }
 
+    /// One resource names one version, so an operator who must not interrupt
+    /// service authors the new material *beside* the serving credential and
+    /// withdraws the old one after the cut-over. This is the sequence an admin
+    /// surface has to produce; every step of it publishes, and the one step that
+    /// would make "which key authorizes this" ambiguous does not.
+    #[test]
+    fn an_uninterrupted_rotation_is_two_credentials_and_a_deliberate_cut_over() {
+        let serving = credential_body(&tenant_id(1), 3, "primary")
+            .transitioned(SecretLifecycle::Active)
+            .unwrap();
+        // Step 1: the new version is staged beside the serving one, under its own
+        // credential resource, so nothing stops serving while it is proven.
+        let incoming = ProviderCredentialBody::staged(
+            resource_id(18),
+            owner(),
+            provider_id(18),
+            display_name("Rotating"),
+            serving.secret().rotated(),
+        );
+        let overlap = state_of([
+            serving.version(slug("primary")),
+            incoming.version(slug("rotating")),
+        ]);
+        let credentials = Credentials::of(&overlap).expect("staging beside a serving credential");
+        assert_eq!(credentials.active().count(), 1, "one version serves");
+        assert_eq!(credentials.of_owner(owner()).count(), 2);
+
+        // Step 2: activating the new version *before* withdrawing the old one is
+        // the ambiguity the rules exist to refuse, not a valid overlap.
+        let contested = state_of([
+            serving.version(slug("primary")),
+            incoming
+                .transitioned(SecretLifecycle::Active)
+                .unwrap()
+                .version(slug("rotating")),
+        ]);
+        assert!(matches!(
+            Credentials::of(&contested).expect_err("two active versions of one secret"),
+            CredentialError::AmbiguousActiveSecret { .. }
+        ));
+
+        // Step 3: the cut-over — the old version is withdrawn in the same revision
+        // that puts the new one in service, so no revision has either two active
+        // versions or none.
+        let cut_over = state_of([
+            serving
+                .transitioned(SecretLifecycle::Revoked)
+                .unwrap()
+                .version_at(slug("primary"), ResourceVersionNumber::FIRST.next()),
+            incoming
+                .transitioned(SecretLifecycle::Active)
+                .unwrap()
+                .version(slug("rotating")),
+        ]);
+        let credentials = Credentials::of(&cut_over).expect("a cut-over publishes");
+        let mut active = credentials.active();
+        assert_eq!(
+            active.next().expect("one active credential").body.secret(),
+            secret_ref_at(3, 2),
+            "the new material serves, and only it"
+        );
+        assert!(active.next().is_none());
+
+        // Repointing the serving credential instead, which `rotated` does, is the
+        // same cut-over in one resource: it publishes, and it leaves the revision
+        // with no active version until a further move, which is why an
+        // uninterrupted rotation is authored as two.
+        let repointed = state_of([serving
+            .rotated()
+            .version_at(slug("primary"), ResourceVersionNumber::FIRST.next())]);
+        assert_eq!(
+            Credentials::of(&repointed)
+                .expect("repointing publishes")
+                .active()
+                .count(),
+            0
+        );
+    }
+
     #[test]
     fn a_body_cannot_declare_an_owner_its_envelope_does_not_place_it_under() {
         // Scope and body disagree: the credential is filed under a project, its
@@ -1482,6 +1561,43 @@ mod tests {
             skew.reference(),
             legacy.reference,
             "a refusal an operator reads names one row"
+        );
+
+        // The other half of the classification: rows this build *can* read that
+        // contradict each other are not an upgrade away from working, so they
+        // hydrate as invalid desired state rather than as compatibility skew. Only
+        // a writer outside the gateway can produce this, because `validate` runs
+        // before publication too.
+        let mut contradictory = DesiredState::new();
+        for resource in candidate.state.resources() {
+            contradictory
+                .insert(resource.clone())
+                .expect("distinct references");
+        }
+        let borrowed = ProviderCredentialBody::staged(
+            resource_id(19),
+            SecretOwner::tenant(tenant_id(9)),
+            provider_id(19),
+            display_name("Borrowed"),
+            secret_ref(3),
+        )
+        .version(slug("borrowed"));
+        contradictory
+            .insert(tenant(9, "globex"))
+            .and_then(|state| state.insert(borrowed))
+            .expect("distinct references");
+        let manifest = RevisionManifest::of(
+            revision_id(1),
+            None,
+            std::time::SystemTime::UNIX_EPOCH,
+            &candidate,
+        )
+        .expect("a valid candidate");
+        let error = LoadedRevision::assemble(manifest, contradictory)
+            .expect_err("two owners for one secret is not readable desired state");
+        assert!(
+            !error.is_incompatible(),
+            "a contradiction between readable rows is repair work, not an upgrade"
         );
     }
 
