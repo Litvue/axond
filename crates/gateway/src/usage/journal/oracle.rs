@@ -415,6 +415,41 @@ impl UsageJournal for InMemoryUsageJournal {
         Ok(())
     }
 
+    async fn relinquish(&self, delivery: &DeliveryId) -> Result<(), JournalError> {
+        let mut storage = self.locked();
+        let Some(position) = storage
+            .positions
+            .get(&IdempotencyKey::from(delivery.event))
+            .copied()
+        else {
+            return Err(JournalError::NotOutstanding {
+                delivery: delivery.clone(),
+            });
+        };
+        let Some(state) = storage.consumers.get_mut(&delivery.consumer) else {
+            return Err(JournalError::NotOutstanding {
+                delivery: delivery.clone(),
+            });
+        };
+        // A resolved event has nothing to give back, and saying so is not an
+        // error: an unattributable refusal of a batch whose acknowledgement
+        // landed on a retry is an ordinary race.
+        if state.acked.contains(&position) || state.quarantined.contains_key(&position) {
+            return Ok(());
+        }
+        let Some(attempts) = state.attempts.get_mut(&position) else {
+            return Err(JournalError::NotOutstanding {
+                delivery: delivery.clone(),
+            });
+        };
+        // Only the attempt this delivery spent, so a refund cannot undo an
+        // attempt a later claim has already made.
+        if *attempts == delivery.attempt {
+            *attempts = attempts.saturating_sub(1);
+        }
+        Ok(())
+    }
+
     async fn quarantine(
         &self,
         delivery: &DeliveryId,

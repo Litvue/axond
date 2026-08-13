@@ -634,6 +634,19 @@ pub async fn build_runtime(
              `capacity_policy = \"refuse\"` is the billing-grade setting"
         );
     }
+    // Not refused, because a `stdout` destination is how the mode is tried out
+    // and how a shipping pipeline can legitimately collect it. It is warned
+    // about because an acknowledgement is only worth what the destination is:
+    // once every destination has acknowledged an event, retention forgets it.
+    if sinks.iter().all(|sink| sink.kind == UsageSinkKind::Stdout) {
+        tracing::warn!(
+            journal = store.name(),
+            retain_acknowledged_seconds = capacity.retain_acknowledged.as_secs(),
+            "the usage journal's only destination is `stdout`, so an acknowledgement means a \
+             log line was written and the event is forgotten once retention expires; a \
+             billing-grade destination should be one that stores the row"
+        );
+    }
     let consumer = ConsumerId::parse(&journal.consumer)
         .map_err(|error| UsageSinkError::invalid("journal", error.to_string()))?;
     // Write-through, because the worker acknowledges on what the sink returns: a

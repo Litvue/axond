@@ -17,6 +17,12 @@
 //! eventually quarantines it. So the lease *is* the backoff, and a poison event
 //! cannot block its ordering key forever.
 //!
+//! That budget is only spent on an event the destination refused *on its own
+//! account*, which [`DeliveryWorker::deliver`] establishes by halving a refused
+//! batch until the refusal is isolated. A destination that accepts nothing is an
+//! outage, not a verdict, and an outage may not condemn anything however long it
+//! lasts.
+//!
 //! # Shutdown
 //!
 //! [`WorkerHandle::drain`] gets a bound, like every other shutdown step
@@ -79,6 +85,13 @@ pub struct DrainReport {
     pub quarantined: u64,
     /// Whether delivery was caught up when the worker stopped.
     pub drained: bool,
+    /// Whether the worker handed this report back itself. False when it had to
+    /// be abandoned at its bound, in which case `delivered` and `failed` are
+    /// unknown rather than zero — the difference an operator deciding whether a
+    /// replica is finished has to see.
+    pub reported: bool,
+    /// Whether the backlog counters were read from the journal at all.
+    pub counted: bool,
 }
 
 impl DrainReport {
@@ -86,9 +99,30 @@ impl DrainReport {
         self.undelivered = stats.pending + stats.in_flight;
         self.quarantined = stats.quarantined;
         self.drained = stats.is_drained();
+        self.counted = true;
     }
 
     pub fn log(&self) {
+        if !self.reported {
+            // Deliberately does not print `delivered`/`failed`: a report the
+            // worker never handed back knows nothing about them, and a zero
+            // there reads as "nothing was delivered".
+            if self.counted {
+                tracing::error!(
+                    undelivered = self.undelivered,
+                    quarantined = self.quarantined,
+                    "usage journal worker did not stop within the shutdown bound; the backlog \
+                     below is durable and will be delivered after restart, and this run's \
+                     delivered count is unknown"
+                );
+            } else {
+                tracing::error!(
+                    "usage journal worker did not stop within the shutdown bound and its backlog \
+                     could not be read; the events are durable and will be delivered after restart"
+                );
+            }
+            return;
+        }
         if self.drained {
             tracing::info!(
                 delivered = self.delivered,
@@ -136,17 +170,23 @@ impl DeliveryWorker {
     /// Start delivering, and hand back the handle shutdown drains through.
     pub fn spawn(self) -> WorkerHandle {
         let (stop, receiver) = watch::channel(None);
+        let (journal, consumer) = (Arc::clone(&self.journal), self.settings.consumer.clone());
         WorkerHandle {
             stop,
             task: tokio::spawn(self.run(receiver)),
+            journal,
+            consumer,
         }
     }
 
     async fn run(self, mut stop: watch::Receiver<Option<Duration>>) -> DrainReport {
-        let mut report = DrainReport::default();
+        let mut report = DrainReport {
+            reported: true,
+            ..DrainReport::default()
+        };
         let mut next_maintain = Instant::now() + self.settings.maintain_interval;
         let budget = loop {
-            self.pump_until_idle(&mut report).await;
+            self.pump_until_idle(&mut report, &stop).await;
             if Instant::now() >= next_maintain {
                 self.maintain().await;
                 self.publish_stats().await;
@@ -176,10 +216,22 @@ impl DeliveryWorker {
         report
     }
 
-    /// Deliver until there is nothing claimable, a batch fails, or the journal
-    /// is unreachable — whichever comes first.
-    async fn pump_until_idle(&self, report: &mut DrainReport) {
+    /// Deliver until there is nothing claimable, a batch fails, the journal is
+    /// unreachable, or shutdown asks for its budget — whichever comes first.
+    ///
+    /// The stop signal is checked between batches rather than only between
+    /// polls, because a replica with a long backlog and a healthy destination
+    /// would otherwise keep claiming past its shutdown bound and be abandoned
+    /// mid-loop.
+    async fn pump_until_idle(
+        &self,
+        report: &mut DrainReport,
+        stop: &watch::Receiver<Option<Duration>>,
+    ) {
         loop {
+            if stop.has_changed().unwrap_or(true) {
+                return;
+            }
             match self.pump(report).await {
                 Ok(0) => return,
                 Ok(_) => {}
@@ -224,19 +276,22 @@ impl DeliveryWorker {
                 redeliveries as u64,
             );
         }
-        if !self.write(&claimed).await {
+        let outcome = self.deliver(&claimed).await;
+        if outcome.landed.len() < claimed.len() {
             report.failed += 1;
             crate::telemetry::metrics::record_usage_journal_deliveries(
                 self.journal.name(),
                 self.settings.consumer.as_str(),
                 "failed",
-                claimed.len() as u64,
+                (claimed.len() - outcome.landed.len()) as u64,
             );
-            // Otherwise left claimed and unacknowledged: the lease is the
-            // backoff. What cannot be left is an event that has used up its
-            // attempts, because its ordering key would wait behind it forever.
+            // Everything else is left claimed and unacknowledged: the lease is
+            // the backoff. What cannot be left is an event the destination
+            // refuses on its own account and that has used up its attempts,
+            // because its ordering key would wait behind it forever.
             let attempts = self.journal.capacity().max_delivery_attempts;
-            for delivery in &claimed {
+            for index in &outcome.refused {
+                let delivery = &claimed[*index];
                 if delivery.id.attempt < attempts {
                     continue;
                 }
@@ -261,11 +316,30 @@ impl DeliveryWorker {
                     ),
                 }
             }
+            // An event nobody accepted and nobody attributed a refusal to gets
+            // its attempt back, so however long a destination stays down it
+            // cannot spend a budget that exists for poison. The lease is
+            // untouched, so the retry still waits for it.
+            for (index, delivery) in claimed.iter().enumerate() {
+                if outcome.landed.contains(&index) || outcome.refused.contains(&index) {
+                    continue;
+                }
+                if let Err(error) = self.journal.relinquish(&delivery.id).await {
+                    tracing::warn!(
+                        delivery = %delivery.id,
+                        error = %error,
+                        "usage event's delivery attempt could not be returned after an \
+                         unattributable refusal"
+                    );
+                }
+            }
+        }
+        if outcome.landed.is_empty() {
             return Ok(0);
         }
 
         let mut acknowledged = 0;
-        for delivery in &claimed {
+        for delivery in outcome.landed.iter().map(|index| &claimed[*index]) {
             match self.journal.ack(&delivery.id).await {
                 Ok(()) => acknowledged += 1,
                 // The write happened; the acknowledgement did not. A redelivery
@@ -286,6 +360,72 @@ impl DeliveryWorker {
             acknowledged as u64,
         );
         Ok(acknowledged)
+    }
+
+    /// Write the batch, and work out who a refusal belongs to.
+    ///
+    /// A destination that refuses a whole batch has said nothing about any
+    /// particular event in it: `SinkFailure` carries a message, not a
+    /// classification, so "this row is bad" and "the database is restarting" look
+    /// the same. Charging the poison budget for either would mean an outage a few
+    /// leases long condemns the head of every ordering key — permanent manual
+    /// reconciliation, in the mode that exists so nothing needs reconciling.
+    ///
+    /// So a refusal is attributed rather than assumed. The batch is halved and
+    /// rewritten until a refused range is a single event, and *only* an event
+    /// refused while the same destination accepted its siblings counts as
+    /// refused-on-its-own-account. If nothing lands, the destination is down: the
+    /// probing stops immediately, no attempt is charged to any event, and the
+    /// lease hands the batch back to be retried whole.
+    ///
+    /// A batch of one is refused without a verdict for the same reason: with no
+    /// sibling to judge it against, "the destination is down" and "this row is
+    /// bad" are the same observation. Such an event is retried until traffic on
+    /// another ordering key gives the destination a chance to accept something
+    /// beside it, so a genuinely poisonous event stalls its own key — visible on
+    /// `axond.usage.journal.oldest_pending_age` — rather than being set aside on a
+    /// guess.
+    ///
+    /// Rewriting a range means a destination may see an event twice, which is the
+    /// same duplicate the lease already produces and the same idempotency on
+    /// `request_id` absorbs it.
+    async fn deliver(&self, claimed: &[Delivery]) -> Delivered {
+        let mut outcome = Delivered::default();
+        if self.write(claimed).await {
+            outcome.landed.extend(0..claimed.len());
+            return outcome;
+        }
+        if claimed.len() == 1 {
+            return outcome;
+        }
+
+        let mut orphans: Vec<usize> = Vec::new();
+        let mut level = vec![halve(0..claimed.len())];
+        while !level.is_empty() {
+            let mut next = Vec::new();
+            for (left, right) in level {
+                for range in [left, right] {
+                    if self.write(&claimed[range.clone()]).await {
+                        outcome.landed.extend(range);
+                        continue;
+                    }
+                    if range.len() == 1 {
+                        orphans.push(range.start);
+                    } else {
+                        next.push(halve(range));
+                    }
+                }
+            }
+            if outcome.landed.is_empty() {
+                // Nothing at all has been accepted, so this is the destination
+                // failing rather than an event being refused: stop probing and
+                // let the lease retry the batch whole.
+                return outcome;
+            }
+            level = next;
+        }
+        outcome.refused = orphans;
+        outcome
     }
 
     /// Write the batch to every destination. All-or-nothing per destination: a
@@ -355,10 +495,32 @@ impl DeliveryWorker {
     }
 }
 
+/// What one delivery pass established: which events the destinations accepted,
+/// and which ones they refused on their own account.
+#[derive(Default)]
+struct Delivered {
+    /// Indices into the claimed batch that reached every destination.
+    landed: Vec<usize>,
+    /// Indices the destinations refused while accepting their siblings, so the
+    /// refusal is the event's own and may spend its attempt budget. Empty when
+    /// the destination accepted nothing: an outage condemns no one.
+    refused: Vec<usize>,
+}
+
+/// Split a range in two, left half first.
+fn halve(range: std::ops::Range<usize>) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+    let mid = range.start + range.len() / 2;
+    (range.start..mid, mid..range.end)
+}
+
 /// The running worker, and the only way to stop it.
 pub struct WorkerHandle {
     stop: watch::Sender<Option<Duration>>,
     task: JoinHandle<DrainReport>,
+    /// Kept so a worker that had to be abandoned does not cost the operator the
+    /// one number they are shutting down on: the backlog is read here instead.
+    journal: Arc<dyn UsageJournal>,
+    consumer: ConsumerId,
 }
 
 impl WorkerHandle {
@@ -369,21 +531,48 @@ impl WorkerHandle {
     /// time is reported as undelivered rather than waited on, because the events
     /// are durable and the process is not.
     pub async fn drain(self, budget: Duration) -> DrainReport {
-        let _ = self.stop.send(Some(budget));
+        let Self {
+            stop,
+            task,
+            journal,
+            consumer,
+        } = self;
+        let _ = stop.send(Some(budget));
         // The bound the worker was given plus a margin for the batch it is
         // already writing; a task that overran it is abandoned rather than
         // allowed to hold the process open.
-        match tokio::time::timeout(budget + Duration::from_secs(1), self.task).await {
+        match tokio::time::timeout(budget + Duration::from_secs(1), task).await {
             Ok(Ok(report)) => report,
             Ok(Err(error)) => {
                 tracing::error!(error = %error, "usage journal worker panicked");
-                DrainReport::default()
+                Self::unreported(&journal, &consumer).await
             }
             Err(_) => {
                 tracing::error!("usage journal worker did not stop inside its bound");
-                DrainReport::default()
+                Self::unreported(&journal, &consumer).await
             }
         }
+    }
+
+    /// What can still be said about a worker whose own report never arrived.
+    ///
+    /// Not zeros: a report with `undelivered: 0` says delivery finished, which is
+    /// the opposite of what a drain that ran out of time means, and an operator
+    /// reads it as licence to decommission the replica. The backlog is read
+    /// straight from the journal instead, and the counters only this worker knew
+    /// are marked unknown.
+    async fn unreported(journal: &Arc<dyn UsageJournal>, consumer: &ConsumerId) -> DrainReport {
+        let mut report = DrainReport::default();
+        match journal.stats(consumer).await {
+            Ok(stats) => report.observe(stats),
+            Err(error) => tracing::error!(
+                journal = journal.name(),
+                error = %error,
+                "usage journal backlog could not be read after the drain was abandoned"
+            ),
+        }
+        report.drained = false;
+        report
     }
 }
 
@@ -407,6 +596,10 @@ mod tests {
         /// Whether the destination refuses the batch. A refusal is the failure
         /// the lease exists for.
         refuse: bool,
+        /// A `request_id` this destination refuses whenever it appears in a
+        /// batch, accepting everything else: one bad row, which is the only
+        /// failure the poison budget is for.
+        poison: Option<String>,
     }
 
     impl Recorder {
@@ -431,6 +624,13 @@ mod tests {
         async fn record_batch(&self, batch: &[ObservedRecord]) -> Result<(), SinkFailure> {
             if self.refuse {
                 return Err(SinkFailure::new("the destination is refusing writes"));
+            }
+            if let Some(poison) = self.poison.as_deref()
+                && batch
+                    .iter()
+                    .any(|observed| observed.record.request_id == poison)
+            {
+                return Err(SinkFailure::new("the destination refuses this row"));
             }
             for observed in batch {
                 self.record(&observed.record).await;
@@ -481,6 +681,10 @@ mod tests {
             reason: PoisonReason,
         ) -> Result<(), JournalError> {
             self.0.quarantine(delivery, reason).await
+        }
+
+        async fn relinquish(&self, delivery: &DeliveryId) -> Result<(), JournalError> {
+            self.0.relinquish(delivery).await
         }
 
         async fn stats(&self, consumer: &ConsumerId) -> Result<JournalStats, JournalError> {
@@ -603,7 +807,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_event_the_destination_keeps_refusing_is_quarantined_not_retried_forever() {
+    async fn a_destination_wide_outage_quarantines_nothing_however_long_it_lasts() {
+        // One attempt each, so the old accounting — every event in a refused
+        // batch spends an attempt — would condemn the whole backlog on the
+        // second claim.
         let journal = Arc::new(InMemoryUsageJournal::with_capacity(Capacity {
             max_events: 8,
             max_delivery_attempts: 1,
@@ -619,28 +826,64 @@ mod tests {
             Arc::clone(&sink),
             settings(Duration::from_millis(5)),
         );
-        journal
-            .append(&event_for("GW_INBOUND_ACME_KEY"))
-            .await
-            .expect("append");
+        for subject in ["one", "two", "three", "four"] {
+            journal.append(&event_for(subject)).await.expect("append");
+        }
+
+        // Long enough for every event to be re-claimed several times over.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let report = handle.drain(Duration::from_millis(50)).await;
+        assert!(report.failed > 1, "the batch was retried: {report:?}");
+        // Undelivered and still deliverable, which is the whole promise: an
+        // outage is not a verdict on anybody's event.
+        assert_eq!(report.quarantined, 0, "{report:?}");
+        assert_eq!(report.undelivered, 4, "{report:?}");
+        assert_eq!(report.delivered, 0, "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn one_refused_event_is_isolated_and_its_siblings_are_delivered() {
+        let journal = Arc::new(InMemoryUsageJournal::with_capacity(Capacity {
+            max_events: 8,
+            max_delivery_attempts: 1,
+            retain_acknowledged: Duration::from_secs(60),
+            policy: CapacityPolicy::Refuse,
+        }));
+        let poison = event_for("poison");
+        let sink = Arc::new(Recorder {
+            poison: Some(poison.record().request_id.clone()),
+            ..Recorder::default()
+        });
+        let handle = worker(
+            Arc::clone(&journal) as Arc<dyn UsageJournal>,
+            Arc::clone(&sink),
+            settings(Duration::from_millis(5)),
+        );
+        journal.append(&poison).await.expect("append");
+        for subject in ["one", "two", "three"] {
+            journal.append(&event_for(subject)).await.expect("append");
+        }
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let stats = journal.stats(&consumer("billing")).await.expect("stats");
-            if stats.quarantined == 1 {
+            if stats.quarantined == 1 && stats.pending == 0 && stats.in_flight == 0 {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "the event was never quarantined: {stats:?}"
+                "the refused event was not isolated: {stats:?}"
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        let written = sink.written();
+        assert!(
+            !written.contains(&poison.record().request_id),
+            "the refused event was never written: {written:?}"
+        );
         let report = handle.drain(Duration::from_millis(50)).await;
-        // The ordering key is free again, and the evidence is still there.
         assert_eq!(report.quarantined, 1, "{report:?}");
         assert_eq!(report.undelivered, 0, "{report:?}");
-        assert_eq!(journal.stored_events(), 1);
     }
 
     #[tokio::test]
@@ -721,6 +964,111 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(report.undelivered, 3, "{report:?}");
+        assert!(!report.drained, "{report:?}");
+        assert!(
+            report.reported,
+            "the worker reported for itself: {report:?}"
+        );
+    }
+
+    /// A destination whose write never returns: the worker cannot be stopped by
+    /// any signal while it is inside one, so shutdown has to abandon it.
+    struct NeverReturns;
+
+    #[async_trait]
+    impl UsageSink for NeverReturns {
+        fn name(&self) -> &'static str {
+            "never-returns"
+        }
+
+        async fn record(&self, _record: &UsageRecord) {
+            std::future::pending::<()>().await;
+        }
+
+        async fn record_batch(&self, _batch: &[ObservedRecord]) -> Result<(), SinkFailure> {
+            std::future::pending::<Result<(), SinkFailure>>().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_drain_that_had_to_abandon_the_worker_reports_the_backlog_rather_than_zeros() {
+        let journal = Arc::new(InMemoryUsageJournal::new());
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(NeverReturns)];
+        let handle = DeliveryWorker::new(
+            Arc::clone(&journal) as Arc<dyn UsageJournal>,
+            Arc::new(sinks),
+            settings(Duration::from_secs(30)),
+        )
+        .spawn();
+        for _ in 0..3 {
+            journal
+                .append(&event_for("GW_INBOUND_ACME_KEY"))
+                .await
+                .expect("append");
+        }
+        // Long enough that the worker is inside the write it will never leave.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let report = handle.drain(Duration::from_millis(10)).await;
+        assert!(!report.reported, "the worker never reported: {report:?}");
+        // The whole point: the backlog is read by the parent instead of being
+        // reported as a drained zero, which would read as "safe to decommission".
+        assert!(report.counted, "{report:?}");
+        assert_eq!(report.undelivered, 3, "{report:?}");
+        assert!(!report.drained, "{report:?}");
+    }
+
+    /// A destination that is healthy but slow, so a long backlog takes far longer
+    /// to deliver than any shutdown bound allows.
+    struct Slow(Duration);
+
+    #[async_trait]
+    impl UsageSink for Slow {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+
+        async fn record(&self, _record: &UsageRecord) {
+            tokio::time::sleep(self.0).await;
+        }
+
+        async fn record_batch(&self, _batch: &[ObservedRecord]) -> Result<(), SinkFailure> {
+            tokio::time::sleep(self.0).await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_worker_with_a_long_backlog_stops_at_its_bound_instead_of_being_abandoned() {
+        let journal = Arc::new(InMemoryUsageJournal::with_capacity(Capacity {
+            max_events: 4096,
+            max_delivery_attempts: 8,
+            retain_acknowledged: Duration::from_secs(60),
+            policy: CapacityPolicy::Refuse,
+        }));
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(Slow(Duration::from_millis(30)))];
+        let handle = DeliveryWorker::new(
+            Arc::clone(&journal) as Arc<dyn UsageJournal>,
+            Arc::new(sinks),
+            settings(Duration::from_secs(30)),
+        )
+        .spawn();
+        // Eight to a claim at thirty milliseconds a batch: more than a second and
+        // a half of delivery, so a worker that only noticed shutdown once it ran
+        // out of claimable work would be abandoned rather than stopped.
+        for _ in 0..400 {
+            journal
+                .append(&event_for("GW_INBOUND_ACME_KEY"))
+                .await
+                .expect("append");
+        }
+
+        let report = handle.drain(Duration::from_millis(50)).await;
+        assert!(
+            report.reported,
+            "the worker stopped at its bound and reported: {report:?}"
+        );
+        assert!(report.undelivered > 0, "{report:?}");
         assert!(!report.drained, "{report:?}");
     }
 }

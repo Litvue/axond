@@ -96,6 +96,13 @@ than failing every request later. `kind = "otlp"` is rejected as a billing-grade
 destination: the OTel SDK's batch processor acknowledges nothing, so the worker
 would have no answer to acknowledge on.
 
+A journal whose only destination is `kind = "stdout"` boots with a warning. It is
+allowed — it is how the mode is tried out, and a log pipeline that collects the
+line is a real destination — but an acknowledgement then means "a line was
+written", and once every destination has acknowledged an event the outbox forgets
+it when `retain_acknowledged_seconds` expires. Point billing-grade delivery at a
+destination that stores the row.
+
 Every key is in the [configuration
 reference](../configuration.md#usage_journal--billing-grade-usage-delivery-opt-in-tier-2).
 
@@ -133,6 +140,13 @@ is already proof there is room. Only an outbox whose positions span its limit
 counts rows, at most once per second per replica and never past `max_events + 1`
 rows — the largest number the decision can tell apart. So the request path never
 pays for the size of the backlog, which is exactly when it could least afford to.
+
+What the request path *does* pay for is a connection. `connections` defaults to
+`2` — one for appends, one for the worker's claims — and a connection is handed to
+one operation at a time, so on a busy replica concurrent appends queue behind each
+other and throughput is bounded by the round trip to the outbox rather than by the
+upstreams. Raise it towards the concurrency you actually serve (and inside what
+your Postgres `max_connections` allows) before concluding the mode is slow.
 
 ## What enabling it changes about your sinks
 
@@ -250,10 +264,26 @@ only recovery step — there is nothing to run by hand.
 reached. Fix the destination and the backlog drains on its own. Watch
 `axond.usage.journal.oldest_pending_age`.
 
-**Poison.** A row this build cannot decode, and a row that exhausted
-`max_delivery_attempts`, is quarantined with a reason
-(`axond.usage.journal.quarantined`) so it stops blocking its ordering key. It
-stays on disk for you:
+**Poison.** A row this build cannot decode, and a row the destination refuses on
+its own account until it exhausts `max_delivery_attempts`, is quarantined with a
+reason (`axond.usage.journal.quarantined`) so it stops blocking its ordering key.
+
+A destination-wide outage is *not* poison and never quarantines anything, however
+long it lasts. When a whole batch is refused the worker halves it and rewrites the
+halves until the refusal is isolated to a single event, and only an event refused
+while the same destination accepted its siblings spends an attempt. A destination
+that accepts nothing has said nothing about any particular event, so the probing
+stops, the attempt is given back, and the lease retries the batch whole. A batch
+of one is refused without a verdict for the same reason: with no sibling to judge
+it against, "the destination is down" and "this row is bad" are the same
+observation, so it is retried rather than condemned. A genuinely poisonous event
+alone on its key therefore stalls that key — visible on
+`axond.usage.journal.oldest_pending_age` — until traffic on another key gives the
+destination a chance to accept something beside it. Rewriting halves means a
+destination can see an event twice during that probe, which is the same duplicate
+a lease expiry produces and the same idempotency on `request_id` absorbs it.
+
+A quarantined event stays on disk for you:
 
 ```sql
 SELECT e.request_id, d.consumer, d.poison_reason, d.attempts, e.record
@@ -315,6 +345,13 @@ they are still in the outbox, and the next process claims them. An incomplete
 drain is normal for a large backlog and is not a data-loss event — the only
 data-loss counter is `axond.usage.journal.lost`. Size `[shutdown]` for the drain
 you want, but do not treat the bound as a correctness requirement.
+
+The worker checks the stop signal between claims, so it stops at its bound rather
+than finishing a long backlog first. If it is stuck inside a destination write it
+cannot be stopped at all, and shutdown abandons it: the backlog is then read from
+the outbox and logged at `ERROR` *without* delivery counts, because nobody
+reported them — a shutdown line missing `delivered` means "this run's totals are
+unknown", never "nothing was pending".
 
 ## Metrics and alerts
 

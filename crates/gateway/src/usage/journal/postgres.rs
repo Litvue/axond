@@ -361,24 +361,38 @@ impl UsageJournal for PostgresJournal {
                 }
 
                 let mut dropped = 0;
-                let mut stored = stored_events(&tx, &gate, capacity.max_events).await?;
+                let stored = stored_events(&tx, &gate, capacity.max_events).await?;
                 if stored >= capacity.max_events {
+                    // `stored` is trusted only for *whether* the outbox is at its
+                    // limit, never for how far over it is: a count stops at
+                    // `max_events + 1` and a cached one lags deletions, so
+                    // subtracting it from the limit could free two rows out of a
+                    // hundred surplus and admit anyway. How much room to make is
+                    // therefore decided by position — everything at or below the
+                    // surplus cutoff is beyond the limit, whatever the count says.
+                    let mut surplus = surplus_cutoff(&tx, capacity.max_events).await?;
                     // Space that is only owed to a courtesy window goes first:
                     // giving up a delivered event costs a redundant
                     // re-acknowledgement, refusing costs an undelivered event.
-                    let wanted = stored - capacity.max_events + 1;
-                    let reclaimed = reclaim_delivered(&tx, wanted).await?;
-                    stored -= reclaimed;
-                    if stored >= capacity.max_events
+                    let mut reclaimed = 0;
+                    if let Some(cutoff) = surplus {
+                        reclaimed = reclaim_delivered(&tx, cutoff).await?;
+                        if reclaimed > 0 {
+                            surplus = surplus_cutoff(&tx, capacity.max_events).await?;
+                        }
+                    }
+                    if let Some(cutoff) = surplus
                         && capacity.policy == CapacityPolicy::DropOldest
                     {
-                        dropped = drop_oldest(&tx, stored - capacity.max_events + 1).await?;
-                        stored -= dropped;
+                        dropped = drop_oldest(&tx, cutoff).await?;
+                        if dropped > 0 {
+                            surplus = surplus_cutoff(&tx, capacity.max_events).await?;
+                        }
                     }
                     if reclaimed > 0 || dropped > 0 {
                         gate.invalidate();
                     }
-                    if stored >= capacity.max_events {
+                    if surplus.is_some() {
                         // Everything left is either undelivered or somebody's
                         // quarantined evidence, so there is no room to make. The
                         // measurement is kept: the next append refuses on it
@@ -647,6 +661,56 @@ impl UsageJournal for PostgresJournal {
         reason: PoisonReason,
     ) -> Result<(), JournalError> {
         self.verdict(delivery, Some(reason)).await
+    }
+
+    async fn relinquish(&self, delivery: &DeliveryId) -> Result<(), JournalError> {
+        let (name, key) = (
+            delivery.consumer.as_str().to_owned(),
+            delivery.event.to_string(),
+        );
+        let attempt = i32::try_from(delivery.attempt).unwrap_or(i32::MAX);
+        let refused = delivery.clone();
+        self.run("relinquish", move |client| {
+            let (name, key, refused) = (name.clone(), key.clone(), refused.clone());
+            Box::pin(async move {
+                // Gated on the attempt this delivery spent, so a refund cannot
+                // undo an attempt a later claim already made, and on the event
+                // being unresolved, so it cannot revive a verdict. Both make it
+                // safe to repeat.
+                let refunded = client
+                    .execute(
+                        "UPDATE axond_usage_outbox_delivery d
+                         SET attempts = d.attempts - 1
+                         FROM axond_usage_outbox e
+                         WHERE e.position = d.position AND e.request_id = $1
+                           AND d.consumer = $2 AND d.attempts = $3
+                           AND d.acknowledged_at IS NULL AND d.quarantined_at IS NULL",
+                        &[&key, &name, &attempt],
+                    )
+                    .await?;
+                if refunded == 0 {
+                    // Either somebody else moved the delivery on, which is an
+                    // ordinary race, or there is no delivery row at all — the
+                    // one case a consumer should hear about.
+                    let exists = client
+                        .query_opt(
+                            "SELECT 1 FROM axond_usage_outbox e
+                             JOIN axond_usage_outbox_delivery d
+                                 ON d.position = e.position AND d.consumer = $2
+                             WHERE e.request_id = $1",
+                            &[&key, &name],
+                        )
+                        .await?;
+                    if exists.is_none() {
+                        return Err(OpError::Journal(JournalError::NotOutstanding {
+                            delivery: refused,
+                        }));
+                    }
+                }
+                Ok(())
+            })
+        })
+        .await
     }
 
     async fn stats(&self, consumer: &ConsumerId) -> Result<JournalStats, JournalError> {
@@ -931,39 +995,56 @@ const DELIVERED: &str = "EXISTS (SELECT 1 FROM axond_usage_outbox_consumer)
              WHERE d.position = e.position AND d.consumer = c.consumer
                AND d.acknowledged_at IS NOT NULL))";
 
-/// Give up the retention window on up to `wanted` delivered events, oldest
-/// first. Lossless: every consumer already acknowledged them.
-async fn reclaim_delivered(tx: &Transaction<'_>, wanted: u64) -> Result<u64, OpError> {
-    let limit = i64::try_from(wanted).unwrap_or(i64::MAX);
+/// Give up the retention window on the delivered events at or below `cutoff`,
+/// which are the ones beyond the limit. Lossless: every consumer already
+/// acknowledged them, so only the courtesy window is spent.
+async fn reclaim_delivered(tx: &Transaction<'_>, cutoff: i64) -> Result<u64, OpError> {
     Ok(tx
         .execute(
             &format!(
                 "DELETE FROM axond_usage_outbox WHERE position IN (
                      SELECT e.position FROM axond_usage_outbox e
-                     WHERE {DELIVERED} ORDER BY e.position LIMIT $1)"
+                     WHERE e.position <= $1 AND {DELIVERED})"
             ),
-            &[&limit],
+            &[&cutoff],
         )
         .await?)
 }
 
-/// Delete up to `wanted` oldest droppable events, raising the durable loss
-/// total. The caller counts the loss in telemetry after the commit, so a
+/// The newest position that is beyond `max_events`, or `None` when the outbox
+/// has room for one more row.
+///
+/// Exact, and exact without counting: skipping to the `max_events`-th newest
+/// position over the primary key answers "are there already `max_events` rows"
+/// and, in the same probe, says which positions the surplus occupies. Only the
+/// at-limit path pays for it — an outbox spanning fewer positions than its limit
+/// never gets here.
+async fn surplus_cutoff(tx: &Transaction<'_>, max_events: u64) -> Result<Option<i64>, OpError> {
+    let keep = i64::try_from(max_events.saturating_sub(1)).unwrap_or(i64::MAX);
+    Ok(tx
+        .query_opt(
+            "SELECT position FROM axond_usage_outbox ORDER BY position DESC OFFSET $1 LIMIT 1",
+            &[&keep],
+        )
+        .await?
+        .map(|row| row.get::<_, i64>(0)))
+}
+
+/// Delete the droppable events at or below `cutoff` — the surplus beyond the
+/// limit — raising the durable loss total. The caller counts the loss in telemetry after the commit, so a
 /// rolled-back drop is not reported as lost billing data.
 ///
 /// A quarantined event is never a candidate: it is evidence an operator was
 /// asked to look at, so a journal whose whole backlog is poison refuses instead.
-async fn drop_oldest(tx: &Transaction<'_>, wanted: u64) -> Result<u64, OpError> {
-    let limit = i64::try_from(wanted).unwrap_or(i64::MAX);
+async fn drop_oldest(tx: &Transaction<'_>, cutoff: i64) -> Result<u64, OpError> {
     let dropped = tx
         .execute(
             "DELETE FROM axond_usage_outbox WHERE position IN (
                  SELECT e.position FROM axond_usage_outbox e
-                 WHERE NOT EXISTS (
+                 WHERE e.position <= $1 AND NOT EXISTS (
                      SELECT 1 FROM axond_usage_outbox_delivery d
-                     WHERE d.position = e.position AND d.quarantined_at IS NOT NULL)
-                 ORDER BY e.position LIMIT $1)",
-            &[&limit],
+                     WHERE d.position = e.position AND d.quarantined_at IS NOT NULL))",
+            &[&cutoff],
         )
         .await?;
     if dropped > 0 {
@@ -1767,6 +1848,49 @@ mod tests {
             .expect("claim");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].event.id(), kept.id());
+    }
+
+    #[tokio::test]
+    async fn an_outbox_far_over_a_lowered_limit_is_brought_under_it_by_one_append() {
+        // The way an outbox gets more rows than its limit: the limit was lowered
+        // under a backlog that had already been admitted.
+        let Some((dsn, journal)) = outbox("surplus", capacity(8, CapacityPolicy::DropOldest)).await
+        else {
+            return;
+        };
+        for _ in 0..8 {
+            journal
+                .append(&event_for("GW_INBOUND_ACME_KEY"))
+                .await
+                .expect("append");
+        }
+        let lowered = PostgresJournal::connect(
+            &dsn,
+            settings(
+                "axond_outbox_surplus",
+                false,
+                capacity(2, CapacityPolicy::DropOldest),
+            ),
+        )
+        .await
+        .expect("connect");
+
+        lowered
+            .append(&event_for("GW_INBOUND_ACME_KEY"))
+            .await
+            .expect("append");
+
+        // The surplus is decided by position, so the whole of it goes at once.
+        // Arithmetic on a count that stops at `max_events + 1` would have freed
+        // two rows out of seven and admitted anyway, leaving the outbox over the
+        // limit it was configured with.
+        let stored = client(&dsn, Some("axond_outbox_surplus"))
+            .await
+            .query_one("SELECT count(*) FROM axond_usage_outbox", &[])
+            .await
+            .expect("count")
+            .get::<_, i64>(0);
+        assert!(stored <= 2, "the outbox is inside its limit: {stored}");
     }
 
     #[tokio::test]

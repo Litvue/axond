@@ -86,10 +86,14 @@ The parts of that decision worth stating as boundaries:
   a drop candidate: deleting the evidence an operator was asked to look at to
   make room is not a bound, it is a cover-up.
 - **Poison leaves the delivery path instead of blocking its key.** A row this
-  build cannot decode, or one that exhausted `max_delivery_attempts`, is
-  quarantined with a reason and stays on disk for an operator. A row written by a
-  *newer* build is skipped untouched — no attempt spent, no verdict — so a
-  rolling upgrade's older replicas leave it for the replicas that can read it.
+  build cannot decode, or one the destination refuses on its own account until it
+  exhausts `max_delivery_attempts`, is quarantined with a reason and stays on disk
+  for an operator. A refused batch is halved and rewritten until the refusal is
+  isolated, because a destination that accepts nothing is an outage rather than a
+  verdict on anybody's event, and an outage must not be able to condemn a backlog.
+  A row written by a *newer* build is skipped untouched — no attempt spent, no
+  verdict — so a rolling upgrade's older replicas leave it for the replicas that
+  can read it.
 - **Ownership of an attempt is decided by the delivery row, not by the
   selection.** Selecting a candidate under `FOR UPDATE SKIP LOCKED` is not enough
   to own it: the lease lives in a per-consumer delivery row, and a claimant that

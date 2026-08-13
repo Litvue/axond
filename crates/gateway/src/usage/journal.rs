@@ -705,6 +705,20 @@ pub trait UsageJournal: Send + Sync {
         reason: PoisonReason,
     ) -> Result<(), JournalError>;
 
+    /// Give an attempt back, because the failure said nothing about this event.
+    ///
+    /// A destination that refuses a whole batch has not judged anything in it —
+    /// it may simply be unreachable — and charging the attempt budget for that
+    /// would let an outage a few leases long condemn every event at the head of an
+    /// ordering key. A consumer that cannot attribute a refusal therefore returns
+    /// the attempt, and the event is redelivered when its lease expires with the
+    /// budget it had before.
+    ///
+    /// The lease is deliberately left alone: it is the backoff, and an immediate
+    /// redelivery would spin against a destination that is down. Gated and
+    /// idempotent on the same terms as [`ack`](Self::ack), and never below zero.
+    async fn relinquish(&self, delivery: &DeliveryId) -> Result<(), JournalError>;
+
     /// This consumer's depth, in-flight count, oldest pending age, quarantine
     /// count, and the capacity they are bounded by.
     async fn stats(&self, consumer: &ConsumerId) -> Result<JournalStats, JournalError>;
