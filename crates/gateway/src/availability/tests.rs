@@ -838,6 +838,45 @@ fn replaying_a_retained_look_reports_no_disorder() {
     assert_eq!(builder.build(), index, "and nothing changed");
 }
 
+/// A replay is the same look when it bears the same evidence, whatever became of the
+/// operator-facing detail: a store that truncates or drops the string is replaying the
+/// same evidence, and disorder is not the thing to report about it.
+#[test]
+fn a_replay_that_lost_its_detail_is_still_the_same_look() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, None).detailed("listing 200 OK, 41 models"))
+        .observe(outage(scope, "gpt-4o", 600).detailed("504 from https://api.example/v1/models"))
+        .build();
+
+    let builder = AvailabilityIndexBuilder::from_index(&index)
+        .observe(present(scope, "gpt-4o", 100, None))
+        .observe(outage(scope, "gpt-4o", 600));
+
+    assert_eq!(
+        builder.superseded(),
+        0,
+        "the detail is a log line, not evidence"
+    );
+    let replayed = builder.build();
+    let record = replayed
+        .record(&key(scope, "gpt-4o"))
+        .expect("the key is held");
+    assert_eq!(
+        record
+            .last_known_good
+            .as_ref()
+            .and_then(|look| look.detail.as_deref()),
+        Some("listing 200 OK, 41 models"),
+        "and the held look is left alone rather than replaced by the thinner one"
+    );
+    assert_eq!(
+        replayed.evaluate(&key(scope, "gpt-4o"), at(700)).state,
+        index.evaluate(&key(scope, "gpt-4o"), at(700)).state
+    );
+}
+
 /// A hand-built record can carry a retained look newer than its current one, which
 /// no observed sequence produces. Evidence follows the newer of the two, or the
 /// record would report a refusal while holding newer positive evidence.

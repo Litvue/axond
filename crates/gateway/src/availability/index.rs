@@ -488,7 +488,7 @@ impl AvailabilityIndexBuilder {
         // nothing and reports no out-of-order arrival.
         let mut already_judged = None;
         if let Some(current) = current {
-            if entry.discovery.as_ref() == Some(&current) {
+            if Self::holds(&entry.discovery, &current) {
                 already_judged = Some(current);
             } else {
                 already_judged = Some(current.clone());
@@ -500,8 +500,10 @@ impl AvailabilityIndexBuilder {
         // One refused look counts once, so a record carrying the same look in both
         // slots — the shape after any complete listing — is judged once.
         if let Some(retained) = retained
-            && Some(&retained) != already_judged.as_ref()
-            && entry.last_known_good.as_ref() != Some(&retained)
+            && !already_judged
+                .as_ref()
+                .is_some_and(|judged| judged.is_same_look(&retained))
+            && !Self::holds(&entry.last_known_good, &retained)
             && !Self::retain(entry, &retained)
         {
             self.superseded += 1;
@@ -555,12 +557,20 @@ impl AvailabilityIndexBuilder {
         // retained slot counts as well as the current one, or replaying stored evidence
         // in order — a positive retained across the failed refresh that displaced it —
         // would report the disorder the counter exists to distinguish from it.
-        let held = entry.discovery.as_ref() == Some(&observation)
-            || entry.last_known_good.as_ref() == Some(&observation);
+        let held = Self::holds(&entry.discovery, &observation)
+            || Self::holds(&entry.last_known_good, &observation);
         if !held && !Self::admit(entry, observation) {
             self.superseded += 1;
         }
         self
+    }
+
+    /// Whether a slot already holds this evidence, and so applied it when it first
+    /// arrived. Compared as evidence rather than by equality: the operator-facing
+    /// detail is not part of what a slot holds a look *for*, so a store that dropped
+    /// or truncated it still replays the same look.
+    fn holds(slot: &Option<DiscoveryObservation>, look: &DiscoveryObservation) -> bool {
+        slot.as_ref().is_some_and(|held| held.is_same_look(look))
     }
 
     /// Apply an arriving look to a record, returning whether it became the current

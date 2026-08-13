@@ -254,6 +254,23 @@ impl DiscoveryObservation {
         AvailabilityKey::new(self.scope, self.target.clone())
     }
 
+    /// Whether two looks are the same evidence: the same answer, about the same
+    /// target, taken and expiring at the same instants, from the same source.
+    ///
+    /// Everything a verdict can rest on, and deliberately not
+    /// [`detail`](Self::detail), which is a log line rather than evidence. A store
+    /// that truncates or drops the string still replays the same look, and a probe
+    /// cannot make a look count as new by wording its error differently.
+    pub fn is_same_look(&self, other: &Self) -> bool {
+        self.scope == other.scope
+            && self.target == other.target
+            && self.result == other.result
+            && self.completeness == other.completeness
+            && self.source == other.source
+            && self.observed_at == other.observed_at
+            && self.expires_at == other.expires_at
+    }
+
     /// Whether this look establishes something definitively: it answered, and it
     /// covered enough of the surface for the answer to mean what it says.
     pub const fn is_definitive(&self) -> bool {

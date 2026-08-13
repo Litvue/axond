@@ -138,6 +138,11 @@ whose instant were still folded in would discard a positive the receiving scope 
 genuinely reach, which is the same cross-scope decision by timing alone. Replaying
 stored evidence is not disorder either — a look either slot already holds was applied
 when it first arrived, so re-deriving an index reports only genuinely late arrivals.
+Two looks are the same look when they bear the same evidence: scope, target, result,
+completeness, source, and the instants observed and expiring. The operator-facing
+detail is excluded, because it is a log line rather than evidence — a store that
+truncates or drops the string replays the same look, and a probe cannot make one count
+as new by wording its error differently.
 
 **Uncertainty is routable only where a scope chose it.** `unknown` and `stale` are
 not refusals, but routability is a property of the whole verdict:
