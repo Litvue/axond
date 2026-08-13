@@ -66,10 +66,10 @@ evaluation:
   [Rollouts and termination](#rollouts-and-termination)).
 
 ```bash
-digest="$(ops/pin-image-digest.sh --print 0.3.22)" # x-release-please-version
+digest="$(ops/pin-image-digest.sh --print 0.3.23)" # x-release-please-version
 SIGNER_IDENTITY=... GITHUB_REPOSITORY=Litvue/axond \
   ops/verify-image-evidence.sh "ghcr.io/litvue/axond@${digest}"
-ops/pin-image-digest.sh 0.3.22 # x-release-please-version
+ops/pin-image-digest.sh 0.3.23 # x-release-please-version
 kubectl apply -k deploy/kubernetes/overlays/production
 kubectl -n axond rollout status deployment/axond
 ```
@@ -84,8 +84,8 @@ the release you verified:
 
 ```bash
 ops/pin-image-digest.sh --check          # fails while the sentinel is unresolved
-ops/pin-image-digest.sh --print 0.3.22 # x-release-please-version, prints the digest
-ops/pin-image-digest.sh 0.3.22 # x-release-please-version, rewrites the overlay
+ops/pin-image-digest.sh --print 0.3.23 # x-release-please-version, prints the digest
+ops/pin-image-digest.sh 0.3.23 # x-release-please-version, rewrites the overlay
 ```
 
 Resolution insists on the multi-architecture index, so a digest naming one
