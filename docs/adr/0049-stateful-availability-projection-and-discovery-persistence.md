@@ -111,11 +111,16 @@ process. Inference reads neither.
 grant that encloses the scope asked about, and must name a tenant — a
 deployment-wide answer would be every tenant's entitlements in one document. It
 is answered from the index the snapshot carries plus this replica's circuits, so
-it reaches no store. A grant narrower than the deployment sees the namespace
-projection of each verdict, which withholds the discovery source and coarsens the
-reasons that describe the deployment's own machinery. A replica that derives no
-view reports `deriving: false` rather than an empty target list, because "we
-derive nothing" and "you may call nothing" are different answers.
+it reaches no store. A caller who would not be granted the same authority over
+the whole deployment sees the namespace projection of each verdict, which
+withholds the discovery source and coarsens the reasons that describe the
+deployment's own machinery. Disclosure turns on the caller's authority rather
+than on the scope the query names, because this read always names a tenant:
+deciding it on the scope would coarsen the answer for the root operator too, and
+leave nobody able to see why discovery or a replica's health refused a target.
+A replica that derives no view reports `deriving: false` rather than an empty
+target list, because "we derive nothing" and "you may call nothing" are
+different answers.
 
 ### State tier
 

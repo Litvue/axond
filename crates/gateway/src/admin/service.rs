@@ -157,6 +157,43 @@ impl MutationOutcome {
     }
 }
 
+/// How much of an availability verdict a caller may be told.
+///
+/// Authority, not scope, and the distinction matters because an availability
+/// read is always *about* one tenant: the scope such a query names is
+/// tenant-shaped whoever asks, so deciding disclosure from the grant would
+/// coarsen the answer for the root operator too — and leave nobody at all who
+/// could see why discovery or this replica's health refused a target, which is
+/// the question the read exists to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvailabilityAuthority {
+    /// The caller holds this authority over the whole deployment, and sees the
+    /// discovery source and the reason behind each verdict.
+    Deployment,
+    /// The caller holds it over a namespace, and sees the namespace projection:
+    /// the state, without the deployment's discovery machinery behind it.
+    Namespace,
+}
+
+impl AvailabilityAuthority {
+    /// The caller's authority, from whether the deployment scope would be
+    /// granted.
+    pub const fn of(deployment_wide: bool) -> Self {
+        if deployment_wide {
+            Self::Deployment
+        } else {
+            Self::Namespace
+        }
+    }
+
+    const fn disclosure(self) -> StatusScope {
+        match self {
+            Self::Deployment => StatusScope::Deployment,
+            Self::Namespace => StatusScope::Namespace,
+        }
+    }
+}
+
 /// The `/admin/v1` service over a [`ControlPlaneStore`].
 pub struct AdminService {
     /// `None` in stateless mode — and there is no other way to hold `None`, so a
@@ -418,9 +455,15 @@ impl AdminService {
     /// Scoped rather than deployment-wide, and narrowed twice. The grant must
     /// enclose the scope asked about, so a tenant administrator cannot read
     /// another tenant's — or a sibling project's — derived entitlements. And a
-    /// grant narrower than the deployment sees the namespace projection of each
-    /// verdict, which keeps the deployment's discovery machinery out of a tenant's
-    /// answer.
+    /// caller holding less than deployment authority sees the namespace
+    /// projection of each verdict, which keeps the deployment's discovery
+    /// machinery out of a tenant's answer.
+    ///
+    /// The disclosure is decided by [`AvailabilityAuthority`] rather than by the
+    /// grant's scope, because they are different questions: this read always
+    /// names a tenant, so every grant it produces is tenant-shaped — deciding on
+    /// the grant would coarsen the answer for the root operator too, and leave
+    /// nobody who could see why discovery or this replica's health refused.
     ///
     /// A project is answered with what it inherits as well as what it overrides:
     /// its enablements are overrides of its tenant's, so reporting only its own
@@ -430,6 +473,7 @@ impl AdminService {
         &self,
         grant: &AdminGrant,
         scope: &ResourceScope,
+        authority: AvailabilityAuthority,
         reader: Option<&dyn AvailabilityReader>,
         now: SystemTime,
     ) -> Result<AvailabilityResult, AdminError> {
@@ -457,11 +501,7 @@ impl AdminService {
         };
         let targets =
             AvailabilityView::new(&index, &runtime).evaluate_inherited_scope(reference, now);
-        let status = if grant.scope() == &ResourceScope::Deployment {
-            StatusScope::Deployment
-        } else {
-            StatusScope::Namespace
-        };
+        let status = authority.disclosure();
         Ok(AvailabilityResult::of(scope, status, targets))
     }
 

@@ -1802,7 +1802,34 @@ async fn an_availability_read_overlays_this_replicas_own_health() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["targets"][0]["state"], json!("unavailable"));
-    // Which authority refused stays with the operator: a tenant learns that the
-    // target is not being attempted, not that this replica's breaker is open.
+    // An operator trusted with the whole deployment is told which authority
+    // refused, because "why can this tenant not reach this model" is the
+    // question the read exists to answer.
+    assert_eq!(body["targets"][0]["decided_by"], json!("runtime"));
+}
+
+/// The same answer to a tenant's own administrator says only what it is, not
+/// which of the deployment's authorities decided it.
+///
+/// Disclosure follows the caller's authority rather than the scope the query
+/// names — an availability read always names a tenant, so the scope cannot tell
+/// a root operator apart from a tenant administrator asking about themselves.
+#[tokio::test]
+async fn an_availability_read_by_a_tenants_own_administrator_names_no_authority() {
+    let (index, mine, _) = two_tenant_index();
+    let scoped = Deployment::deriving(
+        FakeAdminAuthorizer::permissive().within(&[ResourceScope::Tenant(mine.tenant)]),
+        index,
+        RuntimeObservations::of_circuits([("openai/gpt-4o".to_owned(), CircuitState::Open)]),
+    );
+
+    let (status, body) = scoped
+        .get(&format!("/availability?tenant={}", mine.tenant))
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["targets"][0]["state"], json!("unavailable"));
+    // A tenant learns that the target is not being attempted, not that this
+    // replica's breaker is open.
     assert_eq!(body["targets"][0]["decided_by"], json!("undisclosed"));
 }

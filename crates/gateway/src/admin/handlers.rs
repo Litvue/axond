@@ -33,7 +33,7 @@ use super::reads::{
 };
 use super::resources::{AdminResourceRequest, MutationEnvelope, RollbackRequest};
 use super::router::{ADMIN_MAX_REQUEST_BYTES, AdminApi};
-use super::service::MutationOutcome;
+use super::service::{AvailabilityAuthority, MutationOutcome};
 use crate::desired_state::{MutationKind, ProjectId, ResourceScope, RevisionId, Surface, TenantId};
 
 /// The route table's mutating rows, as method routers.
@@ -357,9 +357,17 @@ async fn availability(
             &scope,
         )
         .await?;
+    // Asked separately from the grant, because the grant answers "may this
+    // caller read this tenant" and disclosure turns on "would this caller be
+    // trusted with the whole deployment" — and this route's scope is
+    // tenant-shaped for every caller, root operator included.
+    let authority = AvailabilityAuthority::of(
+        api.holds_deployment_authority(&identity, AdminAction::ReadAvailability),
+    );
     Ok(Json(api.service.availability(
         &grant,
         &scope,
+        authority,
         api.availability.as_deref(),
         SystemTime::now(),
     )?))

@@ -447,10 +447,12 @@ pub struct AvailabilityResult {
 ///
 /// Carries the verdict and its evidence, never the evidence's operator detail: a
 /// discovery observation's `detail` can hold a provider's error text, and this is
-/// a response. What the caller sees is additionally narrowed by the scope of the
-/// grant that asked — a tenant-scoped administrator gets
-/// [`Availability::for_scope`] at namespace scope, which drops the discovery
-/// source and any reason that describes the deployment's own machinery.
+/// a response. What the caller sees is additionally narrowed by the authority
+/// the caller holds — an administrator who is not trusted with the whole
+/// deployment gets [`Availability::for_scope`] at namespace scope, which drops
+/// the discovery source and any reason that describes the deployment's own
+/// machinery. Authority rather than the scope named in the query, which is
+/// tenant-shaped for every caller of this read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AvailabilityTarget {
     pub provider: String,

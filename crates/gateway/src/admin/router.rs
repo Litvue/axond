@@ -174,6 +174,25 @@ impl AdminApi {
             }
         }
     }
+
+    /// Whether this caller would hold the same authority deployment-wide.
+    ///
+    /// A question about the caller, not an attempt on the deployment: nobody
+    /// asked for that scope, so a negative answer is not a refusal and is not
+    /// written to the denial trail — a tenant administrator's ordinary read must
+    /// not leave one behind. It exists because how much of a verdict may be
+    /// disclosed is a property of the caller's authority, and the scope a query
+    /// names says nothing about it: an availability read always names a tenant,
+    /// so the grant it produces is always tenant-shaped, root operator or not.
+    pub fn holds_deployment_authority(
+        &self,
+        identity: &AdminIdentity,
+        action: AdminAction,
+    ) -> bool {
+        self.authorizer
+            .authorize(identity, action, &ResourceScope::Deployment)
+            .is_ok()
+    }
 }
 
 /// A route's complete administrative registration.
