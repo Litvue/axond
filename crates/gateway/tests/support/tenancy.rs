@@ -126,6 +126,10 @@ pub struct Objects {
     /// sharing rows.
     pub usage_table: String,
     pub budget_table: String,
+    /// The schema the durable usage outbox lives in, for the boot that enables
+    /// one. The outbox's table names are fixed, so a per-boot outbox is a
+    /// per-boot schema.
+    pub outbox_schema: Option<String>,
 }
 
 /// The durable state this deployment keeps, when it keeps any.
@@ -136,6 +140,11 @@ pub enum Durability {
     /// A Postgres usage sink and a Postgres budget with a namespace-wide cap,
     /// which is what makes "one tenant's spend is its own" observable.
     Postgres { namespace_cap_microdollars: u64 },
+    /// The billing-grade durable usage outbox: every settled event is appended
+    /// to a Postgres journal before the request is answered, and a delivery
+    /// worker replays it into the sinks. A second durable usage path, so what
+    /// the row sink partitions has to be asserted of the outbox too.
+    Outbox,
 }
 
 /// Boot the deployment. `Durability::Postgres` yields `None` when no test
@@ -193,12 +202,14 @@ pub fn boot_that_fails_after_starting(durability: Durability) -> Option<Names> {
 pub struct Names {
     pub usage_table: String,
     pub budget_table: String,
+    pub outbox_schema: String,
 }
 
 fn names(suffix: &str) -> Names {
     Names {
         usage_table: format!("axond_usage_iso_{suffix}"),
         budget_table: format!("axond_budget_iso_{suffix}"),
+        outbox_schema: format!("axond_outbox_iso_{suffix}"),
     }
 }
 
@@ -213,12 +224,24 @@ enum Fate {
 async fn start(durability: Durability, suffix: &str, fate: Fate) -> Option<Deployment> {
     let dsn = match durability {
         Durability::None => None,
-        Durability::Postgres { .. } => Some(postgres_dsn()?),
+        Durability::Postgres { .. } | Durability::Outbox => Some(postgres_dsn()?),
     };
     let Names {
         usage_table,
         budget_table,
+        outbox_schema,
     } = names(suffix);
+
+    // The child applies the outbox DDL itself (`create_schema = true`), but the
+    // schema it applies it into has to exist first, and it is this boot's own so
+    // concurrent runs do not share an outbox.
+    if let (Durability::Outbox, Some(dsn)) = (durability, dsn.as_deref()) {
+        connect(dsn)
+            .await
+            .batch_execute(&format!("CREATE SCHEMA {outbox_schema}"))
+            .await
+            .expect("a schema for this boot's outbox");
+    }
 
     let upstream = FakeUpstream::start().await;
     let render = |addr: SocketAddr| {
@@ -228,6 +251,7 @@ async fn start(durability: Durability, suffix: &str, fate: Fate) -> Option<Deplo
             durability,
             &usage_table,
             &budget_table,
+            &outbox_schema,
         )
     };
     let mut env = vec![
@@ -258,6 +282,7 @@ async fn start(durability: Durability, suffix: &str, fate: Fate) -> Option<Deplo
         dsn,
         usage_table: usage_table.clone(),
         budget_table: budget_table.clone(),
+        outbox_schema: matches!(durability, Durability::Outbox).then(|| outbox_schema.clone()),
     });
     let gateway = Axond::start_custom(&render, &env).await;
 
@@ -332,13 +357,16 @@ impl Drop for Deployment {
 impl Drop for Objects {
     fn drop(&mut self) {
         let dsn = self.dsn.clone();
-        let objects = vec![
+        let mut objects = vec![
             format!("TABLE IF EXISTS {}_reservation", self.budget_table),
             format!("TABLE IF EXISTS {}_namespace", self.budget_table),
             format!("TABLE IF EXISTS {}", self.budget_table),
             format!("TABLE IF EXISTS {}", self.usage_table),
             format!("FUNCTION IF EXISTS {}_namespace_fence()", self.budget_table),
         ];
+        if let Some(schema) = &self.outbox_schema {
+            objects.push(format!("SCHEMA IF EXISTS {schema} CASCADE"));
+        }
         let cleanup = std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -413,6 +441,7 @@ fn config_toml(
     durability: Durability,
     usage_table: &str,
     budget_table: &str,
+    outbox_schema: &str,
 ) -> String {
     let price = format!(
         "{{ input_microdollars_per_million = {INPUT_PRICE}, output_microdollars_per_million = {OUTPUT_PRICE} }}"
@@ -438,6 +467,19 @@ fn config_toml(
     // off the process's own output, and a durable sink must not silence that.
     let durable = match durability {
         Durability::None => String::new(),
+        // No row sink and no budget: the outbox is the durable path under test,
+        // and the stdout sink the delivery worker replays into is what tells the
+        // suite an appended event was delivered.
+        Durability::Outbox => format!(
+            r#"
+[usage_journal]
+backend = "postgres"
+dsn_env = "AXOND_ISOLATION_DSN"
+schema = "{outbox_schema}"
+create_schema = true
+consumer = "isolation"
+"#
+        ),
         Durability::Postgres {
             namespace_cap_microdollars,
         } => {

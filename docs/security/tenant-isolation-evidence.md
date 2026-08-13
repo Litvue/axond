@@ -21,6 +21,7 @@ a green test for an absent mechanism is worse than a missing one.
 | Service | A grant is a role at a scope, and scope containment is one-directional, so a tenant-scoped administrator's request against another tenant is a refusal with a recorded reason and an opaque answer | `desired_state::access`, `admin::service`, `tenant_isolation::control_plane` |
 | Storage | Hydration re-checks every stored dependency edge with a join, so a row written around the domain is still refused | `backends::control_plane::hydration`, `backends::control_plane::postgres` |
 | Database | Row-level security keyed on `axond.tenant_id`, so a session pinned to one tenant cannot read or write another's rows even with the service layer bypassed | `sql/control_plane_0002_tenancy_access.sql`, `tenant_isolation::database` |
+| Database (constraints) | Ownership is a constraint, not a convention: a project, principal, or projected row must name the tenant that owns it, and a revision, mutation, or audit event must name a tenant this deployment has a row for, so a row written around every layer above is still refused | `sql/control_plane_0003_tenancy_constraints.sql`, `sql/control_plane_0004_journal_ownership.sql`, `backends::control_plane::postgres` |
 | Catalogues | Credential, model, and policy lookups resolve within the asking tenant's own scopes, including when two tenants enable the same offering | `tenant_isolation::catalogue` |
 | Projection | A project becomes a *tenant-qualified* runtime namespace (`acme/core`), so two tenants' identically named projects cannot collapse into one | `convergence::tenancy`, `config::validate_namespace_ids`, `tenant_isolation::projection` |
 | Runtime | Catalogue, credential selection, and accounting are keyed on the caller's namespace | `crates/gateway/tests/tenant_isolation.rs` |
@@ -41,9 +42,17 @@ each assertion is made from outside the process.
 | Every provider request carries the calling tenant's credential and no other, under interleaved traffic | `a_provider_request_carries_only_the_calling_tenants_credential` |
 | Platform fallback serves only the namespace that opted in, and the usage record attributes the spend to the platform pool | `platform_fallback_is_explicit_and_attributed` |
 | Durable usage rows are partitioned by namespace | `usage_rows_never_cross_a_namespace` |
+| Every event the billing-grade outbox journals is ordered under, and names, only the namespace that spent it | `journaled_usage_events_never_cross_a_namespace` |
 | One tenant exhausting its namespace budget does not deny another | `one_tenants_exhausted_budget_does_not_deny_another` |
 
-The last two need a Postgres. They skip when `AXOND_TEST_POSTGRES_DSN` is unset
+The outbox is asserted separately from the row sink because it is a second
+durable usage path with its own key: an event is appended before the response and
+claimed for delivery per `(namespace, subject)`, so a journal keyed on anything
+coarser would order one tenant's events behind another's and hand a consumer a
+billable fact attributed to the wrong tenant. That boot runs the outbox in a
+schema of its own, dropped with the boot.
+
+The last three need a Postgres. They skip when `AXOND_TEST_POSTGRES_DSN` is unset
 and are mandatory in CI, which sets `AXOND_TEST_REQUIRE_SERVICES=1`; the
 stateless cases run everywhere. Each stateful boot creates its own usage and
 budget objects, owned by a value that exists before the process that creates them
@@ -110,7 +119,7 @@ runtime. Each names the change that unblocks it.
 | Assertion | Blocked on | Why |
 | --- | --- | --- |
 | A *tenant-scoped human* administrator is refused another tenant's resources over an authenticated `/admin/v1` request | [#143] — tenant-scoped admin authentication on the served surface | The stateful runtime authenticates a deployment-scoped breakglass credential, and the projections `/admin/v1` serves are of the whole deployment by construction. The scenarios above therefore decide authorization at the grant seam a tenant-scoped authenticator will hand the service — which is the same seam the request path will use — rather than fabricating an authenticated HTTP flow that no deployment can currently make |
-| Tenancy isolation holds over *durable* projects and credentials on the request path rather than configured namespaces | The convergence slice that wires desired state into `serve` | No revision is loaded on the request path, so a served namespace is one the config declared. The two ends are pinned instead: the projection from durable state is asserted here, and the runtime suite asserts the same *shape* of namespace id it produces, which is what keeps them from drifting before they are joined |
+| Tenancy isolation holds over *durable* projects and credentials on the request path rather than configured namespaces | The convergence slice that wires desired state into `serve` — tenant-routed catalogue and alias inference is [#148] and [#149] | No revision is loaded on the request path, so a served namespace is one the config declared. The two ends are pinned instead: the projection from durable state is asserted here, and the runtime suite asserts the same *shape* of namespace id it produces, which is what keeps them from drifting before they are joined |
 | A cross-tenant alias is refused indistinguishably from a model that does not exist | A runtime error-contract decision, not a test | Today an alias belonging to another tenant is refused `502 no_credential` while an unknown model is a 404-class `model_not_found`, so status alone is an alias-existence oracle across tenants. No identifier, credential, or key of the other tenant is disclosed and nothing is dispatched upstream; changing which refusal is returned is the security owner's call and is tracked on [#225] |
 
 When each lands, the corresponding row moves into the table above with the test
@@ -122,4 +131,6 @@ describes the two tenants' durable state and the sessions that read it, so a new
 assertion is a test against tenants that already exist.
 
 [#143]: https://github.com/Litvue/axond/issues/143
+[#148]: https://github.com/Litvue/axond/issues/148
+[#149]: https://github.com/Litvue/axond/issues/149
 [#225]: https://github.com/Litvue/axond/issues/225

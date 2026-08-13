@@ -18,14 +18,18 @@
 //! - the domain refuses to build a cross-tenant reference, and hydration
 //!   refuses one that storage was made to hold
 //!   (`desired_state::revision`, `backends::control_plane::hydration`);
-//! - Postgres itself refuses a stored edge across a tenant boundary
-//!   (`backends::control_plane::postgres`).
+//! - Postgres itself refuses a stored edge across a tenant boundary, and its
+//!   constraints refuse a row that names no owner or a foreign one
+//!   (`backends::control_plane::postgres`);
+//! - row-level security, the administrative service, the typed catalogues and
+//!   the projection are asserted against a real journal in
+//!   `src/tenant_isolation`.
 //!
 //! What is *not* covered yet, and why, is recorded in
-//! `docs/security/tenant-isolation-evidence.md`: the assertions that need
-//! durable principals and RBAC, row-level security, or the admin surface cannot
-//! be written against a runtime that has none of them, and a test that pretends
-//! otherwise is worse than an absent one.
+//! `docs/security/tenant-isolation-evidence.md`: notably that the served
+//! catalogue and alias resolution are still keyed on configured namespaces
+//! rather than routed from durable tenant state, which waits on #148 and #149,
+//! and a test that pretended otherwise would be worse than an absent one.
 
 mod support;
 
@@ -331,6 +335,92 @@ async fn usage_rows_never_cross_a_namespace() {
     }
 }
 
+/// The billing-grade outbox journals each event under the namespace that spent
+/// it, and no appended event names another tenant.
+///
+/// A second durable usage path, so the partitioning the row sink is asserted for
+/// above says nothing about it: here the event is made durable *before* the
+/// response, keyed by `(namespace, subject)` for delivery ordering, and the
+/// billable record travels as its own JSON. A journal keyed on anything coarser
+/// would order one tenant's events behind another's and hand a consumer a
+/// billable fact attributed to the wrong tenant.
+///
+/// Skipped without a test Postgres, and mandatory in CI, which sets
+/// `AXOND_TEST_REQUIRE_SERVICES=1`.
+#[tokio::test]
+async fn journaled_usage_events_never_cross_a_namespace() {
+    let Some(deployment) = boot(Durability::Outbox).await else {
+        return;
+    };
+    let schema = deployment
+        .objects()
+        .outbox_schema
+        .clone()
+        .expect("an outbox boot has a schema of its own");
+
+    for tenant in TENANTS {
+        let response = post_chat(&deployment, tenant.key, tenant.alias).await;
+        assert_eq!(response.status(), 200, "{} is served", tenant.namespace);
+    }
+    // The delivery worker replays what was appended, so a stdout record is also
+    // the evidence that the journal is the path these events took.
+    deployment.gateway.await_usage_records(2).await;
+
+    let client = connect(&deployment.objects().dsn).await;
+    let rows = await_journaled_events(&client, &schema, 2).await;
+
+    for tenant in TENANTS {
+        let owned: Vec<&(String, String, Value)> = rows
+            .iter()
+            .filter(|(namespace, ..)| namespace == tenant.namespace)
+            .collect();
+        assert_eq!(
+            owned.len(),
+            1,
+            "{} journaled exactly one event: {rows:?}",
+            tenant.namespace
+        );
+        let (_, subject, record) = owned[0];
+        assert_eq!(
+            subject, tenant.key_env,
+            "the ordering key names the tenant's own subject, so its events are ordered \
+             independently of any other tenant's"
+        );
+        assert_eq!(record["namespace"], json!(tenant.namespace));
+        assert_eq!(record["model"], json!(tenant.alias));
+        assert_eq!(record["credential_id"], json!(tenant.credential_id));
+        assert_eq!(record["credential_source"], json!("byok"));
+    }
+
+    // Stated over the whole outbox as well: nothing an event carries — ordering
+    // key or billable record — names a tenant other than the one that spent it.
+    for (namespace, subject, record) in &rows {
+        let owner = TENANTS
+            .into_iter()
+            .find(|tenant| tenant.namespace == namespace)
+            .unwrap_or_else(|| panic!("an appended event belongs to a tenant: {namespace}"));
+        let event = format!("{namespace} {subject} {record}");
+        for foreign in TENANTS
+            .into_iter()
+            .filter(|tenant| tenant.namespace != owner.namespace)
+        {
+            for identifier in [
+                foreign.namespace,
+                foreign.alias,
+                foreign.credential_id,
+                foreign.key_env,
+                foreign.upstream_key,
+            ] {
+                assert!(
+                    !event.contains(identifier),
+                    "an event of {}'s must not name `{identifier}`: {event}",
+                    owner.namespace
+                );
+            }
+        }
+    }
+}
+
 /// One tenant exhausting its namespace budget does not deny another.
 ///
 /// The failure this guards is a shared ledger: a cap keyed on anything coarser
@@ -435,6 +525,41 @@ async fn a_boot_that_fails_after_starting_still_drops_what_it_created() {
         !function_exists(&dsn, &fence).await,
         "the failed boot left the function {fence} behind"
     );
+}
+
+/// `(namespace, subject, record)` per appended outbox event, once `count` have
+/// landed. The append happens before the response, so the rows are there by the
+/// time the record is; the wait is for the second tenant's, not for a batch.
+async fn await_journaled_events(
+    client: &tokio_postgres::Client,
+    schema: &str,
+    count: usize,
+) -> Vec<(String, String, Value)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT namespace, subject, record FROM {schema}.axond_usage_outbox \
+                     ORDER BY position"
+                ),
+                &[],
+            )
+            .await
+            .expect("the outbox is readable");
+        if rows.len() >= count {
+            return rows
+                .iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected {count} journaled events in {schema}, saw {}",
+            rows.len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// `(namespace, model, credential_id)` per settled row, once `count` have
