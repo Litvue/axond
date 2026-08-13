@@ -25,7 +25,7 @@ pub const GATEWAY_KEY: &str = "test-inbound-key";
 /// The environment variable carrying a boot's private inbound key. Its value is
 /// unique per boot, which is what lets a readiness probe tell this child apart
 /// from a sibling test process serving the same loopback port.
-const BOOT_KEY_ENV: &str = "GW_BOOT_KEY";
+pub const BOOT_KEY_ENV: &str = "GW_BOOT_KEY";
 /// Upstream credentials the gateway is expected to inject, asserted on the
 /// fake upstream's recorded requests.
 pub const OPENAI_KEY: &str = "test-upstream-openai-key";
@@ -515,7 +515,10 @@ fn free_addr() -> SocketAddr {
     listener.local_addr().expect("a bound address")
 }
 
-fn config_toml(bind: SocketAddr, upstream: &str, tuning: &str) -> String {
+/// The config a boot with these arguments is given. Public so a harness can
+/// preflight the exact bytes a replica will be started from *before* starting
+/// it, which is the order a deployment gate runs in.
+pub fn config_toml(bind: SocketAddr, upstream: &str, tuning: &str) -> String {
     let price = format!(
         "{{ input_microdollars_per_million = {INPUT_PRICE}, output_microdollars_per_million = {OUTPUT_PRICE} }}"
     );

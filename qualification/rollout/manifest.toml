@@ -1,0 +1,76 @@
+# The committed rollout manifest: every input the rollout harness reads.
+#
+# A run is reproducible from this file plus the committed fixtures and the
+# binary the workspace builds — the driver records the hash of all three in each
+# result artifact (see docs/operations/rollout.md and ADR 0036).
+#
+# Each scenario ships two scales. `reduced` runs inside `cargo test` on every
+# change; `heavy` is the same code and the same assertions with more traffic per
+# phase, and only runs from the `capacity` workflow.
+#
+# `thresholds` are the hard failures. Like the capacity manifest they are
+# restricted to properties that do not move with the machine — where a request
+# was routed, whether anything was lost, whether a drain finished inside the
+# bound the process itself declares. Throughput and latency are *recorded* and
+# never asserted.
+
+schema_version = 1
+
+[[scenario]]
+id = "rolling-replace"
+description = """
+Two replicas behind a readiness-driven load balancer, replaced one at a time by \
+a newer revision and then rolled back, with buffered and streamed traffic in \
+flight throughout."""
+# At least two, or there is no fleet to roll: the point of the harness is what
+# the *other* replicas do while one is draining.
+replicas = 2
+
+[scenario.reduced]
+workers = 6
+requests_per_phase = 48
+# Every third request through the load balancer is streamed, so each phase
+# carries both a buffered and a streaming population.
+stream_every = 3
+
+[scenario.heavy]
+workers = 24
+requests_per_phase = 1200
+stream_every = 3
+
+# The bounds the replicas are booted with. The harness holds the process to
+# them: a drain that outlives drain_grace + deadline + flush (plus the slack
+# below) is a failure, because that sum is what an orchestrator's termination
+# grace period is set from.
+[scenario.shutdown]
+drain_grace_ms = 500
+# Above the ~2s the fake upstream withholds the pinned buffered answer for, so
+# an admitted request is finished rather than cut, and well below it for the
+# stream the upstream never ends — the deadline is what terminates that one.
+deadline_ms = 4000
+flush_timeout_ms = 2000
+
+[scenario.thresholds]
+# A load balancer that keeps routing to a replica it has already seen fail
+# readiness is the failure the drain sequence exists to prevent.
+max_requests_to_drained_replica = 0
+# Every request offered through the load balancer is answered. A replica
+# refusing during its drain is retried onto a ready one, so a refusal is not
+# loss — an unanswered caller is.
+max_request_loss = 0
+max_unavailable_responses = 0
+# Every accepted request settles exactly one usage record, including the ones a
+# draining replica finished and the stream its deadline cut.
+max_usage_record_loss = 0
+# How long the load balancer may still believe a signalled replica is ready.
+# Generous relative to the poll interval: this bounds the gateway's readiness
+# flip, not the harness' polling.
+max_readiness_removal_ms = 2000
+# How long a replacement replica may take to boot and be routable.
+max_replacement_admission_ms = 30000
+# Allowed over drain_grace + deadline + flush_timeout before a bounded
+# termination is not bounded.
+max_drain_exit_slack_ms = 5000
+# The rollout must actually be mixed-version: both revisions serving caller
+# traffic in the same phase, at least this many requests each.
+min_mixed_version_requests = 1
