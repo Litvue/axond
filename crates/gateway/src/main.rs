@@ -79,6 +79,12 @@ mod state;
 mod status;
 mod streaming;
 mod telemetry;
+// One tenant cannot reach another (#225), asserted at the layers a black-box
+// suite cannot see: row-level security, the administrative service over a real
+// journal, and the projection a replica converges on. Tests only, and every
+// scenario needs PostgreSQL.
+#[cfg(test)]
+mod tenant_isolation;
 #[cfg(test)]
 mod test_services;
 mod usage;
