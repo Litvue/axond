@@ -25,8 +25,8 @@ use crate::backends::Capabilities;
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{
-    AccessDenial, AuditEvent, LoadedRevision, ResourceScope, RevisionCandidate, RevisionId,
-    RevisionManifest, TenantId,
+    AccessDenial, AuditEvent, DenialPage, LoadedRevision, ResourceScope, RevisionCandidate,
+    RevisionId, RevisionManifest,
 };
 
 /// An authenticator over two hard-coded credential populations: OIDC-issued
@@ -227,10 +227,10 @@ impl ControlPlaneStore for FlakyStore {
 
     async fn denials(
         &self,
-        tenant: Option<TenantId>,
+        page: &DenialPage,
         limit: usize,
     ) -> Result<Vec<AccessDenial>, ControlPlaneError> {
-        self.inner.denials(tenant, limit).await
+        self.inner.denials(page, limit).await
     }
 }
 
@@ -307,10 +307,10 @@ impl ControlPlaneStore for CountingStore {
 
     async fn denials(
         &self,
-        tenant: Option<TenantId>,
+        page: &DenialPage,
         limit: usize,
     ) -> Result<Vec<AccessDenial>, ControlPlaneError> {
         self.count();
-        self.inner.denials(tenant, limit).await
+        self.inner.denials(page, limit).await
     }
 }

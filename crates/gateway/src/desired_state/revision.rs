@@ -383,21 +383,35 @@ impl DesiredState {
     ///
     /// Inserts when the resource is absent, so a caller building the next revision
     /// out of the current one does not have to branch on whether it is a create.
+    ///
+    /// All-or-nothing, and judged against the *highest* version held. A state may
+    /// hold two versions of one resource — [`DesiredState::insert`] refuses only an
+    /// identical reference, and [`DesiredState::validate`] is what reports the pair
+    /// as [`ValidationError::MultipleVersions`] — so superseding by the first match
+    /// would leave a newer copy behind and call the resource replaced. And nothing
+    /// is removed until the proposal has been accepted: a caller that handles the
+    /// refusal keeps the state it had rather than one quietly missing a resource.
     pub fn supersede(&mut self, resource: ResourceVersion) -> Result<&mut Self, ValidationError> {
-        let previous = self
+        let held: Vec<ResourceRef> = self
             .resources
             .keys()
-            .find(|reference| {
+            .filter(|reference| {
                 reference.kind == resource.reference.kind && reference.id == resource.reference.id
             })
-            .copied();
-        if let Some(previous) = previous {
-            if previous.version >= resource.reference.version {
-                return Err(ValidationError::VersionNotAdvanced {
-                    previous,
-                    proposed: resource.reference,
-                });
-            }
+            .copied()
+            .collect();
+        if let Some(previous) = held
+            .iter()
+            .copied()
+            .max_by_key(|reference| reference.version)
+            && previous.version >= resource.reference.version
+        {
+            return Err(ValidationError::VersionNotAdvanced {
+                previous,
+                proposed: resource.reference,
+            });
+        }
+        for previous in held {
             self.resources.remove(&previous);
         }
         self.insert(resource)
@@ -860,7 +874,7 @@ impl LoadedRevision {
 mod tests {
     use super::super::fixtures::{
         DESIRED_STATE_RESOURCES, alias, blob_backed_catalog, catalog_payload, credential, project,
-        reference, resource_id, revision_id, state, tenant, tenant_id,
+        reference, resource_id, revision_id, state, tenant, tenant_body, tenant_id,
     };
     use super::super::ids::Uuid7;
     use super::super::resource::{
@@ -893,6 +907,46 @@ mod tests {
         assert_eq!(forward, backward, "the state itself is order-independent");
         assert_eq!(forward.len(), DESIRED_STATE_RESOURCES);
         assert!(!forward.is_empty());
+    }
+
+    /// Superseding is all-or-nothing, and it is the newest copy it argues with.
+    ///
+    /// A state can hold two versions of one resource — `insert` refuses only an
+    /// identical reference — so a refused proposal must not have already deleted
+    /// the copy a caller is holding, and an accepted one must not leave a newer
+    /// version behind while reporting the resource replaced.
+    #[test]
+    fn a_refused_supersede_leaves_the_state_it_found() {
+        let second = ResourceVersionNumber::FIRST.next();
+        let third = second.next();
+        let name = Slug::parse("acme").unwrap();
+        let mut state = DesiredState::new();
+        state
+            .insert(tenant_body(1, "Acme").version_at(name.clone(), ResourceVersionNumber::FIRST))
+            .and_then(|state| state.insert(tenant_body(1, "Acme").version_at(name.clone(), third)))
+            .expect("two versions of one tenant are insertable, if not publishable");
+
+        let held = state.clone();
+        let refused = state
+            .supersede(tenant_body(1, "Renamed").version_at(name.clone(), second))
+            .expect_err("v2 does not advance past the v3 the state holds");
+        assert!(matches!(
+            refused,
+            ValidationError::VersionNotAdvanced { previous, .. } if previous.version == third
+        ));
+        assert_eq!(
+            state, held,
+            "a refusal removed a version the caller still holds"
+        );
+
+        state
+            .supersede(tenant_body(1, "Renamed").version_at(name, third.next()))
+            .expect("v4 advances past every version held");
+        assert_eq!(
+            state.len(),
+            1,
+            "an accepted supersede left an older version behind"
+        );
     }
 
     #[test]

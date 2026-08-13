@@ -126,8 +126,13 @@ pub struct RevisionPage {
     pub next_start: Option<String>,
 }
 
-/// An actor, projected. The same three kinds the domain records, so an audit
-/// reader can filter on `breakglass` without parsing prose.
+/// An actor, projected. The same kinds the domain records, so an audit reader
+/// can filter on `breakglass` without parsing prose.
+///
+/// A workload (#144) is named by its tenant and principal rather than by an
+/// issuer: it is Axond-owned, and its tenant is what makes the row attributable
+/// after the principal it names is revoked. Its key material has no projection
+/// here or anywhere else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ActorView {
     pub kind: &'static str,
