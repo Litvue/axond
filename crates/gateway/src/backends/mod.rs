@@ -11,7 +11,7 @@
 //! stateful operating modes"; `docs/maintainers/backend-contracts.md` maps these
 //! contracts to it).
 //!
-//! Seven contracts exist. This module owns the three that are new and
+//! Eight contracts exist. This module owns the four that are
 //! control-plane-shaped, and it names the four request-path seams that already
 //! ship so the boundary between them is reviewable in one place:
 //!
@@ -20,6 +20,7 @@
 //! | [`control_plane::ControlPlaneStore`] | Durable desired state: revisions, manifests, resource versions, audit | Control plane only | here |
 //! | [`secrets::SecretStore`] | Wrapped secret material and unwrapping | Snapshot compilation only | here |
 //! | [`catalog::CatalogSource`] | Model metadata ingestion | Background refresh only | here |
+//! | [`catalog_store::CatalogStore`] | Durable retention of imported catalogue snapshots | Background refresh only | here |
 //! | [`crate::budget::BudgetStore`] | Spend caps | Request path (opt-in) | [`crate::budget`] |
 //! | [`crate::rate_limit::RateLimiter`] | Inbound admission | Request path (opt-in) | [`crate::rate_limit`] |
 //! | [`crate::revocation::RevocationStore`] | Precise `jti` revocation | Request path (opt-in) | [`crate::revocation`] |
@@ -42,6 +43,8 @@
 
 pub mod catalog;
 pub mod catalog_projection;
+pub mod catalog_refresh;
+pub mod catalog_store;
 pub mod control_plane;
 pub mod models_dev;
 pub mod secrets;
@@ -177,6 +180,17 @@ pub const RESPONSIBILITIES: &[Responsibility] = &[
         responsibility: "model metadata ingestion",
         path: BackendPath::Background,
         permitted: &[BackendKind::ModelsDev],
+    },
+    Responsibility {
+        contract: "CatalogStore",
+        responsibility: "durable retention of imported catalogue snapshots",
+        // Retention is durable state, so Redis is excluded for the reason
+        // `durable_control_plane` gives; in-memory is permitted because a
+        // single-replica development run legitimately keeps its catalogue for
+        // the life of the process, and losing it costs a re-import rather than
+        // the deployment.
+        path: BackendPath::Background,
+        permitted: &[BackendKind::Postgres, BackendKind::InMemory],
     },
     Responsibility {
         contract: "BudgetStore",
@@ -387,7 +401,7 @@ mod tests {
                 responsibility.contract
             );
         }
-        assert_eq!(seen.len(), 7, "the responsibility table is exhaustive");
+        assert_eq!(seen.len(), 8, "the responsibility table is exhaustive");
     }
 
     #[test]
