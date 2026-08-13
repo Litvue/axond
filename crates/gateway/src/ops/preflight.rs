@@ -347,9 +347,11 @@ fn check_references(report: &mut Report, config: &Config, env: &HashMap<String, 
         }
     }
     // Provider credentials are the references a stateless replica fails to boot
-    // on most often, and `env` is mandatory rather than optional there.
+    // on most often, and `env` is mandatory rather than optional there. A
+    // credential with no env var is one a revision projected, whose material a
+    // secret store holds rather than the environment this checks.
     for credential in &config.credential {
-        if let Some(name) = non_empty(Some(credential.env.as_str())) {
+        if let Some(name) = non_empty(credential.env.as_deref()) {
             references.push((
                 format!(
                     "[[credential]] {}/{} `{}`",

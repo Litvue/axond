@@ -26,6 +26,10 @@
 //!   logs, spans, usage records, status.
 //! * [`journal`] sweeps everything a published revision durably leaves behind,
 //!   against a real PostgreSQL journal.
+//! * [`stateful`] drives the zero-redeploy sequence — stage, activate, serve,
+//!   rotate, roll back, revoke — against the *production* secret store, so the
+//!   lifecycle is asserted over envelope-encrypted rows and owner-checked reads
+//!   rather than over a fake.
 //!
 //! # Why the durable half is required rather than optional
 //!
@@ -44,3 +48,4 @@ pub(crate) mod sweep;
 mod journal;
 mod lifecycle;
 mod request_path;
+mod stateful;

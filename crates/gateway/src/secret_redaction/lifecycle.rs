@@ -351,7 +351,8 @@ async fn the_stateless_credential_path_still_serves_and_still_redacts() {
     config.credential.push(crate::config::Credential {
         namespace: "platform".to_owned(),
         provider: "openai".to_owned(),
-        env: "AXOND_STATELESS_OPENAI".to_owned(),
+        env: Some("AXOND_STATELESS_OPENAI".to_owned()),
+        secret: None,
         id: Some("stateless".to_owned()),
         weight: 1,
     });

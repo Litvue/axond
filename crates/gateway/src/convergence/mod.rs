@@ -13,6 +13,7 @@
 //! | --- | --- |
 //! | [`settings`] | how often to look, how long divergence may last, how to pace retries |
 //! | [`compile`] | how a hydrated revision becomes a whole runtime snapshot, and every way that fails |
+//! | [`credentials`] | how a revision's provider credentials become the pools a provider call leases from |
 //! | [`reconciler`] | the loop: observe, hydrate, compile, publish, report, back off |
 //! | [`status`] | what the replica reports: desired, loaded, active, lag, last refusal |
 //! | [`backoff`] | bounded exponential retry pacing |
@@ -46,15 +47,17 @@
 //!
 //! # Not wired to `serve` yet
 //!
-//! Stateful boot still refuses to start, and deliberately: a revision's resource
-//! *bodies* — tenancy, providers, catalogue, pricing, policy — are schemas owned
-//! by later slices, so no production [`compile::RevisionProjection`] can exist
-//! yet. This module is the convergence machinery and its contract, with the body
-//! schemas as the one seam left open; wiring it into `serve` is the projection
-//! landing, not a second convergence design.
+//! Stateful boot still refuses to start, and deliberately. Two of the projections
+//! a snapshot needs exist — [`tenancy`], which makes a project a namespace, and
+//! [`credentials`], which makes an active provider credential the pool a call
+//! leases from — but a servable snapshot also needs the catalogue, pricing, and
+//! policy a revision carries, and it needs a caller to be bound to a projected
+//! namespace, which is #252's. Those are the seams left open; wiring `serve` is
+//! the remaining projections landing, not a second convergence design.
 
 pub mod backoff;
 pub mod compile;
+pub mod credentials;
 pub mod lkg;
 pub mod reconciler;
 pub mod secrets;
@@ -72,6 +75,8 @@ pub use backoff::{Backoff, BackoffPolicy, InvalidBackoff};
 pub use compile::{
     CandidateCompiler, CompileError, ProjectionError, RevisionCompiler, RevisionProjection,
 };
+#[allow(unused_imports)]
+pub use credentials::{CredentialProjection, RuntimeProjection};
 #[allow(unused_imports)]
 pub use lkg::{LastKnownGood, LastKnownGoodError};
 #[allow(unused_imports)]
