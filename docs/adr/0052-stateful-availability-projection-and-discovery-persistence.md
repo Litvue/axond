@@ -81,7 +81,7 @@ this replica's circuits are joined to the index at the instant a verdict is
 asked for. Two replicas answer honestly instead of one answering for the fleet,
 and replica-local state never reaches a durable row.
 
-**Evidence is durable, bounded, and detail-free.** Control-plane migration 3 adds
+**Evidence is durable, bounded, and detail-free.** Control-plane migration 5 adds
 `axond_cp_availability_observation`: one row per record slot (`current`,
 `last_known_good`), carrying tenant and project, provider and model, a bounded
 result, completeness and source vocabulary, the instants observed, expiring, and

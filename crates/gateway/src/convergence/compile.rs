@@ -44,7 +44,7 @@
 //! structural rather than a rule the reconciler has to remember.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -309,6 +309,9 @@ pub struct RevisionCompiler<P> {
     /// snapshots: the discovery evidence accumulated under one revision is
     /// exactly what the next revision must not cost.
     availability: Option<Arc<AvailabilityEvidence>>,
+    /// Which derivation the last compilation published, so a candidate refused at
+    /// activation names the one to undo.
+    derived: Mutex<Option<u64>>,
     /// The clock effective-dated pricing is resolved against.
     ///
     /// Injected as a function rather than read inline so a test can compile the
@@ -342,6 +345,7 @@ impl<P: RevisionProjection> RevisionCompiler<P> {
             projection,
             secrets,
             availability: None,
+            derived: Mutex::new(None),
             clock: SystemTime::now,
         }
     }
@@ -454,12 +458,25 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
                 revision: id,
                 source: Box::new(source),
             })?;
+        // Named, so a refusal undoes *this* derivation or nothing: a discovery
+        // re-projection between here and the sink's answer has folded looks over
+        // this candidate's index, and undoing that one would restore the very
+        // dimensions the deployment refused.
+        *self.derived.lock().unwrap_or_else(PoisonError::into_inner) = Some(projected.derivation());
         Ok(snapshot.with_availability(Arc::new(projected.into_index())))
     }
 
     fn abandoned(&self) {
-        if let Some(evidence) = self.availability.as_ref() {
-            evidence.abandon();
+        let Some(evidence) = self.availability.as_ref() else {
+            return;
+        };
+        let derived = self
+            .derived
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(derivation) = derived {
+            evidence.abandon(derivation);
         }
     }
 }

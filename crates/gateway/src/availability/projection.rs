@@ -357,6 +357,7 @@ impl RuntimeObservations {
 /// statistic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectedAvailability {
+    derivation: u64,
     index: AvailabilityIndex,
     unnameable: usize,
     undescribed: usize,
@@ -366,6 +367,14 @@ pub struct ProjectedAvailability {
 }
 
 impl ProjectedAvailability {
+    /// Which derivation of the holder produced this, so a caller that finds out
+    /// afterwards its candidate was refused can name the one to undo rather than
+    /// "the last one" — which a discovery re-projection may since have replaced.
+    /// Zero for a projection produced without a holder.
+    pub const fn derivation(&self) -> u64 {
+        self.derivation
+    }
+
     pub const fn index(&self) -> &AvailabilityIndex {
         &self.index
     }
@@ -487,6 +496,7 @@ impl<'a> AvailabilityProjection<'a> {
             .count();
 
         Ok(ProjectedAvailability {
+            derivation: 0,
             unnameable,
             undescribed,
             skewed,
@@ -620,11 +630,14 @@ pub struct AvailabilityEvidence {
     /// the revision still being served, rather than leaving a discovery loop to
     /// re-project looks over dimensions no snapshot ever served.
     replaced: Mutex<Option<Superseded>>,
+    /// How many derivations this holder has published, so each one has a name.
+    derivations: Mutex<u64>,
 }
 
 /// The state one derivation replaced: enough to put it back.
 #[derive(Debug)]
 struct Superseded {
+    derivation: u64,
     index: Arc<AvailabilityIndex>,
     derived_from: Option<(Arc<DesiredState>, CredentialReadiness)>,
     looks: Vec<DiscoveryObservation>,
@@ -640,6 +653,7 @@ impl AvailabilityEvidence {
             derived_from: Mutex::new(None),
             deriving: Mutex::new(()),
             replaced: Mutex::new(None),
+            derivations: Mutex::new(0),
         }
     }
 
@@ -728,35 +742,57 @@ impl AvailabilityEvidence {
                 return Err(error);
             }
         };
+        let derivation = {
+            let mut derivations = self.lock(&self.derivations);
+            *derivations += 1;
+            *derivations
+        };
         *self.lock(&self.replaced) = Some(Superseded {
+            derivation,
             index: previous,
             derived_from: self.lock(&self.derived_from).clone(),
             looks: pending,
         });
         *self.lock(&self.index) = Arc::new(projected.index().clone());
         *self.lock(&self.derived_from) = Some((Arc::new(state.clone()), readiness.clone()));
-        Ok(projected)
+        Ok(ProjectedAvailability {
+            derivation,
+            ..projected
+        })
     }
 
-    /// Undo the last derivation, because the candidate it was derived for was
-    /// never served.
+    /// Undo derivation `derivation`, because the candidate it was derived for
+    /// was never served.
     ///
     /// The dimensions go back to the revision this replica is still running and
     /// the looks go back on the queue, in arrival order ahead of anything
     /// observed since — a refused candidate must cost freshness, not evidence.
-    /// Idempotent: a derivation that was served leaves nothing to undo once the
-    /// next one supersedes it.
-    pub fn abandon(&self) {
+    ///
+    /// Named rather than "the last one", and a no-op for any other: a discovery
+    /// re-projection between the compile and the refusal has already folded looks
+    /// over the refused candidate's index, so undoing *that* would restore the
+    /// very dimensions this exists to discard, and undoing a derivation somebody
+    /// has been served since would be worse. Reports whether it undid anything.
+    pub fn abandon(&self, derivation: u64) -> bool {
         let _deriving = self.lock(&self.deriving);
-        let Some(replaced) = self.lock(&self.replaced).take() else {
-            return;
+        let mut held = self.lock(&self.replaced);
+        if held
+            .as_ref()
+            .is_none_or(|superseded| superseded.derivation != derivation)
+        {
+            return false;
+        }
+        let Some(replaced) = held.take() else {
+            return false;
         };
+        drop(held);
         *self.lock(&self.index) = replaced.index;
         *self.lock(&self.derived_from) = replaced.derived_from;
         let mut queued = self.lock(&self.pending);
         let since: Vec<DiscoveryObservation> = queued.drain(..).collect();
         queued.extend(replaced.looks);
         queued.extend(since);
+        true
     }
 
     /// Fold whatever has been observed since into the revision already derived.

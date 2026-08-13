@@ -1,4 +1,4 @@
--- Axond durable discovery observations, migration 0003.
+-- Axond durable discovery observations, migration 0005.
 --
 -- Availability is derived, never published: a revision states what a tenant
 -- enabled and whom it may authenticate as, and nothing in it can state that a

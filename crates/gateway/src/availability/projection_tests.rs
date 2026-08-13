@@ -1057,7 +1057,7 @@ fn a_candidate_nobody_serves_leaves_neither_its_dimensions_nor_its_looks() {
     ));
     // A candidate whose credential material never resolved: same revision, a
     // dimension the running snapshot does not have.
-    evidence
+    let candidate = evidence
         .derive(&deployment.state, &CredentialReadiness::none())
         .expect("the candidate projects");
     assert_eq!(
@@ -1069,7 +1069,7 @@ fn a_candidate_nobody_serves_leaves_neither_its_dimensions_nor_its_looks() {
         Entitlement::Unknown
     );
 
-    evidence.abandon();
+    assert!(evidence.abandon(candidate.derivation()));
 
     let held = evidence.index();
     let record = held
@@ -1088,5 +1088,49 @@ fn a_candidate_nobody_serves_leaves_neither_its_dimensions_nor_its_looks() {
         verdict(&projected, &deployment.key(), 120).state,
         AvailabilityState::Available,
         "and the look the refused candidate consumed is still evidence"
+    );
+}
+
+/// The undo names a derivation, so a discovery re-projection between the compile
+/// and the refusal is not silently rolled back into: reverting *that* would put
+/// back the refused candidate's own dimensions, which is the state the mechanism
+/// exists to discard.
+#[test]
+fn an_abandonment_refuses_a_derivation_something_else_has_since_replaced() {
+    let deployment = Deployment::new().entitled().governed();
+    let evidence = AvailabilityEvidence::new(catalogue());
+    evidence
+        .derive(&deployment.state, &resolved(40))
+        .expect("the served revision projects");
+    let candidate = evidence
+        .derive(&deployment.state, &CredentialReadiness::none())
+        .expect("the candidate projects");
+
+    // A discovery loop folds a round of looks in before the sink answers.
+    evidence.observe(DiscoveryObservation::new(
+        deployment.scope(),
+        target(),
+        DiscoveryResult::Present,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        at(110),
+    ));
+    evidence
+        .reproject()
+        .expect("a revision has been derived")
+        .expect("it projects again");
+
+    assert!(
+        !evidence.abandon(candidate.derivation()),
+        "the derivation the refusal names is no longer the one to undo"
+    );
+    let held = evidence.index();
+    let record = held
+        .record(&deployment.key())
+        .expect("the target is described");
+    assert_eq!(
+        record.discovery.as_ref().map(|look| look.observed_at),
+        Some(at(110)),
+        "and the look the re-projection folded in is still held"
     );
 }
