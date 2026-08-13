@@ -137,7 +137,10 @@ ledger row for DDL it did not run:
   table not being empty (idempotent by construction, which is what makes a row
   usable as evidence) — each naming its object unqualified, so an unnamed
   `CREATE INDEX ON t (c)` or a schema-qualified `other.t` is unconfirmable too
-  rather than probed for under a name that is not one. Nothing confirmed is a
+  rather than probed for under a name that is not one. The parse skips comments
+  (`--`, nested `/* */`) and quoted regions (`'...'`, `$tag$ ... $tag$`) in both
+  its statement split and its keywords, so prose or a function body cannot
+  contribute the keywords a statement is judged by. Nothing confirmed is a
   refusal (nothing was applied: drop the ledger and `apply`); a partly-confirmed
   migration is a refusal naming what is missing (neither applied nor unapplied
   is true). Every probe is qualified to

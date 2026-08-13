@@ -316,6 +316,9 @@ path is not evidence about this one). What it does instead of recording:
   being empty — each of them naming its object unqualified, since the probe asks
   about the configured schema. An unnamed `CREATE INDEX ON t (c)` or a
   schema-qualified `other.t` is unconfirmable for the same reason as the rest.
+  Comments (`--` and nested `/* */`) and quoted regions (`'...'`, `$tag$ ... $tag$`)
+  are prose or data, never statements: a `CREATE TABLE` inside a function body or
+  a block comment is not evidence that anything was created.
   Anything else — an `ALTER`, a backfill, a `DROP`, a non-idempotent `INSERT` —
   is both what no catalogue can report on and what a rerun would damage,
   and one such statement makes its whole migration unadoptable. A *second* seed into

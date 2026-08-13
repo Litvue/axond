@@ -72,13 +72,68 @@ enum Statement {
     Seed(&'static str),
 }
 
-/// The migration's text as statements, with comments and string literals ignored
+/// Where the lexical region starting at `at` ends, when one starts there: a `--`
+/// line comment, a `/* */` block comment, a `'...'` literal, or a `$tag$ ... $tag$`
+/// body. `None` when `at` is ordinary text.
+///
+/// Everything inside such a region is prose or data, never syntax — and both
+/// scanners below have to agree about that, because they are what adoption's
+/// evidence is derived from. Read as syntax, `/* create table axond_cp_head */`
+/// before an `ALTER` supplies that statement's leading keywords and turns an
+/// unconfirmable migration into an adoptable one, and a `;` inside a `$$` body
+/// splits a function into fragments whose keywords read as top-level DDL. Both
+/// are the fail-open direction, which is the one this design exists to close.
+/// An unterminated region runs to the end of the text: the alternative is
+/// reading its contents, and the contents are the hazard.
+fn skipped(bytes: &[u8], at: usize) -> Option<usize> {
+    let after = |from: usize, needle: &[u8]| {
+        (from..=bytes.len().saturating_sub(needle.len()))
+            .find(|index| &bytes[*index..index + needle.len()] == needle)
+            .map_or(bytes.len(), |index| index + needle.len())
+    };
+    match bytes[at] {
+        b'-' if bytes.get(at + 1) == Some(&b'-') => Some(after(at + 2, b"\n")),
+        b'/' if bytes.get(at + 1) == Some(&b'*') => {
+            // Block comments nest in PostgreSQL, so the first `*/` need not be
+            // this one's.
+            let (mut depth, mut index) = (1usize, at + 2);
+            while index < bytes.len() {
+                if bytes[index..].starts_with(b"/*") {
+                    depth += 1;
+                    index += 2;
+                } else if bytes[index..].starts_with(b"*/") {
+                    depth -= 1;
+                    index += 2;
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            Some(bytes.len())
+        }
+        b'\'' => Some(after(at + 1, b"'")),
+        b'$' => {
+            // `$tag$` or `$$`, as against a `$1` parameter, which is ordinary text.
+            let tag = bytes[at + 1..]
+                .iter()
+                .position(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+                .filter(|end| bytes.get(at + 1 + end) == Some(&b'$'))?;
+            let delimiter = &bytes[at..=at + 1 + tag];
+            Some(after(at + delimiter.len(), delimiter))
+        }
+        _ => None,
+    }
+}
+
+/// The migration's text as statements, with comments and quoted regions ignored
 /// while looking for the separators.
 ///
-/// A `;` inside `'...'` is not a statement boundary and `--` starts a comment, so
-/// a plain `split(';')` would both cut statements in half and find keywords in
-/// prose. The slices point into the embedded SQL, so every name parsed out of one
-/// is `'static`.
+/// A `;` inside `'...'` or a `$$` body is not a statement boundary and a comment
+/// is not statement text, so a plain `split(';')` would both cut statements in
+/// half and find keywords in prose. The slices point into the embedded SQL, so
+/// every name parsed out of one is `'static`.
 ///
 /// A chunk with no word outside its comments is not a statement and is dropped: a
 /// file that ends with an explanatory comment, or that has a stray `;;`, is
@@ -87,25 +142,21 @@ enum Statement {
 fn statements(sql: &'static str) -> Vec<&'static str> {
     let mut statements = Vec::new();
     let mut start = 0;
-    let mut quoted = false;
-    let mut commented = false;
+    let mut index = 0;
     let bytes = sql.as_bytes();
-    for (index, byte) in bytes.iter().enumerate() {
-        match byte {
-            b'\n' if commented => commented = false,
-            _ if commented => {}
-            b'\'' => quoted = !quoted,
-            _ if quoted => {}
-            b'-' if bytes.get(index + 1) == Some(&b'-') => commented = true,
-            b';' => {
-                let statement = sql[start..index].trim();
-                if !words(statement).is_empty() {
-                    statements.push(statement);
-                }
-                start = index + 1;
-            }
-            _ => {}
+    while index < bytes.len() {
+        if let Some(end) = skipped(bytes, index) {
+            index = end;
+            continue;
         }
+        if bytes[index] == b';' {
+            let statement = sql[start..index].trim();
+            if !words(statement).is_empty() {
+                statements.push(statement);
+            }
+            start = index + 1;
+        }
+        index += 1;
     }
     let tail = sql[start..].trim();
     if !words(tail).is_empty() {
@@ -114,41 +165,29 @@ fn statements(sql: &'static str) -> Vec<&'static str> {
     statements
 }
 
-/// The words of a statement, with comments and string literals skipped.
+/// The words of a statement, with comments and quoted regions skipped.
 fn words(statement: &'static str) -> Vec<&'static str> {
     let mut words = Vec::new();
     let mut start: Option<usize> = None;
-    let mut quoted = false;
-    let mut commented = false;
+    let mut index = 0;
     let bytes = statement.as_bytes();
-    for (index, byte) in bytes.iter().enumerate() {
-        let word = byte.is_ascii_alphanumeric() || *byte == b'_';
-        match byte {
-            b'\n' if commented => commented = false,
-            _ if commented => {}
-            // A quote or a comment marker ends the word running up to it as much
-            // as a space does: `EXISTS foo--why` names `foo`, and dropping the
-            // word would make the next one answer for it.
-            b'\'' => {
-                if let Some(from) = start.take() {
-                    words.push(&statement[from..index]);
-                }
-                quoted = !quoted;
+    while index < bytes.len() {
+        // A quote or a comment marker ends the word running up to it as much as a
+        // space does: `EXISTS foo--why` names `foo`, and dropping the word would
+        // make the next one answer for it.
+        if let Some(end) = skipped(bytes, index) {
+            if let Some(from) = start.take() {
+                words.push(&statement[from..index]);
             }
-            _ if quoted => {}
-            b'-' if bytes.get(index + 1) == Some(&b'-') => {
-                if let Some(from) = start.take() {
-                    words.push(&statement[from..index]);
-                }
-                commented = true;
-            }
-            _ if word => start = start.or(Some(index)),
-            _ => {
-                if let Some(from) = start.take() {
-                    words.push(&statement[from..index]);
-                }
-            }
+            index = end;
+            continue;
         }
+        if bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_' {
+            start = start.or(Some(index));
+        } else if let Some(from) = start.take() {
+            words.push(&statement[from..index]);
+        }
+        index += 1;
     }
     if let Some(from) = start {
         words.push(&statement[from..]);
@@ -1244,6 +1283,17 @@ mod tests {
             // never ran, and doubling on a rerun.
             "CREATE TABLE IF NOT EXISTS first (id integer);\nINSERT INTO first (id) VALUES (1);\n",
             "DROP TABLE second;\n",
+            // A block comment is prose, so the `ALTER` after it is still an
+            // `ALTER`: read as syntax, its words would supply the missing
+            // `CREATE TABLE first` and make this migration adoptable on the
+            // strength of a table it never created.
+            "/* create table first, if /* nested */ missing */\n\
+             ALTER TABLE first ADD COLUMN note text;\n",
+            // A `;` inside a dollar-quoted body is not a statement boundary, so
+            // the `CREATE TABLE` a trigger would run is not this migration's.
+            "CREATE FUNCTION f() RETURNS trigger AS $body$\n\
+             BEGIN CREATE TABLE first (id integer); RETURN NULL; END;\n\
+             $body$ LANGUAGE plpgsql;\n",
         ] {
             let migration = Migration {
                 version: 2,
