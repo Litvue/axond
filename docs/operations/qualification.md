@@ -69,8 +69,8 @@ check out.
 
 | Record | Tier | Runner | Binary `sha256` | Branch commit (pre-squash) |
 | --- | --- | --- | --- | --- |
-| `qualification/capacity/evidence/reduced-local.toml` | reduced | local | `5a81966c9775` | `9c126fd` |
-| `qualification/capacity/evidence/heavy-local.toml` | heavy | local | `5a81966c9775` | `9c126fd` |
+| `qualification/capacity/evidence/reduced-local.toml` | reduced | local | `8e2cbb566e82` | `8ba8b96` |
+| `qualification/capacity/evidence/heavy-local.toml` | heavy | local | `8e2cbb566e82` | `8ba8b96` |
 
 Both were produced on an 8 vCPU cloud VM from a **debug build**, which is what
 `cargo test` builds. They are the first envelope, not a fleet baseline: a release

@@ -86,14 +86,14 @@ Intel Xeon Platinum 8559C, 31 GiB RAM, Linux 5.15.200, rustc 1.97.1, no queueing
 
 | Profile | Concurrency | Requests | Accepted req/s | p50 | p95 | p99 | TTFT p95 | Peak RSS | Peak sockets | CPU cores used |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `buffered` | 128 | 40 000 | 7 642 | 16.1 ms | 25.1 ms | 30.7 ms | — | 47 MiB | 345 | 4.8 |
-| `streaming` | 300 | 8 000 | 1 022 | 278 ms | 308 ms | 677 ms | 65 ms | 54 MiB | 761 | 3.2 |
-| `mixed` | 128 | 12 000 | 1 369 | 2.7 ms | 277 ms | 284 ms | 51 ms | 42 MiB | 295 | 2.4 |
-| `response-size` | 64 | 6 000 | 1 391 | 43.3 ms | 72.8 ms | 90.0 ms | — | 67 MiB | 151 | 4.2 |
-| `cancellation` | 300 | 8 000 | 1 554 | 269 ms | 354 ms | 501 ms | 77 ms | 58 MiB | 706 | 3.9 |
-| `tenants` | 128 | 12 000 | 953 | 253 ms | 266 ms | 271 ms | 51 ms | 42 MiB | 297 | 2.2 |
-| `shedding` | 512 | 20 000 | 3.8 | 19.2 ms | 51.1 ms | 77.3 ms | — | 75 MiB | 2 169 | 1.3 |
-| `backend-limits` | 64 | 1 200 | 99 | 4.3 ms | 2 003 ms | 2 058 ms | — | 36 MiB | 139 | 0.2 |
+| `buffered` | 128 | 40 000 | 7 643 | 16.0 ms | 25.3 ms | 31.5 ms | — | 48 MiB | 324 | 4.8 |
+| `streaming` | 300 | 8 000 | 1 028 | 274 ms | 293 ms | 668 ms | 59 ms | 54 MiB | 727 | 3.2 |
+| `mixed` | 128 | 12 000 | 1 366 | 2.9 ms | 279 ms | 285 ms | 51 ms | 42 MiB | 279 | 2.3 |
+| `response-size` | 64 | 6 000 | 1 377 | 43.7 ms | 75.4 ms | 94.2 ms | — | 71 MiB | 148 | 4.3 |
+| `cancellation` | 300 | 8 000 | 1 621 | 271 ms | 336 ms | 475 ms | 71 ms | 58 MiB | 710 | 3.7 |
+| `tenants` | 128 | 12 000 | 960 | 253 ms | 265 ms | 271 ms | 51 ms | 43 MiB | 298 | 2.2 |
+| `shedding` | 512 | 20 000 | 3.7 | 18.8 ms | 64.0 ms | 83.0 ms | — | 70 MiB | 1 803 | 1.3 |
+| `backend-limits` | 64 | 1 200 | 99 | 3.5 ms | 2 004 ms | 2 055 ms | — | 37 MiB | 139 | 0.1 |
 
 Throughput and latency move 10–25% between runs on a shared host, while the
 socket and memory columns barely move: read the first two as an order of
@@ -103,8 +103,8 @@ artifacts only when their `environment` blocks match.
 The last three rows are not throughput measurements and must not be read as
 one. `shedding` offers 20 000 callers at a ceiling of 8, so its accepted rate is
 the ceiling divided by how long one upstream answer takes; what it shows is the
-2 169 descriptors 512 simultaneous callers cost a replica that is refusing
-almost all of them, and that the refusal is cheap (1.4 cores). `backend-limits`
+1 803 descriptors 512 simultaneous callers cost a replica that is refusing
+almost all of them, and that the refusal is cheap (1.3 cores). `backend-limits`
 spends most of its wall clock waiting on upstreams that never answer, so its
 latency columns are the 2 000 ms bound the replica declares rather than work it
 did, and its CPU is near zero for the same reason. `tenants` is a like-for-like
@@ -118,7 +118,7 @@ buffered and streamed requests in one distribution.
 What the envelope says, in operator terms:
 
 - **Sockets scale with concurrency, roughly two per in-flight stream** — one
-  inbound, one upstream. 300 concurrent streams held ~761 descriptors. A
+  inbound, one upstream. 300 concurrent streams held ~727 descriptors. A
   refused caller costs an inbound descriptor too, until it is told no: the
   `shedding` row above holds four times the sockets of any other profile while
   admitting eight requests. Size `ulimit -n` for the load offered, not for the
