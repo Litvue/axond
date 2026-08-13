@@ -569,3 +569,117 @@ fn every_dropped_accounting_report_is_counted_once() {
     // An ordinary log line is not a drop report.
     assert_eq!(records(json!({"message": "listening"})), None);
 }
+
+/// The heavy tier runs alone. Both tiers and the manifest's own tests live in
+/// one binary, and this suite runs in the shared `Stateful tests` lane rather
+/// than under `--test-threads=1`: the exclusion has to be something the driver
+/// holds, not something an invocation configures, or a resource envelope
+/// measured here is measuring whatever else libtest started beside it.
+#[test]
+fn a_tier_offers_load_alone() {
+    let source = include_str!("support/stateful_endurance/run.rs");
+    assert!(
+        source.contains("let _offering = load_lock().lock().await;"),
+        "the driver takes the load lock before it offers anything"
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let held = stateful_endurance::run::load_lock().lock().await;
+        assert!(
+            stateful_endurance::run::load_lock().try_lock().is_err(),
+            "a second tier waits rather than offering load beside the first"
+        );
+        drop(held);
+        assert!(
+            stateful_endurance::run::load_lock().try_lock().is_ok(),
+            "and takes it once the first has finished"
+        );
+    });
+}
+
+/// The database outage excuses the rows it lost, and only those. The split is
+/// made on the window both sides can be counted over — records the processes
+/// settled outside it against rows the database holds outside it — so a row
+/// lost at a safe moment is charged to the deployment however many records the
+/// sink reported dropping while the backend was gone.
+#[test]
+fn a_durable_loss_is_excused_by_when_it_happened() {
+    let split = |emitted_outside, duplicates, durable_distinct, durable_outside| {
+        stateful_endurance::run::reconcile_durable_loss(
+            100,
+            emitted_outside,
+            duplicates,
+            durable_distinct,
+            durable_outside,
+        )
+    };
+
+    // Nothing lost: every settled record is in the database.
+    let clean = split(90, 0, 100, 90);
+    assert_eq!((clean.total, clean.outside, clean.in_window), (0, 0, 0));
+
+    // Ten lost, and the database holds every record settled outside the
+    // window: the outage accounts for all of them.
+    let excused = split(90, 0, 90, 90);
+    assert_eq!(
+        (excused.total, excused.outside, excused.in_window),
+        (10, 0, 10)
+    );
+
+    // Ten lost, and three of them were settled outside the window. Those three
+    // are the deployment's, whatever the sinks reported losing during the
+    // outage — the old magnitude comparison excused them.
+    let mixed = split(90, 0, 90, 87);
+    assert_eq!((mixed.total, mixed.outside, mixed.in_window), (10, 3, 7));
+
+    // Duplicates are charged to the outside bucket, so a second copy of a
+    // record cannot be read as a row the database is missing.
+    let duplicated = split(90, 3, 90, 87);
+    assert_eq!(
+        (duplicated.total, duplicated.outside, duplicated.in_window),
+        (10, 0, 10)
+    );
+
+    // The outside half is a part of the whole-run loss, never more than it: a
+    // drain tick's disagreement about which side of the edge a record fell on
+    // must not invent a loss that the set difference does not show.
+    let bounded = split(90, 0, 98, 80);
+    assert_eq!(
+        (bounded.total, bounded.outside, bounded.in_window),
+        (2, 2, 0)
+    );
+}
+
+/// A credential is passed to a replica as it was given. libpq's keyword/value
+/// form ends a field at a space, so an unquoted value with one in it makes the
+/// rest of the password a keyword; a quote or a backslash inside the value
+/// closes or escapes the wrong thing.
+#[test]
+fn a_replicas_dsn_carries_awkward_credentials_intact() {
+    let (rebuilt, reach) = stateful_endurance::durable::through_gate(
+        "postgres://a%20user:p%40ss%20w%27o%5Crd@db.internal:5432/some%20db?application_name=axond",
+        "127.0.0.1:6543",
+    );
+    assert_eq!(reach, stateful_endurance::durable::Reach::Gated);
+
+    // What matters is what libpq's own parser makes of it: the gate's address,
+    // and every field back exactly as it was given.
+    let parsed: tokio_postgres::Config = rebuilt
+        .parse()
+        .unwrap_or_else(|error| panic!("{rebuilt} does not parse: {error}"));
+    assert_eq!(parsed.get_user(), Some("a user"));
+    assert_eq!(parsed.get_password(), Some(r"p@ss w'o\rd".as_bytes()));
+    assert_eq!(parsed.get_dbname(), Some("some db"));
+    assert_eq!(parsed.get_application_name(), Some("axond"));
+    assert_eq!(parsed.get_ports(), [6543]);
+
+    // A TLS DSN is handed over untouched: a byte-forwarding gate cannot stand
+    // in front of a handshake to a different name.
+    let tls = "postgres://user:pw@db.internal:5432/postgres?sslmode=require";
+    let (passed, reach) = stateful_endurance::durable::through_gate(tls, "127.0.0.1:6543");
+    assert_eq!(passed, tls);
+    assert_eq!(reach, stateful_endurance::durable::Reach::Direct);
+}

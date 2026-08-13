@@ -79,7 +79,9 @@ qualification without a datastore is not a smaller one.
 export AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:5432/postgres
 
 # The smoke tier and the deterministic checks. Part of the normal suite, and of
-# the `Stateful tests` lane in CI.
+# the `Stateful tests` lane in CI. No `--test-threads=1` is needed: the driver
+# holds a load lock, so whichever tier is offering load is the only one, and the
+# deterministic checks beside it do not offer any.
 cargo test --locked --all-features --test stateful_endurance -- --nocapture
 
 # The soak tier: twelve hours, by name.
@@ -126,9 +128,9 @@ Hard failures, asserted at both tiers:
 - **exactly one usage record per dispatched request** — none missing, none
   duplicated, none carrying a status the plan cannot account for;
 - **no durable row lost outside a declared window**
-  (`max_durable_usage_loss_outside_windows = 0`). Rows lost *inside* the
-  database outage are excused only as far as the processes' own reports of
-  dropped batches account for them — see below;
+  (`max_durable_usage_loss_outside_windows = 0`), where *outside* is decided by
+  when the records were settled rather than by how many the processes reported
+  dropping — see below;
 - **no tenant boundary crossed** (`max_tenant_boundary_violations = 0`), which
   is also an early abort: the rest of a run that mixed two tenants' credentials
   measures nothing;
@@ -169,9 +171,22 @@ for a database that is not there ([ADR 0009](../adr/0009-durable-usage-sinks.md)
 A dropped batch is a logged event, and the harness keeps those events apart from
 its bounded scrollback: `usage.sink_drops` records how many batches were
 dropped, how many records they held, why, and whether each fell inside the
-declared window. Durable loss is excused only up to
-`sink_drops.records_in_usage_window` — a row that went missing with no process
-saying it dropped it is a finding, whenever it happened.
+declared window.
+
+Which half of the loss the outage excuses is a question about *when*, so it is
+answered on the window both sides can be counted over rather than by comparing
+magnitudes. `usage.settled_outside_usage_window` is what the processes settled
+outside the outage — the driver's count, less every duplicate the run saw, since
+nothing says which side of the window a second copy arrived on.
+`usage.durable_outside_usage_window` is what the database holds outside it, by
+the `recorded_at` the gateway stamped when the record was produced rather than
+when the batch flushed. The difference is `durable_loss_outside_windows`, and it
+is gated at zero; the rest of the whole-run loss is `durable_loss_in_window`,
+which the outage accounts for. A row lost at a safe moment therefore stays a
+finding however many batches the sink reported dropping while the backend was
+gone. `sink_drops` remains the fleet's own account of the excused half, and the
+edge between the two is carried one drain interval past the declared close, so a
+record the driver sees a tick late is not read as a safe-time loss.
 
 ## Reading an artifact
 
@@ -202,8 +217,8 @@ Fields worth knowing:
 - `usage.durable_loss_total` is every emitted record the database never
   received, split into the part the outage explains
   (`durable_loss_in_window`) and the part it does not
-  (`durable_loss_outside_windows`, gated at zero). Loss with no drop report
-  behind it fails whichever side of the split it lands on.
+  (`durable_loss_outside_windows`, gated at zero), with the two counts the split
+  was made from beside them.
 - `telemetry.worst_usage_silence_ms` is the longest stretch under load in which
   the fleet produced no accounting at all, excluding the declared outages. A
   gateway that keeps answering while its usage records stop is invisible in a

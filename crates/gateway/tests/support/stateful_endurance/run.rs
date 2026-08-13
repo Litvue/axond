@@ -18,8 +18,8 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use futures::StreamExt;
@@ -105,6 +105,7 @@ pub async fn run_with(
     manifest_text: &str,
     dispatch: Dispatch<'_>,
 ) -> Option<StatefulEnduranceResult> {
+    let _offering = load_lock().lock().await;
     let dsn = durable::dsn()?;
     let slo = profile.slo(tier);
     let mut scale = *profile.scale(tier);
@@ -284,6 +285,16 @@ pub async fn run_with(
     let path = result.write(dispatch.stem);
     eprintln!("{}\nartifact: {}", result.summary(), fleet::relative(&path));
     Some(result)
+}
+
+/// Only one tier offers load at a time, whatever the harness runs it from and
+/// however many threads libtest gives it. Both tiers live in one binary beside
+/// the manifest's own tests, and this lane runs the whole suite rather than
+/// `--test-threads=1`: an exclusion the driver holds is true, where one the
+/// invocation configures is only configured.
+pub fn load_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(tokio::sync::Mutex::default)
 }
 
 /// The offered duration, and where it came from. The override is the soak
@@ -1397,8 +1408,14 @@ impl State {
         }
         *self.by_status.entry(status).or_default() += 1;
 
+        // Which side of the outage a record was settled on, as the database
+        // will see it. The driver stamps a record with the tick it drained it
+        // on, which is up to one drain interval after the process wrote it, so
+        // the closing edge is carried that far forward: a record the database
+        // records inside the window must not be counted as one this side owed
+        // outside it.
         let (from, to) = self.usage_window;
-        if now >= from && now < to {
+        if now >= from && now < to + DRAIN_EVERY {
             self.emitted_in_usage_window += 1;
         } else {
             self.emitted_outside_usage_window += 1;
@@ -1724,6 +1741,50 @@ fn attribution_holds(namespace: &str, credential: &str) -> bool {
 // The verdict
 // ---------------------------------------------------------------------------
 
+/// The run's durable loss, split by when the records were settled rather than
+/// by how much the processes reported losing.
+pub struct DurableLoss {
+    /// Records the run settled that the database does not hold, over the whole
+    /// run.
+    pub total: u64,
+    /// Records settled outside the widened usage-outage window that the
+    /// database does not hold outside it. Nothing excuses these.
+    pub outside: u64,
+    /// The remainder, which the declared outage accounts for.
+    pub in_window: u64,
+    /// What the comparison outside the window was made against.
+    pub settled_outside: u64,
+}
+
+/// Split the durable loss over the usage-backend outage.
+///
+/// The whole-run loss is a set difference. Which half of it the outage excuses
+/// is a question about *when*, so the outside half is derived from a comparison
+/// of the same window on both sides — what the processes settled outside it
+/// against what the database holds outside it, by the gateway's own
+/// `recorded_at` — and only the remainder is charged to the outage. A drop
+/// reported during the outage can no longer excuse a row lost at a safe moment.
+pub fn reconcile_durable_loss(
+    settled: u64,
+    emitted_outside: u64,
+    duplicates: u64,
+    durable_distinct: u64,
+    durable_outside: u64,
+) -> DurableLoss {
+    let total = settled.saturating_sub(durable_distinct);
+    // Every duplicate is charged to the outside bucket, because nothing says
+    // which side of the window a second copy arrived on. Understating what was
+    // settled outside understates the loss rather than inventing one.
+    let settled_outside = emitted_outside.saturating_sub(duplicates);
+    let outside = settled_outside.saturating_sub(durable_outside).min(total);
+    DurableLoss {
+        total,
+        outside,
+        in_window: total - outside,
+        settled_outside,
+    }
+}
+
 /// What the database held once everything had settled.
 struct DurableEvidence {
     counts: durable::Counts,
@@ -1766,6 +1827,7 @@ fn assemble(
         ledger,
         probe_ledger,
         records_observed,
+        emitted_outside_usage_window,
         unexpected_statuses,
         by_status,
         sink_drops,
@@ -1792,13 +1854,13 @@ fn assemble(
     let settled = tally.distinct + probes.distinct;
     let duplicates = records_observed.saturating_sub(settled);
     let missing = owed.saturating_sub(tally.distinct);
-    // Which records the database is missing is a set difference; *why* is not
-    // something two clocks a drain tick apart can answer, so the attribution
-    // comes from the fleet's own drop reports. A loss the processes never
-    // reported, or reported outside the declared outage, is the deployment's.
-    let durable_loss = settled.saturating_sub(durable.counts.distinct);
-    let durable_loss_in_window = durable_loss.min(sink_drops.records_in_usage_window);
-    let durable_loss_outside = durable_loss - durable_loss_in_window;
+    let loss = reconcile_durable_loss(
+        settled,
+        emitted_outside_usage_window,
+        duplicates,
+        durable.counts.distinct,
+        durable.distinct_outside_window,
+    );
     let trend = trend(&segments, slo);
     let growth = resources
         .iter()
@@ -1836,7 +1898,7 @@ fn assemble(
         Verdict::at_most("unexpected_usage_statuses", unexpected_statuses as f64, 0.0),
         Verdict::at_most(
             "durable_usage_loss_outside_windows",
-            durable_loss_outside as f64,
+            loss.outside as f64,
             slo.max_durable_usage_loss_outside_windows as f64,
         ),
         Verdict::at_most(
@@ -1991,9 +2053,11 @@ fn assemble(
             durable: durable.counts,
             durable_lag_ms: durable.settled.lag_ms,
             durable_settled: durable.settled.within_bound,
-            durable_loss_total: durable_loss,
-            durable_loss_outside_windows: durable_loss_outside,
-            durable_loss_in_window,
+            durable_loss_total: loss.total,
+            durable_loss_outside_windows: loss.outside,
+            durable_loss_in_window: loss.in_window,
+            settled_outside_usage_window: loss.settled_outside,
+            durable_outside_usage_window: durable.distinct_outside_window,
             durable_duplicate_rows: durable.counts.rows.saturating_sub(durable.counts.distinct),
             sink_drops,
         },

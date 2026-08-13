@@ -26,6 +26,52 @@ pub fn dsn() -> Option<String> {
     crate::support::stateful::postgres_dsn()
 }
 
+/// One libpq keyword/value field, quoted so a credential is passed as it was
+/// given. A value with a space in it ends the field otherwise, and a quote or a
+/// backslash in it ends or escapes the wrong thing: single-quote everything and
+/// escape the two characters that mean something inside the quotes.
+pub fn quoted(value: &str) -> String {
+    let escaped = value.replace('\\', r"\\").replace('\'', r"\'");
+    format!("'{escaped}'")
+}
+
+/// The DSN a replica is given so its usage sink reaches the database through
+/// `gate`, and how it reaches it. A free function so the rebuild can be tested
+/// against credentials a run would rather not have in its fixtures.
+pub fn through_gate(dsn: &str, gate: &str) -> (String, Reach) {
+    let config: tokio_postgres::Config = dsn.parse().expect("the test DSN is a valid one");
+    if config.get_ssl_mode() == tokio_postgres::config::SslMode::Require {
+        return (dsn.to_owned(), Reach::Direct);
+    }
+    let (host, port) = gate
+        .rsplit_once(':')
+        .expect("the gate authority is host:port");
+    let mut rebuilt = format!("host={host} port={port}");
+    if let Some(user) = config.get_user() {
+        rebuilt.push_str(&format!(" user={}", quoted(user)));
+    }
+    if let Some(password) = config.get_password() {
+        let password = String::from_utf8_lossy(password).into_owned();
+        rebuilt.push_str(&format!(" password={}", quoted(&password)));
+    }
+    if let Some(dbname) = config.get_dbname() {
+        rebuilt.push_str(&format!(" dbname={}", quoted(dbname)));
+    }
+    // Carried over rather than dropped: a DSN that named the application or set
+    // server options meant them, and a replica connecting without them is not
+    // the deployment the run means to qualify.
+    if let Some(name) = config.get_application_name() {
+        rebuilt.push_str(&format!(" application_name={}", quoted(name)));
+    }
+    if let Some(options) = config.get_options() {
+        rebuilt.push_str(&format!(" options={}", quoted(options)));
+    }
+    if let Some(timeout) = config.get_connect_timeout() {
+        rebuilt.push_str(&format!(" connect_timeout={}", timeout.as_secs()));
+    }
+    (rebuilt, Reach::Gated)
+}
+
 /// The durable table one run owns, and how the run reaches it.
 pub struct Durable {
     /// The schema this run created, dropped when the run ends.
@@ -79,27 +125,7 @@ impl Durable {
     /// into it: a DSN can name its host in several shapes, and a harness that
     /// guesses which one produces a run that fails for the wrong reason.
     pub fn replica_dsn(&self, gate: &str) -> (String, Reach) {
-        let config: tokio_postgres::Config = self.dsn.parse().expect("the test DSN is a valid one");
-        if config.get_ssl_mode() == tokio_postgres::config::SslMode::Require {
-            return (self.dsn.clone(), Reach::Direct);
-        }
-        let (host, port) = gate
-            .rsplit_once(':')
-            .expect("the gate authority is host:port");
-        let mut rebuilt = format!("host={host} port={port}");
-        if let Some(user) = config.get_user() {
-            rebuilt.push_str(&format!(" user={user}"));
-        }
-        if let Some(password) = config.get_password() {
-            rebuilt.push_str(&format!(
-                " password={}",
-                String::from_utf8_lossy(password).into_owned()
-            ));
-        }
-        if let Some(dbname) = config.get_dbname() {
-            rebuilt.push_str(&format!(" dbname={dbname}"));
-        }
-        (rebuilt, Reach::Gated)
+        through_gate(&self.dsn, gate)
     }
 
     /// Where the database actually is, for the gate to forward to. Read from

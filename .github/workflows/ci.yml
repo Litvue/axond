@@ -287,7 +287,12 @@ jobs:
           if-no-files-found: warn
       # The stateful endurance smoke tier: the same driver, manifest, and gates
       # the `Endurance` workflow dispatches for twelve hours, at a minute. It
-      # only runs where a database is configured, which is this lane.
+      # only runs where a database is configured, which is this lane. It shares
+      # the lane rather than taking `--test-threads=1`, because the driver holds
+      # a load lock: only one tier offers load at a time whatever libtest does,
+      # and the run's gates are the deployment's behaviour — records reconciled,
+      # tenants isolated, revisions converged, restarts served — not throughput
+      # or latency, which are recorded and never asserted for this reason.
       - name: Publish the stateful endurance smoke results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

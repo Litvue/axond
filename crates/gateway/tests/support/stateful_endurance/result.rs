@@ -311,11 +311,19 @@ pub struct Usage {
     pub durable_loss_total: u64,
     /// Records emitted outside every declared fault window that never reached
     /// the database. The gate: a sink may drop a batch while its backend is
-    /// gone (ADR 0009), and may not lose a record at any other time.
+    /// gone (ADR 0009), and may not lose a record at any other time. The
+    /// difference of the two counts below, so a loss is excused by *when* it
+    /// happened rather than by how much the processes reported losing.
     pub durable_loss_outside_windows: u64,
     /// Records emitted during the usage-backend outage that never reached the
     /// database. Reported, not gated.
     pub durable_loss_in_window: u64,
+    /// Distinct records the processes settled outside the widened usage-outage
+    /// window, by the driver's clock, less every duplicate the run saw.
+    pub settled_outside_usage_window: u64,
+    /// Distinct rows the database holds outside that window, by the gateway's
+    /// own `recorded_at`. The other side of the same comparison.
+    pub durable_outside_usage_window: u64,
     /// Rows the database holds twice for one request. Documented behaviour of a
     /// retried batch, so reported rather than gated.
     pub durable_duplicate_rows: u64,
