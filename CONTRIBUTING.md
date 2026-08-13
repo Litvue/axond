@@ -98,6 +98,10 @@ raising the MSRV follows
   minor, and they get there through a breaking commit title — everything else,
   features included, ships as a patch. See
   [version classification](./docs/maintainers/releasing.md#version-classification).
+- **Squash-merge pull requests.** release-please reads one Conventional Commit
+  per commit on `main`; a merge commit repeats its branch's commit in the release
+  notes. See
+  [duplicated changelog entries](./docs/maintainers/releasing.md#duplicated-changelog-entries).
 - **Report vulnerabilities privately.** See [`SECURITY.md`](./SECURITY.md).
 - **Workflow steps are pinned to commit SHAs.** Every `uses:` names a full commit
   SHA with the version in a trailing comment; a tag or branch ref fails the
