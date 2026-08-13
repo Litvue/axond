@@ -165,7 +165,12 @@ def check_stale_claims(files: list[Path]) -> list[str]:
         "refuses to serve an empty snapshot": STATEFUL_BOOTS,
         "declines a stateful config": STATEFUL_BOOTS,
         "never serves an empty snapshot": STATEFUL_BOOTS,
-        "refuses to boot": STATEFUL_BOOTS,
+        # Narrowed to the stateful replica on purpose: a *gateway* refusing to
+        # boot on an un-migrated budget layout or a cross-family alias is a live
+        # contract, and forbidding the bare verb would forbid documenting it.
+        "replica refuses to boot": STATEFUL_BOOTS,
+        "replica still refuses to boot": STATEFUL_BOOTS,
+        "stateful boot refuses to start": STATEFUL_BOOTS,
     }
     failures: list[str] = []
     # Beyond Markdown, because this claim is made in an operator's config, in the

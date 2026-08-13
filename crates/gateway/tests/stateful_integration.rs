@@ -215,6 +215,37 @@ fn every_gate_has_a_scenario_that_exists() {
     }
 }
 
+/// A `Wired` gate's evidence has to *run* somewhere a merge cannot skip.
+///
+/// The datastore scenarios skip without `AXOND_TEST_POSTGRES_DSN`, the way the
+/// rest of the suite treats optional services, so a `wired` row proven only by
+/// them would be a claim a bare `cargo test` never checks. What makes it a claim
+/// is CI: the lane that supplies a database is required, and it forbids the skip.
+/// Asserted here rather than trusted, because a lane can be renamed or dropped
+/// from the aggregate by an unrelated workflow edit, and nothing else would
+/// notice that a `wired` gate's evidence had quietly become optional.
+#[test]
+fn a_wired_gate_runs_in_a_required_ci_lane() {
+    let workflow = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml"),
+    )
+    .expect("the CI workflow is committed");
+
+    for required in [
+        "AXOND_TEST_POSTGRES_DSN: postgres://",
+        "AXOND_TEST_REQUIRE_SERVICES: \"1\"",
+        "      - stateful-tests",
+        "test \"${{ needs.stateful-tests.result }}\" = success",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "a `wired` gate's datastore scenarios are evidence only while the stateful lane runs \
+             them and `CI Success` requires that lane: .github/workflows/ci.yml no longer contains \
+             {required:?}"
+        );
+    }
+}
+
 // ── The standing refusal every blocked gate rests on ─────────────────────────
 
 /// A complete stateful bootstrap whose references are satisfied, pointed at no
@@ -324,7 +355,11 @@ async fn stateless_boot_serves_with_no_control_plane() {
 #[tokio::test]
 async fn stateful_boot_serves_administration_and_refuses_inference() {
     let Some(control_plane) = ControlPlane::create().await else {
-        eprintln!("skipping: AXOND_TEST_POSTGRES_DSN is not set");
+        eprintln!(
+            "SKIPPED without AXOND_TEST_POSTGRES_DSN: IG-01's `wired` row is NOT proven by this \
+             run. It is proven by CI's required `Stateful tests` lane, which sets \
+             AXOND_TEST_REQUIRE_SERVICES=1 so this skip is a failure there."
+        );
         return;
     };
     let migrated = control_plane.run(&["migrate", "apply"]);
