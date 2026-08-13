@@ -159,6 +159,7 @@ impl Deployment {
                 Arc::new(FakeAdminAuthorizer::permissive().within(scopes)),
             )),
             store: self.store.clone(),
+            secrets: self.secrets.clone(),
         }
     }
 
