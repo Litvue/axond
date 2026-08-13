@@ -97,30 +97,36 @@ here without a scenario, or a scenario without a row, fails the suite.
 | IG-08 | Bounded, observable runtime | Readiness reflects convergence rather than process liveness; `/status` reports desired, loaded, active, and lag | IG-03, #238 | `readiness_and_status_report_convergence` | blocked |
 | IG-09 | Every request records the effective price version | The compiled snapshot carries the approved price-book identity into each usage record | IG-03, #249 | `every_usage_record_names_the_price_version` | blocked |
 | IG-10 | Tenant catalogue views isolated and explained | The tenant-facing catalogue is projected from the snapshot and explains effective availability | IG-03, #255 | `a_tenant_catalogue_is_isolated_and_explains_itself` | blocked |
-| IG-11 | Published capacity and failure-recovery evidence | Stateful profiles in the qualification harness: convergence under load, control-plane outage, rolling upgrade | IG-01 … IG-08, #156 | `stateful_qualification_profiles_are_published` | blocked |
+| IG-11 | Published capacity and failure-recovery evidence | Stateful profiles in the qualification harness: convergence under load, control-plane outage, rolling upgrade | IG-03 … IG-08, #156 | `stateful_qualification_profiles_are_published` | blocked |
 
-## The first gate that can become executable
+## The next gate that can become executable
 
-IG-01 — a stateful `serve` that reaches its control plane or refuses — is the
-gate every other stateful one waits behind: until a replica boots statefully,
-IG-03 through IG-11 have nothing running to assert against, which is why their
-scenarios assert today's refusal instead.
+IG-01 is wired: a replica boots against a migrated control plane, serves
+`/admin/v1`, and refuses inference and readiness until a revision compiles — so
+the scenarios above now assert a running stateful process, and the loud-failure
+half asserts the *reference* a boot could not resolve rather than any nonzero
+exit.
 
-Its foundations are now on main: the policy document type (#253), the derived
-availability contracts (#250), the `/admin/v1` boundary and its served runtime
-(#254, #143), the models.dev catalogue import (#207), and the envelope-encrypted
-SecretStore (#275), on top of the wave-0 journal, convergence loop, and
-last-known-good cache. What a stateful boot still cannot resolve is
-*who* a request belongs to and *what* it may reach: tenancy, principals, and RBAC
-(#252) and model enablement and project aliases (#255). A boot wired before those
+IG-03 is next, and it is what the remaining blocked gates wait behind: until a
+published revision compiles into a runtime snapshot, IG-04 and IG-06 through
+IG-11 have no served revision to assert against, which is why their scenarios
+assert today's inference refusal instead. Much of its foundation is on main — the
+policy document type (#253), the derived availability contracts (#250), the
+`/admin/v1` boundary and its served runtime (#254, #143), the models.dev
+catalogue import (#207), and the envelope-encrypted SecretStore (#275), on top of
+the wave-0 journal, convergence loop, and last-known-good cache. What a compiled
+snapshot still cannot resolve is *who* a request belongs to and *what* it may
+reach: tenancy, principals, and RBAC (#252), model enablement and project aliases
+(#255), and runtime policy activation (#276). A compilation wired before those
 land would hydrate a revision it cannot fully compile.
 
-So the next integration pull request is IG-01, opened when #252 and #255 are on
-main — not against their branches, and not duplicating the compilation a
-contract slice owns. It replaces
-`stateful_boot_refuses_to_serve_an_empty_snapshot` with a scenario that boots a
-replica against a migrated control plane and asserts it serves the head revision,
-and moves the IG-01 row with it. IG-03 follows once IG-01 serves.
+So the next integration pull request is IG-03, opened when those are on main —
+not against their branches, and not duplicating the compilation a contract slice
+owns. It replaces `hydrate_compile_publish_is_one_atomic_step`'s refusal
+assertion with a scenario that publishes a revision, waits for the snapshot it
+compiles into, and asserts inference is served from it, and moves the IG-03 row
+with it. IG-05's authenticated administrative path can move independently of
+compilation, since `/admin/v1` already serves.
 
 IG-11 is furthest out, and the [qualification
 packet](./qualification.md) says why in the terms it owns: capacity is
@@ -144,7 +150,11 @@ A gate moves to `wired` in one pull request that does all four of:
    [upgrades](./upgrades.md)).
 
 A gate is never moved to `wired` because its dependencies merged. The scenario
-runs, or the gate is blocked.
+runs, or the gate is blocked — and for a scenario that needs a datastore,
+"runs" means it runs in a lane `CI Success` requires, where
+`AXOND_TEST_REQUIRE_SERVICES=1` turns the local skip into a failure. A `wired`
+row whose evidence only executes when a developer happens to export a DSN is a
+claim nothing enforces.
 
 ## Running the harness
 

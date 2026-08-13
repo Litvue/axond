@@ -27,13 +27,14 @@ an operator can state.
 Both promises are currently documented and unit-tested, and neither has ever been
 observed end to end. That is the gap axond #219 exists to close.
 
-It cannot be closed yet. A stateful replica still refuses to boot, because a
-revision's resource *bodies* — tenancy, providers, catalogue, pricing, policy —
-belong to slices that have not landed, so there is nothing to serve and therefore
-no serving, convergence, or restore behaviour to observe. Waiting is the honest
-option; waiting *silently* is not, because the thing most likely to go wrong is
-not that the harness is late but that the scenarios get renegotiated one at a
-time as each slice lands, until what ships is whatever was convenient to test.
+It cannot be closed yet. A stateful replica boots and administers, but it refuses
+*inference*, because a revision's resource *bodies* — tenancy, providers,
+catalogue, pricing, policy — belong to slices that have not landed, so there is
+nothing to serve and therefore no serving, convergence, or restore behaviour to
+observe. Waiting is the honest option; waiting *silently* is not, because the
+thing most likely to go wrong is not that the harness is late but that the
+scenarios get renegotiated one at a time as each slice lands, until what ships is
+whatever was convenient to test.
 
 The instinct to write the harness now against fakes is worse than waiting: a
 recovery harness whose control plane is an in-process fake qualifies the fake.

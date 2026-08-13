@@ -165,6 +165,7 @@ def check_stale_claims(files: list[Path]) -> list[str]:
         "refuses to serve an empty snapshot": STATEFUL_BOOTS,
         "declines a stateful config": STATEFUL_BOOTS,
         "never serves an empty snapshot": STATEFUL_BOOTS,
+        "refuses to boot": STATEFUL_BOOTS,
     }
     failures: list[str] = []
     # Beyond Markdown, because this claim is made in an operator's config, in the
