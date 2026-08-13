@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -140,6 +141,8 @@ pub struct Axond {
     /// exactly what it qualified.
     pub config: String,
     child: Child,
+    /// This boot's own config directory, removed with the process that read it.
+    config_dir: PathBuf,
     output: Arc<Mutex<Output>>,
     /// The threads draining the child's pipes into `output`, kept so a failed
     /// boot can wait for them before quoting what the child said.
@@ -266,6 +269,7 @@ impl Axond {
             boot_key,
             config,
             child,
+            config_dir: dir,
             output,
             readers,
         };
@@ -488,6 +492,7 @@ impl Drop for Axond {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.config_dir);
     }
 }
 
