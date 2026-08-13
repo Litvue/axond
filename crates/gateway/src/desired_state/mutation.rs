@@ -22,7 +22,7 @@
 use std::time::SystemTime;
 
 use super::canonical::{Canonical, CanonicalValue};
-use super::ids::{AuditEventId, MutationId, PrincipalId, RevisionId, TenantId};
+use super::ids::{AuditEventId, InvalidId, MutationId, PrincipalId, RevisionId, TenantId};
 use super::resource::{ResourceRef, ResourceScope};
 
 /// Who performed a mutation.
@@ -95,6 +95,12 @@ pub enum InvalidActor {
     },
     #[error("an actor of kind `{kind}` does not have a `{field}` field in this build")]
     UnknownField { kind: &'static str, field: String },
+    #[error("an actor of kind `{kind}` records a `{field}` that is not an id: {source}")]
+    Id {
+        kind: &'static str,
+        field: &'static str,
+        source: InvalidId,
+    },
 }
 
 impl Actor {
@@ -148,6 +154,29 @@ impl Actor {
             "breakglass" => {
                 only("breakglass", &["kind"])?;
                 Ok(Self::Breakglass)
+            }
+            "workload" => {
+                only("workload", &["kind", "tenant", "principal"])?;
+                let id = |field: &'static str| {
+                    string(field).ok_or(InvalidActor::Field {
+                        kind: "workload",
+                        field,
+                    })
+                };
+                Ok(Self::Workload {
+                    tenant: TenantId::parse(&id("tenant")?).map_err(|source| InvalidActor::Id {
+                        kind: "workload",
+                        field: "tenant",
+                        source,
+                    })?,
+                    principal: PrincipalId::parse(&id("principal")?).map_err(|source| {
+                        InvalidActor::Id {
+                            kind: "workload",
+                            field: "principal",
+                            source,
+                        }
+                    })?,
+                })
             }
             "system" => {
                 only("system", &["kind", "component"])?;

@@ -2869,7 +2869,8 @@ mod tests {
                 // A field a later release adds to the human approver.
                 ("assurance", CanonicalValue::string("webauthn")),
             ]),
-            CanonicalValue::map([("kind", CanonicalValue::string("workload"))]),
+            // An approver kind a later release adds.
+            CanonicalValue::map([("kind", CanonicalValue::string("delegate"))]),
         ] {
             let error = read_with_field(
                 APPROVAL_FIELD,
@@ -2911,6 +2912,58 @@ mod tests {
         assert_eq!(snapshot.effective().ends(), None);
         // The rule ends at `last`, so nothing is priced there.
         assert_eq!(snapshot.targets().len(), 0);
+    }
+
+    /// A service account is an approver like any other: the audit trail records
+    /// one, so a book it approved must read back as the same principal rather than
+    /// as a version mismatch.
+    #[test]
+    fn a_service_account_can_approve_a_book() {
+        let by = Actor::Workload {
+            tenant: fixtures::tenant_id(1),
+            principal: fixtures::principal_id(9),
+        };
+        let body = PriceBookBody::new(
+            fixtures::catalog_content_id(),
+            Approval::Approved {
+                by: by.clone(),
+                at: EffectiveInstant::EPOCH,
+                citation: None,
+            },
+        );
+        let read =
+            PriceBookBody::read(&fixtures::price_book(&body, 7, "baseline")).expect("readable");
+        assert_eq!(read.approval().approver(), Some(&by));
+        assert_eq!(read, body, "and the book itself round trips");
+    }
+
+    /// A workload approver missing the principal it names is damage, not skew:
+    /// this build knows the kind, so the record is one no writer produced.
+    #[test]
+    fn a_workload_approver_without_its_principal_is_damaged() {
+        let error = read_with_field(
+            APPROVAL_FIELD,
+            CanonicalValue::map([
+                (STATE_FIELD, CanonicalValue::string("approved")),
+                (
+                    APPROVED_BY_FIELD,
+                    CanonicalValue::map([
+                        ("kind", CanonicalValue::string("workload")),
+                        (
+                            "tenant",
+                            CanonicalValue::string(fixtures::tenant_id(1).to_string()),
+                        ),
+                    ]),
+                ),
+                (APPROVED_AT_FIELD, CanonicalValue::integer(1)),
+            ]),
+        )
+        .expect_err("an approver missing its principal is refused");
+        assert!(matches!(error, PricingError::MalformedActor { .. }));
+        assert!(
+            !error.is_incompatible(),
+            "a known approver kind missing a field is damage: {error}"
+        );
     }
 
     #[test]
