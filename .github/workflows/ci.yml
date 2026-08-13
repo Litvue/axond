@@ -138,7 +138,7 @@ jobs:
           name: endurance-results-smoke
           path: target/endurance/smoke/*.json
           if-no-files-found: warn
-      # Likewise for the reduced rollout scenarios (ADR 0038). This lane has no
+      # Likewise for the reduced rollout scenarios (ADR 0040). This lane has no
       # database, so their rollback fence records itself as skipped; the
       # `stateful-tests` lane below evaluates it.
       - name: Publish the reduced rollout results
