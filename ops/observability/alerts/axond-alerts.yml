@@ -56,7 +56,21 @@ groups:
           severity: warning
         annotations:
           summary: "Cached observations for {{ $labels.axond_status_component }} are over two minutes old"
-          description: "A rising age with a steady state means the refresher, not the dependency, is the problem: the replica no longer knows the component's state rather than knowing it is down."
+          description: "The age is republished each refresh round, so it only climbs past the budget when a round takes longer than the budget - a probe_timeout or refresh_interval above status.staleness_budget. A refresher that stops ticking freezes this gauge instead of raising it; AxondStatusRefresherStalled is the rule for that."
+          runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#dependency-observations-have-gone-stale"
+
+      # The companion the age gauge cannot be: every observation is republished
+      # each round, so a refresher that stops leaves the age frozen at a small
+      # value rather than growing. What does change is that nothing is published
+      # at all, and an absent refresh series says so.
+      - alert: AxondStatusRefresherStalled
+        expr: "absent_over_time(axond_status_refreshes[10m])"
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No status refresh has been recorded for ten minutes"
+          description: "The background refresher is not observing anything, so every component state and observation age is frozen at whatever was true when it stopped - including the ok ones. Also expected on a replica with no refresher wired, where GET /admin/v1/status answers with every component disabled."
           runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#dependency-observations-have-gone-stale"
 
       - alert: AxondStatusRefreshesFailing

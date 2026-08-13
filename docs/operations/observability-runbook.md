@@ -97,18 +97,37 @@ that is the correct answer, not an incident.
 
 ### Dependency observations have gone stale
 
-**Signal.** `axond_status_observation_age` rising past the staleness budget on
-one or more components, or `axond_status_refreshes{axond_status_outcome="failed"}`
-increasing while the component's state does not move.
+**Signal.** `axond_status_refreshes` no longer being recorded at all,
+`axond_status_refreshes{axond_status_outcome="failed"}` increasing while the
+component's state does not move, or `axond_status_observation_age` past the
+staleness budget.
 
-**Alert.** `AxondStatusObservationsStale`, `AxondStatusRefreshesFailing`.
+**Alert.** `AxondStatusRefresherStalled`, `AxondStatusRefreshesFailing`,
+`AxondStatusObservationsStale`.
 
-**First response.** A rising age with a steady state means the refresher, not the
-dependency, is the problem: the observations behind that state are old. Check
-whether the replica is saturated (`axond_admission_in_flight`) or whether every
-probe of that component is timing out. A stale observation is deliberately
-reported as `degraded`/`stale` rather than as `ok` or as a readiness failure, so
-treat it as "I no longer know", not as "the dependency is down".
+**First response.** Read the three signals as different failures, because the age
+gauge alone cannot tell them apart. Every round publishes an observation for
+every probe — an abandoned probe publishes a synthetic `timeout` observation too
+— and each publish restamps the age, so:
+
+- **the refresher stopped.** Nothing is published, so the age *freezes* at a
+  small value rather than climbing, and the refresh series simply stops. That is
+  what `AxondStatusRefresherStalled` watches for. Everything the status surface
+  reports is now as old as the stall, including the `ok` components. (A replica
+  with no refresher wired reports every component `disabled` and alerts here
+  too.)
+- **probes keep failing.** Refreshes are recorded with
+  `axond_status_outcome="failed"`, the state is honest, and the dependency — not
+  the replica — is the thing to fix.
+- **rounds are slower than the budget.** The age exceeds the budget while still
+  being republished, which means `probe_timeout` or `refresh_interval` is above
+  `status.staleness_budget`. Check whether the replica is saturated
+  (`axond_admission_in_flight`) or the probes are timing out, then reconcile the
+  three settings.
+
+A stale observation is deliberately reported as `degraded`/`stale` rather than as
+`ok` or as a readiness failure, so treat it as "I no longer know", not as "the
+dependency is down".
 
 ### The control plane is unreachable
 
