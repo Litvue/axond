@@ -248,7 +248,7 @@ may spend, how much it may have in flight, and the token epoch below which a tok
 is refused. It is scoped to what it governs and written under that object's
 identity, so "the policy of project `core`" is one durable resource whose
 successive versions are successive revisions of the same document ([ADR
-0035](../adr/0035-typed-policy-documents-generations-and-transitions.md)).
+0036](../adr/0036-typed-policy-documents-generations-and-transitions.md)).
 
 - **Nothing is merged, across revisions or across scopes.** Reading policy takes
   one whole document or none of it. A field absent from a newer document is not
