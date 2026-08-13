@@ -28,6 +28,10 @@ mod exporter;
 pub mod http;
 pub mod metrics;
 mod spans;
+// Keeps `tracing`'s process-wide callsite interest cache from disabling a
+// callsite on behalf of a thread that has a subscriber of its own.
+#[cfg(test)]
+pub(crate) mod testing;
 
 pub use http::TelemetryLayer;
 pub use metrics::{record_last_known_good, record_revision_rejection};

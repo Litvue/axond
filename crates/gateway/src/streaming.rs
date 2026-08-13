@@ -2164,6 +2164,7 @@ targets = [
 
     #[tokio::test]
     async fn stream_open_429_closes_lease_as_rate_limited() {
+        crate::telemetry::testing::keep_callsites_answerable();
         let exporter = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
@@ -2361,6 +2362,7 @@ targets = [
         const FAILURE: &str = "error sending request for url \
                                (http://provider.internal:9443/v1/chat/completions)";
 
+        crate::telemetry::testing::keep_callsites_answerable();
         let logged = Arc::new(Mutex::new(Vec::<u8>::new()));
         let sink = logged.clone();
         let subscriber = tracing_subscriber::fmt()

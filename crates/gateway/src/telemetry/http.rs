@@ -182,7 +182,6 @@ mod tests {
     use std::sync::atomic::Ordering;
     use tower::util::ServiceExt;
     use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
 
     /// A method is a token the caller picks, so the recorded dimension has to be
     /// normalised the way an unmatched path is: a standard method keeps its own
@@ -241,10 +240,15 @@ mod tests {
         opentelemetry::global::set_text_map_propagator(
             opentelemetry_sdk::propagation::TraceContextPropagator::new(),
         );
-        tracing_subscriber::registry()
-            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("axond-test")))
-            .try_init()
-            .expect("install the test subscriber");
+        // Scoped rather than global: the process-wide default is the callsite
+        // keeper, and a subscriber this test installed for every other thread
+        // would export their spans into this exporter.
+        crate::telemetry::testing::keep_callsites_answerable();
+        let recording = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("axond-test"))),
+        );
+        let _default = tracing::dispatcher::set_default(&recording);
         super::super::EXPORTING.store(true, Ordering::Relaxed);
 
         let app = Router::new()
