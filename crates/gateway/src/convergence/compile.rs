@@ -173,6 +173,10 @@ impl CompileError {
     /// returns them so a new variant's label is added here in the same edit. The
     /// metric catalogue and the status vocabulary are both checked against this
     /// list, so a compile refusal cannot ship a label an alert cannot see.
+    ///
+    /// [`Self::Activation`] forwards a label it does not own, so every one of
+    /// [`ActivationRefusal::REASONS`] appears here too — held in step by
+    /// `every_activation_refusal_is_a_compile_reason` rather than by hand.
     pub const REASONS: &'static [&'static str] = &[
         "secret",
         "projection",
@@ -180,6 +184,12 @@ impl CompileError {
         "pricing",
         "clock",
         "snapshot",
+        "unsupported",
+        "migration",
+        "refused",
+        "withdrawn",
+        "ungoverned",
+        "invalid_policy",
     ];
 
     /// The revision that was refused.
@@ -707,5 +717,20 @@ mod tests {
             .expect("an unresolvable gateway key cannot be published");
         assert_eq!(error.reason(), "snapshot");
         assert!(error.to_string().contains("AXOND_KEY"), "{error}");
+    }
+
+    /// A refused activation is reported under a label it did not coin, so the
+    /// guards that read [`CompileError::REASONS`] — the metric catalogue and the
+    /// status vocabulary — would otherwise stop covering the one kind of
+    /// compile refusal whose labels are declared somewhere else.
+    #[test]
+    fn every_activation_refusal_is_a_compile_reason() {
+        for reason in ActivationRefusal::REASONS {
+            assert!(
+                CompileError::REASONS.contains(reason),
+                "`{reason}` is forwarded by `CompileError::Activation` and has to be catalogued \
+                 with the rest"
+            );
+        }
     }
 }

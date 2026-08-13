@@ -193,7 +193,13 @@ publication:
    Redis, or apply `ops/postgres/budget_v2.sql` for Postgres. (Not `axond
    migrate apply` — that is the control-plane schema, not these ledgers.) The
    command wants the bootstrap the fleet will *start* on, so set
-   `[budget] namespace_scope = true` before running it.
+   `[budget] namespace_scope = true` before running it. A stateful bootstrap
+   declares no `[[namespace]]`, and the v1 keys carry a `{namespace|subject}`
+   tag that is only attributable against real namespace ids, so pass them:
+   `--namespace acme/core --namespace acme/edge`, once per namespace the fleet
+   has served under this `key_prefix`. The command refuses before it scans
+   anything if the list is missing, and stops before moving anything if a key
+   matches no listed namespace or more than one.
 4. Restart on that bootstrap.
 5. Publish the document that states (or omits) `namespace_budget_limit_microdollars`.
 

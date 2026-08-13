@@ -147,6 +147,20 @@ pub enum ActivationRefusal {
 }
 
 impl ActivationRefusal {
+    /// Every label [`Self::reason`] returns.
+    ///
+    /// A refusal reaches an operator as a *compile* refusal, so these labels are
+    /// spliced into [`CompileError::REASONS`](crate::convergence::CompileError::REASONS)
+    /// and checked against the metric catalogue and the status vocabulary there.
+    pub const REASONS: &'static [&'static str] = &[
+        "unsupported",
+        "migration",
+        "refused",
+        "withdrawn",
+        "ungoverned",
+        "invalid_policy",
+    ];
+
     /// A stable, low-cardinality label for metrics and log filtering.
     pub const fn reason(&self) -> &'static str {
         match self {
@@ -295,6 +309,23 @@ pub(super) fn plan(
         // published it, and every revision restates every document, so an
         // unrelated change would otherwise activate policy that never moved.
         if current.body == published.body && current.generation.same_policy(&published.generation) {
+            // The document did not move, but what it governs may have: a
+            // namespace this scope has just claimed was being enforced under
+            // another scope's document until now, and that tightening is a
+            // handover an operator watching `draining()` before a migration has
+            // to see. Namespaces already governed by this body are filtered out,
+            // so a genuinely unchanged assignment stays the no-op it was.
+            if let Some(reasons) = handover(
+                *scope,
+                published
+                    .namespaces
+                    .iter()
+                    .filter_map(|namespace| active.governing(namespace))
+                    .filter(|inherited| **inherited != published.body)
+                    .map(|inherited| inherited.displaced_by(&published.body)),
+            )? {
+                activation.draining.push((*scope, reasons));
+            }
             continue;
         }
         let transition = current.body.transition(&published.body);
@@ -826,6 +857,50 @@ mod tests {
         assert_eq!(activation.live(), [project]);
     }
 
+    /// A handover need not change a document at all: the project's document is
+    /// republished verbatim and only what it governs moves. The namespace it
+    /// takes over was enforcing a looser cap, so the holds admitted under that
+    /// cap are stranded — and an operator gating a migration on `draining()`
+    /// reads it, rather than the scope being skipped as unchanged.
+    #[test]
+    fn an_unchanged_document_taking_a_namespace_over_still_drains() {
+        let tenant = body(scope(), 1, 1_000);
+        let projects = body(project(), 1, 500);
+        let with = |core: &crate::desired_state::policy::PolicyBody| {
+            let mut config = stateful_config();
+            config.namespace.push(crate::policy::view::tests::projected(
+                "acme/edge",
+                Some(NamespacePolicy {
+                    body: projects,
+                    generation: generation(&projects, 2),
+                }),
+            ));
+            config.namespace.push(crate::policy::view::tests::projected(
+                "acme/core",
+                Some(NamespacePolicy {
+                    body: *core,
+                    generation: generation(core, 2),
+                }),
+            ));
+            PolicyView::of(&config)
+        };
+
+        let activation = plan(&with(&tenant), &with(&projects), shared())
+            .expect("taking a namespace over is not a refusal");
+        assert!(
+            activation
+                .draining()
+                .contains(&(project(), vec![TransitionReason::BudgetLowered])),
+            "the document did not move, but the namespace it took over was \
+             enforcing more: {activation:?}"
+        );
+
+        // The same document governing the same namespaces is still a no-op.
+        let activation = plan(&with(&projects), &with(&projects), shared())
+            .expect("republishing changes nothing");
+        assert!(activation.is_noop(), "{activation:?}");
+    }
+
     /// A project of a tenant that has one, for handover tests.
     fn project() -> PolicyScope {
         PolicyScope::Project {
@@ -974,8 +1049,13 @@ mod tests {
         .expect("the namespace stays governed, by its tenant's document");
         assert_eq!(
             activation.draining(),
-            [(project(), vec![TransitionReason::BudgetLowered])],
-            "a tighter document taking the namespace over is a drain, not a silent withdrawal"
+            [
+                (scope(), vec![TransitionReason::BudgetLowered]),
+                (project(), vec![TransitionReason::BudgetLowered]),
+            ],
+            "a tighter document taking the namespace over is a drain, not a silent withdrawal — \
+             reported for the scope handing it off and, though its own document never moved, for \
+             the one taking it over"
         );
         assert!(activation.withdrawn().is_empty());
     }
@@ -1082,9 +1162,17 @@ mod tests {
             ActivationRefusal::Ungoverned {
                 namespace: "acme/core".to_owned(),
             },
+            ActivationRefusal::InvalidCap {
+                scope: scope(),
+                field: "budget_limit_microdollars",
+            },
         ];
-        for refusal in refusals {
+        for refusal in &refusals {
             let reason = refusal.reason();
+            assert!(
+                ActivationRefusal::REASONS.contains(&reason),
+                "`{reason}` is declared where the compile vocabulary reads it from"
+            );
             assert!(
                 crate::convergence::reconciler::REVISION_REASONS.contains(&reason),
                 "`{reason}` is a label a refused publication produces"
@@ -1093,6 +1181,16 @@ mod tests {
                 crate::status::StatusReason::from_revision_reason(reason),
                 crate::status::StatusReason::PolicyRejected,
                 "`{reason}` reaches the status contract as a decided code"
+            );
+        }
+        // The other direction, so a label declared and no longer produced is
+        // noticed too: the list is a vocabulary, not an archive.
+        for reason in ActivationRefusal::REASONS {
+            assert!(
+                refusals
+                    .iter()
+                    .any(|refusal| &refusal.reason() == reason),
+                "`{reason}` is declared but no refusal produces it"
             );
         }
     }

@@ -716,10 +716,12 @@ pub async fn build(
 /// refuses to boot with a namespace cap until this has been done, and refuses to
 /// boot without one afterwards, so neither direction silently resets a ledger.
 ///
-/// `namespaces` is the configured namespace id list: the v1 keys carry an
-/// unescaped `{namespace|subject}` tag, so they are attributed by resolving that
-/// tag against real namespace ids rather than by splitting it at a delimiter
-/// that may appear in either half.
+/// `namespaces` is the namespace id list the v1 keys are attributed against:
+/// they carry an unescaped `{namespace|subject}` tag, so they are resolved
+/// against real namespace ids rather than split at a delimiter that may appear
+/// in either half. Stateless deployments take it from `[[namespace]]`; stateful
+/// ones, whose bootstrap file cannot declare a namespace, pass the projected ids
+/// on the command line. An empty list is refused before anything is scanned.
 pub async fn migrate_redis(
     config: &BudgetConfig,
     namespaces: &[String],
@@ -747,6 +749,21 @@ pub async fn migrate_redis(
              `namespace_limit_microdollars` in stateless mode, `namespace_scope = true` in \
              stateful mode, where the cap itself is published — then migrate, then start the \
              fleet on that same configuration.",
+        ));
+    }
+    // A v1 key names `{namespace|subject}` as one tag, so a namespace list is
+    // what makes it attributable at all. In stateful mode the bootstrap file
+    // cannot declare a namespace, so an empty list is the ordinary case there and
+    // not an operator's slip: refused here, with the flag named, rather than
+    // half-way through a scan that would abort on the first key it met.
+    if namespaces.is_empty() {
+        return Err(BudgetError::invalid(
+            "redis",
+            "the Redis budget migration attributes each v1 key to a namespace, and none were \
+             given. In stateless mode declare them under `[[namespace]]`; in stateful mode, where \
+             namespaces belong to the control plane, pass the projected ids with `--namespace` \
+             (repeat the flag), listing every namespace the fleet has served under this \
+             `key_prefix`.",
         ));
     }
     let url = dsn(config, "redis", env)?;
@@ -921,10 +938,24 @@ mod tests {
         };
         let err = migrate_redis(&stateful, &[], &HashMap::new())
             .await
-            .expect_err("no DSN is set, so it fails past the layout gate");
+            .expect_err("a stateful config declares no namespace to attribute keys to");
         assert!(
             !format!("{err}").contains("Declare it under"),
-            "the layout is declared, so the refusal must be about the DSN: {err}"
+            "the layout is declared, so the refusal must not be about the cap: {err}"
+        );
+        assert!(
+            format!("{err}").contains("--namespace"),
+            "the refusal must name the flag that makes the procedure performable: {err}"
+        );
+
+        // With the list given, the layout gate is behind it and the next thing
+        // that can fail is the connection — nothing was scanned in between.
+        let err = migrate_redis(&stateful, &["acme".to_owned()], &HashMap::new())
+            .await
+            .expect_err("no DSN is set");
+        assert!(
+            format!("{err}").contains("AXOND_TEST_MISSING_BUDGET_URL"),
+            "the refusal must be about the DSN: {err}"
         );
     }
 

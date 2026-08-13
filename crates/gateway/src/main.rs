@@ -178,6 +178,17 @@ fn cli() -> Command {
                                 .long("config")
                                 .value_name("PATH")
                                 .help("Config file path"),
+                        )
+                        .arg(
+                            Arg::new("namespace")
+                                .long("namespace")
+                                .value_name("ID")
+                                .action(ArgAction::Append)
+                                .help(
+                                    "A namespace the v1 keys are attributed against; repeat \
+                                     once per namespace. Required in stateful mode, where the \
+                                     bootstrap file declares none",
+                                ),
                         ),
                 ),
         )
@@ -460,14 +471,23 @@ fn migrate_redis_budget(args: &clap::ArgMatches) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to load config from `{config_path}`: {e}"))?;
     let env: HashMap<String, String> = std::env::vars().collect();
     let runtime = tokio::runtime::Runtime::new()?;
-    // The v1 keys are attributed against the configured namespaces, so this must
-    // run with the config that wrote them.
+    // The v1 keys are attributed against the namespaces that wrote them, which
+    // the file names in stateless mode and cannot name at all in stateful mode —
+    // there, `[[namespace]]` is control-plane owned, so the operator passes the
+    // list the projection serves with `--namespace`.
     // Distinct: an id may legitimately appear twice, and the same id offered
     // twice as a candidate owner of a key is not an ambiguity.
-    let namespaces: Vec<String> = config
-        .namespace
-        .iter()
-        .map(|namespace| namespace.id.clone())
+    let namespaces: Vec<String> = args
+        .get_many::<String>("namespace")
+        .map(|ids| ids.cloned().collect::<Vec<_>>())
+        .unwrap_or_else(|| {
+            config
+                .namespace
+                .iter()
+                .map(|namespace| namespace.id.clone())
+                .collect()
+        })
+        .into_iter()
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
