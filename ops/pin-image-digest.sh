@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Resolve the production overlay's image digest, or refuse the unresolved one.
+# Resolve the production overlays' image digests, or refuse the unresolved ones.
 #
 # The committed overlay pins an all-zero sentinel digest: an image reference that
 # cannot be pulled. That is deliberate — a tag in a production manifest is a name
@@ -21,7 +21,14 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-overlay="${repo_root}/deploy/kubernetes/overlays/production/kustomization.yaml"
+# Every overlay that carries the sentinel, not just the stateless one: the
+# stateful overlay pins the migration Job as well as its Deployment, and a
+# `--check` blind to it would report a resolved fleet while that overlay still
+# names an image no node can pull.
+overlays=(
+  "${repo_root}/deploy/kubernetes/overlays/production/kustomization.yaml"
+  "${repo_root}/deploy/kubernetes/overlays/production-stateful/kustomization.yaml"
+)
 image="${AXOND_IMAGE:-ghcr.io/litvue/axond}"
 sentinel="sha256:0000000000000000000000000000000000000000000000000000000000000000"
 required_platforms=(linux/amd64 linux/arm64)
@@ -32,7 +39,7 @@ usage() {
 }
 
 current_digest() {
-  sed -n 's/^ *digest: *\(sha256:[0-9a-f]\{64\}\) *$/\1/p' "$overlay" | head -n 1
+  sed -n 's/^ *digest: *\(sha256:[0-9a-f]\{64\}\) *$/\1/p' "$1" | head -n 1
 }
 
 workspace_version() {
@@ -59,17 +66,19 @@ esac
 [[ "$mode" != check || $# -eq 0 ]] || usage
 
 if [[ "$mode" == check ]]; then
-  digest="$(current_digest)"
-  [[ -n "$digest" ]] || {
-    echo "no image digest found in ${overlay#"$repo_root"/}" >&2
-    exit 1
-  }
-  if [[ "$digest" == "$sentinel" ]]; then
-    echo "the production overlay still pins the unresolved sentinel digest." >&2
-    echo "run: ops/pin-image-digest.sh <version>   (then verify it with ops/verify-image-evidence.sh)" >&2
-    exit 1
-  fi
-  echo "production overlay pins ${image}@${digest}"
+  for overlay in "${overlays[@]}"; do
+    digest="$(current_digest "$overlay")"
+    [[ -n "$digest" ]] || {
+      echo "no image digest found in ${overlay#"$repo_root"/}" >&2
+      exit 1
+    }
+    if [[ "$digest" == "$sentinel" ]]; then
+      echo "${overlay#"$repo_root"/} still pins the unresolved sentinel digest." >&2
+      echo "run: ops/pin-image-digest.sh <version>   (then verify it with ops/verify-image-evidence.sh)" >&2
+      exit 1
+    fi
+    echo "${overlay#"$repo_root"/} pins ${image}@${digest}"
+  done
   exit 0
 fi
 
@@ -146,11 +155,13 @@ fi
 
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
-sed "s|^\( *digest: \)sha256:[0-9a-f]\{64\}|\1${digest}|" "$overlay" >"$tmp"
-grep -Fq "$digest" "$tmp" || {
-  echo "failed to write the digest into ${overlay#"$repo_root"/}" >&2
-  exit 1
-}
-cat "$tmp" >"$overlay"
-echo "pinned ${image}@${digest} (${reference}) in ${overlay#"$repo_root"/}"
+for overlay in "${overlays[@]}"; do
+  sed "s|^\( *digest: \)sha256:[0-9a-f]\{64\}|\1${digest}|" "$overlay" >"$tmp"
+  grep -Fq "$digest" "$tmp" || {
+    echo "failed to write the digest into ${overlay#"$repo_root"/}" >&2
+    exit 1
+  }
+  cat "$tmp" >"$overlay"
+  echo "pinned ${image}@${digest} (${reference}) in ${overlay#"$repo_root"/}"
+done
 echo "verify it before applying: SIGNER_IDENTITY=... GITHUB_REPOSITORY=Litvue/axond ops/verify-image-evidence.sh ${image}@${digest}"

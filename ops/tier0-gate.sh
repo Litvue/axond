@@ -336,11 +336,29 @@ fi
 # connection this namespace would have had to allow.
 stateful_log="$(mktemp "$tmpdir/axond-tier0-stateful.XXXXXX.log")"
 stateful_status=0
+# The bind address comes from the config rather than a literal, so a port moved
+# there cannot leave this probing a port nothing was ever going to use.
+stateful_port="$(sed -n 's/^bind = "127\.0\.0\.1:\([0-9]\+\)"$/\1/p' "$stateful_config")"
+[[ -n "$stateful_port" ]] ||
+  failure "could not read the stateful bootstrap's bind port; the listener probe below would prove nothing"
 env -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
   -u GW_TIER0_CONTROL_PLANE_DSN -u GW_TIER0_SECRET_STORE_KEK \
   -u GW_TIER0_ADMIN_BREAKGLASS \
   AXOND_CONFIG="$stateful_config" RUST_LOG=warn \
-  timeout 10 "$bin" >"$stateful_log" 2>&1 || stateful_status=$?
+  timeout 10 "$bin" >"$stateful_log" 2>&1 &
+stateful_pid=$!
+# Observed rather than read out of the log: the startup line is emitted at info
+# level and before `bind` returns, so a log search proves neither that a socket
+# was opened nor, under this gate's `RUST_LOG`, that one was not.
+stateful_bound=no
+while kill -0 "$stateful_pid" 2>/dev/null; do
+  if (exec 3<>"/dev/tcp/127.0.0.1/${stateful_port}") 2>/dev/null; then
+    stateful_bound=yes
+    break
+  fi
+  sleep 0.1
+done
+wait "$stateful_pid" || stateful_status=$?
 [[ "$stateful_status" != 0 ]] ||
   failure "a stateful process started with no control plane reachable and its control-plane, KEK, and breakglass references unset; it must fail loudly rather than serve an empty snapshot"
 [[ "$stateful_status" != 124 ]] ||
@@ -351,9 +369,8 @@ grep -q 'stateful' "$stateful_log" ||
 # connection the namespace denied — the opposite of what it claims to prove.
 grep -q 'GW_TIER0_' "$stateful_log" ||
   failure "stateful refusal did not name the unresolved reference, so it is not evidence that boot stopped at the reference rather than at a connection"
-if grep -q 'axond listening' "$stateful_log"; then
-  failure "a stateful boot that cannot reach a control plane must not bind a listener"
-fi
+[[ "$stateful_bound" == no ]] ||
+  failure "a stateful boot that cannot reach a control plane accepted a connection on 127.0.0.1:${stateful_port}; it must bind nothing"
 if grep -Eq 'postgres(ql)?://|dbname=' "$stateful_log"; then
   failure "stateful diagnostics must name references, never a resolved DSN"
 fi

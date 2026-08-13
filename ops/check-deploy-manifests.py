@@ -917,12 +917,25 @@ def check_sentinel_refused() -> list[str]:
         text=True,
         check=False,
     )
+    failures: list[str] = []
     if completed.returncode == 0:
-        return [
+        failures.append(
             "ops/pin-image-digest.sh --check accepted the committed overlay; it must refuse the "
             "unresolved sentinel digest"
-        ]
-    return []
+        )
+    # A `--check` that passes is only worth what it covers. Every overlay
+    # carrying the sentinel has to be in the helper's list, or an operator
+    # resolves one overlay, sees the check pass, and applies another that still
+    # names an image no node can pull.
+    helper = (ROOT / "ops/pin-image-digest.sh").read_text(encoding="utf-8")
+    for overlay in sorted((ROOT / "deploy/kubernetes/overlays").glob("*/kustomization.yaml")):
+        relative = overlay.relative_to(ROOT).as_posix()
+        if SENTINEL_DIGEST in overlay.read_text(encoding="utf-8") and relative not in helper:
+            failures.append(
+                f"ops/pin-image-digest.sh: {relative} pins the sentinel digest but the helper "
+                "neither rewrites nor checks it, so its placeholder survives a passing --check"
+            )
+    return failures
 
 
 def gate(

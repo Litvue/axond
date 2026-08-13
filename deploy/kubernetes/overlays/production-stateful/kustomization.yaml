@@ -13,8 +13,9 @@
 # The `images:` block below is what pins the migration Job as well as the
 # Deployment: the production overlay's own transformer runs before this overlay
 # adds the Job, so a digest set only there would leave the Job on a mutable tag.
-# `ops/pin-image-digest.sh` writes both, and `--check` fails while either still
-# carries the sentinel.
+# `ops/pin-image-digest.sh` rewrites this overlay as well as the production one,
+# and its `--check` fails while either still carries the sentinel; the manifest
+# gate fails if a sentinel-bearing overlay is missing from that helper's list.
 #
 # Not applyable as committed, by design: the digest is the all-zero sentinel.
 #

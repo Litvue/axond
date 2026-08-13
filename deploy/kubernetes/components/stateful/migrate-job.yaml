@@ -1,11 +1,21 @@
-# The forward migration, run once, before the replicas that read the schema.
+# The forward migration: run once for the whole fleet, by one Pod that is not a
+# replica.
+#
+# `kubectl apply -k` creates this Job and the Deployment in the same apply and
+# orders neither, so on a first install the replicas lose the race: a replica
+# that finds an unrecognised schema refuses to boot and exits, and the fleet
+# crash-loops on kubelet's backoff until this Job completes and the next restart
+# finds the schema. That is self-healing rather than ordered — see
+# `docs/deployment/kubernetes.md#stateful-mode` for the quiet install that scales
+# the Deployment to zero first.
 #
 # `axond migrate apply` is forward-only and idempotent, and it is the only
 # command in this manifest set that writes DDL: a rerun against a current schema
 # reports it and exits 0. It runs as a Job rather than as an initContainer
 # because an initContainer runs once per Pod — a three-replica rollout would race
 # three migrations against one database — and rather than as
-# `[control_plane] migrate = true` for the same reason.
+# `[control_plane] migrate = true` for the same reason. A replica crash-looping
+# until the schema exists is the cheaper failure of the two.
 #
 # A Job's `spec` is immutable, so an upgrade that ships new migrations deletes
 # this one first. That is the documented order in

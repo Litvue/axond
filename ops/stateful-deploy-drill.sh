@@ -173,7 +173,11 @@ render "$overlay" |
 the overlay's image pinning changed and this drill needs updating"
 kube apply -f "${workdir}/rendered.yaml" >/dev/null
 
-step "The migration runs once, before any replica reads the schema"
+# One Job migrates for the whole fleet. Nothing orders it against the Deployment
+# — `kubectl apply` creates both — so the replicas crash-loop against an
+# unrecognised schema until it completes; what matters here is that exactly one
+# process writes DDL and that it converges.
+step "One Job migrates the schema, and a rerun is a no-op"
 kube -n axond wait --for=condition=complete job/axond-migrate --timeout=180s >/dev/null ||
   fail "the axond-migrate Job did not complete: $(kube -n axond logs job/axond-migrate 2>&1 | tail -n 5)"
 migration_log="$(kube -n axond logs job/axond-migrate)"
@@ -209,7 +213,29 @@ and this overlay's Recreate/AlwaysAllow/admin-Service decisions exist because no
 running="$(kube -n axond get pods -l app.kubernetes.io/name=axond \
   --field-selector=status.phase=Running -o name | wc -l)"
 [[ "$running" == 3 ]] || fail "expected three Running replicas, got ${running}"
-ok "three replicas Running, none Ready"
+# `Running` and not Ready is also what a crash-looping replica reports, and one
+# that cannot read its schema crash-loops exactly that way — so the container
+# has to be up, not merely scheduled, or this step would pass on a fleet that
+# never served anything.
+serving="$(kube -n axond get pods -l app.kubernetes.io/name=axond \
+  -o jsonpath='{range .items[*]}{.status.containerStatuses[*].state.running.startedAt}{"\n"}{end}' |
+  grep -c . || true)"
+[[ "$serving" == 3 ]] ||
+  fail "only ${serving} of three replicas have a running container; a Pod stuck in \
+CrashLoopBackOff reports Running and not Ready too: $(kube -n axond get pods -o wide 2>&1)"
+# Restarts before the Job completed are expected — the two are applied together
+# — so what has to hold is that they stopped: a replica on a migrated schema
+# refuses inference in place rather than exiting.
+restart_counts() {
+  kube -n axond get pods -l app.kubernetes.io/name=axond \
+    -o jsonpath='{range .items[*]}{.status.containerStatuses[*].restartCount}{","}{end}'
+}
+before="$(restart_counts)"
+sleep 15
+[[ "$(restart_counts)" == "$before" ]] ||
+  fail "a replica restarted while the schema was already current; it is crash-looping \
+rather than serving a refusal: $(kube -n axond get pods 2>&1)"
+ok "three replicas Running with a live container, none Ready, none restarting"
 
 inference_endpoints="$(kube -n axond get endpointslices -l kubernetes.io/service-name=axond \
   -o jsonpath='{range .items[*].endpoints[*]}{.conditions.ready}{"\n"}{end}' | grep -c true || true)"
@@ -374,7 +400,7 @@ grep -qi "Cannot evict pod\|disruption budget\|TooManyRequests" "${workdir}/evic
 $(cat "${workdir}/eviction.log")"
 ok "the default budget refuses the eviction, which is a node drain that never finishes"
 
-printf '\nstateful deploy drill passed: the overlay migrates once before its replicas,\n'
+printf '\nstateful deploy drill passed: the overlay migrates once for the whole fleet,\n'
 printf 'serves /admin/v1 on Pods that refuse inference and never report Ready, upgrades\n'
 printf 'with Recreate where a RollingUpdate stalls, and stays drainable where the\n'
 printf 'default disruption budget would block every eviction.\n'

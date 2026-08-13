@@ -125,8 +125,12 @@ the release you verified:
 ```bash
 ops/pin-image-digest.sh --check          # fails while the sentinel is unresolved
 ops/pin-image-digest.sh --print 0.3.29 # x-release-please-version, prints the digest
-ops/pin-image-digest.sh 0.3.29 # x-release-please-version, rewrites the overlay
+ops/pin-image-digest.sh 0.3.29 # x-release-please-version, rewrites the overlays
 ```
+
+Both production overlays are rewritten and both are checked: the stateful one
+pins its migration Job itself, so a helper blind to it would report a resolved
+fleet while that Job still named an image no node can pull.
 
 Resolution insists on the multi-architecture index, so a digest naming one
 architecture's child image — schedulable onto that architecture alone — is
@@ -222,7 +226,7 @@ fleet become wrong at once. The component answers each:
 The schema is applied once, by the `axond-migrate` Job the component adds, not
 by the replicas: `axond migrate apply` is forward-only and idempotent, but a
 restart that let three replicas migrate concurrently is a database being
-rewritten while its peers read it. The Job runs before the replicas can serve,
+rewritten while its peers read it. The Job
 carries its own default-deny NetworkPolicy (DNS plus Postgres, nothing else),
 and does not wear `app.kubernetes.io/name: axond`, so it is neither a Service
 endpoint nor selected by the gateway's own policies. A Job is immutable once
@@ -235,10 +239,28 @@ kubectl wait --for=condition=complete job/axond-migrate -n axond --timeout=5m
 kubectl logs job/axond-migrate -n axond
 ```
 
+Nothing orders that apply: the Job and the Deployment are created together, and
+a replica that finds an unrecognised schema refuses to boot and exits. So a
+first install crash-loops for as long as the migration takes, then converges on
+kubelet's backoff — self-healing, but indistinguishable at a glance from a
+broken deployment. For an install that does not look like one, migrate against
+an empty fleet:
+
+```bash
+kubectl apply -k deploy/kubernetes/overlays/production-stateful
+kubectl scale deployment/axond -n axond --replicas=0
+kubectl wait --for=condition=complete job/axond-migrate -n axond --timeout=5m
+kubectl scale deployment/axond -n axond --replicas=3
+```
+
+`axond migrate status` — the same binary, read-only — is what tells a
+crash-looping replica apart from one refusing inference: the first reports a
+schema behind the binary, the second reports it current.
+
 The overlay pins its own images, because the production overlay's transformer
-never sees the Job: resolve the sentinel in
-`overlays/production-stateful/kustomization.yaml` the same way, and mind that
-`ops/pin-image-digest.sh` writes the production overlay only. The mounted
+never sees the Job: `ops/pin-image-digest.sh` resolves the sentinel in
+`overlays/production-stateful/kustomization.yaml` alongside the production one,
+and its `--check` refuses either while unresolved. The mounted
 `axond.toml` declares `mode = "stateful"`, the control-plane DSN, the SecretStore
 KEK, and a break-glass principal, and declares no providers, models, aliases, or
 tenants: in this mode the control plane owns them, and a bootstrap that also
