@@ -1021,6 +1021,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "control_plane_0003_tenancy_constraints",
         sql: include_str!("../../../sql/control_plane_0003_tenancy_constraints.sql"),
     },
+    Migration {
+        version: 4,
+        name: "control_plane_0004_journal_ownership",
+        sql: include_str!("../../../sql/control_plane_0004_journal_ownership.sql"),
+    },
 ];
 
 /// The schema version this build requires.
