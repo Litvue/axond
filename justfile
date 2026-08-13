@@ -122,6 +122,14 @@ compat-lock:
 fuzz-smoke:
     cd fuzz && cargo run --no-default-features --locked --bin fuzz-smoke
 
+# Refresh fuzz/Cargo.lock after changing a dependency of the gateway crates. The
+# fuzz workspace locks its own graph, and it reaches `axond` through a path
+# dependency, so a new or bumped gateway dependency leaves it stale and the
+# required `--locked` replay refuses to run. `fetch` records the addition without
+# upgrading anything else.
+fuzz-lock:
+    cd fuzz && cargo fetch
+
 # A bounded coverage-guided run of one target, starting from the committed seeds.
 # Needs a nightly toolchain and cargo-fuzz; the unbounded runs are scheduled in
 # .github/workflows/fuzz.yml.

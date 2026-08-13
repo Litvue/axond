@@ -146,6 +146,17 @@ jobs:
         with:
           workspaces: fuzz
           cache-targets: false
+      # A gateway dependency added or bumped outside a release leaves this
+      # workspace's lock stale, and every `--locked` step below then fails on a
+      # lockfile error that names no remedy. Failing here instead names one.
+      - name: Check that fuzz/Cargo.lock records the gateway graph
+        working-directory: fuzz
+        run: |
+          cargo fetch --locked || {
+            echo "::error file=fuzz/Cargo.lock::fuzz/Cargo.lock does not match the"\
+              "gateway crates' dependencies; run \`just fuzz-lock\` and commit it"
+            exit 1
+          }
       # The root `fmt` and `clippy` lanes cannot reach a separate workspace, so
       # the fuzz code would otherwise be the only Rust here without either gate.
       - name: Format

@@ -75,7 +75,10 @@ root checks skip it; `just fuzz-smoke` runs the required pull-request replay on
 stable, and `just fuzz <target>` runs a bounded coverage-guided run once
 [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) and a nightly toolchain
 are installed. A reproducer belongs in `fuzz/seeds/<target>/` in the same PR as
-the fix.
+the fix. Because that workspace locks its own graph and depends on `axond` by
+path, adding or bumping a dependency of any `crates/` member leaves
+`fuzz/Cargo.lock` stale: run `just fuzz-lock` and commit it, which the `Fuzz
+smoke` lane asks for by name before it replays anything.
 
 Changing anything public in `gateway-core` or `gateway-transport`? Run the
 compatibility gate, which compares the crates against the versions on crates.io

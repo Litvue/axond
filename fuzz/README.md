@@ -34,7 +34,7 @@ sanitizer runtime, and they reach `axond`'s parsers through a seam only
 `--cfg fuzzing` compiles, which no other consumer can switch on. Nothing at the
 repository root builds it, so this project runs its own `cargo fmt --check` and
 `cargo clippy -- -D warnings` in the same CI lane as the smoke.
-[ADR 0036](../docs/adr/0036-fuzzing-the-untrusted-input-parsers.md) records the
+[ADR 0037](../docs/adr/0037-fuzzing-the-untrusted-input-parsers.md) records the
 decision and what it costs.
 
 That flag reaches every dependency rather than just `axond` — Cargo has no
@@ -57,6 +57,19 @@ of tokens minted at replay time. It fails on a panic, on an input slower than it
 budget, or on an allocation past a hard cap enforced by the binary's own global
 allocator. It also fails if the corpus stops reaching a spread of outcome
 classes, so the lane cannot go green by refusing everything at the door.
+
+Every command here runs `--locked`, and this workspace has its own lockfile that
+records the gateway crates through the path dependency on `axond`. So a pull
+request that adds or bumps a dependency of any `crates/` member has to refresh it:
+
+```bash
+just fuzz-lock   # cargo fetch in fuzz/, recording the change and nothing else
+```
+
+The lane checks this first and says so, rather than leaving a bare `--locked`
+error to interpret. Releases are handled for you: `release-please.yml` syncs both
+lockfiles when the workspace version changes, for whichever of the gateway crates
+this lockfile actually records.
 
 ## Coverage-guided runs (nightly toolchain)
 

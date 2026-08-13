@@ -171,8 +171,18 @@ jobs:
             git fetch --force origin "$RELEASE_BRANCH"
             git reset --hard FETCH_HEAD
             cargo update --workspace
-            cargo update --manifest-path fuzz/Cargo.toml \
-              --package axond --package gateway-core --package gateway-transport
+            # Only the workspace crates the fuzz lock actually records: naming one
+            # the fuzz graph has stopped pulling in is an error, which under
+            # `set -euo pipefail` would abort the release's lockfile sync entirely.
+            fuzz_specs=()
+            for crate in axond gateway-core gateway-transport; do
+              if grep -q "^name = \"$crate\"\$" fuzz/Cargo.lock; then
+                fuzz_specs+=(--package "$crate")
+              fi
+            done
+            if [ ${#fuzz_specs[@]} -gt 0 ]; then
+              cargo update --manifest-path fuzz/Cargo.toml "${fuzz_specs[@]}"
+            fi
             if git diff --quiet Cargo.lock fuzz/Cargo.lock; then
               echo "both lockfiles are already in sync with $RELEASE_BRANCH"
               exit 0
