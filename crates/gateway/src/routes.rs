@@ -6977,6 +6977,53 @@ max_ttl = "15m"
         assert_eq!(status, StatusCode::OK);
     }
 
+    /// `main` merges this router with the administrative surface, which nests
+    /// the whole `/admin/v1` prefix and refuses it wholesale in stateless mode.
+    /// The status diagnostic lives under that prefix without being part of that
+    /// surface: it reports on the replica rather than administering durable
+    /// state, so it must survive the merge in either mode while every
+    /// administrative path keeps answering `stateful_mode_required`.
+    #[tokio::test]
+    async fn the_status_diagnostic_survives_the_administrative_merge() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let app = router(state).merge(crate::admin::router::refusing_router());
+        let answer = |path: String| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::get(path)
+                            .header(
+                                axum::http::header::AUTHORIZATION,
+                                format!("Bearer {OPERATOR_KEY}"),
+                            )
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                (status, String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
+
+        let (status, body) = answer("/admin/v1/status".to_owned()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the administrative refusal swallowed the diagnostic: {body}"
+        );
+        assert!(body.contains("\"object\":\"status\""), "{body}");
+
+        let (status, body) = answer(format!("{}/tenants", crate::admin::ADMIN_PREFIX)).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("stateful_mode_required"), "{body}");
+    }
+
     /// A status read is a cache read: the handler returns the last observation
     /// and never probes, so a dependency outage cannot be turned into a status
     /// outage — or into load on a struggling backend — by polling this route.
