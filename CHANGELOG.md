@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.3.28](https://github.com/Litvue/axond/compare/v0.3.27...v0.3.28) (2026-08-13)
+
+
+### Features
+
+* **admin:** serve /admin/v1 and axond admin from the runtime ([#143](https://github.com/Litvue/axond/issues/143)) ([#277](https://github.com/Litvue/axond/issues/277)) ([e23483b](https://github.com/Litvue/axond/commit/e23483b72f7321e11f28cac24370ed0ba508ab30))
+* **catalog:** import models.dev catalogues with an immutable identity ([#207](https://github.com/Litvue/axond/issues/207)) ([d764ca2](https://github.com/Litvue/axond/commit/d764ca2718c9f0ffa32ba482065dfdc0c9c7bf5c))
+* **catalog:** make a refused import visible while the last good one serves ([#264](https://github.com/Litvue/axond/issues/264)) ([e118edf](https://github.com/Litvue/axond/commit/e118edf2fec277e16d1cebd3405dfbea87b72f8e))
+* **catalog:** preserve provider-local aliases in the normalized model projection ([#247](https://github.com/Litvue/axond/issues/247)) ([e1fa070](https://github.com/Litvue/axond/commit/e1fa0704d2a8950a509a31cefea5d6e54cc5e305))
+* **control-plane:** persist tenancy, principals, RBAC, and audit boundaries ([#252](https://github.com/Litvue/axond/issues/252)) ([39c2836](https://github.com/Litvue/axond/commit/39c283662a0882517bc01b4ffe97f9726f169a39))
+* **ops:** production Kubernetes overlay, restore/PITR drill, and a supported-backend window ([#269](https://github.com/Litvue/axond/issues/269)) ([f56ac03](https://github.com/Litvue/axond/commit/f56ac036061ba7e4814efafb00faa07373085d67))
+* **ops:** project authenticated dependency status and ship validated observability assets ([#238](https://github.com/Litvue/axond/issues/238)) ([bd677e4](https://github.com/Litvue/axond/commit/bd677e4b8f647d0d3770d3c0e435ec81504968a0))
+* **ops:** reconcile and adopt an empty control-plane ledger explicitly ([#244](https://github.com/Litvue/axond/issues/244)) ([9402972](https://github.com/Litvue/axond/commit/94029722a74f1e96e81b1ba33b8535ce53917b2a))
+* **pricing:** approve price books explicitly and publish their identity with the snapshot ([#251](https://github.com/Litvue/axond/issues/251)) ([e17e81e](https://github.com/Litvue/axond/commit/e17e81ea69124023109cd3becd2797b63277a399))
+* **secrets:** resolve store material into the provider credential pools ([#295](https://github.com/Litvue/axond/issues/295)) ([89372f1](https://github.com/Litvue/axond/commit/89372f1515eb6c122b279000af1f5bcadc03457c))
+
+
+### Bug Fixes
+
+* **desired-state:** hold model sub-records to their schemas and call a damaged schema marker damage in every body ([#255](https://github.com/Litvue/axond/issues/255)) ([77d2519](https://github.com/Litvue/axond/commit/77d251901776b5fa2c801359fecba512487526c2))
+* **ops:** validate the image index by digest, not by tag ([#292](https://github.com/Litvue/axond/issues/292)) ([8e61491](https://github.com/Litvue/axond/commit/8e6149105e15a760f96f727bd47c2ee386a36573))
+* **secrets:** classify boot schema failures and keep resolved material across reloads ([#279](https://github.com/Litvue/axond/issues/279)) ([c0ccc93](https://github.com/Litvue/axond/commit/c0ccc9368712d3cbc385eb38577393d588325d7f))
+
+
+### Documentation
+
+* **catalog:** name the unit boundary between the two observed prices ([#291](https://github.com/Litvue/axond/issues/291)) ([9824f9f](https://github.com/Litvue/axond/commit/9824f9f9263770c8663640ab01abc2fb71554ee1))
+* **integration:** fold the landed [#160](https://github.com/Litvue/axond/issues/160) foundations into the acceptance matrix ([#289](https://github.com/Litvue/axond/issues/289)) ([ee051da](https://github.com/Litvue/axond/commit/ee051da1e05c01619ec1e507aeb4de81db60668a))
+* **readme:** say a stateful replica boots and refuses inference, not boot ([#294](https://github.com/Litvue/axond/issues/294)) ([fe0fbcd](https://github.com/Litvue/axond/commit/fe0fbcdb520d17d996c2c631d9f7360d2c6299e5))
+* **release:** hold the runbook's quoted note to the one the check emits ([#270](https://github.com/Litvue/axond/issues/270)) ([fd1296e](https://github.com/Litvue/axond/commit/fd1296ec92a3b9e7315ff9b33c84c35ff072f0fd))
+
+
+### Tests
+
+* **qualification:** add multi-replica rollout and rollback harness ([#268](https://github.com/Litvue/axond/issues/268)) ([67ba00a](https://github.com/Litvue/axond/commit/67ba00a9564cd8217d3156bb0cf6217bbf9e0836))
+* **qualification:** check the packet against its own row, and read scenario manifests ([#293](https://github.com/Litvue/axond/issues/293)) ([3447e51](https://github.com/Litvue/axond/commit/3447e51d935f8f1e641505f839b450538c671f5e))
+* **qualification:** commit the production qualification packet and retain capacity evidence ([#278](https://github.com/Litvue/axond/issues/278)) ([73283fb](https://github.com/Litvue/axond/commit/73283fb4e5f8b685963cf566a93c5c89c6021242))
+* **recovery:** drive the control-plane recovery stages against real Postgres ([#219](https://github.com/Litvue/axond/issues/219)) ([#282](https://github.com/Litvue/axond/issues/282)) ([a97f06e](https://github.com/Litvue/axond/commit/a97f06e63bd9b1260e465b03cd0507b2618c1267))
+* **rollout:** probe replica readiness once per interval ([#290](https://github.com/Litvue/axond/issues/290)) ([0ecf236](https://github.com/Litvue/axond/commit/0ecf236f5985e2377151bfbd2762824f8e22aab8))
+* **security:** add a stateful tenant-isolation regression suite ([#263](https://github.com/Litvue/axond/issues/263)) ([fac3abc](https://github.com/Litvue/axond/commit/fac3abcb89d43476ef911ee8ba393bcd684a81eb))
+
 ## [0.3.27](https://github.com/Litvue/axond/compare/v0.3.26...v0.3.27) (2026-08-13)
 
 
