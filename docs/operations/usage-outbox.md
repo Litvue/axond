@@ -163,6 +163,14 @@ detail: a delivery may only be acknowledged once a destination has accepted the
 records, and a queue that accepted a record on the destination's behalf would let
 the outbox forget an event no one has stored.
 
+A claim is also *acknowledged* as one set, in a single statement, rather than a
+transaction per event. That is throughput, not semantics — each event still gets
+its own verdict, a quarantined or already-resolved delivery is still answered
+individually, and a repeated acknowledgement still changes nothing — but a round
+trip per event would cap delivery at a fraction of the rate the request path
+appends at, and a worker that falls permanently behind fills the outbox until
+requests are refused with `usage_not_durable`.
+
 So, per `[[usage_sink]]`:
 
 | Key | In telemetry-grade mode | With the journal enabled |

@@ -693,6 +693,80 @@ impl UsageJournal for PostgresJournal {
         self.verdict(delivery, None).await
     }
 
+    /// One statement for the whole claim, then [`Self::ack`] for whatever it did
+    /// not resolve.
+    ///
+    /// The bulk `UPDATE` deliberately only touches the unambiguous case — a
+    /// delivery this consumer holds that has no verdict yet — because everything
+    /// else (the event pruned underneath the claim, a quarantine, a stray
+    /// acknowledgement) is a distinct answer the contract owes the caller, and
+    /// `verdict` is where those distinctions live. In steady state nothing is
+    /// left over, so a claim of 256 costs one round trip instead of a thousand.
+    async fn ack_all(&self, deliveries: &[DeliveryId]) -> Vec<Result<(), JournalError>> {
+        if deliveries.len() < 2 {
+            let mut verdicts = Vec::with_capacity(deliveries.len());
+            for delivery in deliveries {
+                verdicts.push(self.ack(delivery).await);
+            }
+            return verdicts;
+        }
+        // A claim is one consumer's, so the statement is written for that one
+        // and anything else in the set falls through to the single-event path.
+        let name = deliveries[0].consumer.as_str().to_owned();
+        let keys: Vec<String> = deliveries
+            .iter()
+            .filter(|delivery| delivery.consumer.as_str() == name)
+            .map(|delivery| delivery.event.to_string())
+            .collect();
+        let resolved = self
+            .run("ack_all", Lane::Delivery, {
+                let (name, keys) = (name.clone(), keys.clone());
+                move |client| {
+                    let (name, keys) = (name.clone(), keys.clone());
+                    Box::pin(async move {
+                        // Not gated on the lease or the attempt number, for the
+                        // same reason `verdict` is not: the acknowledgement that
+                        // matters most is the one repeated after a crash.
+                        let rows = client
+                            .query(
+                                "UPDATE axond_usage_outbox_delivery d
+                                 SET acknowledged_at = now(), lease_expires_at = NULL
+                                 FROM axond_usage_outbox e
+                                 WHERE e.position = d.position
+                                   AND d.consumer = $2
+                                   AND e.request_id = ANY($1)
+                                   AND d.attempts > 0
+                                   AND d.acknowledged_at IS NULL
+                                   AND d.quarantined_at IS NULL
+                                 RETURNING e.request_id",
+                                &[&keys, &name],
+                            )
+                            .await?;
+                        Ok(rows
+                            .iter()
+                            .map(|row| row.get::<_, String>(0))
+                            .collect::<HashSet<String>>())
+                    })
+                }
+            })
+            .await;
+        // A failed statement leaves nothing known to be acknowledged, so every
+        // event falls through to the single-event path rather than being
+        // reported as an error the worker would warn about.
+        let resolved: HashSet<String> = resolved.unwrap_or_default();
+        let mut verdicts = Vec::with_capacity(deliveries.len());
+        for delivery in deliveries {
+            let resolved = delivery.consumer.as_str() == name
+                && resolved.contains(&delivery.event.to_string());
+            if resolved {
+                verdicts.push(Ok(()));
+            } else {
+                verdicts.push(self.ack(delivery).await);
+            }
+        }
+        verdicts
+    }
+
     async fn quarantine(
         &self,
         delivery: &DeliveryId,
@@ -2065,6 +2139,66 @@ mod tests {
             matches!(error, JournalError::NotOutstanding { .. }),
             "{error:?}"
         );
+    }
+
+    /// The batched acknowledgement is a round-trip optimisation, not a second
+    /// contract: what it resolves in one statement must be exactly what a
+    /// verdict each would have answered, quarantine and stray delivery included.
+    #[tokio::test]
+    async fn acknowledging_a_claim_in_one_statement_still_answers_for_each_event() {
+        let Some((_, journal)) = outbox("ack_all", capacity(16, CapacityPolicy::Refuse)).await
+        else {
+            return;
+        };
+        let billing = consumer("billing");
+        for subject in ["acme", "globex", "initech", "umbrella"] {
+            journal.append(&event_for(subject)).await.expect("append");
+        }
+        let claimed = journal
+            .claim(
+                &billing,
+                claim_at(8, Duration::from_secs(30), SystemTime::now()),
+            )
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 4, "one event per ordering key");
+        // One of them is poison, and a batched acknowledgement may not quietly
+        // release it; one was never handed out at all.
+        journal
+            .quarantine(&claimed[3].id, PoisonReason::Malformed)
+            .await
+            .expect("quarantine");
+        let stray = DeliveryId {
+            consumer: consumer("audit"),
+            event: claimed[0].event.id(),
+            attempt: 1,
+        };
+
+        let ids: Vec<DeliveryId> = claimed
+            .iter()
+            .map(|delivery| delivery.id.clone())
+            .chain([stray])
+            .collect();
+        let verdicts = journal.ack_all(&ids).await;
+
+        assert!(verdicts[0].is_ok() && verdicts[1].is_ok() && verdicts[2].is_ok());
+        assert!(
+            matches!(verdicts[3], Err(JournalError::Quarantined { .. })),
+            "{:?}",
+            verdicts[3]
+        );
+        assert!(
+            matches!(verdicts[4], Err(JournalError::NotOutstanding { .. })),
+            "{:?}",
+            verdicts[4]
+        );
+        // Repeating it is the recovery path, and says the same thing.
+        let repeated = journal.ack_all(&ids).await;
+        assert!(repeated[0].is_ok() && repeated[1].is_ok() && repeated[2].is_ok());
+        assert!(matches!(repeated[3], Err(JournalError::Quarantined { .. })));
+        let stats = journal.stats(&billing).await.expect("stats");
+        assert_eq!(stats.pending, 0, "{stats:?}");
+        assert_eq!(stats.quarantined, 1, "{stats:?}");
     }
 
     #[tokio::test]

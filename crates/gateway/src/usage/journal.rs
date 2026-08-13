@@ -694,6 +694,25 @@ pub trait UsageJournal: Send + Sync {
     /// ([`JournalError::Quarantined`]).
     async fn ack(&self, delivery: &DeliveryId) -> Result<(), JournalError>;
 
+    /// Acknowledge a whole claim, and answer for each delivery in order.
+    ///
+    /// Exactly [`ack`](Self::ack) per delivery, verdict for verdict — the reason
+    /// it exists is round trips. A claim is written to the destinations in one
+    /// batch, so acknowledging it one event at a time makes delivery throughput a
+    /// multiple of the journal's latency rather than the destination's, and a
+    /// gateway that appends faster than that fills its outbox and starts refusing
+    /// requests. A store that can resolve a set in one statement should.
+    ///
+    /// The default is the loop, so an implementation only overrides this if
+    /// batching actually buys it something.
+    async fn ack_all(&self, deliveries: &[DeliveryId]) -> Vec<Result<(), JournalError>> {
+        let mut verdicts = Vec::with_capacity(deliveries.len());
+        for delivery in deliveries {
+            verdicts.push(self.ack(delivery).await);
+        }
+        verdicts
+    }
+
     /// Set an event aside as poison. It stops being delivered — and stops
     /// blocking its ordering key — and is counted in
     /// [`JournalStats::quarantined`] until an operator deals with it.

@@ -274,6 +274,50 @@ async fn acknowledging_twice_acknowledges_once() {
     assert_eq!(stats.quarantined, 0);
 }
 
+/// Whether a store resolves a claim in one statement or one at a time, the set
+/// of verdicts has to be the same — otherwise a worker's delivered count and
+/// its warnings would depend on the backend.
+#[tokio::test]
+async fn acknowledging_a_claim_at_once_answers_for_each_of_its_events() {
+    let journal = InMemoryUsageJournal::new();
+    let billing = consumer("billing");
+    for subject in ["acme", "globex", "initech"] {
+        journal.append(&event_for(subject)).await.expect("append");
+    }
+    let claimed = journal.claim(&billing, claim(10)).await.expect("claim");
+    assert_eq!(claimed.len(), 3);
+    journal
+        .quarantine(&claimed[2].id, PoisonReason::Malformed)
+        .await
+        .expect("quarantine");
+
+    let ids: Vec<DeliveryId> = claimed
+        .iter()
+        .map(|delivery| delivery.id.clone())
+        .chain([DeliveryId {
+            consumer: billing.clone(),
+            event: next_request_id(),
+            attempt: 1,
+        }])
+        .collect();
+    let verdicts = journal.ack_all(&ids).await;
+
+    assert!(verdicts[0].is_ok() && verdicts[1].is_ok());
+    assert!(
+        matches!(verdicts[2], Err(JournalError::Quarantined { .. })),
+        "an acknowledgement may not release a quarantine, however it is batched: {:?}",
+        verdicts[2]
+    );
+    assert!(
+        verdicts[3].is_ok(),
+        "an event the journal no longer holds has nothing left to redeliver: {:?}",
+        verdicts[3]
+    );
+    let stats = journal.stats(&billing).await.expect("stats");
+    assert_eq!(stats.pending, 0, "{stats:?}");
+    assert_eq!(stats.quarantined, 1, "{stats:?}");
+}
+
 #[tokio::test]
 async fn a_delivery_that_was_never_claimed_cannot_be_acknowledged() {
     let journal = InMemoryUsageJournal::new();

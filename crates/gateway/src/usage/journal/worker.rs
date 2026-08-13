@@ -220,8 +220,12 @@ impl DeliveryWorker {
         };
         let mut next_maintain = Instant::now() + self.settings.maintain_interval;
         let budget = loop {
-            self.pump_until_idle(&mut report, &stop, &mut next_maintain)
-                .await;
+            if let Some(budget) = self
+                .pump_until_idle(&mut report, &mut stop, &mut next_maintain)
+                .await
+            {
+                break budget;
+            }
             // Not once the stop signal is in: housekeeping is three journal
             // operations, each bounded only by the journal's own operation
             // timeout, and starting one here would spend the shutdown bound on
@@ -269,11 +273,16 @@ impl DeliveryWorker {
 
     /// Deliver until there is nothing claimable, a batch fails, the journal is
     /// unreachable, or shutdown asks for its budget — whichever comes first.
+    /// Returns the shutdown budget if the signal arrived here.
     ///
-    /// The stop signal is checked between batches rather than only between
-    /// polls, because a replica with a long backlog and a healthy destination
-    /// would otherwise keep claiming past its shutdown bound and be abandoned
-    /// mid-loop.
+    /// The stop signal races the pass rather than only being checked between
+    /// passes, because the pass itself is a claim, a destination write, and an
+    /// acknowledgement, each carrying the journal's operation timeout: waiting
+    /// for one to finish before the drain deadline even starts is how a replica
+    /// that stopped correctly gets abandoned and its counts reported as unknown.
+    /// Abandoning a pass costs nothing — the lease on an unacknowledged delivery
+    /// expires and the next claim hands it back, and the destinations are
+    /// idempotent on `request_id`.
     ///
     /// Housekeeping is due on its own interval rather than once delivery has
     /// caught up: a replica that never catches up is exactly the one whose
@@ -282,16 +291,27 @@ impl DeliveryWorker {
     async fn pump_until_idle(
         &self,
         report: &mut DrainReport,
-        stop: &watch::Receiver<Option<Duration>>,
+        stop: &mut watch::Receiver<Option<Duration>>,
         next_maintain: &mut Instant,
-    ) {
+    ) -> Option<Duration> {
         loop {
             if stop.has_changed().unwrap_or(true) {
-                return;
+                return None;
             }
             self.maintain_if_due(next_maintain).await;
-            match self.pump(report).await {
-                Ok(0) => return,
+            let delivered = tokio::select! {
+                // Biased so a pass is not started when the signal is already in.
+                biased;
+                changed = stop.changed() => {
+                    // A dropped sender leaves no budget to drain within.
+                    return Some(
+                        changed.ok().and_then(|()| *stop.borrow_and_update()).unwrap_or_default(),
+                    );
+                }
+                delivered = self.pump(report) => delivered,
+            };
+            match delivered {
+                Ok(0) => return None,
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(
@@ -299,7 +319,7 @@ impl DeliveryWorker {
                         error = %error,
                         "usage journal claim failed; retrying after the poll interval"
                     );
-                    return;
+                    return None;
                 }
             }
         }
@@ -396,15 +416,23 @@ impl DeliveryWorker {
             return Ok(0);
         }
 
+        // Acknowledged as one set, because the claim was written as one: a
+        // round trip per event would cap delivery at a fraction of the rate the
+        // request path appends at, and an outbox that fills up refuses requests.
+        let landed: Vec<super::DeliveryId> = outcome
+            .landed
+            .iter()
+            .map(|index| claimed[*index].id.clone())
+            .collect();
         let mut acknowledged = 0;
-        for delivery in outcome.landed.iter().map(|index| &claimed[*index]) {
-            match self.journal.ack(&delivery.id).await {
+        for (delivery, verdict) in landed.iter().zip(self.journal.ack_all(&landed).await) {
+            match verdict {
                 Ok(()) => acknowledged += 1,
                 // The write happened; the acknowledgement did not. A redelivery
                 // is the correct outcome, and the destination's idempotency is
                 // what makes it harmless.
                 Err(error) => tracing::warn!(
-                    delivery = %delivery.id,
+                    delivery = %delivery,
                     error = %error,
                     "usage event was written but not acknowledged; it will be redelivered"
                 ),
@@ -1129,6 +1157,45 @@ mod tests {
         assert!(!report.drained, "{report:?}");
     }
 
+    /// The other half of the bound: the pass that outlasts it was already
+    /// running when stop was sent, so a deadline started afterwards would begin
+    /// counting only once the destination finally answered.
+    #[tokio::test]
+    async fn a_pass_already_in_flight_when_stop_arrives_does_not_spend_the_bound() {
+        let journal = Arc::new(InMemoryUsageJournal::new());
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(Slow(Duration::from_secs(5)))];
+        let handle = DeliveryWorker::new(
+            Arc::clone(&journal) as Arc<dyn UsageJournal>,
+            Arc::new(sinks),
+            settings(Duration::from_secs(30)),
+        )
+        .spawn();
+        for _ in 0..8 {
+            journal
+                .append(&event_for("GW_INBOUND_ACME_KEY"))
+                .await
+                .expect("append");
+        }
+        // Long enough that the worker is inside the destination write, not
+        // waiting on a poll, when the stop signal arrives.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let started = Instant::now();
+        let report = handle.drain(Duration::from_millis(50)).await;
+
+        assert!(
+            report.reported,
+            "a worker that stopped correctly mid-pass was abandoned: {report:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown waited for the in-flight destination write: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(report.undelivered, 8, "{report:?}");
+        assert!(!report.drained, "{report:?}");
+    }
+
     /// Fast enough that a test does not wait on a poll, long enough that the
     /// worker is not spinning while the test appends.
     fn settings(lease: Duration) -> WorkerSettings {
@@ -1614,33 +1681,27 @@ mod tests {
         );
     }
 
-    /// A destination whose write never returns: the worker cannot be stopped by
-    /// any signal while it is inside one, so shutdown has to abandon it.
-    struct NeverReturns;
-
-    #[async_trait]
-    impl UsageSink for NeverReturns {
-        fn name(&self) -> &'static str {
-            "never-returns"
-        }
-
-        async fn record(&self, _record: &UsageRecord) {
-            std::future::pending::<()>().await;
-        }
-
-        async fn record_batch(&self, _batch: &[ObservedRecord]) -> Result<(), SinkFailure> {
-            std::future::pending::<Result<(), SinkFailure>>().await
-        }
-    }
-
+    /// Delivery is abandoned when stop arrives, so what can still wedge a worker
+    /// past its bound is a journal operation outside the delivery pass: a
+    /// housekeeping call that never returns.
     #[tokio::test]
     async fn a_drain_that_had_to_abandon_the_worker_reports_the_backlog_rather_than_zeros() {
-        let journal = Arc::new(InMemoryUsageJournal::new());
-        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(NeverReturns)];
+        let slow = Arc::new(AtomicBool::new(true));
+        let journal = Arc::new(SlowMaintain(
+            InMemoryUsageJournal::new(),
+            Arc::clone(&slow),
+            Duration::from_secs(60),
+        ));
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(Recorder::default())];
         let handle = DeliveryWorker::new(
             Arc::clone(&journal) as Arc<dyn UsageJournal>,
             Arc::new(sinks),
-            settings(Duration::from_secs(30)),
+            WorkerSettings {
+                // Due immediately, so the worker is inside housekeeping rather
+                // than waiting on a poll it could be stopped at.
+                maintain_interval: Duration::ZERO,
+                ..settings(Duration::from_secs(30))
+            },
         )
         .spawn();
         for _ in 0..3 {
@@ -1649,7 +1710,6 @@ mod tests {
                 .await
                 .expect("append");
         }
-        // Long enough that the worker is inside the write it will never leave.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let report = handle.drain(Duration::from_millis(10)).await;
