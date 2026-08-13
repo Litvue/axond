@@ -276,13 +276,34 @@ struct Deployment {
 
 impl Deployment {
     /// Create an isolated schema, open the link, and migrate the journal through
-    /// it. `None` when no database is configured — a recovery stage without a
+    /// it. `None` when there is nothing to qualify — a recovery stage without a
     /// database produces nothing rather than producing evidence about a fake.
+    ///
+    /// A DSN the harness cannot cut faithfully skips for the same reason. The
+    /// rest of the stateful suite accepts shapes this one cannot — libpq
+    /// `key=value`, a multi-host failover list, a Unix socket — and a
+    /// contributor configured that way should get no recovery evidence rather
+    /// than five failures about the harness. Both checks run before anything is
+    /// created, so a skip leaves no schema behind.
     async fn open() -> Option<Self> {
         let operator_dsn = crate::test_services::postgres_dsn()?;
-        let upstream = severable::upstream(&operator_dsn)
-            .await
-            .expect("the configured control-plane DSN names a TCP host the harness can reach");
+        let Some(upstream) = severable::upstream(&operator_dsn).await else {
+            eprintln!(
+                "recovery qualification skipped: the configured DSN does not name one \
+                 reachable TCP host, so there is no single link to cut"
+            );
+            return None;
+        };
+        // Resolved before the schema exists: a DSN the link cannot be spliced
+        // into is a skip, not a half-built deployment.
+        let redirected = severable::redirect(&operator_dsn, 0);
+        if redirected.is_none() {
+            eprintln!(
+                "recovery qualification skipped: the configured DSN is not a `postgres://` URL \
+                 this harness can redirect through a severable link"
+            );
+            return None;
+        }
         let schema = format!(
             "recovery_{}",
             SystemTime::now()
@@ -309,7 +330,7 @@ impl Deployment {
             .await
             .expect("a loopback link to the control-plane database");
         let dsn = severable::redirect(&operator_dsn, link.port())
-            .expect("the configured control-plane DSN can be redirected through the link");
+            .expect("a DSN that redirects at all redirects to the link's port");
 
         let secrets = PostgresSecrets::connect(
             &operator_dsn,
@@ -1165,7 +1186,7 @@ async fn recovery_convergence_journal_recovery() {
         .expect("the link comes back on the same port");
     recorder.mark("restored", "the journal is reachable again on the same DSN");
 
-    let accepted = publish(
+    let accepted = publish_until_accepted(
         &administrator,
         ExpectedRevision::Exactly(head),
         "recovery-after-restore",
@@ -1300,6 +1321,34 @@ async fn direct_administrator(deployment: &Deployment) -> PostgresControlPlane {
     )
     .await
     .expect("the database itself is reachable throughout")
+}
+
+/// Publish through a link that was just restored, retrying while the refusal is
+/// the dead connection the cut left behind.
+///
+/// The administrator here reaches the journal through the severed link, so its
+/// first statement after `restore()` can meet the same dead socket a replica
+/// does — which is why convergence is retried. Retrying only `unavailable`
+/// keeps the assertion honest: a rejected precondition or an invalid revision
+/// still fails immediately, on the first attempt.
+async fn publish_until_accepted(
+    store: &PostgresControlPlane,
+    expected: ExpectedRevision,
+    key: &str,
+    state: DesiredState,
+) -> Result<RevisionManifest, ControlPlaneError> {
+    let mut last = publish(store, expected, key, state.clone()).await;
+    for _ in 0..50 {
+        match last {
+            Ok(manifest) => return Ok(manifest),
+            Err(failure) if BackendFailure::retryable(&failure) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                last = publish(store, expected, key, state.clone()).await;
+            }
+            Err(failure) => return Err(failure),
+        }
+    }
+    last
 }
 
 /// Converge until the replica is serving `head`, or give up loudly.
