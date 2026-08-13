@@ -254,7 +254,7 @@ floor still builds.
 ## Workflow Action pins
 
 The policy behind this section is
-[ADR 0034](../adr/0034-pinned-github-actions.md). The release jobs can reach the
+[ADR 0035](../adr/0035-pinned-github-actions.md). The release jobs can reach the
 release GitHub App token, `CARGO_REGISTRY_TOKEN`, and the keyless signing
 identity, so a third-party Action running there is as privileged as this runbook.
 `owner/action@v3` is a pointer the upstream owner can move, so every `uses:` in

@@ -99,7 +99,7 @@ raising the MSRV follows
 - **Workflow steps are pinned to commit SHAs.** Every `uses:` names a full commit
   SHA with the version in a trailing comment; a tag or branch ref fails the
   `workflow-policy` lane. Dependabot proposes the bumps — see
-  [ADR 0034](./docs/adr/0034-pinned-github-actions.md) and
+  [ADR 0035](./docs/adr/0035-pinned-github-actions.md) and
   [the runbook](./docs/maintainers/releasing.md#workflow-action-pins).
 - **Never commit secrets.** Credentials are referenced by env-var name in
   config; real keys and `axond.toml` are gitignored.
