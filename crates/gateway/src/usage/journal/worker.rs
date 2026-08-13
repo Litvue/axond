@@ -208,7 +208,13 @@ impl DeliveryWorker {
         let budget = loop {
             self.pump_until_idle(&mut report, &stop, &mut next_maintain)
                 .await;
-            self.maintain_if_due(&mut next_maintain).await;
+            // Not once the stop signal is in: housekeeping is three journal
+            // operations, each bounded only by the journal's own operation
+            // timeout, and starting one here would spend the shutdown bound on
+            // work the next process does anyway.
+            if !stop.has_changed().unwrap_or(true) {
+                self.maintain_if_due(&mut next_maintain).await;
+            }
             tokio::select! {
                 changed = stop.changed() => {
                     // A dropped sender is a process that is going away without a
@@ -221,10 +227,17 @@ impl DeliveryWorker {
         };
 
         let deadline = Instant::now() + budget;
-        while Instant::now() < deadline {
-            match self.pump(&mut report).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
+        // Bounded inside the pass rather than only between passes: one pass is
+        // a claim, a destination write, and an acknowledgement per event, each
+        // carrying the journal's operation timeout, so a full batch against a
+        // slow destination can outlast the whole budget on its own. Cutting one
+        // off costs nothing — an unacknowledged delivery's lease expires and
+        // the next process claims it again — whereas overrunning the budget
+        // gets the worker abandoned and its counts reported as unknown.
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match tokio::time::timeout(remaining, self.pump(&mut report)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(_)) => {}
             }
         }
         // Bounded separately from the delivery budget, and by less than the
@@ -680,7 +693,7 @@ impl WorkerHandle {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
 
@@ -879,6 +892,177 @@ mod tests {
             !report.counted,
             "the backlog read did not finish, so it is unknown rather than zero: {report:?}"
         );
+    }
+
+    /// A journal whose housekeeping pass takes as long as a journal operation
+    /// timeout allows, from the moment the test says so.
+    struct SlowMaintain(InMemoryUsageJournal, Arc<AtomicBool>, Duration);
+
+    #[async_trait]
+    impl UsageJournal for SlowMaintain {
+        fn name(&self) -> &'static str {
+            "slow-maintain"
+        }
+
+        fn capacity(&self) -> Capacity {
+            self.0.capacity()
+        }
+
+        fn mode(&self) -> super::super::DeliveryMode {
+            self.0.mode()
+        }
+
+        async fn append(&self, event: &UsageEvent) -> Result<Appended, JournalError> {
+            self.0.append(event).await
+        }
+
+        async fn claim(
+            &self,
+            consumer: &ConsumerId,
+            claim: Claim,
+        ) -> Result<Vec<Delivery>, JournalError> {
+            self.0.claim(consumer, claim).await
+        }
+
+        async fn ack(&self, delivery: &DeliveryId) -> Result<(), JournalError> {
+            self.0.ack(delivery).await
+        }
+
+        async fn quarantine(
+            &self,
+            delivery: &DeliveryId,
+            reason: PoisonReason,
+        ) -> Result<(), JournalError> {
+            self.0.quarantine(delivery, reason).await
+        }
+
+        async fn relinquish(&self, delivery: &DeliveryId) -> Result<(), JournalError> {
+            self.0.relinquish(delivery).await
+        }
+
+        async fn stats(&self, consumer: &ConsumerId) -> Result<JournalStats, JournalError> {
+            self.0.stats(consumer).await
+        }
+
+        async fn maintain(&self, now: SystemTime) -> Result<u64, JournalError> {
+            if self.1.load(Ordering::SeqCst) {
+                tokio::time::sleep(self.2).await;
+            }
+            self.0.maintain(now).await
+        }
+    }
+
+    /// A destination that says when it has started writing, so a test can stop
+    /// a worker that is provably mid-pass rather than idle.
+    struct Announcing(watch::Sender<bool>, Duration);
+
+    #[async_trait]
+    impl UsageSink for Announcing {
+        fn name(&self) -> &'static str {
+            "announcing"
+        }
+
+        async fn record(&self, _record: &UsageRecord) {
+            let _ = self.0.send(true);
+            tokio::time::sleep(self.1).await;
+        }
+
+        async fn record_batch(&self, _batch: &[ObservedRecord]) -> Result<(), SinkFailure> {
+            let _ = self.0.send(true);
+            tokio::time::sleep(self.1).await;
+            Ok(())
+        }
+    }
+
+    /// Housekeeping is not started once shutdown has been asked for: it is
+    /// nobody's dependency, the next process does it anyway, and a pass begun
+    /// here would spend the whole shutdown bound and have the worker abandoned.
+    #[tokio::test]
+    async fn housekeeping_due_at_shutdown_does_not_cost_the_worker_its_report() {
+        let slow = Arc::new(AtomicBool::new(false));
+        let journal = Arc::new(SlowMaintain(
+            InMemoryUsageJournal::new(),
+            Arc::clone(&slow),
+            Duration::from_secs(5),
+        ));
+        let (writing, mut written) = watch::channel(false);
+        let sinks: Vec<Box<dyn UsageSink>> =
+            vec![Box::new(Announcing(writing, Duration::from_millis(100)))];
+        let handle = DeliveryWorker::new(
+            Arc::clone(&journal) as Arc<dyn UsageJournal>,
+            Arc::new(sinks),
+            WorkerSettings {
+                // Always due, so shutdown lands on a tick rather than by luck.
+                maintain_interval: Duration::ZERO,
+                ..settings(Duration::from_secs(30))
+            },
+        )
+        .spawn();
+        journal
+            .append(&event_for("GW_INBOUND_ACME_KEY"))
+            .await
+            .expect("append");
+        // Stopped while the worker is inside a write: the pass it could run
+        // slowly is then unambiguously one begun after the stop signal.
+        written.changed().await.expect("the worker started writing");
+        slow.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        let report = handle.drain(Duration::from_millis(50)).await;
+
+        assert!(
+            report.reported,
+            "the worker was abandoned inside a housekeeping pass it should not have started: \
+             {report:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown waited on housekeeping: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// One delivery pass can outlast the whole shutdown bound on its own, so
+    /// the bound is enforced inside the pass: the events it drops are still
+    /// claimed, leased, and redelivered by the next process.
+    #[tokio::test]
+    async fn a_single_slow_delivery_pass_cannot_overrun_the_shutdown_bound() {
+        let journal = Arc::new(InMemoryUsageJournal::new());
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(Slow(Duration::from_secs(5)))];
+        let handle = DeliveryWorker::new(
+            Arc::clone(&journal) as Arc<dyn UsageJournal>,
+            Arc::new(sinks),
+            WorkerSettings {
+                // Nothing is claimable until the appends below, so the pass that
+                // matters is the one the drain phase starts.
+                poll_interval: Duration::from_secs(30),
+                ..settings(Duration::from_secs(30))
+            },
+        )
+        .spawn();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        for _ in 0..8 {
+            journal
+                .append(&event_for("GW_INBOUND_ACME_KEY"))
+                .await
+                .expect("append");
+        }
+
+        let started = Instant::now();
+        let report = handle.drain(Duration::from_millis(50)).await;
+
+        assert!(
+            report.reported,
+            "a pass slower than the bound left the worker abandoned: {report:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown waited on the destination: {:?}",
+            started.elapsed()
+        );
+        // Cut off, not lost: the events are still in the outbox for the next
+        // process to claim.
+        assert_eq!(report.undelivered, 8, "{report:?}");
+        assert!(!report.drained, "{report:?}");
     }
 
     /// Fast enough that a test does not wait on a poll, long enough that the
