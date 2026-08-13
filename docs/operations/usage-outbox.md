@@ -136,7 +136,12 @@ reads the outbox's position span on every append, which every replica's appends
 move, and subtracts the positions it knows are vacant. Only deletions — retention,
 reclamation, drop-oldest — are cached, for at most a second, and a stale one makes
 a replica read the outbox as *fuller* than it is. So the limit can refuse an
-append a second early after another replica prunes; it cannot be overshot.
+append a second early after another replica prunes; it cannot be overshot. A
+deletion that removes the outbox's *lowest* row — deleting a quarantined event by
+hand, below — is the one case where a cached vacancy count would read the other
+way, because the span collapses past holes that are still counted; a span smaller
+than the one those holes were counted against is therefore discarded rather than
+reused, and that append counts.
 
 An append pays two index probes for that span and, below the limit, nothing else:
 the span can only overstate how many rows it covers, so a span under `max_events`

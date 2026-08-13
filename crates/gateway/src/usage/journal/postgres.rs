@@ -1503,8 +1503,9 @@ struct GateState {
 /// What a bounded count established about the span it was taken against.
 #[derive(Clone, Copy)]
 enum Measured {
-    /// Positions inside the span holding no row.
-    Gaps(u64),
+    /// Positions inside `span` holding no row. The span is kept with them
+    /// because a gap count only describes the span it was taken against.
+    Gaps { gaps: u64, span: u64 },
     /// The count stopped at its bound, so the outbox is over the limit and how
     /// far over is not worth knowing.
     Over,
@@ -1526,13 +1527,24 @@ impl CapacityGate {
     /// this process invalidates on its own, and another replica's deletion leaves
     /// the gaps understated for at most a window, which reads *fuller* than the
     /// outbox is. That is the safe direction for a limit whose job is to refuse.
+    ///
+    /// With one exception, which is why the span is remembered: a deletion that
+    /// removes the *lowest* row collapses the span past a gap that is still
+    /// counted, and `span - gaps` would then read *emptier* than the outbox is —
+    /// far enough, if a hand-deleted quarantined event sat below a large hole,
+    /// to admit past `max_events`. A span smaller than the one the gaps were
+    /// taken against is therefore no estimate at all, and the caller counts.
     fn estimate(&self, span: u64, max_events: u64) -> Option<u64> {
         let state = self.state.lock().expect("capacity gate");
         if state.at?.elapsed() >= COUNT_REFRESH {
             return None;
         }
         Some(match state.measured? {
-            Measured::Gaps(gaps) => span.saturating_sub(gaps),
+            Measured::Gaps {
+                gaps,
+                span: measured,
+            } if span >= measured => span.saturating_sub(gaps),
+            Measured::Gaps { .. } => return None,
             Measured::Over => max_events.saturating_add(1),
         })
     }
@@ -1542,7 +1554,10 @@ impl CapacityGate {
         let measured = if counted > max_events {
             Measured::Over
         } else {
-            Measured::Gaps(span.saturating_sub(counted))
+            Measured::Gaps {
+                gaps: span.saturating_sub(counted),
+                span,
+            }
         };
         let mut state = self.state.lock().expect("capacity gate");
         state.measured = Some(measured);
@@ -2286,6 +2301,35 @@ mod tests {
         assert!(
             !gate.refusing(),
             "a deletion made room, so the next append has to look again"
+        );
+    }
+
+    /// A gap count describes the span it was taken against and nothing else. If
+    /// the lowest row is deleted — the documented way an operator disposes of a
+    /// quarantined event — the span collapses past gaps that are still counted,
+    /// and reusing them would read the outbox as emptier than it is and admit
+    /// past `max_events`.
+    #[test]
+    fn a_gap_count_is_not_reused_against_a_span_that_has_since_collapsed() {
+        let gate = CapacityGate::new();
+        // 900 rows in a 1,000-wide span: one ancient row at the bottom, a
+        // reclaimed hole above it, and the recent block at the limit.
+        gate.measured(1_000, 900, 1_000);
+        assert_eq!(
+            gate.estimate(1_000, 1_000),
+            Some(900),
+            "the span it was measured against is exactly what it describes"
+        );
+        assert_eq!(
+            gate.estimate(1_100, 1_000),
+            Some(1_000),
+            "appends extend the span, and every one of them stored a row"
+        );
+        assert_eq!(
+            gate.estimate(899, 1_000),
+            None,
+            "the span collapsed below the measurement, so the gaps say nothing \
+             and the append has to count"
         );
     }
 
