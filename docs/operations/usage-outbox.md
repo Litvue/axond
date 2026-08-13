@@ -11,7 +11,7 @@ This page is the operator's view of the other mode. With
 a durable outbox **before the request is answered**, and a delivery worker
 replays it into the configured sinks until they acknowledge it. Nothing here is
 constructed unless you turn it on; the rationale and its boundaries are
-[ADR 0046](../adr/0046-billing-grade-usage-outbox.md).
+[ADR 0047](../adr/0047-billing-grade-usage-outbox.md).
 
 ## The two modes
 
@@ -92,9 +92,13 @@ Order matters: the schema exists before the writer runs.
 
 The outbox connects **at boot** and checks that its tables are readable, so a bad
 DSN, a missing schema, or a role without the right grants refuses to start rather
-than failing every request later. `kind = "otlp"` is rejected as a billing-grade
+than failing every request later. `kind = "otlp"` is not a billing-grade
 destination: the OTel SDK's batch processor acknowledges nothing, so the worker
-would have no answer to acknowledge on.
+would have no answer to acknowledge on. Declare it beside a storing sink and it
+keeps exporting anyway — the worker hands it the events a destination that
+answers has already accepted, so the export is exactly as best-effort as it was
+in telemetry-grade mode and its failures never hold an event in the outbox. A
+journal whose destinations are *all* `otlp` refuses to boot.
 
 A journal whose only destination is `kind = "stdout"` boots with a warning. It is
 allowed — it is how the mode is tried out, and a log pipeline that collects the

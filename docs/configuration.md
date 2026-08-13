@@ -728,14 +728,23 @@ With `backend = "postgres"`, every settled usage event is appended to a durable
 outbox **before the request is answered**, and a bounded delivery worker replays
 it into the configured `[[usage_sink]]`s until they acknowledge it — at-least-once,
 replayed after a restart, deduplicated by the consumer on `request_id`
-([ADR 0046](./adr/0046-billing-grade-usage-outbox.md)). The operator guide is
+([ADR 0047](./adr/0047-billing-grade-usage-outbox.md)). The operator guide is
 [`docs/operations/usage-outbox.md`](./operations/usage-outbox.md); read it before
 enabling this, because it adds a failure mode to the request path.
 
 In billing-grade mode the sinks are written through synchronously by the worker
 instead of buffering, since the worker acknowledges on their answer. At least one
-sink is therefore required, and `kind = "otlp"` is rejected: the OTel batch
-processor confirms nothing, so there would be no answer to acknowledge on.
+sink is therefore required.
+
+`kind = "otlp"` is not one the worker can acknowledge on — the OTel batch
+processor confirms nothing, so an acknowledgement taken from it would forget an
+event no collector ever received. It is not rejected either, because exporting
+usage telemetry and storing it durably are things one deployment reasonably does
+at once. An OTLP sink declared beside a storing one keeps exporting: the worker
+writes it after a destination that *can* answer has accepted the events, once per
+delivery pass, and a failed export is logged rather than retried, since the event
+is already delivered. What is refused is a journal whose destinations are *all*
+OTLP, because then an acknowledgement rests on nothing.
 
 That moves buffering out of the sink and into the outbox, so a sink's
 `buffer_capacity`, `max_batch`, and `flush_interval_ms` stop applying —

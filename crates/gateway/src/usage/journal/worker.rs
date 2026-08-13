@@ -171,6 +171,11 @@ pub struct DeliveryWorker {
     /// batching sink would make the acknowledgement a lie, because it returns
     /// before the row exists.
     sinks: Arc<Vec<Box<dyn UsageSink>>>,
+    /// Destinations that are written but never acknowledged on, because they
+    /// cannot report a failed write. Telemetry riding along with the durable
+    /// path: an event is delivered to them only once a destination that *can*
+    /// answer has accepted it, and their refusal changes nothing.
+    advisory: Arc<Vec<Box<dyn UsageSink>>>,
     settings: WorkerSettings,
 }
 
@@ -183,8 +188,17 @@ impl DeliveryWorker {
         Self {
             journal,
             sinks,
+            advisory: Arc::new(Vec::new()),
             settings,
         }
+    }
+
+    /// Add the destinations delivery does not answer to. Kept apart from the
+    /// acknowledged set rather than refused at boot, so a deployment can export
+    /// usage telemetry and store it durably at the same time.
+    pub fn also_telling(mut self, advisory: Arc<Vec<Box<dyn UsageSink>>>) -> Self {
+        self.advisory = advisory;
+        self
     }
 
     /// Start delivering, and hand back the handle shutdown drains through.
@@ -442,6 +456,14 @@ impl DeliveryWorker {
     /// same duplicate the lease already produces and the same idempotency on
     /// `request_id` absorbs it.
     async fn deliver(&self, claimed: &[Delivery]) -> Delivered {
+        let outcome = self.deliver_durably(claimed).await;
+        self.tell_advisory(claimed, &outcome.landed).await;
+        outcome
+    }
+
+    /// The part of delivery an acknowledgement rests on: the destinations that
+    /// answer for a write, and the bisection that attributes a refusal.
+    async fn deliver_durably(&self, claimed: &[Delivery]) -> Delivered {
         let mut outcome = Delivered::default();
         if self.write(claimed).await {
             outcome.landed.extend(0..claimed.len());
@@ -487,6 +509,35 @@ impl DeliveryWorker {
         }
         outcome.refused = orphans;
         outcome
+    }
+
+    /// Hand the events that landed to the destinations that cannot answer for
+    /// them. Best effort by definition: nothing here can hold up an
+    /// acknowledgement, spend an attempt, or condemn an event, because a sink
+    /// that confirms nothing has no verdict to give. Written once per pass, off
+    /// the events a durable destination accepted, so the bisection above cannot
+    /// export the same event twice.
+    async fn tell_advisory(&self, claimed: &[Delivery], landed: &[usize]) {
+        if self.advisory.is_empty() || landed.is_empty() {
+            return;
+        }
+        let batch: Vec<ObservedRecord> = landed
+            .iter()
+            .map(|&index| claimed[index].event.observed())
+            .collect();
+        for sink in self.advisory.iter() {
+            match sink.record_batch(&batch).await {
+                Ok(()) => {
+                    crate::telemetry::metrics::record_usage_written(sink.name(), batch.len() as u64)
+                }
+                Err(error) => tracing::warn!(
+                    sink = sink.name(),
+                    records = batch.len(),
+                    error = %error,
+                    "usage telemetry export failed; the events are delivered and stay delivered"
+                ),
+            }
+        }
     }
 
     /// Write the batch to every destination. All-or-nothing per destination: a
@@ -715,11 +766,18 @@ mod tests {
         /// appears in a batch, accepting everything else: the bad rows the
         /// poison budget is for.
         poison: Vec<String>,
+        /// Every batch it was handed, refused ones included, so a test can see
+        /// what a destination was told rather than only what it kept.
+        seen: Mutex<Vec<Vec<String>>>,
     }
 
     impl Recorder {
         fn written(&self) -> Vec<String> {
             self.written.lock().expect("not poisoned").clone()
+        }
+
+        fn batches(&self) -> Vec<Vec<String>> {
+            self.seen.lock().expect("not poisoned").clone()
         }
     }
 
@@ -737,6 +795,12 @@ mod tests {
         }
 
         async fn record_batch(&self, batch: &[ObservedRecord]) -> Result<(), SinkFailure> {
+            self.seen.lock().expect("not poisoned").push(
+                batch
+                    .iter()
+                    .map(|observed| observed.record.request_id.clone())
+                    .collect(),
+            );
             if self.refuse {
                 return Err(SinkFailure::new("the destination is refusing writes"));
             }
@@ -1257,6 +1321,67 @@ mod tests {
         let report = handle.drain(Duration::from_millis(50)).await;
         assert_eq!(report.quarantined, 1, "{report:?}");
         assert_eq!(report.undelivered, 0, "{report:?}");
+    }
+
+    /// A telemetry export declared beside a storing destination is written, but
+    /// it answers for nothing: it sees only what the acknowledged destination
+    /// accepted, its refusal cannot hold an event in the outbox, and the
+    /// refused event stays out of the export.
+    #[tokio::test]
+    async fn a_destination_that_cannot_answer_is_told_but_never_acknowledged_on() {
+        let journal = Arc::new(InMemoryUsageJournal::with_capacity(Capacity {
+            max_events: 8,
+            max_delivery_attempts: 1,
+            retain_acknowledged: Duration::from_secs(60),
+            policy: CapacityPolicy::Refuse,
+        }));
+        let poison = event_for("poison");
+        let storing = Arc::new(Recorder {
+            poison: vec![poison.record().request_id.clone()],
+            ..Recorder::default()
+        });
+        let exported = Arc::new(Recorder {
+            refuse: true,
+            ..Recorder::default()
+        });
+        let acknowledged: Vec<Box<dyn UsageSink>> =
+            vec![Box::new(SharedSink(Arc::clone(&storing)))];
+        let advisory: Vec<Box<dyn UsageSink>> = vec![Box::new(SharedSink(Arc::clone(&exported)))];
+        let handle = DeliveryWorker::new(
+            Arc::clone(&journal) as Arc<dyn UsageJournal>,
+            Arc::new(acknowledged),
+            settings(Duration::from_millis(5)),
+        )
+        .also_telling(Arc::new(advisory))
+        .spawn();
+        journal.append(&poison).await.expect("append");
+        for subject in ["one", "two", "three"] {
+            journal.append(&event_for(subject)).await.expect("append");
+        }
+
+        eventually(&storing, "the healthy events", |written| written.len() == 3).await;
+        let report = handle.drain(Duration::from_millis(200)).await;
+
+        // The export refused every batch it saw, and delivery went on regardless.
+        assert_eq!(report.delivered, 3, "{report:?}");
+        assert_eq!(report.quarantined, 1, "{report:?}");
+        assert_eq!(report.undelivered, 0, "{report:?}");
+        assert!(
+            !exported
+                .batches()
+                .iter()
+                .any(|batch| batch.contains(&poison.record().request_id)),
+            "an event no destination stored was exported: {:?}",
+            exported.batches()
+        );
+        // Told once per pass, off what landed, rather than once per probe the
+        // bisection made.
+        for batch in exported.batches() {
+            assert!(
+                batch.len() <= 3 && !batch.is_empty(),
+                "the export saw a bisection probe rather than the delivered set: {batch:?}"
+            );
+        }
     }
 
     #[tokio::test]

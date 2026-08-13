@@ -97,7 +97,7 @@ pub struct Config {
     pub usage_sink: Vec<UsageSinkConfig>,
     /// Durable, replayed usage delivery. Defaults to `backend = "none"`: the
     /// telemetry-grade path stays exactly as it is and no datastore joins the
-    /// default deployment (ADR 0002, ADR 0046).
+    /// default deployment (ADR 0002, ADR 0047).
     #[serde(default)]
     pub usage_journal: UsageJournalConfig,
     /// Spend cap enforcement. Defaults to no budget at all, so nothing drags a
@@ -1186,7 +1186,7 @@ impl UsageSinkConfig {
 const DEFAULT_USAGE_TABLE: &str = "axond_usage";
 
 /// Billing-grade usage delivery: durable append before the request is answered,
-/// replayed until the destinations acknowledge it (ADR 0046).
+/// replayed until the destinations acknowledge it (ADR 0047).
 ///
 /// Off by default, and off in every configuration written so far, because the
 /// guarantee costs a datastore on the request path. Turning it on is the operator
@@ -3128,20 +3128,23 @@ impl Config {
                     .into(),
             ));
         }
-        if let Some(sink) = self
+        // An OTLP sink is not refused, because a deployment that exports usage
+        // telemetry has every reason to store it durably too. It is carried
+        // alongside the acknowledged destinations instead: the OTel SDK's batch
+        // processor owns the write and never says whether it landed, so
+        // acknowledging on its behalf would forget events while reporting
+        // success. What is refused is a journal where *every* destination is
+        // like that, since then an acknowledgement rests on nothing.
+        if self
             .usage_sink
             .iter()
-            .find(|sink| sink.kind == UsageSinkKind::Otlp)
+            .all(|sink| sink.kind == UsageSinkKind::Otlp)
         {
-            // The OTel SDK's batch processor owns the write and does not tell us
-            // whether it landed, so acknowledging on its behalf would drop
-            // events while reporting success.
-            return Err(ConfigError::Invalid(format!(
-                "usage_journal `postgres`: a `{}` sink cannot be a billing-grade destination, \
-                 because it cannot report a failed write. Export usage telemetry from a \
-                 deployment without a journal, or use a sink that acknowledges",
-                sink.kind.as_str()
-            )));
+            return Err(ConfigError::Invalid(
+                "usage_journal `postgres`: an `otlp` sink cannot answer for a write, so at least \
+                 one other `[[usage_sink]]` must be configured for the worker to acknowledge on"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -3917,6 +3920,32 @@ dsn_env = "AXOND_BUDGET_REDIS_URL"
         ))
         .expect("a journal with default connections validates");
         assert_eq!(config.usage_journal.connections, 8);
+    }
+
+    /// Exporting usage over OTLP is an ordinary thing to be doing when billing
+    /// grade is switched on, and it is the sink list as a whole that the journal
+    /// would otherwise refuse — so the export is kept and simply not
+    /// acknowledged on. Only a journal with nothing but OTLP is refused, because
+    /// then there is nothing an acknowledgement could rest on.
+    #[test]
+    fn an_otlp_sink_beside_a_storing_one_does_not_cost_the_journal_its_boot() {
+        let journal = "[usage_journal]\nbackend = \"postgres\"\ndsn_env = \"OUTBOX_DSN\"\n";
+        let config = Config::from_toml_str(&format!(
+            "{VALID}\n[[usage_sink]]\nkind = \"postgres\"\ndsn_env = \"USAGE_DSN\"\n\
+             [[usage_sink]]\nkind = \"otlp\"\n{journal}"
+        ))
+        .expect("a journal may export telemetry beside a destination that stores the row");
+        assert_eq!(config.usage_sink.len(), 2);
+
+        let error = Config::from_toml_str(&format!(
+            "{VALID}\n[[usage_sink]]\nkind = \"otlp\"\n{journal}"
+        ))
+        .expect_err("a journal whose every destination confirms nothing cannot acknowledge");
+        assert!(
+            matches!(error, ConfigError::Invalid(ref message)
+                if message.contains("cannot answer for a write")),
+            "{error:?}"
+        );
     }
 
     #[test]

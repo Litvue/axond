@@ -645,11 +645,26 @@ pub async fn build_runtime(
              `capacity_policy = \"refuse\"` is the billing-grade setting"
         );
     }
+    // Split before anything is built: an `otlp` sink is a destination the
+    // worker tells, not one it acknowledges on, so it takes no part in the
+    // durable contract and none of the checks that contract implies.
+    let (advisory, durable): (Vec<UsageSinkConfig>, Vec<UsageSinkConfig>) = sinks
+        .iter()
+        .cloned()
+        .partition(|sink| sink.kind == UsageSinkKind::Otlp);
+    if !advisory.is_empty() {
+        tracing::info!(
+            journal = store.name(),
+            sinks = advisory.len(),
+            "usage telemetry sinks are exported alongside billing-grade delivery but are not \
+             acknowledged on, because they cannot report a failed write"
+        );
+    }
     // Not refused, because a `stdout` destination is how the mode is tried out
     // and how a shipping pipeline can legitimately collect it. It is warned
     // about because an acknowledgement is only worth what the destination is:
     // once every destination has acknowledged an event, retention forgets it.
-    if sinks.iter().all(|sink| sink.kind == UsageSinkKind::Stdout) {
+    if durable.iter().all(|sink| sink.kind == UsageSinkKind::Stdout) {
         tracing::warn!(
             journal = store.name(),
             retain_acknowledged_seconds = capacity.retain_acknowledged.as_secs(),
@@ -662,7 +677,7 @@ pub async fn build_runtime(
         .map_err(|error| UsageSinkError::invalid("journal", error.to_string()))?;
     // Write-through, because the worker acknowledges on what the sink returns: a
     // batching sink would have it acknowledge a row that does not exist yet.
-    let owned = journal_owned_batch_keys(sinks);
+    let owned = journal_owned_batch_keys(&durable);
     if !owned.is_empty() {
         tracing::warn!(
             journal = store.name(),
@@ -674,10 +689,15 @@ pub async fn build_runtime(
              replace them"
         );
     }
-    let sinks = build_sinks(sinks, env, Buffering::WriteThrough).await?;
+    let acknowledged = build_sinks(&durable, env, Buffering::WriteThrough).await?;
+    let exported = if advisory.is_empty() {
+        Vec::new()
+    } else {
+        build_sinks(&advisory, env, Buffering::WriteThrough).await?
+    };
     let worker = DeliveryWorker::new(
         Arc::clone(&store),
-        Arc::new(sinks),
+        Arc::new(acknowledged),
         WorkerSettings {
             consumer,
             claim_batch: journal.claim_batch,
@@ -686,6 +706,7 @@ pub async fn build_runtime(
             maintain_interval: Duration::from_secs(60),
         },
     )
+    .also_telling(Arc::new(exported))
     .spawn();
     Ok(UsageRuntime {
         delivery: Arc::new(UsageDelivery::billing(store, journal.on_undurable)),
