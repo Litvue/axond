@@ -37,6 +37,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, Config, Row, Transaction};
 
 use super::envelope::{DeploymentKek, EnvelopeError, SealedSecret};
@@ -667,18 +668,21 @@ fn unavailable_message(message: impl Into<String>) -> SecretError {
 
 /// A boot-time failure while doing `operation`, split by who has to act.
 ///
-/// A `SQLSTATE` means the server understood the statement and refused it: a
-/// missing table, a missing grant, a read-only transaction. Those are
-/// [`SecretError::Denied`] and carry `remedy`, because retrying them forever
-/// changes nothing. An error without one never reached a server — a dropped
-/// connection, a TLS failure — so it is [`SecretError::Unavailable`] and the
-/// operator's answer is to wait.
+/// A `SQLSTATE` the operator has to answer — a missing table, a missing grant, a
+/// read-only transaction — is [`SecretError::Denied`] and carries `remedy`,
+/// because retrying it forever changes nothing. Everything else is
+/// [`SecretError::Unavailable`]: an error with no `SQLSTATE` never reached a
+/// server, and a server *can* answer with a transient code (it is starting up,
+/// out of connections, deadlocked, or racing a sibling replica's
+/// `CREATE TABLE IF NOT EXISTS`), which the next attempt clears. Misclassifying
+/// those as `Denied` would stop a replica that was about to succeed and hand the
+/// operator a remedy for a problem it does not have.
 fn boot_failure(
     operation: &str,
     error: &tokio_postgres::Error,
     remedy: impl FnOnce() -> String,
 ) -> SecretError {
-    match error.code() {
+    match error.code().filter(|code| operator_must_act(code)) {
         Some(code) => denied(format!(
             "could not {operation} ({}: {error}). {}",
             code.code(),
@@ -686,6 +690,20 @@ fn boot_failure(
         )),
         None => unavailable(operation, error),
     }
+}
+
+/// Whether a `SQLSTATE` names a condition only the operator can clear.
+///
+/// Class `42` (access rule violated, undefined object), `3F` (invalid schema
+/// name) and `25006` (read-only transaction) describe a deployment that is
+/// configured wrong: the role lacks a grant, the schema is absent, the endpoint
+/// is a replica. No amount of waiting fixes any of them. Every other class —
+/// notably `08` connection, `53` insufficient resources, `57` operator
+/// intervention, `40` rollback, `55` object in use, and the `23505` two
+/// concurrently booting replicas race on — clears on its own.
+fn operator_must_act(code: &SqlState) -> bool {
+    matches!(code.code().get(..2), Some("42" | "3F"))
+        || *code == SqlState::READ_ONLY_SQL_TRANSACTION
 }
 
 /// A Postgres failure while doing `operation`.
@@ -714,6 +732,41 @@ mod tests {
     use crate::test_services::postgres_dsn;
 
     const PLAINTEXT: &str = "sk-live-do-not-log";
+
+    #[test]
+    fn only_the_sqlstates_an_operator_can_clear_refuse_a_boot() {
+        for permanent in [
+            SqlState::INSUFFICIENT_PRIVILEGE,
+            SqlState::UNDEFINED_TABLE,
+            SqlState::INVALID_SCHEMA_NAME,
+            SqlState::READ_ONLY_SQL_TRANSACTION,
+        ] {
+            assert!(
+                operator_must_act(&permanent),
+                "{} needs an operator",
+                permanent.code()
+            );
+        }
+        // A booting, saturated, contended, or restarting server answers with a
+        // code too, and the next attempt clears every one of these — including
+        // the unique violation two replicas racing `CREATE TABLE IF NOT EXISTS`
+        // collide on.
+        for transient in [
+            SqlState::CANNOT_CONNECT_NOW,
+            SqlState::TOO_MANY_CONNECTIONS,
+            SqlState::ADMIN_SHUTDOWN,
+            SqlState::T_R_DEADLOCK_DETECTED,
+            SqlState::LOCK_NOT_AVAILABLE,
+            SqlState::UNIQUE_VIOLATION,
+            SqlState::CONNECTION_FAILURE,
+        ] {
+            assert!(
+                !operator_must_act(&transient),
+                "{} is worth retrying",
+                transient.code()
+            );
+        }
+    }
 
     fn kek(seed: u8) -> DeploymentKek {
         DeploymentKek::parse(
