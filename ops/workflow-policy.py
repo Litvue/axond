@@ -130,32 +130,61 @@ def command_block(lines: list[str], index: int) -> str:
     return "\n".join(lines[index : end + 1])
 
 
+def unquote(word: str) -> str:
+    """A shell word without the quoting that does not change what it names."""
+    return word.strip().strip("\"'")
+
+
+def minted_public_keys(text: str) -> set[str]:
+    """The public keys this file generates, as the words that would refer to them.
+
+    A pair minted here is a signer this file named itself; a key handed in from
+    outside is not, so the two are told apart by what the `--key` word is rather
+    than by whether the file mints a pair somewhere. Both the generated path and
+    any variable holding it count, because the script that mints a pair reads it
+    back through a variable.
+    """
+    keys = {
+        f"{unquote(match.group(1))}.pub"
+        for match in re.finditer(
+            r"cosign generate-key-pair[^\n]*--output-key-prefix[= ]+(\S+)", text
+        )
+    }
+    # `pub="$work/canary.pub"` refers to the same file as the prefix does.
+    for match in re.finditer(r"^\s*(\w+)=(\S+)\s*$", text, re.MULTILINE):
+        if unquote(match.group(2)) in keys:
+            keys |= {f"${match.group(1)}", f"${{{match.group(1)}}}"}
+    return keys
+
+
 def check_cosign_verify(text: str, relative: str) -> list[str]:
     """Every `cosign verify` restricts who the signature must come from.
 
     Keyless verification without both certificate flags accepts any Fulcio
     certificate, so it proves only that *someone* signed the artifact. `--key`
     can say the same thing — the signature must verify against one named public
-    key — but only when the file knows which key that is, so the exemption is
-    limited to a file that mints the pair it then verifies against. A `--key`
-    pointing at anything supplied from outside names no signer, and the release
-    path must keep restricting the identity and its issuer instead.
+    key — but only when this file is what named it: the exemption covers the
+    public half of a pair minted here, and nothing else. A key arriving from the
+    environment names no signer, so it stays subject to the identity flags even
+    in a file that mints a throwaway pair elsewhere in it.
     """
     failures: list[str] = []
     lines = text.splitlines()
-    self_minted = "cosign generate-key-pair" in text
+    minted = minted_public_keys(text)
     for index, line in enumerate(lines):
         # A shell comment discussing the command is prose, not an invocation.
         if "cosign verify" not in line or line.lstrip().startswith("#"):
             continue
         block = command_block(lines, index)
-        if re.search(r"--key[= ]", block):
-            if self_minted:
+        key = re.search(r"--key[= ]+(\S+)", block)
+        if key:
+            if unquote(key.group(1)) in minted:
                 continue
             failures.append(
-                f"{relative}:{index + 1}: `cosign verify --key` names a signer only "
-                "where the key is generated in this file; otherwise pass "
-                "--certificate-identity-regexp and --certificate-oidc-issuer"
+                f"{relative}:{index + 1}: `cosign verify --key {key.group(1)}` names a "
+                "signer only where that key is the public half of a pair generated in "
+                "this file; otherwise pass --certificate-identity-regexp and "
+                "--certificate-oidc-issuer"
             )
             continue
         if "--certificate-identity-regexp" not in block or "--certificate-oidc-issuer" not in block:
@@ -319,8 +348,9 @@ def self_test() -> list[str]:
             "cosign verify against a key that comes from somewhere else",
             SELF_TEST_PERMISSIONS
             + "jobs:\n  a:\n    steps:\n"
+            "      - run: cosign generate-key-pair --output-key-prefix k\n"
             '      - run: cosign verify --key "$SOME_KEY" ghcr.io/o/r@sha256:x\n',
-            "names a signer only where the key is generated in this file",
+            "the public half of a pair generated in this file",
         ),
         (
             "cosign verify without an identity restriction",
@@ -376,17 +406,29 @@ def self_test() -> list[str]:
         # A key-based verify restricts the signer by naming the key, and a
         # neighbouring one must not lend that restriction to a keyless verify:
         # both invocations are read as the separate commands they are.
-        script.write_text(
+        minted = (
             'cosign generate-key-pair --output-key-prefix "$WORK/k"\n'
-            'cosign verify --key "$PUB" "$IMAGE" >/dev/null\n'
+            'PUB="$WORK/k.pub"\n'
+        )
+        script.write_text(
+            minted + 'cosign verify --key "$PUB" "$IMAGE" >/dev/null\n'
             'cosign verify --key "$PUB" "$INDEX" >/dev/null\n',
             encoding="utf-8",
         )
         if check(root):
             problems.append(f"self-test: key-based verifies were rejected: {check(root)}")
+        # Minting a throwaway pair does not vouch for a key handed in from
+        # elsewhere, even in the same file.
         script.write_text(
-            'cosign generate-key-pair --output-key-prefix "$WORK/k"\n'
-            'cosign verify "$IMAGE" >/dev/null\n'
+            minted + 'cosign verify --key "$RELEASE_KEY" "$IMAGE" >/dev/null\n',
+            encoding="utf-8",
+        )
+        if not any("generated in this file" in failure for failure in check(root)):
+            problems.append(
+                "self-test: a foreign key was excused by an unrelated generated pair"
+            )
+        script.write_text(
+            minted + 'cosign verify "$IMAGE" >/dev/null\n'
             'cosign verify --key "$PUB" "$INDEX" >/dev/null\n',
             encoding="utf-8",
         )
