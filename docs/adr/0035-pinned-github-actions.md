@@ -60,7 +60,14 @@ look:
   verifies its images through
   [`ops/verify-image-evidence.sh`](../../ops/verify-image-evidence.sh) rather
   than an inline `run:` block; a gate that only read the workflows would pass
-  while the real verification accepted any Fulcio certificate.
+  while the real verification accepted any Fulcio certificate. One file is
+  exempt from the certificate flags and it is named in the checker:
+  [`ops/check-cosign-format.sh`](../../ops/check-cosign-format.sh) verifies a
+  throwaway image against a key pair it mints itself, because a pull request has
+  no OIDC identity to verify against. The exemption is scoped to that file and to
+  keys generated in it, so a script cannot opt out of the identity restriction by
+  minting a pair next to the verify it wants excused, and widening it is a review
+  of the list.
 
 `ops/workflow-policy.py --self-test` runs the checker against in-memory fixtures
 for each rejection class and runs first in the lane, so a pass means the gate is

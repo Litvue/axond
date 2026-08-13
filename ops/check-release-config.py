@@ -411,6 +411,126 @@ def check_release_success(text: str) -> list[str]:
     return failures
 
 
+def cosign_installer_steps(text: str) -> list[str]:
+    """Every step that installs cosign, however the step happens to be written.
+
+    A step's `uses:` is not necessarily its first line — `- name:` above it is
+    just as valid — so the installer is found by its `uses:` line and the whole
+    enclosing list item is returned. Keying on `- uses:` instead would read a
+    named step as no step at all and pass a lane that pins nothing.
+    """
+    lines = text.splitlines()
+    marks = [
+        index
+        for index, line in enumerate(lines)
+        if re.match(r"\s*(- )?uses: sigstore/cosign-installer@", line)
+    ]
+    steps: list[str] = []
+    for mark in marks:
+        start = mark
+        while start >= 0 and not lines[start].lstrip().startswith("- "):
+            start -= 1
+        if start < 0:
+            continue
+        indent = len(lines[start]) - len(lines[start].lstrip())
+        end = start + 1
+        while end < len(lines):
+            line = lines[end]
+            if not line.strip():
+                end += 1
+                continue
+            depth = len(line) - len(line.lstrip())
+            if depth < indent or (depth == indent and line.lstrip().startswith("- ")):
+                break
+            end += 1
+        steps.append("\n".join(lines[start:end]))
+    return steps
+
+
+def check_cosign_pin(text: str) -> list[str]:
+    """Signing must name the cosign binary, and stay on the format consumers verify.
+
+    The installer's default cosign version moves with the installer's own major
+    version, so an action bump silently changes what `cosign sign` writes.
+    cosign 3 defaults to the protobuf bundle format stored as an OCI 1.1
+    referring artifact; a consumer running cosign 2.x looks for the
+    `sha256-<digest>.sig` tag and reports no signature at all. The release only
+    verifies its own output with the version it just signed with, so that break
+    reaches operators rather than CI. docs/installation.md hands out a bare
+    `cosign verify`, so the format is part of the published contract: the binary
+    is pinned here, and moving it off the 2.x line is a documented migration
+    rather than a dependency bump.
+    """
+    failures: list[str] = []
+    steps = cosign_installer_steps(text)
+    if not steps:
+        return ["release-please.yml: no cosign-installer step found; the release must sign"]
+    for body in steps:
+        pin = re.search(r"cosign-release:\s*(\S+)", body)
+        if pin is None:
+            failures.append(
+                "release-please.yml: a sigstore/cosign-installer step does not pin "
+                f"`cosign-release`, so the cosign binary — and the signature format "
+                f"docs/installation.md tells operators to verify — follows the "
+                "installer's default"
+            )
+        elif not re.fullmatch(r"v2\.\d+\.\d+", pin.group(1)):
+            failures.append(
+                "release-please.yml: a sigstore/cosign-installer step pins "
+                f"cosign-release: {pin.group(1)}, off the 2.x line the published "
+                "verification instructions assume; move the docs and this check "
+                "together with the signing format"
+            )
+    return failures
+
+
+def check_cosign_format_lane(text: str, ci: str) -> list[str]:
+    """The lane that exercises cosign must install the binary the release signs with.
+
+    `check_cosign_pin` only reads YAML, and the pin's risk is an upstream one:
+    whether that installer still accepts `cosign-release` and still resolves 2.x
+    assets. `ops/check-cosign-format.sh` answers it by signing with the real
+    binary, which is evidence about the release only while the CI lane and the
+    release lanes install the same thing — otherwise a bump moves the release and
+    leaves the test proving something about a version nobody ships.
+    """
+    release = {
+        (
+            re.search(r"uses: (sigstore/cosign-installer@\S+)", step).group(1),
+            re.search(r"cosign-release:\s*(\S+)", step).group(1),
+        )
+        for step in cosign_installer_steps(text)
+        if re.search(r"cosign-release:\s*(\S+)", step)
+    }
+    tested = {
+        (
+            re.search(r"uses: (sigstore/cosign-installer@\S+)", step).group(1),
+            re.search(r"cosign-release:\s*(\S+)", step).group(1),
+        )
+        for step in cosign_installer_steps(ci)
+        if re.search(r"cosign-release:\s*(\S+)", step)
+    }
+    failures: list[str] = []
+    if "ops/check-cosign-format.sh" not in ci:
+        failures.append(
+            "ci.yml: no lane runs ops/check-cosign-format.sh, so nothing proves the "
+            "installer still delivers the pinned cosign or that it writes the "
+            "signature format docs/installation.md documents"
+        )
+    if not tested:
+        failures.append(
+            "ci.yml: no cosign-installer step pins `cosign-release`, so the signing "
+            "format is exercised with a different binary than the release uses"
+        )
+    elif tested != release:
+        failures.append(
+            f"ci.yml installs cosign as {sorted(tested)} while release-please.yml "
+            f"signs with {sorted(release)}; the compatibility lane must install what "
+            "the release installs or it proves nothing about the release"
+        )
+    return failures
+
+
 def check_compose_platform(notes: list[str]) -> list[str]:
     """The quickstart's platform default must match what its pinned tag can serve.
 
@@ -634,6 +754,51 @@ def self_test() -> int:
     # release asks for the fallback that release removed.
     assert platform_default((0, 3, 18), (0, 3, 18)) == AMD64_FALLBACK_PLATFORM
 
+    # The cosign pin: an installer step without one, or one off the 2.x line,
+    # changes the signature format operators verify and must be reported.
+    signed = (
+        "jobs:\n  release-image:\n    steps:\n"
+        "      - uses: sigstore/cosign-installer@abc # v4.1.2\n"
+        "        with:\n          cosign-release: v2.5.2\n"
+        "      - run: cosign sign --yes ghcr.io/o/r@sha256:x\n"
+    )
+    assert check_cosign_pin(signed) == []
+    assert check_cosign_pin(signed.replace("          cosign-release: v2.5.2\n", "")) != []
+    assert check_cosign_pin(signed.replace("v2.5.2", "v3.0.6")) != []
+    assert check_cosign_pin("jobs:\n  release-image:\n    steps: []\n") != []
+    # A named step is the same step: reading it as no step at all would let an
+    # unpinned lane pass, which is the regression this gate exists to catch.
+    named = signed.replace(
+        "      - uses: sigstore/cosign-installer@abc # v4.1.2\n",
+        "      - name: Install cosign\n        uses: sigstore/cosign-installer@abc # v4.1.2\n",
+    )
+    assert len(cosign_installer_steps(named)) == 1
+    assert check_cosign_pin(named) == []
+    assert check_cosign_pin(named.replace("          cosign-release: v2.5.2\n", "")) != []
+    # Two lanes, one of them unpinned: the pinned one must not hide the other.
+    both = signed + signed.replace(
+        "        with:\n          cosign-release: v2.5.2\n", ""
+    ).replace("release-image", "release-image-index-promote")
+    assert len(cosign_installer_steps(both)) == 2
+    assert len(check_cosign_pin(both)) == 1
+
+    # The lane that signs for real must install what the release installs: a
+    # bump applied to one side only leaves the evidence describing a version
+    # nobody ships.
+    lane = (
+        "jobs:\n  cosign-format:\n    steps:\n"
+        "      - uses: sigstore/cosign-installer@abc # v4.1.2\n"
+        "        with:\n          cosign-release: v2.5.2\n"
+        "      - run: bash ops/check-cosign-format.sh\n"
+    )
+    assert check_cosign_format_lane(signed, lane) == []
+    assert check_cosign_format_lane(signed, lane.replace("v2.5.2", "v2.4.0")) != []
+    assert check_cosign_format_lane(signed, lane.replace("@abc", "@def")) != []
+    assert check_cosign_format_lane(
+        signed, lane.replace("      - run: bash ops/check-cosign-format.sh\n", "")
+    ) != []
+    assert check_cosign_format_lane(signed, "jobs:\n  fmt:\n    steps: []\n") != []
+
     # The committed constant is deliberately not asserted here: it legitimately
     # moves if the quickstart is ever pinned back onto a newer amd64-only release,
     # and a tree where it disagrees with the pinned tag is already reported by
@@ -661,6 +826,12 @@ def main(argv: list[str]) -> int:
     failures.extend(check_image_matrix(text))
     failures.extend(check_image_gates(text))
     failures.extend(check_release_success(text))
+    failures.extend(check_cosign_pin(text))
+    failures.extend(
+        check_cosign_format_lane(
+            text, (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        )
+    )
     failures.extend(check_compose_platform(notes))
     failures.extend(check_platform_transition_guidance())
     failures.extend(check_no_latest_tag(text))

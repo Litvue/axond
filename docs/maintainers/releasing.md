@@ -310,7 +310,10 @@ no `permissions:` block, `permissions: write-all`, an unanchored
 `SIGNER_IDENTITY`, and a `cosign verify` that does not restrict the certificate
 identity and issuer — in the workflows and in the shell under `ops/`, which is
 where [`ops/verify-image-evidence.sh`](../../ops/verify-image-evidence.sh)
-actually verifies the release images. It also requires one reviewed pin per
+actually verifies the release images. The single exception is named in the
+checker: [`ops/check-cosign-format.sh`](../../ops/check-cosign-format.sh) may
+verify with `--key`, and only against a key pair it mints itself, because a pull
+request has no OIDC identity to verify against. It also requires one reviewed pin per
 action across all workflows, so two lanes cannot silently run different builds of
 the same Action.
 The lane proves it still rejects those with `ops/workflow-policy.py --self-test`
@@ -333,6 +336,33 @@ script still refuses it unless it reports the pinned version. Locally:
 just workflow-policy   # pins, permissions, signer restrictions, Dependabot labels
 just actionlint        # workflow linting; downloads the pinned actionlint
 ```
+
+`sigstore/cosign-installer` needs one pin more than its own SHA: the cosign
+binary it installs, named by `cosign-release`. The installer's default tracks its
+major version, so bumping the Action changes what `cosign sign` writes. cosign 3
+defaults to the protobuf bundle format stored as an OCI 1.1 referring artifact,
+while cosign 2 writes the `sha256-<digest>.sig` tag that
+[the verification instructions](../installation.md) hand to operators — and
+because the release verifies its own output with the same binary that produced
+it, a format change passes every lane and fails only in an operator's terminal.
+The release therefore pins cosign to the 2.x line, and
+[`ops/check-release-config.py`](../../ops/check-release-config.py) fails if an
+installer step drops that pin or moves off it. Adopting cosign 3 is a deliberate
+migration: the published verification instructions, the operator-facing docs, and
+that check move in the same change, not in a dependency bump.
+
+Reading the YAML only proves the pin is written down, not that the installer
+still honours it — whether a major-4 installer still accepts `cosign-release` and
+still resolves 2.x assets is an upstream question. The `Cosign signing format`
+CI lane answers it on every change: it installs cosign through the same pinned
+installer step the release uses, then
+[`ops/check-cosign-format.sh`](../../ops/check-cosign-format.sh) asserts the
+installed version is the pinned one and signs a throwaway image and index in a
+local registry, requiring the signature to appear under the `sha256-<digest>.sig`
+tag operators resolve. Signing there is key-based because a pull request has no
+OIDC identity; the storage format under test is the same either way.
+`ops/check-release-config.py` keeps that lane's installer step identical to the
+release lanes', so a bump cannot move the release and leave the evidence behind.
 
 Everything in that lane is offline except the label check
 ([`ops/dependabot-labels.sh`](../../ops/dependabot-labels.sh)), which needs an
