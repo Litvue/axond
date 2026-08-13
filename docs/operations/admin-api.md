@@ -146,6 +146,24 @@ Rollback never rewinds the journal. It reads an earlier revision's complete
 state and publishes it forward, so the history that produced an incident is
 still readable after the incident is undone.
 
+## Conditional reads
+
+Every read carries a strong `ETag` over the bytes of the response, and answers
+`304 Not Modified` — with the same validator and no body — to a request whose
+`If-None-Match` names it. A dashboard or a reconciler waiting for a revision to
+converge can therefore poll without paying for a control-plane read and a
+complete desired state on every tick.
+
+The validator is a digest of the projection, not a revision id: `/convergence`
+has no revision of its own to name, and a projection changes shape between
+releases while the revision does not. Treat it as opaque — compare it and echo
+it, and do not parse it. An `If-None-Match` this surface cannot read is treated
+as absent and answered in full, because a `304` against a validator nobody
+issued would hand an operator a stale answer mid-incident.
+
+A validator is not a credential. A conditional read authenticates and is
+authorized exactly like an unconditional one, and a refusal carries no `ETag`.
+
 ## Scope
 
 An administrator's grant is deployment-, tenant-, or project-scoped, and a
