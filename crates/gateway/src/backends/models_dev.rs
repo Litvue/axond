@@ -86,7 +86,8 @@ use super::catalog::{
     CatalogRefresh, CatalogSnapshot, CatalogSource, ETag, InvalidCatalogId, JsonPointer, Modality,
     ModelCapability, ModelFacts, ModelField, ModelId, ModelLifecycle, ModelLimits, ObservedPrice,
     ObservedRate, PriceRates, PriceTier, PriceTierThreshold, ProviderEndpoint, ProviderOffering,
-    Refusable, Refusal, RefusalReason, SchemaVersion, SourceValidators, source_snapshot,
+    RawPayload, Refusable, Refusal, RefusalReason, SchemaVersion, SourceValidators,
+    source_snapshot,
 };
 use super::{Capabilities, Capability};
 use crate::desired_state::canonical::{CanonicalError, CanonicalValue};
@@ -1435,7 +1436,10 @@ impl CatalogSource for SeedCatalogSource {
                 validators: snapshot.source.validators,
             });
         }
-        Ok(CatalogRefresh::Updated(Box::new(snapshot)))
+        Ok(CatalogRefresh::Updated {
+            snapshot: Box::new(snapshot),
+            payload: RawPayload::new(SEED_PAYLOAD.as_bytes()),
+        })
     }
 }
 
@@ -1652,11 +1656,11 @@ impl<F: CatalogFetch> CatalogSource for ModelsDevSource<F> {
                     }
                     .into());
                 }
-                Ok(CatalogRefresh::Updated(Box::new(self.adapter.parse(
-                    &bytes,
-                    validators,
-                    SystemTime::now(),
-                )?)))
+                let snapshot = self.adapter.parse(&bytes, validators, SystemTime::now())?;
+                Ok(CatalogRefresh::Updated {
+                    snapshot: Box::new(snapshot),
+                    payload: RawPayload::new(bytes),
+                })
             }
         }
     }
@@ -2523,9 +2527,16 @@ mod tests {
     #[tokio::test]
     async fn the_seed_source_serves_the_catalogue_without_a_network() {
         let source = SeedCatalogSource;
-        let CatalogRefresh::Updated(snapshot) = source.refresh(None).await.expect("refresh") else {
+        let CatalogRefresh::Updated { snapshot, payload } =
+            source.refresh(None).await.expect("refresh")
+        else {
             panic!("a first refresh transfers the seed");
         };
+        assert_eq!(
+            payload.as_bytes(),
+            SEED_PAYLOAD.as_bytes(),
+            "the seed hands over the bytes it was parsed from, so a store retains the import"
+        );
         assert_eq!(
             source.refresh(Some(&snapshot.source.validators)).await,
             Ok(CatalogRefresh::Unchanged {
@@ -2685,7 +2696,8 @@ mod tests {
         let source = ModelsDevSource::new(adapter, HttpFetch::new());
         let mut catalogue = LastKnownGoodCatalog::new();
 
-        let CatalogRefresh::Updated(snapshot) = source.refresh(None).await.expect("first refresh")
+        let CatalogRefresh::Updated { snapshot, .. } =
+            source.refresh(None).await.expect("first refresh")
         else {
             panic!("a first refresh has nothing to be conditional on");
         };

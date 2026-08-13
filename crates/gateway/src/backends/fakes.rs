@@ -18,7 +18,7 @@ use super::catalog::{
     CatalogContent, CatalogError, CatalogModelEntry, CatalogProvider, CatalogRefresh,
     CatalogSnapshot, CatalogSource, JsonPointer, Modality, ModelCapability, ModelFacts, ModelId,
     ModelLimits, ObservedPrice, ObservedRate, PriceRates, ProviderEndpoint, ProviderId,
-    ProviderOffering, SchemaVersion, SourceValidators, source_snapshot,
+    ProviderOffering, RawPayload, SchemaVersion, SourceValidators, source_snapshot,
 };
 use super::secrets::{
     KekRef, SecretDescriptor, SecretError, SecretMaterial, SecretResolver, SecretStore,
@@ -432,9 +432,12 @@ impl CatalogSource for InMemoryCatalog {
             self.validators.clone(),
             SystemTime::UNIX_EPOCH,
         );
-        Ok(CatalogRefresh::Updated(Box::new(CatalogSnapshot {
-            source,
-            content: self.content.clone(),
-        })))
+        Ok(CatalogRefresh::Updated {
+            snapshot: Box::new(CatalogSnapshot {
+                source,
+                content: self.content.clone(),
+            }),
+            payload: RawPayload::new(&b"{}"[..]),
+        })
     }
 }

@@ -62,6 +62,7 @@
 //! projection borrows, adds no state, and is not a second place facts live.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -229,6 +230,47 @@ pub struct CatalogSnapshot {
     pub content: CatalogContent,
 }
 
+/// The exact bytes one import accepted, shared rather than copied.
+///
+/// [`SourceSnapshot::raw`] names these bytes; this is the bytes themselves, and
+/// they exist because a digest is not a payload: retaining an import durably
+/// means storing what was accepted, and rehydrating a stored catalogue means
+/// parsing those same bytes again through the same parser. Carried only from a
+/// fetch to whatever retains it — nothing holds it for the life of a snapshot,
+/// so an active catalogue costs its normalized content and not a second copy of
+/// a multi-megabyte document.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RawPayload(Arc<[u8]>);
+
+impl RawPayload {
+    pub fn new(bytes: impl Into<Arc<[u8]>>) -> Self {
+        Self(bytes.into())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Length only. A payload is an upstream document of unbounded size, and a
+/// derived `Debug` would put the whole of it in a log line the first time one is
+/// traced.
+impl std::fmt::Debug for RawPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawPayload")
+            .field("bytes", &self.0.len())
+            .finish()
+    }
+}
+
 /// The outcome of a refresh.
 ///
 /// `Unchanged` is a first-class answer rather than an empty snapshot, so a
@@ -239,9 +281,16 @@ pub enum CatalogRefresh {
     Unchanged {
         validators: SourceValidators,
     },
-    /// Boxed because a snapshot is a whole catalogue and `Unchanged` — the
-    /// common answer — is two optional header values.
-    Updated(Box<CatalogSnapshot>),
+    Updated {
+        /// Boxed because a snapshot is a whole catalogue and `Unchanged` — the
+        /// common answer — is two optional header values.
+        snapshot: Box<CatalogSnapshot>,
+        /// The bytes the snapshot was parsed from, so a store can retain the
+        /// import itself rather than a rendering of it. Handed over here, at the
+        /// one moment they are in hand, because a source that dropped them left
+        /// the deployment unable to prove later what it accepted.
+        payload: RawPayload,
+    },
 }
 
 /// Why an import did not become the active catalogue, as a bounded label.
@@ -289,6 +338,12 @@ pub enum RefusalReason {
     AmbiguousModelKey,
     /// Normalized content that is not internally consistent.
     Content,
+    /// The import parsed, and the store would not retain it. Its own reason
+    /// because the payload is blameless: an operator reading `schema` goes and
+    /// looks at the upstream document, while this one is the deployment's own
+    /// database, and a catalogue admitted in memory but absent from the store
+    /// would be a catalogue that silently un-imports itself on restart.
+    NotRetained,
     /// The source confirmed content nobody holds: an unchanged answer arrived
     /// where no import has ever succeeded, so there is no error text and no
     /// pointer behind this refusal — only an answer no conditional request
@@ -322,6 +377,7 @@ pub const REFUSAL_REASONS: &[&str] = &[
     "uncanonicalizable_text",
     "ambiguous_model_key",
     "content",
+    "not_retained",
     "unsolicited_unchanged",
     "unknown",
 ];
@@ -345,6 +401,7 @@ impl RefusalReason {
         Self::UncanonicalizableText,
         Self::AmbiguousModelKey,
         Self::Content,
+        Self::NotRetained,
         Self::UnsolicitedUnchanged,
         Self::Unknown,
     ];
@@ -368,6 +425,7 @@ impl RefusalReason {
             Self::UncanonicalizableText => "uncanonicalizable_text",
             Self::AmbiguousModelKey => "ambiguous_model_key",
             Self::Content => "content",
+            Self::NotRetained => "not_retained",
             Self::UnsolicitedUnchanged => "unsolicited_unchanged",
             Self::Unknown => "unknown",
         }
@@ -2094,6 +2152,18 @@ pub enum Admission {
     Initial { content_id: CatalogContentId },
 }
 
+impl Admission {
+    /// The content that is now active. Every arm has one: an admission that did
+    /// not leave content active is not an admission.
+    pub const fn content_id(&self) -> CatalogContentId {
+        match self {
+            Self::Unchanged { content_id }
+            | Self::Updated { content_id, .. }
+            | Self::Initial { content_id } => *content_id,
+        }
+    }
+}
+
 /// What a refresh that produced no error did to the catalogue.
 ///
 /// A refresh can fail without an error to log: a source that answers "not
@@ -2180,6 +2250,32 @@ impl LastKnownGoodCatalog {
             active: None,
             consecutive_refusals: 0,
             last_refusal: None,
+        }
+    }
+
+    /// The state a store held, adopted as this process's own.
+    ///
+    /// Not [`admit`](Self::admit) plus a loop of
+    /// [`record_refusal`](Self::record_refusal): the refusal run is a count that
+    /// was already established elsewhere, and replaying it as events would both
+    /// be a lie about what this process observed and cost one call per refusal
+    /// for a deployment that has been failing for a week. Restoring is the one
+    /// operation that may set the counters directly, and it is what makes a
+    /// restarted replica report the staleness the deployment actually has rather
+    /// than a fresh, healthy catalogue that has simply forgotten.
+    ///
+    /// `active` carries its own confirmation time in `source.fetched_at` — the
+    /// store records when the content was last confirmed current, which is what
+    /// age means here — so nothing is re-stamped to boot.
+    pub fn restored(
+        active: Option<CatalogSnapshot>,
+        consecutive_refusals: u32,
+        last_refusal: Option<Refusal>,
+    ) -> Self {
+        Self {
+            active,
+            consecutive_refusals,
+            last_refusal,
         }
     }
 
@@ -2393,7 +2489,7 @@ impl LastKnownGoodCatalog {
                         .content_id(),
                 }))
             }
-            Ok(CatalogRefresh::Updated(snapshot)) => {
+            Ok(CatalogRefresh::Updated { snapshot, .. }) => {
                 Ok(Refreshed::Admitted(self.admit_as_of(*snapshot, checked_at)))
             }
             Err(error) => {
@@ -2774,6 +2870,15 @@ mod tests {
             SystemTime::UNIX_EPOCH,
         );
         CatalogSnapshot { source, content }
+    }
+
+    /// A refresh answer carrying `snapshot`, with the bytes the fixture states it
+    /// was parsed from.
+    fn refreshed(snapshot: CatalogSnapshot) -> CatalogRefresh {
+        CatalogRefresh::Updated {
+            snapshot: Box::new(snapshot),
+            payload: RawPayload::new(&b"{}"[..]),
+        }
     }
 
     #[test]
@@ -3275,7 +3380,8 @@ mod tests {
     #[tokio::test]
     async fn a_first_refresh_returns_metadata_with_validators() {
         let source = InMemoryCatalog::with_models(&[("openai", "gpt-4o")], "v1");
-        let CatalogRefresh::Updated(snapshot) = source.refresh(None).await.expect("refresh") else {
+        let CatalogRefresh::Updated { snapshot, .. } = source.refresh(None).await.expect("refresh")
+        else {
             panic!("a first refresh has no prior validators to match");
         };
         assert_eq!(snapshot.source.validators, SourceValidators::etag("v1"));
@@ -3313,7 +3419,7 @@ mod tests {
     #[tokio::test]
     async fn a_changed_upstream_transfers_the_new_metadata() {
         let source = InMemoryCatalog::with_models(&[("openai", "gpt-4o")], "v2");
-        let CatalogRefresh::Updated(snapshot) = source
+        let CatalogRefresh::Updated { snapshot, .. } = source
             .refresh(Some(&SourceValidators::etag("v1")))
             .await
             .expect("refresh")
@@ -3327,7 +3433,7 @@ mod tests {
     #[tokio::test]
     async fn observed_pricing_is_metadata_not_activation() {
         let source = InMemoryCatalog::with_models(&[("openai", "gpt-4o")], "v1");
-        let CatalogRefresh::Updated(snapshot) = source.refresh(None).await.unwrap() else {
+        let CatalogRefresh::Updated { snapshot, .. } = source.refresh(None).await.unwrap() else {
             panic!("expected metadata");
         };
         let offering = &snapshot.content.models()[0].offerings[0];
@@ -3349,7 +3455,7 @@ mod tests {
         source.set_unavailable(false);
         assert!(matches!(
             source.refresh(None).await,
-            Ok(CatalogRefresh::Updated(_))
+            Ok(CatalogRefresh::Updated { .. })
         ));
     }
 
@@ -3545,10 +3651,10 @@ mod tests {
         let imported_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let first = catalogue
             .record_refresh::<CatalogError>(
-                Ok(CatalogRefresh::Updated(Box::new(snapshot(
+                Ok(refreshed(snapshot(
                     content(vec![offering("openai", "gpt-4o", Some(price(1, 2)))]),
                     SourceValidators::etag("\"one\""),
-                )))),
+                ))),
                 None,
                 imported_at,
             )
@@ -3740,11 +3846,7 @@ mod tests {
         );
         assert_eq!(stated.source.fetched_at, SystemTime::UNIX_EPOCH);
         catalogue
-            .record_refresh::<CatalogError>(
-                Ok(CatalogRefresh::Updated(Box::new(stated))),
-                None,
-                checked_at,
-            )
+            .record_refresh::<CatalogError>(Ok(refreshed(stated)), None, checked_at)
             .expect("an admitted import");
 
         let report = catalogue.report(checked_at);
