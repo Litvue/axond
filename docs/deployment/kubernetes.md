@@ -336,6 +336,11 @@ requires a `RollingUpdate` to stall and the default disruption budget to refuse
 the eviction that `AlwaysAllow` permits. Run it when you change the strategy,
 the Services, the budget, or the migration Job.
 
+For the operator sequence around these checks — including the deliberately
+unready probe contract, first-install migration ordering, desired-state rollback,
+and a compatible image rollback — use the
+[stateful Kubernetes deployment runbook](../operations/stateful-deployment-runbook.md).
+
 ## Configuration and secrets
 
 The stable `axond-config` ConfigMap name and `[reload] watch = true` allow a

@@ -1,0 +1,227 @@
+# Stateful Kubernetes deployment runbook
+
+This is the operator procedure for
+[deploy/kubernetes/overlays/production-stateful](../../deploy/kubernetes/overlays/production-stateful).
+The current stateful process serves authenticated /admin/v1, but it does not
+compile a published revision into an inference snapshot. A healthy Pod is
+therefore **Running and not Ready**: /healthz returns 200, /readyz returns
+503, and inference returns typed 503 inference_unavailable. Use the stateless
+production overlay for inference traffic until revision convergence is wired
+into serve.
+
+This distinction is important during an incident: Kubernetes availability and
+inference availability are not claims this overlay makes today. The procedure
+below treats the migration Job, Pod state, and the direct administrative
+port-forward as the acceptance checks instead.
+
+## Preconditions
+
+- Kubernetes 1.32 or newer. The production overlay uses the GA sleep
+  lifecycle action and matchLabelKeys for topology spread.
+- A Postgres primary reachable from the axond namespace. The deployment's
+  GW_CONTROL_PLANE_DSN and GW_SECRET_STORE_KEK are supplied through the Secret
+  named axond-secrets.
+- A verified multi-architecture image-index digest. The committed all-zero
+  digest is intentionally not pullable.
+- Three Secret values for this bootstrap: GW_CONTROL_PLANE_DSN,
+  GW_SECRET_STORE_KEK, and GW_ADMIN_BREAKGLASS. The KEK must be the deployment's
+  existing key material; changing it makes stored ciphertext unrecoverable.
+
+Resolve and verify the image before applying the overlay. The resolver updates
+both production overlays, so scope the check to the one being deployed:
+
+~~~bash
+ops/pin-image-digest.sh 0.3.36 # x-release-please-version
+ops/pin-image-digest.sh --check overlays/production-stateful
+SIGNER_IDENTITY=... GITHUB_REPOSITORY=Litvue/axond \
+  ops/verify-image-evidence.sh ghcr.io/litvue/axond@sha256:VERIFIED_INDEX_DIGEST
+~~~
+
+## First install
+
+Create the namespace and the Secret out of band; the overlay deletes the
+repository's public example Secret. The values below are placeholders and must
+be replaced:
+
+~~~bash
+set -euo pipefail
+
+namespace=axond
+overlay=deploy/kubernetes/overlays/production-stateful
+
+kubectl create namespace "$namespace" --dry-run=client -o yaml |
+  kubectl apply -f -
+kubectl -n "$namespace" create secret generic axond-secrets \
+  --from-literal=GW_CONTROL_PLANE_DSN='postgres://<user>:<password>@<host>:5432/<db>' \
+  --from-literal=GW_SECRET_STORE_KEK='<base64-encoded-key-material>' \
+  --from-literal=GW_ADMIN_BREAKGLASS='<breakglass-value>' \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+ops/pin-image-digest.sh --check overlays/production-stateful
+kubectl apply -k "$overlay"
+~~~
+
+The Job and Deployment are created by the same apply and are not ordered by
+Kubernetes. A Pod may briefly restart against a schema that is not present yet;
+that is expected. To keep the fleet empty while the migration completes, scale
+the Deployment down immediately after the apply, then start the three replicas:
+
+~~~bash
+kubectl -n "$namespace" scale deployment/axond --replicas=0
+kubectl -n "$namespace" wait \
+  --for=condition=complete job/axond-migrate --timeout=5m
+kubectl -n "$namespace" logs job/axond-migrate
+kubectl -n "$namespace" scale deployment/axond --replicas=3
+~~~
+
+For a failed or exhausted Job, inspect it before restarting anything:
+
+~~~bash
+kubectl -n axond get job axond-migrate
+kubectl -n axond describe job axond-migrate
+kubectl -n axond logs job/axond-migrate
+~~~
+
+BackoffLimitExceeded is terminal for that Job. Once Postgres and the Secret
+are fixed, delete and re-apply it; axond migrate apply is forward-only and
+idempotent:
+
+~~~bash
+kubectl -n axond delete job axond-migrate --ignore-not-found
+kubectl apply -k deploy/kubernetes/overlays/production-stateful
+kubectl -n axond wait \
+  --for=condition=complete job/axond-migrate --timeout=5m
+~~~
+
+## Readiness acceptance
+
+Do not use kubectl wait --for=condition=available,
+kubectl wait --for=condition=ready, or kubectl rollout status for this
+overlay. They wait for a condition the current stateful process deliberately
+does not report. Inspect the replacement and process state instead:
+
+~~~bash
+kubectl -n axond get pods -l app.kubernetes.io/name=axond \
+  -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount'
+kubectl -n axond get deployment axond \
+  -o jsonpath='{.status.updatedReplicas}/{.status.replicas}{" updated/desired\n"}'
+kubectl -n axond get endpointslices \
+  -l kubernetes.io/service-name=axond
+~~~
+
+Acceptance is three stable Running Pods, READY false for each, no ready
+inference endpoints, and no continuing restart loop after the migration Job
+completed. A node drain remains permitted because the stateful
+PodDisruptionBudget sets unhealthyPodEvictionPolicy: AlwaysAllow.
+
+Probe one Pod through an operator-controlled port-forward. The administrative
+surface is intentionally not published through an axond-admin Service:
+
+~~~bash
+pod="$(kubectl -n axond get pods -l app.kubernetes.io/name=axond \
+  -o jsonpath='{.items[0].metadata.name}')"
+kubectl -n axond port-forward "pod/$pod" 18080:8080 >/tmp/axond-stateful-forward.log 2>&1 &
+forward_pid=$!
+trap 'kill "$forward_pid" 2>/dev/null || true' EXIT
+
+for attempt in $(seq 1 30); do
+  curl -fsS http://127.0.0.1:18080/healthz >/dev/null && break
+  sleep 1
+done
+test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/healthz)" = 200
+test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/readyz)" = 503
+
+inference_body="$(curl -sS -X POST -H 'content-type: application/json' \
+  -d '{}' http://127.0.0.1:18080/v1/chat/completions)"
+grep -q '"inference_unavailable"' <<<"$inference_body"
+
+# The value, not the variable name, is the breakglass token.
+test -n "$GW_ADMIN_BREAKGLASS"
+curl -fsS -H "Authorization: Bearer $GW_ADMIN_BREAKGLASS" \
+  http://127.0.0.1:18080/admin/v1/state >/dev/null
+~~~
+
+## Upgrade
+
+An upgrade is a maintenance window for this overlay: Recreate replaces the
+whole fleet because there is no Ready Pod to keep available. Re-run the schema
+Job explicitly, then watch updated replicas rather than availability:
+
+~~~bash
+kubectl -n axond delete job axond-migrate --ignore-not-found
+kubectl apply -k deploy/kubernetes/overlays/production-stateful
+kubectl -n axond wait \
+  --for=condition=complete job/axond-migrate --timeout=5m
+kubectl -n axond logs job/axond-migrate
+
+for attempt in $(seq 1 90); do
+  updated="$(kubectl -n axond get deployment axond -o jsonpath='{.status.updatedReplicas}')"
+  desired="$(kubectl -n axond get deployment axond -o jsonpath='{.status.replicas}')"
+  if test "$updated" = 3 && test "$desired" = 3; then
+    break
+  fi
+  sleep 2
+done
+test "$updated" = 3
+test "$desired" = 3
+~~~
+
+Repeat the readiness acceptance after the replacement. The admin port-forward
+is unavailable while Recreate is deleting and creating Pods, so schedule
+administrative work around that window.
+
+## Rollback
+
+There are two different rollbacks. Both are forward actions; neither rewinds
+the Postgres journal in place.
+
+### Roll back desired state
+
+/admin/v1/rollback republishes an earlier complete desired state as a new
+revision. It retains the incident revision and its audit trail. Through the
+same Pod port-forward as above:
+
+~~~bash
+export AXOND_ADMIN_ENDPOINT=http://127.0.0.1:18080
+export AXOND_ADMIN_TOKEN="$GW_ADMIN_BREAKGLASS"
+axond admin history --limit 20
+axond admin rollback \
+  --revision KNOWN_GOOD_REVISION \
+  --summary 'restore the known-good desired state' \
+  --idempotency-key rollback-INCIDENT_ID \
+  --expected-revision CURRENT_HEAD
+~~~
+
+At the current stateful boundary this changes the control-plane history, not
+inference readiness: Pods continue to report 503 readiness until revision
+convergence is available. Use the expected-revision from the history read; the
+gateway rejects a stale rollback instead of overwriting a newer change.
+
+### Roll back a compatible image
+
+Only roll an image back when the retained binary accepts the schema already
+applied. Migrations are forward-only; an older binary that cannot read the
+current schema must be fixed forward, or paired with a database recovery whose
+schema and image belong together. Do not run a reverse migration.
+
+For an image-only emergency rollback, keep the completed migration Job and
+change the Deployment to the previously verified index digest:
+
+~~~bash
+old_image=ghcr.io/litvue/axond@sha256:PREVIOUS_VERIFIED_INDEX_DIGEST
+kubectl -n axond set image deployment/axond axond="$old_image"
+~~~
+
+Because the strategy is Recreate, verify the replacement with
+.status.updatedReplicas and the readiness acceptance above. Record the image
+change in the version-controlled overlay after the incident; a later
+kubectl apply -k will otherwise restore its declared image. Do not delete the
+migration Job for an image-only rollback: the schema is not rolled backward.
+
+## Related procedures
+
+- [Kubernetes deployment shape](../deployment/kubernetes.md#stateful-mode)
+- [Upgrades and rollback](./upgrades.md)
+- [Administering a stateful deployment](./admin-api.md)
+- [Control-plane journal and migration states](./control-plane-journal.md#operator-commands)
+- [Backup, restore, and PITR](./backup-and-recovery.md)

@@ -91,6 +91,9 @@ and operate it.
 - [Administering a stateful deployment](./operations/admin-api.md) — the
   `/admin/v1` routes and `axond admin`, their preconditions, and what a stateful
   replica serves before revision convergence ships.
+- [Stateful Kubernetes deployment runbook](./operations/stateful-deployment-runbook.md)
+  — apply, migrate, verify readiness, upgrade, and roll back the shipped
+  stateful overlay.
 - [Billing-grade usage outbox](./operations/usage-outbox.md) — the opt-in durable
   outbox: setup, guarantees, refusals, recovery, poison, upgrades, and alerts.
 - [Control-plane revision journal](./operations/control-plane-journal.md) — the
