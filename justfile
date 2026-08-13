@@ -120,8 +120,11 @@ capacity:
 # series to target/endurance/soak. The smoke tier of the same driver runs in
 # `just test`. Pass a shorter duration in milliseconds to dispatch a shorter run:
 # `just endurance 2400000`.
+# The soak test by name: the rest of the binary — the smoke tier, the sequential
+# regression, and the deterministic checks — belongs to `just test`, and running
+# it again here would offer the dispatched hours a second workload to share.
 endurance duration_ms="":
-    AXOND_ENDURANCE=1 AXOND_ENDURANCE_DURATION_MS={{ duration_ms }} cargo test --locked --all-features --test endurance -- --nocapture --test-threads=1
+    AXOND_ENDURANCE=1 AXOND_ENDURANCE_DURATION_MS={{ duration_ms }} cargo test --locked --all-features --test endurance -- the_endurance_soak_tier_qualifies_and_publishes_its_evidence --exact --nocapture --test-threads=1
 
 # Run the gateway against ./axond.toml (copy axond.example.toml first).
 run:

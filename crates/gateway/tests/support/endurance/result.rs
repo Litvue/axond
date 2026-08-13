@@ -56,9 +56,17 @@ impl EnduranceResult {
     /// return where it landed. The raw samples are written separately, as they
     /// are produced (see [`super::sampler`]).
     pub fn write(&self) -> PathBuf {
+        self.write_as(&self.profile.id)
+    }
+
+    /// Write the artifact under a stem of its own. A run that is not the tier's
+    /// qualifying one — a regression that offers both tiers in seconds — has to
+    /// leave its evidence somewhere that is not where a reader looks for the
+    /// run that qualified the release.
+    pub fn write_as(&self, stem: &str) -> PathBuf {
         let dir = Self::directory(self.profile.tier_enum());
         std::fs::create_dir_all(&dir).expect("the endurance artifact directory is writable");
-        let path = dir.join(format!("{}.json", self.profile.id));
+        let path = dir.join(format!("{stem}.json"));
         let json = serde_json::to_string_pretty(self).expect("the result artifact serializes");
         std::fs::write(&path, format!("{json}\n")).expect("the endurance artifact is writable");
         path
@@ -102,7 +110,13 @@ pub struct ProfileEcho {
     pub description: String,
     pub tier: String,
     pub seed: u64,
+    /// How long this run was offered for, which is the manifest's tier unless
+    /// it was dispatched shorter. The segment length beside it is fitted to the
+    /// same number, so the two cannot disagree about which run this was.
     pub duration_ms: u64,
+    /// What the manifest commits the tier to, kept so a dispatched artifact
+    /// still says what it is a shorter run *of*.
+    pub manifest_duration_ms: u64,
     pub concurrency: usize,
     pub think_time_ms: u64,
     pub sample_interval_ms: u64,
@@ -120,6 +134,7 @@ impl ProfileEcho {
             tier: tier.as_str().to_owned(),
             seed: profile.seed,
             duration_ms: scale.duration_ms,
+            manifest_duration_ms: profile.scale(tier).duration_ms,
             concurrency: scale.concurrency,
             think_time_ms: scale.think_time_ms,
             sample_interval_ms: scale.sample_interval_ms,
@@ -154,6 +169,13 @@ pub struct RunMeta {
     pub harness_version: &'static str,
     /// Where the raw time series landed, relative to the workspace root.
     pub samples_path: String,
+    /// How long a finished attempt or an emitted usage record may sit in the
+    /// driver before it is folded into the open segment and released.
+    pub drain_interval_ms: u64,
+    /// How many times that happened. A number far larger than the segment
+    /// count is the evidence that what the driver holds is bounded by the
+    /// drain tick rather than by the segment length.
+    pub drains: u64,
 }
 
 impl RunMeta {
@@ -164,6 +186,8 @@ impl RunMeta {
         requested_duration_ms: u64,
         duration_source: &'static str,
         samples_path: String,
+        drain_interval_ms: u64,
+        drains: u64,
     ) -> Self {
         Self {
             started_at_unix_ms: started_at
@@ -176,6 +200,8 @@ impl RunMeta {
             harness: "axond endurance harness",
             harness_version: env!("CARGO_PKG_VERSION"),
             samples_path,
+            drain_interval_ms,
+            drains,
         }
     }
 }
@@ -402,6 +428,30 @@ pub struct Reconciliation {
     /// What the plan said each ending would settle, and how many of each it
     /// offered: the expectation the observed statuses are read against.
     pub planned_status_counts: BTreeMap<String, u64>,
+    /// How the duplicate count above was arrived at.
+    pub fingerprints: Fingerprints,
+}
+
+/// The identity ledger duplicate detection was performed against. A run that
+/// reports no duplicates is worth what the method that looked for them is
+/// worth, so the method is part of the evidence: how many identities were
+/// compared, whether the comparison was exact, and how many of them the driver
+/// held in memory at once while comparing.
+#[derive(Debug, Clone, Serialize)]
+pub struct Fingerprints {
+    /// Identified usage records, duplicates included.
+    pub recorded: u64,
+    /// How many files the identities were spilled across. Equal identities
+    /// always share a shard, which is what keeps the sharded count exact.
+    pub shards: usize,
+    /// The largest shard, and so the most identities held at once: the bound a
+    /// whole-run in-memory set did not have.
+    pub peak_shard_fingerprints: u64,
+    /// Whether every identity was compared against every identity it could
+    /// equal. False would mean the count is a lower bound.
+    pub exact: bool,
+    /// Where the identities were spilled, relative to the workspace root.
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]

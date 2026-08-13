@@ -11,7 +11,7 @@
 //! dropped, latency samples are decimated, usage records are reconciled in
 //! batches and released, and the raw time series goes to a file as it is taken.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,11 +24,12 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+use super::ledger::{Ledger, Tally};
 use super::manifest::{Ending, Profile, RESULT_SCHEMA_VERSION, Scale, Tier};
 use super::plan::{self, KEY_DIR_PLACEHOLDER, Planned, Tenant};
 use super::result::{
-    Distribution, EnduranceResult, Occupancy, ProfileEcho, Reconciliation, Resources, RunMeta,
-    Segment, Span, Throughput, Trend, Upstream, Workload,
+    Distribution, EnduranceResult, Fingerprints, Occupancy, ProfileEcho, Reconciliation, Resources,
+    RunMeta, Segment, Span, Throughput, Trend, Upstream, Workload,
 };
 use super::sampler::{Finished, Sample, Sampler, USER_HZ};
 use crate::support::capacity::result::{Environment, Percentiles, Verdict};
@@ -105,6 +106,16 @@ const RETAINED_SAMPLES: usize = 100_000;
 /// open segment and released, independently of how long a segment lasts.
 const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
 
+/// How long finished work may sit in memory before it is folded into the open
+/// segment and released. The drain tick, or the segment when a segment is
+/// shorter than the tick — never the segment when it is longer, which is the
+/// whole point: what the driver holds is bounded by a quarter of a second of
+/// traffic whether the manifest segments the run every 2.5 seconds or every
+/// fifteen minutes.
+pub fn drain_interval(segment_ms: u64) -> Duration {
+    DRAIN_INTERVAL.min(Duration::from_millis(segment_ms.max(1)))
+}
+
 /// Only one profile offers load at a time: two runs on one host measure each
 /// other's contention, and the artifact would still read as an envelope.
 fn load_lock() -> &'static Mutex<()> {
@@ -164,14 +175,43 @@ struct Attempt {
     stream_lifetime_ms: Option<f64>,
 }
 
-/// Run `profile` at `tier` and return its result artifact.
+/// Run `profile` at `tier` and return its result artifact, taking the duration
+/// override from the environment and writing under the profile's own name.
 pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> EnduranceResult {
+    let dispatched = std::env::var(DURATION_ENV).ok();
+    let dispatch = Dispatch {
+        duration_ms: dispatched.as_deref(),
+        stem: &profile.id,
+    };
+    run_with(profile, tier, manifest_text, dispatch).await
+}
+
+/// How a run was dispatched. The duration override is passed rather than read
+/// so a test can offer both tiers in one process without touching the
+/// environment of a running program, and the stem keeps a regression run's
+/// artifacts from overwriting the tier's qualifying ones.
+#[derive(Clone, Copy)]
+pub struct Dispatch<'a> {
+    pub duration_ms: Option<&'a str>,
+    pub stem: &'a str,
+}
+
+/// Run `profile` at `tier` as `dispatch` asks, and return its result artifact.
+pub async fn run_with(
+    profile: &Profile,
+    tier: Tier,
+    manifest_text: &str,
+    dispatch: Dispatch<'_>,
+) -> EnduranceResult {
     let _offering = load_lock().lock().await;
     let mut scale = *profile.scale(tier);
-    let requested = requested_duration(&scale, tier, std::env::var(DURATION_ENV).ok().as_deref());
+    let requested = requested_duration(&scale, tier, dispatch.duration_ms);
     // Recorded on the artifact, not just used: a dispatched run at a shorter
-    // duration is segmented to match, and the echo has to say what it was.
+    // duration is segmented to match, and the echo has to say what it was. Both
+    // fields move together — an echo carrying the manifest's twelve hours beside
+    // a segment length sized for five describes a run that never happened.
     scale.segment_ms = segment_ms(&scale, requested);
+    scale.duration_ms = requested.duration.as_millis() as u64;
 
     let key_dir = key_dir(profile, tier);
     let (tenants, tenant_config) = plan::tenants(&key_dir);
@@ -192,7 +232,10 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Enduranc
     environment.manifest.path = super::manifest::MANIFEST_RELATIVE.to_owned();
 
     let samples_path =
-        EnduranceResult::directory(tier).join(format!("{}.samples.jsonl", profile.id));
+        EnduranceResult::directory(tier).join(format!("{}.samples.jsonl", dispatch.stem));
+    let ledger = Ledger::create(
+        &EnduranceResult::directory(tier).join(format!("{}-fingerprints", dispatch.stem)),
+    );
     let sampler = Sampler::start(
         gateway.pid(),
         Duration::from_millis(scale.sample_interval_ms.max(1)),
@@ -228,7 +271,7 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Enduranc
     // The driver's own handle would keep the channel open past the last worker.
     drop(tx);
 
-    let mut aggregate = Aggregate::new(scale.segment_ms);
+    let mut aggregate = Aggregate::new(scale.segment_ms, ledger);
     // Close each segment on its boundary while the load continues, so a run
     // that is killed at hour eleven has already summarised eleven hours.
     let segment = Duration::from_millis(scale.segment_ms);
@@ -236,14 +279,15 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Enduranc
     // Folded on a short tick rather than on the boundary: a fifteen-minute
     // segment of finished attempts and parsed usage records waiting in memory
     // is the accumulation this harness exists to detect, in the harness.
-    let mut tick = started + DRAIN_INTERVAL.min(segment);
+    let drain_every = drain_interval(scale.segment_ms);
+    let mut tick = started + drain_every;
     while Instant::now() < deadline {
         let until = tick.min(boundary).min(deadline);
         tokio::time::sleep_until(until.into()).await;
         aggregate.drain(&mut rx, &sampler, &gateway, &gauges);
         let now = Instant::now();
         while tick <= now {
-            tick += DRAIN_INTERVAL.min(segment);
+            tick += drain_every;
         }
         if now >= boundary {
             aggregate.close_segment(started.elapsed());
@@ -254,6 +298,11 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Enduranc
     for worker in workers {
         worker.await.expect("an endurance worker does not panic");
     }
+    // The callers are gone, so their connections should be too. Held open, the
+    // driver's idle pool would keep tens of inbound sockets alive well past the
+    // quiesce, and the settled descriptor reading would be measuring the
+    // harness rather than what the replica failed to give back.
+    drop(client);
     let elapsed = started.elapsed();
     aggregate.drain(&mut rx, &sampler, &gateway, &gauges);
     // The tail of the run, closed while it still counts as offered load: a
@@ -282,6 +331,7 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Enduranc
         aggregate,
         finished,
         &samples_path,
+        drain_every,
         started_at,
         elapsed,
         &gauges,
@@ -591,14 +641,20 @@ struct Aggregate {
     ttft: Reservoir,
     lifetime: Reservoir,
     planned_status_counts: BTreeMap<String, u64>,
-    seen: HashSet<u64>,
+    /// Request-id fingerprints, spilled to disk rather than held: identity over
+    /// a twelve-hour run is millions of ids, and a set of them is the growth
+    /// this harness exists to detect.
+    ledger: Ledger,
     records_observed: u64,
-    duplicates: u64,
     unidentified: u64,
     unexpected_statuses: u64,
     by_status: BTreeMap<String, u64>,
     by_namespace: BTreeMap<String, u64>,
     by_credential_source: BTreeMap<String, u64>,
+    /// How many times the driver folded and released what it was holding.
+    /// Recorded because "bounded independently of the segment length" is a
+    /// claim about this number, not about the segment count beside it.
+    drains: u64,
     /// Open segment, reset at each boundary.
     open: OpenSegment,
     /// Whether the workers are still offering. Cleared once they have stopped,
@@ -628,7 +684,7 @@ struct OpenSegment {
 }
 
 impl Aggregate {
-    fn new(segment_ms: u64) -> Self {
+    fn new(segment_ms: u64, ledger: Ledger) -> Self {
         Self {
             segment_ms,
             segments: Vec::new(),
@@ -652,14 +708,14 @@ impl Aggregate {
             ttft: Reservoir::new(),
             lifetime: Reservoir::new(),
             planned_status_counts: BTreeMap::new(),
-            seen: HashSet::new(),
+            ledger,
             records_observed: 0,
-            duplicates: 0,
             unidentified: 0,
             unexpected_statuses: 0,
             by_status: BTreeMap::new(),
             by_namespace: BTreeMap::new(),
             by_credential_source: BTreeMap::new(),
+            drains: 0,
             open: OpenSegment::default(),
             under_load: true,
             rss_peak: 0,
@@ -678,6 +734,7 @@ impl Aggregate {
         gateway: &Axond,
         gauges: &Gauges,
     ) {
+        self.drains += 1;
         while let Ok(attempt) = rx.try_recv() {
             self.absorb_attempt(&attempt);
         }
@@ -786,17 +843,13 @@ impl Aggregate {
 
     /// Reconcile one usage record. Identity is `request_id`, which is globally
     /// unique, so a repeat is a duplicate rather than a coincidence; the ids
-    /// themselves are held as hashes, because a twelve-hour run settles more of
-    /// them than the harness should keep as strings.
+    /// themselves are fingerprinted and spilled to the ledger, because a
+    /// twelve-hour run settles more of them than the harness may hold.
     fn absorb_record(&mut self, record: &Value) {
         self.records_observed += 1;
         self.open.usage_records += 1;
         match record["request_id"].as_str() {
-            Some(id) => {
-                if !self.seen.insert(fingerprint(id)) {
-                    self.duplicates += 1;
-                }
-            }
+            Some(id) => self.ledger.record(fingerprint(id)),
             None => self.unidentified += 1,
         }
         let status = record["status"].as_str().unwrap_or("unknown").to_owned();
@@ -940,6 +993,7 @@ fn assemble(
     aggregate: Aggregate,
     finished: Finished,
     samples_path: &Path,
+    drain_every: Duration,
     started_at: SystemTime,
     elapsed: Duration,
     gauges: &Gauges,
@@ -948,7 +1002,7 @@ fn assemble(
     let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
     let resources = resources(&aggregate, &finished, scale, elapsed);
     let trend = trend(&aggregate.segments, scale);
-    let distinct = aggregate.seen.len() as u64;
+    let tally = aggregate.ledger.tally();
     EnduranceResult {
         schema_version: RESULT_SCHEMA_VERSION,
         profile: ProfileEcho::new(profile, tier, scale),
@@ -958,6 +1012,8 @@ fn assemble(
             requested.duration.as_millis() as u64,
             requested.source,
             relative_to_workspace(samples_path),
+            drain_every.as_millis() as u64,
+            aggregate.drains,
         ),
         environment,
         workload: Workload {
@@ -995,15 +1051,16 @@ fn assemble(
         reconciliation: Reconciliation {
             expected: aggregate.settling,
             records_observed: aggregate.records_observed,
-            distinct_request_ids: distinct,
-            duplicates: aggregate.duplicates,
-            missing: aggregate.settling.saturating_sub(distinct),
+            distinct_request_ids: tally.distinct,
+            duplicates: tally.duplicates,
+            missing: aggregate.settling.saturating_sub(tally.distinct),
             unexpected_statuses: aggregate.unexpected_statuses,
             unidentified: aggregate.unidentified,
             by_status: aggregate.by_status.clone(),
             by_namespace: aggregate.by_namespace.clone(),
             by_credential_source: aggregate.by_credential_source.clone(),
             planned_status_counts: aggregate.planned_status_counts.clone(),
+            fingerprints: fingerprints(&tally),
         },
         upstream,
         segments: aggregate.segments,
@@ -1250,7 +1307,7 @@ async fn await_usage_records(gateway: &Axond, aggregate: &mut Aggregate, expecte
         for record in gateway.drain_usage_records() {
             aggregate.absorb_record(&record);
         }
-        if aggregate.seen.len() as u64 >= expected || Instant::now() >= deadline {
+        if aggregate.ledger.recorded() >= expected || Instant::now() >= deadline {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1266,6 +1323,19 @@ async fn await_closed_upstreams(upstream: &FakeUpstream) -> i64 {
             return open;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// How duplicate detection was done, kept beside the count it produced: a
+/// reconciliation that says nothing was duplicated is only worth as much as
+/// the method that looked.
+fn fingerprints(tally: &Tally) -> Fingerprints {
+    Fingerprints {
+        recorded: tally.recorded,
+        shards: tally.shards,
+        peak_shard_fingerprints: tally.peak_shard_fingerprints,
+        exact: true,
+        path: relative_to_workspace(&tally.directory),
     }
 }
 
