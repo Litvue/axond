@@ -1113,11 +1113,13 @@ async fn publish(
     // constrains them: a project names its tenant and a principal names the
     // tenant and project it is scoped to, through foreign keys among these three
     // tables, so a cross-tenant grant is unwritable rather than merely
-    // unvalidated. The journal rows below carry no such key by design — 0002
-    // explains why, and a pre-0002 revision with no projected owner is
-    // republishable because of it — so their ownership is checked in the domain
-    // alone. Same transaction either way, so "projected" and "published" cannot
-    // come apart.
+    // unvalidated. The journal rows below name their tenant under a key too, since
+    // 0004 — which is why the projection runs first, and why it records an owner
+    // for a tenant only history names (see [`record_referenced_tenants`]): the key
+    // is satisfied for a rolled-back pre-tenancy revision instead of refusing it.
+    // A journal row's *project* is still checked in the domain alone; 0004 says
+    // why. Same transaction either way, so "projected" and "published" cannot come
+    // apart.
     project_tenancy(transaction, id, candidate).await?;
 
     for resource in candidate.state.resources() {
@@ -1346,6 +1348,8 @@ async fn project_tenancy(
             })?;
     }
 
+    record_referenced_tenants(transaction, &revision, candidate).await?;
+
     let declared: Vec<String> = directory
         .principals()
         .map(|principal| principal.body.principal().to_string())
@@ -1439,6 +1443,62 @@ async fn project_tenancy(
         .execute("SET CONSTRAINTS ALL IMMEDIATE", &[])
         .await
         .map_err(|error| projection_failure("settle names and identities", "name", "", &error))?;
+    Ok(())
+}
+
+/// Record an owner row for every tenant this revision's journal rows name and its
+/// tenancy does not declare.
+///
+/// Schema 0004 points foreign keys from the journal tables at `axond_cp_tenant`,
+/// so "a stored row cannot name a tenant this deployment has no row for" is a
+/// database fact rather than a service-layer convention. The keys are `NOT VALID`,
+/// which exempts rows written before they existed and checks every row written
+/// after — including the rows a *rollback* writes. A revision published by a
+/// pre-tenancy build declares no tenant and still carries tenant-scoped resources,
+/// and #142's replica compiles those revisions into routing state today, so
+/// republishing one has to keep working.
+///
+/// It keeps working because the owner is recorded here, at `lifecycle =
+/// 'deleted'`: the vocabulary's own word for a tenant that is neither served nor
+/// administrable, which is exactly what an undeclared tenant is
+/// ([`Tenancy::is_served`] is `false` for one, and so is administrability). The
+/// row says "referenced by history, declared by nothing" — it is not a tenant
+/// anybody granted, it holds no name against the exclusion constraint, which
+/// ignores deleted rows, and it cannot be administered into one without a revision
+/// declaring it.
+///
+/// `ON CONFLICT DO NOTHING` is what keeps that safe for tenants that *are*
+/// declared, here or by an earlier revision: an existing row is never rewritten by
+/// this step, so a rollback to a pre-tenancy revision still retires nothing and a
+/// live tenant is never demoted by history mentioning it.
+async fn record_referenced_tenants(
+    transaction: &Transaction<'_>,
+    revision: &str,
+    candidate: &RevisionCandidate,
+) -> Result<(), ControlPlaneError> {
+    let mut referenced: Vec<String> = candidate
+        .state
+        .resources()
+        .filter_map(|resource| rows::scope_columns(&resource.scope).tenant)
+        .chain(rows::scope_columns(&candidate.mutation.scope).tenant)
+        .chain(rows::actor_columns(&candidate.mutation.actor).tenant)
+        .chain(rows::actor_columns(&candidate.audit.actor).tenant)
+        .collect();
+    referenced.sort_unstable();
+    referenced.dedup();
+    if referenced.is_empty() {
+        return Ok(());
+    }
+    transaction
+        .execute(
+            "INSERT INTO axond_cp_tenant (tenant_id, slug, lifecycle, revision_id) \
+             SELECT referenced, referenced, 'deleted', $2 \
+             FROM unnest($1::text[]) AS referenced \
+             ON CONFLICT (tenant_id) DO NOTHING",
+            &[&referenced, &revision],
+        )
+        .await
+        .map_err(|error| projection_failure("record referenced tenants", "tenant", "", &error))?;
     Ok(())
 }
 
@@ -2739,12 +2799,20 @@ mod tests {
 
         // And a contradiction of it, as a restored backup or a manual `UPDATE`
         // produces one: the row now sits in a project whose tenant is not the one
-        // it names.
+        // it names. The stranger is given a tenant row first, because 0004's key
+        // refuses a journal row naming a tenant that has none — which is the point
+        // of that key, and is also why the corruption this test is about has to be
+        // the one the database does not answer: whether the *project* belongs to
+        // the tenant beside it.
         let stranger = tenant_id(11);
         store
             .corrupt_with(&format!(
-                "UPDATE axond_cp_resource_version SET tenant_id = '{stranger}' \
-                 WHERE scope_kind = 'project'"
+                "INSERT INTO axond_cp_tenant (tenant_id, slug, lifecycle, revision_id) \
+                 VALUES ('{stranger}', 'stranger', 'active', '{}') \
+                 ON CONFLICT (tenant_id) DO NOTHING; \
+                 UPDATE axond_cp_resource_version SET tenant_id = '{stranger}' \
+                 WHERE scope_kind = 'project'",
+                second.id
             ))
             .await;
         let error = store
@@ -4523,6 +4591,156 @@ mod tests {
         assert!(refusal.to_string().contains("check"), "{refusal}");
     }
 
+    /// The other half of that property, on the tables that hold history.
+    ///
+    /// 0002 left the journal out because a revision an older build published has
+    /// tenant-scoped rows and no owner rows, and a key would have refused to
+    /// republish it. 0004 adds the keys `NOT VALID`, which is the honest statement
+    /// of what they cover: every row written from now on, and none of the ones that
+    /// predate them. This asserts both halves — the keys are there and unvalidated,
+    /// and a new row naming a tenant this deployment has no row for is refused by
+    /// the database rather than by a service-layer check somebody can skip.
+    #[tokio::test]
+    async fn a_journal_row_cannot_name_a_tenant_this_deployment_has_no_row_for() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        store
+            .publish_revision(candidate(
+                ExpectedRevision::Empty,
+                "directory",
+                state_with_directory(),
+            ))
+            .await
+            .expect("a revision declaring a directory publishes");
+        assert_eq!(
+            store
+                .column(
+                    "SELECT conname::text FROM pg_constraint \
+                     WHERE contype = 'f' AND NOT convalidated \
+                     AND connamespace = current_schema()::regnamespace \
+                     ORDER BY conname"
+                )
+                .await,
+            vec![
+                "axond_cp_audit_event_actor_tenant_fkey",
+                "axond_cp_mutation_actor_tenant_fkey",
+                "axond_cp_mutation_tenant_fkey",
+                "axond_cp_resource_version_tenant_fkey",
+            ],
+            "the unvalidated keys are the journal's, and validation is not pending on others"
+        );
+
+        let stranger = tenant_id(11);
+        let refusal = store
+            .attempt(&format!(
+                "INSERT INTO axond_cp_resource_version \
+                 (resource_kind, resource_id, version, scope_kind, tenant_id, slug, body_form, \
+                 body_inline, content_checksum, serializer) \
+                 VALUES ('alias', '{}', 1, 'tenant', '{stranger}', 'smuggled', 'inline', \
+                 '\\x7b7d'::bytea, {DIGEST}, 'json')",
+                crate::desired_state::ResourceId::new(uuid(46))
+            ))
+            .await
+            .expect_err("a stored version needs a tenant this deployment has a row for");
+        assert!(
+            refusal
+                .to_string()
+                .contains("axond_cp_resource_version_tenant_fkey"),
+            "{refusal}"
+        );
+
+        // And the attribution half: a change *by* a tenant nothing declares is
+        // attribution nobody can follow up on, so it is not recordable either.
+        let refusal = store
+            .attempt(&format!(
+                "INSERT INTO axond_cp_mutation \
+                 (mutation_id, actor_kind, actor_tenant_id, actor_principal_id, mutation_kind, \
+                 scope_kind, tenant_id, idempotency_key, submitted_at) \
+                 VALUES ('{}', 'workload', '{stranger}', '{}', 'publish', 'tenant', '{}', \
+                 'smuggled', now())",
+                MutationId::new(uuid(47)),
+                PrincipalId::new(uuid(48)),
+                tenant_id(1)
+            ))
+            .await
+            .expect_err("attribution names a tenant that exists");
+        assert!(
+            refusal.to_string().contains("actor_tenant_fkey"),
+            "{refusal}"
+        );
+    }
+
+    /// Which is republishable because the owner is recorded, not invented.
+    ///
+    /// A revision a pre-tenancy build published declares no tenant and still
+    /// carries tenant-scoped resources. The projection records the owner those rows
+    /// name at `lifecycle = 'deleted'` — referenced by history, declared by nothing
+    /// — so the key is satisfied without a live tenant appearing that no revision
+    /// granted. Declaring it later is what makes it a tenant; rolling back to the
+    /// pre-tenancy revision afterwards demotes nobody.
+    #[tokio::test]
+    async fn a_revision_naming_an_undeclared_tenant_records_that_owner_as_deleted() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let owner = tenant_id(1);
+        let first = store
+            .publish_revision(candidate(
+                ExpectedRevision::Empty,
+                "pre-tenancy",
+                state_a_pre_tenancy_build_published(),
+            ))
+            .await
+            .expect("a revision without owner rows publishes");
+        assert_eq!(
+            store
+                .column("SELECT lifecycle FROM axond_cp_tenant ORDER BY tenant_id")
+                .await,
+            vec!["deleted"],
+            "an owner history names is not a tenant anybody granted"
+        );
+        assert_eq!(
+            store
+                .column("SELECT slug FROM axond_cp_tenant ORDER BY tenant_id")
+                .await,
+            vec![owner.to_string()],
+            "a recorded owner holds no name a declared tenant could want, being deleted"
+        );
+
+        let second = store
+            .publish_revision(candidate(
+                ExpectedRevision::Exactly(first.id),
+                "declared",
+                state(),
+            ))
+            .await
+            .expect("declaring the tenant the history named publishes");
+        assert_eq!(
+            store
+                .column("SELECT lifecycle || ' ' || slug FROM axond_cp_tenant")
+                .await,
+            vec!["active acme"],
+            "declaring a recorded owner is what turns it into a tenant"
+        );
+
+        store
+            .publish_revision(candidate(
+                ExpectedRevision::Exactly(second.id),
+                "rolled back",
+                state_a_pre_tenancy_build_published(),
+            ))
+            .await
+            .expect("a rollback to the pre-tenancy revision publishes");
+        assert_eq!(
+            store
+                .column("SELECT lifecycle || ' ' || slug FROM axond_cp_tenant")
+                .await,
+            vec!["active acme"],
+            "recording an owner rewrote a live tenant, which a rollback must never do"
+        );
+    }
+
     /// A refusal names the rule, and never the row it collided with.
     ///
     /// The identity constraints carry sign-ins and key digests, and PostgreSQL's
@@ -4706,15 +4924,16 @@ mod tests {
         let Some((store, _, _)) = journal().await else {
             return;
         };
-        // Both of them, in order: 0002 declares the tenancy tables and 0003
-        // replaces the rules it got wrong, so a hand-run upgrade is the pair.
-        let tenancy: Vec<_> = schema::MIGRATIONS
+        // All of them, in order: 0002 declares the tenancy tables, 0003 replaces
+        // the rules it got wrong and 0004 keys the journal, so a hand-run upgrade
+        // is the set rather than any one of them.
+        let upgrade: Vec<_> = schema::MIGRATIONS
             .iter()
-            .filter(|migration| migration.name.contains("tenancy"))
+            .filter(|migration| migration.version > 1)
             .collect();
-        assert_eq!(tenancy.len(), 2, "the tenancy migrations ship");
+        assert_eq!(upgrade.len(), 3, "the upgrade migrations ship");
 
-        for migration in &tenancy {
+        for migration in &upgrade {
             store
                 .attempt(migration.sql)
                 .await
