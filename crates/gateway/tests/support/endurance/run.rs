@@ -357,7 +357,11 @@ pub struct Requested {
 /// leave a dispatched forty-minute run with three of the eight segments it is
 /// gated on would fail it for being short rather than for anything it measured.
 fn segment_ms(scale: &Scale, requested: Requested) -> u64 {
-    let fitting = requested.duration.as_millis() as u64 / scale.thresholds.min_segments.max(1);
+    // One segment more than the gate asks for. Dividing by the gate exactly
+    // would put the last boundary on the deadline, so a dispatched run would
+    // fail its segment count for losing a millisecond rather than for anything
+    // it measured.
+    let fitting = requested.duration.as_millis() as u64 / (scale.thresholds.min_segments + 1);
     scale.segment_ms.min(fitting).max(1)
 }
 
@@ -1307,7 +1311,10 @@ async fn await_usage_records(gateway: &Axond, aggregate: &mut Aggregate, expecte
         for record in gateway.drain_usage_records() {
             aggregate.absorb_record(&record);
         }
-        if aggregate.ledger.recorded() >= expected || Instant::now() >= deadline {
+        // Distinct, not total: a run that repeats a record has not accounted
+        // for a request twice, and stopping on the total would report the
+        // records still in flight as lost on top of the duplicate.
+        if aggregate.ledger.distinct_at_least() >= expected || Instant::now() >= deadline {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
