@@ -11,7 +11,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 CONFIG=.github/dependabot.yml
-REPOSITORY="${GITHUB_REPOSITORY:-Litvue/axond}"
+# Dependabot only ever reads this configuration on the repository that owns it, so
+# the labels only have to exist there. A fork's labels are not copied on fork and
+# have no bearing on the upstream pin bumps.
+UPSTREAM=Litvue/axond
+REPOSITORY="${GITHUB_REPOSITORY:-$UPSTREAM}"
+
+# Whether this checkout is the one whose Dependabot configuration is at stake.
+is_upstream() {
+    [[ $1 == "$UPSTREAM" ]]
+}
 
 # The labels are the `- value` entries indented under a `labels:` key. Anything
 # that starts at or left of the key itself ends the block, list items included:
@@ -97,6 +106,17 @@ YAML
         problems=1
     fi
 
+    # A fork runs this same required lane, and must not fail on a label that only
+    # matters where Dependabot runs.
+    if ! is_upstream "$UPSTREAM"; then
+        echo "self-test: $UPSTREAM was not recognised as the upstream repository" >&2
+        problems=1
+    fi
+    if is_upstream "contributor/axond"; then
+        echo "self-test: a fork was treated as the upstream repository" >&2
+        problems=1
+    fi
+
     if ((problems)); then
         return 1
     fi
@@ -125,6 +145,12 @@ fi
 
 if ((${#labels[@]} == 0)); then
     echo "$CONFIG applies no labels; nothing to verify"
+    exit 0
+fi
+
+if ! is_upstream "$REPOSITORY"; then
+    echo "skipping the label check: Dependabot reads $CONFIG on $UPSTREAM, not $REPOSITORY"
+    echo "labels $UPSTREAM needs: ${labels[*]}"
     exit 0
 fi
 

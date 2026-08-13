@@ -298,7 +298,11 @@ just actionlint        # workflow linting; downloads the pinned actionlint
 
 Everything in that lane is offline except the label check
 ([`ops/dependabot-labels.sh`](../../ops/dependabot-labels.sh)), which needs an
-authenticated `gh` and reports that it skipped when there is none. On CI it uses
+authenticated `gh` and reports that it skipped when there is none. It also skips
+outside `Litvue/axond` — labels are not copied when a repository is forked, and
+Dependabot only ever reads this configuration where it lives, so a fork running
+the same required lane would otherwise fail on a label that cannot matter to it.
+On CI it uses
 the job's own `github.token` for a read-only label query and prints what it
 verified, so the lane carries its own evidence:
 
