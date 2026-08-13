@@ -1586,6 +1586,58 @@ async fn the_router_requires_preconditions_before_a_handler_runs() {
     assert_eq!(store.published_revisions(), 0);
 }
 
+/// One path, one spec per method: preconditions are keyed to a spec's action, so
+/// a reader sharing a path with a writer must not inherit the writer's headers,
+/// and the writer must not lose them.
+#[tokio::test]
+async fn a_path_that_answers_two_verbs_keeps_each_methods_preconditions() {
+    let store = Arc::new(InMemoryControlPlane::new());
+    let specs = || {
+        vec![
+            AdminRouteSpec {
+                path: "/thing",
+                action: AdminAction::ReadState,
+                router: || get(read_state),
+            },
+            AdminRouteSpec {
+                path: "/thing",
+                action: AdminAction::Publish,
+                router: || post(publish),
+            },
+        ]
+    };
+    let authorization = format!("Bearer {HUMAN_TOKEN}");
+
+    let response = mount(api(Some(store.clone())), specs())
+        .oneshot(
+            Request::get(format!("{ADMIN_PREFIX}/thing"))
+                .header(axum::http::header::AUTHORIZATION, &authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("a response");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the read was asked for a mutation's headers"
+    );
+
+    let response = mount(api(Some(store.clone())), specs())
+        .oneshot(
+            Request::post(format!("{ADMIN_PREFIX}/thing"))
+                .header(axum::http::header::AUTHORIZATION, &authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("a response");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "idempotency_key_required");
+    assert_eq!(store.published_revisions(), 0);
+}
+
 #[tokio::test]
 async fn an_authenticated_human_publishes_and_reads_through_the_router() {
     let store = Arc::new(InMemoryControlPlane::new());

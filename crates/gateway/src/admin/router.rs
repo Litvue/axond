@@ -124,6 +124,14 @@ impl AdminApi {
 /// The action is declared here rather than derived from the path, because it is
 /// what the authorizer decides on and what the middleware reads to know whether
 /// the route mutates.
+///
+/// One action, and therefore one method per spec: precondition parsing is keyed
+/// to this action, so a spec whose router combined `get(read).post(publish)`
+/// would either demand an idempotency key of its reader or let its writer
+/// publish without one. A path that answers both registers two specs on the same
+/// path — mounting merges them and each keeps its own layer, which is what makes
+/// "every mutating route parses its preconditions" hold per method rather than
+/// per path.
 pub struct AdminRouteSpec {
     /// Path *within* [`ADMIN_PREFIX`], so no spec can register itself outside the
     /// administrative surface.
