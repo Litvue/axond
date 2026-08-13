@@ -38,6 +38,7 @@ OVERRIDES = ROOT / "ops/api-compat-overrides.toml"
 OVERRIDE_KEYS = {"crate", "baseline", "justification", "reviewed_in"}
 LIBRARY_KINDS = {"lib", "rlib", "dylib", "cdylib", "proc-macro"}
 CHECKING = re.compile(r"^\s*Checking (\S+) v(\S+) -> v(\S+)", re.MULTILINE)
+CSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 TABLE = re.compile(r"\[\[break\]\]\s*(?:#.*)?")
 KEY_VALUE = re.compile(r'([A-Za-z0-9_-]+)\s*=\s*"([^"]*)"\s*(?:#.*)?')
 
@@ -138,7 +139,22 @@ def load_overrides(crates: list[str]) -> list[dict[str, str]]:
     return overrides
 
 
-def check(crate: str) -> tuple[bool, str | None, str]:
+def baseline_of(output: str) -> str | None:
+    """The published version `cargo-semver-checks` actually compared against.
+
+    It is read from the progress line rather than from crates.io, so that an
+    override names the same version the gate reports. Cargo renders that line for
+    a terminal and CI asks it to keep doing so (`CARGO_TERM_COLOR: always`), so
+    every CSI sequence comes off first — colour, and the erase/cursor moves
+    progress rendering also emits — and a carriage return counts as a line start
+    like a newline. With any of those left in, the line does not match and a real
+    break looks like a comparison that never happened, which no override can name.
+    """
+    matched = CHECKING.search(CSI.sub("", output).replace("\r", "\n"))
+    return matched.group(2) if matched else None
+
+
+def check(crate: str) -> tuple[bool, str, str]:
     """Run the semver check for one crate; return (passed, baseline, output)."""
     completed = subprocess.run(
         [
@@ -156,14 +172,16 @@ def check(crate: str) -> tuple[bool, str | None, str]:
         check=False,
     )
     print(completed.stdout, end="")
-    matched = CHECKING.search(completed.stdout)
-    baseline = matched.group(2) if matched else None
-    if completed.returncode != 0 and baseline is None:
-        # The tool failed before it could compare anything (no network, a build
-        # error, an unpublished crate). That is not an override-able break.
+    baseline = baseline_of(completed.stdout)
+    if baseline is None:
+        # Either the tool failed before it could compare anything (no network, a
+        # build error, an unpublished crate), or it compared and this gate could
+        # not read which version against. Neither is an override-able break, and
+        # a pass whose baseline is unknown is not evidence: an override could
+        # never name that baseline.
         raise SystemExit(
-            f"cargo semver-checks could not compare {crate} against a published "
-            "baseline; fix the invocation rather than overriding it"
+            f"cargo semver-checks did not report a published baseline for "
+            f"{crate}; fix the invocation rather than overriding it"
         )
     return completed.returncode == 0, baseline, completed.stdout
 
@@ -190,6 +208,18 @@ def self_test() -> int:
         }
     ], parsed
     assert parse_overrides("# only a comment\n", "self-test") == []
+    # The baseline an override has to name is read from styled output too, which
+    # is what CI produces.
+    for line in (
+        "    Checking gateway-core v0.3.21 -> v0.3.22 (minor change)\n",
+        # Colour, which `CARGO_TERM_COLOR: always` keeps in the CI log.
+        "\x1b[1m\x1b[32m    Checking\x1b[0m gateway-core v0.3.21 -> v0.3.22\n",
+        # Progress rendering: erase the line, redraw it after a carriage return.
+        "\x1b[2K\r\x1b[32m    Checking\x1b[0m gateway-core v0.3.21 -> v0.3.22\r",
+        "\x1b[1A\x1b[2K    Checking gateway-core v0.3.21 -> v0.3.22\n",
+    ):
+        assert baseline_of(line) == "0.3.21", line
+    assert baseline_of("error: no such package\n") is None
     for bad in (
         '[[allow]]\ncrate = "gateway-core"\n',  # a table that is not a break
         'crate = "gateway-core"\n',  # a key outside any table
