@@ -1,4 +1,4 @@
-# 46. Callable offering identity: keying the normalized model projection
+# 47. Callable offering identity: keying the normalized model projection
 
 Date: 2026-08-12
 
