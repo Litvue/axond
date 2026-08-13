@@ -204,10 +204,14 @@ and loses the active snapshot.
    being served), `catalogue.active_age_ms`, `catalogue.consecutive_refusals`,
    and `catalogue.last_refusal`. Tenant-scoped responses do not: a tenant sees
    only that the `catalogue` component is healthy or degraded.
-3. **Find the location.** The refusal's log line carries the JSON Pointer into
-   the payload and the typed error the parser produced. That pointer is the
-   whole diagnosis for a schema, price, or identifier refusal; it is deliberately
-   absent from metrics and from the status response, where it would be unbounded.
+3. **Find the location.** The refusal's log line carries the typed error the
+   parser produced, and a JSON Pointer into the payload whenever the refusal was
+   decided at one location: that pointer is the whole diagnosis for a `price`,
+   `identifier`, `id_mismatch`, or modality/status refusal. A `not_json`,
+   `schema`, or `content` refusal names no single location — the deserializer's
+   line and column in the message text is the lead there. The pointer is
+   deliberately absent from metrics and from the status response, where it would
+   be unbounded.
 4. **Decide by age, not by the alert.** Age is when this gateway last confirmed
    the content current — an import or a `304`, not a retrieval time the document
    claims — so a freshly imported offline seed reads as fresh
