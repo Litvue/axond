@@ -472,7 +472,8 @@ default, which [the shipped
 pipeline](../../ops/observability/otel-collector.yaml) leaves alone. Raise that
 key above the rule's ten-minute window and the series never lapses, which
 silently disables the rule rather than making it noisy. Widen the window with it
-if you raise it.
+if you raise it — the gate holds the shipped pair to that relation, so the two
+files cannot be edited apart.
 
 Dots become underscores and nothing else is appended: no `_total` on counters and
 no unit suffix. With the exporter's default `add_metric_suffixes: true` you get
