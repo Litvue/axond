@@ -146,7 +146,11 @@ def check_signer_identity(text: str, relative: str) -> list[str]:
     # shadows the workflow-level one, so an unanchored override widens what
     # `cosign verify` accepts even when an anchored line remains in the file.
     for number, line in enumerate(lines, 1):
-        if "SIGNER_IDENTITY:" not in line or ANCHORED_IDENTITY.match(line):
+        # A comment discussing the setting configures nothing, and these workflows
+        # explain the identity in prose next to it.
+        if "SIGNER_IDENTITY:" not in line or line.lstrip().startswith("#"):
+            continue
+        if ANCHORED_IDENTITY.match(line):
             continue
         failures.append(
             f"{relative}:{number}: SIGNER_IDENTITY must be an anchored regular "
@@ -260,6 +264,13 @@ def self_test() -> list[str]:
             + "env:\n  SIGNER_IDENTITY: ^https://github\\.com/o/r@refs/heads/main$\n"
             "jobs:\n  a:\n    env:\n      SIGNER_IDENTITY: https://github.com/o/r\n",
             "anchored regular",
+        ),
+        (
+            "a comment about the signer identity",
+            SELF_TEST_PERMISSIONS
+            + "env:\n  SIGNER_IDENTITY: ^https://github\\.com/o/r@refs/heads/main$\n"
+            "  # SIGNER_IDENTITY: stays anchored so another ref cannot satisfy it\n",
+            "",
         ),
         (
             "one workflow disagreeing with itself about a pin",
