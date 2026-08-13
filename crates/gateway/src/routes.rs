@@ -1563,7 +1563,7 @@ async fn dispatch_with_failover(
         // the last one; the streaming relay reports the real first chunk.
         let ttft_ms = attempt.result.is_ok().then_some(latency_ms);
         if let Err(err) = &attempt.result {
-            note_attempt_timeout(&attempt_span, target, err);
+            note_attempt_failure(&attempt_span, target, err);
         }
         telemetry::finish_upstream_attempt(
             &attempt_span,
@@ -2012,7 +2012,7 @@ async fn stream_with_failover(
                     continue;
                 }
                 Err(err) => {
-                    note_attempt_timeout(span, target, &err);
+                    note_attempt_failure(span, target, &err);
                     record_target_failure(&snapshot, target, &circuit_key, &err);
                     let has_next = index + 1 < walk.total
                         && walk.attempts < max_attempts
@@ -2220,9 +2220,10 @@ fn auth_scheme(kind: ProviderKind) -> AuthScheme {
 }
 
 /// Attribute a failed attempt's timeout class to its span and the timeout
-/// counter. Only the bound is recorded — never the upstream URL, which the
-/// transport has already kept out of the error.
-fn note_attempt_timeout(span: &tracing::Span, target: &Target, err: &TransportError) {
+/// counter, and leave the operator the reason it failed. Only the bound reaches
+/// the span — never the upstream URL, which the transport has already kept out
+/// of the error.
+fn note_attempt_failure(span: &tracing::Span, target: &Target, err: &TransportError) {
     if let Some(kind) = err.timeout_kind() {
         let bound = err
             .timeout_bound()
@@ -2242,7 +2243,19 @@ fn note_attempt_timeout(span: &tracing::Span, target: &Target, err: &TransportEr
             timeout_bound = bound,
             "upstream attempt exceeded a transport bound"
         );
+        return;
     }
+    // The caller is told only that the transport failed, so this line is the
+    // one place the reason survives: a DNS failure, a refused connect, and a
+    // TLS handshake failure are the same answer and different incidents. The
+    // endpoint stays here, in the operator's log, where it is already
+    // credential-redacted and where the operator configured it.
+    warn!(
+        provider = %target.provider,
+        model = %target.model,
+        error = %err,
+        "upstream attempt failed on the transport"
+    );
 }
 
 fn record_target_success(snapshot: &ConfigSnapshot, target: &Target, circuit_key: &str) {

@@ -279,6 +279,38 @@ fn a_record_that_settles_late_still_fails_a_row_that_expects_none() {
     );
 }
 
+/// A transport row's caller-facing answer names no endpoint, which leaves the
+/// operator's log as the only surface carrying why the call failed. The row
+/// claims that reason survived, so the claim has to fail when it did not.
+#[test]
+fn the_operator_reason_claim_fails_when_the_log_does_not_carry_it() {
+    let endpoints = vec!["http://127.0.0.1:9931".to_owned()];
+    let retained = |output: &str| fault::run::operator_reason_retained(output, &endpoints);
+
+    assert_eq!(
+        retained(
+            "WARN axond: upstream attempt failed on the transport \
+             error=error sending request for url (http://127.0.0.1:9931/v1/chat/completions)"
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        retained("WARN axond: upstream attempt failed on the transport"),
+        Some(false),
+        "the reason has to name the endpoint the row was pointed at"
+    );
+    assert_eq!(
+        retained("INFO axond: served http://127.0.0.1:9931"),
+        Some(false),
+        "an endpoint alone is not the transport failure being explained"
+    );
+    assert_eq!(
+        fault::run::operator_reason_retained("anything at all", &[]),
+        None,
+        "a row that injects no endpoint of its own claims nothing"
+    );
+}
+
 /// A Postgres row keeps its spend in a run-scoped table, and the store derives
 /// a fence trigger name from that table. Postgres refuses an identifier of 64
 /// characters, so the table name has to leave room for what is derived from it.

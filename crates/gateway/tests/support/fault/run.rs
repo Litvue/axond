@@ -370,6 +370,7 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
             relayed_output_bytes: observed.relayed_output_bytes,
             during_outage_status,
             after_recovery_status: row.fault.recovers().then_some(observed.status).flatten(),
+            operator_reason_retained: operator_reason_retained(&output, &wiring.injected_endpoints),
         },
         deadline: Deadline {
             bound: wiring.bound.to_owned(),
@@ -1104,6 +1105,27 @@ fn scan(
     }
 }
 
+/// Whether the operator was left the reason a transport row's call failed.
+///
+/// The caller is told only that the transport failed — the endpoint `reqwest`
+/// renders into its message names a host the caller never chose — so the
+/// operator's log is the one surface that still has to carry it, and the
+/// leakage scan permits an endpoint there alone. A row that injects no endpoint
+/// of its own has nothing to claim, and returns `None`.
+pub fn operator_reason_retained(output: &str, injected_endpoints: &[String]) -> Option<bool> {
+    if injected_endpoints.is_empty() {
+        return None;
+    }
+    let named = output.contains("failed on the transport");
+    let endpoint = injected_endpoints.iter().any(|endpoint| {
+        endpoint
+            .split_once("://")
+            .map(|(_, authority)| authority.trim_end_matches('/'))
+            .is_some_and(|authority| output.contains(authority))
+    });
+    Some(named && endpoint)
+}
+
 /// The password in a connection string, if it carries one. Only a userinfo
 /// with a `:` has one: a bare username is not a secret, and scanning the
 /// surfaces for `postgres` would report the backend's own name as a leak.
@@ -1219,6 +1241,13 @@ fn judge(row: &Row, mut result: FaultResult, cleaned_up: bool) -> FaultResult {
             result.usage.unattributable_records
         ),
     ));
+    if let Some(retained) = result.classification.operator_reason_retained {
+        verdicts.push(Verdict::holds(
+            "operator_reason_retained",
+            retained,
+            retained.to_string(),
+        ));
+    }
     if expect.usage_records > 0 {
         verdicts.push(Verdict::holds(
             "usage_carries_request_id",

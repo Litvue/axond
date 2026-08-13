@@ -150,6 +150,10 @@ pub struct Classification {
     pub during_outage_status: Option<u16>,
     /// Recovery rows: what the caller saw once it came back.
     pub after_recovery_status: Option<u16>,
+    /// Transport rows: the caller's answer names no endpoint, so the operator's
+    /// log is the only surface left carrying why the call failed. `None` on a
+    /// row that injects no endpoint of its own.
+    pub operator_reason_retained: Option<bool>,
 }
 
 /// Which bound was supposed to end the request, and whether it did.
