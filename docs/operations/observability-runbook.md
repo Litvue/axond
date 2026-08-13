@@ -180,10 +180,12 @@ every probe — an abandoned probe publishes a synthetic `timeout` observation t
   the replica — is the thing to fix.
 - **rounds are slower than the budget.** The age exceeds the budget while still
   being republished, which means a round takes longer than the budget allows —
-  the probe timeout or the refresh interval is above the staleness budget. Those
-  three are fields of the registry's internal settings, not configuration: there
-  is no `[status]` section to edit, so this is a report for whoever wires the
-  refresher rather than a knob you can turn. What you can establish from here is
+  the probe timeout or the refresh interval is above the staleness budget. The
+  three are derived from `[control_plane]` for a stateful replica and are
+  internal settings otherwise; there is no `[status]` section to edit, and the
+  rule's five-minute threshold is above the slowest round any derivation
+  permits, so this is a report about a refresher falling behind rather than a
+  deployment that configured itself into it. What you can establish from here is
   whether the replica is saturated (`axond_admission_in_flight`) or the probes
   are timing out (`axond_status_outcome="failed"`).
 

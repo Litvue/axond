@@ -50,13 +50,13 @@ groups:
           runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#a-dependency-is-impaired"
 
       - alert: AxondStatusObservationsStale
-        expr: "max by (axond_status_component) (axond_status_observation_age) > 120000"
+        expr: "max by (axond_status_component) (axond_status_observation_age) > 300000"
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Cached observations for {{ $labels.axond_status_component }} are over two minutes old"
-          description: "The age is republished each refresh round, so it only climbs past the budget when a round takes longer than the budget - a probe_timeout or refresh_interval above status.staleness_budget. A refresher that stops ticking freezes this gauge instead of raising it; AxondStatusRefresherStalled is the rule for that."
+          summary: "Cached observations for {{ $labels.axond_status_component }} are over five minutes old"
+          description: "Above the slowest round any derived pacing permits, so an age past it is a refresher falling behind rather than a generous [control_plane] operation_timeout_ms. The age is republished each round, so it only climbs when a round takes longer than the threshold; a refresher that stops ticking freezes this gauge instead of raising it, and AxondStatusRefresherStalled is the rule for that."
           runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#dependency-observations-have-gone-stale"
 
       # The companion the age gauge cannot be: every observation is republished

@@ -164,6 +164,20 @@ fn the_derived_cadence_cannot_outrun_the_pipeline_that_watches_it() {
              healthy replica's series lapses and the stall rule pages"
         );
     }
+
+    // The same cap against the other status rule: a round is allowed to take up
+    // to the cap, and the age gauge carries what the round took, so a threshold
+    // at or below it calls a slow-but-configured deployment stale.
+    let stale_threshold: u64 = rules
+        .split_once("(axond_status_observation_age) > ")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .and_then(|(threshold, _)| threshold.trim().parse().ok())
+        .expect("AxondStatusObservationsStale compares the age against a millisecond threshold");
+    assert!(
+        cap < Duration::from_millis(stale_threshold),
+        "a round may take {cap:?} while AxondStatusObservationsStale calls {stale_threshold}ms \
+         stale, so a deployment paced at the cap pages while observing normally"
+    );
 }
 
 /// Cardinality, from the asset side: the only drill-downs offered are the four
