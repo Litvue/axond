@@ -27,11 +27,13 @@ port-forward as the acceptance checks instead.
   GW_SECRET_STORE_KEK, and GW_ADMIN_BREAKGLASS. The KEK must be the deployment's
   existing key material; changing it makes stored ciphertext unrecoverable.
 
-Resolve and verify the image before applying the overlay. The resolver updates
-both production overlays, so scope the check to the one being deployed:
+Resolve and verify the image before applying the overlay. Set
+`RELEASE_VERSION` to the verified release; the resolver updates both production
+overlays, so scope the check to the one being deployed:
 
 ~~~bash
-ops/pin-image-digest.sh 0.3.36 # x-release-please-version
+RELEASE_VERSION=REPLACE_WITH_VERIFIED_RELEASE_VERSION
+ops/pin-image-digest.sh "$RELEASE_VERSION"
 ops/pin-image-digest.sh --check overlays/production-stateful
 SIGNER_IDENTITY=... GITHUB_REPOSITORY=Litvue/axond \
   ops/verify-image-evidence.sh ghcr.io/litvue/axond@sha256:VERIFIED_INDEX_DIGEST
