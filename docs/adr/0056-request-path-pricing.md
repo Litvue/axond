@@ -135,10 +135,13 @@ before any traffic moves onto it.
 Binding a target the approved book does not price takes it out of service (503)
 rather than quietly billing the file's rate. This is the intended failure — an
 unapproved price is a budget the deployment cannot enforce — but it makes a
-binding typo an availability event, so the refusal names the offering, the book,
-and the book's approval state to keep the loop short. An alias with more than one
-target degrades instead: unpriced targets are skipped while any priced one can
-still serve.
+binding typo an availability event. The operator-facing detail names the
+offering and book in logs, while the data-plane response stays the stable typed
+unavailability (`model_not_priced`, or
+`continuation_affinity_unavailable` for a continuation) without price-book
+identity or approval-state internals. An alias with more than one target
+degrades instead: unpriced targets are skipped while any priced one can still
+serve.
 
 Rows written before this change carry no book identity, and rows from a
 file-priced deployment never will. A query that groups by pricing has to treat

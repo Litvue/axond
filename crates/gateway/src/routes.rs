@@ -3303,6 +3303,36 @@ targets = [
             );
         }
 
+        // Streaming does not get a different pricing boundary: an initial
+        // request is still pinned to the unpriced first target and must be
+        // refused before the stream is opened or a budget hold is taken.
+        let streaming_initial = router(state.clone())
+            .oneshot(
+                authorized("/v1/responses")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "gpt-4o",
+                            "input": "hi",
+                            "stream": true
+                        }))
+                        .expect("body"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("a response");
+        assert_eq!(streaming_initial.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_slice(
+            &streaming_initial
+                .into_body()
+                .collect()
+                .await
+                .expect("a body")
+                .to_bytes(),
+        )
+        .expect("an error document");
+        assert_eq!(body["error"]["type"], "model_not_priced");
+
         let continuation = router(state.clone())
             .oneshot(
                 authorized("/v1/responses")

@@ -57,11 +57,20 @@ omitted when absent), and the OTLP sink emits it as an OTel log record with
   `usage_v1_001_add_signer_kid.sql` then
   `usage_v2_001_add_price_identity.sql`; existing installations apply only the
   new additive file **before** deploying a writer that emits its column.
-  Ordering is enforced rather than trusted: the Postgres sink checks the table's
-  columns while it connects and refuses to boot naming the file to apply, so an
-  unmigrated table fails the deploy instead of dropping every batch at insert
-  time. A table the gateway cannot see at all (it is created after boot, and
-  `create_table` is off by default) is not a gap and does not refuse the boot.
+  Ordering is enforced rather than trusted: the Postgres sink checks every
+  column the writer binds while it connects and refuses to boot naming the
+  migration file(s) to apply, in order. This includes older additive columns
+  such as `signer_kid`, not only the newest price identity columns. The contract
+  is intentionally fail-closed: migrate the existing table in place before
+  deploying the writer; do not drop a table holding usage history because the
+  refusal names a base schema file. A table the gateway cannot see at all (it is
+  created after boot, and `create_table` is off by default) is not a gap and does
+  not refuse the boot.
+- The gate resolves the configured relation with `to_regclass` on the same
+  connection as the `INSERT`, so an unqualified table follows that connection's
+  PostgreSQL `search_path` (including a DSN `options=-csearch_path=...`). It does
+  not assume `public` or inspect a different relation. A missing table remains
+  the operator's creation step; a present but unmigrated table is a boot error.
 - Removing or renaming a column, making one `NOT NULL`, or changing a unit or a
   vocabulary (e.g. a new `status` value is fine; redefining an existing one is
   not) **is** a bump: a new `ops/postgres/usage_v<N>.sql` plus a bump of

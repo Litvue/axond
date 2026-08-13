@@ -149,7 +149,8 @@ impl PostgresSink {
         // Migration before writer: every column this sink binds must already
         // exist, or the boot fails naming the file to apply. An existing
         // installation that has not run a migration would otherwise accept the
-        // boot and lose every batch at insert time.
+        // boot and lose every batch at insert time. This is intentionally
+        // fail-closed for every additive migration, including older ones.
         if let Some(gap) = migration_gap(&sink.missing_columns(&client).await?) {
             return Err(UsageSinkError::invalid("postgres", gap));
         }
@@ -163,6 +164,11 @@ impl PostgresSink {
     /// sequence (`create_table` is off by default), and refusing a boot for a
     /// table that will be created before the first flush would be a new failure
     /// mode rather than a caught one.
+    ///
+    /// `to_regclass($1)` is deliberate. It resolves the configured relation on
+    /// this connection using its `search_path`, exactly as the unqualified
+    /// INSERT does; reconstructing `public` from the configured string would
+    /// check a different table for DSNs that set `options=-csearch_path=...`.
     async fn missing_columns(&self, client: &Client) -> Result<Vec<String>, tokio_postgres::Error> {
         let rows = client
             .query(
@@ -665,35 +671,63 @@ mod tests {
     /// an unmigrated table in the configured schema as absent and let the
     /// writer boot before dropping every insert.
     #[tokio::test]
-    async fn the_schema_gate_follows_the_connection_search_path() {
+    async fn the_schema_gate_follows_the_connection_search_path_and_names_the_gap() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
         };
         let suffix = std::process::id();
         let schema = format!("axond_usage_search_path_{suffix}");
         let table = format!("axond_usage_{suffix}");
-        let sink = PostgresSink {
+        let setup = PostgresSink {
             table: table.clone(),
             config: dsn.parse().expect("static test dsn"),
             client: tokio::sync::Mutex::new(None),
         };
-        let client = sink.connect_client().await.expect("connect");
-        client
+        let setup_client = setup.connect_client().await.expect("connect");
+        setup_client
             .batch_execute(&format!(
                 "CREATE SCHEMA IF NOT EXISTS {schema}; \
                  DROP TABLE IF EXISTS {schema}.{table}; \
-                 CREATE TABLE {schema}.{table} (schema_version integer); \
-                 SET search_path TO {schema}"
+                 CREATE TABLE {schema}.{table} (schema_version integer)"
             ))
             .await
             .expect("create an intentionally unmigrated table on the search path");
+
+        // Use the DSN's startup option rather than a later SET so this covers
+        // the same connection-level search_path an operator configures for
+        // the INSERT path.
+        let mut config: Config = dsn.parse().expect("static test dsn");
+        config.options(format!("-csearch_path={schema}"));
+        let sink = PostgresSink {
+            table: table.clone(),
+            config,
+            client: tokio::sync::Mutex::new(None),
+        };
+        let client = sink
+            .connect_client()
+            .await
+            .expect("connect with search_path");
 
         let missing = sink
             .missing_columns(&client)
             .await
             .expect("inspect the table resolved through search_path");
+        let resolved: Option<String> = client
+            .query_one("SELECT to_regclass($1)::text", &[&table])
+            .await
+            .expect("resolve the same relation as INSERT")
+            .get(0);
+        let expected = format!("{schema}.{table}");
+        assert_eq!(resolved.as_deref(), Some(expected.as_str()));
         assert!(missing.iter().any(|column| column == "price_book"));
         assert!(missing.iter().any(|column| column == "signer_kid"));
+        let gap = migration_gap(&missing).expect("an unmigrated table is a boot gap");
+        assert!(gap.contains("usage_v1_001_add_signer_kid.sql"), "{gap}");
+        assert!(gap.contains("usage_v2_001_add_price_identity.sql"), "{gap}");
+        assert!(
+            gap.contains("before deploying this writer"),
+            "the gate is fail-closed with an operator remedy: {gap}"
+        );
 
         client
             .batch_execute(&format!("DROP TABLE {schema}.{table}"))

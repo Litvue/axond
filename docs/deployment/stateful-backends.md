@@ -104,10 +104,15 @@ psql "$AXOND_USAGE_POSTGRES_DSN" -f ops/postgres/usage_v2_001_add_price_identity
 ```
 
 Apply additive usage migrations in filename order **before** deploying a binary
-that writes the new shape. The sink compares the table's columns against the
-ones it binds while it connects, so a binary deployed ahead of its migration
-refuses to boot and names the file to apply rather than dropping batches at
-insert time. A table that does not exist yet is not checked: with
+that writes the new shape. The sink compares every column it binds against the
+existing table while it connects, so a binary deployed ahead of any migration
+(including an older `usage_v1_001` migration) refuses to boot and names the
+ordered files to apply rather than dropping batches at insert time. This is an
+intentional fail-closed contract: migrate the table in place and preserve its
+history; do not recreate it merely because the refusal mentions the base DDL.
+The check resolves an unqualified table through the connection's `search_path`,
+just like the `INSERT`, so a DSN selecting `billing` is checked in `billing`,
+not hard-coded `public`. A table that does not exist yet is not checked: with
 `create_table = false` its creation is yours to sequence, and until it exists
 the off-path sink drops rejected batches and increments the dropped-record
 metric.
