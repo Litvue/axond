@@ -48,7 +48,7 @@
 //! Nothing here fetches, persists, or serves anything: it is an I/O-free
 //! projection of content already in hand, off the request path, and the
 //! decisions it rests on are recorded in
-//! [ADR 0035](https://github.com/Litvue/axond/blob/main/docs/adr/0035-callable-offering-identity.md).
+//! [ADR 0040](https://github.com/Litvue/axond/blob/main/docs/adr/0040-callable-offering-identity.md).
 
 use std::collections::{BTreeMap, BTreeSet};
 
