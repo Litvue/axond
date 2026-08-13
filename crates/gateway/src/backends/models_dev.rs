@@ -1787,16 +1787,24 @@ mod tests {
     }
 
     #[test]
-    fn an_unsupported_long_source_url_keeps_the_rejected_suffix_visible() {
+    fn an_unsupported_long_source_url_keeps_its_rejected_suffix_visible_and_bounded() {
+        const REJECTED_SUFFIX: &str = "not-the-catalogue.json";
         let rejected = format!(
-            "https://mirror.example/{}/models.json",
-            "snapshot/".repeat(16)
+            "https://mirror.example/{}/{}",
+            "snapshot/".repeat(1024),
+            REJECTED_SUFFIX
         );
-        let error = ModelsDevAdapter::new(&rejected).expect_err("models.json is not the catalogue");
+        let error = ModelsDevAdapter::new(&rejected)
+            .expect_err("the unique rejected suffix is not the catalogue");
+        let rendered = error.to_string();
 
         assert!(
-            error.to_string().contains("models.json"),
-            "the diagnostic must preserve the suffix that made the URL invalid: {error}"
+            rendered.contains(REJECTED_SUFFIX),
+            "the diagnostic must preserve the unique suffix that made the URL invalid: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("… ({} bytes) …", rejected.len())) && rendered.len() < 512,
+            "the rejected URL must remain bounded while retaining its tail: {rendered}"
         );
     }
 
