@@ -42,6 +42,7 @@
 
 pub mod catalog;
 pub mod control_plane;
+pub mod models_dev;
 pub mod secrets;
 
 #[cfg(test)]

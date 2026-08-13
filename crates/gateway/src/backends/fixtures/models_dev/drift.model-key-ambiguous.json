@@ -1,0 +1,70 @@
+{
+  "models": {
+    "alpha/m-1": {
+      "id": "alpha/m-1",
+      "name": "M1",
+      "family": "m",
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "limit": {
+        "context": 200000,
+        "output": 64000
+      }
+    },
+    "beta/m-1": {
+      "id": "beta/m-1",
+      "name": "M1",
+      "family": "m",
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "limit": {
+        "context": 200000,
+        "output": 64000
+      }
+    }
+  },
+  "providers": {
+    "reseller": {
+      "id": "reseller",
+      "name": "Reseller",
+      "env": [
+        "RESELLER_API_KEY"
+      ],
+      "models": {
+        "m-1": {
+          "id": "m-1",
+          "name": "M1",
+          "family": "m",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "cost": {
+            "input": 1,
+            "output": 2
+          }
+        }
+      }
+    }
+  }
+}
