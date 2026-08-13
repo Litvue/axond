@@ -157,16 +157,20 @@ impl<T> Conditional<T> {
     /// representations of a route may condition on both, and an unreadable field
     /// is simply no match.
     fn matched(&self, etag: &HeaderValue) -> bool {
-        // `If-None-Match` is compared weakly (RFC 9110 §13.1.2): the `W/` prefix
-        // is stripped from both sides, so a strong validator matches the weak
-        // form an intermediary may have handed back, and `/convergence`'s own
-        // weak validator matches itself.
-        let served = etag.to_str().unwrap_or_default().trim_start_matches("W/");
+        // `If-None-Match` is compared weakly (RFC 9110 §13.1.2): the single `W/`
+        // prefix an entity-tag may carry is stripped from both sides, so a strong
+        // validator matches the weak form an intermediary may have handed back, and
+        // `/convergence`'s own weak validator matches itself. Exactly one prefix,
+        // because `W/W/"…"` is not an entity-tag and must not name anything.
+        let served = etag.to_str().unwrap_or_default();
+        let served = served.strip_prefix("W/").unwrap_or(served);
         self.if_none_match
             .iter()
             .filter_map(|value| value.to_str().ok())
             .flat_map(|value| value.split(','))
             .map(str::trim)
-            .any(|candidate| candidate == "*" || candidate.trim_start_matches("W/") == served)
+            .any(|candidate| {
+                candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == served
+            })
     }
 }

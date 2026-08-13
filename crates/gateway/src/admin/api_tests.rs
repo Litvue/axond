@@ -1323,13 +1323,16 @@ async fn a_conditional_the_surface_cannot_use_is_answered_in_full() {
     let (_, history, _) = deployment.get_conditional("/history", None).await;
     let history = history.expect("a validator");
     for conditional in [
-        history.as_str(),
-        "\"not-a-checksum\"",
-        "garbage",
-        "W/\"not-a-checksum\"",
+        history.clone(),
+        "\"not-a-checksum\"".to_owned(),
+        "garbage".to_owned(),
+        "W/\"not-a-checksum\"".to_owned(),
+        // Not an entity-tag: a doubled prefix names no representation, however
+        // closely the rest of it resembles the current one.
+        format!("W/W/{validator}"),
     ] {
         let (status, echoed, body) = deployment
-            .get_conditional("/state", Some(conditional))
+            .get_conditional("/state", Some(&conditional))
             .await;
         assert_eq!(status, StatusCode::OK, "{conditional}");
         assert_eq!(echoed.as_deref(), Some(validator.as_str()), "{conditional}");
