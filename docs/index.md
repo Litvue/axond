@@ -87,6 +87,9 @@ and operate it.
 - [Secret material in the stateful control plane](./security/secret-material.md)
   — what a stored secret reference guarantees, and the regression suite that
   proves material stays out of state, responses, logs, and telemetry.
+- [Tenant isolation evidence](./security/tenant-isolation-evidence.md) — which
+  layer enforces each part of isolation, the test that proves it, and what is
+  not covered yet.
 - [Security policy](../SECURITY.md) — private vulnerability reporting, the
   supported-version window, response targets, and how a fix and advisory ship.
 

@@ -165,9 +165,41 @@ impl Axond {
             .expect("axond becomes healthy on a free port")
     }
 
+    /// Boot from a config the caller renders, plus extra environment.
+    ///
+    /// For suites whose subject is the *shape* of a deployment rather than one
+    /// section of the shipped fixture — several namespaces, several credential
+    /// pools, a durable sink — where patching `tuning` into one namespace's
+    /// config would not express it. `render` is called per attempt because a
+    /// retried boot binds a different port, and the config carries the bind.
+    ///
+    /// The rendered config must declare a `[[gateway_key]]` reading
+    /// `GW_BOOT_KEY`: that key is how readiness tells this child apart from a
+    /// sibling that won the port (see [`Self::answers_for_this_boot`]).
+    pub async fn start_custom(
+        render: &dyn Fn(SocketAddr) -> String,
+        env: &[(String, String)],
+    ) -> Self {
+        for _ in 1..BOOT_ATTEMPTS {
+            if let Some(gateway) = Self::try_start_custom(render, env).await {
+                return gateway;
+            }
+        }
+        Self::try_start_custom(render, env)
+            .await
+            .expect("axond becomes healthy on a free port")
+    }
+
     /// One boot attempt: `None` when the process never became healthy, which on
     /// a loopback port means someone else won the bind.
     async fn try_start(upstream_base_url: &str, tuning: &str) -> Option<Self> {
+        Self::try_start_custom(&|addr| config_toml(addr, upstream_base_url, tuning), &[]).await
+    }
+
+    async fn try_start_custom(
+        render: &dyn Fn(SocketAddr) -> String,
+        extra_env: &[(String, String)],
+    ) -> Option<Self> {
         // One reservation, used for both the config directory and the boot key:
         // re-reading the counter could hand two concurrent boots the same value,
         // and the key has to be unique by construction, not by timing.
@@ -177,10 +209,14 @@ impl Axond {
         let addr = free_addr();
         let path = dir.join(format!("axond-{}.toml", addr.port()));
         let boot_key = format!("test-boot-key-{}-{boot}", std::process::id());
-        let config = config_toml(addr, upstream_base_url, tuning);
+        let config = render(addr);
         std::fs::write(&path, &config).expect("test config is written");
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_axond"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_axond"));
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
+        let mut child = command
             .env("AXOND_CONFIG", &path)
             .env("GW_INBOUND_KEY", GATEWAY_KEY)
             .env(BOOT_KEY_ENV, &boot_key)
@@ -256,13 +292,17 @@ impl Axond {
                 return self.answers_for_this_boot(&client, &base_url).await;
             }
             if let Ok(Some(_)) = self.child.try_wait() {
-                // The process is gone. A refused config is a test bug rather
-                // than a lost race, so that fails loudly; anything else (a
-                // sibling taking the port) is the caller's to retry.
+                // The process is gone. Exactly one reason for that is the
+                // caller's to retry — a sibling took the port — and it says so
+                // on stderr. Every other exit is a test bug (a refused config, a
+                // datastore the boot could not reach), and reporting it here
+                // with the child's own output is the difference between naming
+                // the cause and exhausting the retries on "never became
+                // healthy".
                 let output = self.output();
                 assert!(
-                    !output.contains("invalid config"),
-                    "axond refused the test config:\n{output}"
+                    output.contains("Address already in use"),
+                    "axond exited without serving:\n{output}"
                 );
                 return false;
             }
