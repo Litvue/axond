@@ -138,7 +138,11 @@ rather than taste:
   the field being *absent*: a body that carries a `schema` which is not text is
   refused, because a damaged marker is not an older release's writing and reading
   it as one would let the row skip the scope, target, reach, and wire-family
-  rules with nothing reported. These rules run wherever a revision is read, so
+  rules with nothing reported. It is refused as `ModelError::DamagedSchema`, and
+  that refusal is *not* a compatibility one: no release wrote a marker that is
+  not an identifier, so the row is damaged storage and the action is to restore
+  it or republish the resource, not to roll a build forward. These rules run
+  wherever a revision is read, so
   they hold at publication as well as at hydration; refusing to *author* a new
   untyped alias belongs to the slice that writes these bodies, which keeps the
   accommodation limited to rows already in the journal.

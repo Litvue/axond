@@ -49,6 +49,17 @@ pub(super) trait BodyError: Sized {
     }
     fn field_type(reference: ResourceRef, field: &'static str) -> Self;
     fn malformed_id(reference: ResourceRef, field: &'static str, source: InvalidId) -> Self;
+
+    /// A body whose `schema` is present and is not text, so the identifier that
+    /// decides how to read everything else is itself unreadable.
+    ///
+    /// Defaulted to the wrong-type refusal, because that is what it is; a schema
+    /// whose classification of it differs from an ordinary wrong type — a model
+    /// body, where a marker no release ever wrote is damage rather than skew —
+    /// says so by overriding this.
+    fn damaged_schema(reference: ResourceRef) -> Self {
+        Self::field_type(reference, SCHEMA_FIELD)
+    }
     fn identity_mismatch(reference: ResourceRef, declared: String, identity: ResourceId) -> Self;
 
     /// A field that must be a set of strings and is not.
@@ -151,7 +162,14 @@ impl<'a, E: BodyError> Record<'a, E> {
             fields,
             error: std::marker::PhantomData,
         };
-        let declared = record.string(SCHEMA_FIELD)?;
+        // Read directly rather than through `string`, so a marker that is
+        // present and not text is its own refusal: absence is a body written
+        // before this schema existed, while a non-text marker is a body no
+        // release wrote.
+        let CanonicalValue::String(declared) = record.value(SCHEMA_FIELD)? else {
+            return Err(E::damaged_schema(reference));
+        };
+        let declared = declared.as_str();
         let schema = *schemas
             .iter()
             .find(|candidate| **candidate == declared)

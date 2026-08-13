@@ -669,6 +669,14 @@ pub enum ModelError {
         expected: &'static str,
         found: String,
     },
+    /// A `schema` that is present and is not text, so the identifier deciding how
+    /// to read the rest of the body is itself unreadable. No release wrote one,
+    /// so the row is damage rather than another release's writing.
+    #[error(
+        "{reference} carries a `schema` that is not an identifier, which no release wrote; \
+         restore the row or republish the resource rather than changing build"
+    )]
+    DamagedSchema { reference: ResourceRef },
     #[error("{reference} has no `{field}`")]
     MissingField {
         reference: ResourceRef,
@@ -817,12 +825,13 @@ impl ModelError {
             | Self::UnknownField { .. }
             | Self::UnknownWireFamily { .. }
             | Self::UnknownLifecycle { .. } => true,
-            // Only the schema identifier itself: its absence is a body written
-            // before these bodies had one at all.
-            Self::MissingField { field, .. } | Self::FieldType { field, .. } => {
-                *field == SCHEMA_FIELD
-            }
-            Self::Kind { .. }
+            // Absence of the schema identifier only: a body written before these
+            // bodies had one at all is another release's writing, while a marker
+            // that is present and unreadable is `DamagedSchema` below.
+            Self::MissingField { field, .. } => *field == SCHEMA_FIELD,
+            Self::FieldType { .. }
+            | Self::DamagedSchema { .. }
+            | Self::Kind { .. }
             | Self::NotInline { .. }
             | Self::NotARecord { .. }
             | Self::MalformedId { .. }
@@ -851,6 +860,7 @@ impl ModelError {
             | Self::NotInline { reference }
             | Self::NotARecord { reference }
             | Self::Schema { reference, .. }
+            | Self::DamagedSchema { reference }
             | Self::MissingField { reference, .. }
             | Self::UnknownField { reference, .. }
             | Self::FieldType { reference, .. }
@@ -899,6 +909,10 @@ impl BodyError for ModelError {
             expected,
             found,
         }
+    }
+
+    fn damaged_schema(reference: ResourceRef) -> Self {
+        Self::DamagedSchema { reference }
     }
 
     fn missing_field(reference: ResourceRef, field: &'static str) -> Self {
@@ -2977,6 +2991,10 @@ mod tests {
         // that is present but is not text is damage, so reading it as a row
         // predating this slice would let it skip the scope, target, reach, and
         // wire-family rules with nothing reported.
+        //
+        // And damage is what it is *called*, too: no release wrote a marker that
+        // is not an identifier, so reporting it as skew would send an operator to
+        // roll a build forward when the row needs restoring.
         let alias = typed_alias(
             &tenant_id(1),
             &project_id(2),
@@ -2997,29 +3015,73 @@ mod tests {
             let error = Models::of(&state).expect_err("a damaged schema marker is refused");
             assert_eq!(
                 error,
-                ModelError::FieldType {
-                    reference: damaged.reference,
-                    field: SCHEMA_FIELD
+                ModelError::DamagedSchema {
+                    reference: damaged.reference
                 }
             );
             assert!(
-                error.is_incompatible(),
-                "a marker this build cannot read is skew, not corruption"
+                !error.is_incompatible(),
+                "a marker no release wrote is corruption, not skew: {error}"
+            );
+            let detail = error.to_string();
+            assert!(
+                detail.contains("no release wrote") && detail.contains("restore"),
+                "a corruption refusal must say what to do: {detail}"
             );
             let error = state
                 .validate()
                 .expect_err("a revision carrying a damaged alias is not valid");
             assert!(
-                matches!(
-                    model_error(&error),
-                    Some(ModelError::FieldType {
-                        field: SCHEMA_FIELD,
-                        ..
-                    })
-                ),
+                matches!(model_error(&error), Some(ModelError::DamagedSchema { .. })),
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn a_damaged_alias_marker_hydrates_as_damage_not_skew() {
+        // The companion to
+        // `a_body_this_build_cannot_read_hydrates_as_an_incompatibility_not_corruption`:
+        // a marker naming a schema this build does not read is another release's
+        // revision, while a marker that is not an identifier at all is a row to
+        // repair. Hydration is where the two stop being the same alert.
+        let candidate = candidate(ExpectedRevision::Empty, "models", state_with_models());
+        let manifest =
+            RevisionManifest::of(revision_id(1), None, SystemTime::UNIX_EPOCH, &candidate)
+                .expect("the fixture state is publishable");
+
+        let mut damaged = DesiredState::new();
+        for blob in candidate.state.blobs() {
+            damaged.declare_blob(*blob);
+        }
+        for resource in candidate.state.resources() {
+            let resource = if resource.reference.kind == ResourceKind::Alias {
+                with_fields(resource, |fields| {
+                    set(fields, SCHEMA_FIELD, CanonicalValue::integer(1));
+                })
+            } else {
+                resource.clone()
+            };
+            damaged.insert(resource).expect("distinct references");
+        }
+        let error = LoadedRevision::assemble(manifest, damaged)
+            .expect_err("a damaged alias marker must not hydrate");
+        assert!(
+            matches!(
+                error,
+                IntegrityError::Invalid(ValidationError::Model(ref refusal))
+                    if matches!(**refusal, ModelError::DamagedSchema { .. })
+            ),
+            "{error}"
+        );
+        assert!(
+            !error.is_incompatible(),
+            "damaged storage is not a build to roll forward: {error}"
+        );
+        assert!(
+            error.to_string().contains("restore the row"),
+            "the alert must name the repair: {error}"
+        );
     }
 
     #[test]

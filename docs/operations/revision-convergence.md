@@ -160,9 +160,13 @@ Six rules hold for every body schema, present and future:
   ([ADR 0042](../adr/0042-model-enablement-and-alias-contracts.md)). The
   exception is the *absence* of the field and nothing else: an alias body that
   carries a `schema` whose value is not text is read strictly and refused, so a
-  damaged marker cannot skip the alias rules unreported. Reads accommodate rows
-  already in the journal; the slice that gains an authoring path is where
-  refusing to *write* a new untyped alias belongs.
+  damaged marker cannot skip the alias rules unreported. That refusal is
+  *damage*, not skew — no release wrote a marker that is not an identifier, so
+  hydration reports it as stored state that does not add up rather than as a
+  revision this build is too old to read, and the action is to restore or
+  republish that row rather than to roll the replica's build forward. Reads
+  accommodate rows already in the journal; the slice that gains an authoring path
+  is where refusing to *write* a new untyped alias belongs.
 - **A sub-record is part of its schema.** `observed_price` and `approved_price`
   in an enablement, and each entry of an alias's `targets`, define their own field
   sets (`input_micros_per_million`/`output_micros_per_million`,
