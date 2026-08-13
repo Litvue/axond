@@ -163,6 +163,13 @@ soak:
 capacity:
     AXOND_CAPACITY=1 cargo test --locked --all-features --test capacity -- --nocapture --test-threads=1
 
+# The twelve-hour mixed-workload endurance soak, writing its result and time
+# series to target/endurance/soak. The smoke tier of the same driver runs in
+# `just test`. Pass a shorter duration in milliseconds to dispatch a shorter run:
+# `just endurance 2400000`.
+endurance duration_ms="":
+    AXOND_ENDURANCE=1 AXOND_ENDURANCE_DURATION_MS={{ duration_ms }} cargo test --locked --all-features --test endurance -- --nocapture --test-threads=1
+
 # Run the gateway against ./axond.toml (copy axond.example.toml first).
 run:
     cargo run -p axond

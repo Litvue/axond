@@ -391,7 +391,7 @@ pub async fn run(profile: &Profile, tier: Tier, manifest_text: &str) -> Capacity
             ),
         },
         upstream: Upstream {
-            requests: upstream.state.requests().len() as u64,
+            requests: upstream.state.received(),
             streams_opened: upstream.state.opened_streams(),
             streams_open_at_end: leaked,
         },

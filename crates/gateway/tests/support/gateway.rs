@@ -5,6 +5,7 @@
 //! router assembled in-process, so a regression in boot or wiring fails here
 //! too.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
@@ -82,6 +83,53 @@ static CONFIGS: AtomicU64 = AtomicU64::new(0);
 /// How many ephemeral ports a boot may lose before the suite gives up.
 const BOOT_ATTEMPTS: u32 = 4;
 
+/// How many output lines a boot keeps. Failure output wants the recent past,
+/// and a run long enough to overflow this is a soak whose evidence is its
+/// artifact rather than its scrollback — retaining every line of a twelve-hour
+/// run would make the harness the leak it is looking for.
+const RETAINED_LINES: usize = 4096;
+
+/// What the process has said, kept so a failing test can print it and a
+/// harness can read what each request was charged.
+#[derive(Default)]
+struct Output {
+    /// Everything the process wrote, usage records included, bounded to the
+    /// most recent [`RETAINED_LINES`]. Records stay here as well as in
+    /// [`Self::usage`] because assertions about what the process must *not*
+    /// print — a prompt, a credential — read the raw text.
+    lines: VecDeque<String>,
+    /// How many lines were dropped to stay inside that bound, so truncated
+    /// output says so rather than reading as everything the process wrote.
+    dropped: u64,
+    /// Usage records, parsed as they arrive. Unbounded by default — a suite
+    /// asserts over all of them — and drained by the endurance harness, which
+    /// reconciles each batch as it lands.
+    usage: Vec<Value>,
+}
+
+impl Output {
+    fn ingest(&mut self, line: String) {
+        if let Ok(value) = serde_json::from_str::<Value>(&line)
+            && value.get("schema_version").is_some()
+        {
+            self.usage.push(value);
+        }
+        if self.lines.len() == RETAINED_LINES {
+            self.lines.pop_front();
+            self.dropped += 1;
+        }
+        self.lines.push_back(line);
+    }
+
+    fn rendered(&self) -> String {
+        let recent = self.lines.iter().cloned().collect::<Vec<_>>().join("\n");
+        match self.dropped {
+            0 => recent,
+            dropped => format!("[{dropped} earlier lines dropped]\n{recent}"),
+        }
+    }
+}
+
 pub struct Axond {
     pub base_url: String,
     /// This boot's private inbound key: no other process has it, so a route that
@@ -91,7 +139,7 @@ pub struct Axond {
     /// exactly what it qualified.
     pub config: String,
     child: Child,
-    lines: Arc<Mutex<Vec<String>>>,
+    output: Arc<Mutex<Output>>,
 }
 
 impl Axond {
@@ -147,7 +195,7 @@ impl Axond {
             .spawn()
             .expect("the axond binary starts");
 
-        let lines = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::new(Mutex::new(Output::default()));
         for stream in [
             child
                 .stdout
@@ -163,10 +211,10 @@ impl Axond {
         .into_iter()
         .flatten()
         {
-            let sink = lines.clone();
+            let sink = output.clone();
             std::thread::spawn(move || {
                 for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                    sink.lock().expect("output lock").push(line);
+                    sink.lock().expect("output lock").ingest(line);
                 }
             });
         }
@@ -176,7 +224,7 @@ impl Axond {
             boot_key,
             config,
             child,
-            lines,
+            output,
         };
         gateway.await_ready().await.then_some(gateway)
     }
@@ -259,21 +307,23 @@ impl Axond {
         format!("{}{path}", self.base_url)
     }
 
-    /// Everything the process has written to stdout/stderr, for failure output.
+    /// What the process has written to stdout/stderr, for failure output and
+    /// for assertions over the raw text: its most recent lines.
     pub fn output(&self) -> String {
-        self.lines.lock().expect("output lock").join("\n")
+        self.output.lock().expect("output lock").rendered()
     }
 
     /// The usage records the process has emitted on its stdout sink — the
     /// black-box view of what each request was charged.
     pub fn usage_records(&self) -> Vec<Value> {
-        self.lines
-            .lock()
-            .expect("output lock")
-            .iter()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|value| value.get("schema_version").is_some())
-            .collect()
+        self.output.lock().expect("output lock").usage.clone()
+    }
+
+    /// Take the usage records emitted since the last drain. A run long enough
+    /// to settle millions of them reconciles each batch and lets it go, rather
+    /// than holding every record until the end.
+    pub fn drain_usage_records(&self) -> Vec<Value> {
+        std::mem::take(&mut self.output.lock().expect("output lock").usage)
     }
 
     /// Wait until at least `count` usage records have been written. Settlement
