@@ -123,8 +123,9 @@ convergence**. A stateful replica boots and serves `/admin/v1`; what it refuses,
 per request, is inference, until revision convergence ships. So there is no
 stateful replica *serving* to converge, and a profile written against one today
 would measure the refusal and retain it as evidence of something else. That is
-why the `recovery` slice stays `declared` with a contract rather than a driver,
-and why no capacity profile claims it.
+why the `recovery` slice stays `harnessed`: its durable stages run against a real
+Postgres, and every stage that needs a served request is blocked in the scenario
+rather than measured. It is also why no capacity profile claims it.
 
 ## Related
 
