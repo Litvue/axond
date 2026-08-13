@@ -4,6 +4,11 @@
 //! datastore. `AXOND_TEST_REQUIRE_SERVICES=1` inverts that: a missing variable
 //! panics, so CI cannot report a green run for tests that never executed.
 
+/// Whether CI asked for a run that cannot be green without the services.
+pub(crate) fn required() -> bool {
+    std::env::var("AXOND_TEST_REQUIRE_SERVICES").as_deref() == Ok("1")
+}
+
 fn resolve(variable: &str, value: Option<String>, require_services: bool) -> Option<String> {
     match value {
         Some(value) => Some(value),
@@ -19,7 +24,7 @@ pub(crate) fn redis_url() -> Option<String> {
     resolve(
         "AXOND_TEST_REDIS_URL",
         std::env::var("AXOND_TEST_REDIS_URL").ok(),
-        std::env::var("AXOND_TEST_REQUIRE_SERVICES").as_deref() == Ok("1"),
+        required(),
     )
 }
 
@@ -27,7 +32,7 @@ pub(crate) fn postgres_dsn() -> Option<String> {
     resolve(
         "AXOND_TEST_POSTGRES_DSN",
         std::env::var("AXOND_TEST_POSTGRES_DSN").ok(),
-        std::env::var("AXOND_TEST_REQUIRE_SERVICES").as_deref() == Ok("1"),
+        required(),
     )
 }
 

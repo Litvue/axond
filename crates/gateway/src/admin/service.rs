@@ -56,7 +56,7 @@ use std::time::SystemTime;
 use serde::Serialize;
 use tracing::{debug, warn};
 
-use super::auth::{AdminAction, AdminAuthError, AdminGrant};
+use super::auth::{AdminAction, AdminAuthError, AdminGrant, AdminIdentity};
 use super::diff::SemanticDiff;
 use super::error::AdminError;
 use super::protocol::{MutationRequest, WriteMode};
@@ -67,8 +67,9 @@ use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::config::Mode;
 use crate::convergence::RevisionReport;
 use crate::desired_state::{
-    AuditEvent, AuditEventId, DesiredState, ExpectedRevision, LoadedRevision, Mutation, MutationId,
-    ResourceScope, RevisionCandidate, RevisionId, Uuid7Generator, ValidationError,
+    AccessDenial, AuditEvent, AuditEventId, DenialReason, DesiredState, ExpectedRevision,
+    LoadedRevision, Mutation, MutationId, ResourceScope, RevisionCandidate, RevisionId, Surface,
+    Uuid7Generator, ValidationError,
 };
 
 /// Whether a grant at `granted` may change a resource scoped to `resource`.
@@ -231,6 +232,67 @@ impl AdminService {
         Ok(())
     }
 
+    /// Record an authenticated caller's refusal in the durable denial trail.
+    ///
+    /// Only refusals of *authority* are recorded, and only in stateful mode:
+    /// there is nothing to write to otherwise, and a refusal that never reached
+    /// an identity — a missing credential, a stateless deployment — attributes to
+    /// nobody, so a row for it would be a log line pretending to be an audit
+    /// record. What is recorded is the pair an investigator asks about: which
+    /// identity reached for which scope, and which rule turned it away.
+    ///
+    /// A store failure here does not change the answer the caller gets. The
+    /// refusal already happened; failing the request because the *record* of it
+    /// could not be written would turn an authorization failure into an
+    /// availability failure, and would let a caller who can stall the control
+    /// plane change a `403` into a `503`. It is logged at `warn`, where the
+    /// deployment's own alerting sees it.
+    pub(super) async fn record_denial(
+        &self,
+        identity: &AdminIdentity,
+        action: AdminAction,
+        surface: Surface,
+        scope: &ResourceScope,
+        error: &AdminError,
+    ) {
+        let (Some(store), AdminError::Forbidden(refusal)) = (self.store.as_ref(), error) else {
+            return;
+        };
+        let denial = AccessDenial {
+            id: AuditEventId::new(self.ids.next()),
+            actor: identity.actor(),
+            surface,
+            action: action.recorded_action(),
+            scope: scope.clone(),
+            reason: match refusal {
+                AdminAuthError::ActionNotPermitted { .. } => DenialReason::RoleLacksAction,
+                _ => DenialReason::OutOfScope,
+            },
+            recorded_at: SystemTime::now(),
+        };
+        if let Err(error) = store.record_denial(&denial).await {
+            warn!(
+                target: "axond.admin",
+                error = %error,
+                action = action.as_str(),
+                "an administrative denial could not be recorded",
+            );
+        }
+    }
+
+    /// Record a mutation's own refusal, from the grant and the request that
+    /// carry everything the trail needs.
+    async fn denied(&self, grant: &AdminGrant, request: &MutationRequest, error: &AdminError) {
+        self.record_denial(
+            grant.identity(),
+            grant.action(),
+            request.surface,
+            &request.scope,
+            error,
+        )
+        .await;
+    }
+
     /// Check a grant covers the action about to be performed.
     fn permits(grant: &AdminGrant, action: AdminAction) -> Result<(), AdminError> {
         if grant.action() != action {
@@ -330,15 +392,49 @@ impl AdminService {
     ///
     /// Takes the report rather than reading one, because convergence state is
     /// replica-local and cached: this answers during a control-plane outage, which
-    /// is when it is asked.
+    /// is when it is asked. `None` is a replica with no reconciler attached,
+    /// which has converged onto nothing and says so.
     pub fn convergence(
         &self,
         grant: &AdminGrant,
-        report: &RevisionReport,
+        report: Option<&RevisionReport>,
     ) -> Result<ConvergenceResult, AdminError> {
         Self::permits_deployment_read(grant, AdminAction::ReadConvergence)?;
         self.store()?;
-        Ok(ConvergenceResult::of(report))
+        Ok(report.map_or_else(ConvergenceResult::unreconciled, ConvergenceResult::of))
+    }
+
+    /// Republish a retained revision's complete desired state as a new revision.
+    ///
+    /// A rollback is not a rewind: nothing is deleted, no revision is reopened,
+    /// and the chain keeps moving forward. It is an ordinary mutation whose
+    /// candidate happens to be a state that was published before, which is why it
+    /// goes through [`AdminService::apply`] and inherits every property that path
+    /// has — expected-revision preconditions, idempotent replay, complete
+    /// validation, dry run, diff, audit attribution, and one atomic publication.
+    ///
+    /// The target is hydrated whole rather than diffed onto the head: a revision
+    /// is complete, so "the state as of `target`" needs no replay of the
+    /// intervening changes and cannot half-apply.
+    pub async fn rollback(
+        &self,
+        grant: &AdminGrant,
+        request: &MutationRequest,
+        target: RevisionId,
+    ) -> Result<MutationOutcome, AdminError> {
+        let store = self.store()?;
+        if grant.action() != AdminAction::Rollback {
+            return Err(AdminError::Forbidden(AdminAuthError::ActionNotPermitted {
+                action: grant.action(),
+            }));
+        }
+        let restored = store.load_revision(target).await.map_err(log_store)?;
+        let restored = restored.state().clone();
+        self.apply(grant, request, &move |state: &mut DesiredState| {
+            state.clone_from(&restored);
+            Ok(())
+        })
+        .await
     }
 
     /// Publish, or rehearse publishing, a complete candidate revision.
@@ -361,10 +457,19 @@ impl AdminService {
         // The verb the request performs, not merely some mutating verb: a
         // rollback grant is not a publication grant, and the service is the place
         // that cannot be bypassed by a handler asking its authorizer for the
-        // wrong one.
-        Self::permits(grant, AdminAction::for_mutation(request.kind))?;
+        // wrong one. Every refusal below is an authenticated caller reaching past
+        // its authority, so each one is written to the denial trail before it is
+        // returned — including the ones an authorizer already had a chance to
+        // make, because these checks exist precisely for the case where it did
+        // not.
+        if let Err(error) = Self::permits(grant, AdminAction::for_mutation(request.kind)) {
+            self.denied(grant, request, &error).await;
+            return Err(error);
+        }
         if grant.scope() != &request.scope {
-            return Err(AdminError::Forbidden(AdminAuthError::ScopeNotPermitted));
+            let error = AdminError::Forbidden(AdminAuthError::ScopeNotPermitted);
+            self.denied(grant, request, &error).await;
+            return Err(error);
         }
 
         // 3. The complete desired state the caller built its change on, read once.
@@ -418,7 +523,10 @@ impl AdminService {
         // changed rather than only what it said it would.
         let mut candidate_state = current_state.clone();
         edit.edit(&mut candidate_state)?;
-        Self::within_scope(grant.scope(), current_state, &candidate_state)?;
+        if let Err(error) = Self::within_scope(grant.scope(), current_state, &candidate_state) {
+            self.denied(grant, request, &error).await;
+            return Err(error);
+        }
 
         // 5 and 6. Validate the whole candidate, then diff two complete states.
         let mutation = MutationId::new(self.ids.next());
@@ -445,7 +553,27 @@ impl AdminService {
                 recorded_at: submitted_at,
             },
         };
-        let checksum = candidate.validated_checksum()?;
+        // A candidate built on a base that is no longer the head cannot be
+        // *judged* invalid: its invalidity may be an artefact of state the
+        // caller had not read — a project whose tenant another writer published
+        // is the ordinary case. The honest answer is the one the caller can act
+        // on, which is "re-read and retry", so staleness outranks invalidity
+        // here. A lost-response retry is unaffected: its candidate was valid
+        // when it was first built, and is rebuilt from the same base.
+        let checksum = match candidate.validated_checksum() {
+            Ok(checksum) => checksum,
+            Err(error) if !expected.matches(head) => {
+                debug!(
+                    rule = AdminError::from(error).rule(),
+                    "an invalid candidate was built on a stale base"
+                );
+                return Err(AdminError::RevisionConflict {
+                    expected,
+                    actual: head,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
         let diff = SemanticDiff::between(Some(current_state), &candidate.state)?;
         let base = base.map(|id| id.to_string());
 

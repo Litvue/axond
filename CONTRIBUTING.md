@@ -94,6 +94,13 @@ The gate itself runs on `python3` 3.10 or newer, so `just api-compat-self-test`
 works offline and without `cargo-semver-checks`; `just msrv` needs `rustup`, and
 fails rather than measuring the floor with a newer compiler.
 
+`just deploy-check`, which `just check` includes, renders the shipped Kubernetes
+manifests, so it needs `kustomize` or `kubectl` on `PATH` and network access the
+first time it builds its venv from
+[`ops/deploy-requirements.txt`](./ops/deploy-requirements.txt) (refreshed with
+`just deploy-lock`). `just restore-drill` is deliberately outside `just check`:
+it needs Docker and takes about a minute.
+
 A break fails CI. If it is intentional, add a reviewed entry to
 [`ops/api-compat-overrides.toml`](./ops/api-compat-overrides.toml) in the same PR
 and follow

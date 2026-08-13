@@ -42,7 +42,7 @@ use crate::config::Mode;
 use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{
     CanonicalValue, DesiredState, ExpectedRevision, IdempotencyKey, MutationKind, ResourceBody,
-    ResourceKind, ResourceScope, ResourceVersion, Slug, ValidationError, fixtures,
+    ResourceKind, ResourceScope, ResourceVersion, Slug, Surface, ValidationError, fixtures,
 };
 
 const HUMAN_TOKEN: &str = "oidc-assertion-for-alice";
@@ -94,6 +94,7 @@ fn request(key: &str, expected: ExpectedRevision, mode: WriteMode) -> MutationRe
             mode,
         },
         kind: MutationKind::Update,
+        surface: Surface::Tenant,
         scope: scope(),
         summary: AuditSummary::parse("publish the fixture state").expect("a valid summary"),
     }
@@ -408,6 +409,92 @@ async fn a_grant_cannot_be_spent_on_another_action_or_another_scope() {
         .expect_err("a grant is scoped");
     assert_eq!(error.code(), "admin_forbidden");
     assert_eq!(store.published_revisions(), 0);
+}
+
+#[tokio::test]
+async fn a_refusal_of_authority_is_written_to_the_denial_trail() {
+    let store = Arc::new(InMemoryControlPlane::new());
+    let tenant = fixtures::tenant_id(1);
+    let scoped = ResourceScope::Tenant(tenant);
+
+    // (a) The authorizer refuses: recorded through the one path a handler has to
+    // authority, so no route can refuse silently.
+    let api = Arc::new(AdminApi::new(
+        Arc::new(AdminService::stateful(store.clone())),
+        authenticator(),
+        Arc::new(FakeAdminAuthorizer::permitting(&[AdminAction::ReadState])),
+    ));
+    let error = api
+        .authorize(&human(), AdminAction::Publish, Surface::Tenant, &scoped)
+        .await
+        .expect_err("a read-only identity may not publish");
+    assert_eq!(error.code(), "admin_forbidden");
+
+    // (b) The service refuses an edit that reached past the granted scope: the
+    // authorizer never saw this one, which is exactly why it is recorded here.
+    let service = service(&store);
+    let mut request = request("key-1", ExpectedRevision::Empty, WriteMode::Apply);
+    request.scope = scoped.clone();
+    service
+        .apply(
+            &AdminGrant::granted(human(), AdminAction::Publish, scoped.clone()),
+            &request,
+            &replace_with(fixtures::state()),
+        )
+        .await
+        .expect_err("a claimed scope is not the scope that was changed");
+
+    let denials = crate::backends::control_plane::ControlPlaneStore::denials(
+        store.as_ref(),
+        Some(tenant),
+        10,
+    )
+    .await
+    .expect("the denial trail");
+    assert_eq!(denials.len(), 2, "both refusals are queryable: {denials:?}");
+    assert!(
+        denials.iter().all(|denial| denial.scope == scoped
+            && denial.surface == Surface::Tenant
+            && denial.actor == human().actor()),
+        "a denial names who reached for what: {denials:?}"
+    );
+    assert!(
+        denials
+            .iter()
+            .any(|denial| denial.reason == crate::desired_state::DenialReason::RoleLacksAction),
+        "the action refusal names the role, not the scope: {denials:?}"
+    );
+    assert!(
+        denials
+            .iter()
+            .any(|denial| denial.reason == crate::desired_state::DenialReason::OutOfScope),
+        "the scope refusal names the scope: {denials:?}"
+    );
+    assert_eq!(store.published_revisions(), 0);
+}
+
+#[tokio::test]
+async fn an_authenticated_refusal_survives_a_denial_trail_that_cannot_be_written() {
+    // A control-plane outage must not turn a `403` into a `503`: the refusal has
+    // already happened, and the caller learns the same thing either way.
+    let store = Arc::new(InMemoryControlPlane::new());
+    store.set_unavailable(true);
+    let api = Arc::new(AdminApi::new(
+        Arc::new(AdminService::stateful(store.clone())),
+        authenticator(),
+        Arc::new(FakeAdminAuthorizer::permitting(&[AdminAction::ReadState])),
+    ));
+    let error = api
+        .authorize(
+            &human(),
+            AdminAction::Publish,
+            Surface::Tenant,
+            &ResourceScope::Tenant(fixtures::tenant_id(1)),
+        )
+        .await
+        .expect_err("a read-only identity may not publish");
+    assert_eq!(error.code(), "admin_forbidden");
+    assert_eq!(error.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -1040,9 +1127,10 @@ async fn convergence_is_projected_from_replica_state_without_reading_the_backend
         }),
     };
     let result = service
-        .convergence(&grant(AdminAction::ReadConvergence), &report)
+        .convergence(&grant(AdminAction::ReadConvergence), Some(&report))
         .expect("a convergence projection");
     assert!(!result.converged);
+    assert!(result.reconciling);
     assert_eq!(result.source, Some("last-known-good"));
     assert_eq!(result.lag_ms, 3_000);
     assert_eq!(result.last_rejection, Some("unavailable"));
@@ -1055,6 +1143,15 @@ async fn convergence_is_projected_from_replica_state_without_reading_the_backend
     let payload = serde_json::to_string(&result).unwrap();
     assert!(!payload.contains(SECRET_LOOKING));
     assert!(!payload.contains("db.internal"));
+
+    // A replica with no reconciler has converged onto nothing. "Nothing desired
+    // equals nothing active" is convergence for a reconciler, never an
+    // all-clear for an operator gating a rollout on this read.
+    let unreconciled = service
+        .convergence(&grant(AdminAction::ReadConvergence), None)
+        .expect("a convergence projection");
+    assert!(!unreconciled.converged);
+    assert!(!unreconciled.reconciling);
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,9 +1552,23 @@ fn every_declared_code_is_reachable_distinct_and_prose_free() {
         AdminError::ControlPlaneDenied {
             detail: SECRET_LOOKING.to_owned(),
         },
+        AdminError::NameTaken {
+            noun: "tenant",
+            name: "acme".to_owned(),
+            detail: SECRET_LOOKING.to_owned(),
+        },
         AdminError::AuditSummaryInvalid,
         AdminError::DryRunInvalid,
         AdminError::HistoryLimitInvalid { max: 100 },
+        AdminError::RequestInvalid {
+            schema: "tenant",
+            // The caller's own document, echoed to the caller: unlike an
+            // operator detail, this is not the deployment's to keep.
+            detail: "`slug`: a slug is lowercase".to_owned(),
+        },
+        AdminError::RequestTooLarge {
+            limit: crate::admin::router::ADMIN_MAX_REQUEST_BYTES,
+        },
         AdminError::RouteNotFound,
         AdminError::MethodNotAllowed,
     ];
@@ -1552,7 +1663,14 @@ async fn read_state(
     State(api): State<Arc<AdminApi>>,
     Extension(identity): Extension<AdminIdentity>,
 ) -> Result<Json<Value>, AdminError> {
-    let grant = api.authorize(&identity, AdminAction::ReadState, &scope())?;
+    let grant = api
+        .authorize(
+            &identity,
+            AdminAction::ReadState,
+            Surface::AuditTrail,
+            &scope(),
+        )
+        .await?;
     let view = api.service.desired_state(&grant).await?;
     Ok(Json(serde_json::to_value(view).expect("serializable")))
 }
@@ -1562,7 +1680,9 @@ async fn publish(
     Extension(identity): Extension<AdminIdentity>,
     Extension(preconditions): Extension<MutationPreconditions>,
 ) -> Result<Json<Value>, AdminError> {
-    let grant = api.authorize(&identity, AdminAction::Publish, &scope())?;
+    let grant = api
+        .authorize(&identity, AdminAction::Publish, Surface::Tenant, &scope())
+        .await?;
     let outcome = api
         .service
         .apply(
@@ -1570,6 +1690,7 @@ async fn publish(
             &MutationRequest {
                 preconditions,
                 kind: MutationKind::Update,
+                surface: Surface::Tenant,
                 scope: scope(),
                 summary: AuditSummary::parse("publish via the router")?,
             },
@@ -1929,11 +2050,100 @@ async fn a_precondition_header_that_is_not_readable_text_is_invalid_rather_than_
     }
 }
 
+#[tokio::test]
+async fn merging_the_admin_surface_into_the_inference_router_keeps_both_fallbacks() {
+    // How `main` composes the two routers. Three things must survive the merge:
+    // an inference route still answers, an unknown *inference* path still meets
+    // the inference fallback rather than the administrative envelope, and an
+    // unknown administrative path still meets the administrative envelope rather
+    // than the inference fallback.
+    let store = Arc::new(InMemoryControlPlane::new());
+    let inference = axum::Router::new()
+        .route("/v1/models", get(|| async { "inference" }))
+        .fallback(|| async { (StatusCode::NOT_FOUND, "not an inference route") });
+    let app = inference.merge(mount(api(Some(store.clone())), test_specs()));
+
+    let answer = |request: Request<Body>| {
+        let app = app.clone();
+        async move {
+            let response = app.oneshot(request).await.expect("a response");
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+
+    let (status, body) = answer(Request::get("/v1/models").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "inference", "the merge shadowed an inference route");
+
+    let (status, body) = answer(Request::get("/v1/nothing").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        body, "not an inference route",
+        "the administrative fallback swallowed an inference path"
+    );
+
+    let (status, body) = answer(
+        Request::get(format!("{ADMIN_PREFIX}/nonexistent"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let body: Value = serde_json::from_str(&body).expect("the administrative envelope");
+    assert_eq!(body["error"]["type"], "admin_route_not_found");
+
+    // And the merged surface is still authenticated: the inference router's
+    // permissiveness is not inherited by an administrative route.
+    let (status, body) = answer(
+        Request::get(format!("{ADMIN_PREFIX}/state"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let body: Value = serde_json::from_str(&body).expect("the administrative envelope");
+    assert_eq!(body["error"]["type"], "admin_unauthenticated");
+    assert_eq!(store.published_revisions(), 0);
+}
+
+#[tokio::test]
+async fn every_shipped_route_authenticates_before_it_answers_anything_about_state() {
+    // The shipped table, not the synthetic one: a route added without the layer
+    // would answer this loop with something other than `401`.
+    let store = Arc::new(InMemoryControlPlane::new());
+    for spec in super::router::admin_route_specs() {
+        // A path parameter is filled with a syntactically plausible value, so a
+        // `404` cannot stand in for the authentication this asserts.
+        let path = format!("{ADMIN_PREFIX}{}", spec.path).replace("{revision}", "not-a-revision");
+        let builder = if spec.action.mutates() {
+            Request::post(&path)
+        } else {
+            Request::get(&path)
+        };
+        let response = super::router::router(api(Some(store.clone())))
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .expect("a response");
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+        assert_eq!(body["error"]["type"], "admin_unauthenticated", "{path}");
+    }
+    assert_eq!(store.published_revisions(), 0);
+}
+
 #[test]
-fn the_shipped_admin_table_is_empty_and_every_row_is_scoped_to_the_admin_prefix() {
-    // #143's handlers land as rows here; until then the boundary ships without
-    // any, and nothing mounts it in `serve`.
-    assert!(super::router::admin_route_specs().is_empty());
+fn every_shipped_row_is_scoped_to_the_admin_prefix_and_declares_its_action() {
+    for spec in super::router::admin_route_specs() {
+        assert!(
+            spec.path.starts_with('/') && !spec.path.starts_with(ADMIN_PREFIX),
+            "a shipped path is relative to the prefix: {}",
+            spec.path
+        );
+    }
     assert_eq!(ADMIN_PREFIX, "/admin/v1");
     for spec in test_specs() {
         assert!(

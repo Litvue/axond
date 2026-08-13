@@ -78,7 +78,11 @@ pub struct Rejection {
 }
 
 /// An immutable read of one replica's convergence state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The default is the honest report of a replica that has converged onto
+/// nothing — no desired revision observed, none loaded, none active — which is
+/// exactly the state of a replica with no reconciler running.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RevisionReport {
     pub desired: Option<RevisionId>,
     pub loaded: Option<RevisionId>,

@@ -47,8 +47,8 @@ use async_trait::async_trait;
 
 use super::{BackendFailure, BackendKind, Capabilities, FailureCategory};
 use crate::desired_state::{
-    AuditEvent, ExpectedRevision, IdempotencyKey, IntegrityError, LoadedRevision, ResourceRef,
-    RevisionCandidate, RevisionId, RevisionManifest, ValidationError,
+    AccessDenial, AuditEvent, ExpectedRevision, IdempotencyKey, IntegrityError, LoadedRevision,
+    ResourceRef, RevisionCandidate, RevisionId, RevisionManifest, TenantId, ValidationError,
 };
 
 /// The durable implementations a deployment may select for the control plane.
@@ -162,6 +162,23 @@ pub enum ControlPlaneError {
         backend: &'static str,
         message: String,
     },
+    /// Two resources claim one name. The projection enforces uniqueness on the
+    /// names an operator types — a tenant slug, a project slug within its tenant
+    /// — and a candidate that re-uses one already held by a row this deployment
+    /// retains cannot be published.
+    ///
+    /// Separate from [`ControlPlaneError::Denied`] because the two need opposite
+    /// answers: a denial is the deployment's own problem, where this is the
+    /// caller's, fixed by picking another name or by deleting the resource that
+    /// holds this one. It is reported with the name, so the fix does not require
+    /// reading a driver message.
+    #[error("the {noun} name `{name}` is already held by another {noun}")]
+    NameTaken {
+        noun: &'static str,
+        name: String,
+        /// The resource that holds the name, when the projection can name it.
+        holder: Option<String>,
+    },
     /// A retained revision could not be interpreted. Never masked as
     /// "unavailable": an operator has to know that stored state is unreadable.
     ///
@@ -245,7 +262,7 @@ impl BackendFailure for ControlPlaneError {
     fn category(&self) -> FailureCategory {
         match self {
             Self::Unavailable { .. } => FailureCategory::Unavailable,
-            Self::Conflict { .. } => FailureCategory::Conflict,
+            Self::Conflict { .. } | Self::NameTaken { .. } => FailureCategory::Conflict,
             Self::RevisionNotFound(_) => FailureCategory::NotFound,
             Self::Invalid(_)
             | Self::ImmutableResourceVersion { .. }
@@ -350,6 +367,34 @@ pub trait ControlPlaneStore: Send + Sync {
 
     /// Audit events for a revision, newest-first, for `/admin/v1` reads.
     async fn audit_trail(&self, id: RevisionId) -> Result<Vec<AuditEvent>, ControlPlaneError>;
+
+    /// Record an administrative action that was refused.
+    ///
+    /// Separate from [`publish_revision`](Self::publish_revision) because a
+    /// refusal publishes nothing: there is no revision for an audit event to hang
+    /// off, and minting an empty one to hold a refusal would put a revision in the
+    /// chain that describes no state. It is still the half of the trail that
+    /// matters most — "who tried to reach another tenant, and when" is not
+    /// answerable from successful changes.
+    ///
+    /// The caller is told only that it was forbidden; the reason is recorded here.
+    /// Recording is best-effort in exactly one sense: a store that cannot record a
+    /// denial must return an error rather than succeed, but a *caller* must still
+    /// refuse the request. A denial that cannot be written is not a denial that
+    /// becomes a grant.
+    async fn record_denial(&self, denial: &AccessDenial) -> Result<(), ControlPlaneError>;
+
+    /// Refused actions against one tenant, newest-first, for `/admin/v1` reads.
+    ///
+    /// Tenant-scoped rather than global: a tenant administrator reading their own
+    /// trail must see attempts against their tenant, and must not see another
+    /// tenant's. Deployment-scoped denials — refusals that named no tenant — are
+    /// read with `None`, which only a platform-scoped caller may ask for.
+    async fn denials(
+        &self,
+        tenant: Option<TenantId>,
+        limit: usize,
+    ) -> Result<Vec<AccessDenial>, ControlPlaneError>;
 }
 
 #[cfg(test)]

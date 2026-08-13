@@ -8,10 +8,11 @@ behaviour being qualified is
 [revision convergence](./revision-convergence.md#during-a-control-plane-outage)
 and the [control-plane journal](./control-plane-journal.md#during-a-postgres-outage).
 
-This page is a **contract, not a report.** The harness driver does not exist
-yet, and the scenarios below are declared rather than measured — see
-[what is blocked, and on what](#what-is-blocked-and-on-what). Nothing here is a
-claim that Axond has been qualified for recovery.
+This page is a **contract, and a partial report.** Five stages run today against
+a real PostgreSQL journal and write evidence to `target/recovery/`; the rest are
+declared and blocked — see [the stages](#the-stages-and-what-runs-today) and
+[what is blocked, and on what](#what-is-blocked-and-on-what). No scenario is
+qualified end to end, because none of them can serve a request yet.
 
 For the stateless request path under load, read
 [capacity qualification](./capacity.md) instead: it qualifies a Tier 0 process
@@ -25,11 +26,19 @@ it retains, the gate it fails on, and — while it is blocked — the slices it 
 waiting on and what it needs from each. A scenario the driver has no capability
 for cannot be written, so a result is always reproducible from the repository.
 
-`crates/gateway/tests/recovery_contract.rs` is what keeps the file honest while
-the harness is unbuilt. It fails when a scenario loses its gate, when the
-evidence classes below stop being covered, when a dependency edge is dropped or
-invented, when this page and the manifest disagree, and when a scenario claims
-to be executable that no driver runs.
+A scenario is split into **stages** — the control-plane half and the serving
+half became executable at different times — and each stage carries its own
+status, evidence, and blockers. A scenario is executable exactly when all of its
+stages are, which is why every scenario below is still incomplete.
+
+`crates/gateway/tests/recovery_contract.rs` keeps the file honest: it fails when
+a scenario loses its gate, when the evidence classes below stop being covered,
+when a dependency edge is dropped or invented, when this page and the manifest
+disagree, and when a stage claims to be executable while still naming a blocker.
+The complementary check lives next to the driver, in
+`crates/gateway/src/qualification/recovery.rs`: the stages the manifest calls
+executable and the stages the driver runs must be the same set, so a status can
+never be upgraded by editing the manifest alone.
 
 ## The scenarios
 
@@ -43,6 +52,58 @@ to be executable that no driver runs.
 | `secret-rotation` | A provider credential is rotated in the secret store and published; replicas pick it up by converging, with no restart or redeployment. | serves |
 | `backup-restore` | The database is lost and restored from a backup: revisions, tenancy, secret metadata, pricing, and audit rows return together. | serves |
 | `point-in-time-recovery` | Recovery to a chosen target rather than to a backup, with the data-loss boundary measured instead of assumed. | serves |
+
+## The stages, and what runs today
+
+| Stage | Status | What it does |
+| --- | --- | --- |
+| `control-plane-outage/journal-outage` | runs | Severs the link to a real journal under a converged replica: the active revision and its compiled snapshot are retained, an administrative publish is refused as `unavailable` without writing, and convergence reports the refusal. |
+| `control-plane-outage/serving` | blocked | Inference offered across the same window, so the serving-error ceiling is measured rather than asserted. |
+| `control-plane-outage/administration` | blocked | The authenticated administrative surface refusing writes, and the audit trail of the refusal. |
+| `cold-boot-valid-cache/cold-boot` | runs | A cache exported by a converged replica restores a boot with the journal unreachable, reporting `source = last-known-good`. |
+| `cold-boot-valid-cache/serving` | blocked | The restored snapshot answering requests. |
+| `cold-boot-no-cache/cold-boot` | runs | The same boot with no cache: bootstrap refuses with the control plane named, and publishes nothing. |
+| `cold-boot-no-cache/readiness` | blocked | The readiness endpoint an operator's tooling probes. |
+| `cold-boot-invalid-cache/cold-boot` | runs | An edited record, a foreign signing key, and a truncated file each refuse the boot and name the cache. |
+| `cold-boot-invalid-cache/readiness` | blocked | The readiness endpoint and the operator-facing report of a cache that refused itself. |
+| `recovery-convergence/journal-recovery` | runs | The journal returns holding revisions the fleet never saw; both replicas converge to the head without intervention, writes are accepted again, and every revision is still readable. |
+| `recovery-convergence/serving` | blocked | Traffic across the recovery. |
+| `recovery-convergence/administration` | blocked | The audit trail read through an authenticated surface. |
+| `secret-rotation/rotation` | blocked | Rotating material behind a credential reference without a redeployment. |
+| `secret-rotation/serving` | blocked | Requests authenticated with the rotated material. |
+| `backup-restore/restore` | blocked | Backup, loss, restore, and what came back with it. |
+| `backup-restore/reconvergence` | blocked | Replicas converging onto the restored journal. |
+| `point-in-time-recovery/recovery` | blocked | Recovery to a chosen target, with the data-loss boundary measured. |
+| `point-in-time-recovery/reconvergence` | blocked | Serving across the recovery and converging onto the recovered head. |
+
+## Running the stages that run
+
+The driver lives in the crate rather than in `tests/`, because a recovery stage
+has to hold a replica's reconciler, its signed cache, and a real
+`PostgresControlPlane` at once and then take the database away from underneath
+them — none of which is reachable from outside the binary while stateful boot is
+not wired to `serve`.
+
+```sh
+AXOND_TEST_POSTGRES_DSN=postgres://postgres:secret@127.0.0.1:5432/postgres \
+  cargo test -p axond --bin axond qualification::recovery
+```
+
+Each stage creates its own schema, migrates it with this build, and reaches it
+through a loopback link the harness cuts to produce the outage — so the replica
+meets a dead socket and a refused reconnect, and the database keeps its rows.
+Without a DSN the stages write nothing rather than falling back to an in-process
+control plane: an outage of a fake is evidence about the fake.
+
+One JSON artifact per stage lands at
+`target/recovery/<scenario>.<stage>.json`, carrying the build and schema it ran
+against, the timeline, the observations, and a verdict per gate field. A field
+the stage is not in a position to measure is recorded as `not_evaluated` with
+the reason, never omitted — an artifact that listed only the gates it met would
+read as a qualified scenario.
+
+CI runs the same stages in the stateful lane, which has a real Postgres service,
+and keeps the artifacts under `recovery-evidence` on the run.
 
 ## What a run retains
 
@@ -93,11 +154,12 @@ flaking, and a flaky recovery gate is one that gets switched off.
 
 ## What is blocked, and on what
 
-Every scenario is `status = "blocked"` today. The reason is upstream of the
-harness: a stateful replica still refuses to boot, because the resource bodies a
-revision is made of — tenancy, providers, catalogue, pricing, policy — are owned
-by slices that have not landed, so there is no serving, convergence, or restore
-behaviour to observe. The machinery each scenario will drive does exist:
+Every scenario is still `blocked`, because every scenario has at least one
+blocked stage. The reason is upstream of the harness: a replica cannot yet serve
+a projected revision, because the resource bodies a revision is made of —
+tenancy, providers, catalogue, pricing, policy — are owned by slices that have
+not landed. So the serving, restore, and rotation halves are specified and
+waiting, while the control-plane halves run against
 [the journal](./control-plane-journal.md) and its forward-only migrations, the
 convergence reconciler, and the signed last-known-good cache.
 

@@ -4,8 +4,8 @@ services:
   axond:
     build: .
     image: axond:quickstart
-    # A source build is not constrained by what the last release published: the
-    # Dockerfile builds either architecture natively, so this drops the
-    # quickstart's amd64 fallback rather than emulating on an ARM developer
-    # machine. An explicit AXOND_PLATFORM still wins.
+    # A source build is not constrained by what any release published: the
+    # Dockerfile builds either architecture natively, so this stays unpinned even
+    # if the quickstart is ever pinned back onto an amd64-only release and has to
+    # restore its fallback. An explicit AXOND_PLATFORM still wins.
     platform: ${AXOND_PLATFORM-}

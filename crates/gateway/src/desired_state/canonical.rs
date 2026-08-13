@@ -322,7 +322,17 @@ impl CanonicalValue {
 
     /// A set-like collection built from members in any order.
     pub fn set(members: impl IntoIterator<Item = CanonicalValue>) -> Self {
-        Self::Set(members.into_iter().collect())
+        let mut members: Vec<Self> = members.into_iter().collect();
+        // The encoder's order — the members' own encodings, sorted — so this is
+        // the set a decoder returns and not merely one that hashes the same. A
+        // member with no canonical form has no place in that order either; the
+        // encoder refuses it, so leaving it where it was costs nothing.
+        members.sort_by_cached_key(|member| {
+            let mut encoded = Vec::new();
+            let _ = member.write(&mut encoded);
+            encoded
+        });
+        Self::Set(members)
     }
 
     pub fn string(value: impl Into<String>) -> Self {
@@ -627,6 +637,27 @@ mod tests {
         assert_eq!(
             ascending.to_canonical_bytes().unwrap(),
             descending.to_canonical_bytes().unwrap()
+        );
+        // And the values themselves are equal, so a set built here is the set a
+        // decoder returns rather than one that merely encodes the same.
+        assert_eq!(ascending, descending);
+        let decoded = SerializerVersion::default()
+            .decode(&ascending.to_canonical_bytes().unwrap())
+            .unwrap();
+        assert_eq!(decoded, ascending);
+
+        // Members whose encodings order differently from their content: `"aa"`
+        // encodes after `"z"` because length leads.
+        let by_content = CanonicalValue::set([
+            CanonicalValue::string("aa"),
+            CanonicalValue::string("z"),
+            CanonicalValue::string("y"),
+        ]);
+        assert_eq!(
+            SerializerVersion::default()
+                .decode(&by_content.to_canonical_bytes().unwrap())
+                .unwrap(),
+            by_content
         );
 
         // Priority is a list: reordering targets *is* a different desired state.

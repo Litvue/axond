@@ -37,6 +37,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, Config, Row, Transaction};
 
 use super::envelope::{DeploymentKek, EnvelopeError, SealedSecret};
@@ -171,11 +172,30 @@ impl PostgresSecrets {
             ids: Uuid7Generator::new(),
             client: tokio::sync::Mutex::new(None),
         };
+        // Only this call site is a boot: a bad password or an absent database is
+        // a deployment to fix, and a replica that has not started yet loses
+        // nothing by saying so. `connect_client` is also the reconnect path, and
+        // there the same codes stay retryable — see `run`.
         let client = tokio::time::timeout(store.settings.connect_timeout, store.connect_client())
             .await
             .map_err(|_| unavailable_message("connection timed out"))?
-            .map_err(|error| unavailable("connect", &error))?;
-        store.prepare_schema(&client).await?;
+            .map_err(|error| {
+                boot_failure(
+                    "connect to the secret store",
+                    &error,
+                    // Nothing has answered a query yet, so there is no
+                    // writability to report against this one.
+                    Writability::Unknown,
+                    || {
+                        "Check the role, password, and database named by the `dsn_env` connection \
+                         string under `[secret_store]`."
+                            .to_owned()
+                    },
+                )
+            })?;
+        let writability = Writability::of(&client).await;
+        writability.report();
+        store.prepare_schema(&client, writability).await?;
         *store.client.lock().await = Some(client);
         Ok(store)
     }
@@ -193,22 +213,40 @@ impl PostgresSecrets {
     /// `create_table = false` is [`SecretError::Denied`], because a store that
     /// carried on would fail every candidate revision at compile time with an
     /// error that pointed at the wrong thing.
-    async fn prepare_schema(&self, client: &Client) -> Result<(), SecretError> {
+    ///
+    /// Neither step is blanket-`Unavailable` like the statements below are: the
+    /// two failures an operator actually hits here — no privilege to create the
+    /// table, and no table to read — are permanent, and telling on-call to wait
+    /// for a database that is answering fine would send them the wrong way.
+    async fn prepare_schema(
+        &self,
+        client: &Client,
+        writability: Writability,
+    ) -> Result<(), SecretError> {
         if self.settings.create_table {
-            client
-                .batch_execute(SCHEMA_DDL)
-                .await
-                .map_err(|error| unavailable("apply secret-store schema", &error))?;
+            client.batch_execute(SCHEMA_DDL).await.map_err(|error| {
+                boot_failure("apply secret-store schema", &error, writability, || {
+                    "Grant the connecting role `CREATE` on the schema and ownership of \
+                         `axond_secret`, or apply `ops/postgres/secret_store_v1.sql` yourself and \
+                         set `create_table = false` under `[secret_store]`."
+                        .to_owned()
+                })
+            })?;
         }
         client
             .query_one("SELECT count(*) FROM axond_secret WHERE false", &[])
             .await
             .map_err(|error| {
-                denied(format!(
-                    "the secret store's `axond_secret` table is not readable ({error}). Apply \
-                     `ops/postgres/secret_store_v1.sql`, or set `create_table = true` under \
-                     `[secret_store]` to let boot apply it."
-                ))
+                boot_failure(
+                    "read the secret store's `axond_secret` table",
+                    &error,
+                    writability,
+                    || {
+                        "Apply `ops/postgres/secret_store_v1.sql`, or set `create_table = true` \
+                         under `[secret_store]` to let boot apply it."
+                            .to_owned()
+                    },
+                )
             })?;
         Ok(())
     }
@@ -243,6 +281,13 @@ impl PostgresSecrets {
     ) -> Result<T, SecretError> {
         let mut guard = self.client.lock().await;
         if guard.as_ref().is_none_or(Client::is_closed) {
+            // Deliberately not classified the way boot's connect is. A serving
+            // replica reconnects for the life of the process, and a credential
+            // rotation the deployment is halfway through, or a pooler answering
+            // for a backend that has not reloaded `pg_hba.conf`, answers with the
+            // same permanent-looking codes and clears on the next attempt.
+            // Refusing here would strand a replica over a blip; convergence
+            // retries an outage.
             *guard = Some(
                 self.connect_client()
                     .await
@@ -472,6 +517,9 @@ impl SecretStore for PostgresSecrets {
                 // administrators rotating one secret serialize on it instead of
                 // both computing the same next version.
                 let current = Self::locked_descriptor(&transaction, owner, &reference).await?;
+                // Only a tombstone refuses: rotating from a revoked version is
+                // how withdrawn material is replaced, and it mints a successor
+                // rather than returning the revoked version to service.
                 if current.lifecycle.is_terminal() {
                     return Err(SecretError::Lifecycle {
                         reference,
@@ -653,6 +701,161 @@ fn unavailable_message(message: impl Into<String>) -> SecretError {
     }
 }
 
+/// A boot-time failure while doing `operation`, split by who has to act.
+///
+/// A `SQLSTATE` the operator has to answer — a missing table, a missing grant, a
+/// database that is not there — is [`SecretError::Denied`] and carries `remedy`,
+/// because retrying it forever changes nothing. Everything else is
+/// [`SecretError::Unavailable`]: an error with no `SQLSTATE` never reached a
+/// server, and a server *can* answer with a transient code (it is starting up,
+/// out of connections, deadlocked, or racing a sibling replica's
+/// `CREATE TABLE IF NOT EXISTS`), which the next attempt clears. Misclassifying
+/// those as `Denied` would stop a replica that was about to succeed and hand the
+/// operator a remedy for a problem it does not have.
+/// A retryable failure carries `writability`'s diagnostic when the server
+/// refused the write, so the one case an operator does have to fix — a `dsn_env`
+/// left pointing at a standby — names itself in every retried outage instead of
+/// hiding behind a generic "the store is down".
+fn boot_failure(
+    operation: &str,
+    error: &tokio_postgres::Error,
+    writability: Writability,
+    remedy: impl FnOnce() -> String,
+) -> SecretError {
+    match error.code().filter(|code| operator_must_act(code)) {
+        Some(code) => denied(format!(
+            "could not {operation} ({}: {error}). {}",
+            code.code(),
+            remedy()
+        )),
+        None => match writability.diagnosis(error.code()) {
+            Some(diagnosis) => {
+                unavailable_message(format!("{operation} failed: {error}. {diagnosis}"))
+            }
+            None => unavailable(operation, error),
+        },
+    }
+}
+
+/// What the server said about accepting writes when boot asked, before any
+/// statement of ours could fail.
+///
+/// The preflight exists because `25006` alone cannot be acted on: a stable hot
+/// standby and a two-second failover window produce the same code. Asking
+/// `pg_is_in_recovery()` separates them, and the answer is reported as a
+/// diagnostic rather than a refusal — a replica that boots mid-failover must
+/// still be allowed to retry into a promoted primary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Writability {
+    /// The endpoint accepts writes.
+    Writable,
+    /// The endpoint is in recovery: a hot standby, or a primary not yet
+    /// promoted. A `dsn_env` pointed here on purpose is a misconfiguration.
+    Standby,
+    /// Not in recovery, but writes are refused: `default_transaction_read_only`
+    /// on the role or the database, or a pooler holding the session read-only.
+    ReadOnly,
+    /// Boot could not ask — the probe itself failed, or nothing had connected
+    /// yet.
+    Unknown,
+}
+
+impl Writability {
+    /// Ask the server directly. A probe that fails is [`Self::Unknown`]: the
+    /// diagnostic is a courtesy, and losing it must not fail a boot that would
+    /// otherwise work.
+    async fn of(client: &Client) -> Self {
+        let Ok(row) = client
+            .query_one(
+                "SELECT pg_is_in_recovery(), current_setting('transaction_read_only') = 'on'",
+                &[],
+            )
+            .await
+        else {
+            return Self::Unknown;
+        };
+        match (row.get::<_, bool>(0), row.get::<_, bool>(1)) {
+            (true, _) => Self::Standby,
+            (false, true) => Self::ReadOnly,
+            (false, false) => Self::Writable,
+        }
+    }
+
+    /// Say so at boot, before anything has failed, so the endpoint is named in
+    /// the log of a replica that goes on to retry.
+    fn report(self) {
+        match self {
+            Self::Standby => tracing::warn!(
+                "the secret store's `dsn_env` endpoint is in recovery: writes are refused while it \
+                 is a standby. Repoint it at the primary if this is not a failover in progress."
+            ),
+            Self::ReadOnly => tracing::warn!(
+                "the secret store's `dsn_env` endpoint refuses writes although it is not in \
+                 recovery: check `default_transaction_read_only` on the role or the database, and \
+                 the pooler's routing."
+            ),
+            Self::Writable | Self::Unknown => {}
+        }
+    }
+
+    /// The operator-facing half of a `25006`, for the retryable error's message.
+    fn diagnosis(self, code: Option<&SqlState>) -> Option<&'static str> {
+        if code != Some(&SqlState::READ_ONLY_SQL_TRANSACTION) {
+            return None;
+        }
+        match self {
+            Self::Standby => Some(
+                "The endpoint is in recovery (`pg_is_in_recovery()`). This retries in case a \
+                 failover is in progress; if it is not, the `dsn_env` under `[secret_store]` names \
+                 a standby and has to be repointed at the primary.",
+            ),
+            Self::ReadOnly => Some(
+                "The endpoint is not in recovery but still refuses writes: check \
+                 `default_transaction_read_only` on the connecting role and the database, and the \
+                 pooler's routing.",
+            ),
+            // A server that took writes at boot and refuses them now is a
+            // demotion in progress, which is exactly what retrying is for.
+            Self::Writable | Self::Unknown => None,
+        }
+    }
+}
+
+/// Whether a `SQLSTATE` names a condition only the operator can clear.
+///
+/// Class `42` (access rule violated, undefined object), `3F` (invalid schema
+/// name), `28` (invalid authorization) and `3D` (invalid catalog name) describe a
+/// deployment that is configured wrong: the role lacks a grant, the schema or
+/// database is absent, the password is not the one the server wants. No amount of
+/// waiting fixes any of them. Every other class —
+/// notably `08` connection, `53` insufficient resources, `57` operator
+/// intervention, `40` rollback, `55` object in use, and the `23505` two
+/// concurrently booting replicas race on — clears on its own.
+///
+/// The duplicate-object codes are the exception inside class `42`:
+/// `CREATE TABLE IF NOT EXISTS` is not race-free, and a fleet booting at once
+/// can surface the collision as `42P07`/`42710` rather than `23505`. The next
+/// attempt finds the object already there, so those are the sibling replica
+/// winning, not a deployment to fix.
+///
+/// `25006` (read-only transaction) is the deliberate near miss. A `dsn_env`
+/// pointed at a hot standby answers with it and needs an operator, but so does a
+/// primary that is being demoted and a pooler routing to a replica for the length
+/// of a failover, and those clear by themselves. Refusing a replica that started
+/// mid-failover, with a remedy naming a grant it already has, is the worse of the
+/// two mistakes, so the standing misconfiguration is separated out by
+/// [`Writability`]'s preflight instead: it names the endpoint in the boot log and
+/// in every retried outage, without ever refusing one.
+fn operator_must_act(code: &SqlState) -> bool {
+    if matches!(
+        *code,
+        SqlState::DUPLICATE_TABLE | SqlState::DUPLICATE_OBJECT
+    ) {
+        return false;
+    }
+    matches!(code.code().get(..2), Some("42" | "3F" | "28" | "3D"))
+}
+
 /// A Postgres failure while doing `operation`.
 ///
 /// Everything is `Unavailable`: the statements here are parameterized and the
@@ -679,6 +882,206 @@ mod tests {
     use crate::test_services::postgres_dsn;
 
     const PLAINTEXT: &str = "sk-live-do-not-log";
+
+    #[test]
+    fn only_the_sqlstates_an_operator_can_clear_refuse_a_boot() {
+        for permanent in [
+            SqlState::INSUFFICIENT_PRIVILEGE,
+            SqlState::UNDEFINED_TABLE,
+            SqlState::INVALID_SCHEMA_NAME,
+            SqlState::INVALID_PASSWORD,
+            SqlState::INVALID_CATALOG_NAME,
+        ] {
+            assert!(
+                operator_must_act(&permanent),
+                "{} needs an operator",
+                permanent.code()
+            );
+        }
+        // A booting, saturated, contended, or restarting server answers with a
+        // code too, and the next attempt clears every one of these — including
+        // the unique violation two replicas racing `CREATE TABLE IF NOT EXISTS`
+        // collide on.
+        for transient in [
+            SqlState::CANNOT_CONNECT_NOW,
+            SqlState::TOO_MANY_CONNECTIONS,
+            SqlState::ADMIN_SHUTDOWN,
+            SqlState::T_R_DEADLOCK_DETECTED,
+            SqlState::LOCK_NOT_AVAILABLE,
+            SqlState::UNIQUE_VIOLATION,
+            SqlState::DUPLICATE_TABLE,
+            SqlState::DUPLICATE_OBJECT,
+            SqlState::CONNECTION_FAILURE,
+            // A demotion or a failover window answers with this one, and the
+            // hot-standby DSN it also names stays visible in the retried outage.
+            SqlState::READ_ONLY_SQL_TRANSACTION,
+        ] {
+            assert!(
+                !operator_must_act(&transient),
+                "{} is worth retrying",
+                transient.code()
+            );
+        }
+    }
+
+    /// `25006` is retryable either way; what changes is what on-call is told.
+    #[test]
+    fn a_read_only_endpoint_is_diagnosed_rather_than_refused() {
+        let read_only = Some(&SqlState::READ_ONLY_SQL_TRANSACTION);
+        let standby = Writability::Standby
+            .diagnosis(read_only)
+            .expect("a standby names itself");
+        assert!(standby.contains("pg_is_in_recovery"), "{standby}");
+        assert!(standby.contains("dsn_env"), "{standby}");
+        let misconfigured = Writability::ReadOnly
+            .diagnosis(read_only)
+            .expect("a read-only session names its setting");
+        assert!(
+            misconfigured.contains("default_transaction_read_only"),
+            "{misconfigured}"
+        );
+        // A server that accepted writes at boot and refuses one now is being
+        // demoted: there is nothing for an operator to do but let it retry.
+        assert_eq!(Writability::Writable.diagnosis(read_only), None);
+        assert_eq!(Writability::Unknown.diagnosis(read_only), None);
+        // And the diagnostic belongs to `25006` alone.
+        assert_eq!(
+            Writability::Standby.diagnosis(Some(&SqlState::TOO_MANY_CONNECTIONS)),
+            None
+        );
+    }
+
+    /// The same endpoint as `dsn`, reached as another role. The test DSN is
+    /// whatever the environment supplies, so the credentials are replaced rather
+    /// than assumed; `None` for a key/value DSN this cannot rewrite.
+    fn with_role(dsn: &str, role: &str, password: &str) -> Option<String> {
+        let (scheme, rest) = dsn.split_once("://")?;
+        if !matches!(scheme, "postgres" | "postgresql") {
+            return None;
+        }
+        let endpoint = match rest.split_once('/') {
+            // Only an `@` in the authority is credentials; one in the path or
+            // the query is not.
+            Some((authority, _)) => authority
+                .rsplit_once('@')
+                .map_or(rest, |(_, host)| &rest[authority.len() - host.len()..]),
+            None => rest.rsplit_once('@').map_or(rest, |(_, host)| host),
+        };
+        Some(format!("{scheme}://{role}:{password}@{endpoint}"))
+    }
+
+    #[test]
+    fn a_test_dsn_is_rewritten_onto_another_role_whatever_credentials_it_carried() {
+        for dsn in [
+            "postgres://postgres:secret@127.0.0.1:5432/axond",
+            "postgres://127.0.0.1:5432/axond",
+            "postgresql://someone@127.0.0.1:5432/axond?sslmode=disable",
+        ] {
+            let rewritten = with_role(dsn, "reader", "pw").expect("a URL-shaped DSN");
+            assert!(
+                rewritten.contains("://reader:pw@127.0.0.1:5432/axond"),
+                "{rewritten}"
+            );
+        }
+        assert_eq!(
+            with_role("host=127.0.0.1 user=postgres", "reader", "pw"),
+            None
+        );
+    }
+
+    /// A live endpoint that refuses writes: the boot is retryable, and the error
+    /// says which of the two read-only worlds it is in.
+    #[tokio::test]
+    async fn a_read_only_boot_is_an_outage_carrying_its_own_diagnosis() {
+        let Some(dsn) = postgres_dsn() else {
+            return;
+        };
+        let (client, connection) = tokio_postgres::connect(&dsn, crate::usage::tls_connector())
+            .await
+            .expect("connect to the test database");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let role = format!(
+            "axond_ro_{}",
+            Uuid7Generator::new().next().to_string().replace('-', "")
+        );
+        // The grant matters: without `CREATE` the role would fail the DDL on
+        // privilege too, and the test would only be passing because the server
+        // happens to check read-only-ness first.
+        client
+            .batch_execute(&format!(
+                "CREATE ROLE {role} LOGIN PASSWORD 'axond'; ALTER ROLE {role} SET \
+                 default_transaction_read_only = on; GRANT CREATE, USAGE ON SCHEMA public TO \
+                 {role}"
+            ))
+            .await
+            .expect("a role that may create but cannot write");
+
+        // Everything after the role exists runs through `outcome`, so the shared
+        // test database does not keep the login role when an assertion fails.
+        let outcome = match with_role(&dsn, &role, "axond") {
+            Some(read_only_dsn) => Some((
+                schema_ddl_sqlstate(&read_only_dsn).await,
+                PostgresSecrets::connect(&read_only_dsn, SecretStoreSettings::default(), kek(29))
+                    .await
+                    .err(),
+            )),
+            None => None,
+        };
+        client
+            .batch_execute(&format!(
+                "REVOKE ALL ON SCHEMA public FROM {role}; DROP ROLE IF EXISTS {role}"
+            ))
+            .await
+            .expect("drop the test role");
+
+        let Some((sqlstate, outcome)) = outcome else {
+            // A key/value DSN this cannot rewrite: nothing was exercised.
+            return;
+        };
+        // The fixture is pinned rather than assumed: the role holds `CREATE` on
+        // the schema, so the server cannot answer the DDL with `42501` and reach
+        // the assertions below by a different route than the one they name.
+        assert_eq!(
+            sqlstate.as_ref(),
+            Some(&SqlState::READ_ONLY_SQL_TRANSACTION),
+            "this fixture is only a demotion window if the endpoint refuses the DDL for being \
+             read-only; a different SQLSTATE means the role or the pooler, not read-only-ness, \
+             is what fails here"
+        );
+
+        let error = outcome.expect("a read-only endpoint cannot be prepared");
+        assert_eq!(
+            error.category(),
+            FailureCategory::Unavailable,
+            "a demotion window must be retried, not refused: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("default_transaction_read_only"),
+            "the outage carries the preflight's answer for the endpoint that is read-only \
+             without being in recovery: {message}"
+        );
+    }
+
+    /// The SQLSTATE the endpoint actually answers the shipped schema statements
+    /// with, so a classification assertion cannot quietly start proving
+    /// something else on another server version or behind a pooler.
+    async fn schema_ddl_sqlstate(dsn: &str) -> Option<SqlState> {
+        let (client, connection) = tokio_postgres::connect(dsn, crate::usage::tls_connector())
+            .await
+            .ok()?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(SCHEMA_DDL)
+            .await
+            .err()?
+            .code()
+            .cloned()
+    }
 
     fn kek(seed: u8) -> DeploymentKek {
         DeploymentKek::parse(
@@ -764,6 +1167,34 @@ mod tests {
         .expect_err("nothing listens there");
         assert_eq!(error.category(), FailureCategory::Unavailable);
         assert!(!error.to_string().contains("sk-"), "{error}");
+    }
+
+    /// A database that is not there is a DSN to fix, and boot says so instead of
+    /// telling on-call to wait for a server that is answering fine. The reconnect
+    /// path deliberately keeps the same code retryable — see `run`.
+    #[tokio::test]
+    async fn a_boot_against_an_absent_database_is_refused_not_an_outage() {
+        let Some(dsn) = postgres_dsn() else {
+            return;
+        };
+        let config: Config = dsn.parse().expect("the test DSN parses");
+        let tokio_postgres::config::Host::Tcp(host) = &config.get_hosts()[0] else {
+            panic!("the test DSN names a TCP host");
+        };
+        let absent = format!(
+            "host={host} port={} user={} password={} dbname=axond_absent_database",
+            config.get_ports()[0],
+            config.get_user().unwrap_or("postgres"),
+            String::from_utf8_lossy(config.get_password().unwrap_or_default()),
+        );
+
+        let error = PostgresSecrets::connect(&absent, SecretStoreSettings::default(), kek(1))
+            .await
+            .expect_err("there is no such database");
+
+        assert_eq!(error.category(), FailureCategory::Denied);
+        let message = error.to_string();
+        assert!(message.contains("dsn_env"), "{message}");
     }
 
     #[tokio::test]
@@ -1086,6 +1517,83 @@ mod tests {
                 .rotate(owner(), &staged, SecretMaterial::new(String::new()))
                 .await,
             Err(SecretError::Invalid(_))
+        ));
+
+        drop_schema(&schema).await;
+    }
+
+    /// A database that refuses to create the table has answered, so the answer is
+    /// a refusal with the grant to fix — not an outage the replica should retry
+    /// until somebody notices the message names the wrong problem.
+    #[tokio::test]
+    async fn a_schema_the_table_cannot_be_created_in_is_refused_not_an_outage() {
+        let Some(dsn) = postgres_dsn() else {
+            return;
+        };
+        // A search path naming no existing schema: `CREATE TABLE` has nowhere to
+        // go and Postgres says so with a `SQLSTATE`, which is the same shape as
+        // the privilege failure an operator actually hits.
+        let error = PostgresSecrets::connect(
+            &dsn,
+            SecretStoreSettings {
+                schema: Some(format!(
+                    "axond_absent_{}",
+                    Uuid7Generator::new().next().to_string().replace('-', "")
+                )),
+                create_table: true,
+                ..SecretStoreSettings::default()
+            },
+            kek(19),
+        )
+        .await
+        .expect_err("the table cannot be created there");
+
+        assert_eq!(error.category(), FailureCategory::Denied);
+        let message = error.to_string();
+        assert!(message.contains("create_table"), "{message}");
+    }
+
+    /// Rotation from a revoked base is permitted, and deliberately: it mints a
+    /// fresh version rather than returning the revoked one to service, which is
+    /// how an operator replaces material they have just withdrawn. The revoked
+    /// version stays revoked and stays unresolvable.
+    #[tokio::test]
+    async fn rotating_from_a_revoked_version_mints_a_successor_and_leaves_it_revoked() {
+        let Some((store, schema)) = store(23).await else {
+            return;
+        };
+        let staged = store
+            .stage(owner(), SecretMaterial::new(PLAINTEXT.to_owned()))
+            .await
+            .expect("a staged version");
+        store
+            .transition(owner(), &staged.reference, SecretLifecycle::Revoked)
+            .await
+            .expect("a withdrawal");
+
+        let rotated = store
+            .rotate(
+                owner(),
+                &staged.reference,
+                SecretMaterial::new("sk-replacement".to_owned()),
+            )
+            .await
+            .expect("a replacement for withdrawn material");
+
+        assert_eq!(rotated.reference, staged.reference.rotated());
+        assert_eq!(rotated.lifecycle, SecretLifecycle::Staged);
+        assert_eq!(
+            store
+                .describe(owner(), &staged.reference)
+                .await
+                .expect("the base version")
+                .lifecycle,
+            SecretLifecycle::Revoked,
+            "the withdrawn version does not come back"
+        );
+        assert!(matches!(
+            store.resolve(owner(), &staged.reference).await,
+            Err(SecretError::Lifecycle { .. })
         ));
 
         drop_schema(&schema).await;

@@ -189,6 +189,21 @@ pub struct BinaryMeta {
     pub version: &'static str,
 }
 
+/// The binary under test, named by hash. Shared with the rollout harness so two
+/// artifacts from the same commit describe the same build and say so with the
+/// same digest.
+pub fn binary_meta() -> BinaryMeta {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_axond"));
+    BinaryMeta {
+        path: binary.display().to_string(),
+        sha256: manifest::sha256_file(&binary),
+        size_bytes: std::fs::metadata(&binary)
+            .map(|meta| meta.len())
+            .unwrap_or_default(),
+        version: env!("CARGO_PKG_VERSION"),
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigMeta {
     pub sha256: String,
@@ -246,7 +261,7 @@ pub struct Hardware {
 }
 
 impl Hardware {
-    fn collect() -> Self {
+    pub fn collect() -> Self {
         Self {
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
@@ -292,7 +307,7 @@ pub struct Toolchain {
 }
 
 impl Toolchain {
-    fn collect() -> Self {
+    pub fn collect() -> Self {
         Self {
             rustc: command_output("rustc", &["--version"]),
             cargo_profile: if cfg!(debug_assertions) {
@@ -314,7 +329,7 @@ pub struct Source {
 }
 
 impl Source {
-    fn collect() -> Self {
+    pub fn collect() -> Self {
         Self {
             crate_version: env!("CARGO_PKG_VERSION"),
             git_commit: command_output("git", &["rev-parse", "HEAD"]),

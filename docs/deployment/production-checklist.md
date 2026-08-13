@@ -51,7 +51,10 @@ read the maintainer-facing
 - [ ] Namespace budget-cap migrations were completed with the fleet stopped.
 - [ ] Postgres DDL is applied before writers using the new schema.
 - [ ] Redis key prefixes and Postgres tables are isolated between environments.
+- [ ] Postgres and Redis are on [supported versions](./stateful-backends.md#supported-versions).
 - [ ] Backup and restore procedures include schema/layout metadata and have been tested.
+- [ ] The [recovery objectives](../operations/backup-and-recovery.md#objectives) (RPO, RTO) are accepted or explicitly revised, and WAL archiving failures are alerted on.
+- [ ] A restore and a point-in-time recovery have been rehearsed against *your* backups, not only by [the drill](../operations/backup-and-recovery.md#the-drill).
 - [ ] Autoscaling does not accidentally multiply an in-memory budget or rate limit.
 - [ ] Per-replica `[admission]` ceilings x replica count is the concurrency the providers and the fleet can actually absorb.
 

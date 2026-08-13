@@ -317,10 +317,14 @@ version 2 transition.
   further usage sinks (Tinybird, ClickHouse) remain post-beta with no committed
   schedule.
 - **The stateful control plane.** `mode = "stateful"` bootstrap configuration
-  parses and validates ([ADR 0027]), and a stateful process then refuses to
-  start: no `/admin/v1` route, durable schema, or snapshot compiler ships yet.
-  Nothing about that surface is under the `0.x` config or HTTP promise until it
-  exists.
+  parses and validates ([ADR 0027]), and a stateful process now boots, serves
+  authenticated `/admin/v1`, and refuses *inference* per request
+  (`503 inference_unavailable`, `/readyz` `503`) because no compiler from a
+  published revision to a runtime snapshot ships yet. Neither `/admin/v1` nor the
+  stateful bootstrap surface is under the `0.x` config or HTTP promise until
+  convergence exists; a stateless deployment answers every `/admin/v1` path with
+  `501 stateful_mode_required`. See
+  [administering a stateful deployment](./operations/admin-api.md).
 
 ## Supported releases and who owns each matrix
 

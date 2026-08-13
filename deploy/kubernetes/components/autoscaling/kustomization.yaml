@@ -1,0 +1,20 @@
+# Optional autoscaling, opted into by adding this component to an overlay's
+# `components` list. It is a component rather than a resource in the production
+# overlay because an HPA is a claim about a measured workload: adding one to a
+# fleet whose replica count still carries semantics (per-replica admission
+# ceilings, per-replica budgets and circuits) changes those semantics silently.
+# Read `docs/deployment/kubernetes.md#optional-autoscaling` before enabling it.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - hpa.yaml
+patches:
+  # The HPA owns the replica count once it exists. Leaving `replicas` in the
+  # Deployment means every `kubectl apply` fights the autoscaler for it, so it is
+  # removed here rather than merely ignored.
+  - target:
+      kind: Deployment
+      name: axond
+    patch: |-
+      - op: remove
+        path: /spec/replicas

@@ -96,6 +96,33 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// The inference surface of a replica whose configuration is not a runtime
+/// snapshot yet: the probes, and one refusal for everything else.
+///
+/// A stateful replica serves `/admin/v1` long before it can compile a published
+/// revision into a snapshot, and the two must not be confused. Liveness stays
+/// `200` — the process is healthy and is administrable — while readiness stays
+/// `503` and every inference path answers `reason` in the gateway's own error
+/// envelope. Nothing here holds an [`AppState`]: there is no configuration to
+/// hold, which is the whole point.
+pub fn unconverged_router(reason: &'static str) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route(
+            "/readyz",
+            get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "unconverged") }),
+        )
+        .fallback(move || async move {
+            let body = json!({
+                "error": {
+                    "type": "inference_unavailable",
+                    "message": reason,
+                }
+            });
+            (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+        })
+}
+
 /// Whether a route is one of the two unauthenticated liveness probes or must
 /// pass inbound authentication before its handler can run.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4099,6 +4126,62 @@ min_iat = {}
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A stateful replica is administrable before it is servable. Its inference
+    /// surface must say so per request rather than answer an empty configuration:
+    /// an unknown-model `404` or an unauthorized `401` would read, to a caller,
+    /// as a deployment that is configured and simply lacks what was asked for.
+    #[tokio::test]
+    async fn an_unconverged_replica_refuses_inference_without_pretending_to_be_ready() {
+        let reason = crate::ops::inference_refusal(
+            &crate::config::Config::from_toml_str(
+                "mode = \"stateful\"\n\
+                 [control_plane]\ndsn_env = \"GW_CONTROL_PLANE_DSN\"\n\
+                 [secret_store]\nkek_env = \"GW_KEK\"\n\
+                 [[admin_breakglass]]\nenv = \"GW_BREAKGLASS\"\n",
+            )
+            .expect("a valid stateful config"),
+        )
+        .expect("stateful inference is refused");
+        let app = unconverged_router(reason);
+
+        let live = app
+            .clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(live.status(), StatusCode::OK, "the process is healthy");
+
+        let ready = app
+            .clone()
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            ready.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "but it must never be routed inference traffic"
+        );
+
+        for path in ["/v1/chat/completions", "/v1/models", "/v1/messages"] {
+            let resp = app
+                .clone()
+                .oneshot(Request::post(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            let body: Value =
+                serde_json::from_slice(&resp.into_body().collect().await.expect("body").to_bytes())
+                    .expect("json error body");
+            assert_eq!(body["error"]["type"], "inference_unavailable", "{path}");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("stateful")),
+                "the refusal names the mode that caused it: {body}"
+            );
+        }
     }
 
     /// Draining is what a rolling deployment observes, and it must not take the

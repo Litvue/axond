@@ -125,12 +125,37 @@ pub enum AdminError {
     /// caller cannot influence.
     #[error("the control plane refused the operation")]
     ControlPlaneDenied { detail: String },
+    /// Two resources claim one name. The caller's fix is to rename, or to delete
+    /// whatever still holds the name — so the name is in the response, and the
+    /// status is a conflict rather than the `500` an opaque backend refusal
+    /// would have produced.
+    #[error("the {noun} name `{name}` is already taken")]
+    NameTaken {
+        noun: &'static str,
+        name: String,
+        detail: String,
+    },
     #[error("the audit summary is empty, too long, or not printable")]
     AuditSummaryInvalid,
     #[error("the `X-Axond-Dry-Run` header must be `true` or `false`")]
     DryRunInvalid,
     #[error("a history request may ask for at most {max} revisions")]
     HistoryLimitInvalid { max: u32 },
+    /// The request body is not the document the route reads. Separate from
+    /// [`AdminError::ValidationFailed`], which is about a *candidate revision*
+    /// the caller's edit produced: this one never got as far as an edit, so
+    /// nothing was read from the control plane to refuse it.
+    #[error("the request body is not a valid `{schema}` document: {detail}")]
+    RequestInvalid {
+        schema: &'static str,
+        detail: String,
+    },
+    /// The request body is larger than this surface reads. Declared in the
+    /// envelope rather than left to axum's bare `413`: a handler parses a
+    /// document whole, so the bound is what stops an authenticated caller from
+    /// making the process buffer an arbitrary body.
+    #[error("the request body exceeds the {limit}-byte administrative limit")]
+    RequestTooLarge { limit: usize },
     /// No such administrative route. Unlike `/v1`, where a `404` would be
     /// indistinguishable from a misconfigured `base_url`, an unknown
     /// `/admin/v1` path is a client error and says so in its own code.
@@ -163,9 +188,12 @@ impl AdminError {
         "revision_too_large",
         "control_plane_unavailable",
         "control_plane_denied",
+        "name_taken",
         "audit_summary_invalid",
         "dry_run_invalid",
         "history_limit_invalid",
+        "admin_request_invalid",
+        "admin_request_too_large",
         "admin_route_not_found",
         "admin_method_not_allowed",
     ];
@@ -190,9 +218,12 @@ impl AdminError {
             Self::RevisionTooLarge { .. } => "revision_too_large",
             Self::ControlPlaneUnavailable { .. } => "control_plane_unavailable",
             Self::ControlPlaneDenied { .. } => "control_plane_denied",
+            Self::NameTaken { .. } => "name_taken",
             Self::AuditSummaryInvalid => "audit_summary_invalid",
             Self::DryRunInvalid => "dry_run_invalid",
             Self::HistoryLimitInvalid { .. } => "history_limit_invalid",
+            Self::RequestInvalid { .. } => "admin_request_invalid",
+            Self::RequestTooLarge { .. } => "admin_request_too_large",
             Self::RouteNotFound => "admin_route_not_found",
             Self::MethodNotAllowed => "admin_method_not_allowed",
         }
@@ -212,10 +243,13 @@ impl AdminError {
             | Self::ValidationFailed { .. }
             | Self::AuditSummaryInvalid
             | Self::DryRunInvalid
-            | Self::HistoryLimitInvalid { .. } => StatusCode::BAD_REQUEST,
+            | Self::HistoryLimitInvalid { .. }
+            | Self::RequestInvalid { .. } => StatusCode::BAD_REQUEST,
             Self::RevisionConflict { .. }
             | Self::IdempotencyKeyReused { .. }
+            | Self::NameTaken { .. }
             | Self::ImmutableResourceVersion { .. } => StatusCode::CONFLICT,
+            Self::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RevisionNotFound(_) | Self::RouteNotFound => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             // Stateless mode is not a failure and not a misconfiguration: the
@@ -258,7 +292,9 @@ impl AdminError {
             | Self::RevisionIncompatible { detail, .. }
             | Self::RevisionTooLarge { detail, .. }
             | Self::ControlPlaneUnavailable { detail }
-            | Self::ControlPlaneDenied { detail } => Some(detail),
+            | Self::ControlPlaneDenied { detail }
+            | Self::NameTaken { detail, .. }
+            | Self::RequestInvalid { detail, .. } => Some(detail),
             _ => None,
         }
     }
@@ -335,6 +371,16 @@ impl AdminError {
             ControlPlaneError::Denied { backend, message } => Self::ControlPlaneDenied {
                 detail: format!("{backend}: {message}"),
             },
+            ControlPlaneError::NameTaken { noun, name, holder } => Self::NameTaken {
+                noun,
+                detail: holder.map_or_else(
+                    || format!("the {noun} name `{name}` is already projected"),
+                    |constraint| {
+                        format!("the {noun} name `{name}` violates the unique index {constraint}")
+                    },
+                ),
+                name,
+            },
             ControlPlaneError::Corrupt { revision, source } => Self::RevisionUnreadable {
                 revision: Some(revision),
                 detail: source.to_string(),
@@ -367,6 +413,9 @@ fn validation_rule(error: &ValidationError) -> (&'static str, Option<ResourceRef
             ("duplicate_resource_version", Some(*reference))
         }
         ValidationError::MultipleVersions { first, .. } => ("multiple_versions", Some(*first)),
+        ValidationError::VersionNotAdvanced { proposed, .. } => {
+            ("version_not_advanced", Some(*proposed))
+        }
         ValidationError::DuplicateSlug { first, .. } => ("duplicate_slug", Some(*first)),
         ValidationError::ScopeMismatch { reference, .. } => ("scope_mismatch", Some(*reference)),
         ValidationError::DanglingResourceReference { from, .. } => {
@@ -376,6 +425,9 @@ fn validation_rule(error: &ValidationError) -> (&'static str, Option<ResourceRef
             ("dangling_blob_reference", Some(*from))
         }
         ValidationError::UnreferencedBlob { .. } => ("unreferenced_blob", None),
+        ValidationError::PinnedSnapshotWithdrawn { enablement, .. } => {
+            ("pinned_snapshot_withdrawn", Some(*enablement))
+        }
         ValidationError::CrossTenantReference { from, .. } => {
             ("cross_tenant_reference", Some(*from))
         }
@@ -386,9 +438,12 @@ fn validation_rule(error: &ValidationError) -> (&'static str, Option<ResourceRef
         // #243's credential records validate by their own rules; the resource is
         // named by the inner error's message, and the material never is.
         ValidationError::Credential(_) => ("provider_credential", None),
-        // #253's policy records validate by their own rules, and name the
-        // resource they are about without quoting its body.
+        ValidationError::CredentialTransition(_) => ("credential_transition", None),
+        // #253's policy records and #255's model contracts validate by their own
+        // rules, and name the resource they are about without quoting its body.
         ValidationError::Policy(policy) => ("policy", Some(policy.reference())),
+        ValidationError::Provider(_) => ("provider_connection", None),
+        ValidationError::Model(_) => ("model_contract", None),
         ValidationError::AuditMutationMismatch { .. } => ("audit_mutation_mismatch", None),
         ValidationError::Canonical(_) => ("not_canonical", None),
     }

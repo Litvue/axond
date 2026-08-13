@@ -25,12 +25,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
+use super::access::Directory;
 use super::canonical::{Canonical, CanonicalError, CanonicalValue, Checksum, SerializerVersion};
 use super::credentials::{CredentialError, Credentials};
-use super::ids::{AuditEventId, MutationId, RevisionId, Slug};
+use super::ids::{AuditEventId, MutationId, ResourceId, RevisionId, Slug};
+use super::models::{ModelEnablementBody, ModelError, Models};
 use super::mutation::{AuditEvent, ExpectedRevision, Mutation};
 use super::policy::{PolicyError, PolicySet};
-use super::resource::{BlobRef, ResourceRef, ResourceScope, ResourceVersion};
+use super::providers::{ProviderError, Providers};
+use super::resource::{BlobRef, ResourceKind, ResourceRef, ResourceScope, ResourceVersion};
+use super::secrets::ForbiddenTransition;
 use super::tenancy::{Tenancy, TenancyError};
 
 /// Why a desired state is not a valid revision.
@@ -50,6 +54,11 @@ pub enum ValidationError {
         first: ResourceRef,
         second: ResourceRef,
     },
+    #[error("{proposed} does not advance on {previous}")]
+    VersionNotAdvanced {
+        previous: ResourceRef,
+        proposed: ResourceRef,
+    },
     #[error("`{slug}` names both {first} and {second} in the same scope")]
     DuplicateSlug {
         slug: Slug,
@@ -67,6 +76,27 @@ pub enum ValidationError {
     DanglingBlobReference { from: ResourceRef, digest: Checksum },
     #[error("blob {digest} is declared but referenced by no resource")]
     UnreferencedBlob { digest: Checksum },
+    /// A catalogue row was asked to carry different content while an enablement
+    /// still reads its offering from the content it carries now.
+    ///
+    /// An enablement's snapshot is immutable — [`ModelEnablementBody`] refuses a
+    /// version that re-pins one, because that is how a published alias's meaning
+    /// changes underneath it — so a refresh cannot be applied to the enablements
+    /// that pinned the old contents. The refusal names them, and the way through
+    /// is the one ADR 0042 describes: publish the refreshed snapshot, enable the
+    /// offerings against it, and retire the enablements that read the old one.
+    ///
+    /// [`ModelEnablementBody`]: super::models::ModelEnablementBody
+    #[error(
+        "{catalog} still supplies the snapshot {digest} that {enablement} is pinned to; \
+         an enablement's snapshot is immutable, so publish the refreshed catalogue as its own \
+         resource and enable offerings against it"
+    )]
+    PinnedSnapshotWithdrawn {
+        catalog: ResourceRef,
+        enablement: ResourceRef,
+        digest: Checksum,
+    },
     #[error("{from} depends on {to}, which belongs to another tenant")]
     CrossTenantReference { from: ResourceRef, to: ResourceRef },
     #[error("deployment-scoped {from} depends on tenant-scoped {to}")]
@@ -75,8 +105,21 @@ pub enum ValidationError {
     Tenancy(#[from] TenancyError),
     #[error("this revision's provider credentials are not valid: {0}")]
     Credential(#[from] CredentialError),
+    /// A credential's material was moved somewhere its current state does not
+    /// reach — staged material retired without ever serving, or withdrawn
+    /// material put back in service. The domain owns which moves exist; this is
+    /// how an administrative edit that asked for one that does not is refused
+    /// with the same typed failure every other invalid candidate carries.
+    #[error("this revision moves a credential's material illegally: {0}")]
+    CredentialTransition(#[from] ForbiddenTransition),
     #[error("this revision's policy is not valid: {0}")]
     Policy(#[from] PolicyError),
+    #[error("this revision's provider connections are not valid: {0}")]
+    Provider(#[from] ProviderError),
+    /// Boxed so that this error — and every `Result` that carries it — stays the
+    /// size it was before model bodies were typed.
+    #[error("this revision's model contracts are not valid: {0}")]
+    Model(Box<ModelError>),
     #[error("audit event {audit} records mutation {recorded}, not this candidate's {mutation}")]
     AuditMutationMismatch {
         audit: AuditEventId,
@@ -128,6 +171,38 @@ impl DesiredState {
     /// carry forward into the next revision.
     pub fn declare_blob(&mut self, blob: BlobRef) -> &mut Self {
         self.blobs.insert(blob.digest, blob);
+        self
+    }
+
+    /// Drop declarations no resource references any more.
+    ///
+    /// An orphaned blob is a validation failure, and superseding the only
+    /// resource that referenced a payload orphans one: re-pointing a catalogue
+    /// row at a new snapshot would otherwise produce a candidate no author could
+    /// repair, because a declaration cannot be withdrawn one at a time. Content
+    /// addressing makes this safe — a digest nothing references contributes
+    /// nothing to the state — and it is the *author's* call, not validation's,
+    /// which is why it is an explicit step rather than a silent one inside
+    /// [`DesiredState::validate`].
+    ///
+    /// A snapshot a model enablement pins counts as referenced even though the
+    /// enablement's body is not itself a blob: dropping it would turn a
+    /// catalogue re-import into an unpinned-snapshot refusal.
+    pub fn retain_referenced_blobs(&mut self) -> &mut Self {
+        let mut referenced: BTreeSet<Checksum> = self
+            .resources
+            .values()
+            .filter_map(|resource| resource.body.blob())
+            .map(|blob| blob.digest)
+            .collect();
+        referenced.extend(
+            self.resources
+                .values()
+                .filter(|resource| resource.reference.kind == ResourceKind::ModelEnablement)
+                .filter_map(|resource| ModelEnablementBody::read(resource).ok())
+                .map(|body| body.offering().snapshot),
+        );
+        self.blobs.retain(|digest, _| referenced.contains(digest));
         self
     }
 
@@ -246,18 +321,32 @@ impl DesiredState {
             return Err(ValidationError::UnreferencedBlob { digest: *digest });
         }
 
-        // Last, because it is the only step that reads a *body*: everything above
-        // holds for every resource kind, including the ones whose schemas later
-        // slices own. Tenancy is the one schema the domain knows (#191), and it is
-        // what makes ownership — a project's tenant, and the tenant of anything
+        // Last, because these are the only steps that read a *body*: everything
+        // above holds for every resource kind, including the ones whose schemas
+        // later slices own. Tenancy is the schema the domain knows (#191), and it
+        // is what makes ownership — a project's tenant, and the tenant of anything
         // scoped to one — a domain invariant rather than a projection's problem.
-        Tenancy::of(self)?;
+        let tenancy = Tenancy::of(self)?;
+        // Then the directory, against that tenancy (#144): a grant over a tenant
+        // this revision does not declare, or over another tenant's project, is
+        // refused here rather than at the moment someone uses it. Identity bodies
+        // are strictly read because no release has ever published one — there is
+        // no untyped identity row in any deployment for this to become
+        // retroactively strict about.
+        Directory::of(self, &tenancy)?;
 
         // Then the bodies that hang off tenancy. Credentials are read after it
         // because their ownership is stated in the same terms — a tenant, and
         // optionally one of its projects — and a project that does not belong to
         // the tenant a credential names is tenancy's refusal to make, not a second
         // opinion about it here (#198).
+        // Provider connections before the credentials that authenticate to them:
+        // "is this endpoint dialable, and does this connection belong to the
+        // tenant it claims?" is a question about the provider row itself, and a
+        // credential naming an unreadable provider should be refused as the
+        // provider it is, not as a credential (#143).
+        Providers::of(self)?;
+
         Credentials::of(self)?;
 
         // A policy document states the scope it governs in tenancy's own terms
@@ -265,7 +354,52 @@ impl DesiredState {
         // forming a second opinion about them (#208).
         PolicySet::of(self)?;
 
+        // Model enablements and aliases state ownership the same way, and an alias
+        // reaches its own project's enablements and its tenant's defaults — which
+        // is only meaningful once tenancy has agreed the project belongs to the
+        // tenant (#205).
+        Models::of(self)?;
+
         Ok(())
+    }
+
+    /// Replace a resource with a later version of itself.
+    ///
+    /// The shape every administrative change has: desired state is complete, so
+    /// renaming a project or disabling a tenant means republishing everything with
+    /// one resource advanced. Refuses a version that does not advance, because a
+    /// revision that reuses a version number would make "which body is version 3?"
+    /// depend on which revision you loaded.
+    ///
+    /// Inserts when the resource is absent, so a caller building the next revision
+    /// out of the current one does not have to branch on whether it is a create.
+    pub fn supersede(&mut self, resource: ResourceVersion) -> Result<&mut Self, ValidationError> {
+        let previous = self
+            .resources
+            .keys()
+            .find(|reference| {
+                reference.kind == resource.reference.kind && reference.id == resource.reference.id
+            })
+            .copied();
+        if let Some(previous) = previous {
+            if previous.version >= resource.reference.version {
+                return Err(ValidationError::VersionNotAdvanced {
+                    previous,
+                    proposed: resource.reference,
+                });
+            }
+            self.resources.remove(&previous);
+        }
+        self.insert(resource)
+    }
+
+    /// The version of a resource this state holds, by identity rather than by
+    /// reference: a caller advancing a resource knows *which* resource, not which
+    /// version number it is currently at.
+    pub fn version_of(&self, kind: ResourceKind, id: ResourceId) -> Option<&ResourceVersion> {
+        self.resources
+            .values()
+            .find(|resource| resource.reference.kind == kind && resource.reference.id == id)
     }
 
     /// The checksum of this state's canonical bytes: the revision's identity as
@@ -421,6 +555,15 @@ pub enum BodySkew {
     Credential(CredentialError),
     #[error(transparent)]
     Policy(PolicyError),
+    /// Boxed for the same reason [`ValidationError::Model`] is.
+    #[error(transparent)]
+    Model(Box<ModelError>),
+}
+
+impl From<ModelError> for ValidationError {
+    fn from(error: ModelError) -> Self {
+        Self::Model(Box::new(error))
+    }
 }
 
 impl From<TenancyError> for BodySkew {
@@ -441,6 +584,12 @@ impl From<PolicyError> for BodySkew {
     }
 }
 
+impl From<ModelError> for BodySkew {
+    fn from(error: ModelError) -> Self {
+        Self::Model(Box::new(error))
+    }
+}
+
 impl BodySkew {
     /// The resource the refusal is about, whichever schema refused it.
     pub const fn reference(&self) -> ResourceRef {
@@ -448,6 +597,7 @@ impl BodySkew {
             Self::Tenancy(error) => error.reference(),
             Self::Credential(error) => error.reference(),
             Self::Policy(error) => error.reference(),
+            Self::Model(error) => error.reference(),
         }
     }
 }
@@ -541,6 +691,9 @@ impl IntegrityError {
             }
             ValidationError::Policy(policy) if policy.is_incompatible() => {
                 Self::Incompatible(BodySkew::Policy(policy))
+            }
+            ValidationError::Model(model) if model.is_incompatible() => {
+                Self::Incompatible(BodySkew::Model(model))
             }
             other => Self::Invalid(other),
         }

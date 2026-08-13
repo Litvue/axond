@@ -83,18 +83,36 @@ use std::fmt;
 use super::canonical::{Canonical, CanonicalValue};
 use super::ids::{InvalidId, ProjectId, ResourceId, Slug, TenantId};
 use super::record::{
-    BodyError, DISPLAY_NAME_FIELD, PROJECT_ID_FIELD, Record, SCHEMA_FIELD, TENANT_ID_FIELD,
+    BodyError, DISPLAY_NAME_FIELD, DisplayNameError, PROJECT_ID_FIELD, Record, SCHEMA_FIELD,
+    TENANT_ID_FIELD,
 };
 use super::resource::{
     ResourceBody, ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber,
 };
 use super::revision::DesiredState;
 
-/// The tenant body schema this build reads and writes.
+/// The tenant body schema a tenant that has never left [`TenantLifecycle::Active`]
+/// is written under, and the only one a build predating lifecycle ever wrote.
 pub const TENANT_SCHEMA: &str = "axond.tenant.v1";
+
+/// The tenant body schema a tenant carrying a lifecycle state other than
+/// [`TenantLifecycle::Active`] is written under (#144).
+///
+/// Two identifiers rather than one, and an active tenant keeps being written
+/// under [`TENANT_SCHEMA`], so publishing tenants does not require every replica
+/// to understand lifecycle first. Disabling a tenant is the moment a revision
+/// starts requiring a build that does — which is the honest boundary, because a
+/// replica that read a disabled tenant as active would keep serving it.
+///
+/// Named for the field set it adds rather than `axond.tenant.v2`: a `v2` is the
+/// next shape of *the tenant body itself*, and spending that identifier on an
+/// additive field set would leave the real successor without a name.
+pub const TENANT_LIFECYCLE_SCHEMA: &str = "axond.tenant.lifecycle.v1";
 
 /// The project body schema this build reads and writes.
 pub const PROJECT_SCHEMA: &str = "axond.project.v1";
+
+const LIFECYCLE_FIELD: &str = "lifecycle";
 
 /// Why a tenancy body, or the tenancy graph it belongs to, was refused.
 ///
@@ -180,6 +198,59 @@ pub enum TenancyError {
         scoped: TenantId,
         owner: TenantId,
     },
+    #[error("{reference} field `{field}` is not a set of strings")]
+    FieldSet {
+        reference: ResourceRef,
+        field: &'static str,
+    },
+    #[error("{reference} field `{field}` is not a checksum")]
+    MalformedChecksum {
+        reference: ResourceRef,
+        field: &'static str,
+    },
+    /// A closed vocabulary — a lifecycle state, an identity kind, a role — spelled
+    /// with a value this build does not know.
+    ///
+    /// A compatibility refusal: every spelling this release writes is one it
+    /// reads, so a value it does not know is a value a *newer* release wrote, and
+    /// the answer is to run that release rather than to repair a database.
+    #[error("{reference} declares `{value}`, which this build does not read as a {vocabulary}")]
+    UnknownVocabulary {
+        reference: ResourceRef,
+        vocabulary: &'static str,
+        value: String,
+    },
+    #[error("{reference} grants no role; a principal with no grant is not a principal")]
+    NoRoles { reference: ResourceRef },
+    #[error("{reference} grants `{role}` at {scope}, which is not a scope that role is granted at")]
+    RoleScope {
+        reference: ResourceRef,
+        role: &'static str,
+        scope: String,
+    },
+    #[error("{reference} carries `{field}`, which a {kind} identity does not define")]
+    FieldNotForKind {
+        reference: ResourceRef,
+        field: &'static str,
+        kind: &'static str,
+    },
+    #[error("{reference} and {first} are both the identity of {detail}")]
+    DuplicatePrincipal {
+        reference: ResourceRef,
+        first: ResourceRef,
+        detail: String,
+    },
+    #[error("{reference} belongs to {project}, which this revision does not declare")]
+    UnknownProject {
+        reference: ResourceRef,
+        project: ProjectId,
+    },
+    #[error("{reference} is a {kind} identity at {scope}, which that kind does not live at")]
+    IdentityScope {
+        reference: ResourceRef,
+        kind: &'static str,
+        scope: String,
+    },
 }
 
 impl TenancyError {
@@ -237,6 +308,7 @@ impl TenancyError {
             Self::MissingField { field, .. } | Self::FieldType { field, .. } => {
                 *field == SCHEMA_FIELD
             }
+            Self::UnknownVocabulary { .. } => true,
             Self::Kind { .. }
             | Self::NotInline { .. }
             | Self::NotARecord { .. }
@@ -244,7 +316,15 @@ impl TenancyError {
             | Self::IdentityMismatch { .. }
             | Self::OwnerMismatch { .. }
             | Self::UnknownTenant { .. }
-            | Self::ProjectOwnerMismatch { .. } => false,
+            | Self::ProjectOwnerMismatch { .. }
+            | Self::FieldSet { .. }
+            | Self::MalformedChecksum { .. }
+            | Self::NoRoles { .. }
+            | Self::RoleScope { .. }
+            | Self::FieldNotForKind { .. }
+            | Self::DuplicatePrincipal { .. }
+            | Self::UnknownProject { .. }
+            | Self::IdentityScope { .. } => false,
         }
     }
 
@@ -268,7 +348,16 @@ impl TenancyError {
             | Self::IdentityMismatch { reference, .. }
             | Self::OwnerMismatch { reference, .. }
             | Self::UnknownTenant { reference, .. }
-            | Self::ProjectOwnerMismatch { reference, .. } => *reference,
+            | Self::ProjectOwnerMismatch { reference, .. }
+            | Self::FieldSet { reference, .. }
+            | Self::MalformedChecksum { reference, .. }
+            | Self::UnknownVocabulary { reference, .. }
+            | Self::NoRoles { reference }
+            | Self::RoleScope { reference, .. }
+            | Self::FieldNotForKind { reference, .. }
+            | Self::DuplicatePrincipal { reference, .. }
+            | Self::IdentityScope { reference, .. }
+            | Self::UnknownProject { reference, .. } => *reference,
         }
     }
 }
@@ -396,6 +485,24 @@ impl BodyError for TenancyError {
         }
     }
 
+    fn identity_mismatch(reference: ResourceRef, declared: String, identity: ResourceId) -> Self {
+        Self::IdentityMismatch {
+            reference,
+            declared,
+            identity,
+        }
+    }
+
+    fn field_set(reference: ResourceRef, field: &'static str) -> Self {
+        Self::FieldSet { reference, field }
+    }
+
+    fn malformed_checksum(reference: ResourceRef, field: &'static str) -> Self {
+        Self::MalformedChecksum { reference, field }
+    }
+}
+
+impl DisplayNameError for TenancyError {
     fn malformed_display_name(
         reference: ResourceRef,
         field: &'static str,
@@ -407,13 +514,64 @@ impl BodyError for TenancyError {
             source,
         }
     }
+}
 
-    fn identity_mismatch(reference: ResourceRef, declared: String, identity: ResourceId) -> Self {
-        Self::IdentityMismatch {
-            reference,
-            declared,
-            identity,
+/// Where a tenant is in its life (#144).
+///
+/// A transition, never an erasure: disabling or deleting a tenant stops it being
+/// served and stops it being administered, and leaves every revision, mutation,
+/// audit event, and usage record that named it exactly where it was. "Forget this
+/// tenant's data" is a separate, deliberate compliance operation on the rows a
+/// retention policy allows to be dropped — not a side effect of an administrator
+/// clicking delete, which would take the evidence of what was billed with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum TenantLifecycle {
+    /// Served and administered.
+    #[default]
+    Active,
+    /// Not served, still administered: an administrator can read it, re-enable
+    /// it, and settle its bill. What a suspension for non-payment is.
+    Disabled,
+    /// Not served and not administered: a tombstone that keeps the tenant's id
+    /// from being reused and keeps its history attributable.
+    Deleted,
+}
+
+impl TenantLifecycle {
+    /// Every state, so a stored spelling resolves exhaustively.
+    pub const ALL: &'static [Self] = &[Self::Active, Self::Disabled, Self::Deleted];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Disabled => "disabled",
+            Self::Deleted => "deleted",
         }
+    }
+
+    /// The state a stored or requested identifier names, or `None` for text no
+    /// release wrote.
+    pub fn parse(input: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|state| state.as_str() == input)
+    }
+
+    /// Whether a request may be served for this tenant's projects.
+    pub const fn is_served(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    /// Whether this tenant may still be administered — read, re-enabled, billed.
+    pub const fn is_administrable(self) -> bool {
+        matches!(self, Self::Active | Self::Disabled)
+    }
+}
+
+impl fmt::Display for TenantLifecycle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -427,19 +585,39 @@ impl BodyError for TenancyError {
 pub struct TenantBody {
     tenant: TenantId,
     display_name: DisplayName,
+    lifecycle: TenantLifecycle,
 }
 
 impl TenantBody {
-    /// The schema identifier this body encodes and reads.
+    /// The schema identifier an active tenant encodes under, and the one a build
+    /// predating lifecycle wrote.
     pub const SCHEMA: &'static str = TENANT_SCHEMA;
 
-    const KNOWN_FIELDS: &'static [&'static str] = &[TENANT_ID_FIELD, DISPLAY_NAME_FIELD];
+    /// The schema identifier a tenant that is not active encodes under.
+    pub const LIFECYCLE_SCHEMA: &'static str = TENANT_LIFECYCLE_SCHEMA;
+
+    /// Base schema last, because that is the one a refusal names — see
+    /// `Record::open_any`.
+    const SCHEMAS: &'static [&'static str] = &[TENANT_LIFECYCLE_SCHEMA, TENANT_SCHEMA];
+
+    const KNOWN_FIELDS: &'static [&'static str] =
+        &[TENANT_ID_FIELD, DISPLAY_NAME_FIELD, LIFECYCLE_FIELD];
 
     pub const fn new(tenant: TenantId, display_name: DisplayName) -> Self {
         Self {
             tenant,
             display_name,
+            lifecycle: TenantLifecycle::Active,
         }
+    }
+
+    /// The same tenant in another lifecycle state.
+    ///
+    /// A new *version* of the tenant is how a transition is published: identity
+    /// is stable, and the revision that disabled it stays readable next to the
+    /// one that did not.
+    pub fn in_lifecycle(self, lifecycle: TenantLifecycle) -> Self {
+        Self { lifecycle, ..self }
     }
 
     pub const fn tenant(&self) -> TenantId {
@@ -448,6 +626,10 @@ impl TenantBody {
 
     pub const fn display_name(&self) -> &DisplayName {
         &self.display_name
+    }
+
+    pub const fn lifecycle(&self) -> TenantLifecycle {
+        self.lifecycle
     }
 
     /// The resource identity a tenant's versions are written under.
@@ -478,35 +660,74 @@ impl TenantBody {
     }
 
     /// Read a tenant resource's body, binding it to its envelope.
+    ///
+    /// Either schema is accepted, and the pair is not interchangeable: the base
+    /// schema has no lifecycle field and *is* an active tenant, while the
+    /// lifecycle schema carries one and may not spell `active` — one state, one
+    /// encoding, so a checksum answers "is this the same tenant?" without a
+    /// normalization step.
     pub fn read(resource: &ResourceVersion) -> Result<Self, TenancyError> {
-        let record = Record::<TenancyError>::open(
+        let (record, schema) = Record::<TenancyError>::open_any(
             resource,
             ResourceKind::Tenant,
-            Self::SCHEMA,
+            Self::SCHEMAS,
             Self::KNOWN_FIELDS,
         )?;
         let tenant = record.tenant()?;
         record.identity(tenant, ResourceId::new(tenant.uuid()))?;
+        let lifecycle = if schema == TENANT_SCHEMA {
+            if record.optional_string(LIFECYCLE_FIELD)?.is_some() {
+                return Err(TenancyError::UnknownField {
+                    reference: resource.reference,
+                    schema,
+                    field: LIFECYCLE_FIELD.to_owned(),
+                });
+            }
+            TenantLifecycle::Active
+        } else {
+            let declared = record.string(LIFECYCLE_FIELD)?;
+            TenantLifecycle::ALL
+                .iter()
+                .copied()
+                .filter(|lifecycle| *lifecycle != TenantLifecycle::Active)
+                .find(|lifecycle| lifecycle.as_str() == declared)
+                .ok_or_else(|| TenancyError::UnknownVocabulary {
+                    reference: resource.reference,
+                    vocabulary: "tenant lifecycle",
+                    value: declared.to_owned(),
+                })?
+        };
         Ok(Self {
             tenant,
             display_name: record.display_name()?,
+            lifecycle,
         })
     }
 }
 
 impl Canonical for TenantBody {
     fn canonical(&self) -> CanonicalValue {
-        CanonicalValue::map([
-            (SCHEMA_FIELD, CanonicalValue::string(Self::SCHEMA)),
+        let mut fields = vec![
             (
-                TENANT_ID_FIELD,
+                TENANT_ID_FIELD.to_owned(),
                 CanonicalValue::string(self.tenant.to_string()),
             ),
             (
-                DISPLAY_NAME_FIELD,
+                DISPLAY_NAME_FIELD.to_owned(),
                 CanonicalValue::string(self.display_name.as_str()),
             ),
-        ])
+        ];
+        let schema = if self.lifecycle == TenantLifecycle::Active {
+            Self::SCHEMA
+        } else {
+            fields.push((
+                LIFECYCLE_FIELD.to_owned(),
+                CanonicalValue::string(self.lifecycle.as_str()),
+            ));
+            Self::LIFECYCLE_SCHEMA
+        };
+        fields.push((SCHEMA_FIELD.to_owned(), CanonicalValue::string(schema)));
+        CanonicalValue::map(fields)
     }
 }
 
@@ -770,6 +991,23 @@ impl Tenancy {
 
     pub fn project(&self, id: ProjectId) -> Option<&Project> {
         self.projects.get(&id)
+    }
+
+    /// A tenant's lifecycle state, or `None` if this revision does not declare
+    /// the tenant.
+    ///
+    /// The two are distinct on purpose: "disabled" is a decision an administrator
+    /// made, and "not here" is a tenant this revision never had. A caller that
+    /// wants to *serve* a tenant should ask [`Tenancy::is_served`], which folds
+    /// the absent case into the same refusal.
+    pub fn lifecycle(&self, id: TenantId) -> Option<TenantLifecycle> {
+        self.tenants.get(&id).map(|tenant| tenant.body.lifecycle())
+    }
+
+    /// Whether requests may be served for a tenant: it is declared here, and it
+    /// is [`TenantLifecycle::Active`].
+    pub fn is_served(&self, id: TenantId) -> bool {
+        self.lifecycle(id).is_some_and(TenantLifecycle::is_served)
     }
 
     /// One tenant's projects, ordered by [`ProjectId`].
