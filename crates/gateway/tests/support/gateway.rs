@@ -8,9 +8,11 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -139,7 +141,12 @@ pub struct Axond {
     /// exactly what it qualified.
     pub config: String,
     child: Child,
+    /// This boot's own config directory, removed with the process that read it.
+    config_dir: PathBuf,
     output: Arc<Mutex<Output>>,
+    /// The threads draining the child's pipes into `output`, kept so a failed
+    /// boot can wait for them before quoting what the child said.
+    readers: Vec<JoinHandle<()>>,
 }
 
 impl Axond {
@@ -155,19 +162,52 @@ impl Axond {
         // sibling test process can take the port in between. That race is the
         // ephemeral-port allocator's, not the gateway's, so a lost boot is
         // retried on a fresh port rather than failing the suite.
-        for _ in 1..BOOT_ATTEMPTS {
-            if let Some(gateway) = Self::try_start(upstream_base_url, tuning).await {
-                return gateway;
+        let mut last = String::new();
+        for _ in 0..BOOT_ATTEMPTS {
+            match Self::try_start(upstream_base_url, tuning).await {
+                Ok(gateway) => return gateway,
+                Err(output) => last = output,
             }
         }
-        Self::try_start(upstream_base_url, tuning)
-            .await
-            .expect("axond becomes healthy on a free port")
+        panic!("{}", never_served(&last));
     }
 
-    /// One boot attempt: `None` when the process never became healthy, which on
-    /// a loopback port means someone else won the bind.
-    async fn try_start(upstream_base_url: &str, tuning: &str) -> Option<Self> {
+    /// Boot from a config the caller renders, plus extra environment.
+    ///
+    /// For suites whose subject is the *shape* of a deployment rather than one
+    /// section of the shipped fixture — several namespaces, several credential
+    /// pools, a durable sink — where patching `tuning` into one namespace's
+    /// config would not express it. `render` is called per attempt because a
+    /// retried boot binds a different port, and the config carries the bind.
+    ///
+    /// The rendered config must declare a `[[gateway_key]]` reading
+    /// `GW_BOOT_KEY`: that key is how readiness tells this child apart from a
+    /// sibling that won the port (see [`Self::answers_for_this_boot`]).
+    pub async fn start_custom(
+        render: &dyn Fn(SocketAddr) -> String,
+        env: &[(String, String)],
+    ) -> Self {
+        let mut last = String::new();
+        for _ in 0..BOOT_ATTEMPTS {
+            match Self::try_start_custom(render, env).await {
+                Ok(gateway) => return gateway,
+                Err(output) => last = output,
+            }
+        }
+        panic!("{}", never_served(&last));
+    }
+
+    /// One boot attempt. The error is everything that attempt's child wrote,
+    /// which on a loopback port usually means someone else won the bind — and
+    /// when it means something else, it is the only account of what.
+    async fn try_start(upstream_base_url: &str, tuning: &str) -> Result<Self, String> {
+        Self::try_start_custom(&|addr| config_toml(addr, upstream_base_url, tuning), &[]).await
+    }
+
+    async fn try_start_custom(
+        render: &dyn Fn(SocketAddr) -> String,
+        extra_env: &[(String, String)],
+    ) -> Result<Self, String> {
         // One reservation, used for both the config directory and the boot key:
         // re-reading the counter could hand two concurrent boots the same value,
         // and the key has to be unique by construction, not by timing.
@@ -177,10 +217,14 @@ impl Axond {
         let addr = free_addr();
         let path = dir.join(format!("axond-{}.toml", addr.port()));
         let boot_key = format!("test-boot-key-{}-{boot}", std::process::id());
-        let config = config_toml(addr, upstream_base_url, tuning);
+        let config = render(addr);
         std::fs::write(&path, &config).expect("test config is written");
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_axond"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_axond"));
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
+        let mut child = command
             .env("AXOND_CONFIG", &path)
             .env("GW_INBOUND_KEY", GATEWAY_KEY)
             .env(BOOT_KEY_ENV, &boot_key)
@@ -196,6 +240,7 @@ impl Axond {
             .expect("the axond binary starts");
 
         let output = Arc::new(Mutex::new(Output::default()));
+        let mut readers = Vec::new();
         for stream in [
             child
                 .stdout
@@ -212,11 +257,11 @@ impl Axond {
         .flatten()
         {
             let sink = output.clone();
-            std::thread::spawn(move || {
+            readers.push(std::thread::spawn(move || {
                 for line in BufReader::new(stream).lines().map_while(Result::ok) {
                     sink.lock().expect("output lock").ingest(line);
                 }
-            });
+            }));
         }
 
         let mut gateway = Self {
@@ -224,9 +269,15 @@ impl Axond {
             boot_key,
             config,
             child,
+            config_dir: dir,
             output,
+            readers,
         };
-        gateway.await_ready().await.then_some(gateway)
+        if gateway.await_ready().await {
+            Ok(gateway)
+        } else {
+            Err(gateway.final_output())
+        }
     }
 
     /// Whether the process is serving. A boot that loses its port is reported
@@ -256,14 +307,13 @@ impl Axond {
                 return self.answers_for_this_boot(&client, &base_url).await;
             }
             if let Ok(Some(_)) = self.child.try_wait() {
-                // The process is gone. A refused config is a test bug rather
-                // than a lost race, so that fails loudly; anything else (a
-                // sibling taking the port) is the caller's to retry.
-                let output = self.output();
-                assert!(
-                    !output.contains("invalid config"),
-                    "axond refused the test config:\n{output}"
-                );
+                // The process is gone. Every exit is retriable here, because the
+                // one that is genuinely a race — a sibling took the port — is
+                // not reliably distinguishable from the ones that are not: the
+                // bind failure is a substring of output drained by detached
+                // threads, so it may not have arrived yet. The attempt's output
+                // travels with the failure instead, and the caller names the
+                // cause if every attempt fails.
                 return false;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -311,6 +361,28 @@ impl Axond {
     /// for assertions over the raw text: its most recent lines.
     pub fn output(&self) -> String {
         self.output.lock().expect("output lock").rendered()
+    }
+
+    /// [`Self::output`], but complete. The pipes are drained by detached
+    /// threads, so a child that has already exited may still have its last and
+    /// most interesting line in flight; ending the child closes the pipes, which
+    /// ends the readers, and joining them settles the record. For the abandoned
+    /// boot whose output is about to become a failure message.
+    fn final_output(&mut self) -> String {
+        self.shutdown();
+        self.output()
+    }
+
+    /// End the process and settle its output, ahead of the drop that would do
+    /// it anyway. For a harness that must know the child is gone — because what
+    /// it does next, dropping the tables the child writes to, would otherwise
+    /// race the writes still in flight.
+    pub fn shutdown(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
     }
 
     /// The usage records the process has emitted on its stdout sink — the
@@ -420,7 +492,19 @@ impl Drop for Axond {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.config_dir);
     }
+}
+
+/// What to say when every attempt failed. The last child's own output is the
+/// message: a lost port race says `Address already in use` and is the boring
+/// answer, while a refused config or an unreachable datastore says what it was,
+/// and either beats reporting only that nothing became healthy.
+fn never_served(last_output: &str) -> String {
+    format!(
+        "axond never served on a free port in {BOOT_ATTEMPTS} attempts; \
+         the last one said:\n{last_output}"
+    )
 }
 
 /// A loopback address nothing is listening on. The listener is closed before
