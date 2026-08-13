@@ -414,6 +414,11 @@ The refusal reason is the triage key.
   is starting up, out of connections, deadlocked, or racing a sibling replica's
   `CREATE TABLE IF NOT EXISTS` (`23505`, `42P07`, `42710`) stays retryable, so a
   whole fleet booting at once does not turn a hiccup into a permanent refusal.
+  The boot *connection* is classified the same way — a wrong role or password
+  (`28*`) or an absent database (`3D*`) refuses and names the `dsn_env` string to
+  fix. Reconnections during the life of a serving replica are not: the same codes
+  arrive during a credential rotation the deployment is halfway through, and a
+  replica already serving should wait rather than strand itself.
 - **`projection`** — a candidate this build cannot project: a resource body it
   does not read, or a bootstrap that is missing something projection may not
   supply for it (today, a default namespace). Roll the replica forward, publish a

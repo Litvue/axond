@@ -172,10 +172,20 @@ impl PostgresSecrets {
             ids: Uuid7Generator::new(),
             client: tokio::sync::Mutex::new(None),
         };
+        // Only this call site is a boot: a bad password or an absent database is
+        // a deployment to fix, and a replica that has not started yet loses
+        // nothing by saying so. `connect_client` is also the reconnect path, and
+        // there the same codes stay retryable — see `run`.
         let client = tokio::time::timeout(store.settings.connect_timeout, store.connect_client())
             .await
             .map_err(|_| unavailable_message("connection timed out"))?
-            .map_err(|error| unavailable("connect", &error))?;
+            .map_err(|error| {
+                boot_failure("connect to the secret store", &error, || {
+                    "Check the role, password, and database named by the `dsn_env` connection \
+                     string under `[secret_store]`."
+                        .to_owned()
+                })
+            })?;
         store.prepare_schema(&client).await?;
         *store.client.lock().await = Some(client);
         Ok(store)
@@ -253,6 +263,13 @@ impl PostgresSecrets {
     ) -> Result<T, SecretError> {
         let mut guard = self.client.lock().await;
         if guard.as_ref().is_none_or(Client::is_closed) {
+            // Deliberately not classified the way boot's connect is. A serving
+            // replica reconnects for the life of the process, and a credential
+            // rotation the deployment is halfway through, or a pooler answering
+            // for a backend that has not reloaded `pg_hba.conf`, answers with the
+            // same permanent-looking codes and clears on the next attempt.
+            // Refusing here would strand a replica over a blip; convergence
+            // retries an outage.
             *guard = Some(
                 self.connect_client()
                     .await
@@ -695,9 +712,11 @@ fn boot_failure(
 /// Whether a `SQLSTATE` names a condition only the operator can clear.
 ///
 /// Class `42` (access rule violated, undefined object), `3F` (invalid schema
-/// name) and `25006` (read-only transaction) describe a deployment that is
-/// configured wrong: the role lacks a grant, the schema is absent, the endpoint
-/// is a replica. No amount of waiting fixes any of them. Every other class —
+/// name), `28` (invalid authorization), `3D` (invalid catalog name) and `25006`
+/// (read-only transaction) describe a deployment that is configured wrong: the
+/// role lacks a grant, the schema or database is absent, the password is not the
+/// one the server wants, the endpoint is a replica. No amount of waiting fixes
+/// any of them. Every other class —
 /// notably `08` connection, `53` insufficient resources, `57` operator
 /// intervention, `40` rollback, `55` object in use, and the `23505` two
 /// concurrently booting replicas race on — clears on its own.
@@ -714,7 +733,7 @@ fn operator_must_act(code: &SqlState) -> bool {
     ) {
         return false;
     }
-    matches!(code.code().get(..2), Some("42" | "3F"))
+    matches!(code.code().get(..2), Some("42" | "3F" | "28" | "3D"))
         || *code == SqlState::READ_ONLY_SQL_TRANSACTION
 }
 
@@ -751,6 +770,8 @@ mod tests {
             SqlState::INSUFFICIENT_PRIVILEGE,
             SqlState::UNDEFINED_TABLE,
             SqlState::INVALID_SCHEMA_NAME,
+            SqlState::INVALID_PASSWORD,
+            SqlState::INVALID_CATALOG_NAME,
             SqlState::READ_ONLY_SQL_TRANSACTION,
         ] {
             assert!(
@@ -866,6 +887,34 @@ mod tests {
         .expect_err("nothing listens there");
         assert_eq!(error.category(), FailureCategory::Unavailable);
         assert!(!error.to_string().contains("sk-"), "{error}");
+    }
+
+    /// A database that is not there is a DSN to fix, and boot says so instead of
+    /// telling on-call to wait for a server that is answering fine. The reconnect
+    /// path deliberately keeps the same code retryable — see `run`.
+    #[tokio::test]
+    async fn a_boot_against_an_absent_database_is_refused_not_an_outage() {
+        let Some(dsn) = postgres_dsn() else {
+            return;
+        };
+        let config: Config = dsn.parse().expect("the test DSN parses");
+        let tokio_postgres::config::Host::Tcp(host) = &config.get_hosts()[0] else {
+            panic!("the test DSN names a TCP host");
+        };
+        let absent = format!(
+            "host={host} port={} user={} password={} dbname=axond_absent_database",
+            config.get_ports()[0],
+            config.get_user().unwrap_or("postgres"),
+            String::from_utf8_lossy(config.get_password().unwrap_or_default()),
+        );
+
+        let error = PostgresSecrets::connect(&absent, SecretStoreSettings::default(), kek(1))
+            .await
+            .expect_err("there is no such database");
+
+        assert_eq!(error.category(), FailureCategory::Denied);
+        let message = error.to_string();
+        assert!(message.contains("dsn_env"), "{message}");
     }
 
     #[tokio::test]
