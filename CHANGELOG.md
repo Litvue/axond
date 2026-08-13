@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.37](https://github.com/Litvue/axond/compare/v0.3.36...v0.3.37) (2026-08-13)
+
+
+### Features
+
+* **admin:** validate disabled tenant aliases ([#336](https://github.com/Litvue/axond/issues/336)) ([19b88e7](https://github.com/Litvue/axond/commit/19b88e76b0d0d41b724fd65f0d44f572ef178d1d))
+
+
+### Documentation
+
+* **ops:** add stateful deployment rollback runbook ([#339](https://github.com/Litvue/axond/issues/339)) ([7795850](https://github.com/Litvue/axond/commit/7795850fc841bc9b3b287904b06d8f5a06ffad60))
+* **ops:** make stateful runbook release agnostic ([#342](https://github.com/Litvue/axond/issues/342)) ([4eb6ed4](https://github.com/Litvue/axond/commit/4eb6ed42564bd1577f9aff0a5d06255f593b9342))
+
+
+### Tests
+
+* **qualification:** gate stateless fault evidence ([#340](https://github.com/Litvue/axond/issues/340)) ([cef347c](https://github.com/Litvue/axond/commit/cef347ca71e65bdfc7acf92703ae0b6e93f8cd17))
+
 ## [0.3.36](https://github.com/Litvue/axond/compare/v0.3.35...v0.3.36) (2026-08-13)
 
 
