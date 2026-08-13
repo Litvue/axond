@@ -496,6 +496,13 @@ def self_test() -> int:
     assert len(unreadable) == 1, unreadable
     assert "not a number" in unreadable[0], unreadable
 
+    # Fractions are read, not truncated: a tenth of a core is drift the page
+    # would otherwise keep publishing.
+    assert number("4.6") == 4.6 and number("7 675") == 7675.0
+    fractional = capacity_envelope_failures(record, envelope.replace("| 3.0 |", "| 3.4 |"))
+    assert len(fractional) == 1, fractional
+    assert "CPU cores" in fractional[0], fractional
+
     print("check-docs: release-path gate self-test passed")
     return 0
 
@@ -583,7 +590,7 @@ def number(cell: str) -> float | None:
     Cells carry their unit (`44 MiB`, `7 675`), and a hand-edited one may carry
     no number at all — which is a finding to report, not a traceback.
     """
-    match = re.match(r"[\d\u202f ]*\d", cell)
+    match = re.match(r"[\d\u202f ]*\d(?:\.\d+)?", cell)
     if not match:
         return None
     try:
@@ -613,23 +620,27 @@ def capacity_envelope_failures(record: str, page: str) -> list[str]:
             continue
         profile = profiles[name]
         elapsed = profile.get("elapsed_ms") or 0.0
+        # Each column is compared in the units the page prints it in, so the
+        # slack is the page's own rounding rather than a shared fraction: a
+        # tenth of a core is a real difference, half a MiB is not.
         published = {
-            "accepted req/s": (cells[2], profile.get("accepted_rps")),
-            "peak RSS MiB": (cells[7], (profile.get("peak_rss_kib") or 0.0) / 1024),
-            "peak sockets": (cells[8], profile.get("peak_sockets")),
+            "accepted req/s": (cells[2], profile.get("accepted_rps"), 1.0),
+            "peak RSS MiB": (cells[7], (profile.get("peak_rss_kib") or 0.0) / 1024, 1.0),
+            "peak sockets": (cells[8], profile.get("peak_sockets"), 0.0),
             "CPU cores": (
                 cells[9],
                 (profile.get("cpu_seconds") or 0.0) / (elapsed / 1000) if elapsed else None,
+                0.05,
             ),
         }
-        for column, (cell, measured) in published.items():
+        for column, (cell, measured, slack) in published.items():
             shown = number(cell)
             if shown is None or measured is None:
                 failures.append(
                     f"docs/operations/capacity.md: {name} publishes {cell!r} as "
                     f"{column}, which is not a number the record can be read against"
                 )
-            elif abs(shown - measured) > max(1.0, measured * 0.01):
+            elif abs(shown - measured) > slack:
                 failures.append(
                     f"docs/operations/capacity.md: {name} publishes {cell} "
                     f"{column}, the retained record measured {measured:.1f}"
