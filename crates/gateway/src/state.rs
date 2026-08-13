@@ -26,7 +26,7 @@ use crate::admission::AdmissionControl;
 use crate::aliases::AliasScope;
 use crate::availability::AvailabilityIndex;
 use crate::budget::BudgetStore;
-use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind};
+use crate::config::{Config, GatewayVerifierAlgorithm, Mode, ProviderKind};
 use crate::convergence::secrets::ResolvedSecrets;
 use crate::credentials::{CredentialError, Credentials};
 use crate::key_material::{self, KeyMaterialError};
@@ -288,7 +288,14 @@ impl ConfigSnapshot {
             gateway_key_fingerprints
                 .insert(label.to_owned(), key_material::fingerprint(label, &secret));
         }
-        if inbound_keys.is_empty() {
+        // Stateless mode fails closed: there is no keyless deployment. A
+        // stateful one cannot declare `[[gateway_key]]` at all — the section is
+        // rejected by `Config::validate_stateful` — because its inbound
+        // principals arrive with a compiled revision instead of the file. Until
+        // that compiler exists the runtime replaces inference with a refusal
+        // (`ops::inference_refusal`), so a keyless snapshot here never serves a
+        // request; it only lets the administrative surface bind.
+        if inbound_keys.is_empty() && config.mode != Mode::Stateful {
             return Err(SnapshotError::NoInboundKeys);
         }
         let inbound_keys: Arc<[GatewayKeyEntry]> = inbound_keys.into();
@@ -1073,6 +1080,32 @@ namespace = "platform"
                 .namespace,
             "platform"
         );
+    }
+
+    /// A stateful deployment may not declare `[[gateway_key]]` at all — its
+    /// inbound principals arrive with a compiled revision — so it must compile
+    /// a keyless snapshot rather than hit the fail-closed refusal stateless
+    /// mode answers with; otherwise the administrative surface never binds.
+    #[test]
+    fn a_stateful_deployment_compiles_without_an_inbound_key() {
+        let env = HashMap::new();
+        let stateful = Config::from_toml_str(
+            r#"
+mode = "stateful"
+
+[control_plane]
+dsn_env = "GW_CONTROL_PLANE_DSN"
+
+[secret_store]
+kek_env = "GW_SECRET_STORE_KEK"
+
+[[admin_breakglass]]
+env = "GW_ADMIN_BREAKGLASS"
+"#,
+        )
+        .expect("valid stateful bootstrap");
+        let snapshot = ConfigSnapshot::build(stateful, &env, 0).expect("compiles keyless");
+        assert_eq!(snapshot.inbound_key_count(), 0);
     }
 
     /// The secret is held as `SecretString`, so debugging or logging an entry

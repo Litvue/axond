@@ -330,15 +330,16 @@ impl AdminService {
     ///
     /// Takes the report rather than reading one, because convergence state is
     /// replica-local and cached: this answers during a control-plane outage, which
-    /// is when it is asked.
+    /// is when it is asked. `None` is a replica with no reconciler attached,
+    /// which has converged onto nothing and says so.
     pub fn convergence(
         &self,
         grant: &AdminGrant,
-        report: &RevisionReport,
+        report: Option<&RevisionReport>,
     ) -> Result<ConvergenceResult, AdminError> {
         Self::permits_deployment_read(grant, AdminAction::ReadConvergence)?;
         self.store()?;
-        Ok(ConvergenceResult::of(report))
+        Ok(report.map_or_else(ConvergenceResult::unreconciled, ConvergenceResult::of))
     }
 
     /// Republish a retained revision's complete desired state as a new revision.

@@ -114,14 +114,14 @@ impl AdminApi {
         self
     }
 
-    /// What this replica has converged onto. A replica with no reconciler — a
-    /// stateless one — has converged onto nothing, which the empty report says
-    /// without pretending to know more.
-    pub fn convergence_report(&self) -> RevisionReport {
-        self.convergence
-            .as_ref()
-            .map(|status| status.report())
-            .unwrap_or_default()
+    /// What this replica has converged onto, or `None` when no reconciler is
+    /// attached.
+    ///
+    /// Not an empty report: for a reconciler "nothing desired, nothing active"
+    /// *is* convergence, and answering that to an operator gating a rollout
+    /// would be a false all-clear from a replica serving nothing.
+    pub fn convergence_report(&self) -> Option<RevisionReport> {
+        self.convergence.as_ref().map(|status| status.report())
     }
 
     /// Establish an identity from what the request presented.

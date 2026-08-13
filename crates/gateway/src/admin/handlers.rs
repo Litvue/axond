@@ -217,7 +217,7 @@ async fn convergence(
         &ResourceScope::Deployment,
     )?;
     let report = api.convergence_report();
-    Ok(Json(api.service.convergence(&grant, &report)?))
+    Ok(Json(api.service.convergence(&grant, report.as_ref())?))
 }
 
 /// The scope a request names, from an optional tenant and project.

@@ -316,11 +316,35 @@ pub struct ConvergenceResult {
     /// is a response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_rejection: Option<&'static str>,
+    /// Whether a reconciler is attached at all. `false` is not "lagging": the
+    /// replica has no revision projection, so it can never converge onto what
+    /// was published, and an operator gating a rollout on this read must not
+    /// take silence for an all-clear.
+    pub reconciling: bool,
 }
 
 impl ConvergenceResult {
+    /// A replica with no reconciler: converged onto nothing, and honest about it
+    /// rather than reading an empty report's `desired == active` as agreement.
+    pub const fn unreconciled() -> Self {
+        Self {
+            converged: false,
+            desired: None,
+            loaded: None,
+            active: None,
+            source: None,
+            generation: 0,
+            lag_ms: 0,
+            last_convergence_ms: None,
+            consecutive_failures: 0,
+            last_rejection: None,
+            reconciling: false,
+        }
+    }
+
     pub fn of(report: &RevisionReport) -> Self {
         Self {
+            reconciling: true,
             converged: report.converged(),
             desired: report.desired.map(|id| id.to_string()),
             loaded: report.loaded.map(|id| id.to_string()),

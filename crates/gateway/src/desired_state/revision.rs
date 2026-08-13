@@ -29,7 +29,7 @@ use super::access::Directory;
 use super::canonical::{Canonical, CanonicalError, CanonicalValue, Checksum, SerializerVersion};
 use super::credentials::{CredentialError, Credentials};
 use super::ids::{AuditEventId, MutationId, ResourceId, RevisionId, Slug};
-use super::models::{ModelError, Models};
+use super::models::{ModelEnablementBody, ModelError, Models};
 use super::mutation::{AuditEvent, ExpectedRevision, Mutation};
 use super::policy::{PolicyError, PolicySet};
 use super::providers::{ProviderError, Providers};
@@ -163,13 +163,24 @@ impl DesiredState {
     /// nothing to the state — and it is the *author's* call, not validation's,
     /// which is why it is an explicit step rather than a silent one inside
     /// [`DesiredState::validate`].
+    ///
+    /// A snapshot a model enablement pins counts as referenced even though the
+    /// enablement's body is not itself a blob: dropping it would turn a
+    /// catalogue re-import into an unpinned-snapshot refusal.
     pub fn retain_referenced_blobs(&mut self) -> &mut Self {
-        let referenced: BTreeSet<Checksum> = self
+        let mut referenced: BTreeSet<Checksum> = self
             .resources
             .values()
             .filter_map(|resource| resource.body.blob())
             .map(|blob| blob.digest)
             .collect();
+        referenced.extend(
+            self.resources
+                .values()
+                .filter(|resource| resource.reference.kind == ResourceKind::ModelEnablement)
+                .filter_map(|resource| ModelEnablementBody::read(resource).ok())
+                .map(|body| body.offering().snapshot),
+        );
         self.blobs.retain(|digest, _| referenced.contains(digest));
         self
     }

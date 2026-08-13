@@ -25,6 +25,7 @@ use super::protocol::{
 };
 use super::router::{AdminApi, refusing_router, router};
 use super::service::AdminService;
+use crate::backends::control_plane::ControlPlaneStore;
 use crate::desired_state::oracle::InMemoryControlPlane;
 use crate::desired_state::{ResourceScope, fixtures};
 
@@ -316,6 +317,112 @@ async fn every_resource_family_publishes_and_is_readable_as_state() {
     // material, and no body payload, can appear in the projection.
     let rendered = state.to_string();
     assert!(!rendered.contains("secret_material"), "{rendered}");
+}
+
+/// Republishing a credential reauthors it: the document is the complete
+/// credential, so a repointed secret takes effect — and takes the credential
+/// back to `staged`, because material serves only after a candidate compiles
+/// against it.
+#[tokio::test]
+async fn republishing_a_credential_repoints_it_at_the_material_the_document_names() {
+    let deployment = Deployment::new();
+    let mut head = deployment
+        .publish(
+            "/tenants",
+            "key-1",
+            EXPECTED_REVISION_EMPTY,
+            &tenant_document(),
+        )
+        .await;
+    head = deployment
+        .publish("/providers", "key-2", &head, &provider_document())
+        .await;
+    head = deployment
+        .publish("/credentials", "key-3", &head, &credential_document())
+        .await;
+
+    let mut repointed = credential_document();
+    repointed["mutation"] = json!("update");
+    repointed["resource"]["display_name"] = json!("OpenAI rotated");
+    repointed["resource"]["secret"] = fixtures::secret_id(13).to_string().into();
+    let head = deployment
+        .publish("/credentials", "key-4", &head, &repointed)
+        .await;
+
+    let loaded = deployment
+        .store
+        .load_revision(crate::desired_state::RevisionId::parse(&head).expect("a revision"))
+        .await
+        .expect("the published revision hydrates");
+    let credential = loaded
+        .state()
+        .version_of(
+            crate::desired_state::ResourceKind::ProviderCredential,
+            fixtures::resource_id(11),
+        )
+        .expect("the credential is desired");
+    let body =
+        crate::desired_state::ProviderCredentialBody::read(credential).expect("a credential body");
+    assert_eq!(body.secret().secret, fixtures::secret_id(13));
+    assert_eq!(body.display_name().as_str(), "OpenAI rotated");
+    assert_eq!(
+        body.lifecycle(),
+        crate::desired_state::SecretLifecycle::Staged
+    );
+}
+
+/// A resource other resources pin can still be advanced. Dependency edges name
+/// an exact version and one request publishes one resource, so the candidate
+/// carries the dependents forward itself rather than leaving an operator with a
+/// deployment that can never be changed again.
+#[tokio::test]
+async fn advancing_a_resource_other_resources_pin_carries_those_resources_forward() {
+    let deployment = Deployment::new();
+    let mut head = build(&deployment).await;
+
+    let mut disabled = model_document();
+    disabled["mutation"] = json!("update");
+    disabled["resource"]["state"] = json!("disabled");
+    head = deployment
+        .publish("/models", "key-model-2", &head, &disabled)
+        .await;
+
+    let mut reimported = catalog_document();
+    reimported["mutation"] = json!("update");
+    reimported["resource"]["size_bytes"] = json!(4_096);
+    head = deployment
+        .publish("/catalogs", "key-catalog-2", &head, &reimported)
+        .await;
+
+    let loaded = deployment
+        .store
+        .load_revision(crate::desired_state::RevisionId::parse(&head).expect("a revision"))
+        .await
+        .expect("the published revision hydrates");
+    let state = loaded.state();
+    let enablement = state
+        .version_of(
+            crate::desired_state::ResourceKind::ModelEnablement,
+            fixtures::resource_id(14),
+        )
+        .expect("the enablement is desired");
+    let alias = state
+        .version_of(
+            crate::desired_state::ResourceKind::Alias,
+            fixtures::resource_id(15),
+        )
+        .expect("the alias is desired");
+    let alias_body = crate::desired_state::ModelAliasBody::read(alias).expect("an alias body");
+    assert_eq!(
+        alias_body.primary().expect("a target").version,
+        enablement.reference.version,
+        "the alias follows the enablement it names"
+    );
+    // Re-posting an alias document that omits its target version resolves
+    // against the enablement the state holds rather than against version 1.
+    deployment
+        .publish("/aliases", "key-alias-2", &head, &alias_document())
+        .await;
 }
 
 #[tokio::test]

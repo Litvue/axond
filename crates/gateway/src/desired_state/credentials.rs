@@ -483,6 +483,26 @@ impl ProviderCredentialBody {
         }
     }
 
+    /// This credential, reauthored from `authored`: the author's provider,
+    /// display name, and material, over the lifecycle the credential is
+    /// actually in.
+    ///
+    /// Authoring never *sets* a lifecycle — that is a transition the domain
+    /// owns — but naming different material is not a metadata edit: the new
+    /// version re-enters [`SecretLifecycle::Staged`], because material is proven
+    /// by compiling a candidate against it before it serves.
+    pub fn reauthored(&self, authored: Self) -> Self {
+        let lifecycle = if authored.secret == self.secret {
+            self.lifecycle
+        } else {
+            SecretLifecycle::Staged
+        };
+        Self {
+            lifecycle,
+            ..authored
+        }
+    }
+
     /// The resource identity this credential's versions are written under.
     pub const fn resource_id(&self) -> ResourceId {
         self.credential

@@ -170,7 +170,7 @@ impl AdminResourceRequest for TenantRequest {
             move |state: &mut DesiredState| {
                 let body = TenantBody::new(tenant, display_name.clone()).in_lifecycle(lifecycle);
                 let version = next_version(state, ResourceKind::Tenant, body.resource_id());
-                state.supersede(body.version_at(slug.clone(), version))?;
+                publish(state, body.version_at(slug.clone(), version))?;
                 Ok(())
             },
         ))
@@ -200,7 +200,7 @@ impl AdminResourceRequest for ProjectRequest {
             body.scope(),
             move |state: &mut DesiredState| {
                 let version = next_version(state, ResourceKind::Project, body.resource_id());
-                state.supersede(body.version_at(slug.clone(), version))?;
+                publish(state, body.version_at(slug.clone(), version))?;
                 Ok(())
             },
         ))
@@ -250,7 +250,7 @@ impl AdminResourceRequest for ProviderRequest {
             body.scope(),
             move |state: &mut DesiredState| {
                 let version = next_version(state, ResourceKind::Provider, body.resource_id());
-                state.supersede(body.version_at(slug.clone(), version))?;
+                publish(state, body.version_at(slug.clone(), version))?;
                 Ok(())
             },
         ))
@@ -317,8 +317,9 @@ impl AdminResourceRequest for CredentialRequest {
             owner.scope(),
             move |state: &mut DesiredState| {
                 let reference = state.version_of(ResourceKind::ProviderCredential, credential);
-                // A credential that exists moves from what it *is*: lifecycle is
-                // a transition the domain owns, not a field an author overwrites.
+                // A credential that exists moves from what it *is*: the document
+                // reauthors its provider, name, and material, but lifecycle is a
+                // transition the domain owns, not a field an author overwrites.
                 let previous = match reference {
                     Some(resource) => Some(ProviderCredentialBody::read(resource)?),
                     None => None,
@@ -331,8 +332,10 @@ impl AdminResourceRequest for CredentialRequest {
                     SecretRef::new(secret, version),
                 );
                 let body = match (previous, rotate) {
-                    (Some(previous), true) => previous.rotated(),
-                    (Some(previous), false) => previous,
+                    (Some(previous), true) => previous.reauthored(staged).rotated(),
+                    (Some(previous), false) => previous.reauthored(staged),
+                    // Nothing to rotate: the first version of a credential is the
+                    // material the author named, at the version they named.
                     (None, _) => staged,
                 };
                 let body = match lifecycle {
@@ -340,7 +343,7 @@ impl AdminResourceRequest for CredentialRequest {
                     None => body,
                 };
                 let next = next_version(state, ResourceKind::ProviderCredential, credential);
-                state.supersede(body.version_at(slug.clone(), next))?;
+                publish(state, body.version_at(slug.clone(), next))?;
                 Ok(())
             },
         ))
@@ -379,12 +382,15 @@ impl AdminResourceRequest for CatalogRequest {
             move |state: &mut DesiredState| {
                 let version = next_version(state, ResourceKind::CatalogModel, catalog);
                 state.declare_blob(blob);
-                state.supersede(ResourceVersion::new(
-                    ResourceRef::new(ResourceKind::CatalogModel, catalog, version),
-                    ResourceScope::Deployment,
-                    slug.clone(),
-                    ResourceBody::Blob(blob),
-                ))?;
+                publish(
+                    state,
+                    ResourceVersion::new(
+                        ResourceRef::new(ResourceKind::CatalogModel, catalog, version),
+                        ResourceScope::Deployment,
+                        slug.clone(),
+                        ResourceBody::Blob(blob),
+                    ),
+                )?;
                 // Re-pointing a catalogue row at a new snapshot orphans the old
                 // payload's declaration, which is a validation failure no author
                 // could otherwise repair.
@@ -487,7 +493,7 @@ impl AdminResourceRequest for ModelRequest {
                         |resource| resource.reference,
                     );
                 let version = next_version(state, ResourceKind::ModelEnablement, enablement);
-                state.supersede(body.version_at(slug.clone(), version, pinned))?;
+                publish(state, body.version_at(slug.clone(), version, pinned))?;
                 Ok(())
             },
         ))
@@ -527,29 +533,48 @@ impl AdminResourceRequest for AliasRequest {
         let project = project_id::<Self>(&self.project)?;
         let slug = slug::<Self>(&self.slug)?;
         let wire_family = wire_family::<Self>(&self.wire_family)?;
-        let state = match self.state.as_deref() {
+        let lifecycle = match self.state.as_deref() {
             None => ModelLifecycle::Enabled,
             Some(text) => {
                 ModelLifecycle::parse(text).ok_or_else(|| unknown::<Self>("state", text))?
             }
         };
+        // An omitted version is resolved against the enablement the state
+        // actually holds, not assumed to be the first: re-posting an alias
+        // document after its enablement advanced would otherwise name a version
+        // the candidate no longer has, and be refused with nothing pointing at
+        // the field to add.
         let mut targets = Vec::with_capacity(self.targets.len());
         for target in &self.targets {
             let enablement = resource_id::<Self>("targets.enablement", &target.enablement)?;
             let version = match target.version {
-                None => ResourceVersionNumber::FIRST,
-                Some(version) => ResourceVersionNumber::new(version)
-                    .ok_or_else(|| malformed::<Self>("targets.version", "versions start at 1"))?,
+                None => None,
+                Some(version) => {
+                    Some(ResourceVersionNumber::new(version).ok_or_else(|| {
+                        malformed::<Self>("targets.version", "versions start at 1")
+                    })?)
+                }
             };
-            targets.push(AliasTarget::new(enablement, version));
+            targets.push((enablement, version));
         }
-        let body =
-            ModelAliasBody::new(alias, tenant, project, wire_family, targets).transitioned(state);
         Ok(ResourcePlan::new(
-            body.scope(),
+            ResourceScope::Project { tenant, project },
             move |state: &mut DesiredState| {
+                let resolved = targets
+                    .iter()
+                    .map(|(enablement, version)| {
+                        let version = version.unwrap_or_else(|| {
+                            state
+                                .version_of(ResourceKind::ModelEnablement, *enablement)
+                                .map_or(ResourceVersionNumber::FIRST, |held| held.reference.version)
+                        });
+                        AliasTarget::new(*enablement, version)
+                    })
+                    .collect::<Vec<_>>();
+                let body = ModelAliasBody::new(alias, tenant, project, wire_family, resolved)
+                    .transitioned(lifecycle);
                 let version = next_version(state, ResourceKind::Alias, alias);
-                state.supersede(body.version_at(slug.clone(), version))?;
+                publish(state, body.version_at(slug.clone(), version))?;
                 Ok(())
             },
         ))
@@ -615,11 +640,82 @@ impl AdminResourceRequest for PolicyRequest {
             scope.resource_scope(),
             move |state: &mut DesiredState| {
                 let version = next_version(state, ResourceKind::Policy, body.resource_id());
-                state.supersede(body.version_at(slug.clone(), version))?;
+                publish(state, body.version_at(slug.clone(), version))?;
                 Ok(())
             },
         ))
     }
+}
+
+/// Publish a resource version into the candidate, advancing everything pinned to
+/// the version it replaces onto it.
+///
+/// Dependency edges name an exact version, and one request publishes one
+/// resource, so without this an enablement an alias points at could never be
+/// changed again: superseding it would dangle the alias, and pointing the alias
+/// at a version that does not exist yet dangles too. The edit holds the complete
+/// desired state, so the candidate carries the dependents forward itself.
+fn publish(state: &mut DesiredState, resource: ResourceVersion) -> Result<(), ValidationError> {
+    let current = resource.reference;
+    let superseded = state
+        .version_of(current.kind, current.id)
+        .map(|held| held.reference);
+    state.supersede(resource)?;
+    match superseded {
+        Some(superseded) => restack(state, superseded, current),
+        None => Ok(()),
+    }
+}
+
+/// Re-pin every resource that depended on `superseded` onto `current`, and then
+/// whatever depended on those, so one publication leaves no dangling edge.
+fn restack(
+    state: &mut DesiredState,
+    superseded: ResourceRef,
+    current: ResourceRef,
+) -> Result<(), ValidationError> {
+    let dependents: Vec<ResourceVersion> = state
+        .resources()
+        .filter(|resource| resource.depends_on.contains(&superseded))
+        .cloned()
+        .collect();
+    for dependent in dependents {
+        let previous = dependent.reference;
+        let version = previous.version.next();
+        let advanced = if previous.kind == ResourceKind::Alias {
+            // An alias names its targets in its *body*, so re-pinning it is a
+            // retarget rather than an edge rewrite: the edges follow the body.
+            let body = ModelAliasBody::read(&dependent)?;
+            let targets = body.targets().iter().map(|target| {
+                if target.enablement == superseded.id && target.version == superseded.version {
+                    AliasTarget::new(target.enablement, current.version)
+                } else {
+                    *target
+                }
+            });
+            body.clone()
+                .retargeted(targets.collect::<Vec<_>>())
+                .version_at(dependent.slug.clone(), version)
+        } else {
+            // Everything else pins by edge alone — an enablement's catalogue
+            // pin is the version of the row, while the snapshot digest it read
+            // the offering from stays what it was published against.
+            let mut depends_on = dependent.depends_on.clone();
+            depends_on.remove(&superseded);
+            depends_on.insert(current);
+            ResourceVersion::new(
+                ResourceRef::new(previous.kind, previous.id, version),
+                dependent.scope.clone(),
+                dependent.slug.clone(),
+                dependent.body.clone(),
+            )
+            .depending_on(depends_on)
+        };
+        let advanced_reference = advanced.reference;
+        state.supersede(advanced)?;
+        restack(state, previous, advanced_reference)?;
+    }
+    Ok(())
 }
 
 /// The version a supersede publishes: the first, or one past what is there.

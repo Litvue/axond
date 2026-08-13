@@ -1040,9 +1040,10 @@ async fn convergence_is_projected_from_replica_state_without_reading_the_backend
         }),
     };
     let result = service
-        .convergence(&grant(AdminAction::ReadConvergence), &report)
+        .convergence(&grant(AdminAction::ReadConvergence), Some(&report))
         .expect("a convergence projection");
     assert!(!result.converged);
+    assert!(result.reconciling);
     assert_eq!(result.source, Some("last-known-good"));
     assert_eq!(result.lag_ms, 3_000);
     assert_eq!(result.last_rejection, Some("unavailable"));
@@ -1055,6 +1056,15 @@ async fn convergence_is_projected_from_replica_state_without_reading_the_backend
     let payload = serde_json::to_string(&result).unwrap();
     assert!(!payload.contains(SECRET_LOOKING));
     assert!(!payload.contains("db.internal"));
+
+    // A replica with no reconciler has converged onto nothing. "Nothing desired
+    // equals nothing active" is convergence for a reconciler, never an
+    // all-clear for an operator gating a rollout on this read.
+    let unreconciled = service
+        .convergence(&grant(AdminAction::ReadConvergence), None)
+        .expect("a convergence projection");
+    assert!(!unreconciled.converged);
+    assert!(!unreconciled.reconciling);
 }
 
 // ---------------------------------------------------------------------------
