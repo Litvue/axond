@@ -1374,6 +1374,13 @@ impl From<FetchError> for CatalogError {
                 backend: BACKEND,
                 message: error.to_string(),
             },
+            // The document itself is unusable, so the next identical request
+            // produces the same refusal at the cost of the whole body again.
+            // Someone has to raise the ceiling or point the source elsewhere.
+            FetchError::TooLarge { .. } => Self::Invalid {
+                backend: BACKEND,
+                message: error.to_string(),
+            },
             error => Self::Unavailable {
                 backend: BACKEND,
                 message: error.to_string(),
@@ -2530,6 +2537,14 @@ mod tests {
                 CatalogError::Denied { .. }
             ));
         }
+
+        // Nor is a document too large to hold: asking again transfers every one
+        // of those bytes to refuse them a second time.
+        let oversized = CatalogError::from(FetchError::TooLarge {
+            limit: MAX_PAYLOAD_BYTES,
+        });
+        assert!(matches!(oversized, CatalogError::Invalid { .. }));
+        assert!(!oversized.retryable());
     }
 
     /// A declared length is the sender's claim about a body nobody has read yet,
@@ -2565,7 +2580,7 @@ mod tests {
             .expect_err("an oversized payload");
         assert_eq!(
             error,
-            CatalogError::Unavailable {
+            CatalogError::Invalid {
                 backend: BACKEND,
                 message: format!("payload exceeds the {ceiling}-byte ceiling"),
             }
@@ -2598,7 +2613,7 @@ mod tests {
             .with_payload_limit(ceiling);
         assert_eq!(
             source.refresh(None).await.expect_err("too large to parse"),
-            CatalogError::Unavailable {
+            CatalogError::Invalid {
                 backend: BACKEND,
                 message: format!("payload exceeds the {ceiling}-byte ceiling"),
             }
