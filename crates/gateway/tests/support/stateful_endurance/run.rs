@@ -224,7 +224,7 @@ pub async fn run_with(
         reach,
         client: &client,
         rotation: &rotation,
-        taken: &next,
+        offered: &next,
         state: &mut state,
         probe: &probe_tenant,
         sample_interval,
@@ -244,6 +244,7 @@ pub async fn run_with(
     while let Ok(attempt) = rx.try_recv() {
         state.absorb_attempt(&attempt);
     }
+    let total_offered = next.load(Ordering::Relaxed) as u64;
     let elapsed = started.elapsed();
     // The load's tail is its own segment, closed before the settle: folding the
     // idle wait into the last loaded segment would make the busiest segment
@@ -286,6 +287,7 @@ pub async fn run_with(
             upstream: "fake upstream, in process, behind a loopback fault gate",
         },
         state,
+        total_offered,
         stop,
         started_at,
         elapsed,
@@ -424,7 +426,15 @@ async fn worker(
     think: Duration,
     started: Instant,
 ) {
-    while !deadline.passed() && !stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) {
+        // A rolling replacement may extend a run after its original deadline.
+        // Keep workers parked rather than terminating them at the first end so
+        // that the extension actually has load behind it. The supervisor owns
+        // the stop flag and wakes this loop when the extended run is complete.
+        if deadline.passed() {
+            tokio::time::sleep(TICK).await;
+            continue;
+        }
         let index = next.fetch_add(1, Ordering::Relaxed);
         let planned = plan::planned(index, &tenants, &endings);
         let target = {
@@ -656,9 +666,9 @@ struct Supervisor<'a> {
     reach: Reach,
     client: &'a reqwest::Client,
     rotation: &'a Arc<std::sync::Mutex<Vec<String>>>,
-    /// The workers' own counter of requests taken, read live. What the state
-    /// has drained lags a restart by the whole restart.
-    taken: &'a AtomicUsize,
+    /// The workers' own live dispatch counter. The state tally is drained from
+    /// a channel and can lag a restart by the whole restart.
+    offered: &'a AtomicUsize,
     state: &'a mut State,
     probe: &'a Tenant,
     sample_interval: Duration,
@@ -996,7 +1006,7 @@ impl Supervisor<'_> {
                 began.elapsed(),
                 ready,
                 self.started.elapsed(),
-                self.taken.load(Ordering::Relaxed) as u64,
+                self.offered.load(Ordering::Relaxed) as u64,
             );
             if !ready {
                 return;
@@ -1160,12 +1170,9 @@ struct State {
     /// not arrived yet.
     awaiting_recovery: Vec<usize>,
     restart: Restart,
-    /// What the workers had taken when the last replacement joined, so the
-    /// artifact can say how much load the restart was actually measured
-    /// across. The workers' own counter rather than this state's tally: the
-    /// tally only advances on the drain tick, and the restart blocks the loop
-    /// that drains, so it would still read from before the restart began and
-    /// count everything offered *during* it as offered after.
+    /// The workers' live dispatch count when the last replacement joined. The
+    /// final post-restart count uses the same counter domain; the state tally
+    /// only advances on the drain tick and is not comparable to this snapshot.
     offered_at_last_replacement: u64,
     replacement_never_ready: bool,
     tenancy: Tenancy,
@@ -1763,11 +1770,11 @@ impl State {
         took: Duration,
         ready: bool,
         now: Duration,
-        taken: u64,
+        offered: u64,
     ) {
         self.restart.replicas_restarted += 1;
         self.restart.worst_return_ms = self.restart.worst_return_ms.max(took.as_millis() as u64);
-        self.offered_at_last_replacement = taken;
+        self.offered_at_last_replacement = offered;
         if !ready {
             self.replacement_never_ready = true;
         }
@@ -1846,6 +1853,13 @@ pub struct DurableLoss {
     pub settled_outside: u64,
 }
 
+/// Count dispatches after the last replacement using the same live counter for
+/// both values. The state tally is intentionally drained later, so subtracting
+/// it from the workers' live dispatch count would mix two points in time.
+pub fn offered_after_last_replacement(total_offered: u64, at_replacement: u64) -> u64 {
+    total_offered.saturating_sub(at_replacement)
+}
+
 /// Split the durable loss over the usage-backend outage.
 ///
 /// The whole-run loss is a set difference. Which half of it the outage excuses
@@ -1922,6 +1936,7 @@ fn assemble(
     environment: Environment,
     backends: Backends,
     state: State,
+    total_offered: u64,
     stop: Stop,
     started_at: SystemTime,
     elapsed: Duration,
@@ -1931,7 +1946,7 @@ fn assemble(
 ) -> StatefulEnduranceResult {
     let State {
         segments,
-        offered,
+        offered: drained_offered,
         outcomes,
         by_tenant,
         by_ending,
@@ -1961,9 +1976,14 @@ fn assemble(
         timeline,
         ..
     } = state;
+    debug_assert_eq!(
+        drained_offered, total_offered,
+        "all dispatched attempts should be drained before assembly"
+    );
+    let offered = total_offered;
     if restart.replicas_restarted > 0 {
         restart.offered_after_last_replacement =
-            offered.saturating_sub(offered_at_last_replacement);
+            offered_after_last_replacement(offered, offered_at_last_replacement);
     }
     let tally = ledger.tally();
     // The driver's probes settle records of their own. They are reconciled

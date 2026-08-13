@@ -31,6 +31,7 @@
 mod support;
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -70,6 +71,27 @@ async fn qualify(tier: Tier) {
             return;
         };
         assert_qualifies(&result);
+    }
+}
+
+#[test]
+fn stateful_smoke_is_required_by_the_shared_ci_lane() {
+    let workflow = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml"),
+    )
+    .expect("the CI workflow is committed");
+    for required in [
+        "  stateful-tests:\n    name: Stateful tests",
+        "AXOND_TEST_POSTGRES_DSN: postgres://",
+        "AXOND_TEST_REQUIRE_SERVICES: \"1\"",
+        "cargo test -p axond --all-features --locked",
+        "name: Publish the stateful endurance smoke results",
+        "stateful-endurance-results-smoke",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "the shared Stateful tests lane no longer requires the endurance smoke contract: +             missing {required:?}"
+        );
     }
 }
 
@@ -198,6 +220,19 @@ async fn a_restart_that_lands_late_is_still_measured_under_load() {
         "a run with the room is not extended"
     );
     assert!(!roomy.passed());
+}
+
+#[test]
+fn offered_after_last_replacement_uses_one_counter_domain() {
+    assert_eq!(
+        stateful_endurance::run::offered_after_last_replacement(100, 70),
+        30
+    );
+    assert_eq!(
+        stateful_endurance::run::offered_after_last_replacement(70, 100),
+        0,
+        "a counter cannot become negative when a late snapshot is observed"
+    );
 }
 
 /// The committed manifest has to describe a run that can qualify anything, and
@@ -620,6 +655,7 @@ fn a_tier_offers_load_alone() {
     );
 
     let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .expect("a runtime");
     runtime.block_on(async {
@@ -629,8 +665,12 @@ fn a_tier_offers_load_alone() {
             "a second tier waits rather than offering load beside the first"
         );
         drop(held);
+        let regained = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            stateful_endurance::run::load_lock().lock(),
+        );
         assert!(
-            stateful_endurance::run::load_lock().try_lock().is_ok(),
+            regained.await.is_ok(),
             "and takes it once the first has finished"
         );
     });
@@ -750,7 +790,7 @@ fn a_slow_policy_reload_is_not_a_tenant_boundary_breach() {
 #[test]
 fn a_replicas_dsn_carries_awkward_credentials_intact() {
     let (rebuilt, reach) = stateful_endurance::durable::through_gate(
-        "postgres://a%20user:p%40ss%20w%27o%5Crd@127.0.0.1:5432/some%20db?application_name=axond",
+        "postgres://a%20user:p%40ss%20w%27o%5Crd@127.0.0.1:5432/some%20db?application_name=axond&sslmode=disable",
         "127.0.0.1:6543",
     );
     assert_eq!(reach, stateful_endurance::durable::Reach::Gated);
@@ -764,10 +804,31 @@ fn a_replicas_dsn_carries_awkward_credentials_intact() {
     assert_eq!(parsed.get_password(), Some(r"p@ss w'o\rd".as_bytes()));
     assert_eq!(parsed.get_dbname(), Some("some db"));
     assert_eq!(parsed.get_application_name(), Some("axond"));
+    assert_eq!(
+        parsed.get_ssl_mode(),
+        tokio_postgres::config::SslMode::Disable
+    );
     assert_eq!(parsed.get_ports(), [6543]);
 
-    // A TLS DSN is handed over untouched: a byte-forwarding gate cannot stand
-    // in front of a handshake to a different name.
+    // A loopback DSN that merely prefers TLS stays gated without changing its
+    // TLS identity: the original host is retained and the gate is only the
+    // connection address.
+    let prefer = "postgres://user:pw@localhost:5432/postgres?sslmode=prefer";
+    let (passed, reach) = stateful_endurance::durable::through_gate(prefer, "127.0.0.1:6543");
+    assert_eq!(reach, stateful_endurance::durable::Reach::Gated);
+    let parsed_prefer: tokio_postgres::Config = passed.parse().expect("the gated DSN parses");
+    assert_eq!(parsed_prefer.get_hosts().len(), 1);
+    assert!(matches!(
+        &parsed_prefer.get_hosts()[0],
+        tokio_postgres::config::Host::Tcp(host) if host == "localhost"
+    ));
+    assert_eq!(parsed_prefer.get_hostaddrs().len(), 1);
+    assert_eq!(parsed_prefer.get_ports(), [6543]);
+    assert_eq!(
+        parsed_prefer.get_ssl_mode(),
+        tokio_postgres::config::SslMode::Prefer
+    );
+
     let tls = "postgres://user:pw@127.0.0.1:5432/postgres?sslmode=require";
     let (passed, reach) = stateful_endurance::durable::through_gate(tls, "127.0.0.1:6543");
     assert_eq!(passed, tls);
@@ -786,7 +847,7 @@ fn a_replicas_dsn_carries_awkward_credentials_intact() {
 
     // `localhost` is this machine by another name, and the gate binds it too.
     let (_, reach) = stateful_endurance::durable::through_gate(
-        "postgres://user:pw@localhost:5432/postgres",
+        "postgres://user:pw@localhost:5432/postgres?sslmode=disable",
         "127.0.0.1:6543",
     );
     assert_eq!(reach, stateful_endurance::durable::Reach::Gated);

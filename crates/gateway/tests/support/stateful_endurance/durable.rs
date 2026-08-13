@@ -93,13 +93,26 @@ fn is_loopback(config: &tokio_postgres::Config) -> bool {
 /// against credentials a run would rather not have in its fixtures.
 pub fn through_gate(dsn: &str, gate: &str) -> (String, Reach) {
     let config: tokio_postgres::Config = dsn.parse().expect("the test DSN is a valid one");
-    if config.get_ssl_mode() == tokio_postgres::config::SslMode::Require || !is_loopback(&config) {
+    // A required-TLS DSN is handled directly (and rejected by `dsn`, because
+    // reconciliation uses NoTls). Other loopback DSNs can be gated: retain the
+    // original `host` as the TLS/certificate identity and use `hostaddr` for
+    // the gate's loopback socket, so routing through the gate does not change
+    // the deployment's TLS behavior or server name.
+    if !matches!(
+        config.get_ssl_mode(),
+        tokio_postgres::config::SslMode::Disable | tokio_postgres::config::SslMode::Prefer
+    ) || !is_loopback(&config)
+    {
         return (dsn.to_owned(), Reach::Direct);
     }
+    let original_host = match config.get_hosts().first() {
+        Some(tokio_postgres::config::Host::Tcp(host)) => host,
+        _ => unreachable!("a loopback DSN has a TCP host"),
+    };
     let (host, port) = gate
         .rsplit_once(':')
         .expect("the gate authority is host:port");
-    let mut rebuilt = format!("host={host} port={port}");
+    let mut rebuilt = format!("host={} hostaddr={host} port={port}", quoted(original_host));
     if let Some(user) = config.get_user() {
         rebuilt.push_str(&format!(" user={}", quoted(user)));
     }
@@ -122,6 +135,14 @@ pub fn through_gate(dsn: &str, gate: &str) -> (String, Reach) {
     if let Some(timeout) = config.get_connect_timeout() {
         rebuilt.push_str(&format!(" connect_timeout={}", timeout.as_secs()));
     }
+    // Keep the parsed TLS mode explicit. This matters for `sslmode=disable`:
+    // omitting it would make the rebuilt DSN fall back to `prefer`.
+    rebuilt.push_str(match config.get_ssl_mode() {
+        tokio_postgres::config::SslMode::Disable => " sslmode=disable",
+        tokio_postgres::config::SslMode::Prefer => " sslmode=prefer",
+        tokio_postgres::config::SslMode::Require => unreachable!("required TLS returned above"),
+        _ => unreachable!("an unsupported TLS mode returned above"),
+    });
     (rebuilt, Reach::Gated)
 }
 
@@ -142,12 +163,10 @@ pub enum Reach {
     /// Through the gate, so the usage backend can be made to disappear.
     Gated,
     /// Directly, because the DSN names a database that is not on the loopback
-    /// interface and so may negotiate TLS under the default `prefer`: a
-    /// byte-forwarding gate cannot stand in front of a handshake to a
-    /// different name, and rewriting the DSN would hand a remote server's
-    /// credentials to a plaintext forwarder on this machine. The outage is
-    /// then recorded as not evaluated rather than silently skipped. (A DSN
-    /// that *requires* TLS never gets this far: [`dsn`] declines the run.)
+    /// interface or requires TLS. A remote endpoint is not safe to rewrite
+    /// towards a local forwarder, and a required-TLS endpoint cannot be
+    /// reconciled by this harness's `NoTls` connection. The outage is then
+    /// recorded as not evaluated rather than silently skipped.
     Direct,
 }
 
