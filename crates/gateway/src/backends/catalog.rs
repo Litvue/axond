@@ -1032,6 +1032,14 @@ impl ProviderOffering {
 }
 
 impl Canonical for ProviderOffering {
+    /// Over what the provider *states*, and nothing else.
+    ///
+    /// [`ProviderOffering::pointer`] and [`ProviderOffering::overrides`] are left
+    /// out, as [`CatalogProvider`]'s pointer is: one is where a value was read
+    /// from, the other is a function of the offering's facts against the neutral
+    /// record. Neither is content, and including them would let content differ in
+    /// identity while [`CatalogDiff`] — which compares stated values — found
+    /// nothing to report.
     fn canonical(&self) -> CanonicalValue {
         let mut fields = vec![
             ("provider".to_owned(), self.provider.canonical()),
@@ -1041,21 +1049,6 @@ impl Canonical for ProviderOffering {
                 CanonicalValue::string(&self.published_model_id),
             ),
             ("facts".to_owned(), self.facts.canonical()),
-            (
-                "overrides".to_owned(),
-                CanonicalValue::List(
-                    self.overrides
-                        .iter()
-                        .map(|(field, pointer)| {
-                            CanonicalValue::map([
-                                ("field", CanonicalValue::string(field.as_str())),
-                                ("pointer", pointer.canonical()),
-                            ])
-                        })
-                        .collect(),
-                ),
-            ),
-            ("pointer".to_owned(), self.pointer.canonical()),
         ];
         if let Some(price) = &self.price {
             fields.push(("price".to_owned(), price.canonical()));
@@ -2014,6 +2007,23 @@ mod tests {
         assert_eq!(diff.counts().prices_changed, 1);
         assert_eq!(diff.counts().offerings_added, 0);
         assert_eq!(diff.counts().offerings_removed, 0);
+    }
+
+    /// Content identity is over stated values, so two catalogues differing only
+    /// in where their values were read from, or in the derived override record,
+    /// are one identity — otherwise an `Admission::Updated` could carry an empty
+    /// diff, which is the one thing the identity exists to rule out.
+    #[test]
+    fn provenance_is_not_content() {
+        let stated = offering("openai", "gpt-4o", Some(price(1, 2)));
+        let mut elsewhere = stated.clone();
+        elsewhere.pointer = JsonPointer::new("").child("somewhere").child("else");
+        elsewhere.overrides = vec![(ModelField::DisplayName, JsonPointer::new("/made/up"))];
+
+        let before = content(vec![stated]);
+        let after = content(vec![elsewhere]);
+        assert_eq!(before.content_id(), after.content_id());
+        assert!(after.diff(&before).is_empty());
     }
 
     /// Every catalogue record is built in the order it encodes in, so a record

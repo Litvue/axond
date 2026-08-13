@@ -1542,7 +1542,7 @@ mod tests {
     /// normalization, so a change to either is a deliberate edit here rather than
     /// a silent change to every stored snapshot's identity.
     const IDENTITY_CONTENT_ID: &str =
-        "sha256:4ae07b3da3c559576a5be87dbed8349b766e901f2d2243df6cca4696e514e454";
+        "sha256:07f8cd2d43cdbbe172a71954a7994db79c2b38c3d8a034e327b9fed617a89dae";
 
     fn drift(name: &str) -> &'static str {
         match name {
