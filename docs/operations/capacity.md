@@ -42,9 +42,10 @@ rather than the throughput. `backend-limits` boots a short transport bound and
 then stalls two upstreams out of three: every request has to end on the bound
 the replica declares rather than on the upstream relenting, and once a stalling
 target's circuit trips the rest are refused at once while the healthy target
-keeps serving every request sent to it. Each of the three also offers one more
-request after the load stops, because a ceiling that keeps a permit or a bound
-that keeps a slot is invisible in every other number on this page.
+keeps serving every request sent to it. Those two — the profiles that boot a
+limit — also offer one more request after the load stops, because a ceiling that
+keeps a permit or a bound that keeps a slot is invisible in every other number
+on this page.
 
 Each run writes `target/capacity/<tier>/<profile>.json`: throughput, latency
 percentiles, TTFT and stream lifetime, RSS, CPU, sockets, occupancy, rejection
@@ -85,14 +86,14 @@ Intel Xeon Platinum 8559C, 31 GiB RAM, Linux 5.15.200, rustc 1.97.1, no queueing
 
 | Profile | Concurrency | Requests | Accepted req/s | p50 | p95 | p99 | TTFT p95 | Peak RSS | Peak sockets | CPU cores used |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `buffered` | 128 | 40 000 | 7 813 | 15.7 ms | 24.3 ms | 29.7 ms | — | 47 MiB | 354 | 4.8 |
-| `streaming` | 300 | 8 000 | 1 032 | 275 ms | 318 ms | 653 ms | 71 ms | 54 MiB | 805 | 3.2 |
-| `mixed` | 128 | 12 000 | 1 367 | 2.7 ms | 278 ms | 286 ms | 51 ms | 41 MiB | 285 | 2.3 |
-| `response-size` | 64 | 6 000 | 1 447 | 41.8 ms | 70.4 ms | 85.9 ms | — | 68 MiB | 155 | 4.3 |
-| `cancellation` | 300 | 8 000 | 1 668 | 271 ms | 309 ms | 484 ms | 64 ms | 58 MiB | 698 | 3.7 |
-| `tenants` | 128 | 12 000 | 950 | 254 ms | 266 ms | 272 ms | 51 ms | 42 MiB | 268 | 2.1 |
-| `shedding` | 512 | 20 000 | 3.9 | 19.3 ms | 48.7 ms | 80.1 ms | — | 68 MiB | 1 843 | 1.4 |
-| `backend-limits` | 64 | 1 200 | 99 | 3.2 ms | 2 004 ms | 2 043 ms | — | 35 MiB | 143 | 0.1 |
+| `buffered` | 128 | 40 000 | 7 455 | 16.5 ms | 25.8 ms | 31.7 ms | — | 47 MiB | 338 | 4.8 |
+| `streaming` | 300 | 8 000 | 1 037 | 274 ms | 297 ms | 636 ms | 62 ms | 53 MiB | 731 | 3.3 |
+| `mixed` | 128 | 12 000 | 1 360 | 3.0 ms | 279 ms | 291 ms | 51 ms | 42 MiB | 272 | 2.4 |
+| `response-size` | 64 | 6 000 | 1 418 | 42.6 ms | 73.0 ms | 90.1 ms | — | 68 MiB | 156 | 4.3 |
+| `cancellation` | 300 | 8 000 | 1 616 | 276 ms | 323 ms | 489 ms | 69 ms | 58 MiB | 716 | 3.7 |
+| `tenants` | 128 | 12 000 | 945 | 254 ms | 265 ms | 271 ms | 51 ms | 42 MiB | 281 | 2.1 |
+| `shedding` | 512 | 20 000 | 3.8 | 20.1 ms | 47.2 ms | 71.0 ms | — | 70 MiB | 1 823 | 1.4 |
+| `backend-limits` | 64 | 1 200 | 99 | 5.0 ms | 2 005 ms | 2 013 ms | — | 36 MiB | 146 | 0.1 |
 
 Throughput and latency move 10–25% between runs on a shared host, while the
 socket and memory columns barely move: read the first two as an order of
@@ -102,7 +103,7 @@ artifacts only when their `environment` blocks match.
 The last three rows are not throughput measurements and must not be read as
 one. `shedding` offers 20 000 callers at a ceiling of 8, so its accepted rate is
 the ceiling divided by how long one upstream answer takes; what it shows is the
-1 843 descriptors 512 simultaneous callers cost a replica that is refusing
+1 823 descriptors 512 simultaneous callers cost a replica that is refusing
 almost all of them, and that the refusal is cheap (1.4 cores). `backend-limits`
 spends most of its wall clock waiting on upstreams that never answer, so its
 latency columns are the 2 000 ms bound the replica declares rather than work it
@@ -117,7 +118,7 @@ buffered and streamed requests in one distribution.
 What the envelope says, in operator terms:
 
 - **Sockets scale with concurrency, roughly two per in-flight stream** — one
-  inbound, one upstream. 300 concurrent streams held ~805 descriptors. A
+  inbound, one upstream. 300 concurrent streams held ~731 descriptors. A
   refused caller costs an inbound descriptor too, until it is told no: the
   `shedding` row above holds four times the sockets of any other profile while
   admitting eight requests. Size `ulimit -n` for the load offered, not for the

@@ -62,9 +62,9 @@ kind as the others — environment-independent properties of the gateway — and
 they are stated in the terms each profile can support: a profile behind a
 ceiling states its acceptance floor as a count, because a replica admitting
 eight requests admits eight however many callers arrive, and a share would only
-measure how much load the manifest asked for. Each of the three also offers one
-request after its load stops, because a ceiling that kept a permit or a bound
-that kept a slot is invisible in every other number the run records.
+measure how much load the manifest asked for. The two that boot a limit also
+offer one request after their load stops, because a ceiling that kept a permit
+or a bound that kept a slot is invisible in every other number the run records.
 
 **The driver is closed-loop.** It holds a fixed concurrency and sends a fixed
 *number* of requests rather than pushing a fixed arrival rate. An open-loop rate
