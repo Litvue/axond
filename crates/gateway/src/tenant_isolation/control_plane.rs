@@ -373,16 +373,18 @@ async fn a_rehearsed_cross_tenant_mutation_is_refused_like_a_real_one() {
     assert_eq!(error.code(), "admin_forbidden");
     assert_eq!(journal.head().await, Some(revision));
 
-    // And the same rehearsal within the caller's own scope does run, so the
-    // refusal above is about the tenant boundary and not about dry runs.
+    // And the same rehearsal by the same grant, differing only in which tenant it
+    // is attributed to, does run: the caller's own tenant, rehearsing state that
+    // changes nothing. So the refusal above is about the tenant boundary rather
+    // than about dry runs, or about tenant-scoped grants rehearsing at all.
     let outcome = service
         .apply(
-            &grant(AdminAction::Publish, ResourceScope::Deployment),
+            &grant(AdminAction::Publish, ResourceScope::Tenant(caller())),
             &{
                 let mut own = request(
                     "rehearse-mine",
                     ExpectedRevision::Exactly(revision),
-                    ResourceScope::Deployment,
+                    ResourceScope::Tenant(caller()),
                 );
                 own.preconditions.mode = WriteMode::DryRun;
                 own
