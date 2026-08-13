@@ -114,9 +114,13 @@ secret marker.
 ## Exercising the upstream/transport path with no provider
 
 Point a provider's `base_url` at an unreachable address, e.g. `http://127.0.0.1:1/v1`, then
-send `POST /v1/chat/completions`. You get `502` / `upstream_transport` and the transport
-error message, which is a cheap way to test error rendering, redaction, failover, and
-circuit breakers. Note the upstream URL is built by **string concatenation** of `base_url`
+send `POST /v1/chat/completions`. You get `502` / `upstream_transport` with the fixed
+message `upstream transport failure`: the caller is never told the endpoint the attempt
+failed against, so this is a cheap way to test failover, circuit breakers, and that the
+answer names no provider host — the reason itself is on the replica's `upstream attempt
+failed on the transport` warn (`open stream failed on the transport` mid-stream), which is
+where redaction is worth checking. Note the upstream URL is built by **string
+concatenation** of `base_url`
 + route path, so a `base_url` with a query string or trailing junk will produce a mangled
 URL — keep test `base_url`s path-only unless that is what you are testing.
 
