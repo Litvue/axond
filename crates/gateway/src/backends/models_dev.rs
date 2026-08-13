@@ -1351,10 +1351,26 @@ pub enum FetchError {
     TooLarge { limit: usize },
 }
 
+/// A status the *request* is at fault for, and retrying it unchanged cannot fix.
+///
+/// `408` and `429` are excluded: they ask for the same request again, later. The
+/// rest of the `4xx` range says the configured URL is wrong — a mirror that
+/// answers `404`, a document withdrawn with `410`, a path that rejects a
+/// conditional `GET` — and reporting that as an outage would have a scheduler
+/// retry it forever while the operator reads "upstream is down" about a URL only
+/// they can fix.
+const fn misconfigured(status: u16) -> bool {
+    matches!(status, 400..=499) && !matches!(status, 408 | 429)
+}
+
 impl From<FetchError> for CatalogError {
     fn from(error: FetchError) -> Self {
         match error {
             FetchError::Status { status } if status == 401 || status == 403 => Self::Denied {
+                backend: BACKEND,
+                message: error.to_string(),
+            },
+            FetchError::Status { status } if misconfigured(status) => Self::Misconfigured {
                 backend: BACKEND,
                 message: error.to_string(),
             },
@@ -1512,6 +1528,7 @@ mod tests {
     use super::super::catalog::{
         Admission, CatalogChange, HttpDate, LastKnownGoodCatalog, ModelCapability, ProviderId,
     };
+    use super::super::{BackendFailure, FailureCategory};
     use super::*;
 
     const IDENTITY: &str = include_str!("fixtures/models_dev/catalog.identity.json");
@@ -2478,6 +2495,41 @@ mod tests {
                 message: "upstream answered HTTP 403".to_owned(),
             }
         );
+    }
+
+    /// A wrong URL is not an outage: whatever schedules refresh must stop asking
+    /// and say what is wrong, instead of retrying a `404` forever while telling
+    /// an operator the upstream is down.
+    #[test]
+    fn a_url_that_cannot_serve_a_catalogue_is_not_reported_as_an_outage() {
+        for status in [400, 404, 405, 410, 414, 451] {
+            let error = CatalogError::from(FetchError::Status { status });
+            assert_eq!(
+                error,
+                CatalogError::Misconfigured {
+                    backend: BACKEND,
+                    message: format!("upstream answered HTTP {status}"),
+                },
+                "HTTP {status} says the configured URL is wrong"
+            );
+            assert!(!error.retryable(), "HTTP {status} cannot be retried away");
+            assert_eq!(error.category(), FailureCategory::NotFound);
+        }
+
+        for status in [408, 429, 500, 502, 503, 504] {
+            let error = CatalogError::from(FetchError::Status { status });
+            assert!(
+                error.retryable(),
+                "HTTP {status} is the same request again, later"
+            );
+        }
+
+        for status in [401, 403] {
+            assert!(matches!(
+                CatalogError::from(FetchError::Status { status }),
+                CatalogError::Denied { .. }
+            ));
+        }
     }
 
     /// A declared length is the sender's claim about a body nobody has read yet,

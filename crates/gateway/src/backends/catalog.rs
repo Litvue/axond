@@ -207,6 +207,17 @@ pub enum CatalogError {
         backend: &'static str,
         message: String,
     },
+    /// The source cannot serve a catalogue at all — the configured URL answers
+    /// `404`, the document was withdrawn, the request shape is rejected.
+    ///
+    /// Apart from [`CatalogError::Unavailable`] because retrying cannot fix it
+    /// and because an operator reading "upstream is down" would look at the
+    /// wrong thing: what is wrong is the configuration.
+    #[error("catalogue source `{backend}` cannot serve a catalogue: {message}")]
+    Misconfigured {
+        backend: &'static str,
+        message: String,
+    },
 }
 
 impl BackendFailure for CatalogError {
@@ -215,6 +226,7 @@ impl BackendFailure for CatalogError {
             Self::Unavailable { .. } => FailureCategory::Unavailable,
             Self::Invalid { .. } => FailureCategory::Invalid,
             Self::Denied { .. } => FailureCategory::Denied,
+            Self::Misconfigured { .. } => FailureCategory::NotFound,
         }
     }
 }
@@ -1779,7 +1791,12 @@ pub enum Admission {
 /// [#241](https://github.com/Litvue/axond/issues/241). For that age to mean
 /// "last confirmed current" rather than "last changed", an unchanged answer is
 /// recorded through [`LastKnownGoodCatalog::record_unchanged`], which also takes
-/// the validators the `304` itself stated. Staleness degrades
+/// the validators the `304` itself stated. It can act on the categories too
+/// rather than counting every failure alike: [`CatalogError::Unavailable`] is
+/// worth retrying, while [`CatalogError::Misconfigured`],
+/// [`CatalogError::Denied`] and [`CatalogError::Invalid`] are not — retrying them
+/// only buries an operator's own misconfiguration under "upstream is down".
+/// Staleness degrades
 /// metadata quality only: no enablement, admission, or billing decision reads
 /// this snapshot, so a stale catalogue is never an outage.
 #[derive(Debug, Default)]
