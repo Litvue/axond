@@ -15,44 +15,17 @@
 //! recorded: an artifact says which backend and which schema, never how to
 //! reach it or as whom.
 
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 /// The DSN the durable scenarios need, or `None` to skip them. The shared rule:
 /// absent configuration skips, and `AXOND_TEST_REQUIRE_SERVICES=1` turns the
 /// skip into a panic so CI cannot report green for a run that never happened.
 pub fn dsn() -> Option<String> {
-    let dsn = crate::support::stateful::postgres_dsn()?;
-    // The harness's own reconciliation connects without TLS, so a database that
-    // insists on it is one this run cannot count — and a qualification that
-    // cannot count the durable side is not a qualification. Said here, once,
-    // rather than as a panic inside the first query: the operator gets the
-    // reason instead of a connection error from the middle of a boot.
-    if requires_tls(&dsn) {
-        if std::env::var("AXOND_TEST_REQUIRE_SERVICES").as_deref() == Ok("1") {
-            panic!(
-                "AXOND_TEST_POSTGRES_DSN requires TLS, which the stateful endurance harness \
-                 cannot reconcile against; point it at a database it may connect to in the \
-                 clear rather than letting CI report green for a run that never happened"
-            );
-        }
-        eprintln!(
-            "stateful endurance: skipped — AXOND_TEST_POSTGRES_DSN requires TLS and the \
-             harness's own reconciliation connects without it"
-        );
-        return None;
-    }
-    Some(dsn)
-}
-
-/// Whether the DSN insists on an encrypted connection. Only `require` does:
-/// libpq's default `prefer` is satisfied by the plaintext connection the
-/// harness makes, and a server that refuses that is a server this run says so
-/// about rather than one it works around.
-pub fn requires_tls(dsn: &str) -> bool {
-    dsn.parse::<tokio_postgres::Config>()
-        .is_ok_and(|config| config.get_ssl_mode() == tokio_postgres::config::SslMode::Require)
+    crate::support::stateful::postgres_dsn()
 }
 
 /// One libpq keyword/value field, quoted so a credential is passed as it was
@@ -93,16 +66,12 @@ fn is_loopback(config: &tokio_postgres::Config) -> bool {
 /// against credentials a run would rather not have in its fixtures.
 pub fn through_gate(dsn: &str, gate: &str) -> (String, Reach) {
     let config: tokio_postgres::Config = dsn.parse().expect("the test DSN is a valid one");
-    // A required-TLS DSN is handled directly (and rejected by `dsn`, because
-    // reconciliation uses NoTls). Other loopback DSNs can be gated: retain the
-    // original `host` as the TLS/certificate identity and use `hostaddr` for
-    // the gate's loopback socket, so routing through the gate does not change
-    // the deployment's TLS behavior or server name.
-    if !matches!(
-        config.get_ssl_mode(),
-        tokio_postgres::config::SslMode::Disable | tokio_postgres::config::SslMode::Prefer
-    ) || !is_loopback(&config)
-    {
+    // The gate is a byte forwarder, so it can carry plaintext or PostgreSQL's
+    // TLS negotiation without terminating it. Keep the original host as the
+    // certificate identity and use `hostaddr` for the gate's loopback socket.
+    // Remote hosts stay direct: rewriting them would hand their credentials to
+    // a local forwarder and change which outage the run is measuring.
+    if !is_loopback(&config) {
         return (dsn.to_owned(), Reach::Direct);
     }
     let original_host = match config.get_hosts().first() {
@@ -136,12 +105,13 @@ pub fn through_gate(dsn: &str, gate: &str) -> (String, Reach) {
         rebuilt.push_str(&format!(" connect_timeout={}", timeout.as_secs()));
     }
     // Keep the parsed TLS mode explicit. This matters for `sslmode=disable`:
-    // omitting it would make the rebuilt DSN fall back to `prefer`.
+    // omitting it would make the rebuilt DSN fall back to `prefer`, and for
+    // `require`, which must remain a TLS-capable connection through the gate.
     rebuilt.push_str(match config.get_ssl_mode() {
         tokio_postgres::config::SslMode::Disable => " sslmode=disable",
         tokio_postgres::config::SslMode::Prefer => " sslmode=prefer",
-        tokio_postgres::config::SslMode::Require => unreachable!("required TLS returned above"),
-        _ => unreachable!("an unsupported TLS mode returned above"),
+        tokio_postgres::config::SslMode::Require => " sslmode=require",
+        _ => unreachable!("the parsed DSN has an unsupported TLS mode"),
     });
     (rebuilt, Reach::Gated)
 }
@@ -163,10 +133,9 @@ pub enum Reach {
     /// Through the gate, so the usage backend can be made to disappear.
     Gated,
     /// Directly, because the DSN names a database that is not on the loopback
-    /// interface or requires TLS. A remote endpoint is not safe to rewrite
-    /// towards a local forwarder, and a required-TLS endpoint cannot be
-    /// reconciled by this harness's `NoTls` connection. The outage is then
-    /// recorded as not evaluated rather than silently skipped.
+    /// interface. A remote endpoint is not safe to rewrite towards a local
+    /// forwarder; its outage is recorded as not evaluated rather than silently
+    /// changing the connection's security or destination.
     Direct,
 }
 
@@ -325,11 +294,27 @@ pub struct Settled {
 }
 
 async fn connect(dsn: &str) -> tokio_postgres::Client {
-    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+    // Use the same Rustls-capable connector as the gateway's PostgreSQL sinks.
+    // The gate only forwards bytes, so this preserves `sslmode=prefer` and
+    // `sslmode=require` while still allowing the harness to count and reconcile
+    // rows on a TLS-enabled database.
+    let config: tokio_postgres::Config = dsn.parse().expect("the test DSN is valid");
+    let (client, connection) = config
+        .connect(tls_connector())
         .await
         .expect("the stateful endurance run connects to PostgreSQL");
     tokio::spawn(async move {
         let _ = connection.await;
     });
     client
+}
+
+fn tls_connector() -> MakeRustlsConnect {
+    static CONNECTOR: OnceLock<MakeRustlsConnect> = OnceLock::new();
+    CONNECTOR
+        .get_or_init(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            MakeRustlsConnect::with_webpki_roots()
+        })
+        .clone()
 }

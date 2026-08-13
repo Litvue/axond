@@ -22,9 +22,9 @@
 //! `target/stateful-endurance/` carrying the measurements, the timeline, the
 //! per-replica time series, and the exact inputs that produced them.
 //!
-//! The `smoke` tier runs under `cargo test` wherever PostgreSQL is configured —
-//! a minute long, and the same code and the same gates as the tier that
-//! qualifies a release. The `soak` tier is twelve hours behind
+//! The `smoke` tier is opt-in (`AXOND_STATEFUL_ENDURANCE_SMOKE=1`) because it
+//! is a minute-long qualification rather than ordinary unit/integration work;
+//! CI runs it in a dedicated job. The `soak` tier is twelve hours behind
 //! `AXOND_STATEFUL_ENDURANCE=1`. No twelve-hour envelope is claimed here by
 //! anything but a retained soak artifact.
 
@@ -42,6 +42,13 @@ use support::stateful_endurance::{self as stateful_endurance, StatefulEnduranceR
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_stateful_endurance_smoke_tier_qualifies_and_publishes_its_evidence() {
+    if std::env::var("AXOND_STATEFUL_ENDURANCE_SMOKE").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping the stateful endurance smoke tier; set AXOND_STATEFUL_ENDURANCE_SMOKE=1 \
+             to run it"
+        );
+        return;
+    }
     qualify(Tier::Smoke).await;
 }
 
@@ -75,22 +82,39 @@ async fn qualify(tier: Tier) {
 }
 
 #[test]
-fn stateful_smoke_is_required_by_the_shared_ci_lane() {
+fn stateful_smoke_is_explicitly_invoked_by_a_dedicated_ci_lane() {
     let workflow = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml"),
     )
     .expect("the CI workflow is committed");
+    let (shared, smoke) = workflow
+        .split_once("  stateful-endurance-smoke:")
+        .expect("CI has a dedicated stateful endurance smoke job");
     for required in [
         "  stateful-tests:\n    name: Stateful tests",
         "AXOND_TEST_POSTGRES_DSN: postgres://",
         "AXOND_TEST_REQUIRE_SERVICES: \"1\"",
         "cargo test -p axond --all-features --locked",
+    ] {
+        assert!(
+            shared.contains(required),
+            "the shared Stateful tests lane no longer has its service contract: missing {required:?}"
+        );
+    }
+    assert!(
+        !shared.contains("the_stateful_endurance_smoke_tier_qualifies_and_publishes_its_evidence"),
+        "the shared Stateful tests lane must not accidentally run the 90-second smoke tier"
+    );
+    for required in [
+        "name: Stateful endurance smoke",
+        "the_stateful_endurance_smoke_tier_qualifies_and_publishes_its_evidence",
+        "AXOND_STATEFUL_ENDURANCE_SMOKE: \"1\"",
         "name: Publish the stateful endurance smoke results",
         "stateful-endurance-results-smoke",
     ] {
         assert!(
-            workflow.contains(required),
-            "the shared Stateful tests lane no longer requires the endurance smoke contract: +             missing {required:?}"
+            smoke.contains(required),
+            "the dedicated stateful endurance smoke lane is incomplete: missing {required:?}"
         );
     }
 }
@@ -201,10 +225,28 @@ async fn a_restart_that_lands_late_is_still_measured_under_load() {
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     assert!(deadline.passed(), "the run's own duration has elapsed");
 
+    // This is the worker-side behavior that makes the extension useful: a
+    // worker which reached the original end parks and becomes eligible again
+    // when the supervisor moves the shared deadline.
+    let parked = deadline.clone();
+    let worker = tokio::spawn(async move {
+        while parked.passed() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        true
+    });
+    tokio::task::yield_now().await;
+
     // A restart finishing here would have no load behind it, so the end moves.
     let extended = deadline.keep_offering_for(std::time::Duration::from_millis(200));
     assert!(!extended.is_zero(), "the run was stretched to make room");
     assert!(!deadline.passed(), "and is offering again");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), worker)
+            .await
+            .expect("the parked worker resumes")
+            .expect("the worker task completes")
+    );
 
     // A run with the room already keeps its own end: the soak's restart lands
     // hours before it, and an artifact whose duration wandered is not the run
@@ -665,6 +707,9 @@ fn a_tier_offers_load_alone() {
             "a second tier waits rather than offering load beside the first"
         );
         drop(held);
+        // Awaiting the lock proves release without assuming that no real tier
+        // is queued behind it. `try_lock` would race with that waiter and turn
+        // a successful release into a spurious failure.
         let regained = tokio::time::timeout(
             std::time::Duration::from_secs(120),
             stateful_endurance::run::load_lock().lock(),
@@ -831,8 +876,18 @@ fn a_replicas_dsn_carries_awkward_credentials_intact() {
 
     let tls = "postgres://user:pw@127.0.0.1:5432/postgres?sslmode=require";
     let (passed, reach) = stateful_endurance::durable::through_gate(tls, "127.0.0.1:6543");
-    assert_eq!(passed, tls);
-    assert_eq!(reach, stateful_endurance::durable::Reach::Direct);
+    assert_eq!(reach, stateful_endurance::durable::Reach::Gated);
+    let parsed_tls: tokio_postgres::Config = passed.parse().expect("the TLS DSN parses");
+    assert!(matches!(
+        &parsed_tls.get_hosts()[0],
+        tokio_postgres::config::Host::Tcp(host) if host == "127.0.0.1"
+    ));
+    assert_eq!(parsed_tls.get_hostaddrs().len(), 1);
+    assert_eq!(parsed_tls.get_ports(), [6543]);
+    assert_eq!(
+        parsed_tls.get_ssl_mode(),
+        tokio_postgres::config::SslMode::Require
+    );
 
     // So is a database that is not on this machine. Its default mode is
     // `prefer`, which still attempts a handshake, and rewriting the address
@@ -851,17 +906,6 @@ fn a_replicas_dsn_carries_awkward_credentials_intact() {
         "127.0.0.1:6543",
     );
     assert_eq!(reach, stateful_endurance::durable::Reach::Gated);
-
-    // A database that insists on TLS is not a run this harness can reconcile:
-    // it counts rows over its own plaintext connection. It is declined before
-    // anything boots — see `durable::dsn` — rather than panicking part-way
-    // through one.
-    assert!(stateful_endurance::durable::requires_tls(
-        "postgres://user:pw@127.0.0.1:5432/postgres?sslmode=require"
-    ));
-    assert!(!stateful_endurance::durable::requires_tls(
-        "postgres://user:pw@127.0.0.1:5432/postgres"
-    ));
 }
 
 /// A gate is a fault, and a fault that misses its moment is evidence the run

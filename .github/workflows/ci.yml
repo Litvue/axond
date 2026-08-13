@@ -292,30 +292,6 @@ jobs:
           name: recovery-evidence
           path: target/recovery/*.json
           if-no-files-found: warn
-      # The stateful endurance smoke tier: the same driver, manifest, and gates
-      # the `Endurance` workflow dispatches for twelve hours, at a minute. It
-      # only runs where a database is configured, which is this lane. It shares
-      # the lane rather than taking `--test-threads=1`, because the driver holds
-      # a load lock: only one tier offers load at a time whatever libtest does,
-      # and the run's gates are the deployment's behaviour — records reconciled,
-      # tenants isolated, revisions converged, restarts served — not throughput
-      # or latency, which are recorded and never asserted for this reason.
-      #
-      # How it ends: on its own script, every time. The driver stops when the
-      # manifest's duration has elapsed (or on a declared abort condition,
-      # recorded as `run.stop`), then drains, settles and writes the artifact
-      # this step publishes. No step timeout is placed on it, and every request
-      # it makes is individually bounded, so a hung replica ends the run's own
-      # request rather than being cut off by a clock outside the run.
-      - name: Publish the stateful endurance smoke results
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: stateful-endurance-results-smoke
-          path: |
-            target/stateful-endurance/smoke/*.json
-            target/stateful-endurance/smoke/*.samples.jsonl
-          if-no-files-found: warn
       # This lane has the control plane the forward-only rollback fence needs, so
       # its rollout artifacts are the ones that record the fence as evaluated.
       - name: Publish the stateful rollout results
@@ -342,6 +318,53 @@ jobs:
         with:
           name: fault-results
           path: target/faults/**/*.json
+          if-no-files-found: warn
+
+  # Keep the 90-second endurance qualification out of the shared stateful test
+  # invocation. It is opt-in in the test binary and gets its own runner, so the
+  # ordinary stateful checks cannot unexpectedly spend their budget on a load
+  # test with process replacement and database fault injection.
+  stateful-endurance-smoke:
+    name: Stateful endurance smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17.6-alpine
+        env:
+          POSTGRES_PASSWORD: axond-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-targets: false
+      - name: Run the opt-in stateful endurance smoke
+        run: |
+          cargo test -p axond --all-features --locked --test stateful_endurance -- \
+            the_stateful_endurance_smoke_tier_qualifies_and_publishes_its_evidence \
+            --exact --nocapture --test-threads=1
+        env:
+          AXOND_STATEFUL_ENDURANCE_SMOKE: "1"
+          AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
+          AXOND_TEST_REQUIRE_SERVICES: "1"
+      - name: Publish the stateful endurance smoke results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stateful-endurance-results-smoke
+          path: |
+            target/stateful-endurance/smoke/*.json
+            target/stateful-endurance/smoke/*.samples.jsonl
           if-no-files-found: warn
 
   sdk-compat:
@@ -847,6 +870,7 @@ jobs:
       - tests
       - fuzz-smoke
       - stateful-tests
+      - stateful-endurance-smoke
       - sdk-compat
       - sdk-compat-ts
       - docs
@@ -873,6 +897,7 @@ jobs:
           test "${{ needs.tests.result }}" = success
           test "${{ needs.fuzz-smoke.result }}" = success
           test "${{ needs.stateful-tests.result }}" = success
+          test "${{ needs.stateful-endurance-smoke.result }}" = success
           test "${{ needs.sdk-compat.result }}" = success
           test "${{ needs.sdk-compat-ts.result }}" = success
           test "${{ needs.docs.result }}" = success

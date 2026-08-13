@@ -77,28 +77,27 @@ qualification without a datastore is not a smaller one.
 
 Point it at a database on this machine if you want the usage-backend outage
 evaluated. The replicas reach a loopback database through the fault gate, which
-is how it can be taken away mid-run. A DSN naming a host somewhere else is
-handed to them untouched instead: under libpq's default `prefer` it may still
-negotiate TLS, a byte forwarder cannot stand in front of a handshake to another
-name, and rewriting the address would hand a remote server's credentials to a
-plaintext hop on this machine. The artifact then records the backend as reached
-`direct` and the usage-backend outage as not evaluated, rather than the run
-silently downgrading the connection it was given.
-
-A DSN that *requires* TLS is not run at all: the harness reconciles by
-connecting to the database itself, in the clear, and a run whose durable side
-cannot be counted is not a shorter qualification. It is skipped with that
-reason, and — as with an absent DSN — `AXOND_TEST_REQUIRE_SERVICES=1` turns the
-skip into a failure so CI cannot report green for a run that never happened.
+evaluated. The gate forwards PostgreSQL bytes without terminating them, so
+loopback DSNs retain their original host for certificate verification and their
+`sslmode` while `hostaddr` points at the gate. This keeps both `prefer` and
+`require` TLS connections intact while the database outage can still be
+introduced. A DSN naming a host somewhere else is handed to replicas untouched:
+rewriting a remote destination would hand its credentials to a local forwarder,
+so the artifact records the backend as reached `direct` and the usage-backend
+outage as not evaluated.
 
 ```bash
 export AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:5432/postgres
 
-# The smoke tier and the deterministic checks. Part of the normal suite, and of
-# the `Stateful tests` lane in CI. No `--test-threads=1` is needed: the driver
-# holds a load lock, so whichever tier is offering load is the only one, and the
-# deterministic checks beside it do not offer any.
+# The deterministic checks. The 90-second smoke is opt-in and runs in its own CI
+# lane so an ordinary stateful test invocation cannot spend its budget on load.
 cargo test --locked --all-features --test stateful_endurance -- --nocapture
+
+# The smoke tier, when explicitly requested.
+AXOND_STATEFUL_ENDURANCE_SMOKE=1 cargo test --locked --all-features \
+  --test stateful_endurance -- \
+  the_stateful_endurance_smoke_tier_qualifies_and_publishes_its_evidence \
+  --exact --nocapture --test-threads=1
 
 # The soak tier: twelve hours, by name.
 just stateful-endurance

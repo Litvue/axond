@@ -886,8 +886,8 @@ impl Supervisor<'_> {
                     self.state.note(
                         now,
                         event.as_str(),
-                        "not evaluated: the configured DSN requires TLS, which a \
-                         byte-forwarding gate cannot stand in front of",
+                        "not evaluated: the configured database is not loopback, so the \
+                         harness leaves its remote DSN untouched",
                     );
                 }
             }
