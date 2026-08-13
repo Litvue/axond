@@ -127,7 +127,7 @@ endurance duration_ms="":
     AXOND_ENDURANCE=1 AXOND_ENDURANCE_DURATION_MS={{ duration_ms }} cargo test --locked --all-features --test endurance -- the_endurance_soak_tier_qualifies_and_publishes_its_evidence --exact --nocapture --test-threads=1
 
 # The heavy rollout scenarios, writing result artifacts to target/rollout/heavy.
-# The reduced tier of the same driver runs in `just test` (ADR 0037).
+# The reduced tier of the same driver runs in `just test` (ADR 0038).
 # Set AXOND_TEST_POSTGRES_DSN to also evaluate the forward-only rollback fence;
 # without it the artifact records the fence as skipped rather than as passing.
 rollout:

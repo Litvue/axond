@@ -2,7 +2,7 @@
 #
 # A run is reproducible from this file plus the committed fixtures and the
 # binary the workspace builds — the driver records the hash of all three in each
-# result artifact (see docs/operations/rollout.md and ADR 0036).
+# result artifact (see docs/operations/rollout.md and ADR 0038).
 #
 # Each scenario ships two scales. `reduced` runs inside `cargo test` on every
 # change; `heavy` is the same code and the same assertions with more traffic per
