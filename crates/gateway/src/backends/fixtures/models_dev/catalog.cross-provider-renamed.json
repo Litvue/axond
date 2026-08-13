@@ -1,0 +1,139 @@
+{
+  "models": {
+    "xiaomi/mimo-v2-flash": {
+      "id": "xiaomi/mimo-v2-flash",
+      "name": "MiMo-V2-Flash",
+      "family": "mimo",
+      "attachment": false,
+      "reasoning": true,
+      "tool_call": true,
+      "temperature": true,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "open_weights": true,
+      "limit": {
+        "context": 262144,
+        "output": 65536
+      }
+    }
+  },
+  "providers": {
+    "openrouter": {
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "api": "https://openrouter.ai/api/v1",
+      "npm": "@openrouter/ai-sdk-provider",
+      "env": [
+        "OPENROUTER_API_KEY"
+      ],
+      "models": {
+        "mimo-v2-flash": {
+          "id": "mimo-v2-flash",
+          "name": "Xiaomi: MiMo V2 Flash",
+          "family": "mimo",
+          "attachment": false,
+          "reasoning": true,
+          "tool_call": true,
+          "temperature": true,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "open_weights": true,
+          "limit": {
+            "context": 262144,
+            "output": 65536
+          },
+          "cost": {
+            "input": 0.12,
+            "output": 0.36
+          }
+        }
+      }
+    },
+    "qiniu-ai": {
+      "id": "qiniu-ai",
+      "name": "Qiniu AI",
+      "api": "https://api.qnaigc.com/v1",
+      "npm": "@ai-sdk/openai-compatible",
+      "env": [
+        "QINIU_API_KEY"
+      ],
+      "models": {
+        "xiaomi/mimo-v2-flash": {
+          "id": "xiaomi/mimo-v2-flash",
+          "name": "Xiaomi/Mimo-V2-Flash",
+          "family": "mimo",
+          "attachment": false,
+          "reasoning": true,
+          "tool_call": true,
+          "temperature": true,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "open_weights": true,
+          "limit": {
+            "context": 262144,
+            "output": 65536
+          },
+          "cost": {
+            "input": 0.1,
+            "output": 0.3,
+            "cache_read": 0.01
+          }
+        }
+      }
+    },
+    "xiaomi": {
+      "id": "xiaomi",
+      "name": "Xiaomi",
+      "api": "https://api.xiaomi.com/v1",
+      "env": [
+        "XIAOMI_API_KEY"
+      ],
+      "models": {
+        "mimo-v2-flash": {
+          "id": "mimo-v2-flash",
+          "name": "MiMo-V2-Flash",
+          "family": "mimo",
+          "attachment": false,
+          "reasoning": true,
+          "tool_call": true,
+          "temperature": true,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "open_weights": true,
+          "limit": {
+            "context": 262144,
+            "output": 65536
+          },
+          "cost": {
+            "input": 0.08,
+            "output": 0.24
+          }
+        }
+      }
+    }
+  }
+}
