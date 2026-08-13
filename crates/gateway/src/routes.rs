@@ -2539,14 +2539,39 @@ struct RecordArgs<'a> {
 async fn record_usage(state: &AppState, args: RecordArgs<'_>) -> Result<(), GatewayError> {
     let (record, ttft_ms, attempts) = build_record(args);
     telemetry::record_request(&record, ttft_ms, attempts);
-    state
-        .0
-        .usage
-        .record(&record)
-        .await
-        .map_err(|error| GatewayError::UsageNotDurable {
+    // Fan-out delivery is a non-blocking hand-off, so it has no cancellation
+    // window worth detaching for and stays on the handler.
+    if !state.0.usage.appends() {
+        return state.0.usage.record(&record).await.map_err(|error| {
+            GatewayError::UsageNotDurable {
+                reason: error.reason,
+            }
+        });
+    }
+    // The billing-grade append is a database transaction, and hyper drops the
+    // handler future the moment the caller hangs up: a cancelled append would
+    // leave a charge already settled with no record of it anywhere and nothing
+    // counting the loss. Run as a settlement — the same tracking the streamed
+    // path uses, so shutdown waits for it — the append finishes whatever the
+    // connection does, and the handler awaits only the verdict its status code
+    // needs.
+    let (verdict, decided) = tokio::sync::oneshot::channel();
+    let recording = state.clone();
+    crate::streaming::spawn_settlement(async move {
+        let _ = verdict.send(recording.0.usage.record(&record).await);
+    });
+    match decided.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(GatewayError::UsageNotDurable {
             reason: error.reason,
-        })
+        }),
+        // The settlement went down with the runtime, so nothing is known about
+        // the event; the honest answer is the one that does not claim it is
+        // billable.
+        Err(_) => Err(GatewayError::UsageNotDurable {
+            reason: "the durable append did not report before the runtime stopped",
+        }),
+    }
 }
 
 /// Record where the request is already ending for another reason, so a failure
@@ -2554,7 +2579,22 @@ async fn record_usage(state: &AppState, args: RecordArgs<'_>) -> Result<(), Gate
 async fn record_usage_terminal(state: &AppState, args: RecordArgs<'_>) {
     let (record, ttft_ms, attempts) = build_record(args);
     telemetry::record_request(&record, ttft_ms, attempts);
-    state.0.usage.record_terminal(&record).await;
+    if !state.0.usage.appends() {
+        state.0.usage.record_terminal(&record).await;
+        return;
+    }
+    // Detached for the same reason [`record_usage`] is: the request this
+    // describes already failed, so nothing here changes the response, but a
+    // caller hanging up must not be what decides whether the attempt was
+    // recorded. Awaited anyway while the handler lives, so an uncancelled
+    // request still reaches its sinks before it answers.
+    let (done, recorded) = tokio::sync::oneshot::channel();
+    let recording = state.clone();
+    crate::streaming::spawn_settlement(async move {
+        recording.0.usage.record_terminal(&record).await;
+        let _ = done.send(());
+    });
+    let _ = recorded.await;
 }
 
 fn build_record(args: RecordArgs<'_>) -> (UsageRecord, Option<u64>, u32) {
@@ -6176,6 +6216,107 @@ targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_
                 .is_drained(),
             "nothing was journaled, which is what the refusal reports"
         );
+    }
+
+    /// A journal whose append takes long enough for a caller to hang up inside
+    /// it, which is the whole window the cancellation regression is about.
+    struct SlowAppend {
+        inner: journal::oracle::InMemoryUsageJournal,
+        append_takes: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl journal::UsageJournal for SlowAppend {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn capacity(&self) -> journal::Capacity {
+            self.inner.capacity()
+        }
+
+        fn mode(&self) -> journal::DeliveryMode {
+            self.inner.mode()
+        }
+
+        async fn append(
+            &self,
+            event: &journal::UsageEvent,
+        ) -> Result<journal::Appended, journal::JournalError> {
+            tokio::time::sleep(self.append_takes).await;
+            self.inner.append(event).await
+        }
+
+        async fn claim(
+            &self,
+            consumer: &journal::ConsumerId,
+            claim: journal::Claim,
+        ) -> Result<Vec<journal::Delivery>, journal::JournalError> {
+            self.inner.claim(consumer, claim).await
+        }
+
+        async fn ack(&self, delivery: &journal::DeliveryId) -> Result<(), journal::JournalError> {
+            self.inner.ack(delivery).await
+        }
+
+        async fn quarantine(
+            &self,
+            delivery: &journal::DeliveryId,
+            reason: journal::PoisonReason,
+        ) -> Result<(), journal::JournalError> {
+            self.inner.quarantine(delivery, reason).await
+        }
+
+        async fn relinquish(
+            &self,
+            delivery: &journal::DeliveryId,
+        ) -> Result<(), journal::JournalError> {
+            self.inner.relinquish(delivery).await
+        }
+
+        async fn stats(
+            &self,
+            consumer: &journal::ConsumerId,
+        ) -> Result<journal::JournalStats, journal::JournalError> {
+            self.inner.stats(consumer).await
+        }
+    }
+
+    /// The other half of the billing-grade promise: a caller that hangs up while
+    /// its usage is being appended does not take the record with it. The spend
+    /// was settled before the append, so a cancelled append would charge a
+    /// budget for a request no outbox reader can see — and, because the handler
+    /// is simply dropped, nothing would report it either.
+    #[tokio::test]
+    async fn a_caller_hanging_up_during_the_append_still_journals_its_usage() {
+        let (url, _) = controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let outbox = Arc::new(SlowAppend {
+            inner: journal::oracle::InMemoryUsageJournal::new(),
+            append_takes: Duration::from_millis(200),
+        });
+        let state = billing_state(&url, outbox.clone());
+
+        let mut serving = Box::pin(router(state).oneshot(chat_request()));
+        tokio::select! {
+            _ = &mut serving => panic!("the request answered before the append could be cut off"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        // The caller hangs up: hyper drops the handler future exactly like this.
+        drop(serving);
+
+        let consumer = journal::ConsumerId::parse("billing").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let stats = outbox.stats(&consumer).await.unwrap();
+            if stats.pending == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the abandoned request never reached the outbox: {stats:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// The identity contract as the buffered path delivers it: every settled

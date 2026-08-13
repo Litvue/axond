@@ -473,6 +473,17 @@ impl UsageDelivery {
             .map_or(DeliveryMode::TelemetryGrade, |journal| journal.mode())
     }
 
+    /// Whether [`record`](Self::record) is an append to a journal rather than a
+    /// hand-off to the fan-out.
+    ///
+    /// Not [`mode`](Self::mode): a journal that cannot outlive its process still
+    /// reports [`DeliveryMode::TelemetryGrade`], and the question here is only
+    /// whether recording is long enough to be worth protecting from a caller
+    /// hanging up inside it.
+    pub fn appends(&self) -> bool {
+        self.journal.is_some()
+    }
+
     /// Record one terminated request's usage.
     ///
     /// In telemetry-grade mode this is the fan-out and cannot fail. In

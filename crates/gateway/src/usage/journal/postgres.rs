@@ -588,16 +588,18 @@ impl UsageJournal for PostgresJournal {
                             continue;
                         }
                         if attempt > max_attempts {
-                            condemn(
+                            if condemn(
                                 &tx,
                                 position,
                                 &name,
                                 PoisonReason::AttemptsExhausted,
                                 attempt,
                             )
-                            .await?;
-                            condemnations.push(PoisonReason::AttemptsExhausted);
-                            condemned += 1;
+                            .await?
+                            {
+                                condemnations.push(PoisonReason::AttemptsExhausted);
+                                condemned += 1;
+                            }
                             continue;
                         }
                         let event = match decode(&row) {
@@ -613,10 +615,12 @@ impl UsageJournal for PostgresJournal {
                                     "usage outbox row could not be decoded; quarantining it"
                                 );
                                 undeliverable.corrupt();
-                                condemn(&tx, position, &name, PoisonReason::Malformed, attempt)
-                                    .await?;
-                                condemnations.push(PoisonReason::Malformed);
-                                condemned += 1;
+                                if condemn(&tx, position, &name, PoisonReason::Malformed, attempt)
+                                    .await?
+                                {
+                                    condemnations.push(PoisonReason::Malformed);
+                                    condemned += 1;
+                                }
                                 continue;
                             }
                         };
@@ -1146,24 +1150,36 @@ async fn drop_oldest(tx: &Transaction<'_>, cutoff: i64) -> Result<u64, OpError> 
 /// Take an event out of one consumer's delivery path, registering the attempt it
 /// died on so the poison count and the attempt history agree. Telemetry is the
 /// caller's, once the transaction that condemned the row has committed.
+///
+/// Guarded like the claim's own upsert, and for the same reason: the delivery
+/// row may have moved since the selection's snapshot read it. An event the
+/// consumer acknowledged meanwhile keeps its acknowledgement — condemning it
+/// would trip the one-verdict constraint and fail the whole claim with an opaque
+/// backend error over a race that has already resolved correctly — and an
+/// already quarantined event keeps the reason it was first condemned for.
+/// `false` says the row was left alone, so the caller does not count a
+/// quarantine that did not happen.
 async fn condemn(
     tx: &Transaction<'_>,
     position: i64,
     consumer: &str,
     reason: PoisonReason,
     attempt: i32,
-) -> Result<(), OpError> {
-    tx.execute(
-        "INSERT INTO axond_usage_outbox_delivery
+) -> Result<bool, OpError> {
+    let condemned = tx
+        .execute(
+            "INSERT INTO axond_usage_outbox_delivery
              (position, consumer, attempts, quarantined_at, poison_reason)
          VALUES ($1, $2, $3, now(), $4)
          ON CONFLICT (position, consumer) DO UPDATE
              SET attempts = $3, quarantined_at = now(), poison_reason = $4,
-                 lease_expires_at = NULL",
-        &[&position, &consumer, &attempt, &reason.as_str()],
-    )
-    .await?;
-    Ok(())
+                 lease_expires_at = NULL
+             WHERE axond_usage_outbox_delivery.acknowledged_at IS NULL
+               AND axond_usage_outbox_delivery.quarantined_at IS NULL",
+            &[&position, &consumer, &attempt, &reason.as_str()],
+        )
+        .await?;
+    Ok(condemned == 1)
 }
 
 /// The row shape `record` is read back as.
