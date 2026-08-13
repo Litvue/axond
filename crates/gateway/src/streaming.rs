@@ -896,12 +896,15 @@ impl Accounting {
         let budget_key = self.ctx.budget_key.clone();
         let reservation = self.ctx.reservation.clone();
         spawn_settlement(async move {
-            // The record first, so a billing-grade deployment has the event
-            // durable before the hold is settled. A stream cannot be refused
-            // after it has been relayed, so a failure here is reported and
-            // counted rather than returned.
-            state.0.usage.record_terminal(&record).await;
+            // The hold first, as on the buffered path: a stream cannot be
+            // refused after it has been relayed, so the record cannot change
+            // what the caller gets, while a durable append bounded by the
+            // journal's operation timeout would put the charge behind a slow
+            // outbox and let shutdown's settle share expire with the
+            // reservation uncharged. The append is inside this tracked
+            // settlement either way, so a caller hanging up does not cancel it.
             state.0.budget.settle(&budget_key, &reservation, cost).await;
+            state.0.usage.record_terminal(&record).await;
         });
     }
 }

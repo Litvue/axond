@@ -509,8 +509,28 @@ impl DeliveryWorker {
     /// `request_id` absorbs it.
     async fn deliver(&self, claimed: &[Delivery]) -> Delivered {
         let outcome = self.deliver_durably(claimed).await;
+        self.count_written(outcome.landed.len());
         self.tell_advisory(claimed, &outcome.landed).await;
         outcome
+    }
+
+    /// Count what a pass delivered, once, off the events every destination
+    /// accepted. Not counted inside the write itself: a bisection rewrites a
+    /// range a destination has already taken, and those duplicates are absorbed
+    /// by idempotency on `request_id` rather than being rows a counter should
+    /// claim twice.
+    ///
+    /// Its dropped twin is deliberately not emitted: a refused batch stays
+    /// journaled and is retried, so nothing was dropped, and the journal's
+    /// delivery, loss, and quarantine counters are what a billing-grade
+    /// deployment alerts on instead.
+    fn count_written(&self, landed: usize) {
+        if landed == 0 {
+            return;
+        }
+        for sink in self.sinks.iter() {
+            crate::telemetry::metrics::record_usage_written(sink.name(), landed as u64);
+        }
     }
 
     /// The part of delivery an acknowledgement rests on: the destinations that
@@ -596,12 +616,9 @@ impl DeliveryWorker {
     /// sink that rejected the batch has not been written, so nothing in it is
     /// acknowledged and the whole batch is redelivered.
     ///
-    /// A destination that accepted the batch is counted on
-    /// `axond.usage.records_written` exactly as a batching sink counts it, so
-    /// enabling the journal does not silence the per-sink write counter. Its twin
-    /// is deliberately not emitted here: a refused batch stays journaled and is
-    /// retried, so nothing was dropped, and the journal's delivery, loss, and
-    /// quarantine counters are what a billing-grade deployment alerts on instead.
+    /// What landed is counted on `axond.usage.records_written` by
+    /// [`DeliveryWorker::count_written`] once the pass is over, so enabling the
+    /// journal does not silence the per-sink write counter.
     async fn write(&self, claimed: &[Delivery]) -> bool {
         let batch: Vec<ObservedRecord> = claimed
             .iter()
@@ -617,7 +634,6 @@ impl DeliveryWorker {
                 );
                 return false;
             }
-            crate::telemetry::metrics::record_usage_written(sink.name(), batch.len() as u64);
         }
         true
     }
