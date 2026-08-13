@@ -3,9 +3,9 @@
 # #156 asks for reproducible evidence in place of qualitative production claims,
 # and it decomposes into five slices — capacity, provider and backend faults,
 # stateful recovery, multi-replica rollout, and a long soak. Each has landed to a
-# different depth: one has a driver and retained runs, two have a driver and no
-# heavy run behind them, one has a committed contract and no driver, and one has
-# neither. That spread is the whole point of this file. An epic whose children
+# different depth: one is evidenced with retained runs, three are harnessed
+# with drivers but no heavy run behind them, and one is unbuilt. That spread is
+# the whole point of this file. An epic whose children
 # are merged is not an epic whose question is answered, and the difference is
 # only reviewable if it is written down where it cannot rot.
 #
