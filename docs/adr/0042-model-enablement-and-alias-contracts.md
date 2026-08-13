@@ -92,8 +92,12 @@ axond.model-alias.v1:      schema, alias_id, tenant_id, project_id,
   with the alias's declared `wire_family` — the ADR 0020 rule, enforced where the
   contract is authored rather than where a request is served. A duplicate,
   dangling, cross-tenant, sibling-project, or wrong-scope target is refused, and
-  an alias name is unique within a project while the same name may exist in
-  another project or tenant.
+  an active alias must retain a non-empty, reachable target list and all targets
+  must share its wire family; disabled fallback entries may remain in priority
+  order while a later mutation retargets the name. A disabled alias may clear
+  its target list in the same revision that withdraws the name; the retained row
+  is lifecycle history, not an active graph. An alias name is unique within a
+  project while the same name may exist in another project or tenant.
 - **Lifecycle is enabled ↔ disabled, and identity is immutable.** Both
   transitions are permitted and idempotent; a transition to a state a body does
   not know is a typed refusal. Across versions of one resource, identity, owner,
