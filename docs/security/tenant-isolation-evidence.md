@@ -43,9 +43,10 @@ each assertion is made from outside the process.
 The last two need a Postgres. They skip when `AXOND_TEST_POSTGRES_DSN` is unset
 and are mandatory in CI, which sets `AXOND_TEST_REQUIRE_SERVICES=1`; the
 stateless cases run everywhere. Each stateful boot creates its own usage and
-budget objects and drops them when the deployment is dropped — including after a
-failed assertion — so concurrent runs share a database without sharing rows and
-a long-lived one does not accumulate them.
+budget objects, owned by a value that exists before the process that creates them
+and dropped with it — after a failed assertion, and after a boot that never
+served — so concurrent runs share a database without sharing rows and a
+long-lived one does not accumulate them.
 
 ## Not covered yet, and why
 

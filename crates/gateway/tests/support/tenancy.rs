@@ -98,10 +98,31 @@ pub const ALL_ALIASES: [&str; 3] = [ACME.alias, GLOBEX.alias, PLATFORM_ALIAS];
 pub struct Deployment {
     pub upstream: FakeUpstream,
     pub gateway: Axond,
-    /// The Postgres DSN the sink and budget were configured with, when the
-    /// suite is running with a datastore.
-    pub dsn: Option<String>,
-    /// Tables unique to this boot, so concurrent runs share a database without
+    /// The durable objects this boot was pointed at, present when the suite is
+    /// running with a datastore. Declared last, so it is dropped — and its
+    /// objects with it — after the process that writes to them is gone.
+    objects: Option<Objects>,
+}
+
+impl Deployment {
+    /// The durable objects of a stateful boot, for a case that has one.
+    pub fn objects(&self) -> &Objects {
+        self.objects
+            .as_ref()
+            .expect("a stateful deployment has durable objects")
+    }
+}
+
+/// The per-boot Postgres objects, and the [`Drop`] that removes them.
+///
+/// Its own value rather than a part of [`Deployment`], because the child
+/// *creates* these objects while booting (`create_table = true`) and a boot that
+/// fails a post-`CREATE` check panics before a `Deployment` exists. Owning them
+/// from before the process starts is what makes the cleanup unconditional.
+pub struct Objects {
+    /// The DSN the sink and budget were configured with.
+    pub dsn: String,
+    /// Names unique to this boot, so concurrent runs share a database without
     /// sharing rows.
     pub usage_table: String,
     pub budget_table: String,
@@ -160,13 +181,33 @@ pub async fn boot(durability: Durability) -> Option<Deployment> {
         env.push(("AXOND_ISOLATION_DSN".to_owned(), dsn.clone()));
     }
 
-    Some(Deployment {
-        gateway: Axond::start_custom(&render, &env).await,
-        upstream,
+    // Before the boot, not after it: the child creates these objects as it comes
+    // up, so a boot that panics half-created must still take them with it.
+    let objects = dsn.map(|dsn| Objects {
         dsn,
-        usage_table,
-        budget_table,
+        usage_table: usage_table.clone(),
+        budget_table: budget_table.clone(),
+    });
+    let gateway = Axond::start_custom(&render, &env).await;
+
+    Some(Deployment {
+        gateway,
+        upstream,
+        objects,
     })
+}
+
+/// End the process before its tables are dropped: it holds a Postgres pool,
+/// batches usage every 50ms and settles detached, so dropping the tables under a
+/// live child either waits on its lock or fails its next insert against a
+/// relation that is no longer there. A field's own `Drop` runs after this body,
+/// which is why the objects are a field and this is not their cleanup.
+impl Drop for Deployment {
+    fn drop(&mut self) {
+        if self.objects.is_some() {
+            self.gateway.shutdown();
+        }
+    }
 }
 
 /// Drop everything this boot created, so a long-lived CI database does not
@@ -179,17 +220,9 @@ pub async fn boot(durability: Durability) -> Option<Deployment> {
 /// trailing statement. It is a blocking cleanup on a thread of its own: the
 /// tests run on a current-thread runtime, which cannot be re-entered from a
 /// destructor.
-impl Drop for Deployment {
+impl Drop for Objects {
     fn drop(&mut self) {
-        let Some(dsn) = self.dsn.clone() else {
-            return;
-        };
-        // The child first: it holds a Postgres pool, batches usage every 50ms
-        // and settles detached, so dropping the tables under a live process
-        // either waits on its lock or fails its next insert against a relation
-        // that is no longer there. A field's own `Drop` runs after this body,
-        // which would be too late.
-        self.gateway.shutdown();
+        let dsn = self.dsn.clone();
         let objects = vec![
             format!("TABLE IF EXISTS {}_reservation", self.budget_table),
             format!("TABLE IF EXISTS {}_namespace", self.budget_table),

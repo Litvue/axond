@@ -307,8 +307,8 @@ async fn usage_rows_never_cross_a_namespace() {
     // stdout sink is the cheap signal that both records exist at all.
     deployment.gateway.await_usage_records(2).await;
 
-    let client = connect(deployment.dsn.as_deref().expect("a configured DSN")).await;
-    let rows = await_usage_rows(&client, &deployment.usage_table, 2).await;
+    let client = connect(&deployment.objects().dsn).await;
+    let rows = await_usage_rows(&client, &deployment.objects().usage_table, 2).await;
 
     for tenant in TENANTS {
         let owned: Vec<&(String, String, String)> = rows
@@ -382,8 +382,8 @@ async fn one_tenants_exhausted_budget_does_not_deny_another() {
         ACME.namespace
     );
 
-    let client = connect(deployment.dsn.as_deref().expect("a configured DSN")).await;
-    let namespaces = format!("{}_namespace", deployment.budget_table);
+    let client = connect(&deployment.objects().dsn).await;
+    let namespaces = format!("{}_namespace", deployment.objects().budget_table);
     let rows = client
         .query(
             &format!("SELECT namespace, spent_microdollars FROM {namespaces} ORDER BY namespace"),
