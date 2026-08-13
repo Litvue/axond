@@ -190,8 +190,12 @@ and loses the active snapshot.
 
 1. **Read the reason.** Split `axond.catalog.refusals` by `axond.catalog.reason`.
    `unreachable` / `denied` / `oversized` are the fetch: egress, a mirror, an
-   auth-ing proxy, or a body past the ceiling. Everything else is the document
-   itself — upstream published something this schema refuses.
+   auth-ing proxy, or a body past the ceiling. `unsolicited_unchanged` is the one
+   reason with no error and no pointer behind it: the source answered "not
+   modified" while nothing has ever been imported, which an intermediary
+   answering `304` unconditionally will do — look at the cache in front of the
+   source, not at the payload. Everything else is the document itself — upstream
+   published something this schema refuses.
 2. **Read what is active.** The authenticated deployment-scope status response
    carries `catalogue.content_id` (the short digest of the content actually
    being served), `catalogue.active_age_ms`, `catalogue.consecutive_refusals`,
@@ -201,10 +205,12 @@ and loses the active snapshot.
    the payload and the typed error the parser produced. That pointer is the
    whole diagnosis for a schema, price, or identifier refusal; it is deliberately
    absent from metrics and from the status response, where it would be unbounded.
-4. **Decide by age, not by the alert.** `active_age_ms` against your own
-   tolerance for stale model metadata is the actual decision. Hours are usually
-   uninteresting; days mean pricing and capability facts are drifting from
-   upstream.
+4. **Decide by age, not by the alert.** Age is when this gateway last confirmed
+   the content current — an import or a `304`, not a retrieval time the document
+   claims — so a freshly imported offline seed reads as fresh. `active_age_ms`
+   against your own tolerance for stale model metadata is the actual decision.
+   Hours are usually uninteresting; days mean pricing and capability facts are
+   drifting from upstream.
 5. **Fix the source, not the gateway.** Restore reachability, or pin/mirror a
    payload that parses. A refusal that reflects genuine upstream drift is a
    parser change, and the pointer from step 3 is what the change is written

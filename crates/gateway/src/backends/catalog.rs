@@ -289,6 +289,11 @@ pub enum RefusalReason {
     AmbiguousModelKey,
     /// Normalized content that is not internally consistent.
     Content,
+    /// The source confirmed content nobody holds: an unchanged answer arrived
+    /// where no import has ever succeeded, so there is no error text and no
+    /// pointer behind this refusal — only an answer no conditional request
+    /// asked for.
+    UnsolicitedUnchanged,
     /// Classified as a refusal this vocabulary has no code for. Present so a new
     /// failure mode degrades to a safe label instead of tempting a caller to
     /// pass through the error's text.
@@ -317,6 +322,7 @@ pub const REFUSAL_REASONS: &[&str] = &[
     "uncanonicalizable_text",
     "ambiguous_model_key",
     "content",
+    "unsolicited_unchanged",
     "unknown",
 ];
 
@@ -339,6 +345,7 @@ impl RefusalReason {
         Self::UncanonicalizableText,
         Self::AmbiguousModelKey,
         Self::Content,
+        Self::UnsolicitedUnchanged,
         Self::Unknown,
     ];
 
@@ -361,6 +368,7 @@ impl RefusalReason {
             Self::UncanonicalizableText => "uncanonicalizable_text",
             Self::AmbiguousModelKey => "ambiguous_model_key",
             Self::Content => "content",
+            Self::UnsolicitedUnchanged => "unsolicited_unchanged",
             Self::Unknown => "unknown",
         }
     }
@@ -2242,10 +2250,20 @@ impl LastKnownGoodCatalog {
     /// `Ok(None)` is the one odd answer: a `304` before any first import
     /// confirms content nobody holds, which no conditional request asked for.
     /// There is nothing to admit and nothing to age, but the import did not
-    /// advance the catalogue either, so it counts as an [`RefusalReason::Unknown`]
-    /// refusal rather than passing silently — otherwise an intermediary answering
-    /// `304` to every unconditional request would leave the catalogue empty with
-    /// every signal at rest.
+    /// advance the catalogue either, so it counts as an
+    /// [`RefusalReason::UnsolicitedUnchanged`] refusal rather than passing
+    /// silently — otherwise an intermediary answering `304` to every
+    /// unconditional request would leave the catalogue empty with every signal
+    /// at rest. The reason is its own arm because no `CatalogError` was ever
+    /// produced, so the runbook's pointer-in-the-log step has nothing to offer
+    /// and the label itself has to say why.
+    ///
+    /// An admitted snapshot is aged to `checked_at` rather than to the
+    /// `fetched_at` its source stated: age means how long ago *this process*
+    /// confirmed the content current, and a source may state a retrieval time it
+    /// did not perform — the compiled-in seed catalogue states the day it was
+    /// cut, which would otherwise read as months stale the moment it is
+    /// imported.
     pub fn record_refresh<E: Refusable>(
         &mut self,
         refreshed: Result<CatalogRefresh, E>,
@@ -2254,14 +2272,17 @@ impl LastKnownGoodCatalog {
         match refreshed {
             Ok(CatalogRefresh::Unchanged { validators }) => {
                 if !self.record_unchanged(validators, checked_at) {
-                    self.record_refusal(Refusal::new(RefusalReason::Unknown));
+                    self.record_refusal(Refusal::new(RefusalReason::UnsolicitedUnchanged));
                     return Ok(None);
                 }
                 Ok(self.active.as_ref().map(|active| Admission::Unchanged {
                     content_id: active.content.content_id(),
                 }))
             }
-            Ok(CatalogRefresh::Updated(snapshot)) => Ok(Some(self.admit(*snapshot))),
+            Ok(CatalogRefresh::Updated(mut snapshot)) => {
+                snapshot.source.fetched_at = checked_at;
+                Ok(Some(self.admit(*snapshot)))
+            }
             Err(error) => {
                 self.record_refusal(error.refusal());
                 Err((error, self.active.as_ref()))
@@ -3468,7 +3489,44 @@ mod tests {
         let report = catalogue.report(checked_at);
         assert_eq!(report.active, None, "nothing became active");
         assert_eq!(report.consecutive_refusals, 1);
-        assert_eq!(report.last_refusal, Some(RefusalReason::Unknown));
+        assert_eq!(
+            report.last_refusal,
+            Some(RefusalReason::UnsolicitedUnchanged),
+            "and says so by name, because no error was produced to log"
+        );
+    }
+
+    /// Age is how long ago *this process* confirmed the content, so an admitted
+    /// snapshot is aged to the check rather than to a retrieval time its source
+    /// stated. The compiled-in seed states the day it was cut, which would
+    /// otherwise read as months stale the moment it is imported.
+    #[test]
+    fn an_admitted_import_is_aged_from_the_check_and_not_from_what_it_claims() {
+        let mut catalogue = LastKnownGoodCatalog::new();
+        let checked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(86_400);
+        // The fixture states UNIX_EPOCH, a day before this import happened.
+        let stated = snapshot(
+            content(vec![offering("openai", "gpt-4o", Some(price(1, 2)))]),
+            SourceValidators::etag("\"one\""),
+        );
+        assert_eq!(stated.source.fetched_at, SystemTime::UNIX_EPOCH);
+        catalogue
+            .record_refresh::<CatalogError>(
+                Ok(CatalogRefresh::Updated(Box::new(stated))),
+                checked_at,
+            )
+            .expect("an admitted import");
+
+        let report = catalogue.report(checked_at);
+        assert_eq!(
+            report.active_age(),
+            Some(Duration::ZERO),
+            "a fresh import is fresh however old the document says it is"
+        );
+        assert_eq!(
+            report.active.expect("an active catalogue").fetched_at,
+            checked_at
+        );
     }
 
     #[tokio::test]
