@@ -1,0 +1,162 @@
+# A retained capacity run: what one replica did, and on what.
+#
+# Written by ops/qualification-evidence.py from the artifacts of a single
+# run; see docs/operations/qualification.md for how a record is read and
+# docs/operations/capacity.md for what the numbers mean. Two records may
+# only be compared when their provenance matches — the digests and the
+# hardware below are what makes that checkable rather than assumed.
+#
+# The digests are the record's identity: binary.sha256, inputs.
+# manifest_sha256, and each profile's config_sha256 are content-addressed
+# and outlive any rewriting of history. source.git_commit is the branch
+# commit the run happened on, which a squash merge does not land — read
+# it as a note about the run, not as something to check out.
+
+schema_version = 1
+slice = "capacity"
+tier = "reduced"
+runner = "local"
+runner_note = "8 vCPU Intel Xeon Platinum 8559C cloud VM, debug build (cargo test), unshared"
+
+[source]
+git_commit = "c5a35c6539c4f599a37e3e8279c50af2ab794a76"
+git_dirty = false
+crate_version = "0.3.24"
+
+[binary]
+sha256 = "32503505f8106428fd69b14a707fd7358651b04bafe49b027b82bfe5f93c92ae"
+version = "0.3.24"
+cargo_profile = "debug"
+rustc = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+
+[inputs]
+manifest = "qualification/capacity/manifest.toml"
+manifest_sha256 = "9f6e690cb8323bb51c28db5ca7f63113f29cdb9b828bbd20f3d7dd9a24a6515f"
+fixtures = 8
+
+[hardware]
+os = "linux"
+arch = "x86_64"
+kernel = "5.15.200"
+cpu_model = "INTEL(R) XEON(R) PLATINUM 8559C"
+cpus = 8
+total_memory_kib = 32881112
+containerized = false
+
+[[profile]]
+id = "buffered"
+concurrency = 8
+config_sha256 = "59d5fcee0fc90aeff0c39109970f302f9bb5b89417d057ccba8825c121429a12"
+requests = 160
+offered = 160
+accepted = 160
+rejected = 0
+errors = 0
+elapsed_ms = 41
+accepted_rps = 3890.6
+latency_p50_ms = 1.91
+latency_p95_ms = 2.99
+latency_p99_ms = 3.82
+peak_rss_kib = 24844
+rss_growth_kib = 3104
+peak_sockets = 24
+cpu_seconds = 0.12
+missing_usage_records = 0
+leaked_upstream_streams = 0
+verdicts = 6
+passed = true
+
+[[profile]]
+id = "cancellation"
+concurrency = 8
+config_sha256 = "59d5fcee0fc90aeff0c39109970f302f9bb5b89417d057ccba8825c121429a12"
+requests = 48
+offered = 48
+accepted = 48
+rejected = 0
+errors = 0
+elapsed_ms = 956
+accepted_rps = 50.2
+latency_p50_ms = 48.42
+latency_p95_ms = 263.22
+latency_p99_ms = 265.50
+ttft_p95_ms = 47.22
+peak_rss_kib = 25580
+rss_growth_kib = 3924
+peak_sockets = 20
+cpu_seconds = 0.22
+missing_usage_records = 0
+leaked_upstream_streams = 0
+verdicts = 6
+passed = true
+
+[[profile]]
+id = "mixed"
+concurrency = 8
+config_sha256 = "4987ee22aad394470dbe908b3d22b7c4491bc324f9817081f672859b0beed049"
+requests = 120
+offered = 120
+accepted = 120
+rejected = 0
+errors = 0
+elapsed_ms = 1608
+accepted_rps = 74.6
+latency_p50_ms = 1.73
+latency_p95_ms = 277.85
+latency_p99_ms = 281.34
+ttft_p95_ms = 49.17
+peak_rss_kib = 24844
+rss_growth_kib = 3300
+peak_sockets = 21
+cpu_seconds = 0.33
+missing_usage_records = 0
+leaked_upstream_streams = 0
+verdicts = 6
+passed = true
+
+[[profile]]
+id = "response-size"
+concurrency = 8
+config_sha256 = "59d5fcee0fc90aeff0c39109970f302f9bb5b89417d057ccba8825c121429a12"
+requests = 96
+offered = 96
+accepted = 96
+rejected = 0
+errors = 0
+elapsed_ms = 135
+accepted_rps = 710.9
+latency_p50_ms = 7.26
+latency_p95_ms = 23.65
+latency_p99_ms = 57.83
+peak_rss_kib = 32700
+rss_growth_kib = 11016
+peak_sockets = 22
+cpu_seconds = 0.32
+missing_usage_records = 0
+leaked_upstream_streams = 0
+verdicts = 6
+passed = true
+
+[[profile]]
+id = "streaming"
+concurrency = 8
+config_sha256 = "59d5fcee0fc90aeff0c39109970f302f9bb5b89417d057ccba8825c121429a12"
+requests = 48
+offered = 48
+accepted = 48
+rejected = 0
+errors = 0
+elapsed_ms = 1568
+accepted_rps = 30.6
+latency_p50_ms = 261.15
+latency_p95_ms = 264.76
+latency_p99_ms = 264.89
+ttft_p95_ms = 48.45
+peak_rss_kib = 24996
+rss_growth_kib = 3304
+peak_sockets = 20
+cpu_seconds = 0.32
+missing_usage_records = 0
+leaked_upstream_streams = 0
+verdicts = 6
+passed = true
