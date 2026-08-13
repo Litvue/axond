@@ -85,12 +85,19 @@ expired denial becomes `unknown` rather than continuing to deny, so one listing
 taken once cannot outlive every attempt to refresh it.
 
 **A discovery outage costs freshness, not access.** The last definitive positive
-observation is retained across non-definitive ones and is discredited only by a
-definitive negative newer than itself, so an outage degrades to
-`available (last_known_good)` and then to `stale`, never straight to `denied`. The
-current observation and the retained positive age independently — the current slot
-keeps the newest look, and retention is judged against the retained positive alone —
-so which of two overlapping probes finishes first cannot change the result.
+observation is retained across non-definitive ones, so an outage degrades to
+`available (last_known_good)` and then to `stale`, never straight to `denied`. What
+is retained and what is currently held advance independently, so which of two
+overlapping probes finishes first cannot change the result: the current slot keeps
+the newest look, while retention is judged against a watermark of every *conclusive*
+answer the target has ever reached — not the looks still held, because a definitive
+negative retains nothing and an inconclusive refresh displaces it from the current
+slot. A definitive look that lands after a newer *inconclusive* one therefore still
+counts, while one that predates a conclusive answer overturns nothing in either
+direction: an older negative does not discredit a later positive, and an older
+positive does not resurrect a target a later complete listing dropped. Two looks
+bearing the same instant resolve the same way whichever lands first — the negative
+holds, because two answers about one instant are not evidence of reachability.
 
 **Uncertainty is routable only where a scope chose it.** `unknown` and `stale` are
 not refusals, but routability is a property of the whole verdict:
@@ -109,6 +116,16 @@ deployment's own machinery — how discovery is performed, how this replica is
 faring — to `unspecified` and drops the discovery source; what a tenant keeps is
 its own state, whether it rests on last-known-good evidence, and when that
 evidence expires.
+
+**A reload re-projects availability or re-derives it; it never inherits it
+silently.** `ConfigSnapshot::build` always yields the empty index, and
+`with_availability` is consuming, so a rebuild carries evidence forward only by
+attaching the outgoing snapshot's handle (`ConfigSnapshot::availability_handle`)
+at the call site. That is the point rather than a gap: evidence is derived against a
+particular catalogue, credential set, and set of namespaces, and a reload of
+[ADR 0011](./0011-config-hot-reload.md) may change any of them, so inheriting an
+index would carry verdicts about targets the new config no longer declares. The
+reload path chooses, visibly, between re-deriving and re-projecting.
 
 ### State tier
 

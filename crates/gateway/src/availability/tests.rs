@@ -641,6 +641,75 @@ fn a_late_positive_cannot_resurrect_a_target_a_newer_complete_listing_dropped() 
     assert!(!verdict.last_known_good);
 }
 
+/// The same three looks in the order that displaces the negative from the current
+/// slot before the late positive lands. A conclusive answer stays overturned only by
+/// something newer than itself, whether or not it is still the look being held.
+#[test]
+fn a_dropped_target_stays_dropped_even_once_a_failed_refresh_displaces_the_listing() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(absent(scope, "gpt-4o", 300))
+        .observe(outage(scope, "gpt-4o", 400))
+        .observe(present(scope, "gpt-4o", 100, None))
+        .build();
+
+    let record = index.record(&key(scope, "gpt-4o")).expect("a held record");
+    assert!(record.last_known_good.is_none());
+    assert_eq!(record.definitive_at, Some(at(300)));
+
+    let verdict = index.evaluate(&key(scope, "gpt-4o"), at(420));
+    assert_ne!(verdict.state, AvailabilityState::Available);
+    assert!(!verdict.last_known_good);
+}
+
+/// A positive and a complete negative bearing the same instant are not evidence a
+/// target is reachable, so the negative holds — and it holds whichever lands first,
+/// or the index would depend on arrival order at the one instant it cannot order.
+#[test]
+fn two_looks_at_the_same_instant_resolve_the_same_way_whichever_lands_first() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let negative_last = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, None))
+        .observe(absent(scope, "gpt-4o", 100))
+        .build();
+    let negative_first = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(absent(scope, "gpt-4o", 100))
+        .observe(present(scope, "gpt-4o", 100, None))
+        .build();
+
+    for index in [&negative_last, &negative_first] {
+        let record = index.record(&key(scope, "gpt-4o")).expect("a held record");
+        assert!(
+            record.last_known_good.is_none(),
+            "a contested instant is not last-known-good evidence"
+        );
+        assert_ne!(
+            index.evaluate(&key(scope, "gpt-4o"), at(120)).state,
+            AvailabilityState::Available
+        );
+    }
+}
+
+/// The declared-authorities constructor asserts what a deployment declares and
+/// nothing about the provider account, so it stops at the entitlement rung rather
+/// than reaching discovery.
+#[test]
+fn a_declared_record_is_unknown_until_entitlement_is_established() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), AvailabilityRecord::enabled())
+        .observe(present(scope, "gpt-4o", 100, None))
+        .build();
+
+    let verdict = index.evaluate(&key(scope, "gpt-4o"), at(120));
+    assert_eq!(verdict.state, AvailabilityState::Unknown);
+    assert_eq!(verdict.reason, AvailabilityReason::EntitlementUnknown);
+    assert_eq!(verdict.decided_by, DecidedBy::Entitlement);
+}
+
 /// Retained evidence counts as "held" for the out-of-order guard too: a record
 /// whose last-known-good was declared without a current observation must not let an
 /// older look re-adopt evidence it predates.

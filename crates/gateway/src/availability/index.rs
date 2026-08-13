@@ -63,13 +63,17 @@
 //!   listing that no longer carries the target is precisely the evidence that the
 //!   retained positive is wrong;
 //! - the current slot always holds the newest look, so an older arrival from a slow
-//!   probe cannot rewind it, while what is *retained* is judged against the newest
-//!   definitive look held. The two age independently, which is what makes the index
-//!   independent of the order observations arrive in: a definitive look that lands
-//!   after a newer *inconclusive* one still counts, while one that predates a
+//!   probe cannot rewind it, while what is *retained* is judged against every
+//!   conclusive answer this key has ever reached — a watermark
+//!   ([`AvailabilityRecord::definitive_at`]) rather than the looks still held,
+//!   because a negative retains nothing and an inconclusive refresh displaces it
+//!   from the current slot. The two advance independently, which is what makes the
+//!   index independent of the order observations arrive in: a definitive look that
+//!   lands after a newer *inconclusive* one still counts, while one that predates a
 //!   conclusive answer cannot overturn it in either direction — an older negative
 //!   does not discredit a later positive, and an older positive does not resurrect
-//!   a target a later complete listing dropped;
+//!   a target a later complete listing dropped. Two looks bearing the same instant
+//!   resolve the same way whichever lands first: the negative holds;
 //! - nothing ever infers a positive from a non-definitive look. Certainty only
 //!   rises when definitive evidence arrives, which is what
 //!   [`AvailabilityState::certainty`] makes testable.
@@ -126,6 +130,15 @@ pub struct AvailabilityRecord {
     /// The most recent *definitive positive* observation, retained across
     /// non-definitive ones so a discovery outage does not lose it.
     pub last_known_good: Option<DiscoveryObservation>,
+    /// When the newest *definitive* look for this key was observed, whether or
+    /// not it is still held anywhere.
+    ///
+    /// A watermark rather than an observation: a complete listing that dropped
+    /// the target retains nothing, and an inconclusive refresh displaces it from
+    /// [`discovery`](Self::discovery), so without this the fact that a
+    /// conclusive answer was ever reached would be lost and a much older
+    /// positive could be adopted afterwards.
+    pub definitive_at: Option<SystemTime>,
 }
 
 impl Default for AvailabilityRecord {
@@ -139,13 +152,21 @@ impl Default for AvailabilityRecord {
             credential: None,
             discovery: None,
             last_known_good: None,
+            definitive_at: None,
         }
     }
 }
 
 impl AvailabilityRecord {
-    /// A record for a catalogued, enabled, policy-permitted target with no
-    /// evidence yet: the shape a projection produces before discovery has run.
+    /// A record for a catalogued, enabled, policy-permitted target, with
+    /// entitlement, runtime health, and discovery all still unobserved.
+    ///
+    /// The three authorities a deployment declares, and nothing more. It does
+    /// not evaluate to `available`: entitlement keeps its ignorant default, so
+    /// the ladder stops at the entitlement rung until the provider account's own
+    /// answer is known. A projection that has resolved entitlement sets it —
+    /// deliberately not something this constructor assumes, because an entitlement
+    /// nobody established is exactly the uncertainty the states exist to report.
     pub fn enabled() -> Self {
         Self {
             presence: CataloguePresence::Present,
@@ -378,9 +399,25 @@ impl AvailabilityIndexBuilder {
             .last_known_good
             .clone()
             .or_else(|| entry.last_known_good.clone());
+        // The watermark tracks every definitive look this key has seen, so it
+        // advances to cover declared evidence rather than being reset by a
+        // redeclaration of the dimensions.
+        let definitive_at = [
+            entry.definitive_at,
+            record.definitive_at,
+            discovery
+                .as_ref()
+                .filter(|held| held.is_definitive())
+                .map(|held| held.observed_at),
+            last_known_good.as_ref().map(|held| held.observed_at),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
         *entry = AvailabilityRecord {
             discovery,
             last_known_good,
+            definitive_at,
             ..record
         };
         self
@@ -388,45 +425,49 @@ impl AvailabilityIndexBuilder {
 
     /// Record a discovery observation.
     ///
-    /// The two slots age independently, which is what makes the result independent
-    /// of arrival order: the current slot keeps the newest observation, and what is
-    /// retained is decided against the newest *definitive* look held. The rest of
-    /// the rules are in the module docs.
+    /// Retention and the current slot advance independently, which is what makes
+    /// the result independent of arrival order: the current slot keeps the newest
+    /// observation, while retention is judged against
+    /// [`definitive_at`](AvailabilityRecord::definitive_at) — every conclusive
+    /// answer this key has ever reached, not merely the ones still held. The rest
+    /// of the rules are in the module docs.
     #[must_use]
     pub fn observe(mut self, observation: DiscoveryObservation) -> Self {
         let entry = self.records.entry(observation.key()).or_default();
-        // Judged against the newest *definitive* evidence held, in either slot. A
-        // look that predates a conclusive answer says nothing about it — neither an
+        // A look that predates a conclusive answer overturns nothing — neither an
         // older negative discrediting a later positive, nor an older positive
         // resurrecting a target a later complete listing dropped — while a slow
-        // definitive look that lands after a newer *inconclusive* one is still the
-        // best evidence held, and dropping it would cost the fallback an outage
-        // needs.
-        let newest_definitive = entry
-            .discovery
-            .iter()
-            .chain(entry.last_known_good.iter())
-            .filter(|held| held.is_definitive())
-            .map(|held| held.observed_at)
-            .max();
-        if newest_definitive.is_none_or(|held| observation.observed_at >= held) {
+        // definitive look that lands after a newer *inconclusive* one still counts,
+        // and dropping it would cost the fallback an outage needs.
+        let overturns_conclusion = entry.definitive_at.is_none_or(|held| {
             if observation.is_positive() {
-                entry.last_known_good = Some(observation.clone());
-            } else if observation.is_definitive() {
-                // A complete look that no longer carries the target is the one thing
-                // that discredits retained positive evidence.
-                entry.last_known_good = None;
+                // Strictly newer, so a positive and a complete negative bearing the
+                // same instant resolve the same way whichever lands first: the
+                // negative holds, because two answers about one instant are not
+                // evidence a target is reachable.
+                observation.observed_at > held
+            } else {
+                observation.observed_at >= held
             }
+        });
+        if observation.is_definitive() && overturns_conclusion {
+            // A complete look that no longer carries the target is the one thing
+            // that discredits retained positive evidence.
+            entry.last_known_good = observation.is_positive().then(|| observation.clone());
+            entry.definitive_at = Some(observation.observed_at);
         }
         // The current slot is the newest look, whatever it said, so an older
-        // arrival can never become the evidence a verdict reads first.
+        // arrival can never become the evidence a verdict reads first — and a
+        // positive that failed to overturn a conclusion cannot enter it either,
+        // or it would be read as current evidence having been refused retention.
         let newest_held = entry
             .discovery
             .iter()
             .chain(entry.last_known_good.iter())
             .map(|held| held.observed_at)
+            .chain(entry.definitive_at)
             .max();
-        if newest_held.is_some_and(|held| held > observation.observed_at) {
+        if !overturns_conclusion || newest_held.is_some_and(|held| held > observation.observed_at) {
             self.superseded += 1;
             return self;
         }

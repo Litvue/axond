@@ -432,6 +432,13 @@ impl ConfigSnapshot {
         &self.availability
     }
 
+    /// The index as a handle, for carrying the evidence an outgoing snapshot holds
+    /// onto its replacement without cloning the records.
+    #[allow(dead_code)]
+    pub fn availability_handle(&self) -> Arc<AvailabilityIndex> {
+        Arc::clone(&self.availability)
+    }
+
     /// Project a derived availability index onto a snapshot that has not been
     /// published yet.
     ///
@@ -441,10 +448,24 @@ impl ConfigSnapshot {
     /// Nothing else about the snapshot changes — the config, the credential graph,
     /// and the circuits are the ones compilation produced.
     ///
-    /// Because [`ConfigSnapshot::build`] always yields an empty index, a reload
-    /// carries availability forward only if it re-projects it — deliberately, so a
-    /// slice that reloads configuration cannot inherit evidence it did not decide to
-    /// keep. The projection slice owns that choice.
+    /// # Reloads re-project, deliberately
+    ///
+    /// [`ConfigSnapshot::build`] always yields the empty index, so a reload keeps
+    /// availability only by asking for it:
+    ///
+    /// ```ignore
+    /// let outgoing = state.snapshot();
+    /// let next = ConfigSnapshot::build(config, &env, generation)?
+    ///     .with_availability(outgoing.availability_handle());
+    /// ```
+    ///
+    /// Silent inheritance is the behaviour being refused, not an oversight: evidence
+    /// is derived against a particular catalogue, credential set, and set of
+    /// namespaces, so a reload that changed any of those would be carrying verdicts
+    /// about targets the new config may no longer declare. A reload therefore either
+    /// re-derives availability or re-projects the outgoing handle because it knows
+    /// nothing relevant changed — and either way the choice is visible at the call
+    /// site. Until a projection slice lands, nothing constructs an index at all.
     #[must_use]
     #[allow(dead_code)]
     pub fn with_availability(mut self, availability: Arc<AvailabilityIndex>) -> Self {
@@ -649,6 +670,40 @@ namespace = "platform"
             "an index describes reachability and can never enlarge what is served"
         );
         assert!(projected.config.model("gpt-4o-preview").is_none());
+    }
+
+    /// A rebuild starts from the empty index and carries evidence forward only when
+    /// it re-projects the outgoing handle: the reload/projection handoff is explicit
+    /// at the call site rather than an inheritance nobody wrote down (#206).
+    #[test]
+    fn a_rebuilt_snapshot_carries_availability_only_when_it_re_projects_it() {
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "secret".to_owned())]);
+        let scope = ScopeRef::tenant(TenantId::new(
+            Uuid7::from_parts(1, 0, 1).expect("a valid id"),
+        ));
+        let target = TargetRef::parse("openai", "gpt-4o").expect("a well-formed target");
+        let index = AvailabilityIndex::builder()
+            .record(
+                AvailabilityKey::new(scope, target),
+                AvailabilityRecord::enabled(),
+            )
+            .build();
+        let outgoing = ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 0)
+            .expect("the key resolves")
+            .with_availability(Arc::new(index));
+
+        let rebuilt =
+            ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 1).expect("the key resolves");
+        assert!(
+            rebuilt.availability().is_empty(),
+            "a rebuild inherits no evidence it did not ask for"
+        );
+
+        let carried = ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 1)
+            .expect("the key resolves")
+            .with_availability(outgoing.availability_handle());
+        assert_eq!(carried.availability(), outgoing.availability());
+        assert_eq!(carried.generation, 1);
     }
 
     /// A declared key whose env var is unset or empty is a boot failure, not a
