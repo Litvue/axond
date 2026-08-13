@@ -63,9 +63,16 @@ evaluation:
   holding buffered request bodies;
 - a five-second `preStop` sleep, with `terminationGracePeriodSeconds: 45`
   covering it plus the process's own 25-second shutdown budget (see
-  [Rollouts and termination](#rollouts-and-termination)).
+  [Rollouts and termination](#rollouts-and-termination));
+- the base's `secret.example.yaml` deleted (`$patch: delete` in
+  `secret.yaml`), because its values are published in this repository — see
+  [The Secret the overlay does not ship](#the-secret-the-overlay-does-not-ship).
 
 ```bash
+kubectl create namespace axond
+kubectl -n axond create secret generic axond-secrets \
+  --from-literal=GW_INBOUND_PLATFORM_KEY=... \
+  --from-literal=GW_PLATFORM_OPENAI_API_KEY=...
 digest="$(ops/pin-image-digest.sh --print 0.3.23)" # x-release-please-version
 SIGNER_IDENTITY=... GITHUB_REPOSITORY=Litvue/axond \
   ops/verify-image-evidence.sh "ghcr.io/litvue/axond@${digest}"
@@ -73,6 +80,22 @@ ops/pin-image-digest.sh 0.3.23 # x-release-please-version
 kubectl apply -k deploy/kubernetes/overlays/production
 kubectl -n axond rollout status deployment/axond
 ```
+
+### The Secret the overlay does not ship
+
+The base ships `secret.example.yaml` so an evaluation renders something bootable.
+Its two values are readable by anyone with this repository, so the production
+overlay deletes the resource rather than inheriting it. The container still takes
+its credentials from `envFrom: secretRef: axond-secrets`, so applying the overlay
+without supplying that Secret leaves the Pods in `CreateContainerConfigError` —
+the intended failure, because a gateway that never starts is safer than one
+serving with an inbound key published on GitHub.
+
+Supply it however your platform supplies secrets: the `kubectl create secret`
+above for a first rollout, or an External Secrets/sealed-Secret resource named
+`axond-secrets` in the `axond` namespace. `ops/check-deploy-manifests.py` renders
+the overlay and fails if any of the base's published placeholder values reappear
+in it.
 
 ### Resolving the image digest
 

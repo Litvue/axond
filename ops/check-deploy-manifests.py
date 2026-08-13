@@ -488,6 +488,33 @@ def check_namespaces(documents: list[Document], label: str) -> list[str]:
     ]
 
 
+def check_example_secret(production: list[Document], base: list[Document]) -> list[str]:
+    """The base's published placeholder Secret does not survive into production.
+
+    The base ships one so an evaluation renders something bootable, and its values
+    are readable by anyone with the repository. Inheriting it into the overlay that
+    carries the word production turns the documented `kubectl apply -k` into a
+    gateway whose inbound credential is public; a missing `axond-secrets` is the
+    safer failure, because the Pod never serves.
+    """
+    published = {
+        value
+        for secret in of_kind(base, "Secret")
+        for value in secret.get("stringData", {}).values()
+    }
+    failures: list[str] = []
+    for secret in of_kind(production, "Secret"):
+        name = secret["metadata"]["name"]
+        leaked = sorted(set(secret.get("stringData", {}).values()) & published)
+        if leaked:
+            failures.append(
+                f"overlays/production: Secret {name!r} still carries the base's published "
+                f"placeholders {leaked}; delete the resource in the overlay so an operator has "
+                "to supply the credential rather than serving with one from this repository"
+            )
+    return failures
+
+
 def ci_service_images(workflow: dict[str, Any]) -> dict[str, str]:
     """The backend images the stateful lane actually runs, keyed by service name."""
     services = workflow["jobs"]["stateful-tests"]["services"]
@@ -700,6 +727,7 @@ def gate(base: list[Document], production: list[Document], autoscaled: list[Docu
         *check_disruption_budget(production, autoscaled),
         *check_namespaces(base, "base"),
         *check_namespaces(production, "overlays/production"),
+        *check_example_secret(production, base),
     ]
 
 
@@ -811,6 +839,10 @@ def self_test() -> int:
     shrunk = copy.deepcopy(autoscaled)
     one(shrunk, "HorizontalPodAutoscaler")["spec"]["minReplicas"] = 1
     expect_failure("autoscaler floor", check_disruption_budget(production, shrunk))
+
+    inherited = copy.deepcopy(production)
+    inherited.extend(copy.deepcopy(of_kind(base, "Secret")))
+    expect_failure("the base's example Secret inherited", check_example_secret(inherited, base))
 
     stray = copy.deepcopy(production)
     one(stray, "Service")["metadata"].pop("namespace")

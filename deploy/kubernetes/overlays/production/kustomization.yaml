@@ -37,6 +37,9 @@ images:
     digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 patches:
   - path: deployment.yaml
+  # The base's published placeholder Secret is not part of the production
+  # posture; see secret.yaml for what an operator has to supply instead.
+  - path: secret.yaml
   - path: pdb.yaml
 labels:
   - pairs:

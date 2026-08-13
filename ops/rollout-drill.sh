@@ -107,6 +107,14 @@ render "$overlay" |
 grep -q "image: ${image}$" "${workdir}/rendered.yaml" ||
   fail "the overlay's image is not the digest sentinel any more; update this drill"
 kube apply -f "${workdir}/rendered.yaml" >/dev/null
+# The overlay deletes the base's published example Secret, so the credentials an
+# operator supplies out of band are supplied here too — throwaway values, on a
+# cluster this script deletes. Without it the Pods sit in
+# CreateContainerConfigError, which is the overlay working as intended.
+kube -n axond create secret generic axond-secrets \
+  --from-literal=GW_PLATFORM_OPENAI_API_KEY=rollout-drill-openai-key \
+  --from-literal=GW_INBOUND_PLATFORM_KEY=rollout-drill-inbound-key \
+  --dry-run=client -o yaml | kube apply -f - >/dev/null
 # The whole overlay is applied, NetworkPolicies included, so the drill deploys
 # what an operator would rather than a subset. kindnet does not implement
 # NetworkPolicy, so they are inert here — a CNI that enforced them and did not
