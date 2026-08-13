@@ -392,10 +392,18 @@ impl AdminService {
 }
 
 /// Parse the exact version a request names.
+///
+/// The refusal states the shape and never the text: these bodies sit next to
+/// material, and a key pasted into the wrong field must not come back out of
+/// the response or a log line built from the operator detail.
 pub(super) fn reference_of(schema: &'static str, text: &str) -> Result<SecretRef, AdminError> {
-    SecretRef::parse(text).map_err(|error| AdminError::RequestInvalid {
+    SecretRef::parse(text).map_err(|_| AdminError::RequestInvalid {
         schema,
-        detail: format!("`reference`: {error}"),
+        detail: format!(
+            "`reference` names an exact version, as `{}…@v1`; the text presented is not reported, \
+             because these requests carry material",
+            SecretId::PREFIX
+        ),
     })
 }
 
@@ -419,12 +427,23 @@ pub(super) fn lifecycle_of(
 
 /// The owner a request names, refusing a deployment-wide one: material belongs
 /// to a tenant, and optionally to one of its projects.
+///
+/// Like [`reference_of`], an unparseable id is described rather than quoted.
 pub(super) fn owner_of(
     schema: &'static str,
     tenant: &str,
     project: Option<&str>,
 ) -> Result<SecretOwner, AdminError> {
-    let scope = super::handlers::scope_of(schema, Some(tenant), project)?;
+    let scope =
+        super::handlers::scope_of(schema, Some(tenant), project).map_err(|error| match error {
+            AdminError::RequestInvalid { schema, .. } => AdminError::RequestInvalid {
+                schema,
+                detail: "`tenant` and `project` are prefixed ids, as `ten_…` and `prj_…`; the \
+                         text presented is not reported, because these requests carry material"
+                    .to_owned(),
+            },
+            other => other,
+        })?;
     SecretOwner::from_scope(&scope).ok_or(AdminError::RequestInvalid {
         schema,
         detail: "`tenant`: secret material is owned by a tenant, never by the deployment"
@@ -433,10 +452,17 @@ pub(super) fn owner_of(
 }
 
 /// The secret a versions read names.
+///
+/// Non-echoing for the same reason as [`reference_of`], and because a path
+/// segment lands in more places than a body field does.
 pub(super) fn secret_of(schema: &'static str, text: &str) -> Result<SecretId, AdminError> {
-    SecretId::parse(text).map_err(|error| AdminError::RequestInvalid {
+    SecretId::parse(text).map_err(|_| AdminError::RequestInvalid {
         schema,
-        detail: format!("`secret`: {error}"),
+        detail: format!(
+            "`secret` is a prefixed id, as `{}…`; the text presented is not reported, because \
+             this surface neighbours material",
+            SecretId::PREFIX
+        ),
     })
 }
 
@@ -456,18 +482,52 @@ pub(super) fn material_of(
 
 #[cfg(test)]
 mod tests {
-    use super::lifecycle_of;
+    use super::{lifecycle_of, owner_of, reference_of, secret_of};
+    use crate::admin::error::AdminError;
+
+    fn withholds(error: &AdminError, presented: &str) {
+        assert!(!error.to_string().contains(presented));
+        assert!(
+            !error
+                .operator_detail()
+                .is_some_and(|detail| detail.contains(presented))
+        );
+    }
 
     #[test]
     fn an_invalid_lifecycle_does_not_echo_the_caller_value_to_response_or_log() {
         let caller_value = "sk-lifecycle-value-must-not-echo";
         let error = lifecycle_of("secret_lifecycle", caller_value).expect_err("invalid state");
 
-        assert!(!error.to_string().contains(caller_value));
-        assert!(
-            !error
-                .operator_detail()
-                .is_some_and(|detail| detail.contains(caller_value))
+        withholds(&error, caller_value);
+    }
+
+    #[test]
+    fn a_field_that_neighbours_material_never_quotes_what_was_presented() {
+        // The mistake this exists for: a provider key pasted into the field that
+        // was meant to hold the reference to it.
+        let pasted = "sk-live-must-not-echo@v1";
+
+        withholds(
+            &reference_of("secret_rotate", pasted).expect_err("not a reference"),
+            "sk-live-must-not-echo",
+        );
+        withholds(
+            &secret_of("secret_versions", pasted).expect_err("not a secret"),
+            "sk-live-must-not-echo",
+        );
+        withholds(
+            &owner_of("secret_rotate", pasted, None).expect_err("not a tenant"),
+            "sk-live-must-not-echo",
+        );
+        withholds(
+            &owner_of(
+                "secret_rotate",
+                "ten_00000000-0000-7000-8000-000000000000",
+                Some(pasted),
+            )
+            .expect_err("not a project"),
+            "sk-live-must-not-echo",
         );
     }
 }

@@ -168,6 +168,16 @@ query always names a tenant, so it is the caller's authority that decides this,
 not the scope asked about. Asking about a project answers with what the project
 inherits from its tenant as well as what it overrides, because a project's
 enablements are overrides rather than a catalogue of its own.
+ 
+Because they publish no revision, they also write no `AuditEvent`: a successful
+stage, rotation, activation, revocation, or destruction is recorded on the
+`axond.admin.secrets` log target rather than in the control plane, so retain
+those logs if you need to answer "who destroyed this version" later. Refusals of
+authority still record durably, as every other denial does.
+
+Refusals from these routes describe the shape a field wants and never quote what
+was presented — a provider key pasted into `reference`, `secret`, `tenant`, or
+`project` must not come back out in the response or an operator log line.
 
 Budgets and limits are policy fields rather than a route of their own: they are
 published as a `policies` document, and history is therefore one chain rather
