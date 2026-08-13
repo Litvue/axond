@@ -43,9 +43,9 @@ use super::schema::{self, MINIMUM_SERVER_VERSION_NUM, SchemaStatus};
 use super::{ControlPlaneError, ControlPlaneStore};
 use crate::backends::{Capabilities, Capability};
 use crate::desired_state::{
-    AccessDenial, Action, AuditEvent, Credential, DenialReason, Directory, IntegrityError,
-    LoadedRevision, Mutation, ResourceRef, ResourceVersion, ResourceVersionNumber,
-    RevisionCandidate, RevisionId, RevisionManifest, SerializerVersion, Surface, Tenancy, TenantId,
+    AccessDenial, Action, AuditEvent, Credential, DenialPage, DenialReason, Directory,
+    IntegrityError, LoadedRevision, Mutation, ResourceRef, ResourceVersion, ResourceVersionNumber,
+    RevisionCandidate, RevisionId, RevisionManifest, SerializerVersion, Surface, Tenancy,
     Uuid7Generator,
 };
 
@@ -791,10 +791,10 @@ impl ControlPlaneStore for PostgresControlPlane {
 
     async fn denials(
         &self,
-        tenant: Option<TenantId>,
+        page: &DenialPage,
         limit: usize,
     ) -> Result<Vec<AccessDenial>, ControlPlaneError> {
-        let tenant = tenant.map(|tenant| tenant.to_string());
+        let tenant = page.tenant().map(|tenant| tenant.to_string());
         // Clamped rather than rejected: this is a page size, and an administrator
         // asking for everything gets the first page rather than an error.
         let limit = i64::try_from(limit.clamp(1, 1_000)).unwrap_or(1_000);
@@ -803,6 +803,23 @@ impl ControlPlaneStore for PostgresControlPlane {
                 // `IS NOT DISTINCT FROM` so `None` selects the deployment-scoped
                 // denials rather than every row: a refusal that named no tenant is
                 // a platform-scoped read, not a wildcard.
+                //
+                // Scope alone, and deliberately: this read is scope-*exact*, so
+                // every row it returns is a refusal against the tenant that was
+                // asked for, whoever attempted it. Filtering the actor here as
+                // well would make a cross-tenant attempt — a refusal scoped to A
+                // attempted by a workload of B — returnable by no page at all:
+                // not A's, because of the actor; not B's, because of the scope;
+                // and not the deployment page, which is only the rows that named
+                // no tenant. That row is the one the trail exists for.
+                //
+                // Attribution is filtered one layer down, where it is the only
+                // place it can leak: the row-level-security policy shares
+                // *deployment-scoped* refusals with every pinned session, so it
+                // withholds the ones another tenant's workload attempted. A read
+                // that names a tenant is answering for that tenant, and a caller
+                // that may ask about a tenant at all is a caller that may know
+                // who was refused against it.
                 let rows = client
                     .query(
                         "SELECT denial_id, actor_kind, actor_issuer, actor_subject, \
@@ -940,10 +957,14 @@ async fn publish(
             .map_err(|error| unavailable("write blob reference", &error))?;
     }
 
-    // Ownership and identity first, because the resource versions below carry
-    // foreign keys into them: a version scoped to a tenant this revision does not
-    // declare, or naming another tenant's project, is unwritable rather than
-    // merely unvalidated. Same transaction, so "projected" and "published" cannot
+    // Ownership and identity first, because the projection is where the database
+    // constrains them: a project names its tenant and a principal names the
+    // tenant and project it is scoped to, through foreign keys among these three
+    // tables, so a cross-tenant grant is unwritable rather than merely
+    // unvalidated. The journal rows below carry no such key by design — 0002
+    // explains why, and a pre-0002 revision with no projected owner is
+    // republishable because of it — so their ownership is checked in the domain
+    // alone. Same transaction either way, so "projected" and "published" cannot
     // come apart.
     project_tenancy(transaction, id, candidate).await?;
 
@@ -1071,6 +1092,34 @@ async fn publish(
 /// `lifecycle = 'deleted'`, which is a transition, not an erasure — physical
 /// erasure is separate compliance work with its own retention argument.
 ///
+/// A tenant the revision *omits* takes the same transition, because a revision is
+/// the whole desired state and the domain already treats an undeclared tenant as
+/// neither served nor administrable ([`Tenancy::is_served`] is `false` for a
+/// tenant it has no row for). Leaving the retained row at whatever it last said
+/// would leave `lifecycle` reading `active` for a tenant nothing serves, and that
+/// column exists precisely so "is this tenant served?" is answerable without
+/// decoding a body. It also settles the name: the domain frees an undeclared
+/// tenant's slug, and the exclusion constraint that enforces slug uniqueness
+/// ignores deleted rows, so the two agree about what may be reused. The
+/// reconciliation runs first, so a revision that reuses a dropped tenant's name
+/// does not collide with the row it is replacing.
+///
+/// That reconciliation needs a snapshot that *speaks about* tenancy, and one that
+/// declares no tenant at all does not. Two real revisions look like that and mean
+/// the opposite of "retire everything": a pre-tenancy revision, written by a build
+/// that had no tenant resource to declare, and a rollback to one — the deployment
+/// this slice upgrades has a whole journal of them, and #142's replica compiles
+/// them into routing state today. Reading their silence as a deletion of every
+/// tenant would make a rollback the most destructive operation the control plane
+/// has, and would do it without any revision ever having said so.
+///
+/// So the retirement is conditional on the snapshot being *authoritative about
+/// tenancy*: at least one tenant declared. Retiring the last tenant is then an
+/// explicit `lifecycle = 'deleted'` on that tenant rather than an empty
+/// publication, which is the transition the vocabulary already has and the only
+/// one an audit trail can attribute. The cost is stated rather than hidden: a
+/// deployment cannot empty its tenant list by omission, and the runbook says so.
+///
 /// Principals *are* deleted when a revision stops declaring them, because a
 /// revoked administrator whose grants linger is the whole failure this table
 /// exists to make visible. Their history is unaffected: attribution is copied
@@ -1085,6 +1134,24 @@ async fn project_tenancy(
     let directory = Directory::of(&candidate.state, &tenancy)
         .map_err(|error| ControlPlaneError::Invalid(error.into()))?;
     let revision = revision.to_string();
+
+    let declared_tenants: Vec<String> = tenancy
+        .tenants()
+        .map(|tenant| tenant.body.tenant().to_string())
+        .collect();
+    // Only a snapshot that declares tenancy reconciles it: see above — silence is
+    // a pre-tenancy or rolled-back revision, not a deletion of every tenant.
+    if !declared_tenants.is_empty() {
+        transaction
+            .execute(
+                "UPDATE axond_cp_tenant SET lifecycle = 'deleted', revision_id = $2, \
+                 updated_at = now() \
+                 WHERE NOT (tenant_id = ANY($1)) AND lifecycle <> 'deleted'",
+                &[&declared_tenants, &revision],
+            )
+            .await
+            .map_err(|error| unavailable("retire undeclared tenants", &error))?;
+    }
 
     for tenant in tenancy.tenants() {
         transaction
@@ -1209,6 +1276,17 @@ async fn project_tenancy(
                 .map_err(|error| unavailable("grant role", &error))?;
         }
     }
+
+    // The name and identity constraints are deferred, so that a revision in which
+    // two tenants, two projects, or two principals trade what identifies them is
+    // judged on the state it declares rather than on the order its rows were
+    // written in. Settling them here rather than leaving them to commit is what
+    // keeps a violation attributable: at commit the error would arrive with no
+    // operation to name, and after the publication had otherwise succeeded.
+    transaction
+        .execute("SET CONSTRAINTS ALL IMMEDIATE", &[])
+        .await
+        .map_err(|error| projection_failure("settle names and identities", "name", "", &error))?;
     Ok(())
 }
 
@@ -1420,28 +1498,126 @@ async fn insert_audit_event(
 /// slug — the partial index says so — so this is never how a deletion is
 /// undone; restoring one is republishing that tenant as `active`, and it fails
 /// here only when some *other* live tenant took the name meanwhile.
+///
+/// Ownership is the second condition, and reaches this the same way. A revision
+/// that moves a project to another tenant is a state the domain accepts — it
+/// checks ownership within one revision, not across two — and the composite
+/// `(tenant_id, project_id)` foreign key held by any principal scoped into that
+/// project refuses the update, with no `ON UPDATE` action to cascade it. That
+/// refusal is as permanent as a taken name: the fix is a revision that moves the
+/// principals too, not a retry.
 fn projection_failure(
     operation: &str,
     noun: &'static str,
     slug: &str,
     error: &tokio_postgres::Error,
 ) -> ControlPlaneError {
-    if is_unique_violation(error) {
+    let Some(db) = error.as_db_error().filter(|db| is_projection_refusal(db)) else {
+        return unavailable(operation, error);
+    };
+    // Which constraint was violated, rather than an assumption about which one it
+    // was: a projected row can collide over a name, an OIDC subject, or a key
+    // digest, or contradict an ownership row, and reporting all of them as a name
+    // clash describes the wrong conflict and the wrong remedy. Only a name has a
+    // remedy the caller can act on, so only a name keeps the typed refusal; the
+    // rest name the constraint they contradicted.
+    if is_name_conflict(db) {
+        let taken = if slug.is_empty() {
+            colliding_value(db).unwrap_or_else(|| slug.to_owned())
+        } else {
+            slug.to_owned()
+        };
         return ControlPlaneError::NameTaken {
             noun,
-            name: slug.to_owned(),
-            holder: error
-                .as_db_error()
-                .and_then(|db| db.constraint().map(ToOwned::to_owned)),
+            name: taken,
+            holder: db.constraint().map(ToOwned::to_owned),
         };
     }
-    unavailable(operation, error)
+    // The constraint, and nothing the row it collided with holds. PostgreSQL's
+    // message and detail name the colliding key — `Key (issuer, subject)=(…)`,
+    // `Key (key_digest)=(sha256:…)` — and these constraints are the identity
+    // directory's, so splicing them into the refusal would tell a publisher
+    // another principal's sign-in or the digest of another workload's minted key.
+    // A refusal names the rule it broke; the values stay in the operator's log,
+    // which is the same line the wrong constraint name would be diagnosed from.
+    tracing::warn!(
+        constraint = db.constraint().unwrap_or("unnamed"),
+        detail = db.detail().unwrap_or(""),
+        message = db.message(),
+        "a projected row was refused by state this deployment already holds"
+    );
+    denied(projection_refusal(
+        noun,
+        slug,
+        *db.code() == SqlState::FOREIGN_KEY_VIOLATION,
+        db.constraint(),
+    ))
+}
+
+/// The caller-facing text of a projection refusal, built from the rule that
+/// refused it and the revision's own slug — and from nothing else, which is the
+/// point: the values in the row it collided with are not parameters here, so they
+/// cannot reach a response by an edit that forgets why.
+fn projection_refusal(noun: &str, slug: &str, ownership: bool, constraint: Option<&str>) -> String {
+    let subject = if slug.is_empty() {
+        format!("projecting the {noun}s of this revision")
+    } else {
+        format!("projecting the {noun} `{slug}`")
+    };
+    let conflict = if ownership {
+        "contradicts an ownership row this deployment already holds"
+    } else {
+        "collides with a row this deployment already holds"
+    };
+    format!(
+        "{subject} {conflict}{}; the conflicting row stands until a revision changes it, so \
+         no retry clears this",
+        constraint.map_or_else(String::new, |name| format!(" ({name})")),
+    )
 }
 
 fn is_unique_violation(error: &tokio_postgres::Error) -> bool {
     error
         .as_db_error()
         .is_some_and(|db| db.code() == &SqlState::UNIQUE_VIOLATION)
+}
+
+/// Whether a projection failure is a state this deployment already holds refusing
+/// the revision: a duplicate (a unique index, or the deferred exclusion
+/// constraints that carry names and identities), or a contradicted ownership row
+/// (the composite foreign keys). None of the three is transient, and reporting
+/// one as an outage asks a caller to retry against a state no retry reaches.
+fn is_projection_refusal(db: &tokio_postgres::error::DbError) -> bool {
+    matches!(
+        *db.code(),
+        SqlState::UNIQUE_VIOLATION
+            | SqlState::EXCLUSION_VIOLATION
+            | SqlState::FOREIGN_KEY_VIOLATION
+    )
+}
+
+/// Whether the constraint a projection violated is one of the two that carry a
+/// *name*, as opposed to an identity or an ownership row. Read off the constraint
+/// rather than off the operation, because the deferred constraints are settled for
+/// the revision as a whole and the row that lost is only named by the error.
+fn is_name_conflict(db: &tokio_postgres::error::DbError) -> bool {
+    db.constraint()
+        .is_some_and(|name| name.ends_with("_slug_unique"))
+}
+
+/// The name that collided, out of the detail Postgres attaches to a duplicate:
+/// `Key (tenant_id, slug)=(ten_…, core) already exists`. Only the last column of
+/// the key is a name — the others scope it — so this is the value a caller
+/// changes.
+fn colliding_value(db: &tokio_postgres::error::DbError) -> Option<String> {
+    let detail = db.detail()?;
+    let values = detail.split_once(")=(")?.1;
+    let values = values.split_once(')')?.0;
+    values
+        .rsplit(", ")
+        .next()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn audit_event(row: &Row) -> Result<AuditEvent, IntegrityError> {
@@ -1535,15 +1711,16 @@ mod tests {
     use super::*;
     use crate::backends::{BackendFailure, FailureCategory};
     use crate::desired_state::fixtures::{
-        DESIRED_STATE_RESOURCES, candidate, project_alias, project_id, reference, state,
-        state_a_pre_tenancy_build_published, state_with_directory, state_with_renamed_alias,
-        state_with_revoked_workload, state_with_second_tenant, state_with_two_blobs, tenant,
-        tenant_body, tenant_id, two_tenant_directory_state, workload_key,
+        DESIRED_STATE_RESOURCES, candidate, principal_id, project, project_alias, project_body,
+        project_id, reference, state, state_a_pre_tenancy_build_published, state_with_directory,
+        state_with_renamed_alias, state_with_revoked_workload, state_with_second_tenant,
+        state_with_two_blobs, tenant, tenant_body, tenant_id, two_tenant_directory_state,
+        workload_key,
     };
     use crate::desired_state::{
-        Actor, AuditEventId, Checksum, DesiredState, ExpectedRevision, MutationId, PrincipalId,
-        ResourceKind, ResourceScope, ResourceVersionNumber, Slug, TenantLifecycle, Uuid7,
-        ValidationError, WorkloadKey, oracle::InMemoryControlPlane,
+        Actor, AuditEventId, Checksum, DesiredState, DisplayName, ExpectedRevision, IdentityBody,
+        MutationId, PrincipalId, ResourceKind, ResourceScope, ResourceVersionNumber, Role, Slug,
+        TenantLifecycle, Uuid7, ValidationError, WorkloadKey, oracle::InMemoryControlPlane,
     };
 
     /// Each test owns a schema, so the journal's fixed object names do not make
@@ -3296,14 +3473,18 @@ mod tests {
         );
     }
 
-    /// A projected name a retained row still holds is a refusal, not weather.
+    /// A retired tenant's name is free, and a retained *project* name is a
+    /// refusal rather than weather.
     ///
-    /// The failure is permanent by construction: the row holding the name is kept
-    /// on purpose, so every retry hits the same unique index. Reported as an
-    /// outage it would be an administrator retrying a publication that can never
-    /// succeed; reported as a refusal it names the taken name.
+    /// The two halves are the same rule read from both sides. A tenant a revision
+    /// stops declaring is retired, and the constraint that holds its name ignores
+    /// retired rows, so the domain and the database agree that the name is
+    /// reusable. A project has no lifecycle to retire into, so the row keeping its
+    /// name is kept on purpose and every retry hits the same index: that failure
+    /// is permanent by construction, and reported as an outage it would be an
+    /// administrator retrying a publication that can never succeed.
     #[tokio::test]
-    async fn reusing_a_retained_tenants_name_is_refused_rather_than_reported_as_an_outage() {
+    async fn a_retired_tenants_name_is_reusable_and_a_retained_projects_is_refused() {
         let Some((store, _, _)) = journal().await else {
             return;
         };
@@ -3312,22 +3493,24 @@ mod tests {
             .await
             .expect("the first tenant publishes");
 
-        // A different tenant, by id, claiming the name the first one still holds:
-        // the first tenant is no longer declared, but its row is retained because
-        // history points at it, and the name is retained with the row.
-        let mut reused = DesiredState::new();
-        reused
-            .insert(tenant(21, "acme"))
-            .expect("a state declaring one tenant is valid");
+        // The project side first, since it is the half that has no lifecycle to
+        // retire into: the row holding `(tenant, core)` is kept whether or not the
+        // revision still declares it, so a *different* project of that tenant
+        // taking the name is refused however often it is retried.
+        let mut reused_project = DesiredState::new();
+        reused_project
+            .insert(tenant(1, "acme"))
+            .and_then(|state| state.insert(project(&tenant_id(1), 5, "core")))
+            .expect("a tenant and one project of it is valid");
         let error = store
             .publish_revision(candidate_with_mutation(
                 ExpectedRevision::Exactly(first.id),
-                "reuse",
-                reused,
+                "project reuse",
+                reused_project,
                 77,
             ))
             .await
-            .expect_err("a name a projected row holds cannot be taken by another tenant");
+            .expect_err("a name a projected project row holds cannot be taken");
         assert_eq!(
             error.category(),
             FailureCategory::Conflict,
@@ -3341,21 +3524,435 @@ mod tests {
             matches!(error, ControlPlaneError::NameTaken { .. }),
             "{error}"
         );
-        assert!(error.to_string().contains("acme"), "{error}");
-
-        // And the refusal left nothing behind: the first tenant's row is untouched
-        // and the revision that would have renamed the deployment's tenancy was
-        // not published.
-        assert_eq!(
-            store
-                .column("SELECT tenant_id FROM axond_cp_tenant")
-                .await
-                .len(),
-            1
-        );
+        assert!(error.to_string().contains("core"), "{error}");
         assert_eq!(
             store.desired_revision().await.expect("head"),
-            Some(first.id)
+            Some(first.id),
+            "a refused publication is not a published one"
+        );
+
+        // The tenant side: a different tenant, by id, taking the name the first one
+        // used. The first tenant is no longer declared, so it is retired, and its
+        // name goes with the retirement even though its row stays for the history
+        // that points at it.
+        let mut reused = DesiredState::new();
+        reused
+            .insert(tenant(21, "acme"))
+            .expect("a state declaring one tenant is valid");
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(first.id),
+                "reuse",
+                reused,
+                79,
+            ))
+            .await
+            .expect("a retired tenant's name is not held against its successor");
+        assert_eq!(
+            store
+                .column(
+                    "SELECT lifecycle FROM axond_cp_tenant WHERE slug = 'acme' \
+                     ORDER BY tenant_id"
+                )
+                .await,
+            vec!["deleted", "active"],
+            "the name is held by the declared tenant, and kept by the retired row"
+        );
+        assert_eq!(
+            store.count("axond_cp_tenant").await,
+            2,
+            "the retired tenant's row is retained, not deleted"
+        );
+    }
+
+    /// A project's name is reclaimed by renaming the project that holds it, which
+    /// is the release path a project has instead of a tenant's lifecycle.
+    ///
+    /// A tenant releases its name by publishing itself `deleted`; a project has no
+    /// lifecycle to publish, so a dropped project's name would otherwise be taken
+    /// for the life of the deployment. Renaming it while it is still declared —
+    /// uniqueness is judged on the declared state — hands the name back in the
+    /// same revision that stops using it. Giving projects a lifecycle of their own
+    /// is a tenancy-contract change, and follow-up work rather than this slice's.
+    #[tokio::test]
+    async fn a_projects_name_is_reclaimed_by_renaming_the_project_that_holds_it() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let tenant = tenant_id(1);
+        let mut before = state();
+        before
+            .insert(project(&tenant, 3, "edge"))
+            .expect("a tenant with a project");
+        let first = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "acme", before.clone()))
+            .await
+            .expect("the original project publishes");
+
+        // One revision: the project holding the name is renamed, and a new project
+        // takes the name it gave up.
+        let mut reclaimed = before;
+        reclaimed
+            .supersede(project_body(3, 1, "Edge Retired").version_at(
+                Slug::parse("edge-retired").expect("a slug"),
+                ResourceVersionNumber::FIRST.next(),
+            ))
+            .and_then(|state| state.insert(project(&tenant, 4, "edge")))
+            .expect("renaming one project and naming another is valid");
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(first.id),
+                "reclaim",
+                reclaimed,
+                78,
+            ))
+            .await
+            .expect("a name its holder gave up in the same revision is free");
+
+        assert_eq!(
+            store
+                .column(&format!(
+                    "SELECT project_id FROM axond_cp_project WHERE slug = 'edge' \
+                     AND tenant_id = '{tenant}'"
+                ))
+                .await,
+            vec![project_id(4).to_string()],
+            "the new project holds the name"
+        );
+    }
+
+    /// A workload's change is recordable: the vocabulary 0001 wrote as an inline
+    /// column check admitted three actor kinds, and this publishes the fourth
+    /// through the journal's own writer rather than asserting on the schema.
+    #[tokio::test]
+    async fn a_revision_a_workload_published_is_attributed_to_its_principal() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let actor = Actor::Workload {
+            tenant: tenant_id(1),
+            principal: principal_id(32),
+        };
+        let mut candidate = candidate(ExpectedRevision::Empty, "by-workload", state());
+        candidate.mutation.actor = actor.clone();
+        candidate.audit.actor = actor.clone();
+        let published = store
+            .publish_revision(candidate)
+            .await
+            .expect("a workload's revision publishes");
+
+        let trail = store.audit_trail(published.id).await.expect("audit trail");
+        assert_eq!(trail.len(), 1);
+        assert_eq!(trail[0].actor, actor);
+        assert_eq!(
+            store
+                .column("SELECT actor_principal_id FROM axond_cp_mutation")
+                .await,
+            vec![principal_id(32).to_string()],
+            "the mutation carries the workload it was made by"
+        );
+    }
+
+    /// Two tenants — and two projects of one tenant — trading names in a single
+    /// revision, which is valid desired state and must not depend on the order the
+    /// projection happens to write its rows in.
+    #[tokio::test]
+    async fn two_owners_may_trade_names_in_one_revision() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let slug = |slug: &str| Slug::parse(slug).expect("a slug");
+        let mut before = state();
+        before
+            .insert(tenant(11, "globex"))
+            .and_then(|state| state.insert(project(&tenant_id(1), 3, "edge")))
+            .expect("two tenants and two projects of one of them are valid");
+        let first = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "named", before.clone()))
+            .await
+            .expect("the original names publish");
+
+        // Each of the four rows takes the name another of them is giving up.
+        let second = ResourceVersionNumber::FIRST.next();
+        let mut swapped = before;
+        swapped
+            .supersede(tenant_body(1, "Acme").version_at(slug("globex"), second))
+            .and_then(|state| {
+                state.supersede(tenant_body(11, "Globex").version_at(slug("acme"), second))
+            })
+            .and_then(|state| {
+                state.supersede(project_body(2, 1, "Core").version_at(slug("edge"), second))
+            })
+            .and_then(|state| {
+                state.supersede(project_body(3, 1, "Edge").version_at(slug("core"), second))
+            })
+            .expect("a state in which names are exchanged is valid");
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(first.id),
+                "swap",
+                swapped,
+                90,
+            ))
+            .await
+            .expect("names that are exchanged rather than duplicated must publish");
+
+        assert_eq!(
+            store
+                .column("SELECT slug FROM axond_cp_tenant ORDER BY tenant_id")
+                .await,
+            vec!["globex", "acme"],
+            "each tenant holds the name the other gave up"
+        );
+        assert_eq!(
+            store
+                .column("SELECT slug FROM axond_cp_project ORDER BY project_id")
+                .await,
+            vec!["edge", "core"]
+        );
+    }
+
+    /// The rule an in-place upgrade is left with is the deferred one.
+    ///
+    /// An earlier 0002 held a tenant's name in a partial unique *index*, and an
+    /// index cannot be deferred. A deployment that applied that version by hand and
+    /// then applies this one would, if the index survived, keep refusing exactly the
+    /// swap above — permanently, because the constraint the projection defers is
+    /// checked beside an index that is not. So the migration drops it, and this
+    /// asserts the drop by recreating the old index first.
+    #[tokio::test]
+    async fn an_upgraded_deployment_keeps_no_rule_the_projection_cannot_defer() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        store
+            .attempt(
+                "CREATE UNIQUE INDEX axond_cp_tenant_slug_idx ON axond_cp_tenant (slug) \
+                 WHERE lifecycle <> 'deleted'",
+            )
+            .await
+            .expect("the rule 0002 left behind");
+
+        let forward = schema::MIGRATIONS
+            .iter()
+            .find(|migration| migration.name.contains("tenancy_constraints"))
+            .expect("the forward tenancy migration ships");
+        store
+            .attempt(forward.sql)
+            .await
+            .expect("applying the forward migration must not fail");
+        assert_eq!(
+            store
+                .column(
+                    "SELECT indexname::text FROM pg_indexes \
+                     WHERE schemaname = current_schema() \
+                     AND indexname = 'axond_cp_tenant_slug_idx'"
+                )
+                .await,
+            Vec::<String>::new(),
+            "an index the projection cannot defer outlived the migration that replaced it"
+        );
+
+        // And the swap the deferred constraint exists to allow still publishes.
+        let slug = |slug: &str| Slug::parse(slug).expect("a slug");
+        let mut before = state();
+        before
+            .insert(tenant(11, "globex"))
+            .expect("two tenants are valid");
+        let first = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "named", before.clone()))
+            .await
+            .expect("the original names publish");
+        let second = ResourceVersionNumber::FIRST.next();
+        let mut swapped = before;
+        swapped
+            .supersede(tenant_body(1, "Acme").version_at(slug("globex"), second))
+            .and_then(|state| {
+                state.supersede(tenant_body(11, "Globex").version_at(slug("acme"), second))
+            })
+            .expect("a state in which names are exchanged is valid");
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(first.id),
+                "swap",
+                swapped,
+                91,
+            ))
+            .await
+            .expect("an upgraded deployment must accept a traded name too");
+    }
+
+    /// Two administrators exchanging sign-ins, and two workloads exchanging keys,
+    /// in one revision. Like a traded name this is valid desired state — the
+    /// directory refuses a *shared* identity, not a reassigned one — so it must not
+    /// depend on which `PrincipalId` the projection writes first.
+    #[tokio::test]
+    async fn two_principals_may_trade_identities_in_one_revision() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let tenant = tenant_id(1);
+        let identity = |seed: u64, slug: &str, credential: Credential, version| {
+            IdentityBody::new(
+                principal_id(seed),
+                DisplayName::parse(slug).expect("a display name"),
+                credential,
+                [Role::TenantAdmin],
+            )
+            .expect("an identity granting a role")
+            .version_at(
+                ResourceScope::Tenant(tenant),
+                Slug::parse(slug).expect("a slug"),
+                version,
+            )
+        };
+        let oidc = |subject: &str| Credential::Oidc {
+            issuer: "https://idp.example".to_owned(),
+            subject: subject.to_owned(),
+        };
+        let key = |seed: u8| Credential::MintedKey {
+            digest: Some(Checksum::of(workload_key(seed).as_bytes())),
+        };
+        let first_version = ResourceVersionNumber::FIRST;
+        let mut before = state();
+        before
+            .insert(identity(40, "ada", oidc("ada"), first_version))
+            .and_then(|state| state.insert(identity(41, "grace", oidc("grace"), first_version)))
+            .and_then(|state| state.insert(identity(42, "builder", key(0xa1), first_version)))
+            .and_then(|state| state.insert(identity(43, "deployer", key(0xa2), first_version)))
+            .expect("two humans and two workloads of one tenant are valid");
+        let first = store
+            .publish_revision(candidate(
+                ExpectedRevision::Empty,
+                "directory",
+                before.clone(),
+            ))
+            .await
+            .expect("the original directory publishes");
+
+        // Each principal keeps its id, its name, and its roles, and takes the
+        // sign-in or the key the other is giving up.
+        let second = first_version.next();
+        let mut swapped = before;
+        swapped
+            .supersede(identity(40, "ada", oidc("grace"), second))
+            .and_then(|state| state.supersede(identity(41, "grace", oidc("ada"), second)))
+            .and_then(|state| state.supersede(identity(42, "builder", key(0xa2), second)))
+            .and_then(|state| state.supersede(identity(43, "deployer", key(0xa1), second)))
+            .expect("a state in which identities are exchanged is valid");
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(first.id),
+                "reassign",
+                swapped,
+                91,
+            ))
+            .await
+            .expect("identities that are exchanged rather than shared must publish");
+
+        assert_eq!(
+            store
+                .column(
+                    "SELECT subject FROM axond_cp_principal WHERE subject IS NOT NULL \
+                     ORDER BY principal_id"
+                )
+                .await,
+            vec!["grace", "ada"],
+            "each administrator signs in as the subject the other gave up"
+        );
+        assert_eq!(
+            store
+                .column(
+                    "SELECT key_digest FROM axond_cp_principal WHERE key_digest IS NOT NULL \
+                     ORDER BY principal_id"
+                )
+                .await,
+            vec![
+                Checksum::of(workload_key(0xa2).as_bytes()).to_string(),
+                Checksum::of(workload_key(0xa1).as_bytes()).to_string(),
+            ],
+            "and each workload authenticates with the key the other gave up"
+        );
+    }
+
+    /// A project moving to another tenant, with the principal scoped into it. Every
+    /// intermediate row set is inconsistent — the project belongs to one tenant and
+    /// the principal claims the other — and the state as declared is not, so the
+    /// composite ownership key is settled with the names rather than row by row.
+    #[tokio::test]
+    async fn a_project_may_move_to_another_tenant_with_what_is_scoped_into_it() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let scoped = |tenant: u64, version| {
+            IdentityBody::new(
+                principal_id(44),
+                DisplayName::parse("Builder").expect("a display name"),
+                Credential::Oidc {
+                    issuer: "https://idp.example".to_owned(),
+                    subject: "builder".to_owned(),
+                },
+                [Role::Developer],
+            )
+            .expect("an identity granting a role")
+            .version_at(
+                ResourceScope::Project {
+                    tenant: tenant_id(tenant),
+                    project: project_id(3),
+                },
+                Slug::parse("builder").expect("a slug"),
+                version,
+            )
+        };
+        let first_version = ResourceVersionNumber::FIRST;
+        let mut before = state();
+        before
+            .insert(tenant(11, "globex"))
+            .and_then(|state| state.insert(project(&tenant_id(1), 3, "edge")))
+            .and_then(|state| state.insert(scoped(1, first_version)))
+            .expect("two tenants, a project of one, and a developer in that project");
+        let first = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "owned", before.clone()))
+            .await
+            .expect("the original ownership publishes");
+
+        let second = first_version.next();
+        let mut moved = before;
+        moved
+            .supersede(
+                project_body(3, 11, "Edge")
+                    .version_at(Slug::parse("edge").expect("a slug"), second),
+            )
+            .and_then(|state| state.supersede(scoped(11, second)))
+            .expect("a project and its developer moving together is valid");
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(first.id),
+                "move",
+                moved,
+                92,
+            ))
+            .await
+            .expect("a reassignment the state declares consistently must publish");
+
+        assert_eq!(
+            store
+                .column(&format!(
+                    "SELECT tenant_id FROM axond_cp_project WHERE project_id = '{}'",
+                    project_id(3)
+                ))
+                .await,
+            vec![tenant_id(11).to_string()]
+        );
+        assert_eq!(
+            store
+                .column(&format!(
+                    "SELECT tenant_id FROM axond_cp_principal WHERE principal_id = '{}'",
+                    principal_id(44)
+                ))
+                .await,
+            vec![tenant_id(11).to_string()],
+            "the principal moved with the project it is scoped into"
         );
     }
 
@@ -3413,17 +4010,18 @@ mod tests {
         );
     }
 
-    /// Deletion is the only thing that releases a name, and releasing it is not
-    /// reversible by wishing: the slug index is partial over live rows, so a
-    /// deleted tenant's slug is free for the next tenant that asks — and the
-    /// deleted tenant cannot then be reactivated under it.
+    /// Retirement is what releases a name: the slug index is partial over live
+    /// rows, so a tenant that is deleted — declared so, or simply left out of the
+    /// revision — frees its name for the next tenant that asks.
     ///
     /// The three moves an operator actually makes, in order: delete, reuse,
-    /// attempt to restore. The last is a `NameTaken` naming the slug, which is
-    /// the runbook's answer — reactivate under another name, or delete the row
-    /// that took this one — rather than a silent rename of either tenant.
+    /// restore. The last one succeeds, and it is worth being explicit about why:
+    /// the revision that restores the first tenant does not declare the tenant
+    /// that took its name, so that tenant is retired in the same transaction and
+    /// the name is free again. Publishing complete desired state is the whole
+    /// contract, and this is what it costs when a name is recycled.
     #[tokio::test]
-    async fn a_deleted_tenants_slug_is_reusable_and_blocks_its_own_reactivation() {
+    async fn a_retired_tenants_slug_is_reusable_and_a_restore_retires_who_took_it() {
         let Some((store, _, _)) = journal().await else {
             return;
         };
@@ -3480,15 +4078,17 @@ mod tests {
             "both rows are retained; only one is live under the name"
         );
 
-        // And restoring the first tenant under the name it released is refused by
-        // name rather than reported as an outage or applied by renaming someone.
+        // And restoring the first tenant under the name it released is a revision
+        // that declares it and nothing else: the tenant holding the name is
+        // undeclared, so it is retired before the restore is projected, and the
+        // name is transferred rather than duplicated or refused.
         let mut restored = DesiredState::new();
         restored
             .insert(
                 tenant_body(1, "Acme").version_at(acme, ResourceVersionNumber::FIRST.next().next()),
             )
             .expect("a state declaring one tenant is valid");
-        let error = store
+        store
             .publish_revision(candidate_with_mutation(
                 ExpectedRevision::Exactly(head),
                 "restore",
@@ -3496,12 +4096,195 @@ mod tests {
                 98,
             ))
             .await
-            .expect_err("the slug now belongs to a live tenant");
-        assert!(
-            matches!(&error, ControlPlaneError::NameTaken { name, .. } if name == "acme"),
-            "{error}"
+            .expect("the revision that restores the tenant retires the one that took its name");
+        assert_eq!(
+            store
+                .column(
+                    "SELECT lifecycle FROM axond_cp_tenant WHERE slug = 'acme' \
+                     ORDER BY lifecycle"
+                )
+                .await,
+            vec!["active", "deleted"],
+            "one live tenant holds the name; the retired row keeps the name it held"
         );
-        assert!(!error.retryable(), "{error}");
+        assert_eq!(
+            store
+                .column("SELECT tenant_id FROM axond_cp_tenant WHERE lifecycle = 'active'")
+                .await
+                .len(),
+            1,
+            "exactly one tenant is live, and the restore is it"
+        );
+    }
+
+    /// A revision is the whole desired state, so the tenant it stops declaring is
+    /// retired rather than left reading `active`.
+    ///
+    /// The projected `lifecycle` is what a billing, retention, or admission reader
+    /// asks instead of decoding a body, and the domain serves an undeclared tenant
+    /// nothing. A retained row still claiming `active` would answer that question
+    /// with the opposite of the published truth. History is the reason the row
+    /// stays at all, so this also asserts the projects, mutations, and audit
+    /// events of the retired tenant survive the transition.
+    #[tokio::test]
+    async fn a_tenant_a_revision_stops_declaring_is_retired_and_keeps_its_history() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let both = store
+            .publish_revision(candidate(
+                ExpectedRevision::Empty,
+                "two tenants",
+                state_with_second_tenant(),
+            ))
+            .await
+            .expect("two tenants publish");
+        assert_eq!(
+            store
+                .column("SELECT lifecycle FROM axond_cp_tenant ORDER BY tenant_id")
+                .await,
+            vec!["active", "active"]
+        );
+
+        // The second tenant is simply absent from the next revision, which is how
+        // a complete desired state spells "this tenant is gone" without an
+        // explicit transition.
+        let dropped = store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(both.id),
+                "one tenant",
+                state(),
+                120,
+            ))
+            .await
+            .expect("a revision declaring one of them publishes");
+
+        assert_eq!(
+            store
+                .column("SELECT lifecycle FROM axond_cp_tenant ORDER BY tenant_id")
+                .await,
+            vec!["active", "deleted"],
+            "an undeclared tenant is still recorded as servable"
+        );
+        let published = store
+            .load_revision(dropped.id)
+            .await
+            .expect("the revision it just published hydrates");
+        let tenancy = Tenancy::of(published.state()).expect("the published tenancy resolves");
+        assert!(
+            !tenancy.is_served(tenant_id(11)) && tenancy.tenant(tenant_id(11)).is_none(),
+            "the projection and the published snapshot disagree about who is served"
+        );
+        assert!(
+            tenancy.is_served(tenant_id(1)),
+            "retiring one tenant retired another"
+        );
+
+        // Retired, not erased: the rows history points at are all still here.
+        assert_eq!(
+            store
+                .column("SELECT slug FROM axond_cp_project ORDER BY slug")
+                .await,
+            vec!["core"],
+            "the surviving tenant's project is untouched"
+        );
+        assert!(
+            store.count("axond_cp_mutation").await >= 2
+                && store.count("axond_cp_audit_event").await >= 2,
+            "the retired tenant's history is retained"
+        );
+
+        // And declaring it again brings the row back to what that revision says,
+        // so retirement is a projection of the published state rather than a
+        // one-way door.
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(dropped.id),
+                "two tenants again",
+                state_with_second_tenant(),
+                124,
+            ))
+            .await
+            .expect("re-declaring the tenant publishes");
+        assert_eq!(
+            store
+                .column("SELECT lifecycle FROM axond_cp_tenant ORDER BY tenant_id")
+                .await,
+            vec!["active", "active"],
+            "a re-declared tenant is still retired"
+        );
+    }
+
+    /// A revision that says nothing about tenancy retires nothing.
+    ///
+    /// Two publications look identical to the projection and mean the opposite of
+    /// each other: "these are the tenants, and only these" and "this build had no
+    /// tenant resource". The second is what every pre-tenancy revision in an
+    /// upgraded deployment's journal looks like, and a rollback to one republishes
+    /// it — so if omission retired tenants unconditionally, rolling back would
+    /// delete every tenant in the deployment without any revision saying so.
+    ///
+    /// Retiring the last tenant is therefore an explicit lifecycle, and this pins
+    /// both halves: a snapshot with no tenancy leaves the projection alone, and a
+    /// snapshot that does declare tenancy still retires what it omits.
+    #[tokio::test]
+    async fn a_revision_that_declares_no_tenancy_retires_no_tenant() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let both = store
+            .publish_revision(candidate(
+                ExpectedRevision::Empty,
+                "two tenants",
+                state_with_second_tenant(),
+            ))
+            .await
+            .expect("two tenants publish");
+
+        // The state an older build published, republished — a rollback.
+        let rolled_back = store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(both.id),
+                "pre-tenancy",
+                state_a_pre_tenancy_build_published(),
+                130,
+            ))
+            .await
+            .expect("a pre-tenancy revision publishes on a tenancy-aware build");
+        assert_eq!(
+            store
+                .column("SELECT lifecycle FROM axond_cp_tenant ORDER BY tenant_id")
+                .await,
+            vec!["active", "active"],
+            "a rollback to a pre-tenancy revision deleted the deployment's tenants"
+        );
+        assert_eq!(
+            store
+                .column("SELECT slug FROM axond_cp_project ORDER BY slug")
+                .await,
+            vec!["core"],
+            "and their projects"
+        );
+
+        // And the conditional is on tenancy being *declared*, not on the
+        // publication being a rollback: the next revision names one tenant, so it
+        // is authoritative and the other is retired.
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(rolled_back.id),
+                "one tenant",
+                state(),
+                131,
+            ))
+            .await
+            .expect("a revision declaring one tenant publishes");
+        assert_eq!(
+            store
+                .column("SELECT lifecycle FROM axond_cp_tenant ORDER BY tenant_id")
+                .await,
+            vec!["active", "deleted"],
+            "an authoritative snapshot stopped reconciling what it omits"
+        );
     }
 
     /// The half of #144 that is a database property rather than a service one: a
@@ -3588,6 +4371,49 @@ mod tests {
         assert!(refusal.to_string().contains("check"), "{refusal}");
     }
 
+    /// A refusal names the rule, and never the row it collided with.
+    ///
+    /// The identity constraints carry sign-ins and key digests, and PostgreSQL's
+    /// `DETAIL` on a violation quotes the colliding key — `Key (key_digest)=(…)`.
+    /// Splicing that into the error would make a failed publication an oracle for
+    /// another principal's OIDC subject or the digest of another workload's minted
+    /// key, which is the disclosure `Denial::public_reason` prevents one layer up.
+    /// The caller is told which rule refused the revision; the values stay in the
+    /// operator's log.
+    #[test]
+    fn a_projection_refusal_names_the_constraint_and_not_the_row_it_hit() {
+        let message = projection_refusal(
+            "principal",
+            "",
+            false,
+            Some("axond_cp_principal_key_digest_unique"),
+        );
+        assert!(
+            message.contains("axond_cp_principal_key_digest_unique"),
+            "the refusal names the rule it broke: {message}"
+        );
+        assert!(
+            message.contains("no retry clears this"),
+            "and that it is not an outage: {message}"
+        );
+        for leaked in ["sha256:", "Key (", "issuer", "subject", "=("] {
+            assert!(
+                !message.contains(leaked),
+                "the refusal could carry the row it collided with ({leaked}): {message}"
+            );
+        }
+        assert!(
+            projection_refusal(
+                "project",
+                "edge",
+                true,
+                Some("axond_cp_principal_project_fkey")
+            )
+            .contains("contradicts an ownership row"),
+            "an ownership contradiction is described as one"
+        );
+    }
+
     /// Denied actions are the half of the trail successful revisions cannot hold,
     /// and they are read per tenant so one tenant's refusals are not another's
     /// reconnaissance.
@@ -3625,25 +4451,42 @@ mod tests {
             .await
             .expect("a retry is not a second attempt");
 
-        let read = store.denials(Some(tenant), 10).await.expect("read");
+        let read = store
+            .denials(&DenialPage::for_scope(Some(tenant)), 10)
+            .await
+            .expect("read");
         assert_eq!(read, vec![mine[1].clone(), mine[0].clone()]);
         assert_eq!(
-            store.denials(Some(other), 10).await.expect("read"),
+            store
+                .denials(&DenialPage::for_scope(Some(other)), 10)
+                .await
+                .expect("read"),
             vec![theirs.clone()],
             "one tenant's refusals are not another's"
         );
         // `None` is the deployment-scoped page, not a wildcard.
         assert_eq!(
-            store.denials(None, 10).await.expect("read"),
+            store
+                .denials(&DenialPage::for_scope(None), 10)
+                .await
+                .expect("read"),
             vec![deployment]
         );
         // A limit is a page size.
         assert_eq!(
-            store.denials(Some(tenant), 1).await.expect("read"),
+            store
+                .denials(&DenialPage::for_scope(Some(tenant)), 1)
+                .await
+                .expect("read"),
             vec![mine[1].clone()]
         );
         assert!(
-            store.denials(Some(tenant), 0).await.expect("read").len() == 1,
+            store
+                .denials(&DenialPage::for_scope(Some(tenant)), 0)
+                .await
+                .expect("read")
+                .len()
+                == 1,
             "a zero limit is clamped to a page rather than refused"
         );
         // A workload's refusal is attributed to its principal, not to a person.
@@ -3655,12 +4498,126 @@ mod tests {
         store.record_denial(&workload).await.expect("record");
         assert_eq!(
             store
-                .denials(Some(tenant), 1)
+                .denials(&DenialPage::for_scope(Some(tenant)), 1)
                 .await
                 .expect("read")
                 .first()
                 .map(|denial| denial.actor.clone()),
             Some(workload.actor.clone())
+        );
+
+        // And a refusal *against* this tenant attempted by another tenant's
+        // workload is on this tenant's page, actor included. It is the event the
+        // trail exists for, and every other page excludes it by scope: dropping
+        // it here as well would record a cross-tenant probe that no read returns.
+        let mut intruder = denial(95, ResourceScope::Tenant(tenant), DenialReason::CrossTenant);
+        intruder.actor = Actor::Workload {
+            tenant: other,
+            principal: PrincipalId::new(uuid(36)),
+        };
+        store.record_denial(&intruder).await.expect("record");
+        assert!(
+            store
+                .denials(&DenialPage::for_scope(Some(tenant)), 10)
+                .await
+                .expect("read")
+                .contains(&intruder),
+            "a refusal against this tenant is unreadable by anyone"
+        );
+        assert!(
+            !store
+                .denials(&DenialPage::for_scope(Some(other)), 10)
+                .await
+                .expect("read")
+                .contains(&intruder),
+            "the attempting tenant's page is not where a refusal against another one belongs"
+        );
+        assert!(
+            !store
+                .denials(&DenialPage::for_scope(None), 10)
+                .await
+                .expect("read")
+                .contains(&intruder),
+            "the deployment page is the rows that named no tenant"
+        );
+    }
+
+    /// Applying the wall twice is not a broken database.
+    ///
+    /// An operator upgrading a running deployment may apply 0002 by hand — the
+    /// migrating role has to own these tables for `FORCE ROW LEVEL SECURITY`, and
+    /// a deployment whose DDL role is not its application role runs it out of
+    /// band — so a second application has to be a no-op rather than a collision
+    /// on a constraint or a policy name that leaves the schema half-walled.
+    #[tokio::test]
+    async fn the_tenancy_migration_is_idempotent_when_an_operator_reapplies_it() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        // Both of them, in order: 0002 declares the tenancy tables and 0003
+        // replaces the rules it got wrong, so a hand-run upgrade is the pair.
+        let tenancy: Vec<_> = schema::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.name.contains("tenancy"))
+            .collect();
+        assert_eq!(tenancy.len(), 2, "the tenancy migrations ship");
+
+        for migration in &tenancy {
+            store
+                .attempt(migration.sql)
+                .await
+                .expect("re-applying a tenancy migration must not fail");
+        }
+
+        // Applied twice, the wall is still forced rather than merely enabled: a
+        // policy the owning role bypasses is the failure this asserts against.
+        assert_eq!(
+            store
+                .column(
+                    "SELECT relname::text FROM pg_class \
+                     WHERE relnamespace = current_schema()::regnamespace \
+                     AND relrowsecurity AND NOT relforcerowsecurity \
+                     ORDER BY relname"
+                )
+                .await,
+            Vec::<String>::new(),
+            "a table left enabled but unforced by the second application"
+        );
+        // And publishing still works, so the second application did not leave a
+        // constraint the projection now violates.
+        store
+            .publish_revision(candidate(
+                ExpectedRevision::Empty,
+                "after a re-apply",
+                state_with_directory(),
+            ))
+            .await
+            .expect("a revision publishes against a twice-migrated schema");
+    }
+
+    /// The documented boundary is the boundary the database has.
+    ///
+    /// 0002 and the operator runbook both enumerate the tables deliberately left
+    /// outside the wall, and an operator auditing isolation reads that list rather
+    /// than the policies. A list that named a table that does not exist, or missed
+    /// one that does, would have them conclude a table is walled when a pinned
+    /// session can read all of it.
+    #[tokio::test]
+    async fn the_tables_outside_the_wall_are_the_ones_the_migration_names() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        assert_eq!(
+            store
+                .column(
+                    "SELECT relname::text FROM pg_class \
+                     WHERE relnamespace = current_schema()::regnamespace \
+                     AND relkind = 'r' AND NOT relrowsecurity \
+                     ORDER BY relname"
+                )
+                .await,
+            vec!["axond_cp_schema_migration".to_owned()],
+            "the unwalled tables are not the ones 0002 and the runbook name"
         );
     }
 
@@ -3701,6 +4658,17 @@ mod tests {
             ))
             .await
             .expect("record a refusal against the other tenant");
+        // A refusal that names no tenant, attempted by the *other* tenant's
+        // workload: shared in what was asked for, and not in who asked.
+        let mut theirs = denial(96, ResourceScope::Deployment, DenialReason::OutOfScope);
+        theirs.actor = Actor::Workload {
+            tenant: tenant_id(11),
+            principal: principal_id(36),
+        };
+        store
+            .record_denial(&theirs)
+            .await
+            .expect("record a deployment-scoped refusal by another tenant's workload");
 
         // A login role with no bypass, granted only reads: the shape of a
         // read-only replica consumer or a reporting job.
@@ -3750,7 +4718,44 @@ mod tests {
             .await
             .expect("read")
             .get(0);
-        assert_eq!(denials, 0, "another tenant's refusals are not visible");
+        assert_eq!(
+            denials, 0,
+            "another tenant's refusals — including a deployment-scoped one its workload \
+             attempted — are not visible"
+        );
+
+        // The other side of that rule, which is the whole point of the trail: a
+        // refusal aimed at *this* tenant is readable by it even though another
+        // tenant's workload attempted it. The wall filters the actor only where it
+        // hands a session a row the session is not the subject of.
+        let mut aimed_here = denial(
+            97,
+            ResourceScope::Tenant(tenant_id(1)),
+            DenialReason::CrossTenant,
+        );
+        aimed_here.actor = Actor::Workload {
+            tenant: tenant_id(11),
+            principal: principal_id(37),
+        };
+        store
+            .record_denial(&aimed_here)
+            .await
+            .expect("record a refusal against the pinned tenant by another tenant's workload");
+        let readable: Vec<String> = client
+            .query(
+                "SELECT denial_id FROM axond_cp_access_denial ORDER BY denial_id",
+                &[],
+            )
+            .await
+            .expect("read")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            readable,
+            vec![aimed_here.id.to_string()],
+            "the tenant a cross-tenant attempt targeted cannot read that it happened"
+        );
 
         // Grants have no tenant column of their own: a grant is this tenant's
         // exactly when the principal holding it is, and a session that could read
@@ -3798,6 +4803,36 @@ mod tests {
             journal,
             vec![Some(tenant_id(1).to_string())],
             "the mutation journal leaked another tenant's changes"
+        );
+
+        // And the same asymmetry the refusal trail has: a change recorded *against*
+        // this tenant is this tenant's history whoever made it. Filtering the actor
+        // on tenant-scoped rows too would hide a tenant's own change — along with
+        // its audit event and its idempotency record, which are walled through this
+        // table — because another tenant's service account attempted it.
+        store
+            .attempt(&format!(
+                "INSERT INTO axond_cp_mutation (mutation_id, actor_kind, actor_tenant_id,                  actor_principal_id, mutation_kind, scope_kind, tenant_id, idempotency_key,                  submitted_at) VALUES ('mut_00000000-0000-7000-8000-00000000f00d', 'workload',                  '{}', '{}', 'publish', 'tenant', '{}', 'theirs-against-ours', now())",
+                tenant_id(11),
+                principal_id(38),
+                tenant_id(1),
+            ))
+            .await
+            .expect("record a change against this tenant by another tenant's workload");
+        let attributed: Vec<String> = client
+            .query(
+                "SELECT mutation_id FROM axond_cp_mutation WHERE actor_kind = 'workload'                  ORDER BY mutation_id",
+                &[],
+            )
+            .await
+            .expect("read")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            attributed,
+            vec!["mut_00000000-0000-7000-8000-00000000f00d".to_owned()],
+            "a tenant cannot read a change recorded against it by another tenant's workload"
         );
         let events: i64 = client
             .query_one("SELECT count(*) FROM axond_cp_audit_event", &[])

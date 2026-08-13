@@ -228,6 +228,13 @@ pub enum TenancyError {
         role: &'static str,
         scope: String,
     },
+    #[error("{reference} declares `{value}` in `{field}`, which `{schema}` does not spell there")]
+    ValueNotForSchema {
+        reference: ResourceRef,
+        schema: &'static str,
+        field: &'static str,
+        value: String,
+    },
     #[error("{reference} carries `{field}`, which a {kind} identity does not define")]
     FieldNotForKind {
         reference: ResourceRef,
@@ -239,6 +246,12 @@ pub enum TenancyError {
         reference: ResourceRef,
         first: ResourceRef,
         detail: String,
+    },
+    #[error("{reference} and {first} are both authenticated by the key {digest}")]
+    DuplicateKey {
+        reference: ResourceRef,
+        first: ResourceRef,
+        digest: String,
     },
     #[error("{reference} belongs to {project}, which this revision does not declare")]
     UnknownProject {
@@ -264,8 +277,12 @@ impl TenancyError {
     /// refusal: storage is intact, and the fix is to run a build that reads it or
     /// to publish a revision this one does.
     ///
-    /// Four kinds of refusal are *not* compatibility failures:
+    /// Five kinds of refusal are *not* compatibility failures:
     ///
+    /// - a value this build reads, in a position its schema does not put it: a
+    ///   lifecycle body spelling `active`, which the base schema is the encoding
+    ///   of. No release accepts it there, so "run a newer build" would send the
+    ///   operator after one that cannot exist;
     /// - an identity or ownership contradiction: those rows were readable, this
     ///   build understands both of them, and they disagree;
     /// - a body that is not an inline record, or sits under a kind that does not
@@ -309,6 +326,12 @@ impl TenancyError {
                 *field == SCHEMA_FIELD
             }
             Self::UnknownVocabulary { .. } => true,
+            // And its opposite: a spelling this build reads perfectly well, in a
+            // position its schema does not put it. No release will accept it
+            // there — that is what the schema split means — so telling an
+            // operator to upgrade would send them after a build that cannot
+            // exist. The row was rewritten underneath the gateway.
+            Self::ValueNotForSchema { .. } => false,
             Self::Kind { .. }
             | Self::NotInline { .. }
             | Self::NotARecord { .. }
@@ -323,6 +346,7 @@ impl TenancyError {
             | Self::RoleScope { .. }
             | Self::FieldNotForKind { .. }
             | Self::DuplicatePrincipal { .. }
+            | Self::DuplicateKey { .. }
             | Self::UnknownProject { .. }
             | Self::IdentityScope { .. } => false,
         }
@@ -352,10 +376,12 @@ impl TenancyError {
             | Self::FieldSet { reference, .. }
             | Self::MalformedChecksum { reference, .. }
             | Self::UnknownVocabulary { reference, .. }
+            | Self::ValueNotForSchema { reference, .. }
             | Self::NoRoles { reference }
             | Self::RoleScope { reference, .. }
             | Self::FieldNotForKind { reference, .. }
             | Self::DuplicatePrincipal { reference, .. }
+            | Self::DuplicateKey { reference, .. }
             | Self::IdentityScope { reference, .. }
             | Self::UnknownProject { reference, .. } => *reference,
         }
@@ -688,16 +714,30 @@ impl TenantBody {
             TenantLifecycle::Active
         } else {
             let declared = record.string(LIFECYCLE_FIELD)?;
-            TenantLifecycle::ALL
+            let lifecycle = TenantLifecycle::ALL
                 .iter()
                 .copied()
-                .filter(|lifecycle| *lifecycle != TenantLifecycle::Active)
                 .find(|lifecycle| lifecycle.as_str() == declared)
                 .ok_or_else(|| TenancyError::UnknownVocabulary {
                     reference: resource.reference,
                     vocabulary: "tenant lifecycle",
                     value: declared.to_owned(),
-                })?
+                })?;
+            // `active` is a state this build reads — under the other schema,
+            // which is the encoding it has — so a lifecycle body spelling it is
+            // a rewritten row rather than one from a release that spells it
+            // differently. Refusing it as an unknown vocabulary would tell the
+            // operator to run a newer build, and no newer build will accept it
+            // here.
+            if lifecycle == TenantLifecycle::Active {
+                return Err(TenancyError::ValueNotForSchema {
+                    reference: resource.reference,
+                    schema,
+                    field: LIFECYCLE_FIELD,
+                    value: declared.to_owned(),
+                });
+            }
+            lifecycle
         };
         Ok(Self {
             tenant,
@@ -1592,6 +1632,57 @@ mod tests {
             }
             .is_incompatible(),
             "and so is a row whose kind and body disagree"
+        );
+    }
+
+    /// A state this build reads, stored where its schema does not put it, points
+    /// at the row rather than at an upgrade.
+    ///
+    /// `active` under the lifecycle schema is the case: the split exists so one
+    /// state has one encoding, so no release will ever accept it there. Reported
+    /// as an unknown vocabulary it would read "run a build that understands
+    /// this", sending an operator after a build that cannot exist while the
+    /// rewritten row stays rewritten.
+    #[test]
+    fn a_state_stored_under_the_wrong_schema_is_damage_not_a_skew() {
+        let rewritten = with_fields(&tenant_resource(), |fields| {
+            set(
+                fields,
+                SCHEMA_FIELD,
+                CanonicalValue::string(TenantBody::LIFECYCLE_SCHEMA),
+            );
+            set(
+                fields,
+                "lifecycle",
+                CanonicalValue::string(TenantLifecycle::Active.as_str()),
+            );
+        });
+        let error = TenantBody::read(&rewritten)
+            .expect_err("one state has one encoding, so `active` is not spelled here");
+        assert_eq!(
+            error,
+            TenancyError::ValueNotForSchema {
+                reference: rewritten.reference,
+                schema: TenantBody::LIFECYCLE_SCHEMA,
+                field: "lifecycle",
+                value: TenantLifecycle::Active.as_str().to_owned(),
+            }
+        );
+        assert!(
+            !error.is_incompatible(),
+            "a value this build reads is not a value a newer build wrote"
+        );
+
+        // A state no build spells stays a compatibility refusal, which is the
+        // distinction this test exists to keep: that one *is* answerable by
+        // running the release that wrote it.
+        let newer = with_fields(&rewritten, |fields| {
+            set(fields, "lifecycle", CanonicalValue::string("archived"));
+        });
+        let error = TenantBody::read(&newer).expect_err("`archived` is nothing this build reads");
+        assert!(
+            matches!(error, TenancyError::UnknownVocabulary { .. }) && error.is_incompatible(),
+            "an unknown state is a skew: {error}"
         );
     }
 

@@ -107,10 +107,12 @@ pub enum Surface {
     Alias,
     /// Routing, budget, and rate-limit policy.
     Policy,
-    /// The audit trail itself. Readable, never writable: nothing in this model
-    /// offers an action on an audit event, so an operator who can reach the
-    /// database is the only one who can alter one, and that is the boundary a
-    /// retention policy defends rather than a role.
+    /// The audit trail itself. Readable, never writable — by any role, the
+    /// platform administrator included, which is why [`Role::actions`] answers
+    /// this surface before it consults the role. An administrator who can delete
+    /// audit events can delete the record of their own, so altering one stays an
+    /// operation for whoever can reach the database, bounded by retention and
+    /// backups rather than by a grant.
     AuditTrail,
     /// Usage and spend. Separated from [`Surface::Price`] because reading what a
     /// tenant was charged and deciding what it is charged are different jobs.
@@ -262,7 +264,8 @@ impl fmt::Display for Action {
 pub enum Role {
     /// Runs the deployment. Every surface, every action, deployment-wide —
     /// including creating and deleting tenants, which no tenant-scoped role can
-    /// do.
+    /// do. One exception, and it is the deliberate one: writing the audit trail,
+    /// because a trail its administrator can edit does not record administrators.
     PlatformAdmin,
     /// Runs one tenant. Everything inside it, except creating or deleting the
     /// tenant itself: a tenant that could delete itself could also delete the
@@ -351,14 +354,22 @@ impl Role {
             Action::Rotate,
         ];
         match (self, surface) {
-            // Runs the deployment: no cell is narrowed, because the role exists
-            // to be the one that is not.
+            // The audit trail is read-only for every role, before any role's own
+            // row is consulted — including the platform administrator's. An
+            // administrator who can delete audit events can delete the evidence
+            // of their own actions, which is the one power a trail exists to
+            // deny. Altering one stays a database operation, defended by
+            // retention and backups rather than by a grant.
+            (Self::BillingViewer | Self::Developer, Surface::AuditTrail) => NONE,
+            (_, Surface::AuditTrail) => READ,
+            // Runs the deployment: no other cell is narrowed, because the role
+            // exists to be the one that is not.
             (Self::PlatformAdmin, _) => Action::ALL,
             // Its own tenant is readable and renameable; its existence is not
             // its own to decide.
             (Self::TenantAdmin, Surface::Tenant) => &[Action::Read, Action::Update],
             (Self::TenantAdmin, Surface::Provider | Surface::Credential) => OPERATE,
-            (Self::TenantAdmin, Surface::AuditTrail | Surface::Billing) => READ,
+            (Self::TenantAdmin, Surface::Billing) => READ,
             (Self::TenantAdmin, _) => MANAGE,
             (Self::Operator, Surface::Provider | Surface::Credential) => OPERATE,
             (Self::Operator, Surface::Model | Surface::Alias) => MANAGE,
@@ -369,7 +380,6 @@ impl Role {
                 | Surface::Principal
                 | Surface::Price
                 | Surface::Policy
-                | Surface::AuditTrail
                 | Surface::Billing,
             ) => READ,
             (
@@ -891,6 +901,10 @@ pub struct Directory {
     /// `(issuer, subject)` to principal, so a sign-in resolves without a scan and
     /// two rows for one person are refused at resolution time.
     humans: BTreeMap<(String, String), PrincipalId>,
+    /// Key digest to workload, for the same reason: one key authenticates at most
+    /// one identity, so which roles it carries is a declaration rather than a
+    /// consequence of id ordering.
+    keys: BTreeMap<Checksum, PrincipalId>,
 }
 
 impl Directory {
@@ -970,6 +984,26 @@ impl Directory {
                 }
                 directory.humans.insert(key, principal.body.principal());
             }
+            // The same rule for a minted key: two workloads sharing a digest would
+            // make `authenticate_workload` return whichever id sorts first, so a
+            // key would carry a scope and a role set nobody granted it. SQL holds
+            // a unique index on the digest; refusing it here means the revision is
+            // invalid rather than unpublishable, and the refusal names the digest
+            // rather than a name that did not clash.
+            if let Credential::MintedKey {
+                digest: Some(digest),
+            } = principal.body.credential()
+            {
+                if let Some(first) = directory.keys.get(digest) {
+                    let first = directory.principals[first].reference;
+                    return Err(TenancyError::DuplicateKey {
+                        reference,
+                        first,
+                        digest: digest.to_string(),
+                    });
+                }
+                directory.keys.insert(*digest, principal.body.principal());
+            }
             directory
                 .principals
                 .insert(principal.body.principal(), principal);
@@ -1022,7 +1056,10 @@ impl Directory {
     /// 2. **Whether the request's tenant can be administered.** A deleted tenant
     ///    is a tombstone: reading its audit trail is a database operation, not an
     ///    API call. A disabled tenant is administrable, because settling a bill
-    ///    and re-enabling are the reasons to disable rather than delete.
+    ///    and re-enabling are the reasons to disable rather than delete. A
+    ///    project-scoped request also has to name a project that tenant owns:
+    ///    pairing one's own tenant with a foreign project id is a scope the grant
+    ///    test cannot see through.
     /// 3. **Whether the caller's own tenant is administrable**, which is not the
     ///    same question: a principal of a disabled tenant may not act *anywhere*,
     ///    or disabling a tenant would leave its administrators able to keep
@@ -1072,6 +1109,19 @@ impl Directory {
             }
         }
 
+        // A project scope has to name a project *of* that tenant, checked here
+        // rather than left to the grant test below: `ResourceScope::contains`
+        // compares tenants when the grant is tenant-scoped, so a caller pairing
+        // its own tenant with another tenant's project id — or with one no revision
+        // declares — is inside its grant by that measure. A write would still be
+        // refused by the composite foreign key; a read authorized on a
+        // contradictory scope has nothing behind it at all.
+        if let ResourceScope::Project { tenant, project } = request.scope
+            && tenancy.project(project).map(|owned| owned.body.tenant()) != Some(tenant)
+        {
+            return deny(DenialReason::UnknownProject);
+        }
+
         let principal = match caller {
             Caller::Breakglass => {
                 return Ok(Authorization {
@@ -1092,9 +1142,17 @@ impl Directory {
                 };
             }
             Caller::Human { issuer, subject } => self.human(issuer, subject),
-            Caller::Workload { principal, tenant } => self
-                .principal(*principal)
-                .filter(|found| found.tenant() == Some(*tenant)),
+            // The kind is checked as well as the tenant, so the two caller shapes
+            // are symmetric: `Caller::Human` resolves through an index that holds
+            // only OIDC identities, and a workload claim naming a human's
+            // principal id — which is not a secret, it is a published resource id
+            // — must not authorize with that human's roles and record the change
+            // as that human. Callers are expected to come from
+            // [`Directory::authenticate_workload`]; this is the decision point
+            // refusing to depend on that.
+            Caller::Workload { principal, tenant } => self.principal(*principal).filter(|found| {
+                found.body.kind() == IdentityKind::Workload && found.tenant() == Some(*tenant)
+            }),
         };
         let Some(principal) = principal else {
             return deny(DenialReason::UnknownPrincipal);
@@ -1317,6 +1375,59 @@ impl Authorization {
     }
 }
 
+/// The page of the refusal trail one authorization may read.
+///
+/// The trail is the one read whose *scope is the answer*: the deployment page is
+/// the only place another tenant's workload appears as an actor, so which page a
+/// caller gets cannot come from a query parameter. It comes from here, and the
+/// only way to build one is an [`Authorization`] — which is unforgeable outside
+/// this module and already refuses a tenant-scoped principal that reaches
+/// deployment scope ([`DenialReason::OutOfScope`]). So a tenant administrator
+/// cannot obtain the unscoped page: not by asking for it, and not by holding an
+/// authorization for their own tenant.
+///
+/// A project scope has no page. The trail records refusals against a tenant and
+/// against the deployment; handing a project-scoped principal its tenant's page
+/// would widen the grant it authenticated with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenialPage {
+    tenant: Option<TenantId>,
+}
+
+impl DenialPage {
+    /// The page this decision permits, or `None` if it permits no page at all.
+    ///
+    /// Not every authorization is a trail read: one for another surface, or for a
+    /// write, is not a decision about who may see refusals.
+    pub fn of(authorization: &Authorization) -> Option<Self> {
+        if authorization.request.surface != Surface::AuditTrail
+            || authorization.request.action != Action::Read
+        {
+            return None;
+        }
+        match authorization.request.scope {
+            ResourceScope::Deployment => Some(Self { tenant: None }),
+            ResourceScope::Tenant(tenant) => Some(Self {
+                tenant: Some(tenant),
+            }),
+            ResourceScope::Project { .. } => None,
+        }
+    }
+
+    /// The tenant whose refusals this page holds, or `None` for the
+    /// deployment-scoped page.
+    pub const fn tenant(&self) -> Option<TenantId> {
+        self.tenant
+    }
+
+    /// A page for a store test, where the decision is the thing being stood in
+    /// for rather than the thing under test.
+    #[cfg(test)]
+    pub(crate) const fn for_scope(tenant: Option<TenantId>) -> Self {
+        Self { tenant }
+    }
+}
+
 /// Why a request was refused.
 ///
 /// Precise for the audit trail, and never returned to the caller as-is: see
@@ -1329,6 +1440,11 @@ pub enum DenialReason {
     UnknownPrincipal,
     /// The request names a tenant this revision does not declare.
     UnknownTenant,
+    /// The request names a project this revision does not declare, or one that
+    /// belongs to a tenant other than the one the request paired it with. One
+    /// reason for both, because telling a caller which of the two it hit is a
+    /// project-existence oracle for every other tenant.
+    UnknownProject,
     /// The tenant — the request's, or the caller's own — is deleted.
     TenantNotAdministrable,
     /// The caller holds grants in a different tenant.
@@ -1346,6 +1462,7 @@ impl DenialReason {
     pub const ALL: &'static [Self] = &[
         Self::UnknownPrincipal,
         Self::UnknownTenant,
+        Self::UnknownProject,
         Self::TenantNotAdministrable,
         Self::CrossTenant,
         Self::OutOfScope,
@@ -1356,6 +1473,7 @@ impl DenialReason {
         match self {
             Self::UnknownPrincipal => "unknown-principal",
             Self::UnknownTenant => "unknown-tenant",
+            Self::UnknownProject => "unknown-project",
             Self::TenantNotAdministrable => "tenant-not-administrable",
             Self::CrossTenant => "cross-tenant",
             Self::OutOfScope => "out-of-scope",
@@ -1502,8 +1620,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::super::fixtures::{
-        display_name, human, principal_id, project_id, state, state_with_directory, tenant,
-        tenant_id, workload, workload_key,
+        display_name, human, principal_id, project, project_id, state, state_with_directory,
+        tenant, tenant_id, workload, workload_key,
     };
     use super::*;
     use crate::desired_state::TenantLifecycle;
@@ -1536,38 +1654,45 @@ mod tests {
         for &role in Role::ALL {
             for &surface in Surface::ALL {
                 for &action in Action::ALL {
-                    let expected = match role {
-                        Role::PlatformAdmin => true,
-                        Role::TenantAdmin => match surface {
-                            Surface::Tenant => {
-                                matches!(action, Action::Read | Action::Update)
-                            }
-                            Surface::AuditTrail | Surface::Billing => action == Action::Read,
-                            Surface::Provider | Surface::Credential => true,
-                            _ => action != Action::Rotate,
-                        },
-                        Role::Operator => match surface {
-                            Surface::Provider | Surface::Credential => true,
-                            Surface::Model | Surface::Alias => action != Action::Rotate,
-                            _ => action == Action::Read,
-                        },
-                        Role::BillingViewer => {
-                            action == Action::Read
-                                && matches!(
-                                    surface,
-                                    Surface::Tenant
-                                        | Surface::Project
-                                        | Surface::Price
-                                        | Surface::Billing
-                                )
-                        }
-                        Role::Developer => match surface {
-                            Surface::Alias => action != Action::Rotate,
-                            Surface::Project | Surface::Model | Surface::Price => {
+                    // The audit trail is read-only for everyone who holds it at
+                    // all, so it is stated once, above the roles.
+                    let expected = if surface == Surface::AuditTrail {
+                        action == Action::Read
+                            && !matches!(role, Role::BillingViewer | Role::Developer)
+                    } else {
+                        match role {
+                            Role::PlatformAdmin => true,
+                            Role::TenantAdmin => match surface {
+                                Surface::Tenant => {
+                                    matches!(action, Action::Read | Action::Update)
+                                }
+                                Surface::Billing => action == Action::Read,
+                                Surface::Provider | Surface::Credential => true,
+                                _ => action != Action::Rotate,
+                            },
+                            Role::Operator => match surface {
+                                Surface::Provider | Surface::Credential => true,
+                                Surface::Model | Surface::Alias => action != Action::Rotate,
+                                _ => action == Action::Read,
+                            },
+                            Role::BillingViewer => {
                                 action == Action::Read
+                                    && matches!(
+                                        surface,
+                                        Surface::Tenant
+                                            | Surface::Project
+                                            | Surface::Price
+                                            | Surface::Billing
+                                    )
                             }
-                            _ => false,
-                        },
+                            Role::Developer => match surface {
+                                Surface::Alias => action != Action::Rotate,
+                                Surface::Project | Surface::Model | Surface::Price => {
+                                    action == Action::Read
+                                }
+                                _ => false,
+                            },
+                        }
                     };
                     assert_eq!(
                         role.permits(surface, action),
@@ -1600,17 +1725,133 @@ mod tests {
                 }
             }
         }
-        // Nothing may write the audit trail, whatever else it holds.
+        // No *role* may write the audit trail, whatever else it holds — including
+        // the role that holds everything else. Breakglass is outside the matrix by
+        // construction and therefore outside this invariant too; the assertion
+        // below is about grants, and
+        // `breakglass_is_allowed_everything_and_recorded_as_itself` states the
+        // bypass in the same terms rather than leaving it implied.
         for &role in Role::ALL {
             for &action in Action::ALL {
                 if action.is_write() {
-                    assert_eq!(
-                        role.permits(Surface::AuditTrail, action),
-                        role == Role::PlatformAdmin,
+                    assert!(
+                        !role.permits(Surface::AuditTrail, action),
+                        "{role} may {action} the audit trail"
                     );
                 }
             }
         }
+        // And reading it stays a role a deployment grants deliberately: finance
+        // and application developers are not auditors.
+        for &role in Role::ALL {
+            assert_eq!(
+                role.permits(Surface::AuditTrail, Action::Read),
+                !matches!(role, Role::BillingViewer | Role::Developer),
+                "{role} reads the audit trail"
+            );
+        }
+    }
+
+    /// Which page of the refusal trail a caller gets is a decision, not an
+    /// argument, and this is the boundary that matters: the deployment page is the
+    /// only place another tenant's workload appears as an actor.
+    ///
+    /// A tenant administrator cannot reach it — not by asking, because the page is
+    /// built from an authorization rather than from a parameter, and not by
+    /// holding one, because an authorization at deployment scope is refused to a
+    /// tenant-scoped principal. A project-scoped auditor gets no page at all: the
+    /// trail has no project granularity, and its tenant's page is wider than the
+    /// grant it authenticated with.
+    #[test]
+    fn only_a_deployment_scoped_decision_reads_the_unscoped_refusal_trail() {
+        let state = state_with_directory();
+        let (tenancy, directory) = directory(&state);
+        let tenant = tenant_id(1);
+        let read = |caller: &Caller, scope: ResourceScope| {
+            directory.authorize(
+                &tenancy,
+                caller,
+                request(Surface::AuditTrail, Action::Read, scope),
+            )
+        };
+
+        // The platform administrator, who is the only human here scoped to the
+        // deployment.
+        let platform = read(&caller_human("root"), ResourceScope::Deployment)
+            .expect("a platform administrator reads the deployment trail");
+        assert_eq!(
+            DenialPage::of(&platform).map(|page| page.tenant()),
+            Some(None),
+            "the deployment page is the unscoped one"
+        );
+
+        // The tenant administrator: their own page, and no way to the unscoped one.
+        let scoped = read(&caller_human("admin"), ResourceScope::Tenant(tenant))
+            .expect("a tenant administrator reads their own trail");
+        assert_eq!(
+            DenialPage::of(&scoped).map(|page| page.tenant()),
+            Some(Some(tenant)),
+        );
+        let denial = read(&caller_human("admin"), ResourceScope::Deployment)
+            .expect_err("a tenant administrator does not read the deployment trail");
+        assert_eq!(denial.reason, DenialReason::OutOfScope);
+
+        // A project-scoped principal that holds the surface at all: no page, and
+        // therefore not its tenant's.
+        let mut narrow = state.clone();
+        narrow
+            .supersede(
+                IdentityBody::new(
+                    principal_id(32),
+                    display_name("Auditor"),
+                    Credential::Oidc {
+                        issuer: "https://idp.example".to_owned(),
+                        subject: "dev".to_owned(),
+                    },
+                    [Role::Operator],
+                )
+                .expect("an identity granting a role")
+                .version_at(
+                    ResourceScope::Project {
+                        tenant,
+                        project: project_id(2),
+                    },
+                    Slug::parse("dev").expect("a slug"),
+                    ResourceVersionNumber::FIRST.next(),
+                ),
+            )
+            .expect("granting an existing principal a wider role is valid");
+        let narrow_tenancy = Tenancy::of(&narrow).expect("valid tenancy");
+        let narrow_directory = Directory::of(&narrow, &narrow_tenancy).expect("valid directory");
+        let project = narrow_directory
+            .authorize(
+                &narrow_tenancy,
+                &caller_human("dev"),
+                request(
+                    Surface::AuditTrail,
+                    Action::Read,
+                    ResourceScope::Project {
+                        tenant,
+                        project: project_id(2),
+                    },
+                ),
+            )
+            .expect("an operator in a project may read the surface");
+        assert_eq!(
+            DenialPage::of(&project),
+            None,
+            "a project scope has no page of the trail"
+        );
+
+        // And a decision about something else is not a decision about the trail.
+        let write = directory
+            .authorize(
+                &tenancy,
+                &caller_human("root"),
+                request(Surface::Tenant, Action::Create, ResourceScope::Deployment),
+            )
+            .expect("a platform administrator creates tenants");
+        assert_eq!(DenialPage::of(&write), None);
     }
 
     #[test]
@@ -1855,6 +2096,30 @@ mod tests {
         ));
     }
 
+    /// And one key authenticates one workload. Without this the key would resolve
+    /// to whichever principal sorted first, carrying a scope and a role set nobody
+    /// granted it — and the refusal would come only from SQL, at publication.
+    #[test]
+    fn one_key_is_one_workload() {
+        let mut state = state_with_directory();
+        // The digest principal 32 already carries, at a different id and with a
+        // role that principal was not granted.
+        state
+            .insert(workload(
+                36,
+                "second-runner",
+                ResourceScope::Tenant(tenant_id(1)),
+                &[Role::TenantAdmin],
+                Some(&workload_key(0xd0)),
+            ))
+            .expect("insertion is not validation");
+        let tenancy = Tenancy::of(&state).expect("valid tenancy");
+        assert!(matches!(
+            Directory::of(&state, &tenancy),
+            Err(TenancyError::DuplicateKey { .. })
+        ));
+    }
+
     #[test]
     fn scope_containment_is_one_way() {
         let tenant = tenant_id(1);
@@ -1956,6 +2221,38 @@ mod tests {
         );
     }
 
+    /// A workload claim naming a human is not that human.
+    ///
+    /// A `PrincipalId` is a published resource id rather than a secret, so a
+    /// caller path that built `Caller::Workload` from a request-supplied id —
+    /// instead of from the principal `authenticate_workload` returned — would
+    /// otherwise authorize with a tenant administrator's roles and record the
+    /// change as that person.
+    #[test]
+    fn a_workload_claim_naming_a_human_authorizes_as_nobody() {
+        let state = state_with_directory();
+        let (tenancy, directory) = directory(&state);
+        let tenant = tenant_id(1);
+        let denial = directory
+            .authorize(
+                &tenancy,
+                &Caller::Workload {
+                    tenant,
+                    // The tenant administrator of this very tenant: the claim is
+                    // wrong about the kind and about nothing else.
+                    principal: principal_id(31),
+                },
+                request(
+                    Surface::Principal,
+                    Action::Create,
+                    ResourceScope::Tenant(tenant),
+                ),
+            )
+            .expect_err("a human's id does not authenticate a workload");
+        assert_eq!(denial.reason(), DenialReason::UnknownPrincipal);
+        assert_eq!(denial.public_reason(), "forbidden");
+    }
+
     #[test]
     fn a_caller_of_one_tenant_cannot_reach_another() {
         let mut state = state_with_directory();
@@ -1989,6 +2286,53 @@ mod tests {
             .expect_err("a tenant that does not exist is not reachable either");
         assert_eq!(unknown.reason(), DenialReason::UnknownTenant);
         assert_eq!(unknown.public_reason(), denial.public_reason());
+    }
+
+    /// A caller pairing its *own* tenant with a project that is not that tenant's:
+    /// inside its grant by scope containment, which compares tenants, and a
+    /// contradiction the decision has to catch itself.
+    #[test]
+    fn a_caller_cannot_pair_its_tenant_with_a_project_it_does_not_own() {
+        let mut state = state_with_directory();
+        state
+            .insert(tenant(11, "globex"))
+            .and_then(|state| state.insert(project(&tenant_id(11), 12, "edge")))
+            .expect("a second tenant with a project of its own");
+        let (tenancy, directory) = directory(&state);
+        let tenant = tenant_id(1);
+        for project in [
+            // Another tenant's project, and a project nothing declares.
+            project_id(12),
+            project_id(97),
+        ] {
+            let denial = directory
+                .authorize(
+                    &tenancy,
+                    &caller_human("admin"),
+                    request(
+                        Surface::Alias,
+                        Action::Read,
+                        ResourceScope::Project { tenant, project },
+                    ),
+                )
+                .expect_err("a project of another tenant is not this tenant's project");
+            assert_eq!(denial.reason(), DenialReason::UnknownProject);
+            assert_eq!(denial.public_reason(), "forbidden");
+        }
+        directory
+            .authorize(
+                &tenancy,
+                &caller_human("admin"),
+                request(
+                    Surface::Alias,
+                    Action::Read,
+                    ResourceScope::Project {
+                        tenant,
+                        project: project_id(2),
+                    },
+                ),
+            )
+            .expect("its own tenant's project is still reachable");
     }
 
     #[test]
@@ -2092,6 +2436,14 @@ mod tests {
         }
     }
 
+    /// Breakglass is a bypass of the matrix, not a role inside it.
+    ///
+    /// Including the audit trail, which no role may write: the recovery path is
+    /// deliberately not narrowed surface by surface, because a bypass with
+    /// exceptions is a role, and an operator locked out by a bad grant needs the
+    /// one door that has no grant behind it. What bounds it is that every use is
+    /// recorded as [`Actor::Breakglass`] — the thing an alert watches for — and
+    /// that no handler in this build constructs it from a request.
     #[test]
     fn breakglass_is_allowed_everything_and_recorded_as_itself() {
         let state = state_with_directory();

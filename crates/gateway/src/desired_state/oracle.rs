@@ -33,9 +33,9 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 
-use super::access::AccessDenial;
+use super::access::{AccessDenial, DenialPage};
 use super::canonical::Checksum;
-use super::ids::{RevisionId, TenantId, Uuid7Generator};
+use super::ids::{RevisionId, Uuid7Generator};
 use super::mutation::{AuditEvent, IdempotencyKey};
 use super::resource::{ResourceRef, ResourceVersion};
 use super::revision::{
@@ -295,7 +295,7 @@ impl ControlPlaneStore for InMemoryControlPlane {
 
     async fn denials(
         &self,
-        tenant: Option<TenantId>,
+        page: &DenialPage,
         limit: usize,
     ) -> Result<Vec<AccessDenial>, ControlPlaneError> {
         if let Some(error) = self.outage() {
@@ -308,7 +308,13 @@ impl ControlPlaneStore for InMemoryControlPlane {
         let mut denials: Vec<AccessDenial> = storage
             .denials
             .iter()
-            .filter(|denial| denial.tenant() == tenant)
+            // Scope, exactly as the durable store filters: a page names one
+            // scope and returns every refusal against it, whoever attempted it.
+            // Filtering the actor too would leave a cross-tenant attempt on no
+            // page at all; withholding another tenant's workload is the row-level
+            // security policy's job, and only for the deployment-scoped rows it
+            // shares with every pinned session.
+            .filter(|denial| denial.tenant() == page.tenant())
             .cloned()
             .collect();
         denials.sort_by(|left, right| {
@@ -326,8 +332,8 @@ impl ControlPlaneStore for InMemoryControlPlane {
 mod tests {
     use super::super::canonical::CanonicalValue;
     use super::super::fixtures::{
-        DESIRED_STATE_RESOURCES, alias, candidate, legacy_tenant, reference, revision_id, state,
-        state_with_renamed_alias, tenant_id,
+        DESIRED_STATE_RESOURCES, alias, candidate, legacy_tenant, principal_id, reference,
+        revision_id, state, state_with_renamed_alias, tenant_id,
     };
     use super::super::mutation::{Actor, ExpectedRevision};
     use super::super::resource::{ResourceBody, ResourceKind};
@@ -374,27 +380,79 @@ mod tests {
             .expect("a retry is not a second attempt");
 
         assert_eq!(
-            store.denials(Some(tenant), 10).await.expect("read"),
+            store
+                .denials(&DenialPage::for_scope(Some(tenant)), 10)
+                .await
+                .expect("read"),
             vec![later.clone(), earlier]
         );
         assert_eq!(
-            store.denials(Some(tenant), 1).await.expect("read"),
+            store
+                .denials(&DenialPage::for_scope(Some(tenant)), 1)
+                .await
+                .expect("read"),
             vec![later]
         );
         assert_eq!(
-            store.denials(Some(other), 10).await.expect("read"),
+            store
+                .denials(&DenialPage::for_scope(Some(other)), 10)
+                .await
+                .expect("read"),
             vec![elsewhere.clone()]
         );
         assert_eq!(
-            store.denials(None, 10).await.expect("read"),
+            store
+                .denials(&DenialPage::for_scope(None), 10)
+                .await
+                .expect("read"),
             vec![deployment],
             "no tenant means the deployment-scoped page, not every row"
+        );
+
+        // A refusal against this tenant attempted by another tenant's workload is
+        // on this tenant's page, as it is in the durable store: no other page
+        // would return it, and it is the event the trail exists for.
+        let mut intruder = denial(5, ResourceScope::Tenant(tenant), 500);
+        intruder.actor = Actor::Workload {
+            tenant: other,
+            principal: principal_id(36),
+        };
+        store.record_denial(&intruder).await.expect("record");
+        assert!(
+            store
+                .denials(&DenialPage::for_scope(Some(tenant)), 10)
+                .await
+                .expect("read")
+                .contains(&intruder),
+            "a refusal against this tenant is unreadable by anyone"
+        );
+        assert!(
+            !store
+                .denials(&DenialPage::for_scope(Some(other)), 10)
+                .await
+                .expect("read")
+                .contains(&intruder),
+            "the attempting tenant's page is not where a refusal against another one belongs"
+        );
+        assert!(
+            store
+                .denials(&DenialPage::for_scope(None), 10)
+                .await
+                .expect("read")
+                .iter()
+                .all(|denial| denial.tenant().is_none()),
+            "the platform page is still the deployment-scoped one"
         );
 
         // An outage is an outage for refusals too: a denial that cannot be
         // written must not be reported as written.
         store.set_unavailable(true);
-        assert!(store.denials(Some(tenant), 10).await.is_err());
+        assert!(
+            store
+                .denials(&DenialPage::for_scope(Some(tenant)), 10)
+                .await
+                .is_err()
+        );
         assert!(store.record_denial(&elsewhere).await.is_err());
     }
 

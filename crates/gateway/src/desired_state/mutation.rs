@@ -52,6 +52,22 @@ pub enum Actor {
     System { component: String },
 }
 
+impl Actor {
+    /// The tenant this attribution belongs to, if the actor is one tenant's.
+    ///
+    /// `None` for a human, breakglass, or the gateway itself: those act on the
+    /// deployment, and an administrator of two tenants is not two actors. What
+    /// this exists for is the read side of a refusal — a workload's tenant is
+    /// another tenant's identifier, so it filters what a tenant-scoped read
+    /// returns exactly as it filters what a pinned session sees.
+    pub const fn tenant(&self) -> Option<TenantId> {
+        match self {
+            Self::Human { .. } | Self::Breakglass | Self::System { .. } => None,
+            Self::Workload { tenant, .. } => Some(*tenant),
+        }
+    }
+}
+
 impl Canonical for Actor {
     fn canonical(&self) -> CanonicalValue {
         match self {
