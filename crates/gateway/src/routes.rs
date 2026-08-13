@@ -86,6 +86,15 @@ pub fn router(state: AppState) -> Router {
             } else {
                 route
             };
+            // A diagnostic takes no served-traffic slot, but it is not free
+            // either: its own small ceiling keeps a credential holder from
+            // polling it at unbounded concurrency, without letting served
+            // traffic at *its* ceiling make the replica unanswerable.
+            let route = if spec.auth.takes_a_diagnostic_slot() {
+                route.layer(from_fn_with_state(state.clone(), diagnostic_middleware))
+            } else {
+                route
+            };
             // Admission is the outermost layer, so a request arriving after the
             // drain window is refused before it touches authentication, budgets,
             // or an upstream. The probes and the status diagnostic deliberately
@@ -151,6 +160,11 @@ impl AuthPosture {
     /// rather than a question about the replica doing it.
     fn takes_an_admission_slot(self) -> bool {
         matches!(self, Self::Authenticated)
+    }
+
+    /// Whether the route is bounded by the separate diagnostic ceiling.
+    fn takes_a_diagnostic_slot(self) -> bool {
+        matches!(self, Self::Diagnostic)
     }
 }
 
@@ -409,6 +423,24 @@ fn caller_can_mint_capability(
         .map_or(!capability.is_operator_only(), |scope| {
             scope.contains(&capability) && namespace_allows(snapshot, &caller.namespace, capability)
         })
+}
+
+/// Bound concurrent diagnostic reads.
+///
+/// A diagnostic answers from memory, so the ceiling is small, fixed, and held
+/// only for the handler: there is no body to stream and nothing to settle. It
+/// is deliberately *not* the served-traffic gate. Sharing `max_in_flight` would
+/// let a saturated replica refuse the question "why are you saturated", and
+/// taking a per-subject rate-limit permit would put the rate-limit store on the
+/// path of a read whose whole purpose is to be answerable while that store is
+/// down — the outage the fail-closed limiter turns into a denial.
+async fn diagnostic_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, GatewayError> {
+    let _permit = state.0.admission.admit_diagnostic()?;
+    Ok(next.run(request).await)
 }
 
 /// Reserve a slot for a request and hold it until the response body is fully
@@ -6453,6 +6485,34 @@ max_ttl = "15m"
         status_state_with_revocation(observability, Box::new(crate::revocation::NoDenylist))
     }
 
+    /// A replica whose served-traffic ceiling is small enough for a test to
+    /// exhaust, so "saturated" is a real state rather than a simulated one.
+    fn saturable_status_state(observability: ReplicaObservability) -> AppState {
+        let config = Config::from_toml_str(&format!(
+            "{STATUS_CONFIG}\n[admission]\nmax_in_flight = 1\n"
+        ))
+        .expect("status config");
+        let env = HashMap::from([
+            ("AXOND_OPERATOR_KEY".to_owned(), OPERATOR_KEY.to_owned()),
+            ("AXOND_TENANT_KEY".to_owned(), TENANT_KEY.to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        AppState::new_with_observability(
+            config,
+            &env,
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+            Box::new(NoLimit),
+            Box::new(crate::revocation::NoDenylist),
+            observability,
+        )
+        .expect("status state")
+    }
+
     fn status_state_with_revocation(
         observability: ReplicaObservability,
         revocation: Box<dyn crate::revocation::RevocationStore>,
@@ -6818,6 +6878,54 @@ max_ttl = "15m"
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["phase"], "closing", "{body}");
         assert_eq!(lifecycle.in_flight(), 0, "a diagnostic held the drain open");
+    }
+
+    /// Exempt from the served-traffic gate is not exempt from every bound: the
+    /// diagnostic has a small ceiling of its own, so a credential holder cannot
+    /// poll it at unbounded concurrency. Held at the gate rather than the route
+    /// because a status read completes too fast to keep eight of them in flight
+    /// from a test.
+    #[tokio::test]
+    async fn diagnostic_reads_are_bounded_and_do_not_share_the_served_ceiling() {
+        let state = saturable_status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let admission = &state.0.admission;
+
+        let held: Vec<_> = (0..crate::admission::MAX_IN_FLIGHT_DIAGNOSTICS)
+            .map(|_| admission.admit_diagnostic().expect("under the ceiling"))
+            .collect();
+        assert_eq!(
+            admission.admit_diagnostic().err(),
+            Some(crate::admission::AdmissionRejection::Diagnostics),
+            "the diagnostic ceiling admitted past itself"
+        );
+        // Refused rather than queued, and refused as `503` with retry guidance
+        // rather than as a caller error, because the process is full.
+        let refused = GatewayError::Overloaded(crate::admission::AdmissionRejection::Diagnostics)
+            .into_response();
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(held);
+        drop(admission.admit_diagnostic().expect("a slot was released"));
+
+        // Served traffic at its own ceiling leaves the diagnostic answerable:
+        // "why is this replica saturated" must not be refused by the saturation
+        // it is asking about.
+        let _saturated = admission
+            .admit("tenant-a", crate::admission::RequestKind::Buffered)
+            .await
+            .expect("the only served slot");
+        assert_eq!(
+            admission
+                .admit("tenant-b", crate::admission::RequestKind::Buffered)
+                .await
+                .err(),
+            Some(crate::admission::AdmissionRejection::Global),
+            "the served ceiling never engaged"
+        );
+        let (status, body) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     /// A status read is a cache read: the handler returns the last observation

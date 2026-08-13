@@ -116,6 +116,86 @@ fn dashboard_drill_downs_stay_within_the_configured_dimensions() {
     }
 }
 
+/// `definition` is what Grafana shows; `query` is what it runs. An edit that
+/// moved an unbounded drill-down into the executed query while leaving the echo
+/// bounded would be invisible to a gate that read only the echo, so both are
+/// checked and required to agree.
+#[test]
+fn a_variable_whose_executed_query_differs_from_its_definition_is_refused() {
+    let dashboard = |variable: serde_json::Value| {
+        serde_json::json!({
+            "__inputs": [{"name": "DS_PROMETHEUS", "pluginId": "prometheus"}],
+            "uid": "test",
+            "title": "test",
+            "schemaVersion": 39,
+            "links": [{"url": RUNBOOK_URL}],
+            "templating": {"list": [variable]},
+            "panels": [{
+                "type": "timeseries",
+                "title": "panel",
+                "targets": [{"expr": "sum(rate(axond_request_count[5m]))"}],
+            }],
+        })
+        .to_string()
+    };
+
+    let bounded = "label_values(axond_request_count, axond_namespace)";
+    let smuggled = "label_values(axond_request_count, axond_status)";
+
+    let failures = validate_dashboard(
+        "drift",
+        &dashboard(serde_json::json!({
+            "name": "namespace",
+            "definition": bounded,
+            "query": {"query": smuggled, "refId": "StandardVariableQuery"},
+        })),
+        &BTreeSet::new(),
+    );
+    let text: Vec<String> = failures.iter().map(ToString::to_string).collect();
+    assert!(
+        text.iter().any(|failure| failure.contains("but displays")),
+        "{text:?}"
+    );
+    assert!(
+        failures.iter().any(|failure| matches!(
+            failure,
+            AssetError::UnboundedDrillDown { label, .. } if label == "axond.status"
+        )),
+        "the executed query's drill-down was never checked: {failures:?}"
+    );
+
+    // Agreeing, in either shape Grafana writes, is accepted.
+    for query in [
+        serde_json::json!({"query": bounded, "refId": "StandardVariableQuery"}),
+        serde_json::json!(bounded),
+    ] {
+        assert_eq!(
+            validate_dashboard(
+                "drift",
+                &dashboard(serde_json::json!({
+                    "name": "namespace",
+                    "definition": bounded,
+                    "query": query,
+                })),
+                &BTreeSet::new(),
+            ),
+            Vec::new()
+        );
+    }
+
+    let failures = validate_dashboard(
+        "drift",
+        &dashboard(serde_json::json!({"name": "namespace", "definition": bounded})),
+        &BTreeSet::new(),
+    );
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.to_string().contains("no `query`")),
+        "{failures:?}"
+    );
+}
+
 /// The identity dimensions are refused as metric labels, so no asset can select
 /// on them even by accident. This asserts the property from the asset side: a
 /// panel that tried would fail this gate.

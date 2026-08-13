@@ -599,6 +599,16 @@ fn slug(heading: &str) -> String {
         .collect()
 }
 
+/// The query string Grafana runs for a template variable. Grafana writes it
+/// either as a bare string or as an object carrying one, and both shapes import.
+fn executed_query(variable: &Value) -> Option<String> {
+    let query = variable.get("query")?;
+    query
+        .as_str()
+        .or_else(|| query.get("query").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
 /// Check a Grafana dashboard: it must import without editing, every panel must
 /// query something the catalogue declares, and every drill-down variable must
 /// stay inside the configured dimensions.
@@ -664,6 +674,26 @@ pub fn validate_dashboard(
             continue;
         };
         failures.extend(validate_drill_down(asset, name, definition));
+        // `definition` is Grafana's human-readable echo; `query` is what it
+        // actually runs. Checking only the echo would let an edit to one of them
+        // ship a drill-down the gate never saw, so the executed query is checked
+        // too and the two must agree.
+        let Some(query) = executed_query(variable) else {
+            failures.push(AssetError::malformed(
+                asset,
+                format!("variable `{name}` has no `query` for Grafana to run"),
+            ));
+            continue;
+        };
+        if query != definition {
+            failures.push(AssetError::malformed(
+                asset,
+                format!(
+                    "variable `{name}` runs `{query}` but displays `{definition}`; the query Grafana runs is the one that must stay bounded"
+                ),
+            ));
+            failures.extend(validate_drill_down(asset, name, &query));
+        }
     }
 
     for panel in panels(&dashboard) {

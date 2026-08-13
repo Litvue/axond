@@ -10,23 +10,46 @@ dashboards and alert rules under [`ops/observability/`](../../ops/observability/
 are the same signals as assets you can import, and every rule's `runbook_url`
 points at a section of this page.
 
-**What is live today.** Every metric named below is emitted, with one exception:
-no release yet constructs a status refresher, so `axond_status_component_state`,
-`axond_status_observation_age`, and `axond_status_refreshes` are not produced on
-any deployment — stateless or not — and `GET /admin/v1/status` answers with every
-component `disabled`. Four shipped rules are therefore inert until a future
-slice injects a refresher for the backend it owns: `AxondDependencyImpaired`,
-`AxondStatusObservationsStale`, `AxondStatusRefreshesFailing`, and
-`AxondStatusRefresherStalled`, together with the *Dependency state*, *Observation
-age*, and *Refresh outcomes* panels on the fleet dashboard. The stall rule is
-inert rather than perpetually firing on purpose: it asks for an absent refresh
-series **and** a status gauge that has existed within the last six hours, so
-"never wired" is silent and only "was observing, then stopped" pages. Nothing
-here needs to be disabled at import. Everything else — served traffic, latency,
-convergence, providers, capacity, lifecycle — is live now.
+**What is live today.** Two families are not produced by any release yet, because
+nothing in `serve` constructs the loop that produces them.
+
+* **Status.** No status refresher is constructed, so
+  `axond_status_component_state`, `axond_status_observation_age`, and
+  `axond_status_refreshes` are absent on every deployment — stateless or not —
+  and `GET /admin/v1/status` answers with every component `disabled`.
+* **Revision convergence.** No reconciler is constructed either (the
+  `convergence` module is contract-only until a projection from resource bodies
+  to a servable config lands), so every `axond_revision_*` series — `lag`,
+  `converged`, `consecutive_failures`, `rejections`, `attempts`,
+  `last_known_good`, `convergence_duration` — is absent too.
+
+Eight shipped rules are therefore inert until those slices land:
+`AxondDependencyImpaired`, `AxondStatusObservationsStale`,
+`AxondStatusRefreshesFailing`, `AxondStatusRefresherStalled`, and
+`AxondControlPlaneUnreachable` on the status side; `AxondRevisionLagAboveTarget`,
+`AxondRevisionRejectionsSustained`, and `AxondRevisionConvergenceSplit` on the
+convergence side. So are the *Dependency state*, *Observation age*, *Refresh
+outcomes*, *Revision lag*, *Revision rejections*, *Convergence attempts*, and
+*Convergence duration* panels on the fleet dashboard. Read the two convergence
+failure modes below as the contract they will report against, not as coverage you
+have now.
+
+`AxondFleetRevisionSplit` is the one rule in the convergence group that works
+today, because `axond_config_generation` comes from the file/environment reload
+path rather than from a reconciler — but that gauge is first recorded on a
+replica's first reload, so a fleet that has never reloaded emits no series and
+the rule stays silent until one does.
+
+The stall rule is inert rather than perpetually firing on purpose: it asks for an
+absent refresh series **and** a status gauge that has existed within the last six
+hours, so "never wired" is silent and only "was observing, then stopped" pages.
+Nothing here needs to be disabled at import. Everything else — served traffic,
+latency, config reloads, providers, capacity, usage delivery, lifecycle — is live
+now.
 
 So do not read a flat dependency panel as a healthy dependency: until that
-wiring lands, use `axond_config_reloads`, `axond_revision_*`, and the fail-closed
+wiring lands, use `axond_config_reloads`, upstream health
+(`axond_upstream_circuit_state`, `axond_upstream_timeouts`), and the fail-closed
 denial counters (`axond_rate_limit_unavailable_denials`,
 `axond_revocation_unavailable_denials`, `axond_budget_capacity_denials`) as the
 evidence that a dependency is impaired. Importing the assets now keeps them
@@ -295,7 +318,7 @@ under-sized `max_subjects`, and it is per replica by design.
 ### The replica is shedding load
 
 **Signal.** `axond_admission_rejections` split by `axond_admission_resource`
-(`request`, `stream`, `tenant`, `queue`) and `axond_error_type`, with
+(`request`, `stream`, `tenant`, `queue`, `diagnostic`) and `axond_error_type`, with
 `axond_admission_in_flight` as the leading indicator.
 
 **Alert.** `AxondAdmissionShedding`, `AxondAdmissionSaturated`.
@@ -305,7 +328,11 @@ under-sized `max_subjects`, and it is per replica by design.
 namespace's ceiling and is the caller's own concurrency. Sustained `queue`
 rejections mean under-provisioning rather than burstiness: queueing only absorbs
 short bursts. Shed requests are refused before the rate-limit store, the budget
-reservation, and the provider, so shedding costs nothing upstream.
+reservation, and the provider, so shedding costs nothing upstream. `diagnostic`
+is a different animal: it is the fixed eight-deep ceiling on `GET
+/admin/v1/status`, it is not sized by `admission.max_in_flight`, and it means
+something is polling the diagnostic rather than that the replica is out of
+capacity — served traffic is unaffected either way.
 
 ### A replica is stuck draining
 
@@ -326,8 +353,10 @@ or shorten `max_stream_duration_ms`.
 
 `GET /admin/v1/status` still answers in both phases and reports the phase it is
 in, including `closing`: it authenticates but sits outside admission, and takes
-no in-flight slot, so polling a stuck replica neither is refused nor extends the
-drain it is describing.
+no served in-flight slot, so polling a stuck replica neither is refused nor
+extends the drain it is describing. It is not unbounded, though — eight
+concurrent diagnostic reads per replica, refused beyond that with `503
+diagnostic_concurrency_exceeded`. Poll serially when scripting a fleet sweep.
 
 ## Bounded drill-down
 

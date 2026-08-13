@@ -31,7 +31,7 @@ another ([ADR 0031](./adr/0031-bounded-status-contract.md)):
 | --- | --- | --- |
 | `GET /healthz` | none | *Is the process alive?* Answers `ok` throughout, including the shutdown drain. Restart it if this fails. |
 | `GET /readyz` | none | *Should traffic be sent here?* `ready`, or `503 draining` once termination begins. Point the load balancer here. |
-| `GET /admin/v1/status` | any gateway credential; a scoped token also needs the `status` capability | *Which dependencies is this replica talking to?* Cached component states with an observation age. Answers throughout the shutdown, including `closing`. |
+| `GET /admin/v1/status` | any gateway credential; a scoped token also needs the `status` capability | *Which dependencies is this replica talking to?* Cached component states with an observation age. Answers throughout the shutdown, including `closing`, and is bounded by its own eight-deep diagnostic ceiling rather than by `admission.max_in_flight`. |
 
 Neither `/healthz` nor `/readyz` observes a dependency. A store outage must not
 remove healthy replicas from service, so dependency state lives only on the
@@ -140,7 +140,7 @@ metric and a usage row can never disagree.
 | `axond.rate_limit.denials` | counter | — | Inbound concurrency admissions rejected. |
 | `axond.rate_limit.capacity_denials` | counter | — | In-memory admissions rejected because the bounded subject map is full. |
 | `axond.rate_limit.unavailable_denials` | counter | — | Redis rate-limit admissions denied because the store was unavailable. |
-| `axond.admission.in_flight` | up-down counter | `axond.admission.resource` | Admission capacity held right now, by resource: `request`, `stream`, `tenant`, `queue`. Bounded label set — no tenant, subject, or request identity. |
+| `axond.admission.in_flight` | up-down counter | `axond.admission.resource` | Admission capacity held right now, by resource: `request`, `stream`, `tenant`, `queue`, `diagnostic`. Bounded label set — no tenant, subject, or request identity. |
 | `axond.admission.rejections` | counter | `axond.admission.resource`, `axond.error.type` | Requests shed by admission control, by resource and stable error type. |
 | `axond.status.component_state` | gauge | `axond.status.component` | Last observed dependency state: `0` disabled, `1` ok, `2` degraded, `3` unavailable — a severity ladder, so `>= 2` is trouble and the stateless posture (`disabled` everywhere) sits below `ok` rather than above `unavailable`. Bounded label set — no tenant, subject, or credential identity. |
 | `axond.status.observation_age` | gauge (ms) | `axond.status.component` | Age of the cached observation behind that state; a rising age means the refresher, not the dependency, is the problem. |
@@ -283,6 +283,7 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | `429` | `tenant_concurrency_exceeded` | The caller's namespace is at `admission.max_in_flight_per_tenant` on this replica. The caller's own concurrency is the cause, so it is a `429` rather than a `503`. | Raise the per-tenant ceiling, or have the caller lower its concurrency. Carries `Retry-After: 1`. |
 | `503` | `gateway_overloaded`, `stream_capacity_exhausted` | The replica is at `admission.max_in_flight` (or `max_in_flight_streams`). Raised after authentication and before the rate-limit store, the budget reservation, and the provider, so a shed request costs nothing. | Scale out, or raise the ceilings to what one process can actually hold. `axond.admission.in_flight` says which resource ran out. |
 | `503` | `admission_queue_full`, `admission_queue_timeout` | Queueing is enabled and the queue is full, or a queued request outlived `admission.queue_wait_ms`. | Sustained shedding here means under-provisioning rather than burstiness; queueing only helps short bursts. |
+| `503` | `diagnostic_concurrency_exceeded` | Eight diagnostic reads (`GET /admin/v1/status`) were already in flight on this replica. A fixed ceiling of its own, separate from `max_in_flight`: served traffic at its ceiling never makes the replica unanswerable, and polling the diagnostic never consumes served capacity. | Poll less often. It is not configurable, and a diagnostic answers from memory, so eight concurrent is a bound on abuse rather than a capacity dial. Carries `Retry-After: 1`. |
 | `503` | `admission_tenant_capacity_exhausted` | More distinct namespaces were in flight than `admission.max_tenants`, so the admission table itself is full. | Raise `max_tenants`. No `Retry-After` is sent: waiting will not change it. |
 | `413` | `request_too_large`, `prompt_too_large` | The body exceeded `admission.max_request_bytes` (refused by the router before it was buffered), or the estimated input exceeded `admission.max_prompt_tokens`. | Caller-side fix, or raise the bound if the workload needs it. Neither message echoes the request. |
 | `415` | `unsupported_media_type` | The request did not declare `content-type: application/json`. Unchanged in status from earlier releases; only the body is now the typed JSON envelope. | Caller-side fix: send a JSON content type. |

@@ -45,7 +45,11 @@ reason codes, exact observation ages, and the revision summary, while every othe
 caller sees only the components its own requests depend on, with reasons coarsened
 to `unavailable`, ages floored to whole seconds, and no revision summary. Which
 components are enabled is a deployment property, so a stateless replica answers
-`200` with every component `disabled` rather than `404`.
+`200` with every component `disabled` rather than `404`. The route is bounded by
+its own fixed eight-deep diagnostic ceiling — `503
+diagnostic_concurrency_exceeded` beyond it — rather than by
+`admission.max_in_flight`, so it stays answerable on a saturated or draining
+replica while still refusing an unbounded poller.
 
 Responses is forwarded natively with only `model` rewritten and streaming is
 byte-faithful. **Every** `/v1/responses` request — initial calls as well as ones

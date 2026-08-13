@@ -46,6 +46,17 @@ pub const RESOURCE_REQUEST: &str = "request";
 pub const RESOURCE_STREAM: &str = "stream";
 pub const RESOURCE_TENANT: &str = "tenant";
 pub const RESOURCE_QUEUE: &str = "queue";
+pub const RESOURCE_DIAGNOSTIC: &str = "diagnostic";
+
+/// Concurrent diagnostic reads one replica will answer.
+///
+/// Not configurable, and deliberately far below any served-traffic ceiling: a
+/// diagnostic answers from memory in microseconds, so this is a bound on abuse
+/// rather than a capacity dial. It is separate from `max_in_flight` so that a
+/// replica saturated by served traffic can still be asked what is wrong with
+/// it, and so that polling the diagnostic cannot consume the capacity served
+/// traffic needs.
+pub const MAX_IN_FLIGHT_DIAGNOSTICS: usize = 8;
 
 /// Largest ceiling a semaphore-backed bound may carry. Config validation refuses
 /// anything larger, so an absurd number is a typed boot error rather than an
@@ -80,6 +91,8 @@ pub enum AdmissionRejection {
     QueueFull,
     #[error("admission queue wait expired")]
     QueueTimeout,
+    #[error("concurrent diagnostic limit exceeded")]
+    Diagnostics,
 }
 
 impl AdmissionRejection {
@@ -92,6 +105,7 @@ impl AdmissionRejection {
             Self::Global => "gateway_overloaded",
             Self::QueueFull => "admission_queue_full",
             Self::QueueTimeout => "admission_queue_timeout",
+            Self::Diagnostics => "diagnostic_concurrency_exceeded",
         }
     }
 
@@ -108,9 +122,12 @@ impl AdmissionRejection {
     /// cannot predict, so it advertises nothing.
     pub fn retry_after_seconds(self) -> Option<u64> {
         match self {
-            Self::Tenant | Self::Streams | Self::Global | Self::QueueFull | Self::QueueTimeout => {
-                Some(1)
-            }
+            Self::Tenant
+            | Self::Streams
+            | Self::Global
+            | Self::QueueFull
+            | Self::QueueTimeout
+            | Self::Diagnostics => Some(1),
             Self::TenantCapacity => None,
         }
     }
@@ -122,6 +139,7 @@ impl AdmissionRejection {
             Self::Streams => RESOURCE_STREAM,
             Self::Global => RESOURCE_REQUEST,
             Self::QueueFull | Self::QueueTimeout => RESOURCE_QUEUE,
+            Self::Diagnostics => RESOURCE_DIAGNOSTIC,
         }
     }
 }
@@ -173,6 +191,7 @@ pub struct AdmissionControl {
     global: Option<Arc<Semaphore>>,
     streams: Option<Arc<Semaphore>>,
     queue: Option<Arc<Semaphore>>,
+    diagnostics: Arc<Semaphore>,
     tenants: Arc<TenantTable>,
 }
 
@@ -184,6 +203,7 @@ impl AdmissionControl {
                 .max_in_flight_streams
                 .map(|n| Arc::new(Semaphore::new(n))),
             queue: limits.queue_capacity.map(|n| Arc::new(Semaphore::new(n))),
+            diagnostics: Arc::new(Semaphore::new(MAX_IN_FLIGHT_DIAGNOSTICS)),
             tenants: Arc::new(TenantTable {
                 limit: limits.max_in_flight_per_tenant,
                 max_tenants: limits.max_tenants,
@@ -236,6 +256,22 @@ impl AdmissionControl {
         Ok(permit)
     }
 
+    /// Admit one diagnostic read, or shed it.
+    ///
+    /// Never waits and never queues: a diagnostic that has to queue has stopped
+    /// being a diagnostic. Takes no tenant, global, or stream slot, so a caller
+    /// polling it cannot displace served traffic — and served traffic at its own
+    /// ceiling cannot make the replica unanswerable.
+    pub fn admit_diagnostic(&self) -> Result<DiagnosticPermit, AdmissionRejection> {
+        let permit = Arc::clone(&self.diagnostics)
+            .try_acquire_owned()
+            .map_err(|_| reject(AdmissionRejection::Diagnostics))?;
+        metrics::record_admission_acquired(RESOURCE_DIAGNOSTIC);
+        Ok(DiagnosticPermit {
+            _permit: Some(permit),
+        })
+    }
+
     /// The global ceiling, with the bounded queue behind it. Without a queue
     /// (the default) saturation is refused immediately, which is the bounded
     /// behavior: a caller learns now rather than after an unbounded wait.
@@ -268,6 +304,20 @@ impl AdmissionControl {
 fn reject(rejection: AdmissionRejection) -> AdmissionRejection {
     metrics::record_admission_rejection(rejection.scope(), rejection.code());
     rejection
+}
+
+/// The diagnostic slot one in-flight diagnostic read holds, released on every
+/// exit path by `Drop` exactly as a served request's permit is.
+pub struct DiagnosticPermit {
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for DiagnosticPermit {
+    fn drop(&mut self) {
+        if self._permit.take().is_some() {
+            metrics::record_admission_released(RESOURCE_DIAGNOSTIC);
+        }
+    }
 }
 
 /// A request waiting for the global ceiling. Exists to keep the queue gauge and
