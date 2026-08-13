@@ -806,6 +806,73 @@ fn an_outage_excuses_only_the_rows_the_fleet_reported_losing() {
     );
 }
 
+/// An outage the run never injected excuses nothing. Where the configured
+/// database is not on this machine the harness leaves its DSN alone, so the
+/// usage-backend outage is not evaluated — and the *time* the script set aside
+/// for it must stop being a shelter for lost rows and dropped batches, or a run
+/// against a remote database would grade itself against a fault nobody applied.
+#[test]
+fn an_outage_that_was_never_injected_excuses_nothing() {
+    use stateful_endurance::run::in_usage_window;
+    use std::time::Duration;
+
+    let window = Some((Duration::from_secs(10), Duration::from_secs(20)));
+    assert!(!in_usage_window(window, Duration::from_secs(9)));
+    assert!(in_usage_window(window, Duration::from_secs(10)));
+    assert!(
+        in_usage_window(window, Duration::from_secs(20)),
+        "the closing edge is carried one drain interval, because a record is \
+         stamped with the tick it was drained on"
+    );
+    assert!(!in_usage_window(window, Duration::from_secs(30)));
+
+    // No window at all: nothing is in it, at any moment of the run, including
+    // the instants the schedule had reserved for the outage.
+    for now in [0, 9, 10, 15, 20, 30, 3_600] {
+        assert!(
+            !in_usage_window(None, Duration::from_secs(now)),
+            "an unevaluated outage cannot excuse a loss at {now}s"
+        );
+    }
+
+    // And the run reaches that state exactly where the outage is skipped.
+    let source = include_str!("support/stateful_endurance/run.rs");
+    assert!(
+        source.contains("if reach != Reach::Gated {\n        state.without_usage_outage();"),
+        "a directly reached database leaves the driver with no outage window"
+    );
+    assert!(
+        source.contains("Reach::Direct => durable_counts.distinct,"),
+        "and the durable comparison is then made over the whole run"
+    );
+}
+
+/// The harness's own reconciliation connection follows libpq's rules rather
+/// than its own: `prefer` may fall back to plaintext, so a loopback server with
+/// a certificate this machine has no reason to trust does not abort a whole
+/// qualification run over the harness's connection, while `require` and
+/// `disable` are honoured exactly as they were given.
+#[test]
+fn a_preferred_tls_connection_may_fall_back_but_a_required_one_may_not() {
+    use stateful_endurance::durable::may_fall_back;
+
+    let parsed = |dsn: &str| -> tokio_postgres::Config { dsn.parse().expect("the DSN parses") };
+
+    assert!(may_fall_back(&parsed(
+        "postgres://user:pw@127.0.0.1:5432/postgres?sslmode=prefer"
+    )));
+    // No mode named is `prefer`, which is the case a developer's DSN usually is.
+    assert!(may_fall_back(&parsed(
+        "postgres://user:pw@127.0.0.1:5432/postgres"
+    )));
+    assert!(!may_fall_back(&parsed(
+        "postgres://user:pw@127.0.0.1:5432/postgres?sslmode=require"
+    )));
+    assert!(!may_fall_back(&parsed(
+        "postgres://user:pw@127.0.0.1:5432/postgres?sslmode=disable"
+    )));
+}
+
 /// A replica that has not finished reloading is a slow reload, not a tenant
 /// reaching into another tenant's credentials. The difference decides which
 /// gate fails and whether the run is abandoned, so the probe reads a flag the

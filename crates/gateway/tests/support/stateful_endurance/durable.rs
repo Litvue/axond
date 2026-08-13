@@ -294,19 +294,53 @@ pub struct Settled {
 }
 
 async fn connect(dsn: &str) -> tokio_postgres::Client {
-    // Use the same Rustls-capable connector as the gateway's PostgreSQL sinks.
-    // The gate only forwards bytes, so this preserves `sslmode=prefer` and
-    // `sslmode=require` while still allowing the harness to count and reconcile
-    // rows on a TLS-enabled database.
+    // Use the same Rustls-capable connector as the gateway's PostgreSQL sinks,
+    // so a TLS-enabled database is reconciled rather than refused. The gate only
+    // forwards bytes, so `sslmode=prefer` and `sslmode=require` reach the server
+    // as they were given.
     let config: tokio_postgres::Config = dsn.parse().expect("the test DSN is valid");
-    let (client, connection) = config
-        .connect(tls_connector())
-        .await
-        .expect("the stateful endurance run connects to PostgreSQL");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
+    match config.connect(tls_connector()).await {
+        Ok((client, connection)) => {
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+        }
+        // `prefer` prefers encryption rather than demanding it, as libpq does:
+        // a loopback server offering a certificate this machine has no reason to
+        // trust is not the finding this run is looking for, and refusing to
+        // reconcile at all would abort the whole qualification over the
+        // harness's own connection. `require` and `disable` are honoured as
+        // they were given.
+        Err(error) if may_fall_back(&config) => {
+            let (client, connection) =
+                config
+                    .connect(tokio_postgres::NoTls)
+                    .await
+                    .unwrap_or_else(|plain| {
+                        panic!(
+                            "the stateful endurance run connects to PostgreSQL: TLS was \
+                         preferred and failed ({error}), and so did the plaintext \
+                         connection ({plain})"
+                        )
+                    });
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+        }
+        Err(error) => panic!("the stateful endurance run connects to PostgreSQL: {error}"),
+    }
+}
+
+/// Whether a failed TLS attempt may be retried without encryption. Only for
+/// `prefer`, which is what libpq itself does — and what a DSN naming no mode at
+/// all asks for.
+pub fn may_fall_back(config: &tokio_postgres::Config) -> bool {
+    matches!(
+        config.get_ssl_mode(),
+        tokio_postgres::config::SslMode::Prefer
+    )
 }
 
 fn tls_connector() -> MakeRustlsConnect {

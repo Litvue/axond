@@ -159,6 +159,9 @@ pub async fn run_with(
         duration,
         &tenants,
     );
+    if reach != Reach::Gated {
+        state.without_usage_outage();
+    }
 
     // One client for the workers and the driver alike, as the stateless drivers
     // do: a pool per worker would put the driver's own descriptors and sockets
@@ -256,11 +259,20 @@ pub async fn run_with(
     state.abandon_pending_revisions();
     let settled = durable.await_settled(settle, DURABLE_QUIET).await;
 
-    let (usage_from, usage_to) = profile.schedule.usage_outage_window(duration);
     let durable_counts = durable.counts().await;
-    let durable_outside = durable
-        .distinct_outside(started_at + usage_from, started_at + usage_to)
-        .await;
+    // The outage's half of the loss only exists where the outage was applied.
+    // A directly reached database was never taken away, so every row it holds
+    // was settled at a moment nothing excuses and the comparison is made over
+    // the whole run.
+    let durable_outside = match reach {
+        Reach::Gated => {
+            let (usage_from, usage_to) = profile.schedule.usage_outage_window(duration);
+            durable
+                .distinct_outside(started_at + usage_from, started_at + usage_to)
+                .await
+        }
+        Reach::Direct => durable_counts.distinct,
+    };
 
     // The samplers are read for the last time before the processes stop: a
     // settled reading is what the process *kept*, and a dead process keeps
@@ -345,6 +357,18 @@ pub fn segment_ms(scale: &Scale, duration: Duration, min_segments: u64) -> u64 {
 pub fn touched(windows: &[(Duration, Duration)], at: Duration, latency_ms: f64) -> bool {
     let ended = at + Duration::from_secs_f64((latency_ms / 1000.0).max(0.0));
     windows.iter().any(|(from, to)| ended >= *from && at < *to)
+}
+
+/// Whether a record or a drop report drained at `now` falls inside the declared
+/// usage-backend outage. `None` is a run that never took the database away —
+/// the harness reached it directly, so the outage was not evaluated — and a row
+/// lost during a fault nobody injected is a finding rather than an excused one.
+///
+/// The closing edge is carried one drain interval because both records and
+/// reports are stamped with the tick they were drained on rather than the
+/// instant the process wrote them.
+pub fn in_usage_window(window: Option<(Duration, Duration)>, now: Duration) -> bool {
+    window.is_some_and(|(from, to)| now >= from && now < to + DRAIN_EVERY)
 }
 
 fn authority(base_url: &str) -> &str {
@@ -1151,7 +1175,10 @@ struct State {
     emitted_outside_usage_window: u64,
     emitted_in_usage_window: u64,
     sink_drops: SinkDrops,
-    usage_window: (Duration, Duration),
+    /// The declared usage-backend outage, or `None` when the run never applied
+    /// one: a database this harness reaches directly cannot be taken away, so
+    /// there is no window for a lost row to shelter in.
+    usage_window: Option<(Duration, Duration)>,
     fault_windows: Vec<(Duration, Duration)>,
     /// When the last usage record arrived, absent until the first one does.
     last_record_at: Option<Duration>,
@@ -1326,7 +1353,7 @@ impl State {
             emitted_outside_usage_window: 0,
             emitted_in_usage_window: 0,
             sink_drops: SinkDrops::default(),
-            usage_window: schedule.usage_outage_window(duration),
+            usage_window: Some(schedule.usage_outage_window(duration)),
             fault_windows: schedule.attribution_windows(duration),
             last_record_at: None,
             samplers: Vec::new(),
@@ -1505,8 +1532,7 @@ impl State {
         // the closing edge is carried that far forward: a record the database
         // records inside the window must not be counted as one this side owed
         // outside it.
-        let (from, to) = self.usage_window;
-        if now >= from && now < to + DRAIN_EVERY {
+        if in_usage_window(self.usage_window, now) {
             self.emitted_in_usage_window += 1;
         } else {
             self.emitted_outside_usage_window += 1;
@@ -1540,6 +1566,14 @@ impl State {
         }
     }
 
+    /// Forget the declared usage-backend outage, for a run whose database is
+    /// reached directly and so is never taken away. Without this, records and
+    /// drop reports landing in the *time* the script set aside for an outage
+    /// would be excused by a fault the run never injected.
+    fn without_usage_outage(&mut self) {
+        self.usage_window = None;
+    }
+
     /// Fold in one of the fleet's reports of a usage batch it dropped. The
     /// report is what attributes a missing durable row: the process names the
     /// sink, the reason, and the count, and the driver only has to say whether
@@ -1553,13 +1587,12 @@ impl State {
         self.sink_drops.reports += 1;
         self.sink_drops.records += records;
         *self.sink_drops.by_reason.entry(reason.clone()).or_default() += records;
-        let (from, to) = self.usage_window;
         // Only the durable sink's losses are the database outage's. A stdout
         // sink dropping a batch while Postgres is gone is unrelated to it. The
         // closing edge is carried one drain interval, as it is for the records
         // themselves: both are stamped with the tick they were drained on, and
         // a report read a tick late must still account for what it lost.
-        if sink != "stdout" && now >= from && now < to + DRAIN_EVERY {
+        if sink != "stdout" && in_usage_window(self.usage_window, now) {
             self.sink_drops.records_in_usage_window += records;
             if reason == SAMPLED_DROP_REASON {
                 self.sink_drops.sampled_records_in_usage_window += records;
@@ -1618,9 +1651,10 @@ impl State {
         let Some(last) = self.last_record_at else {
             return;
         };
-        let (usage_from, usage_to) = self.usage_window;
         let overlaps = |from: Duration, to: Duration| now >= from && last < to;
-        if overlaps(usage_from, usage_to)
+        if self
+            .usage_window
+            .is_some_and(|(from, to)| overlaps(from, to))
             || self
                 .fault_windows
                 .iter()
