@@ -1,6 +1,6 @@
 -- Axond catalogue store schema, version 1 — imported models.dev snapshots and
 -- the pointer to the one that is active
--- (docs/adr/0050-durable-catalogue-snapshots-and-refresh-orchestration.md).
+-- (docs/adr/0051-durable-catalogue-snapshots-and-refresh-orchestration.md).
 --
 -- Two tables, and the split is the point. `axond_catalog_snapshot` is history:
 -- one row per distinct imported catalogue, keyed by the identity of its

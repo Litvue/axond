@@ -1,4 +1,4 @@
-# 50. Durable catalogue snapshots, and who decides when to import one
+# 51. Durable catalogue snapshots, and who decides when to import one
 
 Date: 2026-08-12
 

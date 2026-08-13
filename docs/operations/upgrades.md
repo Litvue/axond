@@ -25,7 +25,7 @@ deployment unit. Read the release's `CHANGELOG.md` entry before every rollout.
    catalogues. No release configures a catalogue store yet, so this is inert
    until the slice that wires one exists; the DDL is additive and idempotent,
    and applying it early costs two empty tables
-   ([ADR 0050](../adr/0050-durable-catalogue-snapshots-and-refresh-orchestration.md)).
+   ([ADR 0051](../adr/0051-durable-catalogue-snapshots-and-refresh-orchestration.md)).
 6. Complete any stop-the-fleet Redis/Postgres budget migration before starting
    namespace-cap-aware replicas.
 7. Verify ingress streaming behavior and client retries.

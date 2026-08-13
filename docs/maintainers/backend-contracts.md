@@ -202,7 +202,7 @@ has nothing new" cannot be confused with "the upstream now lists no models",
 which would retire every model.
 
 That holds now that something drives refresh on a schedule
-([ADR 0050](../adr/0050-durable-catalogue-snapshots-and-refresh-orchestration.md)).
+([ADR 0051](../adr/0051-durable-catalogue-snapshots-and-refresh-orchestration.md)).
 `CatalogRefresher` writes an import to `CatalogStore` *before* it becomes
 active, so a deployment never serves a catalogue it could not retain; a refusal
 of any kind — upstream, parse, storage, timeout — leaves the active catalogue
