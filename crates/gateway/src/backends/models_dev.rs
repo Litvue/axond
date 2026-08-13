@@ -339,6 +339,13 @@ impl ModelsDevAdapter {
                     }
                 }
             })?;
+        // `serde_json::from_str` ends by refusing bytes after the top-level
+        // value; a hand-built deserializer has to be told to.
+        deserializer
+            .end()
+            .map_err(|error| ModelsDevError::NotJson {
+                message: error.to_string(),
+            })?;
         let content = normalize(&document)?;
         let source = source_snapshot(
             self.source_url.clone(),
@@ -2246,6 +2253,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A payload that parses and then keeps going is two documents spliced
+    /// together, and the raw digest covers both while the content would come
+    /// from the first alone. Refused, so provenance and content cannot disagree
+    /// about what was read.
+    #[test]
+    fn a_payload_that_does_not_end_where_its_document_does_is_refused() {
+        let spliced = format!("{IDENTITY}{IDENTITY}");
+        assert!(
+            matches!(
+                parse(&spliced).expect_err("two documents are not one document"),
+                ModelsDevError::NotJson { .. }
+            ),
+            "trailing content is malformed JSON, not a schema change"
+        );
+        assert!(
+            parse(&format!("{IDENTITY}  \n")).is_ok(),
+            "trailing whitespace is not content"
+        );
     }
 
     #[test]
