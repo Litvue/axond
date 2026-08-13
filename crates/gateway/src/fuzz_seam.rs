@@ -24,6 +24,7 @@
 // Keep this list identical to `main.rs`. `tests/fuzz_seam.rs` fails if it drifts.
 mod admission;
 mod aliases;
+mod availability;
 mod backends;
 mod budget;
 mod config;
