@@ -951,10 +951,14 @@ async fn publish(
             .map_err(|error| unavailable("write blob reference", &error))?;
     }
 
-    // Ownership and identity first, because the resource versions below carry
-    // foreign keys into them: a version scoped to a tenant this revision does not
-    // declare, or naming another tenant's project, is unwritable rather than
-    // merely unvalidated. Same transaction, so "projected" and "published" cannot
+    // Ownership and identity first, because the projection is where the database
+    // constrains them: a project names its tenant and a principal names the
+    // tenant and project it is scoped to, through foreign keys among these three
+    // tables, so a cross-tenant grant is unwritable rather than merely
+    // unvalidated. The journal rows below carry no such key by design — 0002
+    // explains why, and a pre-0002 revision with no projected owner is
+    // republishable because of it — so their ownership is checked in the domain
+    // alone. Same transaction either way, so "projected" and "published" cannot
     // come apart.
     project_tenancy(transaction, id, candidate).await?;
 
@@ -4129,6 +4133,38 @@ mod tests {
             ))
             .await
             .expect("a revision publishes against a twice-migrated schema");
+    }
+
+    /// The documented boundary is the boundary the database has.
+    ///
+    /// 0002 and the operator runbook both enumerate the tables deliberately left
+    /// outside the wall, and an operator auditing isolation reads that list rather
+    /// than the policies. A list that named a table that does not exist, or missed
+    /// one that does, would have them conclude a table is walled when a pinned
+    /// session can read all of it.
+    #[tokio::test]
+    async fn the_tables_outside_the_wall_are_the_ones_the_migration_names() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        assert_eq!(
+            store
+                .column(
+                    "SELECT relname::text FROM pg_class \
+                     WHERE relnamespace = current_schema()::regnamespace \
+                     AND relkind = 'r' AND NOT relrowsecurity \
+                     ORDER BY relname"
+                )
+                .await,
+            vec![
+                "axond_cp_blob".to_owned(),
+                "axond_cp_head".to_owned(),
+                "axond_cp_revision".to_owned(),
+                "axond_cp_revision_blob".to_owned(),
+                "axond_cp_schema_migration".to_owned(),
+            ],
+            "the unwalled tables are not the ones 0002 and the runbook name"
+        );
     }
 
     /// Row-level security, against a role that cannot bypass it: the wall behind

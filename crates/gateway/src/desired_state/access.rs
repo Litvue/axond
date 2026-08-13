@@ -1672,8 +1672,12 @@ mod tests {
                 }
             }
         }
-        // Nothing may write the audit trail, whatever else it holds — including
-        // the role that holds everything else.
+        // No *role* may write the audit trail, whatever else it holds — including
+        // the role that holds everything else. Breakglass is outside the matrix by
+        // construction and therefore outside this invariant too; the assertion
+        // below is about grants, and
+        // `breakglass_is_allowed_everything_and_recorded_as_itself` states the
+        // bypass in the same terms rather than leaving it implied.
         for &role in Role::ALL {
             for &action in Action::ALL {
                 if action.is_write() {
@@ -2277,6 +2281,14 @@ mod tests {
         }
     }
 
+    /// Breakglass is a bypass of the matrix, not a role inside it.
+    ///
+    /// Including the audit trail, which no role may write: the recovery path is
+    /// deliberately not narrowed surface by surface, because a bypass with
+    /// exceptions is a role, and an operator locked out by a bad grant needs the
+    /// one door that has no grant behind it. What bounds it is that every use is
+    /// recorded as [`Actor::Breakglass`] — the thing an alert watches for — and
+    /// that no handler in this build constructs it from a request.
     #[test]
     fn breakglass_is_allowed_everything_and_recorded_as_itself() {
         let state = state_with_directory();

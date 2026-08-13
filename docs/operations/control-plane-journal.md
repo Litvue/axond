@@ -67,7 +67,9 @@ Two properties worth knowing before you plan capacity or retention:
   cannot read which service accounts of other tenants attempted what.
 
   What is deliberately outside it: `axond_cp_revision`, `axond_cp_revision_blob`,
-  `axond_cp_blob`, `axond_cp_desired`, and `axond_cp_schema_migration`. A revision
+  `axond_cp_blob`, `axond_cp_head`, and `axond_cp_schema_migration` — the five
+  tables 0001 creates that 0002 leaves without a policy, and the same five a
+  `pg_class.relrowsecurity` audit reports. A revision
   is the whole deployment's desired state, so there is no tenant to attribute the
   chain, the head, or a content digest to, and hiding a revision from a tenant
   would hide the revision carrying that tenant's own state. These rows expose that
