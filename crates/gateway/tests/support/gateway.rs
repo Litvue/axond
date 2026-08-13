@@ -5,7 +5,7 @@
 //! router assembled in-process, so a regression in boot or wiring fails here
 //! too.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::upstream::target;
 
@@ -91,6 +91,67 @@ const BOOT_ATTEMPTS: u32 = 4;
 /// run would make the harness the leak it is looking for.
 const RETAINED_LINES: usize = 4096;
 
+/// Normalise one of the process's dropped-accounting reports, whichever of the
+/// four it wrote, into a single report carrying how many records *this* report
+/// lost.
+///
+/// The reports are told apart from the rest of the log by carrying both a
+/// `sink` and a drop `reason`; matching on those rather than on the message
+/// text keeps a rephrased log line from silently turning reported backpressure
+/// into an unexplained missing row.
+///
+/// `records` is a rejected batch and `abandoned` an abandoned buffer: both are
+/// what that report lost. `dropped` is the sink's *running total* — the same
+/// counter the batch and buffer reports add to — so what it adds is whatever it
+/// has over the reports already attributed to that sink, which `attributed`
+/// carries between calls.
+///
+/// The one report that is not a loss of its own is the shutdown flush's: a
+/// rejected flush is the batch failure the sink has already reported, restated
+/// with the same count, so counting it again would let the run excuse a row it
+/// never actually lost twice over.
+pub fn normalise_drop_report(
+    fields: &Value,
+    attributed: &mut BTreeMap<String, u64>,
+) -> Option<Value> {
+    let (sink, reason) = (
+        fields.get("sink").and_then(Value::as_str)?,
+        fields.get("reason").and_then(Value::as_str)?,
+    );
+    let message = fields
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if message.contains("rejected its buffered records on shutdown") {
+        return None;
+    }
+    let counted = attributed.entry(sink.to_owned()).or_default();
+    let records = match (
+        fields.get("records").and_then(Value::as_u64),
+        fields.get("abandoned").and_then(Value::as_u64),
+        fields.get("dropped").and_then(Value::as_u64),
+    ) {
+        (Some(records), _, _) | (_, Some(records), _) => {
+            *counted += records;
+            records
+        }
+        (_, _, Some(total)) => {
+            let increment = total.saturating_sub(*counted);
+            *counted = (*counted).max(total);
+            increment
+        }
+        _ => return None,
+    };
+    (records > 0).then(|| {
+        json!({
+            "sink": sink,
+            "reason": reason,
+            "records": records,
+            "message": fields.get("message").cloned().unwrap_or(Value::Null),
+        })
+    })
+}
+
 /// What the process has said, kept so a failing test can print it and a
 /// harness can read what each request was charged.
 #[derive(Default)]
@@ -107,12 +168,21 @@ struct Output {
     /// asserts over all of them — and drained by the endurance harness, which
     /// reconciles each batch as it lands.
     usage: Vec<Value>,
-    /// The process's own reports of usage batches it dropped, kept apart from
+    /// The process's own reports of usage records it dropped, kept apart from
     /// the bounded scrollback. A harness reconciling durable rows against
     /// emitted records needs every one of these to say *why* a row is missing,
     /// and losing one to the line bound would turn documented backpressure into
     /// an unexplained loss.
+    ///
+    /// Every report is normalised to an increment in `records`, whatever the
+    /// field the process wrote it as.
     usage_drops: Vec<Value>,
+    /// How many dropped records have been attributed to each sink so far. The
+    /// buffer-full report carries the sink's running total rather than what
+    /// this report lost, and that total also counts the batches and buffers
+    /// reported separately, so an increment is the total minus what has
+    /// already been counted.
+    attributed: BTreeMap<String, u64>,
 }
 
 impl Output {
@@ -120,13 +190,8 @@ impl Output {
         if let Ok(value) = serde_json::from_str::<Value>(&line) {
             if value.get("schema_version").is_some() {
                 self.usage.push(value);
-            } else if let Some(fields) = value.get("fields")
-                && fields
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .is_some_and(|message| message.contains("usage batch dropped"))
-            {
-                self.usage_drops.push(fields.clone());
+            } else if let Some(fields) = value.get("fields") {
+                self.ingest_drop(fields);
             }
         }
         if self.lines.len() == RETAINED_LINES {
@@ -134,6 +199,12 @@ impl Output {
             self.dropped += 1;
         }
         self.lines.push_back(line);
+    }
+
+    fn ingest_drop(&mut self, fields: &Value) {
+        if let Some(report) = normalise_drop_report(fields, &mut self.attributed) {
+            self.usage_drops.push(report);
+        }
     }
 
     fn rendered(&self) -> String {

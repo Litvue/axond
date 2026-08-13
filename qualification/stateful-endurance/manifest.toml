@@ -62,14 +62,18 @@ segment_ms = 900000
 # two different qualifications rather than one at two scales.
 [profile.schedule]
 catalogue_revision_at = 0.06
-credential_revision_at = 0.13
-policy_revision_at = 0.20
-upstream_latency_at = 0.26
+credential_revision_at = 0.11
+policy_revision_at = 0.16
+upstream_latency_at = 0.20
 upstream_latency_for = 0.06
 # What the fault gate in front of the provider adds to every connection while
 # the latency window is open.
 upstream_latency_ms = 250
-upstream_outage_at = 0.34
+# Far enough ahead of the database outage that the provider's attribution span
+# closes before the database outage's *widened* one opens. The slack below
+# widens that window backwards, so the separation the smoke tier needs is the
+# recovery allowance plus the slack rather than the allowance alone.
+upstream_outage_at = 0.28
 upstream_outage_for = 0.06
 usage_backend_outage_at = 0.52
 usage_backend_outage_for = 0.06

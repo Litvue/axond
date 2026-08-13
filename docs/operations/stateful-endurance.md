@@ -44,10 +44,10 @@ the same order:
 | At | Event | What the run then looks for |
 | --- | --- | --- |
 | 6% | Catalogue revision — a new alias is published and every replica reloaded | the `chat-catalogue-v2` alias begins serving *on every replica* |
-| 13% | Credential revision — the pool is rotated | a usage record attributed to `fake-openai-rotated` |
-| 20% | Policy revision — the probe tenant loses `allow_platform_fallback` | every replica stops serving the probe tenant |
-| 26% | The provider is slowed by 250 ms at the gate | latency moves; nothing fails |
-| 34% | The provider is taken away — connections refused and cut | refusals typed as circuit-open, and recovery afterwards |
+| 11% | Credential revision — the pool is rotated | a usage record attributed to `fake-openai-rotated` |
+| 16% | Policy revision — the probe tenant loses `allow_platform_fallback` | every replica stops serving the probe tenant |
+| 20% | The provider is slowed by 250 ms at the gate | latency moves; nothing fails |
+| 28% | The provider is taken away — connections refused and cut | refusals typed as circuit-open, and recovery afterwards |
 | 52% | The usage database is taken away | dropped sink batches, reported by the process and reconciled |
 | 72% | Rolling restart — each replica is drained and replaced one at a time | no request refused for want of a ready replica, the flushed rows arrive, and the run keeps offering load afterwards |
 
@@ -56,7 +56,10 @@ the end of a fault by `recovery_allowance_ms`, which is an absolute duration
 while every offset is a fraction, so a gap comfortable over twelve hours can be
 nothing at ninety seconds — and a smoke tier that restarted the fleet inside the
 database outage's attribution window would be excusing errors the soak tier
-counts. A test asserts the separation at both durations.
+counts. The database outage's window is widened *backwards* as well, by
+`usage_outage_attribution_slack_ms`, so the provider outage has to clear it by
+the allowance plus the slack rather than by the allowance alone. A test asserts
+every one of those separations at both durations.
 
 | Tier | Duration | Concurrency | Sample interval | Segment |
 | --- | --- | --- | --- | --- |
@@ -190,6 +193,12 @@ Fields worth knowing:
   reporting the signal.
 - `faults[].gate` is what the loopback gate did — accepted, refused, cut,
   delayed — which is how a run shows the fault it declared actually met traffic.
+- `usage.distinct` is what the *workload* settled and `usage.probe_distinct`
+  what the driver's own boundary and convergence probes settled. Only the first
+  is reconciled against `usage.owed`: the probes are the harness asking, nothing
+  owed them, and counting them together would let a probe record stand in for a
+  workload record the deployment lost. Both are rejoined where the database is
+  compared, because the database holds them too.
 - `usage.durable_loss_total` is every emitted record the database never
   received, split into the part the outage explains
   (`durable_loss_in_window`) and the part it does not

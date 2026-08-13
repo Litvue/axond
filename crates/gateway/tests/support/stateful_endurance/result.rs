@@ -289,7 +289,14 @@ pub struct Usage {
     /// record.
     pub owed: u64,
     pub emitted: u64,
+    /// Distinct records the *workload* settled, which is what `owed` is
+    /// reconciled against.
     pub distinct: u64,
+    /// Distinct records the driver's own boundary and convergence probes
+    /// settled. Reported so the database's row count adds up, and kept out of
+    /// [`Self::distinct`] so a probe record cannot stand in for a workload
+    /// record the deployment lost.
+    pub probe_distinct: u64,
     pub duplicates: u64,
     pub missing: u64,
     pub unexpected_statuses: u64,

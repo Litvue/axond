@@ -30,8 +30,12 @@
 
 mod support;
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
+use serde_json::{Value, json};
+use support::gateway::alias;
+use support::stateful_endurance::fleet;
 use support::stateful_endurance::manifest::{Event, Tier};
 use support::stateful_endurance::{self as stateful_endurance, StatefulEnduranceResult};
 
@@ -318,10 +322,27 @@ fn the_script_is_the_same_at_both_tiers() {
                     profile.id
                 );
             }
+            // The database outage's window is widened *backwards* by the
+            // attribution slack, which no other window is. A record dropped in
+            // the overlap would be excused by the database outage while the
+            // provider's outage was still being attributed the errors around
+            // it, so the widened window has to clear every other fault's
+            // attribution span too.
+            let (usage_from, usage_to) = profile.schedule.usage_outage_window(duration);
+            let usage_declared = windows.last().copied().expect("a usage outage window");
+            for (from, to) in attributed
+                .iter()
+                .filter(|(from, _)| *from != usage_declared.0)
+            {
+                assert!(
+                    *to <= usage_from || *from >= usage_to,
+                    "{} [{label}]: the usage-outage attribution window overlaps another fault's",
+                    profile.id
+                );
+            }
             // Nor may a moment the driver *acts* fall inside one: a revision
             // published or a fleet restarted while a fault is still being
             // attributed has its own errors excused by that fault.
-            let (usage_from, usage_to) = profile.schedule.usage_outage_window(duration);
             for scheduled in profile.schedule.resolve(duration) {
                 if matches!(
                     scheduled.event,
@@ -443,4 +464,108 @@ fn a_request_in_flight_when_a_fault_opens_is_the_faults() {
         !touched(41_000, 1_000.0),
         "it began after the window closed"
     );
+}
+
+/// The reconciliation compares what the workload was owed against what the
+/// workload settled. The driver's own probes settle records too — a boundary
+/// probe every second and a convergence poll every fifty milliseconds — and
+/// counting theirs on the workload's side would let a probe record stand in
+/// for a workload record the deployment lost.
+#[test]
+fn the_drivers_own_probe_records_are_not_the_workloads() {
+    let record = |namespace: &str, model: &str| {
+        stateful_endurance::run::issued_by_the_driver(&json!({
+            "namespace": namespace,
+            "model": model,
+        }))
+    };
+    assert!(record(fleet::PROBE, alias::CHAT), "the boundary probe's");
+    assert!(
+        record(fleet::PLATFORM, fleet::CATALOGUE_ALIAS),
+        "the convergence poll's, which only the driver asks for"
+    );
+    assert!(!record(fleet::PLATFORM, alias::CHAT), "the workload's");
+    assert!(
+        !record(fleet::BYOK, alias::MESSAGES),
+        "and the BYOK tenant's"
+    );
+}
+
+/// Every form the process reports lost accounting in, normalised to what that
+/// report lost. A recogniser that only knew the batch message would turn a
+/// shutdown or a full buffer into an unexplained missing row, and one that
+/// added the running total as though it were an increment would excuse rows
+/// that never went missing.
+#[test]
+fn every_dropped_accounting_report_is_counted_once() {
+    let mut attributed = BTreeMap::new();
+    let mut records = |fields: Value| {
+        support::gateway::normalise_drop_report(&fields, &mut attributed)
+            .map(|report| report["records"].as_u64().expect("a normalised count"))
+    };
+
+    // A rejected batch: five records, and the sink's running total is now five.
+    assert_eq!(
+        records(json!({
+            "sink": "postgres",
+            "reason": "sink_error",
+            "records": 5,
+            "message": "usage batch dropped: sink rejected it",
+        })),
+        Some(5)
+    );
+    // The buffer-full report carries that running total, so it adds the three
+    // it has over what the batch report already accounted for.
+    assert_eq!(
+        records(json!({
+            "sink": "postgres",
+            "reason": "buffer_full",
+            "dropped": 8,
+            "message": "usage record dropped rather than delaying the request path",
+        })),
+        Some(3)
+    );
+    // A total that has not moved is not another loss.
+    assert_eq!(
+        records(json!({
+            "sink": "postgres",
+            "reason": "buffer_full",
+            "dropped": 8,
+            "message": "usage record dropped rather than delaying the request path",
+        })),
+        None
+    );
+    // An abandoned buffer is what that report lost.
+    assert_eq!(
+        records(json!({
+            "sink": "postgres",
+            "reason": "shutdown",
+            "abandoned": 4,
+            "message": "usage sink flush exceeded its bound; buffered records were abandoned",
+        })),
+        Some(4)
+    );
+    // A rejected shutdown flush restates the batch failure the sink already
+    // reported, so it is not a second loss.
+    assert_eq!(
+        records(json!({
+            "sink": "postgres",
+            "reason": "sink_error",
+            "records": 2,
+            "message": "usage sink rejected its buffered records on shutdown",
+        })),
+        None
+    );
+    // Sinks are accounted apart: one sink's total says nothing about another's.
+    assert_eq!(
+        records(json!({
+            "sink": "stdout",
+            "reason": "buffer_full",
+            "dropped": 2,
+            "message": "usage record dropped rather than delaying the request path",
+        })),
+        Some(2)
+    );
+    // An ordinary log line is not a drop report.
+    assert_eq!(records(json!({"message": "listening"})), None);
 }

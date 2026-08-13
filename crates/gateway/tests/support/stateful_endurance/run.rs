@@ -209,6 +209,7 @@ pub async fn run_with(
         reach,
         client: &client,
         rotation: &rotation,
+        taken: &next,
         state: &mut state,
         probe: &probe_tenant,
         sample_interval,
@@ -591,6 +592,16 @@ fn error_type(body: &str) -> Option<String> {
     Some(parsed["error"]["type"].as_str()?.to_owned())
 }
 
+/// Whether a usage record was settled by the driver's own probes rather than
+/// by the workload. The boundary probe is the only caller in the probe
+/// namespace and the convergence probe the only caller of the catalogue
+/// revision's alias, neither of which the workload ever offers, so a record
+/// carrying either was asked for by the harness.
+pub fn issued_by_the_driver(record: &Value) -> bool {
+    record["namespace"].as_str() == Some(fleet::PROBE)
+        || record["model"].as_str() == Some(fleet::CATALOGUE_ALIAS)
+}
+
 fn fingerprint(id: &str) -> u64 {
     // FNV-1a: cheap, stable, and only ever used to tell one request id from
     // another inside one run.
@@ -619,6 +630,9 @@ struct Supervisor<'a> {
     reach: Reach,
     client: &'a reqwest::Client,
     rotation: &'a Arc<std::sync::Mutex<Vec<String>>>,
+    /// The workers' own counter of requests taken, read live. What the state
+    /// has drained lags a restart by the whole restart.
+    taken: &'a AtomicUsize,
     state: &'a mut State,
     probe: &'a Tenant,
     sample_interval: Duration,
@@ -945,6 +959,7 @@ impl Supervisor<'_> {
                 began.elapsed(),
                 ready,
                 self.started.elapsed(),
+                self.taken.load(Ordering::Relaxed) as u64,
             );
             if !ready {
                 return;
@@ -1019,6 +1034,11 @@ struct State {
     latency: Reservoir,
     ttft: Reservoir,
     ledger: Ledger,
+    /// The records the driver's own probes settled, kept in their own ledger.
+    /// Nothing counted them into `owed`, so leaving them in with the
+    /// workload's would let one probe record stand in for a workload record
+    /// the deployment lost.
+    probe_ledger: Ledger,
     records_observed: u64,
     unexpected_statuses: u64,
     by_status: BTreeMap<String, u64>,
@@ -1046,8 +1066,12 @@ struct State {
     /// not arrived yet.
     awaiting_recovery: Vec<usize>,
     restart: Restart,
-    /// What had been offered when the last replacement joined, so the artifact
-    /// can say how much load the restart was actually measured across.
+    /// What the workers had taken when the last replacement joined, so the
+    /// artifact can say how much load the restart was actually measured
+    /// across. The workers' own counter rather than this state's tally: the
+    /// tally only advances on the drain tick, and the restart blocks the loop
+    /// that drains, so it would still read from before the restart began and
+    /// count everything offered *during* it as offered after.
     offered_at_last_replacement: u64,
     replacement_never_ready: bool,
     tenancy: Tenancy,
@@ -1194,6 +1218,7 @@ impl State {
             latency: Reservoir::new(),
             ttft: Reservoir::new(),
             ledger: Ledger::create(&dir.join(format!("{stem}-fingerprints"))),
+            probe_ledger: Ledger::create(&dir.join(format!("{stem}-probe-fingerprints"))),
             records_observed: 0,
             unexpected_statuses: 0,
             by_status: BTreeMap::new(),
@@ -1360,7 +1385,9 @@ impl State {
         self.records_observed += 1;
         self.open.usage_records += 1;
         self.last_record_at = Some(now);
+        let probe = issued_by_the_driver(record);
         match record["request_id"].as_str() {
+            Some(id) if probe => self.probe_ledger.record(fingerprint(id)),
             Some(id) => self.ledger.record(fingerprint(id)),
             None => self.unexpected_statuses += 1,
         }
@@ -1410,10 +1437,9 @@ impl State {
     /// sink, the reason, and the count, and the driver only has to say whether
     /// it happened while the backend was declared out.
     fn absorb_drop(&mut self, report: &Value, now: Duration) {
-        let records = report["records"]
-            .as_u64()
-            .or_else(|| report["dropped"].as_u64())
-            .unwrap_or(1);
+        // Normalised by the collector: whichever field the process wrote its
+        // report as, `records` is what that report lost.
+        let records = report["records"].as_u64().unwrap_or(1);
         let sink = report["sink"].as_str().unwrap_or("unknown").to_owned();
         let reason = report["reason"].as_str().unwrap_or("unknown").to_owned();
         self.sink_drops.reports += 1;
@@ -1630,10 +1656,11 @@ impl State {
         took: Duration,
         ready: bool,
         now: Duration,
+        taken: u64,
     ) {
         self.restart.replicas_restarted += 1;
         self.restart.worst_return_ms = self.restart.worst_return_ms.max(took.as_millis() as u64);
-        self.offered_at_last_replacement = self.offered;
+        self.offered_at_last_replacement = taken;
         if !ready {
             self.replacement_never_ready = true;
         }
@@ -1737,6 +1764,7 @@ fn assemble(
         latency,
         ttft,
         ledger,
+        probe_ledger,
         records_observed,
         unexpected_statuses,
         by_status,
@@ -1757,13 +1785,18 @@ fn assemble(
             offered.saturating_sub(offered_at_last_replacement);
     }
     let tally = ledger.tally();
-    let duplicates = records_observed.saturating_sub(tally.distinct);
+    // The driver's probes settle records of their own. They are reconciled
+    // apart from the workload's — nothing owed them — and rejoined only where
+    // the database is compared, because the database holds them too.
+    let probes = probe_ledger.tally();
+    let settled = tally.distinct + probes.distinct;
+    let duplicates = records_observed.saturating_sub(settled);
     let missing = owed.saturating_sub(tally.distinct);
     // Which records the database is missing is a set difference; *why* is not
     // something two clocks a drain tick apart can answer, so the attribution
     // comes from the fleet's own drop reports. A loss the processes never
     // reported, or reported outside the declared outage, is the deployment's.
-    let durable_loss = tally.distinct.saturating_sub(durable.counts.distinct);
+    let durable_loss = settled.saturating_sub(durable.counts.distinct);
     let durable_loss_in_window = durable_loss.min(sink_drops.records_in_usage_window);
     let durable_loss_outside = durable_loss - durable_loss_in_window;
     let trend = trend(&segments, slo);
@@ -1950,6 +1983,7 @@ fn assemble(
             owed,
             emitted: records_observed,
             distinct: tally.distinct,
+            probe_distinct: probes.distinct,
             duplicates,
             missing,
             unexpected_statuses,
