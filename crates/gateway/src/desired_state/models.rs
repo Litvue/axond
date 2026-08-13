@@ -113,7 +113,7 @@
 //! a tenancy or credential one; what a refusal *means* stays here, in
 //! [`ModelError::is_incompatible`].
 //!
-//! The operator-facing statement of all of this is `docs/adr/0035-model-enablement-and-alias-contracts.md`,
+//! The operator-facing statement of all of this is `docs/adr/0036-model-enablement-and-alias-contracts.md`,
 //! with the schema table and the untyped-alias exception in
 //! `docs/operations/revision-convergence.md`.
 
@@ -506,7 +506,7 @@ impl fmt::Display for ModelOwner {
 /// deliberately inert: nothing bills against it, no conversion turns it into an
 /// [`ApprovedPrice`], and [`ModelEnablementBody::billable_price`] does not look at
 /// it. A catalogue refresh may change what an upstream publishes at any time
-/// without human action (ADR 0035), so treating an observed rate as an effective
+/// without human action (ADR 0036), so treating an observed rate as an effective
 /// one would let an upstream edit change what a deployment charges.
 ///
 /// Integers, in micro-dollars, because desired state has no floating-point
