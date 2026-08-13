@@ -68,9 +68,14 @@ configured rate is not consulted: a rate an operator approved is not overridden
 by a file a deploy pipeline edits.
 
 **A bound target the snapshot has no approved price for is ineligible, never
-free.** `Ineligible::Unpriced` names the offering, the book, and the book's
+free.** `Ineligible::Unpriced` carries the offering, the book, and the book's
 approval state — so a draft book, which activates no rates (ADR 0046), reads as
-"nothing approved this" rather than as "priced at the draft". A target that is
+"nothing approved this" rather than as "priced at the draft". That triple is
+operator-facing only: `Ineligible::detail` is logged, while `Ineligible::reason`
+is the stable redacted string a caller is refused with, because which book a
+deployment runs, at which version, and whether it is still a draft are
+control-plane facts an unprivileged data-plane caller must not read out of an
+error body. A target that is
 ineligible is skipped by the failover walk; an alias whose every target is
 ineligible refuses the request as `model_not_priced` (503) before admission
 capacity or a rate-limit permit is spent. The alias remains listed by `/v1/models`
@@ -94,7 +99,11 @@ of `0` is now "priced by configuration", which is exactly what it has always
 meant in practice. `price_book`, `price_book_checksum`, and `price_catalog` are
 new, nullable, and absent from a file-priced row, so an existing consumer parses
 new rows unchanged. They are added by an additive migration
-(`usage_v2_001_add_price_identity.sql`) and propagated to the OTLP attributes and
+(`usage_v2_001_add_price_identity.sql`), which the Postgres sink requires to have
+been applied: it compares the table's columns against the ones it binds while it
+connects and refuses to boot naming the file to apply, so an existing
+installation that deploys the writer first fails its deploy rather than dropping
+every batch at insert time. The columns are propagated to the OTLP attributes and
 the Postgres journal, which reads them as optional so rows written before this
 change stay readable. No historical row is rewritten when a price changes: a new
 publication writes a new version into new rows and leaves settled ones alone,

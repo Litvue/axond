@@ -854,7 +854,7 @@ mod tests {
             output_tokens: 34,
             cost_microdollars: 640,
             catalog_version: 7,
-            price_book: Some("price-book/default@v7".to_string()),
+            price_book: Some("price/res_0190f2c1-6f6a-7c2e-9d3a-6f1c2b4d5e60@v7".to_string()),
             price_book_checksum: Some(
                 "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
                     .to_string(),

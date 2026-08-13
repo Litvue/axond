@@ -40,6 +40,20 @@ const ADDITIVE_DDL: [&str; 2] = [
     include_str!("../../sql/usage_v2_001_add_price_identity.sql"),
 ];
 
+/// Which migration adds each column the base DDL of the current schema version
+/// does not have, so a writer that would bind a column the table lacks can name
+/// the file to apply instead of failing every batch at insert time.
+///
+/// Ordering is the enforcement: a writer binds all of [`COLUMNS`], so it refuses
+/// to boot against a table an operator has not migrated yet, rather than
+/// discovering it one dropped batch at a time.
+const ADDITIVE_COLUMNS: [(&str, &str); 4] = [
+    ("signer_kid", "usage_v1_001_add_signer_kid.sql"),
+    ("price_book", "usage_v2_001_add_price_identity.sql"),
+    ("price_book_checksum", "usage_v2_001_add_price_identity.sql"),
+    ("price_catalog", "usage_v2_001_add_price_identity.sql"),
+];
+
 /// The table name the shipped DDL uses; substituted when the sink is configured
 /// with another one.
 const DEFAULT_TABLE: &str = "axond_usage";
@@ -132,8 +146,46 @@ impl PostgresSink {
         if settings.create_table {
             client.batch_execute(&sink.schema_ddl()).await?;
         }
+        // Migration before writer: every column this sink binds must already
+        // exist, or the boot fails naming the file to apply. An existing
+        // installation that has not run a migration would otherwise accept the
+        // boot and lose every batch at insert time.
+        if let Some(gap) = migration_gap(&sink.missing_columns(&client).await?) {
+            return Err(UsageSinkError::invalid("postgres", gap));
+        }
         *sink.client.lock().await = Some(client);
         Ok(sink)
+    }
+
+    /// The columns this writer binds that the configured table does not have.
+    ///
+    /// An empty answer for an absent table: creating it is the operator's to
+    /// sequence (`create_table` is off by default), and refusing a boot for a
+    /// table that will be created before the first flush would be a new failure
+    /// mode rather than a caught one.
+    async fn missing_columns(&self, client: &Client) -> Result<Vec<String>, tokio_postgres::Error> {
+        let (schema, table) = self
+            .table
+            .split_once('.')
+            .map_or(("public", self.table.as_str()), |(schema, table)| {
+                (schema, table)
+            });
+        let rows = client
+            .query(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_schema = $1 AND table_name = $2",
+                &[&schema, &table],
+            )
+            .await?;
+        let present: Vec<String> = rows.iter().map(|row| row.get::<_, String>(0)).collect();
+        if present.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(COLUMNS
+            .iter()
+            .filter(|column| !present.iter().any(|present| present == *column))
+            .map(|column| (*column).to_owned())
+            .collect())
     }
 
     /// The shipped DDL, retargeted at the configured table.
@@ -254,6 +306,39 @@ pub fn tls_connector() -> MakeRustlsConnect {
             MakeRustlsConnect::with_webpki_roots()
         })
         .clone()
+}
+
+/// Why a boot is refused when the table is behind this writer, naming the
+/// migrations to apply and in which order.
+///
+/// A column with no migration of its own belongs to the base DDL, so the table
+/// is not merely unmigrated: it was created from an older schema version, and
+/// the answer is that version's file rather than a migration.
+fn migration_gap(missing: &[String]) -> Option<String> {
+    if missing.is_empty() {
+        return None;
+    }
+    let mut files: Vec<&str> = Vec::new();
+    for (column, file) in ADDITIVE_COLUMNS {
+        if missing.iter().any(|name| name == column) && !files.contains(&file) {
+            files.push(file);
+        }
+    }
+    let remedy = if files.is_empty() {
+        format!(
+            "recreate it from ops/postgres/usage_v{}.sql",
+            UsageRecord::SCHEMA_VERSION
+        )
+    } else {
+        format!(
+            "apply ops/postgres/{} before deploying this writer",
+            files.join(", then ops/postgres/")
+        )
+    };
+    Some(format!(
+        "usage table is missing column(s) {}: {remedy}",
+        missing.join(", ")
+    ))
 }
 
 /// A multi-row `INSERT` with one parameter set per row.
@@ -379,6 +464,54 @@ mod tests {
         }
         assert_eq!(UsageRecord::SCHEMA_VERSION, 2);
         assert!(SCHEMA_DDL.contains("version 2"));
+    }
+
+    /// Migration before writer, on the ordering itself: each additive column is
+    /// attributed to the file that adds it, in the order the files apply, so the
+    /// remedy a refused boot prints is one an operator can run top to bottom.
+    #[test]
+    fn every_additive_column_is_attributed_to_the_migration_that_adds_it() {
+        let files = [
+            (
+                "usage_v1_001_add_signer_kid.sql",
+                include_str!("../../sql/usage_v1_001_add_signer_kid.sql"),
+            ),
+            (
+                "usage_v2_001_add_price_identity.sql",
+                include_str!("../../sql/usage_v2_001_add_price_identity.sql"),
+            ),
+        ];
+        for (column, file) in ADDITIVE_COLUMNS {
+            assert!(COLUMNS.contains(&column), "`{column}` is never bound");
+            let (_, ddl) = files
+                .iter()
+                .find(|(name, _)| *name == file)
+                .expect("an additive column is attributed to a shipped migration");
+            assert!(
+                ddl.contains(column),
+                "`{file}` does not add the `{column}` it is credited with"
+            );
+        }
+        // A boot refused for a v1 and a v2 column names them in apply order.
+        let gap = migration_gap(&["price_book".to_owned(), "signer_kid".to_owned()])
+            .expect("missing columns are a gap");
+        let signer = gap
+            .find("usage_v1_001_add_signer_kid.sql")
+            .expect("the v1 file is named");
+        let price = gap
+            .find("usage_v2_001_add_price_identity.sql")
+            .expect("the v2 file is named");
+        assert!(signer < price, "{gap}");
+        assert!(gap.contains("before deploying this writer"), "{gap}");
+    }
+
+    /// A table that is level with the writer is not a gap, and a table missing a
+    /// base column is a schema-version problem rather than a pending migration.
+    #[test]
+    fn only_a_column_the_writer_binds_and_the_table_lacks_refuses_a_boot() {
+        assert_eq!(migration_gap(&[]), None);
+        let older = migration_gap(&["cache_read_tokens".to_owned()]).expect("a gap");
+        assert!(older.contains("ops/postgres/usage_v2.sql"), "{older}");
     }
 
     #[test]

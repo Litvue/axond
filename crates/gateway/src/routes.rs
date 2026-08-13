@@ -1333,9 +1333,13 @@ async fn serve(
     // occupy admission capacity or spend a rate-limit round trip to find out.
     let prices = AliasPrices::resolve(&snapshot, model);
     if let Some(refusal) = prices.refusal() {
+        // The price book, its version, and its approval state answer the
+        // operator's "approve what, where?" and are control-plane facts, so they
+        // are logged rather than returned: the caller gets the stable reason.
+        tracing::warn!(model = %alias, detail = %refusal.detail(), "alias has no approved price");
         return Err(GatewayError::ModelNotPriced {
             alias,
-            reason: refusal.to_string(),
+            reason: refusal.reason().to_owned(),
         });
     }
 
@@ -3102,6 +3106,28 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         )
         .expect("an error document");
         assert_eq!(body["error"]["type"], "model_not_priced");
+
+        // The refusal is a data-plane answer, so it says the model is not
+        // chargeable and nothing about which book a deployment runs, at which
+        // version, or whether that book is still a draft.
+        let pricing = approved_pricing_snapshot();
+        let message = body["error"]["message"]
+            .as_str()
+            .expect("an error message")
+            .to_owned();
+        assert!(message.contains("gpt-4o"), "{message}");
+        for internal in [
+            pricing.book().to_string(),
+            pricing.book().id.to_string(),
+            pricing.checksum().to_string(),
+            pricing.catalog().to_string(),
+            pricing.approval().state().to_owned(),
+        ] {
+            assert!(
+                !message.contains(&internal),
+                "the refusal `{message}` discloses `{internal}`"
+            );
+        }
     }
 
     fn minting_state() -> AppState {

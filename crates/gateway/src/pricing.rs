@@ -140,17 +140,47 @@ impl RequestPrice {
 /// vocabulary keeps the rates its `[[model]]` entry declares. What is refused is
 /// a target the book *is* the authority for and does not price, because serving
 /// it would either charge rates nobody approved or charge nothing at all.
+///
+/// The refusal a caller is given is stable and says nothing more: which price
+/// book a deployment runs, at which resource version, and whether it is still a
+/// draft are control-plane facts an unprivileged caller of the data plane must
+/// not learn from an error body. The identity stays in the variant for the
+/// operator log, and [`Ineligible::reason`] is what crosses the boundary.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Ineligible {
-    #[error(
-        "catalogue offering `{provider}`/`{model}` has no approved price in {book} ({approval})"
-    )]
+    #[error("no price is in force for this model")]
     Unpriced {
         provider: String,
         model: String,
         book: String,
         approval: &'static str,
     },
+}
+
+impl Ineligible {
+    /// The stable, redacted reason a refusal is reported to a caller as. Stable
+    /// so a client can branch on it, redacted so it names no internal resource.
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::Unpriced { .. } => "no price is in force for this model",
+        }
+    }
+
+    /// The same refusal for the operator log: the offering, the price book that
+    /// is its authority, and that book's approval state — the three facts that
+    /// answer "approve what, where?" and none of which reach a caller.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Unpriced {
+                provider,
+                model,
+                book,
+                approval,
+            } => format!(
+                "catalogue offering `{provider}`/`{model}` has no approved price in {book} ({approval})"
+            ),
+        }
+    }
 }
 
 /// What each of an alias's targets is charged at, resolved once per request.
@@ -384,6 +414,76 @@ mod tests {
             .expect_err("a draft book activates no price");
         let Ineligible::Unpriced { approval, .. } = &refusal;
         assert_eq!(*approval, "draft");
+    }
+
+    /// What a caller is told is what every caller is told: an unpriced offering
+    /// and a draft book refuse identically, and neither refusal names the book, a
+    /// resource id, a version, or an approval state. The operator detail keeps
+    /// all four, so redaction costs the audit trail nothing.
+    #[test]
+    fn a_refusal_names_no_price_book_to_the_caller_and_all_of_it_to_the_log() {
+        let approved = fixtures::approved_pricing_snapshot();
+        let draft_body = PriceBookBody::new(fixtures::catalog_content_id(), Approval::Draft)
+            .with_rule(fixtures::price_rule(
+                fixtures::priced_target("openai", "gpt-4o"),
+                RulePrecedence::Baseline,
+                EffectiveInterval::from(EffectiveInstant::EPOCH),
+                2_500_000,
+                10_000_000,
+            ));
+        let draft = PriceBooks::of(&fixtures::state_with_price_book(&draft_body))
+            .expect("a draft book is servable state")
+            .snapshot_at(EffectiveInstant::EPOCH)
+            .expect("the state holds a book");
+
+        for (snapshot, model) in [(&approved, "o3"), (&draft, "gpt-4o")] {
+            let refusal = price_of(Some(snapshot), &target(Some(binding("openai", model))))
+                .expect_err("neither snapshot has an approved price for it");
+
+            // One stable string for both, so a client can branch on it.
+            assert_eq!(refusal.reason(), "no price is in force for this model");
+            let public = refusal.to_string();
+            assert_eq!(public, refusal.reason());
+            for leak in [
+                snapshot.book().to_string(),
+                snapshot.book().id.to_string(),
+                snapshot.checksum().to_string(),
+                snapshot.catalog().to_string(),
+                snapshot.approval().state().to_owned(),
+            ] {
+                assert!(
+                    !public.contains(&leak),
+                    "refusal `{public}` discloses `{leak}`"
+                );
+            }
+
+            // The operator still learns which book to go and approve in.
+            let detail = refusal.detail();
+            assert!(detail.contains(&snapshot.book().to_string()), "{detail}");
+            assert!(detail.contains(snapshot.approval().state()), "{detail}");
+            assert!(detail.contains(model), "{detail}");
+        }
+    }
+
+    /// The rendering `docs/usage-schema.md` promises of the `price_book` column,
+    /// pinned: a `ResourceRef`, so `price/<resource id>@v<version>` and not a
+    /// `price-book/…` kind that does not exist.
+    #[test]
+    fn a_charges_price_book_renders_as_the_resource_reference_it_is() {
+        let pricing = fixtures::approved_pricing_snapshot();
+        let identity = price_of(Some(&pricing), &target(Some(binding("openai", "gpt-4o"))))
+            .expect("the fixture book prices it")
+            .identity()
+            .expect("an approved charge names its book")
+            .book();
+        assert_eq!(identity, pricing.book().to_string());
+        let (kind, version) = identity
+            .split_once('/')
+            .and_then(|(kind, rest)| rest.split_once('@').map(|(_, version)| (kind, version)))
+            .expect("a reference renders as `<kind>/<id>@<version>`");
+        assert_eq!(kind, "price");
+        assert!(version.starts_with('v'), "{identity}");
+        assert!(identity.contains("/res_"), "{identity}");
     }
 
     /// The acceptance criterion for a request that spans a publication: the

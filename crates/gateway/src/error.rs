@@ -31,7 +31,13 @@ pub enum GatewayError {
     /// stays discoverable — it is listed, and its configuration is valid — but a
     /// budget-controlled request against it is refused rather than served at
     /// rates nobody approved or charged as free (#147).
-    #[error("model `{alias}` has no approved price: {reason}")]
+    ///
+    /// `reason` is the refusal's stable redacted form
+    /// ([`crate::pricing::Ineligible::reason`]) and never the price book's
+    /// identity or approval state: this message reaches an unprivileged caller,
+    /// and which book a deployment runs is a control-plane fact. The identifying
+    /// detail is logged where the refusal is raised.
+    #[error("model `{alias}` is not chargeable: {reason}")]
     ModelNotPriced { alias: String, reason: String },
     #[error(
         "request cost ceiling exceeded for model `{alias}`: estimated {estimated_microdollars} microdollars exceeds the per-request ceiling of {ceiling_microdollars} microdollars"

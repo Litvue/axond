@@ -33,7 +33,7 @@ meaning, and how they are allowed to change. The design rationale is
 | `cache_write_tokens` | `bigint` | Prompt tokens written to the provider cache. |
 | `cost_microdollars` | `bigint` | Cost in micro-dollars, priced from the target's catalog entry. |
 | `catalog_version` | `bigint` | Resource version of the approved price book the cost was computed against, or `0` when the request was priced by the configuration file's own rates. |
-| `price_book` | `text` | Exact price-book resource reference and version the rates came from (`price-book/baseline@v3`); NULL for a file-priced row. |
+| `price_book` | `text` | Exact price-book resource reference and version the rates came from, rendered `price/<resource id>@v<version>` (e.g. `price/res_0190f2c1-6f6a-7c2e-9d3a-6f1c2b4d5e60@v3`); NULL for a file-priced row. |
 | `price_book_checksum` | `text` | Canonical checksum of that book's body — the same rates always produce the same checksum, so a republished (rolled-back) book is recognisable as the one that was audited before. NULL for a file-priced row. |
 | `price_catalog` | `text` | Content identity of the catalogue the book was approved against; NULL for a file-priced row. |
 | `latency_ms` | `bigint` | End-to-end gateway latency. |
@@ -55,10 +55,13 @@ omitted when absent), and the OTLP sink emits it as an OTel log record with
   `usage_v<N>.sql`. Fresh installations apply the base DDL followed by every
   additive file in filename order — currently
   `usage_v1_001_add_signer_kid.sql` then
-  `usage_v2_001_add_price_identity.sql`; existing installations apply only the new additive file
-  before deploying a writer that emits its column. The writer does not probe
-  for missing columns: deploying it first causes the existing sink error and
-  dropped-record path.
+  `usage_v2_001_add_price_identity.sql`; existing installations apply only the
+  new additive file **before** deploying a writer that emits its column.
+  Ordering is enforced rather than trusted: the Postgres sink checks the table's
+  columns while it connects and refuses to boot naming the file to apply, so an
+  unmigrated table fails the deploy instead of dropping every batch at insert
+  time. A table the gateway cannot see at all (it is created after boot, and
+  `create_table` is off by default) is not a gap and does not refuse the boot.
 - Removing or renaming a column, making one `NOT NULL`, or changing a unit or a
   vocabulary (e.g. a new `status` value is fine; redefining an existing one is
   not) **is** a bump: a new `ops/postgres/usage_v<N>.sql` plus a bump of
