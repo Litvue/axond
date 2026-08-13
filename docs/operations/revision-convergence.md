@@ -247,7 +247,8 @@ A policy document is the **complete** policy of one tenant or one project: what 
 may spend, how much it may have in flight, and the token epoch below which a token
 is refused. It is scoped to what it governs and written under that object's
 identity, so "the policy of project `core`" is one durable resource whose
-successive versions are successive revisions of the same document.
+successive versions are successive revisions of the same document ([ADR
+0035](../adr/0035-typed-policy-documents-generations-and-transitions.md)).
 
 - **Nothing is merged, across revisions or across scopes.** Reading policy takes
   one whole document or none of it. A field absent from a newer document is not
@@ -261,7 +262,17 @@ successive versions are successive revisions of the same document.
   advanced by the operator when a document's content changes; the revision id says
   which publication carried it. Neither half identifies a generation alone: two
   publications can carry one epoch (a restored backup, a forked control plane), and
-  a revision id says which publication but not whether the change was material.
+  a revision id says which publication but not whether the change was material. A
+  generation therefore also carries a digest of the document's content, which is
+  what separates those two cases.
+- **A document restated by a later revision is the same policy, not a fork.** A
+  revision is whole desired state, so every revision republishes every policy
+  document it carries: changing an unrelated resource hands out a generation with a
+  new revision id for a document whose epoch and content never moved. That is the
+  ordinary case and it is adoptable — a replica follows the fleet onto the revision
+  now serving it, and a writer holding either publication is admitted, because both
+  enforce one policy. The same epoch stating *different* content is the fork, and
+  stays refused.
 - **A change the epoch does not carry is refused.** Publishing different content
   under the same epoch, or moving the epoch backwards, is refused rather than
   applied — otherwise two documents would claim one generation and no replica could
@@ -275,11 +286,14 @@ successive versions are successive revisions of the same document.
   (a document for another scope, an epoch that does not carry its change, or a token
   floor lowered so that revoked tokens would work again). A publication is as
   disruptive as its worst field.
-- **Stale writers fail closed.** A writer is admitted only when the generation it
-  holds *is* the active generation. An older epoch, an epoch this replica has not
-  adopted, and the same epoch from a different revision all deny — refusing on
-  inequality rather than on order is what makes an unknown generation deny instead
-  of enforcing something nobody serves. Adoption only ever moves forward.
+- **Stale writers fail closed.** A writer is admitted only when it holds the policy
+  the fence is enforcing — the active epoch and the active content, whichever
+  revision carried it. An older epoch, an epoch this replica has not adopted, and
+  the same epoch stating different content all deny; refusing anything but the
+  enforced policy is what makes an unknown generation deny instead of enforcing
+  something nobody serves. Adoption is monotonic in what is enforced: onto a higher
+  epoch, or onto the active document as a later revision restates it, never onto a
+  different document.
 - **What bootstrap owns stays in `axond.toml`.** Which backend enforces a limit,
   the DSN it connects with, the table or key prefix it lays state out under, and the
   stance to take when that store is unreachable (`on_unavailable`) are not policy
@@ -287,6 +301,13 @@ successive versions are successive revisions of the same document.
   `allow` would turn a policy publication into a way to switch enforcement off.
   Naming one of those fields in a policy body is its own refusal, reported as damage
   rather than as a release skew, because no future schema adds them.
+- **A value below a bound is a skew; a value outside the range is damage.** Bounds
+  are rules rather than shape, and rules tighten within one schema identifier — the
+  same exception a display name is in tenancy — so a stored counter below a minimum
+  this build enforces is `incompatible` and storage is intact: run a build that
+  reads it, or republish the document. A value that could never have been written —
+  negative, or past what these fields count in — is `corrupt`, as is a body that
+  contradicts its own identity or scope.
 
 Nothing enforces a document yet: no request path reads one, and no store writes
 one. This is the contract a later activation slice binds to, and the

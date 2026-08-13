@@ -56,15 +56,26 @@
 //! content changes, and [`PolicyTransition`] refuses a material change that does
 //! not advance it — which is what makes the epoch a usable order.
 //!
+//! A generation therefore carries the document's content, digested as a
+//! [`PolicyContent`], as well. A
+//! revision is whole desired state, so every revision restates every policy
+//! document it carries: a revision that changed an unrelated resource still hands
+//! out a generation with a new revision id for a document whose epoch and content
+//! never moved. That carry-forward is the ordinary case, and it is exactly what
+//! distinguishes it from a fork — same epoch, *different* content.
+//!
 //! # Stale writers fail closed
 //!
-//! [`PolicyFence`] admits a writer whose generation *is* the active generation,
-//! and refuses every other case: an older epoch, a newer epoch this replica has
-//! not adopted, and the same epoch published by a different revision. Refusing a
-//! seemingly newer generation is deliberate — a writer that may enforce anything
-//! it can claim is newer is not fenced at all — and refusing on inequality rather
-//! than on order means an unknown generation denies instead of admitting
-//! unenforced. That is the same posture as an unreachable budget store
+//! [`PolicyFence`] admits a writer that holds the policy the fence is enforcing —
+//! the active epoch and the active content, whichever revision carried it — and
+//! refuses every other case: an older epoch, a newer epoch this replica has not
+//! adopted, and the same epoch stating a different policy. Refusing a seemingly
+//! newer generation is deliberate — a writer that may enforce anything it can
+//! claim is newer is not fenced at all — and refusing anything but the enforced
+//! policy means an unknown generation denies instead of admitting
+//! unenforced. Adoption follows the same rule: it moves onto a higher epoch, and
+//! onto the active document as a later revision restates it, never onto a
+//! different policy. That is the same posture as an unreachable budget store
 //! ([`UnavailablePolicy::Deny`](crate::budget::UnavailablePolicy)): an
 //! unenforceable cap must not silently admit.
 //!
@@ -97,7 +108,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use super::canonical::{Canonical, CanonicalValue};
+use super::canonical::{Canonical, CanonicalValue, Checksum};
 use super::ids::{InvalidId, ProjectId, ResourceId, RevisionId, Slug, TenantId};
 use super::resource::{
     ResourceBody, ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber,
@@ -232,6 +243,14 @@ impl PolicyError {
     /// one, and reporting it as a version skew would send an operator to upgrade
     /// a fleet over a document that should never have been authored.
     ///
+    /// A *bound* is the exception, for the reason a display name is tenancy's: the
+    /// rules a schema's values are held to can tighten within one identifier, so a
+    /// value below a minimum this build enforces may be one an earlier build wrote
+    /// and accepted, and storage is intact. A value that is not representable at
+    /// all — negative, or past what this build counts in — is damage: every
+    /// release has written these fields as unsigned counters, so no tightening
+    /// produces one.
+    ///
     /// [`TenancyError::is_incompatible`]: super::tenancy::TenancyError::is_incompatible
     pub fn is_incompatible(&self) -> bool {
         match self {
@@ -241,12 +260,12 @@ impl PolicyError {
             Self::MissingField { field, .. } | Self::FieldType { field, .. } => {
                 *field == SCHEMA_FIELD
             }
+            Self::FieldRange { source, .. } => source.is_tightenable(),
             Self::Kind { .. }
             | Self::NotInline { .. }
             | Self::NotARecord { .. }
             | Self::BootstrapOwned { .. }
             | Self::MalformedId { .. }
-            | Self::FieldRange { .. }
             | Self::IdentityMismatch { .. }
             | Self::ScopeMismatch { .. } => false,
         }
@@ -281,6 +300,21 @@ pub enum InvalidPolicy {
     TooSmall { value: u64, min: u64 },
     #[error("{value} does not fit the range this build enforces")]
     NotRepresentable { value: i128 },
+}
+
+impl InvalidPolicy {
+    /// Whether a release could have written this value and had it accepted.
+    ///
+    /// A minimum is a rule rather than a shape, and rules tighten within one
+    /// schema identifier, so a stored value below one is read as a release skew
+    /// ([`PolicyError::is_incompatible`]). A value outside the range these fields
+    /// are counted in was never writable, so it is damage.
+    pub const fn is_tightenable(&self) -> bool {
+        match self {
+            Self::TooSmall { .. } => true,
+            Self::NotRepresentable { .. } => false,
+        }
+    }
 }
 
 /// A policy generation counter an operator advances when a document's content
@@ -398,7 +432,7 @@ impl fmt::Display for PolicyScope {
 /// What is *not* here: the backend that enforces it, where it stores ledgers, and
 /// what it does when it cannot be reached. Those stay in the bootstrap file (see
 /// the module docs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BudgetPolicy {
     subject_limit_microdollars: u64,
     namespace_limit_microdollars: Option<u64>,
@@ -446,7 +480,7 @@ impl BudgetPolicy {
 
 /// How much a scope may have in flight at once, and how long an abandoned lease
 /// stays live.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConcurrencyPolicy {
     max_in_flight_per_subject: u64,
     lease_ttl_seconds: u64,
@@ -490,7 +524,7 @@ impl ConcurrencyPolicy {
 /// shape and a mass revocation is one advancing integer. Advancing it only ever
 /// refuses more, which is why it is a live change; lowering it would un-revoke
 /// tokens an operator already revoked, and is refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RevocationPolicy {
     minimum_token_epoch: u64,
 }
@@ -574,11 +608,21 @@ impl PolicyBody {
     /// A body cannot carry its own revision id — the revision does not exist
     /// until the body is in it — so a generation is formed at the seam that knows
     /// both, and never guessed at inside the body.
-    pub const fn generation(&self, source: RevisionId) -> PolicyGeneration {
+    pub fn generation(&self, source: RevisionId) -> PolicyGeneration {
         PolicyGeneration {
             epoch: self.epoch,
             source,
+            content: self.content(),
         }
+    }
+
+    /// Everything a request would see, without the epoch it was published under.
+    ///
+    /// What distinguishes "the same document, carried into a later revision" from
+    /// "a different document claiming one epoch", which is the distinction
+    /// [`PolicyFence`] turns on.
+    pub fn content(&self) -> PolicyContent {
+        PolicyContent::of(self)
     }
 
     /// The resource identity this document is written under: the governed
@@ -675,10 +719,7 @@ impl PolicyBody {
     /// The epoch is publication metadata, so a republication that advances only
     /// it changes nothing a request would see.
     fn same_content(&self, other: &Self) -> bool {
-        self.scope == other.scope
-            && self.budget == other.budget
-            && self.concurrency == other.concurrency
-            && self.revocation == other.revocation
+        self.content() == other.content()
     }
 }
 
@@ -728,20 +769,82 @@ impl Canonical for PolicyBody {
     }
 }
 
-/// The identity of one published policy document: the epoch its content was
-/// published under, and the revision that published it.
+/// What a policy document states, digested: the scope it governs and every value
+/// it enforces, with no reference to when it was published.
 ///
-/// Neither half identifies a generation alone — see the module docs — so the pair
-/// is one type rather than two fields a caller could compare separately.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// A revision is whole desired state, so every revision restates every policy
+/// document it carries, whether or not that document changed. Comparing content
+/// is what lets a carried-forward document be recognized as the same policy
+/// rather than as a second one claiming its epoch, and a digest is what lets a
+/// [`PolicyGeneration`] carry that comparison without carrying a document.
+///
+/// Fixed-width and total: every field is length-prefixed or fixed-width, and an
+/// absent optional cap is distinguished from any value it could hold, so two
+/// documents digest alike only when they state the same policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PolicyContent(Checksum);
+
+impl PolicyContent {
+    fn of(body: &PolicyBody) -> Self {
+        let mut bytes = Vec::new();
+        for text in [
+            body.scope.tenant().to_string(),
+            body.scope
+                .project()
+                .map_or_else(String::new, |project| project.to_string()),
+        ] {
+            bytes.extend_from_slice(&(text.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(text.as_bytes());
+        }
+        for number in [
+            body.budget.subject_limit_microdollars,
+            u64::from(body.budget.namespace_limit_microdollars.is_some()),
+            body.budget.namespace_limit_microdollars.unwrap_or(0),
+            body.budget.reservation_ttl_seconds,
+            body.concurrency.max_in_flight_per_subject,
+            body.concurrency.lease_ttl_seconds,
+            body.revocation.minimum_token_epoch,
+        ] {
+            bytes.extend_from_slice(&number.to_be_bytes());
+        }
+        Self(Checksum::of(&bytes))
+    }
+
+    /// The digest itself, for a caller that stores or logs it.
+    pub const fn digest(&self) -> Checksum {
+        self.0
+    }
+}
+
+impl fmt::Display for PolicyContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// The identity of one published policy document: the epoch its content was
+/// published under, the policy that content *is*, and the revision that carried
+/// it.
+///
+/// No part identifies a generation alone — see the module docs — so the three are
+/// one type rather than fields a caller could compare separately. The revision is
+/// provenance: it says which publication a writer read, and is what makes two
+/// documents claiming one epoch distinguishable. The content is what says whether
+/// those two documents are the same policy or a fork.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PolicyGeneration {
     epoch: PolicyEpoch,
     source: RevisionId,
+    content: PolicyContent,
 }
 
 impl PolicyGeneration {
-    pub const fn new(epoch: PolicyEpoch, source: RevisionId) -> Self {
-        Self { epoch, source }
+    pub const fn new(epoch: PolicyEpoch, source: RevisionId, content: PolicyContent) -> Self {
+        Self {
+            epoch,
+            source,
+            content,
+        }
     }
 
     pub const fn epoch(&self) -> PolicyEpoch {
@@ -753,12 +856,35 @@ impl PolicyGeneration {
         self.source
     }
 
+    /// The policy this generation enforces, digested.
+    pub const fn content(&self) -> PolicyContent {
+        self.content
+    }
+
     /// Whether this generation's content was published after `other`'s.
     ///
-    /// Strictly by epoch: two generations of the same epoch are not ordered, they
-    /// are a fork, and [`PolicyFence`] refuses one rather than picking a winner.
+    /// Strictly by epoch: two generations of one epoch stating *different*
+    /// policies are not ordered, they are a fork, and [`PolicyFence`] refuses one
+    /// rather than picking a winner.
     pub fn supersedes(&self, other: &Self) -> bool {
         self.epoch > other.epoch
+    }
+
+    /// Whether both generations enforce the same policy under the same epoch,
+    /// whichever revision carried them.
+    ///
+    /// True for a document restated verbatim by a later revision — the ordinary
+    /// case, since a revision that changes an unrelated resource still republishes
+    /// every policy document — and false for two different documents sharing an
+    /// epoch, which is the fork a fence must refuse.
+    pub fn same_policy(&self, other: &Self) -> bool {
+        self.epoch == other.epoch && self.content == other.content
+    }
+
+    /// Whether this generation is `other` carried into a different revision:
+    /// the same policy under the same epoch, published again.
+    pub fn carries_forward(&self, other: &Self) -> bool {
+        self.same_policy(other) && self.source != other.source
     }
 }
 
@@ -788,8 +914,10 @@ pub enum Fenced {
         writer: PolicyGeneration,
         active: PolicyGeneration,
     },
-    /// The same epoch from a different revision: two publications claiming one
-    /// generation, which a restored backup or a forked control plane produces.
+    /// The same epoch stating a *different* policy: two publications claiming one
+    /// generation, which a restored backup or a forked control plane produces. A
+    /// revision that merely restates the active document is not this — see
+    /// [`PolicyGeneration::carries_forward`].
     #[error("writer holds {writer}, which claims the epoch of the active {active}")]
     Forked {
         writer: PolicyGeneration,
@@ -809,9 +937,17 @@ pub struct NotAnAdvance {
 /// writer passes.
 ///
 /// Fail-closed by construction: [`admit`](Self::admit) returns `Ok` only for the
-/// active generation exactly, so an unknown, older, forked, or newer generation
-/// denies. Nothing here writes anything — it is the contract a later activation
-/// slice enforces with.
+/// policy the fence is actively enforcing, so an older, forked, or newer
+/// generation denies. Nothing here writes anything — it is the contract a later
+/// activation slice enforces with.
+///
+/// "The policy it is enforcing" rather than "the revision it came from": a
+/// revision restates every policy document it carries, so a revision that changed
+/// an unrelated resource hands out a generation with a new
+/// [`source`](PolicyGeneration::source) for an unchanged document. Admitting and
+/// adopting compare the epoch and the content, and treat the revision as
+/// provenance — otherwise the ordinary carry-forward would read as a fork, and a
+/// replica could never follow the fleet onto the revision it is serving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyFence {
     active: PolicyGeneration,
@@ -827,8 +963,12 @@ impl PolicyFence {
     }
 
     /// Admit a writer holding `writer`, or say why it is fenced out.
+    ///
+    /// Admits the active generation, and the same policy under the same epoch from
+    /// another revision — the same document, carried forward. Everything else
+    /// denies, including a generation this replica has not adopted.
     pub fn admit(&self, writer: PolicyGeneration) -> Result<(), Fenced> {
-        if writer == self.active {
+        if writer.same_policy(&self.active) {
             return Ok(());
         }
         let (writer, active) = (writer, self.active);
@@ -841,13 +981,16 @@ impl PolicyFence {
         }
     }
 
-    /// Move the fence onto a generation that supersedes the active one.
+    /// Move the fence onto a generation that supersedes the active one, or onto
+    /// the active document as a later revision restates it.
     ///
-    /// A generation that does not advance the epoch is refused, so adopting is
-    /// monotonic: a replica cannot be walked backwards onto a generation whose
-    /// writers it already fenced out.
+    /// A generation that neither advances the epoch nor carries the active
+    /// document forward is refused, so adopting is monotonic in what is
+    /// *enforced*: a replica cannot be walked backwards onto an older policy, nor
+    /// sideways onto a different policy claiming the active epoch, but it can
+    /// follow the fleet onto the revision now serving the same policy.
     pub fn adopt(&mut self, next: PolicyGeneration) -> Result<(), NotAnAdvance> {
-        if !next.supersedes(&self.active) {
+        if !next.supersedes(&self.active) && !next.carries_forward(&self.active) {
             return Err(NotAnAdvance {
                 active: self.active,
                 next,
@@ -1797,12 +1940,29 @@ mod tests {
                 declared: tenant_scope().to_string(),
                 identity: reference.id,
             },
+            PolicyError::FieldRange {
+                reference,
+                field: LEASE_TTL_FIELD,
+                source: Box::new(InvalidPolicy::NotRepresentable { value: -30 }),
+            },
         ] {
             assert!(
                 !error.is_incompatible(),
                 "a refusal inside a body that declared this schema points at storage: {error}"
             );
         }
+
+        // A bound is the one rule that can tighten inside a stable schema — as a
+        // display name's can in tenancy — so a value below one this build enforces
+        // is a release skew rather than a rewritten row.
+        let below_a_bound = PolicyError::FieldRange {
+            reference,
+            field: LEASE_TTL_FIELD,
+            source: Box::new(InvalidPolicy::TooSmall { value: 0, min: 1 }),
+        };
+        assert!(below_a_bound.is_incompatible(), "{below_a_bound}");
+        assert!(InvalidPolicy::TooSmall { value: 0, min: 1 }.is_tightenable());
+        assert!(!InvalidPolicy::NotRepresentable { value: -30 }.is_tightenable());
     }
 
     #[test]
@@ -1953,19 +2113,29 @@ mod tests {
         assert_eq!(snapshot.source(), first);
         assert_eq!(snapshot.scopes().len(), 2);
 
+        let content = tenant_policy_body(1, 1).content();
         let generation = snapshot.generation(tenant_scope()).unwrap();
         assert_eq!(generation.epoch(), PolicyEpoch::FIRST);
         assert_eq!(generation.source(), first);
-        assert_eq!(generation, PolicyGeneration::new(PolicyEpoch::FIRST, first));
-        assert_ne!(
+        assert_eq!(generation.content(), content);
+        assert_eq!(
             generation,
-            PolicyGeneration::new(PolicyEpoch::FIRST, second),
+            PolicyGeneration::new(PolicyEpoch::FIRST, first, content)
+        );
+
+        let carried = set.snapshot(second).generation(tenant_scope()).unwrap();
+        assert_ne!(
+            generation, carried,
             "one epoch published by two revisions is two generations, not one"
         );
-        assert_ne!(
-            generation,
-            set.snapshot(second).generation(tenant_scope()).unwrap(),
-            "so republishing the same document under a new revision is a new generation"
+        assert!(
+            carried.carries_forward(&generation) && generation.carries_forward(&carried),
+            "but a revision that restates an unchanged document carries it forward, \
+             rather than forking it"
+        );
+        assert!(
+            carried.same_policy(&generation),
+            "so the two generations enforce one policy"
         );
 
         // A project with no document of its own is fenced by the generation of
@@ -1986,12 +2156,13 @@ mod tests {
     #[test]
     fn a_writer_of_any_generation_but_the_active_one_fails_closed() {
         let (first, second) = (revision_id(1), revision_id(2));
-        let active = PolicyGeneration::new(PolicyEpoch::new(4).unwrap(), first);
+        let content = tenant_policy_body(1, 4).content();
+        let active = PolicyGeneration::new(PolicyEpoch::new(4).unwrap(), first, content);
         let fence = PolicyFence::new(active);
         assert_eq!(fence.active(), active);
         assert_eq!(fence.admit(active), Ok(()));
 
-        let stale = PolicyGeneration::new(PolicyEpoch::new(3).unwrap(), first);
+        let stale = PolicyGeneration::new(PolicyEpoch::new(3).unwrap(), first, content);
         assert_eq!(
             fence.admit(stale),
             Err(Fenced::Stale {
@@ -2003,7 +2174,7 @@ mod tests {
         // A generation this replica has not adopted is refused rather than
         // trusted: a writer that may enforce anything it claims is newer is not
         // fenced at all.
-        let ahead = PolicyGeneration::new(PolicyEpoch::new(5).unwrap(), second);
+        let ahead = PolicyGeneration::new(PolicyEpoch::new(5).unwrap(), second, content);
         assert_eq!(
             fence.admit(ahead),
             Err(Fenced::Ahead {
@@ -2012,9 +2183,20 @@ mod tests {
             })
         );
 
-        // The same epoch from a different revision — a restored backup, a forked
+        // The same epoch stating a different policy — a restored backup, a forked
         // control plane — is refused rather than resolved in someone's favour.
-        let forked = PolicyGeneration::new(PolicyEpoch::new(4).unwrap(), second);
+        let forked = PolicyGeneration::new(
+            PolicyEpoch::new(4).unwrap(),
+            second,
+            PolicyBody::new(
+                tenant_scope(),
+                PolicyEpoch::new(4).unwrap(),
+                BudgetPolicy::new(9_000_000, None, 60).unwrap(),
+                ConcurrencyPolicy::new(8, 30).unwrap(),
+                RevocationPolicy::new(1),
+            )
+            .content(),
+        );
         assert_eq!(
             fence.admit(forked),
             Err(Fenced::Forked {
@@ -2023,6 +2205,7 @@ mod tests {
             })
         );
         assert!(!forked.supersedes(&active) && !active.supersedes(&forked));
+        assert!(!forked.carries_forward(&active));
 
         // Adoption is monotonic, so a replica cannot be walked back onto a
         // generation whose writers it already fenced out.
@@ -2051,6 +2234,90 @@ mod tests {
             })
         );
         assert_eq!(fence.active(), ahead, "a refused adoption changes nothing");
+    }
+
+    #[test]
+    fn an_unchanged_document_carried_into_a_later_revision_stays_the_same_policy() {
+        // The ordinary case: a revision that changes an unrelated resource still
+        // restates every policy document, so an unchanged document is republished
+        // under a new revision id at the same epoch.
+        let set = PolicySet::of(&state_with_policy()).unwrap();
+        let (published, carried) = (
+            set.snapshot(revision_id(1))
+                .generation(tenant_scope())
+                .unwrap(),
+            set.snapshot(revision_id(2))
+                .generation(tenant_scope())
+                .unwrap(),
+        );
+
+        // A writer holding the earlier publication enforces the policy the fence
+        // is enforcing, so it is admitted rather than fenced out as a fork.
+        let mut fence = PolicyFence::new(carried);
+        assert_eq!(fence.admit(published), Ok(()));
+        assert_eq!(PolicyFence::new(published).admit(carried), Ok(()));
+
+        // And a replica can follow the fleet onto the revision now serving it,
+        // which strict epoch advance alone would never allow.
+        let mut following = PolicyFence::new(published);
+        assert_eq!(following.adopt(carried), Ok(()));
+        assert_eq!(following.active(), carried);
+
+        // Monotonic in what is enforced, not in the revision: the same document is
+        // adoptable in either direction, while a different policy at that epoch is
+        // not adoptable in either.
+        assert_eq!(fence.adopt(published), Ok(()));
+        let forked = PolicyGeneration::new(
+            published.epoch(),
+            revision_id(3),
+            PolicyBody::new(
+                tenant_scope(),
+                published.epoch(),
+                BudgetPolicy::new(9_000_000, None, 60).unwrap(),
+                ConcurrencyPolicy::new(8, 30).unwrap(),
+                RevocationPolicy::new(1),
+            )
+            .content(),
+        );
+        assert_eq!(
+            fence.adopt(forked),
+            Err(NotAnAdvance {
+                active: published,
+                next: forked
+            })
+        );
+        assert!(matches!(fence.admit(forked), Err(Fenced::Forked { .. })));
+
+        // The transition model agrees: restating a document changes nothing.
+        let body = tenant_policy_body(1, published.epoch().get());
+        assert!(body.transition(&body).reasons().is_empty());
+        assert_eq!(
+            body.content(),
+            PolicyBody::new(
+                body.scope(),
+                body.epoch().next(),
+                *body.budget(),
+                *body.concurrency(),
+                *body.revocation(),
+            )
+            .content(),
+            "advancing only the epoch restates the same policy"
+        );
+
+        // An absent optional cap is not a cap of zero, so the two never digest
+        // alike and one can never be carried forward as the other.
+        let capped = |limit| {
+            PolicyBody::new(
+                tenant_scope(),
+                PolicyEpoch::FIRST,
+                BudgetPolicy::new(1_000_000, limit, 60).unwrap(),
+                ConcurrencyPolicy::new(8, 30).unwrap(),
+                RevocationPolicy::new(1),
+            )
+            .content()
+        };
+        assert_ne!(capped(None), capped(Some(0)));
+        assert_ne!(capped(Some(1)), capped(Some(2)));
     }
 
     #[test]
