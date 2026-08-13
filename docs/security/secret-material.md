@@ -39,7 +39,9 @@ unchanged by it. This page is the evidence for them under stateful mode.
   a reference, an owner, and a lifecycle state, and the store behind it exposes
   no method that returns material stored earlier. A malformed body that carries
   material is refused without echoing the input, and destruction is refused with
-  `secret_in_use` while the current revision would still resolve the version.
+  `secret_in_use` while the current revision would still resolve the version —
+  after the caller's ownership of that version is established, so the refusal
+  says nothing about material another owner holds.
 - **Material is not reachable from an operational surface.** Response bodies and
   headers, logs at every level, spans, usage records, and status responses are
   swept for it.

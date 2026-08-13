@@ -42,7 +42,11 @@
 //!
 //! Tombstoning destroys material, so it is refused while the *current* revision
 //! still pins the version: the operator publishes a credential that no longer
-//! references it, and destroys it after. Revocation is not gated the same way —
+//! references it, and destroys it after. That gate reads deployment-wide desired
+//! state, so it runs only once the store has confirmed the caller owns the
+//! version: otherwise `secret_in_use` against `secret_not_found` would answer
+//! whether another owner's material exists and is in service. Revocation is not
+//! gated the same way —
 //! a leaked key must be withdrawable immediately, and withdrawing it is exactly
 //! what makes the next candidate compilation fail rather than silently keep
 //! authorizing. The snapshot serving requests at that moment holds its own
