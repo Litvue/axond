@@ -40,6 +40,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use crate::config::{BudgetBackend, BudgetConfig, StoreUnavailable};
+use crate::desired_state::policy::PolicyGeneration;
+use crate::policy::{BudgetCaps, Ceilings};
 use crate::telemetry::metrics;
 
 pub use postgres::PostgresBudget;
@@ -61,6 +63,14 @@ pub struct Reservation {
     /// belongs to even when a key has many in flight.
     pub id: String,
     pub estimate_microdollars: u64,
+    /// The published policy generation this hold was admitted under, or `None`
+    /// when the bootstrap file's caps admitted it (#150).
+    ///
+    /// Carried on the hold rather than looked up at settlement, which is what
+    /// makes a publication bind from the next admission: a request admitted under
+    /// the previous document settles against the generation that granted it, and
+    /// a drain is finished when no hold names the superseded generation any more.
+    pub generation: Option<PolicyGeneration>,
 }
 
 impl Reservation {
@@ -69,6 +79,7 @@ impl Reservation {
         Self {
             id: String::new(),
             estimate_microdollars: 0,
+            generation: None,
         }
     }
 
@@ -451,9 +462,12 @@ impl BudgetStore for InMemoryBudget {
         if committed.saturating_add(estimated_microdollars) > self.limit_microdollars {
             return Admission::Denied(Denial::Exceeded);
         }
+        // Per-replica, so no published policy governs it: a fleet-wide document
+        // is refused on this backend at activation rather than approximated here.
         let reservation = Reservation {
             id: Reservation::next_id(),
             estimate_microdollars: estimated_microdollars,
+            generation: None,
         };
         ledger.held.insert(
             reservation.id.clone(),
@@ -542,23 +556,79 @@ impl BudgetError {
     }
 }
 
-/// Settings shared by both durable backends: the cap they enforce, how long a
-/// hold survives a replica that dies mid-request, and the stance to take when
-/// the store cannot be reached.
-#[derive(Debug, Clone, Copy)]
+/// What a durable backend needs beyond its connection: where it reads the caps
+/// it enforces, which key layout it was built on, and the stance to take when the
+/// store cannot be reached.
+///
+/// The split is #150's: the *values* are read per request through [`Ceilings`],
+/// because a publication changes them without a restart; the *layout* and the
+/// unavailability stance are fixed for the life of the process, because changing
+/// either under outstanding holds is a migration, not a setting.
+#[derive(Debug, Clone)]
 pub struct SharedSettings {
-    pub limit_microdollars: u64,
-    /// The optional namespace-wide cap. `Some` turns every reserve and settle
-    /// into a composite `(subject, namespace)` operation on the same logical
-    /// reservation; `None` leaves the subject-only behavior untouched.
-    pub namespace_limit_microdollars: Option<u64>,
-    pub reservation_ttl: Duration,
+    pub ceilings: Ceilings,
+    /// Whether this store's keys carry a namespace-wide ledger. `true` turns
+    /// every reserve and settle into a composite `(subject, namespace)` operation
+    /// on the same logical reservation; `false` leaves the subject-only behavior
+    /// untouched.
+    pub namespace_scope: bool,
     pub unavailable: UnavailablePolicy,
 }
 
 impl SharedSettings {
-    pub fn enforces_namespace_cap(&self) -> bool {
-        self.namespace_limit_microdollars.is_some()
+    /// The settings a deployment whose caps never change runs with. Test-only:
+    /// a serving process reads them through the published runtime.
+    #[cfg(test)]
+    pub fn fixed(caps: BudgetCaps, unavailable: UnavailablePolicy) -> Self {
+        Self {
+            namespace_scope: caps.namespace_microdollars.is_some(),
+            ceilings: Ceilings::fixed(crate::policy::ActivePolicy {
+                budget: Some(caps),
+                concurrency: None,
+                generation: None,
+            }),
+            unavailable,
+        }
+    }
+
+    pub const fn enforces_namespace_cap(&self) -> bool {
+        self.namespace_scope
+    }
+
+    /// The caps governing `namespace`, or `None` when this replica holds no
+    /// enforceable policy for it.
+    ///
+    /// A store that cannot answer "what is the cap here" must not admit: an
+    /// unenforced cap and an infinite one are indistinguishable to a caller, and
+    /// only one of them is what an operator published. The layout is checked with
+    /// it, so a view whose scope-wide cap disagrees with the keys this process
+    /// booted on denies rather than enforcing half of each.
+    pub(crate) fn caps(&self, backend: &'static str, namespace: &str) -> Option<BudgetCaps> {
+        let policy = self.ceilings.active(namespace);
+        let Some(caps) = policy.budget else {
+            tracing::warn!(
+                backend,
+                namespace,
+                "no policy governs this namespace, so its spend cap cannot be enforced; denying"
+            );
+            return None;
+        };
+        if caps.namespace_microdollars.is_some() != self.namespace_scope {
+            tracing::error!(
+                backend,
+                namespace,
+                namespace_scope = self.namespace_scope,
+                "the active policy's scope-wide cap disagrees with the key layout this process \
+                 booted on; denying rather than enforcing against the wrong ledgers"
+            );
+            return None;
+        }
+        Some(caps)
+    }
+
+    /// The generation governing `namespace`, for stamping a hold.
+    pub(crate) fn generation(&self, namespace: &str) -> Option<PolicyGeneration> {
+        self.ceilings.active(namespace).generation
     }
 }
 
@@ -578,11 +648,11 @@ pub async fn build(
     config: &BudgetConfig,
     env: &HashMap<String, String>,
     namespace_count: usize,
+    ceilings: Ceilings,
 ) -> Result<Box<dyn BudgetStore>, BudgetError> {
     let settings = SharedSettings {
-        limit_microdollars: config.limit_microdollars,
-        namespace_limit_microdollars: config.namespace_limit_microdollars,
-        reservation_ttl: Duration::from_secs(config.reservation_ttl_seconds),
+        ceilings,
+        namespace_scope: config.enforces_namespace_scope(),
         unavailable: config.on_unavailable.into(),
     };
     match config.backend {
@@ -682,6 +752,12 @@ fn dsn<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ceilings a build test needs: none of these backends is reached, and
+    /// what governs a namespace is decided in `crate::policy`, not here.
+    fn ungoverned() -> Ceilings {
+        Ceilings::fixed(crate::policy::ActivePolicy::default())
+    }
 
     pub(super) fn key() -> BudgetKey {
         BudgetKey {
@@ -785,7 +861,7 @@ mod tests {
             dsn_env: Some("AXOND_TEST_MISSING_BUDGET_URL".to_owned()),
             ..BudgetConfig::default()
         };
-        let err = build(&config, &HashMap::new(), 0)
+        let err = build(&config, &HashMap::new(), 0, ungoverned())
             .await
             .err()
             .expect("a missing dsn must fail at boot");
@@ -814,10 +890,73 @@ mod tests {
 
     #[tokio::test]
     async fn the_default_backend_holds_nothing() {
-        let store = build(&BudgetConfig::default(), &HashMap::new(), 0)
+        let store = build(&BudgetConfig::default(), &HashMap::new(), 0, ungoverned())
             .await
             .expect("the default backend needs no datastore");
         assert_eq!(store.name(), "none");
+    }
+
+    /// A shared store reads its caps per reserve, so a publication moves them
+    /// without a restart — and the connection it reads them for is untouched.
+    #[test]
+    fn shared_settings_read_the_caps_the_runtime_is_publishing_now() {
+        use std::sync::Arc;
+
+        use crate::config::NamespacePolicy;
+        use crate::desired_state::fixtures::{project_id, tenant_id};
+        use crate::desired_state::policy::PolicyScope;
+        use crate::policy::fixtures::{detailed, generation};
+        use crate::policy::view::tests::governed;
+        use crate::policy::{Ceilings, PolicyRuntime, PolicyView};
+
+        let scope = PolicyScope::Project {
+            tenant: tenant_id(1),
+            project: project_id(1),
+        };
+        let published = |subject_limit, epoch| {
+            let body = detailed(scope, epoch, subject_limit, None, 300, 8, 60, 0);
+            governed(
+                "acme/core",
+                NamespacePolicy {
+                    body,
+                    generation: generation(&body, epoch),
+                },
+            )
+        };
+        let runtime = Arc::new(PolicyRuntime::bootstrap(&published(1_000, 1)));
+        let settings = SharedSettings {
+            ceilings: Ceilings::published(&runtime),
+            namespace_scope: false,
+            unavailable: UnavailablePolicy::Deny,
+        };
+
+        assert_eq!(
+            settings
+                .caps("redis", "acme/core")
+                .expect("the namespace is governed")
+                .subject_microdollars,
+            1_000
+        );
+        runtime.install(PolicyView::of(&published(9_000, 2)));
+        assert_eq!(
+            settings
+                .caps("redis", "acme/core")
+                .expect("the namespace is governed")
+                .subject_microdollars,
+            9_000
+        );
+
+        // A namespace no document governs has no enforceable cap, and an
+        // unenforced finite cap must never be served as an infinite one.
+        assert!(settings.caps("redis", "unpublished").is_none());
+
+        // Nor may a document's scope-wide cap be enforced against keys that were
+        // not laid out for one: that is a migration, not a value.
+        let mismatched = SharedSettings {
+            namespace_scope: true,
+            ..settings
+        };
+        assert!(mismatched.caps("redis", "acme/core").is_none());
     }
 
     #[tokio::test]

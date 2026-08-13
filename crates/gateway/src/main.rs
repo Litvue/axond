@@ -52,6 +52,9 @@ mod mint;
 // `axond migrate apply`, and `axond migrate adopt`. Nothing here is on the
 // request path or reachable from `serve`.
 mod ops;
+// What a replica enforces right now, and how a publication replaces it without
+// touching the holds it already granted (#150).
+mod policy;
 mod principals;
 // The recovery qualification driver (#219). Tests only: it holds a replica's
 // reconciler, its cache, and a real Postgres journal at once, and takes the
@@ -517,15 +520,28 @@ async fn serve() -> anyhow::Result<()> {
         on_undurable = config.usage_journal.on_undurable.as_str(),
         "usage delivery"
     );
-    let budget: Box<dyn BudgetStore> =
-        budget::build(&config.budget, &env, config.distinct_namespace_count())
-            .await
-            .map_err(|e| anyhow::anyhow!("budget configuration failed: {e}"))?;
+    // Built before the stores and shared with them: the caps they enforce are
+    // read out of it per request, so a publication changes what is enforced
+    // without rebuilding a connection (#150). Until a control plane publishes,
+    // it holds exactly the bootstrap file's values.
+    let policy = Arc::new(policy::PolicyRuntime::bootstrap(&config));
+    let budget: Box<dyn BudgetStore> = budget::build(
+        &config.budget,
+        &env,
+        config.distinct_namespace_count(),
+        policy::Ceilings::published(&policy),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("budget configuration failed: {e}"))?;
     tracing::info!(backend = budget.name(), "budget enforcement");
-    let rate_limiter: Box<dyn RateLimiter> =
-        rate_limit::build(&config.rate_limit, &config.budget, &env)
-            .await
-            .map_err(|e| anyhow::anyhow!("rate-limit configuration failed: {e}"))?;
+    let rate_limiter: Box<dyn RateLimiter> = rate_limit::build(
+        &config.rate_limit,
+        &config.budget,
+        &env,
+        policy::Ceilings::published(&policy),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("rate-limit configuration failed: {e}"))?;
     tracing::info!(backend = rate_limiter.name(), "inbound rate limiting");
     let revocation: Box<dyn RevocationStore> =
         revocation::build(&config.revocation, &config.budget, &env)
@@ -553,13 +569,14 @@ async fn serve() -> anyhow::Result<()> {
 
     let bind = config.server.bind;
     let watching = config.reload.watch;
-    let state = AppState::with_resources(
+    let state = AppState::new_with_policy(
         config,
         &env,
         usage,
         budget,
         rate_limiter,
         revocation,
+        policy,
         ReplicaObservability::stateless(),
     )
     .map_err(|e| anyhow::anyhow!("config resolution failed: {e}"))?;

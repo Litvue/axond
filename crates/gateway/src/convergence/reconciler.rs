@@ -48,6 +48,7 @@ use super::status::{Clock, Rejection, RevisionReport, RevisionStatus, SnapshotSo
 use crate::backends::BackendFailure;
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::desired_state::{LoadedRevision, RevisionId};
+use crate::policy::{ActivationRefusal, PolicyView};
 use crate::state::{AppState, ConfigSnapshot};
 use crate::telemetry;
 
@@ -57,6 +58,20 @@ use crate::telemetry;
 /// testable without a process's worth of resources — and so the *only* thing the
 /// reconciler can do to the running config is replace it wholesale.
 pub trait SnapshotSink: Send + Sync {
+    /// Whether this candidate's stateful policy may replace what is being
+    /// enforced, decided *before* anything is published (#150).
+    ///
+    /// The two-step exists because policy is the one part of a candidate that
+    /// cannot be judged from the candidate alone: whether a change is live, needs
+    /// a drain, or needs a migration depends on the holds this replica has
+    /// already granted and the durable layout it booted on. A refusal here leaves
+    /// both the running config and the running policy exactly as they were.
+    ///
+    /// The default admits everything, for sinks that hold no policy.
+    fn admit(&self, _snapshot: &ConfigSnapshot) -> Result<(), ActivationRefusal> {
+        Ok(())
+    }
+
     /// Replace the serving snapshot atomically. In-flight requests keep the
     /// snapshot they already hold.
     fn publish(&self, snapshot: ConfigSnapshot);
@@ -66,7 +81,17 @@ pub trait SnapshotSink: Send + Sync {
 }
 
 impl SnapshotSink for AppState {
+    fn admit(&self, snapshot: &ConfigSnapshot) -> Result<(), ActivationRefusal> {
+        self.policy().plan(&PolicyView::of(&snapshot.config))?;
+        Ok(())
+    }
+
+    /// The policy is installed first and the config second, both atomically. The
+    /// order matters only for the instant between them, and this is the harmless
+    /// one: a request in that window is priced by the new limits under the old
+    /// catalogue, never routed by a new catalogue under limits nobody published.
     fn publish(&self, snapshot: ConfigSnapshot) {
+        self.policy().install(PolicyView::of(&snapshot.config));
         AppState::publish(self, snapshot);
     }
 
@@ -500,6 +525,14 @@ impl Reconciler {
         // fails *here*, before the sink is touched, and the previous snapshot
         // keeps serving.
         let snapshot = self.compiler.compile(&revision, generation).await?;
+        // Asked before publishing, so an unsafe policy transition costs a
+        // rejected candidate rather than a half-applied one.
+        self.sink
+            .admit(&snapshot)
+            .map_err(|source| CompileError::Activation {
+                revision: id,
+                source,
+            })?;
         self.status.observe_loaded(id);
         // How many secret versions this snapshot holds, read before it is
         // published because publishing moves it. A count, never a reference and

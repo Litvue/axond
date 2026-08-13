@@ -32,6 +32,7 @@ use crate::convergence::{RevisionReport, RevisionStatus};
 use crate::credentials::{CredentialError, Credentials};
 use crate::desired_state::pricing::PricingSnapshot;
 use crate::key_material::{self, KeyMaterialError};
+use crate::policy::PolicyRuntime;
 use crate::principals::{
     Capability, ConfigPrincipals, GatewayKeyEntry, NamespaceEpoch, Presented, PrincipalAuthority,
     PrincipalShapeError, PrincipalStoreChain, TokenVerifier, TokenVerifierBuildError,
@@ -63,6 +64,10 @@ pub struct Inner {
     pub admission: AdmissionControl,
     pub rate_limiter: Box<dyn RateLimiter>,
     pub revocation: Box<dyn RevocationStore>,
+    /// The stateful policy this replica is enforcing, and the holds outstanding
+    /// under each generation of it (#150). Process-level like the stores that
+    /// read it: a publication replaces the values, never the connections.
+    pub policy: Arc<PolicyRuntime>,
     /// Drain state and the in-flight count. Process-level, like the sinks: a
     /// reload replaces what a request is served *with*, never whether the
     /// process is still accepting requests at all.
@@ -612,6 +617,8 @@ impl AppState {
         )
     }
 
+    /// Test-only: production builds go through [`AppState::new_with_policy`],
+    /// which threads the one [`PolicyRuntime`] the backends read.
     #[cfg(test)]
     pub fn new_with_rate_limiter(
         config: Config,
@@ -659,6 +666,10 @@ impl AppState {
     /// The boot path: every process-level resource is already connected, usage
     /// delivery included, so a deployment that cannot reach a datastore it asked
     /// for has already failed before this is called.
+    ///
+    /// The policy runtime is this replica's own, for a caller whose stores were
+    /// not built against one; a stateful boot builds the stores against a runtime
+    /// and calls [`AppState::new_with_policy`] instead.
     pub fn with_resources(
         config: Config,
         env: &HashMap<String, String>,
@@ -666,6 +677,32 @@ impl AppState {
         budget: Box<dyn BudgetStore>,
         rate_limiter: Box<dyn RateLimiter>,
         revocation: Box<dyn RevocationStore>,
+        observability: ReplicaObservability,
+    ) -> Result<Self, SnapshotError> {
+        let policy = Arc::new(PolicyRuntime::bootstrap(&config));
+        Self::new_with_policy(
+            config,
+            env,
+            usage,
+            budget,
+            rate_limiter,
+            revocation,
+            policy,
+            observability,
+        )
+    }
+
+    /// The serving constructor: the stores were built reading `policy`, so the
+    /// state that publishes into it must be the state they read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_policy(
+        config: Config,
+        env: &HashMap<String, String>,
+        usage: Arc<UsageDelivery>,
+        budget: Box<dyn BudgetStore>,
+        rate_limiter: Box<dyn RateLimiter>,
+        revocation: Box<dyn RevocationStore>,
+        policy: Arc<PolicyRuntime>,
         observability: ReplicaObservability,
     ) -> Result<Self, SnapshotError> {
         // The transport bounds configure the shared client, so they are read
@@ -684,6 +721,7 @@ impl AppState {
             admission,
             rate_limiter,
             revocation,
+            policy,
             lifecycle: Arc::new(Lifecycle::new()),
             status: observability.status,
             revision: observability.revision,
@@ -716,6 +754,11 @@ impl AppState {
     /// hold; every request that starts after this call sees the new one.
     pub fn publish(&self, snapshot: ConfigSnapshot) {
         self.0.config.store(Arc::new(snapshot));
+    }
+
+    /// The stateful policy this replica enforces.
+    pub fn policy(&self) -> &Arc<PolicyRuntime> {
+        &self.0.policy
     }
 }
 

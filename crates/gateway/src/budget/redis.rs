@@ -808,15 +808,22 @@ impl BudgetStore for RedisBudget {
     }
 
     async fn reserve(&self, key: &BudgetKey, estimated_microdollars: u64) -> Admission {
+        // Read once, and carry what was read: the caps, and the generation that
+        // stated them. A publication landing between here and the settlement
+        // binds the *next* request, never this one.
+        let Some(caps) = self.settings.caps(BACKEND, &key.namespace) else {
+            return Admission::Denied(Denial::StoreUnavailable);
+        };
         let reservation = Reservation {
             id: Reservation::next_id(),
             estimate_microdollars: estimated_microdollars,
+            generation: self.settings.generation(&key.namespace),
         };
-        let ttl_ms = self.settings.reservation_ttl.as_millis() as u64;
+        let ttl_ms = caps.reservation_ttl.as_millis() as u64;
         let mut invocation = self.script(&self.reserve, key);
         invocation.arg(now_ms()).arg(ttl_ms);
-        invocation.arg(self.settings.limit_microdollars);
-        if let Some(namespace_limit) = self.settings.namespace_limit_microdollars {
+        invocation.arg(caps.subject_microdollars);
+        if let Some(namespace_limit) = caps.namespace_microdollars {
             invocation.arg(namespace_limit);
         }
         let admitted: Result<i64, ::redis::RedisError> = invocation
@@ -825,7 +832,10 @@ impl BudgetStore for RedisBudget {
             .invoke_async(&mut self.connection.clone())
             .await;
         match admitted {
-            Ok(1) => Admission::Allowed(reservation),
+            Ok(1) => {
+                self.settings.ceilings.enter(reservation.generation);
+                Admission::Allowed(reservation)
+            }
             Ok(2) => exceeded(key, ExceededScope::Namespace),
             Ok(_) => exceeded(key, ExceededScope::Subject),
             Err(e) => self.settings.unavailable.admission(BACKEND, &e),
@@ -840,6 +850,10 @@ impl BudgetStore for RedisBudget {
         if reservation.id.is_empty() {
             return;
         }
+        // Whatever the store answers, the hold is over as far as this replica's
+        // drain accounting goes: a settlement that failed leaves value in Redis
+        // until the TTL, not a request still running under the generation.
+        self.settings.ceilings.exit(reservation.generation);
         let settled: Result<i64, ::redis::RedisError> = self
             .script(&self.settle, key)
             .arg(&reservation.id)
@@ -889,21 +903,31 @@ mod tests {
     use super::super::UnavailablePolicy;
     use super::super::tests::key;
     use super::*;
+    use crate::policy::BudgetCaps;
 
     fn settings(limit: u64) -> SharedSettings {
-        SharedSettings {
-            limit_microdollars: limit,
-            namespace_limit_microdollars: None,
-            reservation_ttl: Duration::from_secs(300),
-            unavailable: UnavailablePolicy::Deny,
-        }
+        expiring_settings(limit, None, Duration::from_secs(300))
     }
 
     fn namespace_settings(limit: u64, namespace_limit: u64) -> SharedSettings {
-        SharedSettings {
-            namespace_limit_microdollars: Some(namespace_limit),
-            ..settings(limit)
-        }
+        expiring_settings(limit, Some(namespace_limit), Duration::from_secs(300))
+    }
+
+    /// Fixed caps, as a deployment whose limits are the file's runs with: the
+    /// dynamic source is exercised where it is decided, in `crate::policy`.
+    fn expiring_settings(
+        limit: u64,
+        namespace_limit: Option<u64>,
+        reservation_ttl: Duration,
+    ) -> SharedSettings {
+        SharedSettings::fixed(
+            BudgetCaps {
+                subject_microdollars: limit,
+                namespace_microdollars: namespace_limit,
+                reservation_ttl,
+            },
+            UnavailablePolicy::Deny,
+        )
     }
 
     fn prefix() -> String {
@@ -1113,8 +1137,7 @@ mod tests {
         let Some(url) = crate::test_services::redis_url() else {
             return;
         };
-        let mut expiring = settings(1_000);
-        expiring.reservation_ttl = Duration::from_millis(50);
+        let expiring = expiring_settings(1_000, None, Duration::from_millis(50));
         let store = RedisBudget::connect(&url, prefix(), expiring)
             .await
             .expect("connect");
@@ -1328,8 +1351,7 @@ mod tests {
             .expect("migrate");
         // A long TTL, so the denial below cannot race the clock; expiry is then
         // forced by rewriting the hold's deadline rather than by sleeping.
-        let mut expiring = namespace_settings(1_000, 1_000);
-        expiring.reservation_ttl = Duration::from_secs(600);
+        let expiring = expiring_settings(1_000, Some(1_000), Duration::from_secs(600));
         let store = RedisBudget::connect(&url, prefix.clone(), expiring)
             .await
             .expect("connect");

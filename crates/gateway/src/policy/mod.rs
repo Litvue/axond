@@ -1,0 +1,340 @@
+//! Enforcing published policy at runtime (#150).
+//!
+//! [`desired_state::policy`](crate::desired_state::policy) says what a scope's
+//! policy *is*; this module is what a replica does with it. It holds the values
+//! the request path enforces — the spend caps, the hold lifetime, the concurrency
+//! ceiling — behind one atomically replaceable [`PolicyView`], so a publication
+//! changes what the fleet enforces without a deploy and without rebuilding a
+//! single connection.
+//!
+//! # What is dynamic, and what is not
+//!
+//! Dynamic (control-plane owned, replaced per revision): the subject spend cap,
+//! the scope-wide spend cap's *value*, the reservation TTL, the per-subject
+//! concurrency ceiling, the lease TTL, and the minted-token floor.
+//!
+//! Not dynamic (bootstrap owned, fixed for the life of a process): which backend
+//! enforces each responsibility, the DSN it is reached through, the key prefix or
+//! table it lays state out under, whether that layout carries a scope-wide cap at
+//! all, and what happens when the backend is unreachable
+//! ([`BOOTSTRAP_OWNED_FIELDS`](crate::desired_state::policy::BOOTSTRAP_OWNED_FIELDS)).
+//! Those are connection and layout facts a running replica cannot change under
+//! its own outstanding holds, so a publication that needs one changed is refused
+//! here and performed by an operator with a documented procedure
+//! (`docs/operations/policy-activation.md`).
+//!
+//! # The control plane is not a hot path
+//!
+//! Nothing in this module reads control-plane Postgres. Convergence compiles a
+//! revision off the request path and hands the result here; enforcement then runs
+//! entirely against whichever responsibility-specific backend the bootstrap file
+//! selected. A deployment whose control plane is down keeps enforcing the last
+//! view it installed, which is the same last-known-good posture the rest of
+//! convergence has.
+//!
+//! # Generations, and why a hold keeps its own
+//!
+//! Every admitted request records the [`PolicyGeneration`] it was admitted under
+//! ([`Reservation::generation`](crate::budget::Reservation::generation),
+//! [`RateLimitPermit`](crate::rate_limit::RateLimitPermit)), and settles against
+//! that generation rather than against whatever is active when it finishes. A
+//! publication therefore binds from the next admission and never rewrites,
+//! re-prices, or invalidates what is already held — which is exactly what
+//! [`TransitionClass::Drain`](crate::desired_state::policy::TransitionClass)
+//! promises, and what makes a rollback safe: the older
+//! document is republished forward, new admissions bind to it, and the holds taken
+//! under the higher caps run to completion on the terms they were granted.
+//!
+//! [`PolicyRuntime`] counts those outstanding holds per generation, so "the drain
+//! has finished" is an observable fact rather than a guess.
+
+mod activation;
+mod source;
+pub(crate) mod view;
+
+pub use activation::{Activation, ActivationRefusal, BackendSupport};
+pub use source::{Ceilings, PolicyHold};
+pub use view::{ActivePolicy, BudgetCaps, ConcurrencyCaps, PolicyView};
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use arc_swap::ArcSwap;
+
+use crate::config::Config;
+use crate::desired_state::policy::PolicyGeneration;
+
+/// The policy a replica is enforcing, and the holds outstanding under it.
+///
+/// One per process, shared by the stores that enforce it and by the convergence
+/// pipeline that replaces it. Replacement is a single atomic store, so a request
+/// reads one whole coherent view or the previous one, never a half-applied mix.
+#[derive(Debug)]
+pub struct PolicyRuntime {
+    /// What this process's backends can enforce. A boot fact: changing it means
+    /// changing the bootstrap file and restarting.
+    support: BackendSupport,
+    view: ArcSwap<PolicyView>,
+    /// Outstanding holds and leases, by the generation that admitted them.
+    ///
+    /// The unit of "may this drain be considered finished": a superseded
+    /// generation with a non-zero count still has work running under the terms it
+    /// granted.
+    holds: Mutex<HashMap<PolicyGeneration, u64>>,
+}
+
+impl PolicyRuntime {
+    /// The runtime a process boots with: whatever the bootstrap file states, and
+    /// no published document.
+    ///
+    /// In stateless mode that is the whole story — the file's limits are the
+    /// policy, forever, and nothing about enforcement changes from what it was
+    /// before this module existed.
+    pub fn bootstrap(config: &Config) -> Self {
+        Self {
+            support: BackendSupport::of(config),
+            view: ArcSwap::from_pointee(PolicyView::of(config)),
+            holds: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The policy governing `namespace` right now.
+    pub fn active(&self, namespace: &str) -> ActivePolicy {
+        self.view.load().policy(namespace)
+    }
+
+    /// Whether `candidate` may be activated on this replica, and what activating
+    /// it costs.
+    ///
+    /// Pure: it answers from the active view without touching it, which is what
+    /// lets convergence run this as a gate *before* anything is published (see
+    /// [`RevisionCompiler`](crate::convergence::RevisionCompiler)).
+    pub fn plan(&self, candidate: &PolicyView) -> Result<Activation, ActivationRefusal> {
+        activation::plan(&self.view.load(), candidate, self.support)
+    }
+
+    /// Install `candidate` as the policy this replica enforces from the next
+    /// admission on.
+    ///
+    /// Infallible by design, and called only from
+    /// [`AppState::publish`](crate::state::AppState::publish): the refusal happens
+    /// at the compile gate, where a candidate can still be dropped without
+    /// touching a serving replica. Reaching a refusal here would mean the snapshot
+    /// being installed disagrees with the policy view derived from it, so it is
+    /// logged loudly and the view still follows the snapshot — a replica must not
+    /// serve a configuration under a policy it does not hold.
+    pub fn install(&self, candidate: PolicyView) -> Activation {
+        let activation = match self.plan(&candidate) {
+            Ok(activation) => activation,
+            Err(refusal) => {
+                tracing::error!(
+                    %refusal,
+                    "a policy view that the compile gate admitted was refused at installation; \
+                     installing it anyway to keep the snapshot and the policy it is served under \
+                     consistent"
+                );
+                Activation::forced()
+            }
+        };
+        self.view.store(std::sync::Arc::new(candidate));
+        activation.log(&self.draining());
+        activation
+    }
+
+    /// Record a hold admitted under `generation`.
+    ///
+    /// `None` — a namespace whose policy is the bootstrap file's — is not counted:
+    /// there is no generation to drain.
+    pub fn enter(&self, generation: Option<PolicyGeneration>) {
+        let Some(generation) = generation else { return };
+        *self
+            .holds
+            .lock()
+            .expect("not poisoned")
+            .entry(generation)
+            .or_insert(0) += 1;
+    }
+
+    /// Record that a hold admitted under `generation` has been settled, released,
+    /// or dropped.
+    pub fn exit(&self, generation: Option<PolicyGeneration>) {
+        let Some(generation) = generation else { return };
+        let mut holds = self.holds.lock().expect("not poisoned");
+        if let Some(count) = holds.get_mut(&generation) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                holds.remove(&generation);
+            }
+        }
+    }
+
+    /// How many holds are outstanding under `generation`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn outstanding(&self, generation: PolicyGeneration) -> u64 {
+        self.holds
+            .lock()
+            .expect("not poisoned")
+            .get(&generation)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Every superseded generation that still has work running under it.
+    ///
+    /// Empty means every drain this replica knows about has finished: nothing
+    /// admitted under a replaced document is still in flight *here*. It says
+    /// nothing about other replicas, which is why the operational procedure is a
+    /// fleet-wide check rather than one replica's answer.
+    pub fn draining(&self) -> Vec<(PolicyGeneration, u64)> {
+        let view = self.view.load();
+        let mut draining: Vec<(PolicyGeneration, u64)> = self
+            .holds
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .filter(|(generation, _)| !view.enforces(**generation))
+            .map(|(generation, count)| (*generation, *count))
+            .collect();
+        // Ordered so two reads of one state produce one answer.
+        draining.sort_by_key(|(generation, _)| {
+            (
+                generation.scope(),
+                generation.epoch().get(),
+                generation.content().to_string(),
+            )
+        });
+        draining
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use crate::desired_state::fixtures::revision_id;
+    use crate::desired_state::policy::{
+        BudgetPolicy, ConcurrencyPolicy, PolicyBody, PolicyEpoch, PolicyGeneration, PolicyScope,
+        RevocationPolicy,
+    };
+
+    /// A policy body for `scope`, at `epoch`, with caps a test can vary.
+    pub(crate) fn body(scope: PolicyScope, epoch: u64, subject_limit: u64) -> PolicyBody {
+        detailed(scope, epoch, subject_limit, None, 300, 8, 60, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn detailed(
+        scope: PolicyScope,
+        epoch: u64,
+        subject_limit: u64,
+        namespace_limit: Option<u64>,
+        reservation_ttl_seconds: u64,
+        max_in_flight: u64,
+        lease_ttl_seconds: u64,
+        minimum_token_epoch: u64,
+    ) -> PolicyBody {
+        PolicyBody::new(
+            scope,
+            PolicyEpoch::new(epoch).expect("a positive epoch"),
+            BudgetPolicy::new(subject_limit, namespace_limit, reservation_ttl_seconds)
+                .expect("a positive reservation ttl"),
+            ConcurrencyPolicy::new(max_in_flight, lease_ttl_seconds)
+                .expect("a positive concurrency policy"),
+            RevocationPolicy::new(minimum_token_epoch),
+        )
+    }
+
+    pub(crate) fn generation(body: &PolicyBody, revision: u64) -> PolicyGeneration {
+        body.generation(revision_id(revision))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::{body, generation};
+    use super::*;
+    use crate::desired_state::fixtures::tenant_id;
+    use crate::desired_state::policy::PolicyScope;
+
+    fn scope() -> PolicyScope {
+        PolicyScope::Tenant(tenant_id(1))
+    }
+
+    fn runtime() -> PolicyRuntime {
+        PolicyRuntime::bootstrap(&crate::policy::view::tests::stateless_config())
+    }
+
+    #[test]
+    fn a_hold_is_outstanding_until_it_exits_and_only_then_stops_draining() {
+        let runtime = runtime();
+        let first = generation(&body(scope(), 1, 1_000), 1);
+        runtime.enter(Some(first));
+        runtime.enter(Some(first));
+        assert_eq!(runtime.outstanding(first), 2);
+
+        runtime.exit(Some(first));
+        assert_eq!(runtime.outstanding(first), 1);
+        runtime.exit(Some(first));
+        assert_eq!(runtime.outstanding(first), 0);
+        assert!(runtime.draining().is_empty());
+    }
+
+    /// The property a rollback and a mixed-version rollout both depend on: what
+    /// was admitted under the superseded document is still counted under *its*
+    /// generation after the replacement is installed, so nothing rewrites the
+    /// terms a running request was granted.
+    #[test]
+    fn a_hold_survives_the_installation_that_supersedes_its_generation() {
+        use crate::config::NamespacePolicy;
+        use crate::policy::view::tests::governed;
+
+        let old = body(
+            PolicyScope::Project {
+                tenant: tenant_id(1),
+                project: crate::desired_state::fixtures::project_id(1),
+            },
+            1,
+            10_000,
+        );
+        let held = generation(&old, 1);
+        let runtime = PolicyRuntime::bootstrap(&governed(
+            "acme/core",
+            NamespacePolicy {
+                body: old,
+                generation: held,
+            },
+        ));
+        runtime.enter(Some(held));
+
+        // The rollback: the previous values, published forward under a new epoch.
+        let rolled_back =
+            crate::policy::fixtures::detailed(old.scope(), 2, 1_000, None, 300, 8, 60, 0);
+        let next = generation(&rolled_back, 2);
+        runtime.install(PolicyView::of(&governed(
+            "acme/core",
+            NamespacePolicy {
+                body: rolled_back,
+                generation: next,
+            },
+        )));
+
+        // New admissions see the new cap...
+        let active = runtime.active("acme/core");
+        assert_eq!(active.budget.expect("governed").subject_microdollars, 1_000);
+        assert_eq!(active.generation, Some(next));
+        // ...and the hold taken under the old one is still draining under it.
+        assert_eq!(runtime.outstanding(held), 1);
+        assert_eq!(runtime.draining(), vec![(held, 1)]);
+
+        runtime.exit(Some(held));
+        assert!(runtime.draining().is_empty());
+    }
+
+    /// A namespace served under the bootstrap file has no generation, so it has
+    /// nothing to drain and cannot be made to look like it does.
+    #[test]
+    fn a_bootstrap_hold_is_not_counted() {
+        let runtime = runtime();
+        runtime.enter(None);
+        runtime.exit(None);
+        assert!(runtime.draining().is_empty());
+    }
+}

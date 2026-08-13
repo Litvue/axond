@@ -22,6 +22,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::admission::MAX_PERMITS;
 use crate::aliases::AliasScope;
+use crate::desired_state::policy::{PolicyBody, PolicyGeneration};
 use crate::desired_state::{ProjectId, SecretRef, TenantId};
 use crate::principals::Capability;
 use crate::usage::journal::{Capacity, CapacityPolicy, ConsumerId};
@@ -425,6 +426,25 @@ pub struct Namespace {
     #[serde(skip)]
     #[allow(dead_code)]
     pub project: Option<ProjectIdentity>,
+    /// The policy document governing this namespace, as a revision published it;
+    /// `None` when the bootstrap file's limits govern it (#150).
+    ///
+    /// Never read from TOML, for the same reason [`Namespace::project`] is not: a
+    /// file cannot claim a generation, and the values it *can* state live in
+    /// `[budget]` and `[rate_limit]`.
+    #[serde(skip)]
+    pub policy: Option<NamespacePolicy>,
+}
+
+/// A published policy document, and the generation it is enforced under.
+///
+/// Carried on the namespace rather than resolved per request so that one
+/// compiled snapshot answers "what governs this namespace, under which
+/// generation" without reading desired state on the request path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NamespacePolicy {
+    pub body: PolicyBody,
+    pub generation: PolicyGeneration,
 }
 
 /// What a projected namespace is, independently of what it is called.
@@ -1376,6 +1396,17 @@ pub struct BudgetConfig {
     /// exactly, so `none` and `in-memory` reject it at boot (ADR 0010).
     #[serde(default)]
     pub namespace_limit_microdollars: Option<u64>,
+    /// Whether the store's keys are laid out to carry a scope-wide cap, when the
+    /// cap's *value* is not this file's to state.
+    ///
+    /// Stateful mode only, and the reason it exists: the layout is a durable fact
+    /// with a migration behind it, so it stays bootstrap-owned
+    /// ([`BOOTSTRAP_OWNED_FIELDS`](crate::desired_state::policy::BOOTSTRAP_OWNED_FIELDS)),
+    /// while the number it caps at is published. In stateless mode
+    /// `namespace_limit_microdollars` states both at once and this is rejected as
+    /// a redundant way to say half of it.
+    #[serde(default)]
+    pub namespace_scope: bool,
     /// What to do when the store cannot be reached. Fail-closed by default: an
     /// unenforceable cap denies rather than silently admitting.
     #[serde(default)]
@@ -1455,6 +1486,7 @@ impl Default for BudgetConfig {
             backend: BudgetBackend::None,
             limit_microdollars: 0,
             namespace_limit_microdollars: None,
+            namespace_scope: false,
             on_unavailable: StoreUnavailable::Deny,
             dsn_env: None,
             table: None,
@@ -1625,6 +1657,14 @@ impl BudgetConfig {
         self.key_prefix
             .clone()
             .unwrap_or_else(|| DEFAULT_BUDGET_KEY_PREFIX.to_owned())
+    }
+
+    /// Whether this store's keys are laid out to carry a scope-wide cap.
+    ///
+    /// One question, asked the same way by both modes: stateless says it by
+    /// stating the cap, stateful says it directly because the cap is published.
+    pub const fn enforces_namespace_scope(&self) -> bool {
+        self.namespace_limit_microdollars.is_some() || self.namespace_scope
     }
 }
 
@@ -2789,6 +2829,29 @@ impl Config {
             }
             _ => {}
         }
+        if budget.namespace_scope {
+            if !budget.backend.is_shared() {
+                return Err(ConfigError::Invalid(format!(
+                    "budget `{backend}`: namespace_scope is supported only by `redis` and \
+                     `postgres`, which enforce a scope-wide cap exactly across replicas"
+                )));
+            }
+            if budget.namespace_limit_microdollars.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "budget `{backend}`: namespace_limit_microdollars already declares the \
+                     scope-wide layout, so namespace_scope restates it. Set the limit in \
+                     stateless mode, and namespace_scope in stateful mode, where the limit is \
+                     published rather than declared"
+                )));
+            }
+            if self.mode != Mode::Stateful {
+                return Err(ConfigError::Invalid(format!(
+                    "budget `{backend}`: namespace_scope declares a layout whose cap the control \
+                     plane publishes, so it is only meaningful under `mode = \"stateful\"`. Set \
+                     namespace_limit_microdollars instead"
+                )));
+            }
+        }
         if budget.backend == BudgetBackend::None {
             return Ok(());
         }
@@ -3542,6 +3605,7 @@ audience = "test"
                     default: false,
                     allow_platform_fallback: false,
                     project: Some(projected(index as u64 + 1)),
+                    policy: None,
                 }));
             config.validate_compiled()
         };
@@ -3589,6 +3653,7 @@ audience = "test"
                 default: false,
                 allow_platform_fallback: false,
                 project: None,
+                policy: None,
             }));
         declared
             .validate_compiled()

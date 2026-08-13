@@ -1034,6 +1034,7 @@ mod tests {
             Admission::Allowed(Reservation {
                 id: "ledger".to_owned(),
                 estimate_microdollars: estimated_microdollars,
+                generation: None,
             })
         }
         async fn settle(
@@ -1289,6 +1290,7 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
             reservation: Reservation {
                 id: "test".to_owned(),
                 estimate_microdollars: 1_000,
+                generation: None,
             },
             rate_limit_permit: None,
             admission_permit: None,

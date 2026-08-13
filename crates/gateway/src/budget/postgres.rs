@@ -31,6 +31,7 @@ use super::{
     Admission, BudgetError, BudgetKey, BudgetStore, Denial, ExceededScope, Reservation,
     SharedSettings,
 };
+use crate::policy::BudgetCaps;
 use crate::telemetry::metrics;
 use crate::usage::validate_table_name;
 
@@ -393,6 +394,7 @@ impl PostgresBudget {
         client: &mut Client,
         key: &BudgetKey,
         reservation: &Reservation,
+        caps: BudgetCaps,
     ) -> Result<Option<ExceededScope>, tokio_postgres::Error> {
         let table = &self.table;
         let namespaces = self.namespace_table();
@@ -407,7 +409,7 @@ impl PostgresBudget {
 
         // The namespace row is taken first, and by both operations, so the two
         // scopes always lock in one order and cannot deadlock against each other.
-        let namespace_spent = match self.settings.namespace_limit_microdollars {
+        let namespace_spent = match caps.namespace_microdollars {
             Some(_) => {
                 transaction
                     .execute(
@@ -503,26 +505,24 @@ impl PostgresBudget {
             (held, None)
         };
 
-        let limit = bigint(self.settings.limit_microdollars);
+        let limit = bigint(caps.subject_microdollars);
         if spent.saturating_add(held).saturating_add(amount) > limit {
             transaction.rollback().await?;
             return Ok(Some(ExceededScope::Subject));
         }
         // Nothing is written until both caps have room, so a denial cannot leave
         // one scope holding an estimate the other rejected.
-        if let (Some(namespace_spent), Some(namespace_held), Some(namespace_limit)) = (
-            namespace_spent,
-            namespace_held,
-            self.settings.namespace_limit_microdollars,
-        ) && namespace_spent
-            .saturating_add(namespace_held)
-            .saturating_add(amount)
-            > bigint(namespace_limit)
+        if let (Some(namespace_spent), Some(namespace_held), Some(namespace_limit)) =
+            (namespace_spent, namespace_held, caps.namespace_microdollars)
+            && namespace_spent
+                .saturating_add(namespace_held)
+                .saturating_add(amount)
+                > bigint(namespace_limit)
         {
             transaction.rollback().await?;
             return Ok(Some(ExceededScope::Namespace));
         }
-        let ttl_ms = bigint(self.settings.reservation_ttl.as_millis() as u64);
+        let ttl_ms = bigint(caps.reservation_ttl.as_millis() as u64);
         transaction
             .execute(
                 &format!(
@@ -609,15 +609,25 @@ impl BudgetStore for PostgresBudget {
     }
 
     async fn reserve(&self, key: &BudgetKey, estimated_microdollars: u64) -> Admission {
+        // The caps and the generation are read once, before the transaction, and
+        // carried on the hold: this request is priced by the document that
+        // admitted it, whatever is published while it runs.
+        let Some(caps) = self.settings.caps(BACKEND, &key.namespace) else {
+            return Admission::Denied(Denial::StoreUnavailable);
+        };
         let reservation = Reservation {
             id: Reservation::next_id(),
             estimate_microdollars: estimated_microdollars,
+            generation: self.settings.generation(&key.namespace),
         };
         match self
-            .run(async |client| self.try_hold(client, key, &reservation).await)
+            .run(async |client| self.try_hold(client, key, &reservation, caps).await)
             .await
         {
-            Ok(None) => Admission::Allowed(reservation),
+            Ok(None) => {
+                self.settings.ceilings.enter(reservation.generation);
+                Admission::Allowed(reservation)
+            }
             Ok(Some(scope)) => {
                 if scope == ExceededScope::Namespace {
                     metrics::record_budget_namespace_denial();
@@ -638,6 +648,7 @@ impl BudgetStore for PostgresBudget {
         if reservation.id.is_empty() {
             return;
         }
+        self.settings.ceilings.exit(reservation.generation);
         match self
             .run(async |client| {
                 self.commit_spend(client, key, reservation, actual_microdollars)
@@ -682,19 +693,28 @@ mod tests {
     }
 
     fn settings(limit: u64) -> SharedSettings {
-        SharedSettings {
-            limit_microdollars: limit,
-            namespace_limit_microdollars: None,
-            reservation_ttl: Duration::from_secs(300),
-            unavailable: UnavailablePolicy::Deny,
-        }
+        expiring_settings(limit, None, Duration::from_secs(300))
     }
 
     fn namespace_settings(limit: u64, namespace_limit: u64) -> SharedSettings {
-        SharedSettings {
-            namespace_limit_microdollars: Some(namespace_limit),
-            ..settings(limit)
-        }
+        expiring_settings(limit, Some(namespace_limit), Duration::from_secs(300))
+    }
+
+    /// Fixed caps, as a deployment whose limits are the file's runs with: the
+    /// dynamic source is exercised where it is decided, in `crate::policy`.
+    fn expiring_settings(
+        limit: u64,
+        namespace_limit: Option<u64>,
+        reservation_ttl: Duration,
+    ) -> SharedSettings {
+        SharedSettings::fixed(
+            BudgetCaps {
+                subject_microdollars: limit,
+                namespace_microdollars: namespace_limit,
+                reservation_ttl,
+            },
+            UnavailablePolicy::Deny,
+        )
     }
 
     /// A store on the shared test database, with both scopes emptied first so
@@ -1330,8 +1350,7 @@ mod tests {
         let table = "axond_budget_ns_expiry_test";
         // A long TTL, so the denial below cannot race the clock; expiry is then
         // forced by backdating the row rather than by sleeping.
-        let mut expiring = namespace_settings(1_000, 1_000);
-        expiring.reservation_ttl = Duration::from_secs(600);
+        let expiring = expiring_settings(1_000, Some(1_000), Duration::from_secs(600));
         let store = namespace_store(&dsn, table, expiring).await;
         let died = BudgetKey {
             namespace: "acme".into(),

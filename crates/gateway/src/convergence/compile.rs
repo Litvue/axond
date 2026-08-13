@@ -47,6 +47,7 @@ use crate::desired_state::pricing::{
     EffectiveInstant, InvalidInstant, PriceBooks, PricingError, PricingSnapshot,
 };
 use crate::desired_state::{DesiredState, LoadedRevision, ResourceRef, RevisionId};
+use crate::policy::ActivationRefusal;
 use crate::state::{ConfigSnapshot, SnapshotError};
 
 use super::secrets::{MaterialLedger, SecretMaterialization};
@@ -65,7 +66,18 @@ pub trait RevisionProjection: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Project desired state onto the bootstrap config.
-    fn project(&self, bootstrap: &Config, state: &DesiredState) -> Result<Config, ProjectionError>;
+    ///
+    /// `source` is the revision the state came from. A projection that derives
+    /// something the runtime must be able to *name* later — a policy generation,
+    /// which is `(scope, epoch, source, content)` — needs it, and taking it here
+    /// rather than reading it back off the state keeps one revision's projection
+    /// reproducible by every replica.
+    fn project(
+        &self,
+        bootstrap: &Config,
+        state: &DesiredState,
+        source: RevisionId,
+    ) -> Result<Config, ProjectionError>;
 }
 
 /// Why desired state does not describe something this build can serve.
@@ -144,6 +156,16 @@ pub enum CompileError {
         #[source]
         source: SnapshotError,
     },
+    /// The candidate is servable, but the *stateful policy* in it cannot replace
+    /// what this replica is enforcing without breaking a hold it already granted
+    /// or a durable layout it booted on (#150). Refused before publication, so
+    /// the previous policy and the previous config both keep serving.
+    #[error("revision {revision} cannot activate its policy: {source}")]
+    Activation {
+        revision: RevisionId,
+        #[source]
+        source: ActivationRefusal,
+    },
 }
 
 impl CompileError {
@@ -167,7 +189,8 @@ impl CompileError {
             | Self::Validation { revision, .. }
             | Self::Pricing { revision, .. }
             | Self::Clock { revision, .. }
-            | Self::Snapshot { revision, .. } => *revision,
+            | Self::Snapshot { revision, .. }
+            | Self::Activation { revision, .. } => *revision,
         }
     }
 
@@ -187,6 +210,7 @@ impl CompileError {
             Self::Pricing { .. } => "pricing",
             Self::Clock { .. } => "clock",
             Self::Snapshot { .. } => "snapshot",
+            Self::Activation { source, .. } => source.reason(),
         }
     }
 }
@@ -314,7 +338,7 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
         let id = revision.id();
         let config = self
             .projection
-            .project(&self.bootstrap, revision.state())
+            .project(&self.bootstrap, revision.state(), id)
             .map_err(|source| CompileError::Projection {
                 revision: id,
                 source,
@@ -383,6 +407,7 @@ pub(crate) mod testing {
             &self,
             bootstrap: &Config,
             state: &DesiredState,
+            _source: RevisionId,
         ) -> Result<Config, ProjectionError> {
             let mut config = bootstrap.clone();
             for resource in state.resources() {
@@ -415,7 +440,12 @@ pub(crate) mod testing {
             "test-refusing"
         }
 
-        fn project(&self, _: &Config, _: &DesiredState) -> Result<Config, ProjectionError> {
+        fn project(
+            &self,
+            _: &Config,
+            _: &DesiredState,
+            _: RevisionId,
+        ) -> Result<Config, ProjectionError> {
             Err(ProjectionError::Incomplete {
                 detail: "no tenant is enabled".to_owned(),
             })
