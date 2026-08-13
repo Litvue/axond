@@ -296,10 +296,12 @@ async fn convergence(
         )
         .await?;
     let report = api.convergence_report();
-    Ok(Conditional::new(
-        &headers,
-        api.service.convergence(&grant, report.as_ref())?,
-    ))
+    let result = api.service.convergence(&grant, report.as_ref())?;
+    // Validated over the state, not the bytes: `lag_ms` moves every millisecond
+    // a replica is behind, and the caller waiting on that is the one this read
+    // exists for.
+    let identity = result.identity();
+    Ok(Conditional::identified_by(&headers, result, &identity))
 }
 
 /// The scope a request names, from an optional tenant and project.

@@ -381,6 +381,48 @@ impl ConvergenceResult {
     }
 }
 
+/// The state a [`ConvergenceResult`] describes, without the elapsed times that
+/// move on their own.
+///
+/// This is what a conditional read of `/convergence` is validated over, and why
+/// that read answers a weak validator: `lag_ms` grows every millisecond a replica
+/// is behind, so a digest of the response bytes could never match for the caller
+/// that most wants it to — a reconciler waiting for its publication to be served.
+/// Everything here changes only when the replica's convergence *state* changes.
+#[derive(Debug, Serialize)]
+pub struct ConvergenceIdentity {
+    converged: bool,
+    reconciling: bool,
+    desired: Option<String>,
+    loaded: Option<String>,
+    active: Option<String>,
+    source: Option<&'static str>,
+    generation: u64,
+    /// How long the last accepted candidate took: a fixed measurement of a past
+    /// event, unlike `lag_ms`, so it belongs in the validator.
+    last_convergence_ms: Option<u64>,
+    consecutive_failures: u32,
+    last_rejection: Option<&'static str>,
+}
+
+impl ConvergenceResult {
+    /// The state this result describes, for a validator.
+    pub fn identity(&self) -> ConvergenceIdentity {
+        ConvergenceIdentity {
+            converged: self.converged,
+            reconciling: self.reconciling,
+            desired: self.desired.clone(),
+            loaded: self.loaded.clone(),
+            active: self.active.clone(),
+            source: self.source,
+            generation: self.generation,
+            last_convergence_ms: self.last_convergence_ms,
+            consecutive_failures: self.consecutive_failures,
+            last_rejection: self.last_rejection,
+        }
+    }
+}
+
 /// Milliseconds since the Unix epoch, saturating rather than failing: a wrong
 /// host clock must not make an audit trail unreadable.
 fn millis(at: SystemTime) -> u64 {

@@ -1254,7 +1254,10 @@ async fn a_read_a_caller_already_holds_answers_not_modified_without_a_body() {
         let (status, etag, body) = deployment.get_conditional(path, None).await;
         assert_eq!(status, StatusCode::OK, "{path}");
         let validator = etag.expect("every administrative read carries a validator");
-        assert!(validator.starts_with('"'), "{path}: {validator}");
+        // `/convergence` answers a weak validator, because its reported lag moves
+        // while nothing about the replica's convergence state does.
+        let expected = if path == "/convergence" { "W/\"" } else { "\"" };
+        assert!(validator.starts_with(expected), "{path}: {validator}");
 
         let (status, repeat, body_again) = deployment.get_conditional(path, Some(&validator)).await;
         assert_eq!(status, StatusCode::NOT_MODIFIED, "{path}");
