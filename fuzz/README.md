@@ -13,6 +13,7 @@ the process actually runs.
 | `sse_decode` | `SseDecoder` on arbitrary bodies split at arbitrary chunk boundaries | A stream arrives in whatever pieces the network produced, and an event, a delimiter, or a character can straddle two of them |
 | `provider_stream` | The OpenAI, Foundry, and Anthropic stream decoders — translated and native | They interpret provider JSON mid-relay, where a panic loses a live response |
 | `provider_error` | `ProviderError::from_upstream`, `::transport`, and the classification behind them | An upstream failure body decides whether the gateway retries, fails over, or opens a circuit |
+| `catalog_import` | The models.dev import: decoding, schema validation, normalization, content identity, semantic classification, and admission | A third party publishes it, a background refresh imports it unattended, and what it says about prices and capabilities feeds routing and spend decisions |
 
 The properties each target asserts live in [`src/lib.rs`](./src/lib.rs) and
 [`src/wire.rs`](./src/wire.rs): a parser returns rather than panicking, a
@@ -27,9 +28,7 @@ mid-event is refused by `finish`, every provider diagnostic is truncated to
 `MAX_DIAGNOSTIC_BYTES`, and classification stays deterministic and internally
 consistent. Disclosure is asserted with canaries: the harness holds a gateway
 credential and an upstream URL that it passes to nothing, so either appearing in
-a rendered error is a finding. Catalogue parsing is deliberately absent — it is
-issue #222's target.
-| `catalog_import` | The models.dev import: decoding, schema validation, normalization, content identity, semantic classification, and admission | A third party publishes it, a background refresh imports it unattended, and what it says about prices and capabilities feeds routing and spend decisions |
+a rendered error is a finding.
 
 The catalogue target takes a *structured* input, because a byte flip almost never
 produces a document that still parses and says something different — which is the
@@ -87,12 +86,6 @@ asserts, it asserts:
   wrapper of the wrong shape still refuses the whole import
   (`drift-limit-type.json`). The corpus carries both so the two cannot quietly
   collapse into one.
-
-The properties each target asserts live in [`src/lib.rs`](./src/lib.rs): a
-parser returns rather than panicking, a refusal is a typed value the gateway
-could answer with, and what it accepts stays inside the bounds the request path
-relies on — including that a signature from one namespace's signer never
-verifies into another.
 
 Runs are hermetic. The seam the targets call
 ([`crates/gateway/src/fuzz_seam.rs`](../crates/gateway/src/fuzz_seam.rs)) builds

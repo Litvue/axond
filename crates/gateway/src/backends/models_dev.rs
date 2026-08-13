@@ -111,7 +111,7 @@ pub enum ModelsDevError {
     #[error(
         "`{}` is not a supported models.dev document; only `{SUPPORTED_PATH}` is \
          (`api.json` and `models.json` have different shapes)",
-        excerpt(url)
+        excerpt_located(url)
     )]
     UnsupportedEndpoint { url: String },
     /// Bounded at both ends: these two are the only refusals that may carry no
@@ -1784,6 +1784,20 @@ mod tests {
                 "`{rejected}` is a different document shape"
             );
         }
+    }
+
+    #[test]
+    fn an_unsupported_long_source_url_keeps_the_rejected_suffix_visible() {
+        let rejected = format!(
+            "https://mirror.example/{}/models.json",
+            "snapshot/".repeat(16)
+        );
+        let error = ModelsDevAdapter::new(&rejected).expect_err("models.json is not the catalogue");
+
+        assert!(
+            error.to_string().contains("models.json"),
+            "the diagnostic must preserve the suffix that made the URL invalid: {error}"
+        );
     }
 
     /// A schema refusal names no pointer, so its position is all it has.
