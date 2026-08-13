@@ -56,13 +56,13 @@ groups:
           severity: warning
         annotations:
           summary: "Cached observations for {{ $labels.axond_status_component }} are over five minutes old"
-          description: "Above the slowest round any derived pacing permits, so an age past it is a refresher falling behind rather than a generous [control_plane] operation_timeout_ms. The age is republished each round, so it only climbs when a round takes longer than the threshold; a refresher that stops ticking freezes this gauge instead of raising it, and AxondStatusRefresherStalled is the rule for that."
+          description: "Above the slowest round any derived pacing permits, so an age past it is a refresher falling behind rather than a generous [control_plane] operation_timeout_ms. The age is exported on its own cadence rather than only after a round, so a probe that is stuck or a round that never came climbs here; a refresher whose task is gone stops exporting entirely, which is AxondStatusRefresherStalled instead."
           runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#dependency-observations-have-gone-stale"
 
-      # The companion the age gauge cannot be: every observation is republished
-      # each round, so a refresher that stops leaves the age frozen at a small
-      # value rather than growing. What does change is that nothing is published
-      # at all, and an absent refresh series says so.
+      # The companion the age gauge cannot be: a refresher whose task is gone
+      # stops exporting altogether, so the age series lapses rather than growing
+      # past a threshold. What says so is that nothing is published at all, and
+      # an absent refresh series is exactly that.
       #
       # The second arm is what keeps "absent" meaning "stopped" rather than
       # "never started": a deployment with no refresher wired emits neither

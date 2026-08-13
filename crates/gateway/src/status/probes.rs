@@ -86,6 +86,20 @@ impl ControlPlaneProbe {
         // Still strictly below the interval, so rounds cannot overlap, and
         // unchanged from the store's own bounds wherever the cap does not bite.
         let probe_timeout = bounds.min(refresh_interval.saturating_sub(SPACING));
+        if probe_timeout < bounds {
+            // Said once, at construction, and named as configuration rather than
+            // as an outage: an operator who later reads `timeout` on the status
+            // page has a boot log line saying the diagnostic will not wait as
+            // long as `[control_plane]` allows the store to take.
+            tracing::warn!(
+                component = "control_plane",
+                store_bound_ms = bounds.as_millis() as u64,
+                probe_timeout_ms = probe_timeout.as_millis() as u64,
+                refresh_interval_ms = refresh_interval.as_millis() as u64,
+                "control plane timeouts exceed the observable cadence; the probe will report \
+                 timeout for calls the store is still entitled to complete"
+            );
+        }
         StatusSettings {
             probe_timeout,
             refresh_interval,
@@ -107,7 +121,12 @@ impl ControlPlaneProbe {
 const SPACING: Duration = Duration::from_secs(1);
 const MAX_SPACING: Duration = Duration::from_secs(30);
 
-/// The slowest a live component may be observed.
+/// The slowest the control plane may be observed.
+///
+/// A property of this pacing, not a fleet-wide policy: it is applied where the
+/// cadence is derived from operator configuration, which today is the control
+/// plane alone. A component whose pacing is derived from something else states
+/// its own bounds, and the coupling below is what any of them has to satisfy.
 ///
 /// The stall rule reads the *absence* of `axond_status_refreshes`, and absence
 /// is the exporter's decision: it holds the last sample for `metric_expiration`
@@ -119,7 +138,13 @@ const MAX_SPACING: Duration = Duration::from_secs(30);
 /// `the_derived_cadence_cannot_outrun_the_pipeline_that_watches_it`.
 pub const MAX_REFRESH_INTERVAL: Duration = Duration::from_secs(4 * 60);
 
-/// The oldest an observation may be before the replica itself calls it `stale`.
+/// The oldest a control-plane observation may be before the replica itself
+/// calls it `stale`.
+///
+/// Scoped the same way: derived pacings clamp themselves here so that no
+/// component's own definition of stale outlives the rule that pages on it. It
+/// is not applied to a registry built with explicit settings, which is the
+/// tests' shape and states its budget outright.
 ///
 /// Held at or below `AxondStatusObservationsStale`'s threshold so the two agree
 /// on the word: an operator paged for a stale observation must find the
@@ -169,7 +194,40 @@ mod tests {
     };
     use crate::status::ComponentState;
 
+    use std::sync::Mutex;
+
+    use tracing_subscriber::layer::SubscriberExt as _;
+
     type Health = Box<dyn Fn() -> Result<(), ControlPlaneError> + Send + Sync>;
+
+    /// Everything a subscriber wrote, as a string.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn rendered(&self) -> String {
+            String::from_utf8(self.0.lock().expect("not poisoned").clone()).expect("utf-8 logs")
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("not poisoned").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     /// The in-memory oracle with a `health` answer of the test's choosing, so
     /// each failure category can be classified without a database. Built as a
@@ -311,6 +369,60 @@ mod tests {
                  the replica still calls fresh: {pacing:?}"
             );
         }
+    }
+
+    /// The one case where the derivation stops honouring the store's bounds, so
+    /// it is stated rather than implied: past the cap the probe is cut off, the
+    /// round is published as a timeout, and construction says so in the log.
+    #[test]
+    fn a_store_slower_than_the_pipeline_is_capped_and_the_capping_is_announced() {
+        let settings = ControlPlaneSettings {
+            connect_timeout: Duration::from_secs(60),
+            operation_timeout: Duration::from_secs(600),
+            ..ControlPlaneSettings::default()
+        };
+        let bounds = settings.operation_timeout * 2 + settings.connect_timeout;
+
+        let logs = CapturedLogs::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(logs.clone()),
+            ),
+        );
+
+        let pacing = {
+            let _default = tracing::dispatcher::set_default(&dispatch);
+            ControlPlaneProbe::pacing(&settings)
+        };
+        assert_eq!(pacing.refresh_interval, MAX_REFRESH_INTERVAL);
+        assert_eq!(pacing.probe_timeout, MAX_REFRESH_INTERVAL - SPACING);
+        assert!(pacing.probe_timeout < bounds);
+        assert_eq!(pacing.staleness_budget, MAX_STALENESS_BUDGET);
+        assert_eq!(pacing.validate(), Ok(()));
+
+        let rendered = logs.rendered();
+        assert!(
+            rendered.contains("exceed the observable cadence") && rendered.contains("WARN"),
+            "capping the probe below the store's bounds is announced: {rendered}"
+        );
+
+        // And the configuration that fits says nothing, so the line means what
+        // it says when it appears.
+        let quiet = CapturedLogs::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(quiet.clone()),
+            ),
+        );
+        {
+            let _default = tracing::dispatcher::set_default(&dispatch);
+            ControlPlaneProbe::pacing(&ControlPlaneSettings::default());
+        }
+        assert_eq!(quiet.rendered(), "");
     }
 
     #[tokio::test]

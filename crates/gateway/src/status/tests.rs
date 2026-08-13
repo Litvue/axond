@@ -493,6 +493,31 @@ fn an_observation_past_the_staleness_budget_degrades_rather_than_fails() {
     assert!(stale.stale());
 }
 
+/// The gauge `AxondStatusObservationsStale` pages on is only useful if it can
+/// climb, and a round republishes every observation — so an export tied to a
+/// round always reports an age of about zero and the rule can never fire. This
+/// pins the export as its own operation over the *current* view, which is what
+/// the refresher runs between rounds.
+#[test]
+fn the_exported_view_ages_between_rounds_rather_than_resetting() {
+    let clock = ManualClock::new();
+    let registry = registry_with(
+        &clock,
+        vec![Component::ControlPlane],
+        Duration::from_secs(60),
+    );
+    registry.publish(ComponentObservation::ok(Component::ControlPlane));
+    assert_eq!(registry.export().components[0].age, Duration::ZERO);
+
+    // No round in between: exactly the case the rule watches for, a refresher
+    // that is late or stuck rather than one that stopped being scheduled.
+    clock.advance(Duration::from_secs(61));
+    let aged = registry.export().components[0];
+    assert_eq!(aged.component, Component::ControlPlane);
+    assert_eq!(aged.age, Duration::from_secs(61));
+    assert_eq!(aged.reason, Some(StatusReason::Stale));
+}
+
 /// A probe that fails the test if a *read* ever reaches it, and blocks forever
 /// when the test asks it to.
 struct HostileProbe {

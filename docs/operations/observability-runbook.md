@@ -164,10 +164,12 @@ staleness budget.
 **First response.** Read the three signals as different failures, because the age
 gauge alone cannot tell them apart. Every round publishes an observation for
 every probe — an abandoned probe publishes a synthetic `timeout` observation too
-— and each publish restamps the age, so:
+— and each publish restamps the age; the age is exported on its own fifteen-second
+cadence rather than only after a round, so it climbs while a round is late or
+stuck and resets when one lands. So:
 
-- **the refresher stopped.** Nothing is published, so the age *freezes* at a
-  small value rather than climbing, and the refresh series simply stops. That is
+- **the refresher stopped.** The task is gone, so nothing is exported at all and
+  the last age sample simply lapses rather than climbing. That is
   what `AxondStatusRefresherStalled` watches for. Everything the status surface
   reports is now as old as the stall, including the `ok` components. (A replica
   that never wired a refresher emits no status instruments at all, and the rule's
@@ -178,8 +180,8 @@ every probe — an abandoned probe publishes a synthetic `timeout` observation t
 - **probes keep failing.** Refreshes are recorded with
   `axond_status_outcome="failed"`, the state is honest, and the dependency — not
   the replica — is the thing to fix.
-- **rounds are slower than the budget.** The age exceeds the budget while still
-  being republished, which means a round takes longer than the budget allows —
+- **rounds are slower than the budget.** The age climbs past the budget between
+  exports, which means a round is taking longer than the budget allows —
   the probe timeout or the refresh interval is above the staleness budget. The
   three are derived from `[control_plane]` for a stateful replica and are
   internal settings otherwise; there is no `[status]` section to edit, and the
