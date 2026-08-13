@@ -40,7 +40,7 @@ use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::desired_state::{Actor, MutationKind, ResourceScope};
+use crate::desired_state::{Action, Actor, MutationKind, ResourceScope};
 use crate::principals::constant_time_eq;
 
 /// The prefix every minted inference token carries. Presented to `/admin/v1` it
@@ -305,6 +305,21 @@ impl AdminAction {
             | MutationKind::Update
             | MutationKind::Delete
             | MutationKind::Rotate => Self::Publish,
+        }
+    }
+
+    /// The [`Action`] a denial of this verb is recorded as.
+    ///
+    /// [`Action::Rotate`] is never produced here: a credential rotation arrives
+    /// as [`Self::Publish`] of a credential document, and the denial trail
+    /// records what the caller was refused — reaching the surface at all —
+    /// rather than which field of a document it would have changed.
+    pub const fn recorded_action(self) -> Action {
+        match self {
+            Self::ReadState | Self::ReadHistory | Self::ReadAudit | Self::ReadConvergence => {
+                Action::Read
+            }
+            Self::Publish | Self::Rollback => Action::Update,
         }
     }
 }

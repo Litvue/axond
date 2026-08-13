@@ -237,6 +237,18 @@ routes, and never share a credential type with them.
   authority.
 - Every mutation is written transactionally with its audit event and accepts an
   idempotency key, so retries are safe.
+- **Administrative authority is a role at a scope.** A principal — an OIDC human
+  or an Axond-owned workload of one tenant — holds roles, and a role permits an
+  action on an administrative surface only within the scope it was granted at.
+  Scope containment is one-directional: the deployment contains a tenant, a
+  tenant contains its projects, and nothing contains the deployment. A caller is
+  told only that an action was `forbidden`; the reason, including whether the
+  tenant or the principal existed at all, is recorded rather than returned.
+- **A refusal is part of the trail.** A denied action publishes no revision, so it
+  is recorded on its own instead of minting an empty revision to hang an audit
+  event from. A denial that cannot be recorded is still a denial.
+- Workload key material is shown once at creation and stored only as a digest;
+  it is never in a log, a response, or an audit payload.
 
 `/admin/v1` is control plane. Its unavailability is a control-plane outage, and
 `503` there says nothing about inference health.

@@ -22,7 +22,7 @@
 use std::time::SystemTime;
 
 use super::canonical::{Canonical, CanonicalValue};
-use super::ids::{AuditEventId, MutationId, RevisionId};
+use super::ids::{AuditEventId, MutationId, PrincipalId, RevisionId, TenantId};
 use super::resource::{ResourceRef, ResourceScope};
 
 /// Who performed a mutation.
@@ -35,6 +35,16 @@ pub enum Actor {
     /// The static bootstrap breakglass operator. Distinct from a human on
     /// purpose: "someone used breakglass" is the thing an auditor looks for.
     Breakglass,
+    /// A workload service account: an Axond-owned principal inside a tenant,
+    /// authenticated by key material rather than by an identity provider (#144).
+    ///
+    /// Its owning tenant is carried rather than looked up, so an audit row is
+    /// legible — and attributable to a tenant — without hydrating the revision
+    /// that declared the principal, including after the principal is removed.
+    Workload {
+        tenant: TenantId,
+        principal: PrincipalId,
+    },
     /// The gateway itself — a background catalogue refresh, for example.
     ///
     /// Owned rather than `&'static str` because an audit row read back out of a
@@ -53,6 +63,11 @@ impl Canonical for Actor {
             Self::Breakglass => {
                 CanonicalValue::map([("kind", CanonicalValue::string("breakglass"))])
             }
+            Self::Workload { tenant, principal } => CanonicalValue::map([
+                ("kind", CanonicalValue::string("workload")),
+                ("tenant", CanonicalValue::string(tenant.to_string())),
+                ("principal", CanonicalValue::string(principal.to_string())),
+            ]),
             Self::System { component } => CanonicalValue::map([
                 ("kind", CanonicalValue::string("system")),
                 ("component", CanonicalValue::string(component.clone())),
@@ -66,6 +81,7 @@ impl std::fmt::Display for Actor {
         match self {
             Self::Human { issuer, subject } => write!(f, "human {subject} @ {issuer}"),
             Self::Breakglass => f.write_str("breakglass"),
+            Self::Workload { tenant, principal } => write!(f, "workload {principal} of {tenant}"),
             Self::System { component } => write!(f, "system {component}"),
         }
     }

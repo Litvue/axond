@@ -288,7 +288,19 @@ impl ConfigSnapshot {
             gateway_key_fingerprints
                 .insert(label.to_owned(), key_material::fingerprint(label, &secret));
         }
-        if inbound_keys.is_empty() {
+        // Inbound authentication fails closed: there is no keyless deployment
+        // that serves inference. A stateful replica cannot declare
+        // `[[gateway_key]]` at all — the section is rejected by
+        // `Config::validate_stateful` — because its inbound principals arrive
+        // with a compiled revision instead of the file, and until that compiler
+        // exists the runtime answers every inference request with
+        // `ops::inference_refusal` instead of the snapshot. A keyless snapshot
+        // is therefore admissible exactly while that refusal stands, and the
+        // condition is asked of the refusal itself rather than of the mode: when
+        // the projection lands and `inference_refusal` returns `None`, this
+        // rejects the keyless snapshot again with no edit here, which is the
+        // only ordering that cannot serve inference from an empty snapshot.
+        if inbound_keys.is_empty() && crate::ops::inference_refusal(&config).is_none() {
             return Err(SnapshotError::NoInboundKeys);
         }
         let inbound_keys: Arc<[GatewayKeyEntry]> = inbound_keys.into();
@@ -1073,6 +1085,76 @@ namespace = "platform"
                 .namespace,
             "platform"
         );
+    }
+
+    /// A stateful deployment may not declare `[[gateway_key]]` at all — its
+    /// inbound principals arrive with a compiled revision — so it must compile
+    /// a keyless snapshot rather than hit the fail-closed refusal stateless
+    /// mode answers with; otherwise the administrative surface never binds.
+    #[test]
+    fn a_stateful_deployment_compiles_without_an_inbound_key() {
+        let env = HashMap::new();
+        let stateful = Config::from_toml_str(
+            r#"
+mode = "stateful"
+
+[control_plane]
+dsn_env = "GW_CONTROL_PLANE_DSN"
+
+[secret_store]
+kek_env = "GW_SECRET_STORE_KEK"
+
+[[admin_breakglass]]
+env = "GW_ADMIN_BREAKGLASS"
+"#,
+        )
+        .expect("valid stateful bootstrap");
+        let snapshot = ConfigSnapshot::build(stateful, &env, 0).expect("compiles keyless");
+        assert_eq!(snapshot.inbound_key_count(), 0);
+    }
+
+    /// The keyless snapshot above is admissible only because the runtime answers
+    /// inference with [`crate::ops::inference_refusal`] instead of that snapshot.
+    /// This is the coupling, asserted rather than described: a mode that would
+    /// serve inference from a snapshot has to have an inbound key, so a future
+    /// change that stops refusing stateful inference fails here instead of
+    /// authenticating callers against an empty key set.
+    #[test]
+    fn only_a_mode_whose_inference_is_refused_may_compile_without_an_inbound_key() {
+        // A mode that serves inference has no keyless form to begin with:
+        // configuration refuses it before a snapshot is ever built.
+        let error = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+"#,
+        )
+        .expect_err("a keyless stateless bootstrap serves inference to nobody");
+        assert!(format!("{error}").contains("gateway_key"), "{error}");
+
+        let stateful = Config::from_toml_str(
+            r#"
+mode = "stateful"
+
+[control_plane]
+dsn_env = "GW_CONTROL_PLANE_DSN"
+
+[secret_store]
+kek_env = "GW_SECRET_STORE_KEK"
+
+[[admin_breakglass]]
+env = "GW_ADMIN_BREAKGLASS"
+"#,
+        )
+        .expect("a valid stateful bootstrap");
+        assert!(
+            crate::ops::inference_refusal(&stateful).is_some(),
+            "a keyless stateful snapshot is admissible only while inference is refused; \
+             when the revision projection lands, `ConfigSnapshot::build` must require a key \
+             again rather than authenticate callers against an empty key set"
+        );
+        assert!(ConfigSnapshot::build(stateful, &HashMap::new(), 0).is_ok());
     }
 
     /// The secret is held as `SecretString`, so debugging or logging an entry

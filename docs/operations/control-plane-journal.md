@@ -31,6 +31,11 @@ earlier revision remains loadable exactly as it was published.
 | `axond_cp_audit_event` | The audit trail, written in the publishing transaction |
 | `axond_cp_idempotency` | Per-caller retry records, which expire |
 | `axond_cp_head` | One row naming the desired revision |
+| `axond_cp_tenant` | Projected tenants: slug, lifecycle, and the revision that wrote the row |
+| `axond_cp_project` | Projected projects, owned by exactly one tenant |
+| `axond_cp_principal` | Projected principals: an OIDC `(issuer, subject)` human, or a workload and its key *digest* |
+| `axond_cp_principal_role` | The roles a principal holds |
+| `axond_cp_access_denial` | Administrative actions that were refused, with the reason |
 
 Two properties worth knowing before you plan capacity or retention:
 
@@ -40,6 +45,33 @@ Two properties worth knowing before you plan capacity or retention:
 - **Blobs are references, not payloads.** The journal stores kind, digest, and
   size. Payload bytes live in the blob store, and a revision is only usable when
   its digests resolve there.
+- **The last five tables are a projection, not a second source of truth.** The
+  published revision is what the gateway authorizes against; the transaction that
+  publishes it also writes these rows so the database can enforce ownership on its
+  own — a tenant-scoped row cannot name a tenant nothing declared, and a
+  principal cannot be scoped into another tenant's project. Migration 0002 also
+  adds row-level-security policies keyed on `axond.tenant_id`: a session that sets
+  it sees deployment-wide rows and that tenant's, and a session that does not set
+  it — the publisher — is unrestricted. The policies cover every table that names
+  a tenant, including the two that name one indirectly: a grant is filtered
+  through its principal and an audit event through its mutation, so the
+  administrative journal and the roles it granted are inside the same wall as the
+  rows they describe. Authorization decisions stay in the service layer; the
+  policies are defence in depth.
+- **A retained name stays taken.** A tenant or project a later revision stops
+  declaring keeps its row and its name. Publishing a *different* tenant under a
+  retained name is refused rather than reported as a temporary failure: no retry
+  clears it, and the refusal names the conflict.
+- **A disabled tenant serves nothing.** Only an active tenant's projects become
+  servable namespaces. Disabling is what stops traffic; the rows stay for the
+  history that points at them.
+- **Refusals are not revisions.** A denied administrative action publishes
+  nothing, so it is recorded in `axond_cp_access_denial` rather than in the audit
+  trail of a revision that does not exist. Denials are read per tenant, and the
+  caller is told only that the action was forbidden — the reason lives in the row.
+- **A lifecycle transition is an update.** Disabling or deleting a tenant changes
+  `axond_cp_tenant.lifecycle`; it never deletes the tenant, its projects, or its
+  history. Physical erasure is a separate compliance procedure.
 
 Secret material is never in the journal. A credential resource's body carries an
 opaque, exactly-versioned secret *reference* (`sct_…` plus a version) and the
@@ -154,6 +186,7 @@ own schema changes out of band:
 
 ```bash
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0001_initial.sql
+psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0002_tenancy_access.sql
 ```
 
 That path does not write the ledger row, so the journal is then reported as
@@ -267,9 +300,10 @@ outcomes need different responses:
   damage is investigated.
 - **Incompatible (`stored revision … is not compatible with this build`).** The
   rows add up and this build cannot read them: a body whose schema identifier or
-  field set belongs to a newer release, a tenant, project, or credential body
-  written before those bodies were typed, a credential naming a lifecycle state
-  this build does not know, or a row — or a whole revision — naming a canonical
+  field set belongs to a newer release, a tenant, project, credential, or
+  model-enablement body written before those bodies were typed, a credential
+  naming a lifecycle state this build does not know, an enablement or alias naming
+  a state or wire family it does not know, or a row — or a whole revision — naming a canonical
   encoding version this build does not write, whether or not this build knows that
   version's name, which a restored backup holding rows from two builds produces.
   (A serializer column naming no version of this encoding at all is unreadable
@@ -284,7 +318,15 @@ outcomes need different responses:
   that is not its scope, two credentials claiming one tenant's secret for another,
   two states for one secret version, or two versions of one secret in service — is
   unreadable, above, not this outcome: those are refused at publication, so a
-  stored revision holding one was written outside the gateway. A body that *declares* a schema this build reads and then is not one —
+  stored revision holding one was written outside the gateway. The same holds for
+  an enablement or alias that contradicts itself or its envelope — an owner that is
+  not its scope, an undeclared catalogue snapshot, two enablements for one offering
+  at one scope, or an alias target that is duplicated, dangling, cross-tenant, or of
+  another wire family. An *alias* body written before these bodies were typed is
+  the documented exception: it is skipped rather than reported, so neither outcome
+  names it — see
+  [resource body schemas](./revision-convergence.md#resource-body-schemas).
+  A body that *declares* a schema this build reads and then is not one —
   a field gone, a field whose type changed — is not this outcome; that is
   unreadable, above, because no version skew produces it. Neither is a tenancy body
   that is not an inline record at all, or one under a kind it does not match: no

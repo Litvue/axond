@@ -155,21 +155,21 @@ pub async fn run(config: &Config, config_path: &Path, env: &HashMap<String, Stri
         ),
     );
     // Read from `serve`'s own refusal rather than restated here, so this command
-    // cannot promise a boot `serve` would decline: today that is `mode =
-    // "stateful"`, and when the runtime wiring lands this line disappears with it
-    // instead of failing every stateful deployment forever. Failed rather than
-    // skipped, because the honest answer to this command's question is no: a
-    // rollout gating on a zero exit would pass here and then crash-loop. The
-    // database checks below still run and are still reported — and `axond migrate
-    // status`/`apply` are separate commands with their own exit codes, so
-    // preparing a database is not blocked by this.
-    if let Some(refusal) = super::serving_refusal(config) {
+    // cannot promise a surface `serve` would decline: today that is inference in
+    // `mode = "stateful"`, and when the projection lands this line disappears
+    // with it instead of failing every stateful deployment forever. Failed rather
+    // than skipped, because the honest answer to this command's question is no: a
+    // rollout gating on a zero exit would pass here and then answer every caller
+    // `503`. The replica does start, and its `/admin/v1` surface is checked
+    // below, as are the database checks — and `axond migrate status`/`apply` are
+    // separate commands with their own exit codes.
+    if let Some(refusal) = super::inference_refusal(config) {
         report.failed(
             "serving",
             format!(
-                "`serve` refuses this config, so no replica can start against it: {refusal} The \
-                 checks below still describe the database, and `axond migrate status` reports it \
-                 without this failure"
+                "a replica starts against this config and serves `/admin/v1`, but it refuses \
+                 inference: {refusal} The checks below still describe the database, and `axond \
+                 migrate status` reports it without this failure"
             ),
         );
     }
@@ -738,10 +738,11 @@ mod tests {
         );
     }
 
-    /// `serve` still refuses `mode = "stateful"`. An operator gating a rollout on
-    /// preflight has to learn that here rather than from a crash loop, so the
-    /// refusal is a reported *failure*: a green exit would promise a boot that
-    /// cannot happen. The other checks still run, so the report is still useful.
+    /// `serve` still refuses *inference* in `mode = "stateful"`. An operator
+    /// gating a rollout on preflight has to learn that here rather than from a
+    /// deployment that answers every caller `503`, so the refusal is a reported
+    /// *failure*: a green exit would promise traffic this replica will not serve.
+    /// The other checks still run, so the report is still useful.
     #[tokio::test]
     async fn a_stateful_preflight_names_the_serving_refusal_it_cannot_rehearse() {
         let path = write("axond.toml", stateful_toml());
@@ -754,7 +755,7 @@ mod tests {
             .expect("a stateful preflight must name the refusal");
         assert!(
             matches!(refusal.outcome, Outcome::Failed(_)),
-            "a config no replica can boot must not exit zero: {refusal}"
+            "a config whose inference is refused must not exit zero: {refusal}"
         );
         assert!(
             !report.is_ok(),
@@ -780,7 +781,7 @@ mod tests {
             "stateless mode has no such refusal to report: {report}"
         );
         assert!(
-            super::super::serving_refusal(&stateless).is_none(),
+            super::super::inference_refusal(&stateless).is_none(),
             "and the reported refusal is `serve`'s own, not a second opinion"
         );
     }

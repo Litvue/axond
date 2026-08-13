@@ -76,6 +76,9 @@ and operate it.
   windows, rollback limits, and the evidence a run leaves behind.
 - [Usage schema](./usage-schema.md) — durable row contract and delivery
   guarantees.
+- [Administering a stateful deployment](./operations/admin-api.md) — the
+  `/admin/v1` routes and `axond admin`, their preconditions, and what a stateful
+  replica serves before revision convergence ships.
 - [Control-plane revision journal](./operations/control-plane-journal.md) — the
   stateful mode's Postgres schema, migrations, schema-status refusals, and
   outage behaviour.

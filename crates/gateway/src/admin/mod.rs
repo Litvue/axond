@@ -15,8 +15,12 @@
 //! | [`protocol`] | the mutation preconditions: idempotency key, expected revision, dry run, audit summary |
 //! | [`diff`] | the redacted semantic diff between two complete desired states |
 //! | [`reads`] | bounded read projections: state, history, audit, convergence |
+//! | [`resources`] | the typed request documents, and the edits they become |
 //! | [`service`] | the one path a mutation takes: mode, authority, read, validate, diff, publish |
-//! | [`mod@router`] | the route boundary, its authentication layer, and its precondition layer |
+//! | [`handlers`] | the routes themselves: parse, plan, delegate |
+//! | [`mod@router`] | the route table, its authentication layer, and its precondition layer |
+//! | [`runtime`] | the authorities a running gateway builds, and the surface `serve` mounts |
+//! | [`cli`] | `axond admin`: an HTTP client for these routes, with no second way in |
 //!
 //! # The five properties this slice exists to make structural
 //!
@@ -46,13 +50,13 @@
 //! [`AdminCredential`], which has no [`Debug`] rendering of its material, and no
 //! error variant can hold presented material.
 //!
-//! # Contract only
+//! # One way in
 //!
-//! Nothing here is constructed by `serve`, and [`router::admin_route_specs`] is
-//! empty: the resource handlers, their bodies, and CLI parity are #143's, and the
-//! durable store this composes over is #140's. What ships is the boundary they
-//! land into, plus the contract tests — against the in-memory store oracle and
-//! fake authorities — that hold the five properties above.
+//! A handler holds no store. It parses a document, resolves the scope it
+//! changes, and hands an edit to [`service::AdminService`], which is the only
+//! code that publishes. `axond admin` speaks the same routes over HTTP rather
+//! than reaching into the domain, so the CLI cannot acquire an authority or skip
+//! a precondition the API enforces.
 //!
 //! [`AdminCredential`]: auth::AdminCredential
 //! [`AdminAuthError::InferenceCredential`]: auth::AdminAuthError::InferenceCredential
@@ -64,13 +68,19 @@
 //! [`Debug`]: std::fmt::Debug
 
 pub mod auth;
+pub mod cli;
 pub mod diff;
 pub mod error;
+pub mod handlers;
 pub mod protocol;
 pub mod reads;
+pub mod resources;
 pub mod router;
+pub mod runtime;
 pub mod service;
 
+#[cfg(test)]
+mod api_tests;
 #[cfg(test)]
 mod fakes;
 #[cfg(test)]
@@ -96,6 +106,14 @@ pub use reads::{
     RevisionRecord, StateView,
 };
 #[allow(unused_imports)]
+pub use resources::{
+    AdminResourceRequest, AliasRequest, CatalogRequest, CredentialRequest, ModelRequest,
+    MutationEnvelope, MutationKindInput, PolicyRequest, ProjectRequest, ProviderRequest,
+    ResourcePlan, RollbackRequest, TenantRequest,
+};
+#[allow(unused_imports)]
 pub use router::{AdminApi, AdminRouteSpec, admin_route_specs, router};
+#[allow(unused_imports)]
+pub use runtime::{BreakglassAuthenticator, BreakglassAuthorizer};
 #[allow(unused_imports)]
 pub use service::{AdminService, DesiredStateEdit, MutationOutcome, MutationResult};

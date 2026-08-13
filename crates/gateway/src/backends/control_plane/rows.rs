@@ -112,6 +112,8 @@ id_column!(resource_id, crate::desired_state::ResourceId);
 id_column!(revision_id, crate::desired_state::RevisionId);
 id_column!(mutation_id, crate::desired_state::MutationId);
 id_column!(audit_event_id, crate::desired_state::AuditEventId);
+id_column!(tenant_id, crate::desired_state::TenantId);
+id_column!(principal_id, crate::desired_state::PrincipalId);
 
 /// A scope as its three columns: the discriminant, and the ownership it implies.
 pub(super) struct ScopeColumns {
@@ -161,13 +163,20 @@ pub(super) fn scope(
     }
 }
 
-/// An actor as its four columns. Which are populated is decided by the variant,
+/// An actor as its six columns. Which are populated is decided by the variant,
 /// and the DDL refuses any other combination.
+///
+/// Six rather than four because a workload principal is attributed by tenant and
+/// principal id (#144), and reusing the human columns for it would make an
+/// issuer-scoped subject and an Axond-owned id the same two columns — so a query
+/// for "everything this person did" would return a service account's changes.
 pub(super) struct ActorColumns {
     pub(super) kind: &'static str,
     pub(super) issuer: Option<String>,
     pub(super) subject: Option<String>,
     pub(super) component: Option<String>,
+    pub(super) tenant: Option<String>,
+    pub(super) principal: Option<String>,
 }
 
 pub(super) fn actor_columns(actor: &Actor) -> ActorColumns {
@@ -177,18 +186,32 @@ pub(super) fn actor_columns(actor: &Actor) -> ActorColumns {
             issuer: Some(issuer.clone()),
             subject: Some(subject.clone()),
             component: None,
+            tenant: None,
+            principal: None,
         },
         Actor::Breakglass => ActorColumns {
             kind: "breakglass",
             issuer: None,
             subject: None,
             component: None,
+            tenant: None,
+            principal: None,
+        },
+        Actor::Workload { tenant, principal } => ActorColumns {
+            kind: "workload",
+            issuer: None,
+            subject: None,
+            component: None,
+            tenant: Some(tenant.to_string()),
+            principal: Some(principal.to_string()),
         },
         Actor::System { component } => ActorColumns {
             kind: "system",
             issuer: None,
             subject: None,
             component: Some(component.clone()),
+            tenant: None,
+            principal: None,
         },
     }
 }
@@ -198,14 +221,20 @@ pub(super) fn actor(
     issuer: Option<&str>,
     subject: Option<&str>,
     component: Option<&str>,
+    tenant: Option<&str>,
+    principal: Option<&str>,
 ) -> Result<Actor, IntegrityError> {
-    match (kind, issuer, subject, component) {
-        ("human", Some(issuer), Some(subject), None) => Ok(Actor::Human {
+    match (kind, issuer, subject, component, tenant, principal) {
+        ("human", Some(issuer), Some(subject), None, None, None) => Ok(Actor::Human {
             issuer: issuer.to_owned(),
             subject: subject.to_owned(),
         }),
-        ("breakglass", None, None, None) => Ok(Actor::Breakglass),
-        ("system", None, None, Some(component)) => Ok(Actor::System {
+        ("breakglass", None, None, None, None, None) => Ok(Actor::Breakglass),
+        ("workload", None, None, None, Some(tenant), Some(principal)) => Ok(Actor::Workload {
+            tenant: tenant_id(tenant)?,
+            principal: principal_id(principal)?,
+        }),
+        ("system", None, None, Some(component), None, None) => Ok(Actor::System {
             component: component.to_owned(),
         }),
         (kind, ..) => Err(unreadable(format!(
@@ -324,9 +353,19 @@ mod tests {
     /// Every discriminant this module writes has to be a value the shipped DDL
     /// accepts. The `CHECK` lists and these `match` arms are two spellings of one
     /// closed vocabulary, and this is the only thing that keeps them equal.
+    ///
+    /// Every migration, concatenated, rather than the first one: a vocabulary a
+    /// later migration widens — `actor_kind = 'workload'` is the first — is
+    /// accepted by the schema a deployment actually runs, and a test reading only
+    /// migration 0001 would report the widening as a mismatch while missing every
+    /// vocabulary introduced after it.
     #[test]
     fn every_written_discriminant_is_accepted_by_the_shipped_ddl() {
-        let ddl = crate::backends::control_plane::schema::MIGRATIONS[0].sql;
+        let ddl: String = crate::backends::control_plane::schema::MIGRATIONS
+            .iter()
+            .map(|migration| migration.sql)
+            .collect();
+        let ddl = ddl.as_str();
         let tenant = TenantId::new(uuid(1));
         let project = ProjectId::new(uuid(2));
         let scopes = [
@@ -348,6 +387,10 @@ mod tests {
                 subject: "u-1".to_owned(),
             },
             Actor::Breakglass,
+            Actor::Workload {
+                tenant,
+                principal: crate::desired_state::PrincipalId::new(uuid(3)),
+            },
             Actor::System {
                 component: "catalog-refresh".to_owned(),
             },
@@ -357,6 +400,27 @@ mod tests {
                 ddl.contains(&format!("actor_kind = '{}'", columns.kind)),
                 "the DDL does not accept actor kind `{}`",
                 columns.kind
+            );
+        }
+        // The vocabularies migration 0002 introduced, checked the same way: an
+        // identity kind, a role, and a tenant lifecycle are all values this build
+        // writes into a `CHECK` list it does not compile against.
+        for kind in crate::desired_state::IdentityKind::ALL {
+            assert!(
+                ddl.contains(&format!("identity_kind = '{kind}'")),
+                "the DDL does not accept identity kind `{kind}`"
+            );
+        }
+        for role in crate::desired_state::Role::ALL {
+            assert!(
+                ddl.contains(&format!("'{role}'")),
+                "the DDL does not accept role `{role}`"
+            );
+        }
+        for lifecycle in crate::desired_state::TenantLifecycle::ALL {
+            assert!(
+                ddl.contains(&format!("'{lifecycle}'")),
+                "the DDL does not accept tenant lifecycle `{lifecycle}`"
             );
         }
         for body in [
@@ -396,6 +460,12 @@ mod tests {
                 subject: "u-1".to_owned(),
             },
             Actor::Breakglass,
+            Actor::Workload {
+                tenant: TenantId::new(Uuid7::from_parts(9, 9, 9).expect("valid parts")),
+                principal: crate::desired_state::PrincipalId::new(
+                    Uuid7::from_parts(9, 9, 10).expect("valid parts"),
+                ),
+            },
             Actor::System {
                 component: "catalog-refresh".to_owned(),
             },
@@ -406,6 +476,8 @@ mod tests {
                 columns.issuer.as_deref(),
                 columns.subject.as_deref(),
                 columns.component.as_deref(),
+                columns.tenant.as_deref(),
+                columns.principal.as_deref(),
             )
             .expect("a written actor reads back");
             assert_eq!(restored, original);

@@ -45,15 +45,12 @@
 //!
 //! [adr]: https://github.com/Litvue/axond/blob/main/docs/adr/0027-stateless-and-stateful-operating-modes.md
 //!
-//! # Contract only
+//! # The table
 //!
-//! [`admin_route_specs`] is empty in this slice, and `serve` does not mount this
-//! router. Resource-specific handlers — providers, credentials, catalogues,
-//! prices, aliases, policy, tenants — are #143's, and each one is a spec plus an
-//! edit over the complete state, with the protocol properties above already held.
-//! What ships here is the boundary those handlers register into, its middleware,
-//! and the tests that hold it, mounted on a synthetic spec so the layer's
-//! behaviour is asserted rather than asserted-about.
+//! Every row is a resource document plus an edit: the handlers in
+//! [`super::handlers`] parse, plan, and delegate, and
+//! [`AdminService`] owns validation, preconditions, diffing, and publication.
+//! Adding a resource is a row here — never a second way to write state.
 //!
 //! [`AdminIdentity`]: super::auth::AdminIdentity
 //! [`MutationPreconditions`]: super::protocol::MutationPreconditions
@@ -62,7 +59,7 @@ use std::error::Error as _;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::HeaderMap;
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::Response;
@@ -73,9 +70,15 @@ use super::auth::{
     AdminAction, AdminAuthenticator, AdminAuthorizer, AdminGrant, AdminIdentity, AdminPresented,
 };
 use super::error::AdminError;
+use super::handlers;
 use super::protocol::{ADMIN_PREFIX, MutationPreconditions};
+use super::resources::{
+    AliasRequest, CatalogRequest, CredentialRequest, ModelRequest, PolicyRequest, ProjectRequest,
+    ProviderRequest, TenantRequest,
+};
 use super::service::AdminService;
-use crate::desired_state::ResourceScope;
+use crate::convergence::{RevisionReport, RevisionStatus};
+use crate::desired_state::{ResourceScope, Surface};
 
 /// Everything an administrative handler needs: the service, and the two
 /// authorities that decide who may call it.
@@ -83,6 +86,11 @@ pub struct AdminApi {
     pub service: Arc<AdminService>,
     pub authenticator: Arc<dyn AdminAuthenticator>,
     pub authorizer: Arc<dyn AdminAuthorizer>,
+    /// This replica's own convergence state, or `None` before a reconciler is
+    /// running. Read from the replica's cached status rather than from the
+    /// control plane, so "what am I serving" is answerable during an outage of
+    /// the store that would be needed to answer "what should I be serving".
+    pub convergence: Option<Arc<RevisionStatus>>,
 }
 
 impl AdminApi {
@@ -95,7 +103,25 @@ impl AdminApi {
             service,
             authenticator,
             authorizer,
+            convergence: None,
         }
+    }
+
+    /// Attach the replica's convergence status.
+    #[must_use]
+    pub fn with_convergence(mut self, status: Arc<RevisionStatus>) -> Self {
+        self.convergence = Some(status);
+        self
+    }
+
+    /// What this replica has converged onto, or `None` when no reconciler is
+    /// attached.
+    ///
+    /// Not an empty report: for a reconciler "nothing desired, nothing active"
+    /// *is* convergence, and answering that to an operator gating a rollout
+    /// would be a false all-clear from a replica serving nothing.
+    pub fn convergence_report(&self) -> Option<RevisionReport> {
+        self.convergence.as_ref().map(|status| status.report())
     }
 
     /// Establish an identity from what the request presented.
@@ -109,13 +135,29 @@ impl AdminApi {
     /// The scope comes from the request, so authorization happens in the handler
     /// rather than in the layer: the layer knows the route's action but cannot
     /// know which tenant a body names.
-    pub fn authorize(
+    ///
+    /// A refusal is written to the denial trail before it is returned, which is
+    /// why this is the only way a handler reaches the authorizer: an
+    /// authenticated caller reaching for authority it does not hold is exactly
+    /// the event an investigator asks the control plane about, and a code path
+    /// that could refuse without recording would be the one that hides it.
+    pub async fn authorize(
         &self,
         identity: &AdminIdentity,
         action: AdminAction,
+        surface: Surface,
         scope: &ResourceScope,
     ) -> Result<AdminGrant, AdminError> {
-        Ok(self.authorizer.authorize(identity, action, scope)?)
+        match self.authorizer.authorize(identity, action, scope) {
+            Ok(grant) => Ok(grant),
+            Err(refusal) => {
+                let error = AdminError::from(refusal);
+                self.service
+                    .record_denial(identity, action, surface, scope, &error)
+                    .await;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -142,12 +184,93 @@ pub struct AdminRouteSpec {
 
 /// The administrative route table.
 ///
-/// Empty until #143 lands resource handlers. Deliberately a function returning a
-/// table rather than an absent module: the boundary, its middleware, and its
-/// tests exist now, so a handler is a row here plus an edit.
+/// Reads first, then the resource writes, then rollback. Every write is a
+/// `POST` upsert of one complete resource document rather than a `PATCH`: a
+/// partial write would have to merge against state the caller never saw, and
+/// the whole point of the expected-revision precondition is that a caller
+/// changes state it has read.
 pub fn admin_route_specs() -> Vec<AdminRouteSpec> {
-    Vec::new()
+    vec![
+        AdminRouteSpec {
+            path: "/state",
+            action: AdminAction::ReadState,
+            router: handlers::state_route,
+        },
+        AdminRouteSpec {
+            path: "/history",
+            action: AdminAction::ReadHistory,
+            router: handlers::history_route,
+        },
+        AdminRouteSpec {
+            path: "/audit/{revision}",
+            action: AdminAction::ReadAudit,
+            router: handlers::audit_route,
+        },
+        AdminRouteSpec {
+            path: "/convergence",
+            action: AdminAction::ReadConvergence,
+            router: handlers::convergence_route,
+        },
+        AdminRouteSpec {
+            path: "/tenants",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<TenantRequest>,
+        },
+        AdminRouteSpec {
+            path: "/projects",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<ProjectRequest>,
+        },
+        AdminRouteSpec {
+            path: "/providers",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<ProviderRequest>,
+        },
+        AdminRouteSpec {
+            path: "/credentials",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<CredentialRequest>,
+        },
+        AdminRouteSpec {
+            path: "/catalogs",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<CatalogRequest>,
+        },
+        AdminRouteSpec {
+            path: "/models",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<ModelRequest>,
+        },
+        AdminRouteSpec {
+            path: "/aliases",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<AliasRequest>,
+        },
+        AdminRouteSpec {
+            path: "/policies",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<PolicyRequest>,
+        },
+        AdminRouteSpec {
+            path: "/rollback",
+            action: AdminAction::Rollback,
+            router: handlers::rollback_route,
+        },
+    ]
 }
+
+/// The inbound bound on an administrative document, declared rather than
+/// inherited: a handler buffers the whole body to parse it, and axum's implicit
+/// default would make the process's memory the real ceiling.
+///
+/// Not the inference surface's `max_request_bytes`, which bounds a prompt an
+/// operator tunes for their models. An administrative document is a handful of
+/// identifiers and a summary; the largest thing publishable is a catalogue
+/// *reference*, because a snapshot's payload is content-addressed elsewhere and
+/// never crosses this surface. A megabyte is orders of magnitude above any
+/// legitimate document and small enough that an unauthenticated caller cannot
+/// make the process buffer for them.
+pub const ADMIN_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 /// Mount a table under [`ADMIN_PREFIX`].
 ///
@@ -157,10 +280,12 @@ pub(crate) fn mount(api: Arc<AdminApi>, specs: Vec<AdminRouteSpec>) -> Router {
     let inner = specs
         .into_iter()
         .fold(Router::new(), |router, spec| {
-            let route = (spec.router)().layer(from_fn_with_state(
-                (api.clone(), spec.action),
-                admin_authenticate,
-            ));
+            let route = (spec.router)()
+                .layer(DefaultBodyLimit::max(ADMIN_MAX_REQUEST_BYTES))
+                .layer(from_fn_with_state(
+                    (api.clone(), spec.action),
+                    admin_authenticate,
+                ));
             router.route(spec.path, route)
         })
         .fallback(unknown_route)
@@ -181,6 +306,32 @@ pub(crate) fn mount(api: Arc<AdminApi>, specs: Vec<AdminRouteSpec>) -> Router {
 /// The administrative surface.
 pub fn router(api: Arc<AdminApi>) -> Router {
     mount(api, admin_route_specs())
+}
+
+/// The administrative surface a stateless deployment serves: every path, every
+/// method, refused as [`AdminError::StatefulModeRequired`].
+///
+/// Mounted rather than omitted, and refused *before* authentication rather than
+/// after, for two reasons. A stateless deployment has no administrative
+/// credential to authenticate against — `[[admin_breakglass]]` is rejected
+/// outside stateful mode — so `401` would be the answer to a question about the
+/// deployment's mode, which is not a secret and is exactly what the operator
+/// asked. And a `404` would be indistinguishable from an older build, leaving a
+/// tool to guess whether the surface is absent or the mode is wrong.
+///
+/// Nothing behind this can reach a backend: there is no state, no service, and
+/// no store — the refusal is the whole router.
+pub fn refusing_router() -> Router {
+    Router::new().nest(
+        ADMIN_PREFIX,
+        Router::new()
+            .fallback(stateful_mode_required)
+            .method_not_allowed_fallback(stateful_mode_required),
+    )
+}
+
+async fn stateful_mode_required() -> AdminError {
+    AdminError::StatefulModeRequired
 }
 
 /// An unknown `/admin/v1` path answers in the administrative envelope, so a

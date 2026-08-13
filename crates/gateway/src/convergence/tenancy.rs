@@ -134,6 +134,14 @@ impl RevisionProjection for TenancyProjection {
         // Ordered by project id, so two replicas compiling one revision produce
         // the same configuration and not merely an equivalent one.
         for project in tenancy.projects() {
+            // A suspended tenant serves nothing. Projecting its projects anyway
+            // would make `lifecycle = 'disabled'` a label rather than a decision,
+            // and the one thing an operator disables a tenant to stop is its
+            // traffic. Its rows are retained — the transition is not an erasure —
+            // so this is where the retention stops being servable.
+            if !tenancy.is_served(project.body.tenant()) {
+                continue;
+            }
             let id = tenancy
                 .qualified_name(project.body.project())
                 .ok_or_else(|| ProjectionError::Body {
@@ -179,11 +187,12 @@ mod tests {
     use super::super::compile::{CandidateCompiler, RevisionCompiler};
     use super::*;
     use crate::desired_state::fixtures::{
-        alias, candidate, project, project_id, revision_id, state, tenant, tenant_id,
+        alias, candidate, project, project_id, revision_id, state, tenant, tenant_body, tenant_id,
     };
     use crate::desired_state::{
         DesiredState, ExpectedRevision, LoadedRevision, ProjectBody, QualifiedProject,
-        ResourceScope, ResourceVersion, RevisionManifest, Slug,
+        ResourceScope, ResourceVersion, ResourceVersionNumber, RevisionManifest, Slug,
+        TenantLifecycle,
     };
 
     fn namespaces(config: &Config) -> Vec<&str> {
@@ -255,6 +264,58 @@ mod tests {
             .filter(|namespace| namespace.project.is_some())
             .map(|namespace| (namespace.id, namespace.project))
             .collect()
+    }
+
+    /// A lifecycle transition is what stops traffic, and the rows staying behind
+    /// is what keeps the history readable. Both halves are asserted here, because
+    /// each without the other is a bug: retention that still serves is a
+    /// suspension that suspends nothing, and a stop that deletes is an erasure
+    /// nobody asked for.
+    #[test]
+    fn a_suspended_tenants_projects_stop_being_namespaces_and_keep_being_rows() {
+        let mut state = DesiredState::new();
+        state.insert(tenant(1, "acme")).expect("fresh");
+        state
+            .insert(project(&tenant_id(1), 2, "core"))
+            .expect("a distinct reference");
+        state.insert(tenant(9, "globex")).expect("a distinct id");
+        state
+            .insert(project(&tenant_id(9), 12, "core"))
+            .expect("a distinct reference");
+        assert_eq!(
+            namespaces(
+                &TenancyProjection
+                    .project(&bootstrap(), &state)
+                    .expect("projectable")
+            ),
+            ["platform", "acme/core", "globex/core"]
+        );
+
+        for lifecycle in [TenantLifecycle::Disabled, TenantLifecycle::Deleted] {
+            let mut suspended = state.clone();
+            suspended
+                .supersede(tenant_body(9, "Globex").in_lifecycle(lifecycle).version_at(
+                    Slug::parse("globex").expect("a slug"),
+                    ResourceVersionNumber::FIRST.next(),
+                ))
+                .expect("a tenant this state declares");
+            assert_eq!(
+                namespaces(
+                    &TenancyProjection
+                        .project(&bootstrap(), &suspended)
+                        .expect("projectable")
+                ),
+                ["platform", "acme/core"],
+                "a {lifecycle} tenant serves nothing, and its neighbour is untouched"
+            );
+            assert!(
+                suspended
+                    .resources()
+                    .any(|version| version.slug.as_str() == "core"
+                        && version.scope == ResourceScope::Tenant(tenant_id(9))),
+                "the project row survives the transition it stopped serving"
+            );
+        }
     }
 
     #[test]

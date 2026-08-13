@@ -65,7 +65,8 @@ use std::collections::BTreeMap;
 use super::canonical::{Canonical, CanonicalValue};
 use super::ids::{InvalidId, ProjectId, ResourceId, SecretId, Slug, TenantId};
 use super::record::{
-    BodyError, DISPLAY_NAME_FIELD, PROJECT_ID_FIELD, Record, SCHEMA_FIELD, TENANT_ID_FIELD,
+    BodyError, DISPLAY_NAME_FIELD, DisplayNameError, PROJECT_ID_FIELD, Record, SCHEMA_FIELD,
+    TENANT_ID_FIELD,
 };
 use super::resource::{
     ResourceBody, ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber,
@@ -325,6 +326,16 @@ impl BodyError for CredentialError {
         }
     }
 
+    fn identity_mismatch(reference: ResourceRef, declared: String, identity: ResourceId) -> Self {
+        Self::IdentityMismatch {
+            reference,
+            declared,
+            identity,
+        }
+    }
+}
+
+impl DisplayNameError for CredentialError {
     fn malformed_display_name(
         reference: ResourceRef,
         field: &'static str,
@@ -334,14 +345,6 @@ impl BodyError for CredentialError {
             reference,
             field,
             source,
-        }
-    }
-
-    fn identity_mismatch(reference: ResourceRef, declared: String, identity: ResourceId) -> Self {
-        Self::IdentityMismatch {
-            reference,
-            declared,
-            identity,
         }
     }
 }
@@ -477,6 +480,26 @@ impl ProviderCredentialBody {
             lifecycle: SecretLifecycle::Staged,
             display_name: self.display_name.clone(),
             ..*self
+        }
+    }
+
+    /// This credential, reauthored from `authored`: the author's provider,
+    /// display name, and material, over the lifecycle the credential is
+    /// actually in.
+    ///
+    /// Authoring never *sets* a lifecycle — that is a transition the domain
+    /// owns — but naming different material is not a metadata edit: the new
+    /// version re-enters [`SecretLifecycle::Staged`], because material is proven
+    /// by compiling a candidate against it before it serves.
+    pub fn reauthored(&self, authored: Self) -> Self {
+        let lifecycle = if authored.secret == self.secret {
+            self.lifecycle
+        } else {
+            SecretLifecycle::Staged
+        };
+        Self {
+            lifecycle,
+            ..authored
         }
     }
 

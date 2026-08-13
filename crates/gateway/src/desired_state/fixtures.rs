@@ -6,10 +6,16 @@
 
 use std::time::{Duration, SystemTime};
 
-use super::canonical::CanonicalValue;
+use super::access::{Credential, IdentityBody, Role, WorkloadKey};
+use super::canonical::{CanonicalValue, Checksum};
 use super::credentials::ProviderCredentialBody;
 use super::ids::{
-    AuditEventId, MutationId, ProjectId, ResourceId, RevisionId, SecretId, Slug, TenantId, Uuid7,
+    AuditEventId, MutationId, PrincipalId, ProjectId, ResourceId, RevisionId, SecretId, Slug,
+    TenantId, Uuid7,
+};
+use super::models::{
+    AliasTarget, ApprovedPrice, CatalogOffering, ModelAliasBody, ModelEnablementBody, ModelOwner,
+    ObservedPrice, OfferingId, WireFamily,
 };
 use super::mutation::{
     Actor, AuditEvent, ExpectedRevision, IdempotencyKey, Mutation, MutationKind,
@@ -504,6 +510,174 @@ pub(crate) fn state_with_second_tenant() -> DesiredState {
     state
 }
 
+pub(crate) fn principal_id(seed: u64) -> PrincipalId {
+    PrincipalId::new(uuid(seed))
+}
+
+/// A human principal: an OIDC subject at one issuer, with the roles given.
+///
+/// The seed is the principal id *and* the resource id, the binding
+/// [`IdentityBody::read`] enforces.
+pub(crate) fn human(
+    seed: u64,
+    subject: &str,
+    scope: ResourceScope,
+    roles: &[Role],
+) -> ResourceVersion {
+    identity(
+        seed,
+        subject,
+        scope,
+        roles,
+        Credential::Oidc {
+            issuer: "https://idp.example".to_owned(),
+            subject: subject.to_owned(),
+        },
+    )
+}
+
+/// A workload key of the shape [`WorkloadKey::parse`] accepts, seeded so it is
+/// the same string in every run.
+///
+/// Deterministic rather than minted, because a test that asserts on a stored
+/// digest cannot use fresh randomness — and because a fixture must not need the
+/// system CSPRNG to build a state.
+pub(crate) fn workload_key(seed: u8) -> String {
+    let mut key = String::from(WorkloadKey::PREFIX);
+    for _ in 0..32 {
+        key.push_str(&format!("{seed:02x}"));
+    }
+    key
+}
+
+/// A workload principal whose key digest is the digest of `key`, or which has no
+/// key at all — a workload whose key was revoked and not replaced.
+pub(crate) fn workload(
+    seed: u64,
+    slug: &str,
+    scope: ResourceScope,
+    roles: &[Role],
+    key: Option<&str>,
+) -> ResourceVersion {
+    identity(
+        seed,
+        slug,
+        scope,
+        roles,
+        Credential::MintedKey {
+            digest: key.map(|key| Checksum::of(key.as_bytes())),
+        },
+    )
+}
+
+fn identity(
+    seed: u64,
+    slug: &str,
+    scope: ResourceScope,
+    roles: &[Role],
+    credential: Credential,
+) -> ResourceVersion {
+    IdentityBody::new(
+        principal_id(seed),
+        display_name(&capitalize(slug)),
+        credential,
+        roles.iter().copied(),
+    )
+    .expect("fixture identities grant a role")
+    .version(scope, Slug::parse(slug).expect("fixture slug"))
+}
+
+/// [`state`] plus a directory: a platform administrator, a tenant administrator,
+/// an operator scoped into one project, and a workload of the tenant.
+///
+/// One state that every authorization case can be decided against, so a test
+/// asserts on the decision rather than on a hand-built directory.
+pub(crate) fn state_with_directory() -> DesiredState {
+    directory_state(true)
+}
+
+/// [`state_with_directory`] with the workload no longer declared: what publishing
+/// a revocation looks like, since a revision is the whole directory rather than a
+/// change to it.
+pub(crate) fn state_with_revoked_workload() -> DesiredState {
+    directory_state(false)
+}
+
+fn directory_state(with_workload: bool) -> DesiredState {
+    let tenant = tenant_id(1);
+    let project = project_id(2);
+    let mut state = state();
+    state
+        .insert(human(
+            30,
+            "root",
+            ResourceScope::Deployment,
+            &[Role::PlatformAdmin],
+        ))
+        .and_then(|state| {
+            state.insert(human(
+                31,
+                "admin",
+                ResourceScope::Tenant(tenant),
+                &[Role::TenantAdmin],
+            ))
+        })
+        .and_then(|state| {
+            state.insert(human(
+                32,
+                "dev",
+                ResourceScope::Project { tenant, project },
+                &[Role::Developer],
+            ))
+        })
+        .expect("a directory over declared tenants and projects is valid");
+    if with_workload {
+        state
+            .insert(workload(
+                33,
+                "deployer",
+                ResourceScope::Tenant(tenant),
+                &[Role::Operator],
+                Some(&workload_key(0xd0)),
+            ))
+            .expect("a workload of a declared tenant is valid");
+    }
+    state
+}
+
+/// Two tenants, each with its own administrator and its own project.
+///
+/// What an isolation case needs that [`state_with_directory`] cannot give it: a
+/// second tenant's principals and grants to *fail* to see. Neither tenant's
+/// resources reference the other's, so the state is valid for the same reason
+/// [`state_with_second_tenant`] is.
+pub(crate) fn two_tenant_directory_state() -> DesiredState {
+    let other = tenant_id(11);
+    let mut state = state_with_directory();
+    state
+        .insert(tenant(11, "globex"))
+        .and_then(|state| state.insert(project(&other, 12, "core")))
+        .and_then(|state| {
+            state.insert(human(
+                40,
+                "their-admin",
+                ResourceScope::Tenant(other),
+                &[Role::TenantAdmin],
+            ))
+        })
+        .and_then(|state| {
+            state.insert(workload(
+                41,
+                "their-deployer",
+                ResourceScope::Tenant(other),
+                &[Role::Operator],
+                Some(&workload_key(0xe1)),
+            ))
+        })
+        .expect("two tenants that reference nothing of each other's are valid");
+    state
+}
+
 /// A chain of `depth` aliases, each depending on the next.
 ///
 /// Nesting a hydration bound can be stated against: the chain is linear, so its
@@ -524,6 +698,148 @@ pub(crate) fn deep_chain_state(depth: u64) -> DesiredState {
             .insert(alias(&owner, seed, &format!("step-{step}"), &depends_on))
             .expect("distinct references");
     }
+    state
+}
+
+/// The identity of an offering a catalogue lists, derived the way an importer
+/// derives it: from the provider and model identifiers, never from a display name.
+pub(crate) fn offering_id(model: &str) -> OfferingId {
+    OfferingId::of("openai", model).expect("fixture identifiers are encodable")
+}
+
+/// The snapshot digest [`blob_backed_catalog`] carries, which is what an
+/// enablement pins.
+pub(crate) fn catalog_snapshot() -> Checksum {
+    blob_backed_catalog(5)
+        .body
+        .blob()
+        .expect("a blob body")
+        .digest
+}
+
+pub(crate) fn catalog_offering(model: &str) -> CatalogOffering {
+    CatalogOffering::new(offering_id(model), catalog_snapshot())
+}
+
+/// A typed enablement body owned by `owner`, of the offering `model`.
+pub(crate) fn enablement_body(seed: u64, owner: ModelOwner, model: &str) -> ModelEnablementBody {
+    ModelEnablementBody::new(
+        resource_id(seed),
+        owner,
+        catalog_offering(model),
+        WireFamily::OpenaiChat,
+    )
+}
+
+/// A tenant-default enablement: every project of the tenant sees it unless one
+/// overrides it.
+pub(crate) fn tenant_enablement(tenant: &TenantId, seed: u64, model: &str) -> ResourceVersion {
+    enablement_body(seed, ModelOwner::tenant(*tenant), model).version(
+        Slug::parse(model).expect("fixture slug"),
+        catalog_reference(),
+    )
+}
+
+/// A project override of the same offering: the enablement one project gets
+/// instead of its tenant's default.
+pub(crate) fn project_enablement(
+    tenant: &TenantId,
+    project: &ProjectId,
+    seed: u64,
+    model: &str,
+) -> ResourceVersion {
+    enablement_body(seed, ModelOwner::project(*tenant, *project), model).version(
+        Slug::parse(model).expect("fixture slug"),
+        catalog_reference(),
+    )
+}
+
+/// The catalogue resource version every fixture enablement pins.
+pub(crate) fn catalog_reference() -> ResourceRef {
+    blob_backed_catalog(5).reference
+}
+
+/// A typed project alias resolving to `targets`, in the order given.
+pub(crate) fn typed_alias(
+    tenant: &TenantId,
+    project: &ProjectId,
+    seed: u64,
+    slug: &str,
+    targets: &[ResourceRef],
+) -> ResourceVersion {
+    alias_body(tenant, project, seed, targets).version(Slug::parse(slug).expect("fixture slug"))
+}
+
+pub(crate) fn alias_body(
+    tenant: &TenantId,
+    project: &ProjectId,
+    seed: u64,
+    targets: &[ResourceRef],
+) -> ModelAliasBody {
+    ModelAliasBody::new(
+        resource_id(seed),
+        *tenant,
+        *project,
+        WireFamily::OpenaiChat,
+        targets
+            .iter()
+            .map(|target| AliasTarget::new(target.id, target.version)),
+    )
+}
+
+/// A rate an upstream publishes: recorded, and never billed against.
+pub(crate) fn observed_price() -> ObservedPrice {
+    ObservedPrice::new(2_500_000, 10_000_000)
+}
+
+/// A reference to the exact price version an operator approved.
+pub(crate) fn approved_price(seed: u64) -> ApprovedPrice {
+    ApprovedPrice::version(resource_id(seed), ResourceVersionNumber::FIRST)
+}
+
+/// A price resource an approval points at.
+///
+/// Untyped: the price body schema is the pricing slice's to define (#201), and
+/// this slice only needs a `Price` row that exists, is owned, and is referenced.
+pub(crate) fn price(tenant: &TenantId, seed: u64, slug: &str) -> ResourceVersion {
+    ResourceVersion::new(
+        reference(ResourceKind::Price, seed),
+        ResourceScope::Tenant(*tenant),
+        Slug::parse(slug).expect("fixture slug"),
+        inline("micros_per_million", "2500000"),
+    )
+}
+
+/// A valid state carrying the typed model contracts: a tenant default, a project
+/// override of the same offering, and a project alias resolving to both in
+/// priority order.
+///
+/// The catalogue snapshot both enablements pin is declared once and shared, which
+/// is the pinning rule stated as state rather than as a comment.
+pub(crate) fn state_with_models() -> DesiredState {
+    let tenant_id = tenant_id(1);
+    let project_id = project_id(2);
+    let catalog = blob_backed_catalog(5);
+    let default = tenant_enablement(&tenant_id, 30, "gpt-4o");
+    let over = project_enablement(&tenant_id, &project_id, 31, "gpt-4o");
+    let mut state = DesiredState::new();
+    state.declare_blob(*catalog.body.blob().expect("a blob body"));
+    state
+        .insert(tenant(1, "acme"))
+        .and_then(|state| state.insert(project(&tenant_id, 2, "core")))
+        .and_then(|state| state.insert(catalog.clone()))
+        .and_then(|state| state.insert(default.clone()))
+        .and_then(|state| state.insert(over.clone()))
+        .and_then(|state| {
+            state.insert(typed_alias(
+                &tenant_id,
+                &project_id,
+                32,
+                "fast",
+                &[over.reference, default.reference],
+            ))
+        })
+        .expect("fixture state is valid");
     state
 }
 

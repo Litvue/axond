@@ -14,10 +14,10 @@
 //! `[reload] watch` is on, a change to the config file) re-runs this same load +
 //! validate path and swaps the result in atomically (ADR 0011).
 
-// The `/admin/v1` protocol and service boundary (#200). Contract only, like
-// `backends` and `desired_state`: the route table is empty until the resource
-// handlers land in #143, so `serve` mounts nothing and the request path is
-// unchanged.
+// The `/admin/v1` surface: the only way durable desired state changes (#143).
+// Mounted by `serve` beside the inference router, with its own authentication
+// and its own error envelope; the inference request path is unchanged and still
+// never reads the control plane.
 #[allow(dead_code)]
 mod admin;
 mod admission;
@@ -109,6 +109,7 @@ fn main() -> anyhow::Result<()> {
             Some(("preflight", args)) => preflight(args),
             _ => unreachable!("clap validates subcommands"),
         },
+        Some(("admin", args)) => admin::cli::run(args),
         Some(("migrate", args)) => match args.subcommand() {
             Some(("status", args)) => migrate_control_plane(args, Migration::Status),
             Some(("apply", args)) => migrate_control_plane(args, Migration::Apply),
@@ -124,6 +125,7 @@ fn cli() -> Command {
         .about("A stateless, self-hosted AI gateway")
         .subcommand_required(false)
         .arg_required_else_help(false)
+        .subcommand(admin::cli::command())
         .subcommand(
             Command::new("revoke")
                 .about("Add a minted-token JTI to the revocation denylist")
@@ -459,10 +461,8 @@ async fn serve() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to load config from `{config_path}`: {e}"))?;
 
     // The same refusal `axond check preflight` reports, read from the same place,
-    // so the command cannot describe a boot this function would not perform.
-    if let Some(refusal) = ops::serving_refusal(&config) {
-        anyhow::bail!("{refusal}");
-    }
+    // so the command cannot describe a surface this function would not serve.
+    let inference_refusal = ops::inference_refusal(&config);
 
     let env: HashMap<String, String> = std::env::vars().collect();
 
@@ -493,6 +493,22 @@ async fn serve() -> anyhow::Result<()> {
         tracing::info!(backend = revocation.name(), "token revocation");
     }
 
+    // Built before the inference state takes ownership of the config, and before
+    // the listener exists: a stateful replica whose administrative surface cannot
+    // come up must fail at boot rather than serve a deployment nobody can
+    // administer. In stateless mode this opens nothing at all.
+    let (admin_surface, admin_mode) =
+        admin::runtime::surface(&config, &env).await.map_err(|e| {
+            anyhow::anyhow!(
+                "a stateful deployment could not bring up its administrative surface: {e}"
+            )
+        })?;
+    tracing::info!(
+        mode = admin_mode,
+        prefix = admin::ADMIN_PREFIX,
+        "administrative surface"
+    );
+
     let bind = config.server.bind;
     let watching = config.reload.watch;
     let state =
@@ -514,7 +530,19 @@ async fn serve() -> anyhow::Result<()> {
     // Kept past the router so the sinks can be flushed after the last request:
     // shutdown is the one point where durability outranks the request path.
     let resources = state.clone();
-    let app = routes::router(state).layer(telemetry::TelemetryLayer);
+    // A replica that cannot compile a revision into a snapshot still administers
+    // one: the administrative surface is mounted either way, and only inference
+    // is replaced by its refusal.
+    let inference = match inference_refusal {
+        None => routes::router(state),
+        Some(reason) => {
+            tracing::warn!(reason, "inference is refused on this replica");
+            routes::unconverged_router(reason)
+        }
+    };
+    let app = inference
+        .merge(admin_surface)
+        .layer(telemetry::TelemetryLayer);
 
     tracing::info!(
         %bind,

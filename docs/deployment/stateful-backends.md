@@ -7,7 +7,8 @@ This guide covers the **stateless** operating mode: TOML owns every resource, an
 a backend below is an opt-in for one capability. "Stateful backend" here does not
 mean the stateful control plane accepted in
 [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md), which moves
-resource ownership into Postgres behind `/admin/v1` and is not implemented yet.
+resource ownership into Postgres behind
+[`/admin/v1`](../operations/admin-api.md) and does not serve inference yet.
 Redis is a hot-state backend in both modes and is never a durable store of
 record.
 
