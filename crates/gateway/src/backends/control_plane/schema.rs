@@ -79,6 +79,11 @@ enum Statement {
 /// a plain `split(';')` would both cut statements in half and find keywords in
 /// prose. The slices point into the embedded SQL, so every name parsed out of one
 /// is `'static`.
+///
+/// A chunk with no word outside its comments is not a statement and is dropped: a
+/// file that ends with an explanatory comment, or that has a stray `;;`, is
+/// otherwise read as a statement nothing can confirm, which would withdraw
+/// adoption from the whole history over a comment.
 fn statements(sql: &'static str) -> Vec<&'static str> {
     let mut statements = Vec::new();
     let mut start = 0;
@@ -94,7 +99,7 @@ fn statements(sql: &'static str) -> Vec<&'static str> {
             b'-' if bytes.get(index + 1) == Some(&b'-') => commented = true,
             b';' => {
                 let statement = sql[start..index].trim();
-                if !statement.is_empty() {
+                if !words(statement).is_empty() {
                     statements.push(statement);
                 }
                 start = index + 1;
@@ -103,7 +108,7 @@ fn statements(sql: &'static str) -> Vec<&'static str> {
         }
     }
     let tail = sql[start..].trim();
-    if !tail.is_empty() {
+    if !words(tail).is_empty() {
         statements.push(tail);
     }
     statements
@@ -748,23 +753,27 @@ fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baselin
                 ),
             };
         };
-        let missing: Vec<&'static str> = declared
+        // Named by what is actually wrong with each one: a table that is not there
+        // and a table that is there without its seed row are different repairs, and
+        // an operator told "`axond_cp_head` is not present" about a table that
+        // exists would go looking for the wrong thing.
+        let missing: Vec<String> = declared
             .iter()
             .filter(|item| !confirmed.contains(item))
             .map(|item| match item {
-                Evidence::Relation(name) | Evidence::Seed(name) => *name,
+                Evidence::Relation(name) => format!("`{name}` is not present"),
+                Evidence::Seed(name) => format!("`{name}` has no seeded row"),
             })
             .collect();
         if !missing.is_empty() && missing.len() < declared.len() {
             return Baseline::Inconsistent {
                 message: format!(
-                    "v{} `{}` is only partly applied: `{}` {} not present, so this build cannot \
-                     record it as applied and cannot apply it over what is there either. Finish \
-                     or undo that migration by hand, then re-run.",
+                    "v{} `{}` is only partly applied: {}, so this build cannot record it as \
+                     applied and cannot apply it over what is there either. Finish or undo that \
+                     migration by hand, then re-run.",
                     migration.version,
                     migration.name,
-                    missing.join("`, `"),
-                    if missing.len() == 1 { "is" } else { "are" },
+                    missing.join(", "),
                 ),
             };
         }
@@ -1176,6 +1185,21 @@ mod tests {
                 "a statement whose effect nothing can confirm must void the whole migration: {sql}"
             );
         }
+
+        // Prose is not a statement. A file that ends with an explanation, or that
+        // has a stray separator, would otherwise withdraw adoption from the entire
+        // history over a comment.
+        const COMMENTED: Migration = Migration {
+            version: 3,
+            name: "commented",
+            sql: "CREATE TABLE IF NOT EXISTS first (id integer);;\n\
+                  -- Why this table exists, after the last statement.\n\
+                  -- And a second line of it.\n",
+        };
+        assert_eq!(
+            evidence(&COMMENTED),
+            Some(vec![Evidence::Relation("first")])
+        );
     }
 
     /// `CREATE TABLE` with and without `IF NOT EXISTS`, a name followed by a

@@ -853,8 +853,11 @@ mod tests {
         );
         assert!(
             error.to_string().contains("only partly applied")
-                && error.to_string().contains("axond_cp_head"),
-            "the refusal has to name what is not there: {error}"
+                && error
+                    .to_string()
+                    .contains("`axond_cp_head` has no seeded row"),
+            "the refusal names the repair, and the table is present so it must not claim \
+             otherwise: {error}"
         );
         assert!(
             fixture.ledger().await.is_empty(),
@@ -869,6 +872,13 @@ mod tests {
     /// role, so `42501` while reading the evidence is a realistic failure rather
     /// than a theoretical one. Reported as retryable it would have a rollout gate
     /// loop forever on a grant nobody is going to make from a retry.
+    ///
+    /// The seed probe is the privileged read: `pg_class` is world-readable, so the
+    /// relation probes answer for any role. That is not a gap in the check — a
+    /// table's existence is what they ask about, and existence does not depend on
+    /// who is asking — but it does mean this test rides on the shipped history
+    /// having a seed row, which
+    /// `a_migrations_declared_tables_are_read_out_of_the_shipped_ddl` pins.
     #[tokio::test]
     async fn a_role_that_cannot_read_the_evidence_refuses_rather_than_advising_a_retry() {
         let Some(fixture) = fixture().await else {
@@ -920,6 +930,18 @@ mod tests {
             fixture.ledger().await.is_empty(),
             "a refused adoption must not record a baseline"
         );
+
+        // A role is cluster-wide, unlike the schema this fixture owns, so it is
+        // this test's to clean up or every local run leaves one behind.
+        client
+            .batch_execute(&format!(
+                "REVOKE ALL ON ALL TABLES IN SCHEMA {} FROM {role};
+                 REVOKE ALL ON SCHEMA {} FROM {role};
+                 DROP ROLE {role}",
+                fixture.schema, fixture.schema
+            ))
+            .await
+            .expect("drop the role this test created");
     }
 
     /// Another install's journal on the same search path is not evidence about

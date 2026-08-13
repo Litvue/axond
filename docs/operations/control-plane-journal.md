@@ -301,8 +301,9 @@ path is not evidence about this one). What it does instead of recording:
 - **A migration only partly applied.** Some of what one file declares is there and
   some is not — a table, an index, or the seed row the shipped file ends with, which
   a `psql -f` outside a transaction can stop just short of. Neither "applied" nor
-  "not applied" is true, so it is refused, naming what is missing; finish or undo
-  that file by hand first.
+  "not applied" is true, so it is refused, naming the repair for each thing: an
+  object that is not present is reported as missing, and a table that is present and
+  empty is reported as having no seeded row. Finish or undo that file by hand first.
 - **A ledger that already records a history.** Nothing to adopt: the history is
   reported and nothing is written, so a stray `adopt` in a rollout is not a ledger
   edit.
