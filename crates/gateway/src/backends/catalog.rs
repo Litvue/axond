@@ -1776,7 +1776,10 @@ pub enum Admission {
 /// labelled by reason, the active snapshot's
 /// [`SourceSnapshot::fetched_at`] exported as an age, and an alert when refusals
 /// persist across more than one interval — tracked in
-/// [#241](https://github.com/Litvue/axond/issues/241). Staleness degrades
+/// [#241](https://github.com/Litvue/axond/issues/241). For that age to mean
+/// "last confirmed current" rather than "last changed", an unchanged answer is
+/// recorded through [`LastKnownGoodCatalog::record_unchanged`], which also takes
+/// the validators the `304` itself stated. Staleness degrades
 /// metadata quality only: no enablement, admission, or billing decision reads
 /// this snapshot, so a stale catalogue is never an outage.
 #[derive(Debug, Default)]
@@ -1826,6 +1829,31 @@ impl LastKnownGoodCatalog {
         };
         self.active = Some(snapshot);
         admission
+    }
+
+    /// Record that the source answered [`CatalogRefresh::Unchanged`], so the
+    /// next conditional request carries what it answered with.
+    ///
+    /// A `304` may state validators that are not the ones sent — a refreshed
+    /// `Last-Modified`, or an `ETag` an intermediary rewrote — and they describe
+    /// the content already held, so provenance moves while the content and its
+    /// identity do not. `checked_at` advances too: an unchanged answer is
+    /// evidence the held content is current as of then, which is what an active
+    /// snapshot's age means to an operator.
+    ///
+    /// Returns whether anything was recorded; there is nothing to move before a
+    /// first import.
+    pub fn record_unchanged(
+        &mut self,
+        validators: SourceValidators,
+        checked_at: SystemTime,
+    ) -> bool {
+        let Some(active) = self.active.as_mut() else {
+            return false;
+        };
+        active.source.validators = validators;
+        active.source.fetched_at = checked_at;
+        true
     }
 
     /// Admit a parse result, leaving the active snapshot untouched on failure.
@@ -2067,6 +2095,38 @@ mod tests {
             Some(content_id),
             "and the id reported is the id of what became active"
         );
+    }
+
+    /// A `304` may answer with validators that are not the ones sent, and they
+    /// describe the content already held — so recording them must move
+    /// provenance without touching the content or its identity.
+    #[test]
+    fn an_unchanged_answer_moves_the_validators_without_moving_the_content() {
+        let mut catalogue = LastKnownGoodCatalog::new();
+        assert!(
+            !catalogue.record_unchanged(SourceValidators::etag("\"one\""), SystemTime::UNIX_EPOCH),
+            "there is nothing to say is unchanged before a first import"
+        );
+
+        let held = content(vec![offering("openai", "gpt-4o", None)]);
+        let content_id = held.content_id();
+        catalogue.admit(snapshot(held, SourceValidators::etag("\"one\"")));
+
+        let checked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(3_600);
+        assert!(catalogue.record_unchanged(SourceValidators::etag("\"two\""), checked_at));
+        assert_eq!(
+            catalogue.validators(),
+            Some(&SourceValidators::etag("\"two\"")),
+            "the next conditional request asks with what the source last answered"
+        );
+        let active = catalogue.active().expect("the content stayed active");
+        assert_eq!(active.source.fetched_at, checked_at);
+        assert_eq!(
+            active.content.content_id(),
+            content_id,
+            "an unchanged answer is not new content"
+        );
+        assert_eq!(active.source.content_id, content_id);
     }
 
     #[test]
