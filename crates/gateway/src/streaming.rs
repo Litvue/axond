@@ -495,6 +495,16 @@ impl Relay {
                                             return;
                                         }
                                         Err(open_err) => {
+                                            // The rotation's opener error reaches no other
+                                            // surface, so the operator keeps the whole
+                                            // failure here; the caller gets the wording
+                                            // every transport failure is given.
+                                            tracing::warn!(
+                                                provider = %self.accounting.ctx.target_provider,
+                                                model = %self.accounting.ctx.target_model,
+                                                error = %open_err,
+                                                "upstream attempt failed on the transport"
+                                            );
                                             self.phase =
                                                 Phase::Failed(transport_caller_message(&open_err));
                                             return;
