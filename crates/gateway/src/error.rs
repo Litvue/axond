@@ -26,6 +26,13 @@ pub enum GatewayError {
     NoCredential { namespace: String, provider: String },
     #[error("budget exceeded for model `{0}`")]
     BudgetExceeded(String),
+    /// Every target behind an alias is priced by an approved price book that does
+    /// not price it, so the request cannot be held against a budget. The alias
+    /// stays discoverable — it is listed, and its configuration is valid — but a
+    /// budget-controlled request against it is refused rather than served at
+    /// rates nobody approved or charged as free (#147).
+    #[error("model `{alias}` has no approved price: {reason}")]
+    ModelNotPriced { alias: String, reason: String },
     #[error(
         "request cost ceiling exceeded for model `{alias}`: estimated {estimated_microdollars} microdollars exceeds the per-request ceiling of {ceiling_microdollars} microdollars"
     )]
@@ -121,6 +128,10 @@ impl GatewayError {
             Self::UnknownModel(_) => StatusCode::NOT_FOUND,
             Self::NoCredential { .. } => StatusCode::BAD_GATEWAY,
             Self::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
+            // The configuration is servable and the caller's request is
+            // well-formed; what is missing is an operator's approval, so this is
+            // the deployment's state rather than the caller's fault.
+            Self::ModelNotPriced { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::RequestCostCeilingExceeded { .. } => StatusCode::FORBIDDEN,
             // Fail-closed: the cap cannot be enforced, so the request is a
             // dependency failure rather than an over-cap caller (ADR 0010).
@@ -183,6 +194,7 @@ impl GatewayError {
             Self::UnknownModel(_) => "unknown_model",
             Self::NoCredential { .. } => "no_credential",
             Self::BudgetExceeded(_) => "budget_exceeded",
+            Self::ModelNotPriced { .. } => "model_not_priced",
             Self::RequestCostCeilingExceeded { .. } => "request_cost_ceiling_exceeded",
             Self::BudgetUnavailable => "budget_unavailable",
             Self::UsageNotDurable { .. } => "usage_not_durable",

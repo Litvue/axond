@@ -256,9 +256,24 @@ Each target:
 | `model` | string | — | The upstream model / deployment id sent to the provider. |
 | `price.input_microdollars_per_million` | integer | — | Prompt-token price. Required. |
 | `price.output_microdollars_per_million` | integer | — | Completion-token price. Required; unused by `/v1/embeddings`, which bills input only. |
+| `catalog.provider` | string | — | The **catalogue's** provider id (the upstream's own, not the `[[provider]] id` above), when this target is bound to a catalogue offering. |
+| `catalog.model` | string | — | The model id that provider publishes, which is what an approved price rule is keyed by. |
 
 Pricing is mandatory because budgets are denominated in currency: an unpriced
 target could not be charged, so it fails to parse.
+
+`catalog` is optional and opts the target into **approved price books**: where the
+serving snapshot carries an approved book covering the bound offering, that book's
+rates are charged and the usage row names the book, its checksum, and the
+catalogue it was approved against. The `price` above stays authoritative for an
+unbound target and for a deployment with no approved book, so an existing
+configuration is unaffected. Two consequences are worth knowing before binding
+one: the binding is never inferred from `provider`/`model` (they are
+operator-chosen routing names, and guessing would bill one provider's rates for
+another's traffic), and a bound target the approved book does *not* price is
+**ineligible** rather than free — the alias stays listed by `/v1/models`, but a
+request that can only route to unpriced targets is refused
+`503 model_not_priced` ([ADR 0052](./adr/0052-request-path-pricing.md)).
 
 `/v1/responses` does not use the target order at all: every Responses request,
 initial or continuation, is served only by the **first** target so a

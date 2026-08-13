@@ -124,7 +124,24 @@ pub struct UsageRecord {
     pub cache_write_tokens: u64,
     pub output_tokens: u64,
     pub cost_microdollars: u64,
+    /// Version of the approved price book the cost was computed against, or `0`
+    /// when the file configuration priced the request. Populating it is what
+    /// makes a historical row auditable: the book version, its checksum, and the
+    /// catalogue it was approved against together name immutable content, so a
+    /// later publication cannot change what this row was charged at (#147).
     pub catalog_version: u64,
+    /// The approved price-book resource version, `price/<id>@v<n>`. Absent when
+    /// no book priced the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_book: Option<String>,
+    /// Checksum of the approved book's canonical body, so two replicas that
+    /// report the same book version are provably reporting the same rates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_book_checksum: Option<String>,
+    /// Identity of the normalized catalogue content the book was approved
+    /// against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_catalog: Option<String>,
     pub latency_ms: u64,
     /// Upstream target attempts made for this request across the alias's
     /// targets; the retry count is one less. `1` when the first target served.
@@ -836,7 +853,16 @@ mod tests {
             cache_write_tokens: 0,
             output_tokens: 34,
             cost_microdollars: 640,
-            catalog_version: 0,
+            catalog_version: 7,
+            price_book: Some("price-book/default@v7".to_string()),
+            price_book_checksum: Some(
+                "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+                    .to_string(),
+            ),
+            price_catalog: Some(
+                "sha256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
+                    .to_string(),
+            ),
             latency_ms: 812,
             attempts: 1,
         }

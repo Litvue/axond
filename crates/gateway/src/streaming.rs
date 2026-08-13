@@ -25,9 +25,7 @@ use axum::response::Response;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::future::BoxFuture;
-use gateway_core::{
-    ModelPrice, ModelUsage, ProviderStreamDecoder, ProviderStreamEvent, SseDecoder,
-};
+use gateway_core::{ModelUsage, ProviderStreamDecoder, ProviderStreamEvent, SseDecoder};
 use gateway_transport::{ByteStream, TransportError};
 use opentelemetry::Context;
 use serde_json::{Value, json};
@@ -38,6 +36,7 @@ use crate::admission::AdmissionPermit;
 use crate::budget::{BudgetKey, Reservation};
 use crate::credentials::{CredentialLease, CredentialSource};
 use crate::error::transport_caller_message;
+use crate::pricing::RequestPrice;
 use crate::rate_limit::RateLimitPermit;
 use crate::state::AppState;
 use crate::telemetry;
@@ -60,7 +59,11 @@ pub struct StreamContext {
     /// current, and every way a stream can end — terminal, cancelled, rotated,
     /// never opened — has to report the same event.
     pub identity: EventIdentity,
-    pub price: ModelPrice,
+    /// The rates this stream is charged at, and the approved pricing that set
+    /// them. Copied from the request's snapshot before the stream opened, so a
+    /// price book published while it is relaying changes nothing about how it
+    /// settles (#147).
+    pub price: RequestPrice,
     pub budget_key: BudgetKey,
     /// The hold this request was admitted under, settled once when the stream
     /// ends however it ends.
@@ -888,7 +891,10 @@ impl Accounting {
             cache_write_tokens: usage.cache_write_tokens,
             output_tokens: usage.output_tokens,
             cost_microdollars: cost,
-            catalog_version: 0,
+            catalog_version: self.ctx.price.catalog_version(),
+            price_book: self.ctx.price.identity().map(|id| id.book()),
+            price_book_checksum: self.ctx.price.identity().map(|id| id.checksum()),
+            price_catalog: self.ctx.price.identity().map(|id| id.catalog()),
             latency_ms,
             attempts: self.ctx.attempts,
         };
@@ -987,8 +993,11 @@ mod tests {
     use tower::util::ServiceExt;
     use tracing_subscriber::layer::SubscriberExt;
 
+    use crate::backends::catalog::ProviderId;
     use crate::budget::{Admission, BudgetStore, Denial};
     use crate::config::Config;
+    use crate::desired_state::fixtures::approved_pricing_snapshot;
+    use crate::pricing::PriceIdentity;
     use crate::rate_limit::RateLimiter;
     use crate::routes::router;
     use crate::usage::identity::{RequestId, next_request_id};
@@ -1276,13 +1285,13 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
                 request_id: next_request_id(),
                 trace_id: None,
             },
-            price: ModelPrice {
+            price: RequestPrice::configured(gateway_core::ModelPrice {
                 input_microdollars_per_million: 1_000_000,
                 output_microdollars_per_million: 2_000_000,
                 reasoning_microdollars_per_million: None,
                 cache_read_microdollars_per_million: None,
                 cache_write_microdollars_per_million: None,
-            },
+            }),
             budget_key: BudgetKey {
                 namespace: "platform".to_owned(),
                 subject: "GW_TEST_INBOUND_KEY".to_owned(),
@@ -1322,6 +1331,60 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         accounting.settle(Status::Ok);
         let record = settled(&ledger).await;
         assert_eq!(record["signer_kid"], "test-kid");
+    }
+
+    /// A stream settles at the pricing its request opened under, and says so:
+    /// the row a stream writes carries the same book, checksum and catalogue as
+    /// a buffered row, however many credentials the attempt walked through.
+    #[tokio::test]
+    async fn a_streamed_row_names_the_pricing_the_request_opened_under() {
+        let pricing = approved_pricing_snapshot();
+        let mut ctx = context();
+        ctx.price = RequestPrice::approved(
+            pricing
+                .price(
+                    &ProviderId::parse("openai").expect("a catalogue provider id"),
+                    "gpt-4o",
+                )
+                .expect("the fixture book prices it"),
+            PriceIdentity::of(&pricing),
+        );
+
+        let ledger = Arc::new(Ledger::default());
+        let mut accounting = Accounting::new(
+            state_for("http://127.0.0.1:1", ledger.clone()),
+            ctx,
+            Instant::now(),
+        );
+        accounting.settle(Status::Ok);
+        let record = settled(&ledger).await;
+
+        assert_eq!(record["catalog_version"], pricing.book().version.get());
+        assert_eq!(record["price_book"], pricing.book().to_string());
+        assert_eq!(
+            record["price_book_checksum"],
+            pricing.checksum().to_string()
+        );
+        assert_eq!(record["price_catalog"], pricing.catalog().to_string());
+    }
+
+    /// A deployment priced by its configuration file names no price book, so a
+    /// row from it stays exactly the shape older readers already parse.
+    #[tokio::test]
+    async fn a_row_priced_by_configuration_names_no_price_book() {
+        let ledger = Arc::new(Ledger::default());
+        let mut accounting = Accounting::new(
+            state_for("http://127.0.0.1:1", ledger.clone()),
+            context(),
+            Instant::now(),
+        );
+        accounting.settle(Status::Ok);
+        let record = settled(&ledger).await;
+
+        assert_eq!(record["catalog_version"], 0);
+        assert!(record.get("price_book").is_none());
+        assert!(record.get("price_book_checksum").is_none());
+        assert!(record.get("price_catalog").is_none());
     }
 
     #[test]

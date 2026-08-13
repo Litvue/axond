@@ -30,10 +30,15 @@ use super::{ObservedRecord, SinkFailure, UsageRecord, UsageSink, UsageSinkError}
 // `tests/shipped_ddl.rs` fails if the two copies differ by a byte.
 const SCHEMA_DDL: &str = include_str!("../../sql/usage_v2.sql");
 
-/// Additive migrations for the current schema version. These are applied after
-/// the base DDL for fresh tables; existing installations apply them before
-/// deploying a writer that emits the new column.
-const ADDITIVE_DDL: &str = include_str!("../../sql/usage_v1_001_add_signer_kid.sql");
+/// Additive migrations for the current schema version, in application order.
+/// These are applied after the base DDL for fresh tables; existing
+/// installations apply them before deploying a writer that emits the new
+/// columns. Nullable columns only, so a writer deployed ahead of one of them
+/// still writes rows the earlier shape can read.
+const ADDITIVE_DDL: [&str; 2] = [
+    include_str!("../../sql/usage_v1_001_add_signer_kid.sql"),
+    include_str!("../../sql/usage_v2_001_add_price_identity.sql"),
+];
 
 /// The table name the shipped DDL uses; substituted when the sink is configured
 /// with another one.
@@ -45,7 +50,7 @@ const INDEX_PREFIX_PLACEHOLDER: &str = "\u{1}index_prefix\u{1}";
 
 /// Columns written per row, in parameter order. `reasoning_tokens` remains
 /// reserved for a future schema version; the cache counters are canonical.
-const COLUMNS: [&str; 22] = [
+const COLUMNS: [&str; 25] = [
     "schema_version",
     "request_id",
     "trace_id",
@@ -64,6 +69,9 @@ const COLUMNS: [&str; 22] = [
     "output_tokens",
     "cost_microdollars",
     "catalog_version",
+    "price_book",
+    "price_book_checksum",
+    "price_catalog",
     "latency_ms",
     "attempts",
     "started_at",
@@ -141,7 +149,12 @@ impl PostgresSink {
                 .replace(DEFAULT_TABLE, &self.table)
                 .replace(INDEX_PREFIX_PLACEHOLDER, &format!("{index_prefix}_"))
         };
-        format!("{}\n{}", retarget(SCHEMA_DDL), retarget(ADDITIVE_DDL))
+        let mut ddl = retarget(SCHEMA_DDL);
+        for additive in ADDITIVE_DDL {
+            ddl.push('\n');
+            ddl.push_str(&retarget(additive));
+        }
+        ddl
     }
 
     async fn connect_client(&self) -> Result<Client, tokio_postgres::Error> {
@@ -305,6 +318,9 @@ fn row(observed: &ObservedRecord) -> Vec<Box<dyn ToSql + Sync + Send>> {
         Box::new(bigint(record.output_tokens)),
         Box::new(bigint(record.cost_microdollars)),
         Box::new(bigint(record.catalog_version)),
+        Box::new(record.price_book.clone()),
+        Box::new(record.price_book_checksum.clone()),
+        Box::new(record.price_catalog.clone()),
         Box::new(bigint(record.latency_ms)),
         Box::new(record.attempts as i64),
         Box::new(started_at),
@@ -354,7 +370,10 @@ mod tests {
     fn the_row_shape_matches_the_shipped_ddl() {
         for column in COLUMNS {
             assert!(
-                SCHEMA_DDL.contains(column) || ADDITIVE_DDL.contains(column),
+                SCHEMA_DDL.contains(column)
+                    || ADDITIVE_DDL
+                        .iter()
+                        .any(|additive| additive.contains(column)),
                 "column `{column}` is written but not declared in the base or additive DDL"
             );
         }

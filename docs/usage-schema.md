@@ -32,7 +32,10 @@ meaning, and how they are allowed to change. The design rationale is
 | `cache_read_tokens` | `bigint` | Prompt tokens read from the provider cache, disjoint from `input_tokens`. |
 | `cache_write_tokens` | `bigint` | Prompt tokens written to the provider cache. |
 | `cost_microdollars` | `bigint` | Cost in micro-dollars, priced from the target's catalog entry. |
-| `catalog_version` | `bigint` | Version of the pricing catalog the cost was computed against. |
+| `catalog_version` | `bigint` | Resource version of the approved price book the cost was computed against, or `0` when the request was priced by the configuration file's own rates. |
+| `price_book` | `text` | Exact price-book resource reference and version the rates came from (`price-book/baseline@v3`); NULL for a file-priced row. |
+| `price_book_checksum` | `text` | Canonical checksum of that book's body — the same rates always produce the same checksum, so a republished (rolled-back) book is recognisable as the one that was audited before. NULL for a file-priced row. |
+| `price_catalog` | `text` | Content identity of the catalogue the book was approved against; NULL for a file-priced row. |
 | `latency_ms` | `bigint` | End-to-end gateway latency. |
 | `attempts` | `bigint` | Upstream target attempts across the alias's targets; retry count is `attempts - 1`, and `1` means the first target served. |
 | `started_at` | `timestamptz` | `recorded_at - latency_ms`. |
@@ -48,9 +51,11 @@ omitted when absent), and the OTLP sink emits it as an OTel log record with
 - Adding a **nullable** column, or populating a reserved one, is not a version
   bump: no existing reader changes behaviour.
 - Additive nullable columns that were not reserved in the base DDL ship as
-  ordered `usage_v1_<sequence>_<name>.sql` files alongside `usage_v1.sql`.
-  Fresh installations apply `usage_v1.sql` followed by every additive file in
-  filename order; existing installations apply only the new additive file
+  ordered `usage_v<N>_<sequence>_<name>.sql` files alongside the base
+  `usage_v<N>.sql`. Fresh installations apply the base DDL followed by every
+  additive file in filename order — currently
+  `usage_v1_001_add_signer_kid.sql` then
+  `usage_v2_001_add_price_identity.sql`; existing installations apply only the new additive file
   before deploying a writer that emits its column. The writer does not probe
   for missing columns: deploying it first causes the existing sink error and
   dropped-record path.
@@ -71,6 +76,15 @@ omitted when absent), and the OTLP sink emits it as an OTel log record with
   the contract. Nothing else was strengthened in step: the shipped DDL declares
   no unique index on it (see below), so the promise is about what the writer
   emits, not about what an existing table enforces.
+- Naming the pricing a row was charged against (`price_book`,
+  `price_book_checksum`, `price_catalog`) is **not** a bump: the three columns
+  are nullable, and `catalog_version` keeps its type and its `0` for a row
+  priced by configuration, which is what every row before this change was. A
+  reader that groups by pricing treats `price_book IS NULL` as "configured
+  rates" ([ADR 0052](./adr/0052-request-path-pricing.md)).
+- A price change is never retroactive. A new publication is a new price-book
+  version written into new rows; settled rows are never rewritten, so what a
+  request was charged stays answerable from the row that recorded it.
 
 This schema versions independently of the gateway's own version; where it sits
 among axond's other published interfaces is the

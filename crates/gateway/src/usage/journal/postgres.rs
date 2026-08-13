@@ -1290,6 +1290,15 @@ struct StoredRecord {
     output_tokens: u64,
     cost_microdollars: u64,
     catalog_version: u64,
+    // Absent in a row a pre-#147 writer appended, which is exactly what a
+    // request the file configuration priced also writes: no approved book named
+    // the rates, so there is no identity to replay.
+    #[serde(default)]
+    price_book: Option<String>,
+    #[serde(default)]
+    price_book_checksum: Option<String>,
+    #[serde(default)]
+    price_catalog: Option<String>,
     latency_ms: u64,
     attempts: u32,
 }
@@ -1320,6 +1329,9 @@ impl StoredRecord {
             output_tokens: self.output_tokens,
             cost_microdollars: self.cost_microdollars,
             catalog_version: self.catalog_version,
+            price_book: self.price_book,
+            price_book_checksum: self.price_book_checksum,
+            price_catalog: self.price_catalog,
             latency_ms: self.latency_ms,
             attempts: self.attempts,
         })

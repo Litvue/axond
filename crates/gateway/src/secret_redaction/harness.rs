@@ -228,6 +228,7 @@ impl CandidateCompiler for SecretResolvingCompiler {
                         cache_read_microdollars_per_million: None,
                         cache_write_microdollars_per_million: None,
                     },
+                    catalog: None,
                 }],
             });
         }
