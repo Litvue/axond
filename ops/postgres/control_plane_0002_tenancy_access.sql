@@ -46,12 +46,6 @@
 -- separate compliance job with its own retention argument, and a foreign key to
 -- a tenant that was erased would either fail or orphan the history that proves
 -- what was billed.
---
--- A revision is the whole desired state, so a tenant it omits is written here as
--- `deleted` too: the domain serves an undeclared tenant nothing, and a retained
--- row still reading `active` would answer the one question this column exists to
--- answer with the opposite of the truth. The projection is therefore the
--- published state and not a high-water mark of every tenant that ever existed.
 CREATE TABLE IF NOT EXISTS axond_cp_tenant (
     tenant_id     text        PRIMARY KEY CHECK (tenant_id ~ '^ten_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'),
     slug          text        NOT NULL CHECK (length(slug) BETWEEN 1 AND 63),
@@ -64,40 +58,9 @@ CREATE TABLE IF NOT EXISTS axond_cp_tenant (
 -- deleted tenant releases its slug: keeping it reserved forever turns a deletion
 -- into a permanent namespace claim, and the id — not the slug — is what history
 -- points at.
---
--- Deferrable, and an EXCLUDE constraint rather than a partial unique index
--- because only a constraint can be deferred. Uniqueness is a property of the
--- revision, not of the order its rows happen to be written in: two tenants that
--- trade names in one revision pass through an intermediate state where both hold
--- the same one, and an immediately-checked index would refuse a revision the
--- domain accepts, permanently, depending on which id sorted first. The projection
--- restores immediate checking once every row is written (`SET CONSTRAINTS ALL
--- IMMEDIATE`), so the refusal still arrives inside the projection rather than at
--- commit, where it could not be attributed.
---
--- The index this replaces is dropped rather than left beside the constraint: an
--- index cannot be deferred, so a deployment that applied an earlier 0002 by hand
--- would keep refusing the name swaps the constraint exists to allow, and no retry
--- would clear it.
-DROP INDEX IF EXISTS axond_cp_tenant_slug_idx;
-
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        -- By the table, not by the name alone: a constraint name is unique per
-        -- table, not per database, and a deployment that shares its database with
-        -- another schema would otherwise skip creating this one.
-        SELECT 1 FROM pg_constraint
-        WHERE conrelid = 'axond_cp_tenant'::regclass
-          AND conname = 'axond_cp_tenant_slug_unique'
-    ) THEN
-        ALTER TABLE axond_cp_tenant
-            ADD CONSTRAINT axond_cp_tenant_slug_unique
-            EXCLUDE (slug WITH =) WHERE (lifecycle <> 'deleted')
-            DEFERRABLE INITIALLY DEFERRED;
-    END IF;
-END
-$$;
+CREATE UNIQUE INDEX IF NOT EXISTS axond_cp_tenant_slug_idx
+    ON axond_cp_tenant (slug)
+    WHERE lifecycle <> 'deleted';
 
 -- Projects: the routing and accounting boundary beneath a tenant, and what a
 -- stateless deployment calls a namespace. `UNIQUE (tenant_id, project_id)` is
@@ -107,25 +70,12 @@ $$;
 -- rather than a service-layer convention.
 CREATE TABLE IF NOT EXISTS axond_cp_project (
     project_id   text        PRIMARY KEY CHECK (project_id ~ '^prj_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'),
-    tenant_id    text        NOT NULL REFERENCES axond_cp_tenant (tenant_id)
-                                 DEFERRABLE INITIALLY DEFERRED,
+    tenant_id    text        NOT NULL REFERENCES axond_cp_tenant (tenant_id),
     slug         text        NOT NULL CHECK (length(slug) BETWEEN 1 AND 63),
     revision_id  text        NOT NULL,
     updated_at   timestamptz NOT NULL DEFAULT now(),
     UNIQUE (tenant_id, project_id),
-    -- Deferred for the same reason as a tenant's name: two projects of one tenant
-    -- may trade slugs in a single revision, and which one is written first is an
-    -- id ordering rather than a decision.
-    --
-    -- Unconditional, where a tenant's is partial on lifecycle, because a project
-    -- has no lifecycle to publish: a project a revision stops declaring keeps its
-    -- row and its name, and the name is handed back by renaming that project in
-    -- the revision that drops it rather than by a state it transitions to. Giving
-    -- a project the lifecycle a tenant has changes the tenancy contract (#191)
-    -- every downstream slice reads, so it is follow-up work; the runbook states
-    -- the release path this schema does support.
-    CONSTRAINT axond_cp_project_slug_unique UNIQUE (tenant_id, slug)
-        DEFERRABLE INITIALLY DEFERRED
+    UNIQUE (tenant_id, slug)
 );
 
 -- The identity directory: who may administer this deployment, and where.
@@ -168,58 +118,21 @@ CREATE TABLE IF NOT EXISTS axond_cp_principal (
         (identity_kind = 'human' AND issuer IS NOT NULL AND subject IS NOT NULL AND key_digest IS NULL)
         OR (identity_kind = 'workload' AND issuer IS NULL AND subject IS NULL AND tenant_id IS NOT NULL)
     ),
-    -- Deferred for the reason the names above are. Ownership is a property of the
-    -- revision: a revision that moves a project to another tenant, and the
-    -- principals scoped into it with it, is consistent as a state and inconsistent
-    -- at every point but the last while the projection writes it row by row. An
-    -- immediate key would refuse it depending on which id sorted first, and the
-    -- composite key has no `ON UPDATE` action to cascade instead. Settled with the
-    -- rest inside the projection, so a state that really is contradictory is still
-    -- refused there rather than at commit.
-    FOREIGN KEY (tenant_id) REFERENCES axond_cp_tenant (tenant_id)
-        DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (tenant_id) REFERENCES axond_cp_tenant (tenant_id),
     FOREIGN KEY (tenant_id, project_id) REFERENCES axond_cp_project (tenant_id, project_id)
-        DEFERRABLE INITIALLY DEFERRED
 );
 
--- One sign-in resolves to one principal, and a minted key authenticates one
--- workload. Without these, two rows could claim the same `(issuer, subject)` or
--- the same digest and "who is this?" would depend on which row a query happened
--- to return first.
---
--- Deferred exclusion constraints rather than partial unique indexes, for the
--- reason a tenant's name is one: an index cannot be deferred, and reassigning
--- two administrators' sign-ins — or handing one workload's key to another — is a
--- state the directory accepts, which passes through an intermediate row set
--- holding the same identity twice. The projection settles them once every row is
--- written.
-DROP INDEX IF EXISTS axond_cp_principal_oidc_idx;
-DROP INDEX IF EXISTS axond_cp_principal_key_digest_idx;
+-- One sign-in resolves to one principal. Without this, two rows could claim the
+-- same `(issuer, subject)` and "who is this?" would depend on which row a query
+-- happened to return first.
+CREATE UNIQUE INDEX IF NOT EXISTS axond_cp_principal_oidc_idx
+    ON axond_cp_principal (issuer, subject)
+    WHERE identity_kind = 'human';
 
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conrelid = 'axond_cp_principal'::regclass
-          AND conname = 'axond_cp_principal_oidc_unique'
-    ) THEN
-        ALTER TABLE axond_cp_principal
-            ADD CONSTRAINT axond_cp_principal_oidc_unique
-            EXCLUDE (issuer WITH =, subject WITH =) WHERE (identity_kind = 'human')
-            DEFERRABLE INITIALLY DEFERRED;
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conrelid = 'axond_cp_principal'::regclass
-          AND conname = 'axond_cp_principal_key_digest_unique'
-    ) THEN
-        ALTER TABLE axond_cp_principal
-            ADD CONSTRAINT axond_cp_principal_key_digest_unique
-            EXCLUDE (key_digest WITH =) WHERE (key_digest IS NOT NULL)
-            DEFERRABLE INITIALLY DEFERRED;
-    END IF;
-END
-$$;
+-- A minted key authenticates at most one workload, for the same reason.
+CREATE UNIQUE INDEX IF NOT EXISTS axond_cp_principal_key_digest_idx
+    ON axond_cp_principal (key_digest)
+    WHERE key_digest IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS axond_cp_principal_tenant_idx
     ON axond_cp_principal (tenant_id, identity_kind);
@@ -292,32 +205,10 @@ ALTER TABLE axond_cp_audit_event
     ADD COLUMN IF NOT EXISTS actor_tenant_id text NULL,
     ADD COLUMN IF NOT EXISTS actor_principal_id text NULL;
 
--- 0001 wrote its `actor_kind` vocabulary as an inline column check, so the
--- constraint holding the old three-value list is named by PostgreSQL rather than
--- by us. Dropping a guessed name with `IF EXISTS` would succeed silently against
--- a database whose name differs and then reject `actor_kind = 'workload'` at the
--- first workload-attributed mutation, so the old checks are found by what they
--- constrain instead of by what they are called.
-DO $$
-DECLARE
-    stale record;
-BEGIN
-    FOR stale IN
-        SELECT conrelid::regclass AS table_name, conname
-        FROM pg_constraint
-        WHERE conrelid IN ('axond_cp_mutation'::regclass, 'axond_cp_audit_event'::regclass)
-          AND contype = 'c'
-          AND pg_get_constraintdef(oid) LIKE '%actor_kind%'
-    LOOP
-        EXECUTE format(
-            'ALTER TABLE %s DROP CONSTRAINT %I',
-            stale.table_name,
-            stale.conname
-        );
-    END LOOP;
-END
-$$;
-
+ALTER TABLE axond_cp_mutation
+    DROP CONSTRAINT IF EXISTS axond_cp_mutation_actor_kind_check;
+ALTER TABLE axond_cp_mutation
+    DROP CONSTRAINT IF EXISTS axond_cp_mutation_actor_attribution;
 ALTER TABLE axond_cp_mutation
     ADD CONSTRAINT axond_cp_mutation_actor_attribution CHECK (
         (actor_kind = 'human' AND actor_issuer IS NOT NULL AND actor_subject IS NOT NULL AND actor_component IS NULL AND actor_tenant_id IS NULL AND actor_principal_id IS NULL)
@@ -326,6 +217,10 @@ ALTER TABLE axond_cp_mutation
         OR (actor_kind = 'system' AND actor_component IS NOT NULL AND actor_issuer IS NULL AND actor_subject IS NULL AND actor_tenant_id IS NULL AND actor_principal_id IS NULL)
     );
 
+ALTER TABLE axond_cp_audit_event
+    DROP CONSTRAINT IF EXISTS axond_cp_audit_event_actor_kind_check;
+ALTER TABLE axond_cp_audit_event
+    DROP CONSTRAINT IF EXISTS axond_cp_audit_event_actor_attribution;
 ALTER TABLE axond_cp_audit_event
     ADD CONSTRAINT axond_cp_audit_event_actor_attribution CHECK (
         (actor_kind = 'human' AND actor_issuer IS NOT NULL AND actor_subject IS NOT NULL AND actor_component IS NULL AND actor_tenant_id IS NULL AND actor_principal_id IS NULL)
@@ -403,37 +298,19 @@ CREATE POLICY axond_cp_principal_isolation ON axond_cp_principal
         OR tenant_id = current_setting('axond.tenant_id', true)
     );
 
--- A refusal this tenant was the target of is this tenant's row, whoever attempted
--- it: it is the event the trail exists for, and withholding it would record a
--- cross-tenant probe that the tenant it was aimed at can never read.
---
--- The attribution filter applies to the one class of row a pinned session reads
--- that is not its own: a deployment-scoped denial names no tenant, so the row is
--- shared state — but when a workload made the attempt it carries that workload's
--- tenant and principal id, and a pinned session reading those would learn which
--- service accounts of every other tenant tried to administer the deployment and
--- what they tried. So: rows scoped to this tenant unconditionally, plus the
--- deployment-scoped rows no other tenant's workload attempted. The unpinned
--- publisher sees every row.
 ALTER TABLE axond_cp_access_denial ENABLE ROW LEVEL SECURITY;
 ALTER TABLE axond_cp_access_denial FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS axond_cp_access_denial_isolation ON axond_cp_access_denial;
 CREATE POLICY axond_cp_access_denial_isolation ON axond_cp_access_denial
     USING (
         coalesce(current_setting('axond.tenant_id', true), '') = ''
+        OR tenant_id IS NULL
         OR tenant_id = current_setting('axond.tenant_id', true)
-        OR (
-            tenant_id IS NULL
-            AND (actor_tenant_id IS NULL OR actor_tenant_id = current_setting('axond.tenant_id', true))
-        )
     )
     WITH CHECK (
         coalesce(current_setting('axond.tenant_id', true), '') = ''
+        OR tenant_id IS NULL
         OR tenant_id = current_setting('axond.tenant_id', true)
-        OR (
-            tenant_id IS NULL
-            AND (actor_tenant_id IS NULL OR actor_tenant_id = current_setting('axond.tenant_id', true))
-        )
     );
 
 -- The administrative journal. A pinned session that could read every mutation
@@ -443,30 +320,21 @@ CREATE POLICY axond_cp_access_denial_isolation ON axond_cp_access_denial
 ALTER TABLE axond_cp_mutation ENABLE ROW LEVEL SECURITY;
 ALTER TABLE axond_cp_mutation FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS axond_cp_mutation_isolation ON axond_cp_mutation;
--- Attribution is filtered alongside scope, for the reason a denial's is: a
--- deployment-scoped change made by a tenant's workload is shared in what it
--- changed and not in who changed it.
 CREATE POLICY axond_cp_mutation_isolation ON axond_cp_mutation
     USING (
         coalesce(current_setting('axond.tenant_id', true), '') = ''
-        OR (
-            (tenant_id IS NULL OR tenant_id = current_setting('axond.tenant_id', true))
-            AND (actor_tenant_id IS NULL OR actor_tenant_id = current_setting('axond.tenant_id', true))
-        )
+        OR tenant_id IS NULL
+        OR tenant_id = current_setting('axond.tenant_id', true)
     )
     WITH CHECK (
         coalesce(current_setting('axond.tenant_id', true), '') = ''
-        OR (
-            (tenant_id IS NULL OR tenant_id = current_setting('axond.tenant_id', true))
-            AND (actor_tenant_id IS NULL OR actor_tenant_id = current_setting('axond.tenant_id', true))
-        )
+        OR tenant_id IS NULL
+        OR tenant_id = current_setting('axond.tenant_id', true)
     );
 
--- The tables with no tenant column of their own are filtered through the row
+-- The two tables with no tenant column of their own are filtered through the row
 -- that owns them: a grant through its principal, an audit event through its
--- mutation, a manifest line and a dependency edge through the resource version
--- they point at, a deduplication record through the mutation it replays. The
--- subquery is itself subject to that table's policy, so the
+-- mutation. The subquery is itself subject to that table's policy, so the
 -- ownership question is answered by the same wall rather than by a second copy
 -- of it — and a grant whose principal a pinned session cannot see is a grant it
 -- cannot see either.

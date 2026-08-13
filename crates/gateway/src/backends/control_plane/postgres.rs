@@ -1104,6 +1104,22 @@ async fn publish(
 /// reconciliation runs first, so a revision that reuses a dropped tenant's name
 /// does not collide with the row it is replacing.
 ///
+/// That reconciliation needs a snapshot that *speaks about* tenancy, and one that
+/// declares no tenant at all does not. Two real revisions look like that and mean
+/// the opposite of "retire everything": a pre-tenancy revision, written by a build
+/// that had no tenant resource to declare, and a rollback to one — the deployment
+/// this slice upgrades has a whole journal of them, and #142's replica compiles
+/// them into routing state today. Reading their silence as a deletion of every
+/// tenant would make a rollback the most destructive operation the control plane
+/// has, and would do it without any revision ever having said so.
+///
+/// So the retirement is conditional on the snapshot being *authoritative about
+/// tenancy*: at least one tenant declared. Retiring the last tenant is then an
+/// explicit `lifecycle = 'deleted'` on that tenant rather than an empty
+/// publication, which is the transition the vocabulary already has and the only
+/// one an audit trail can attribute. The cost is stated rather than hidden: a
+/// deployment cannot empty its tenant list by omission, and the runbook says so.
+///
 /// Principals *are* deleted when a revision stops declaring them, because a
 /// revoked administrator whose grants linger is the whole failure this table
 /// exists to make visible. Their history is unaffected: attribution is copied
@@ -1123,15 +1139,19 @@ async fn project_tenancy(
         .tenants()
         .map(|tenant| tenant.body.tenant().to_string())
         .collect();
-    transaction
-        .execute(
-            "UPDATE axond_cp_tenant SET lifecycle = 'deleted', revision_id = $2, \
-             updated_at = now() \
-             WHERE NOT (tenant_id = ANY($1)) AND lifecycle <> 'deleted'",
-            &[&declared_tenants, &revision],
-        )
-        .await
-        .map_err(|error| unavailable("retire undeclared tenants", &error))?;
+    // Only a snapshot that declares tenancy reconciles it: see above — silence is
+    // a pre-tenancy or rolled-back revision, not a deletion of every tenant.
+    if !declared_tenants.is_empty() {
+        transaction
+            .execute(
+                "UPDATE axond_cp_tenant SET lifecycle = 'deleted', revision_id = $2, \
+                 updated_at = now() \
+                 WHERE NOT (tenant_id = ANY($1)) AND lifecycle <> 'deleted'",
+                &[&declared_tenants, &revision],
+            )
+            .await
+            .map_err(|error| unavailable("retire undeclared tenants", &error))?;
+    }
 
     for tenant in tenancy.tenants() {
         transaction
@@ -3690,16 +3710,16 @@ mod tests {
                  WHERE lifecycle <> 'deleted'",
             )
             .await
-            .expect("the rule an earlier 0002 left behind");
+            .expect("the rule 0002 left behind");
 
-        let tenancy = schema::MIGRATIONS
+        let forward = schema::MIGRATIONS
             .iter()
-            .find(|migration| migration.name.contains("tenancy"))
-            .expect("the tenancy migration ships");
+            .find(|migration| migration.name.contains("tenancy_constraints"))
+            .expect("the forward tenancy migration ships");
         store
-            .attempt(tenancy.sql)
+            .attempt(forward.sql)
             .await
-            .expect("re-applying the tenancy migration must not fail");
+            .expect("applying the forward migration must not fail");
         assert_eq!(
             store
                 .column(
@@ -4174,6 +4194,78 @@ mod tests {
         );
     }
 
+    /// A revision that says nothing about tenancy retires nothing.
+    ///
+    /// Two publications look identical to the projection and mean the opposite of
+    /// each other: "these are the tenants, and only these" and "this build had no
+    /// tenant resource". The second is what every pre-tenancy revision in an
+    /// upgraded deployment's journal looks like, and a rollback to one republishes
+    /// it — so if omission retired tenants unconditionally, rolling back would
+    /// delete every tenant in the deployment without any revision saying so.
+    ///
+    /// Retiring the last tenant is therefore an explicit lifecycle, and this pins
+    /// both halves: a snapshot with no tenancy leaves the projection alone, and a
+    /// snapshot that does declare tenancy still retires what it omits.
+    #[tokio::test]
+    async fn a_revision_that_declares_no_tenancy_retires_no_tenant() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let both = store
+            .publish_revision(candidate(
+                ExpectedRevision::Empty,
+                "two tenants",
+                state_with_second_tenant(),
+            ))
+            .await
+            .expect("two tenants publish");
+
+        // The state an older build published, republished — a rollback.
+        let rolled_back = store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(both.id),
+                "pre-tenancy",
+                state_a_pre_tenancy_build_published(),
+                130,
+            ))
+            .await
+            .expect("a pre-tenancy revision publishes on a tenancy-aware build");
+        assert_eq!(
+            store
+                .column("SELECT lifecycle FROM axond_cp_tenant ORDER BY tenant_id")
+                .await,
+            vec!["active", "active"],
+            "a rollback to a pre-tenancy revision deleted the deployment's tenants"
+        );
+        assert_eq!(
+            store
+                .column("SELECT slug FROM axond_cp_project ORDER BY slug")
+                .await,
+            vec!["core"],
+            "and their projects"
+        );
+
+        // And the conditional is on tenancy being *declared*, not on the
+        // publication being a rollback: the next revision names one tenant, so it
+        // is authoritative and the other is retired.
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(rolled_back.id),
+                "one tenant",
+                state(),
+                131,
+            ))
+            .await
+            .expect("a revision declaring one tenant publishes");
+        assert_eq!(
+            store
+                .column("SELECT lifecycle FROM axond_cp_tenant ORDER BY tenant_id")
+                .await,
+            vec!["active", "deleted"],
+            "an authoritative snapshot stopped reconciling what it omits"
+        );
+    }
+
     /// The half of #144 that is a database property rather than a service one: a
     /// row naming another tenant's project, or a tenant nothing declared, is
     /// unwritable even by a caller that skipped every validation above.
@@ -4381,15 +4473,20 @@ mod tests {
         let Some((store, _, _)) = journal().await else {
             return;
         };
-        let tenancy = schema::MIGRATIONS
+        // Both of them, in order: 0002 declares the tenancy tables and 0003
+        // replaces the rules it got wrong, so a hand-run upgrade is the pair.
+        let tenancy: Vec<_> = schema::MIGRATIONS
             .iter()
-            .find(|migration| migration.name.contains("tenancy"))
-            .expect("the tenancy migration ships");
+            .filter(|migration| migration.name.contains("tenancy"))
+            .collect();
+        assert_eq!(tenancy.len(), 2, "the tenancy migrations ship");
 
-        store
-            .attempt(tenancy.sql)
-            .await
-            .expect("re-applying the tenancy migration must not fail");
+        for migration in &tenancy {
+            store
+                .attempt(migration.sql)
+                .await
+                .expect("re-applying a tenancy migration must not fail");
+        }
 
         // Applied twice, the wall is still forced rather than merely enabled: a
         // policy the owning role bypasses is the failure this asserts against.
@@ -4544,6 +4641,39 @@ mod tests {
             denials, 0,
             "another tenant's refusals — including a deployment-scoped one its workload \
              attempted — are not visible"
+        );
+
+        // The other side of that rule, which is the whole point of the trail: a
+        // refusal aimed at *this* tenant is readable by it even though another
+        // tenant's workload attempted it. The wall filters the actor only where it
+        // hands a session a row the session is not the subject of.
+        let mut aimed_here = denial(
+            97,
+            ResourceScope::Tenant(tenant_id(1)),
+            DenialReason::CrossTenant,
+        );
+        aimed_here.actor = Actor::Workload {
+            tenant: tenant_id(11),
+            principal: principal_id(37),
+        };
+        store
+            .record_denial(&aimed_here)
+            .await
+            .expect("record a refusal against the pinned tenant by another tenant's workload");
+        let readable: Vec<String> = client
+            .query(
+                "SELECT denial_id FROM axond_cp_access_denial ORDER BY denial_id",
+                &[],
+            )
+            .await
+            .expect("read")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            readable,
+            vec![aimed_here.id.to_string()],
+            "the tenant a cross-tenant attempt targeted cannot read that it happened"
         );
 
         // Grants have no tenant column of their own: a grant is this tenant's

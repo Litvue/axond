@@ -83,13 +83,13 @@ Two properties worth knowing before you plan capacity or retention:
   `pg_class.relrowsecurity` audit reports as unprotected, so the list and the
   database agree.
 
-  Two preconditions before you apply 0002 to a deployment that is already
-  running. The policies are `FORCE`d so that they bind the table owner too — the
+  Two preconditions before you apply 0002 and 0003 to a deployment that is
+  already running. The policies are `FORCE`d so that they bind the table owner too — the
   single-role install is the common one, and enabling row-level security that the
   owning role bypasses would claim a wall that is not there — and `ALTER TABLE …
   FORCE ROW LEVEL SECURITY` requires the migrating role to *own* every table it
   names, so a deployment whose DDL is applied by a DBA role separate from the
-  application role must run 0002 as the owner rather than as the migrator. And any
+  application role must run them as the owner rather than as the migrator. And any
   reader outside the gateway — a reporting job, a replica consumer — that already
   sets `axond.tenant_id` on its sessions for its own reasons starts seeing
   filtered rows the moment 0002 lands, silently and with no error: unset it there,
@@ -102,6 +102,15 @@ Two properties worth knowing before you plan capacity or retention:
   partial configuration retires every tenant it leaves out, so publish complete
   desired state; and re-declaring the tenant in a later revision brings the row
   back to whatever that revision says, history intact.
+
+  A revision that declares *no* tenant at all is the exception, and deliberately:
+  that is what every pre-tenancy revision in an upgraded deployment's journal
+  looks like, and rolling back to one republishes it. Reading that silence as a
+  deletion would make a rollback the most destructive operation the control plane
+  has, so a snapshot with no tenancy in it reconciles nothing. Emptying the tenant
+  list is therefore an explicit `lifecycle = "deleted"` on the last tenant rather
+  than an empty publication — which is also the only version of it an audit trail
+  can attribute.
 - **A retained project name stays taken.** A project a later revision stops
   declaring keeps its row and its name. Publishing a *different* project under a
   retained name is refused rather than reported as a temporary failure: no retry
@@ -249,7 +258,15 @@ own schema changes out of band:
 ```bash
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0001_initial.sql
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0002_tenancy_access.sql
+psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0003_tenancy_constraints.sql
 ```
+
+0003 is where the deferrable name, identity, and ownership rules live, and it
+replaces the immediately-checked ones 0002 created — a deployment that applied
+0002 alone keeps refusing revisions in which two tenants trade names. It is a
+forward migration rather than an edit to 0002 for the reason the *Drifted* row
+below states: the ledger compares a recorded checksum against the shipped file,
+so an applied migration is immutable. Re-applying it is a no-op.
 
 That path does not write the ledger row, so the journal is then reported as
 *Unrecorded* — a ledger table that exists and records nothing — and both `status`

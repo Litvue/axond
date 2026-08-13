@@ -458,8 +458,10 @@ ownership in `crates/gateway/src/desired_state/tenancy.rs`, the authorization
 decision an `/admin/v1` handler consumes, the tenancy and principal projection
 written by `crates/gateway/src/backends/control_plane/postgres.rs`, the
 row-level-security policies and tenant-scoped constraints in
-`crates/gateway/sql/control_plane_0002_tenancy_access.sql`, and the denied-action
-record. A new administrative surface or action fires this trigger even when the
+`crates/gateway/sql/control_plane_0002_tenancy_access.sql` and the deferred rules
+and attribution filters that replace some of them in
+`crates/gateway/sql/control_plane_0003_tenancy_constraints.sql`, and the
+denied-action record. A new administrative surface or action fires this trigger even when the
 handler is downstream work: the matrix is exhaustive, so a surface with no
 decided action is a hole rather than an omission.
 
