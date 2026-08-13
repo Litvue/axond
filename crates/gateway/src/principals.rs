@@ -312,6 +312,26 @@ pub(crate) fn configured_token_epochs(config: &Config) -> HashMap<String, Namesp
             namespace.namespace_min_iat = Some(epoch.min_iat);
         }
     }
+    // A published revocation floor (#150) raises what the file declares, never
+    // lowers it: an operator who revokes fleet-wide by moving the epoch forward
+    // must not be undone by a stale file entry — nor by a *more specific* one, so
+    // the floor is applied to per-subject epochs too. Revoking is the direction
+    // that must always take effect immediately; relaxing is the direction that
+    // may wait for an edit.
+    for namespace in &config.namespace {
+        let Some(policy) = &namespace.policy else {
+            continue;
+        };
+        let floor = policy.body.revocation().minimum_token_epoch();
+        if floor == 0 {
+            continue;
+        }
+        let entry = epochs.entry(namespace.id.clone()).or_default();
+        entry.namespace_min_iat = Some(entry.namespace_min_iat.unwrap_or(0).max(floor));
+        for min_iat in entry.subjects.values_mut() {
+            *min_iat = (*min_iat).max(floor);
+        }
+    }
     epochs
 }
 
@@ -1680,6 +1700,71 @@ max_ttl = "15m"
                 TokenVerificationError::NotYetValid
             ))
         ));
+    }
+
+    /// A published revocation floor (#150) revokes fleet-wide without a
+    /// redeploy: it raises the file's namespace-wide epoch *and* the more
+    /// specific per-subject ones, because revocation is the direction that must
+    /// always take effect.
+    #[test]
+    fn a_published_revocation_floor_raises_every_epoch_it_covers() {
+        use crate::config::NamespacePolicy;
+        use crate::desired_state::fixtures::{project_id, tenant_id};
+        use crate::desired_state::policy::PolicyScope;
+        use crate::policy::fixtures::{detailed, generation};
+
+        let mut config = Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_key]]
+env = "STATIC_KEY"
+namespace = "platform"
+
+[[gateway_token_epoch]]
+namespace = "platform"
+min_iat = 100
+
+[[gateway_token_epoch]]
+namespace = "platform"
+subject = "agent"
+min_iat = 50
+"#,
+        )
+        .expect("a valid config");
+        let body = detailed(
+            PolicyScope::Project {
+                tenant: tenant_id(1),
+                project: project_id(1),
+            },
+            1,
+            1_000,
+            None,
+            300,
+            8,
+            60,
+            500,
+        );
+        config.namespace[0].policy = Some(NamespacePolicy {
+            body,
+            generation: generation(&body, 1),
+        });
+
+        let epochs = configured_token_epochs(&config);
+        assert_eq!(
+            resolve_token_epoch(&epochs, "platform", "agent"),
+            Some(500),
+            "a lower per-subject entry must not undercut a published floor"
+        );
+        assert_eq!(resolve_token_epoch(&epochs, "platform", "other"), Some(500));
+
+        // A file epoch already past the floor is left where it is: publishing a
+        // floor revokes, it does not un-revoke.
+        config.gateway_token_epoch[0].min_iat = 900;
+        let epochs = configured_token_epochs(&config);
+        assert_eq!(resolve_token_epoch(&epochs, "platform", "other"), Some(900));
     }
 
     /// Namespace epochs reject older issuance times, preserve the exact

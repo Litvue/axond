@@ -102,6 +102,9 @@ and operate it.
 - [Stateful integration](./operations/stateful-integration.md) — the #160
   release gates, who owns each slice, and the harness scenario that proves each
   gate.
+- [Policy activation](./operations/policy-activation.md) — publishing limits
+  without a redeploy: preflight, live/drain/migration classification, generation
+  and rollback semantics, and writer fencing.
 - [Deployment security model](./security/deployment-model.md) — trust
   boundaries, TLS termination, secret delivery, and image verification.
 - [Secret material in the stateful control plane](./security/secret-material.md)

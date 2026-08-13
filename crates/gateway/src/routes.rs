@@ -5369,6 +5369,7 @@ targets = [
             Admission::Allowed(Reservation {
                 id: "recording".to_owned(),
                 estimate_microdollars: estimated_microdollars,
+                generation: None,
             })
         }
         async fn settle(

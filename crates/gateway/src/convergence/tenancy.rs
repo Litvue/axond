@@ -84,7 +84,7 @@ use std::collections::BTreeSet;
 
 use super::compile::{ProjectionError, RevisionProjection};
 use crate::config::{Config, Namespace, ProjectIdentity};
-use crate::desired_state::{DesiredState, Tenancy};
+use crate::desired_state::{DesiredState, RevisionId, Tenancy};
 
 /// Projects a revision's projects onto `[[namespace]]`, leaving every
 /// bootstrap-owned section alone.
@@ -96,7 +96,15 @@ impl RevisionProjection for TenancyProjection {
         "tenancy"
     }
 
-    fn project(&self, bootstrap: &Config, state: &DesiredState) -> Result<Config, ProjectionError> {
+    /// The revision is not read here: a namespace's *name* and identity come
+    /// from the tenancy body alone, and only policy generations are revision-
+    /// stamped (see [`super::policy::PolicyProjection`]).
+    fn project(
+        &self,
+        bootstrap: &Config,
+        state: &DesiredState,
+        _source: RevisionId,
+    ) -> Result<Config, ProjectionError> {
         let tenancy = Tenancy::of(state).map_err(|error| ProjectionError::Body {
             reference: error.reference(),
             detail: error.to_string(),
@@ -175,6 +183,10 @@ impl RevisionProjection for TenancyProjection {
                     tenant: project.body.tenant(),
                     project: project.body.project(),
                 }),
+                // Policy is the policy projection's to fill (#150): a namespace
+                // arrives here governed by nothing, and that projection decides
+                // what governs it.
+                policy: None,
             });
         }
         Ok(config)
@@ -225,7 +237,7 @@ mod tests {
             .insert(project(&tenant_id(9), 12, "core"))
             .expect("a distinct reference");
         let config = TenancyProjection
-            .project(&bootstrap(), &state)
+            .project(&bootstrap(), &state, revision_id(3))
             .expect("the fixture tenancy is projectable");
 
         // Two tenants' `core` projects are two namespaces, not one: this is the
@@ -257,7 +269,7 @@ mod tests {
     /// The projected namespaces of a state, as `(name, identity)`.
     fn projected(state: &DesiredState) -> Vec<(String, Option<ProjectIdentity>)> {
         TenancyProjection
-            .project(&bootstrap(), state)
+            .project(&bootstrap(), state, revision_id(3))
             .expect("projectable")
             .namespace
             .into_iter()
@@ -285,7 +297,7 @@ mod tests {
         assert_eq!(
             namespaces(
                 &TenancyProjection
-                    .project(&bootstrap(), &state)
+                    .project(&bootstrap(), &state, revision_id(3))
                     .expect("projectable")
             ),
             ["platform", "acme/core", "globex/core"]
@@ -302,7 +314,7 @@ mod tests {
             assert_eq!(
                 namespaces(
                     &TenancyProjection
-                        .project(&bootstrap(), &suspended)
+                        .project(&bootstrap(), &suspended, revision_id(3))
                         .expect("projectable")
                 ),
                 ["platform", "acme/core"],
@@ -352,7 +364,7 @@ mod tests {
         // suggests one may be renamed underneath it.
         assert!(
             TenancyProjection
-                .project(&bootstrap(), &before)
+                .project(&bootstrap(), &before, revision_id(3))
                 .expect("projectable")
                 .namespace
                 .iter()
@@ -367,7 +379,7 @@ mod tests {
     fn everything_the_bootstrap_owns_survives_the_projection_untouched() {
         let bootstrap = bootstrap();
         let config = TenancyProjection
-            .project(&bootstrap, &state())
+            .project(&bootstrap, &state(), revision_id(3))
             .expect("projectable");
 
         assert_eq!(config.provider.len(), bootstrap.provider.len());
@@ -393,7 +405,7 @@ mod tests {
         assert_eq!(
             namespaces(
                 &TenancyProjection
-                    .project(&bootstrap, &tenants_only)
+                    .project(&bootstrap, &tenants_only, revision_id(3))
                     .expect("projectable")
             ),
             ["platform"]
@@ -432,7 +444,7 @@ namespace = "acme/core"
         )
         .expect("a valid bootstrap config");
         let error = TenancyProjection
-            .project(&bootstrap, &state())
+            .project(&bootstrap, &state(), revision_id(3))
             .expect_err("one namespace cannot have two owners");
         assert!(
             matches!(error, ProjectionError::Incomplete { .. }),
@@ -471,7 +483,7 @@ env = "GW_ADMIN_BREAKGLASS"
         );
 
         let error = TenancyProjection
-            .project(&bootstrap, &state())
+            .project(&bootstrap, &state(), revision_id(3))
             .expect_err("a projection may not nominate a default namespace");
         let ProjectionError::Incomplete { detail } = &error else {
             panic!("expected a deliberate incompleteness, got {error:?}");
@@ -523,7 +535,7 @@ env = "GW_ADMIN_BREAKGLASS"
             .expect("a distinct reference");
 
         let error = TenancyProjection
-            .project(&bootstrap(), &relocated)
+            .project(&bootstrap(), &relocated, revision_id(3))
             .expect_err("a project cannot be projected under another tenant");
         let ProjectionError::Body { reference, detail } = &error else {
             panic!("expected a body refusal, got {error:?}");
@@ -548,7 +560,7 @@ env = "GW_ADMIN_BREAKGLASS"
             .insert(project(&tenant_id(9), 13, "edge"))
             .expect("a distinct reference");
         let config = TenancyProjection
-            .project(&bootstrap(), &state)
+            .project(&bootstrap(), &state, revision_id(3))
             .expect("projectable");
 
         let ids = namespaces(&config);
@@ -587,10 +599,10 @@ env = "GW_ADMIN_BREAKGLASS"
         // which is what lets two replicas converge onto the same configuration.
         let revision = hydrate(state());
         let first = TenancyProjection
-            .project(&bootstrap(), revision.state())
+            .project(&bootstrap(), revision.state(), revision_id(3))
             .expect("projectable");
         let second = TenancyProjection
-            .project(&bootstrap(), revision.state())
+            .project(&bootstrap(), revision.state(), revision_id(3))
             .expect("projectable");
         assert_eq!(namespaces(&first), namespaces(&second));
     }

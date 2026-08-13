@@ -52,6 +52,42 @@ impl Replica {
         Self::build(store, "nonexistent", None)
     }
 
+    /// A replica running the production projections: tenancy, then the policy
+    /// that governs what tenancy projected.
+    fn converging_policy(store: &Arc<InMemoryControlPlane>) -> Self {
+        let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
+        let state = AppState::new(
+            bootstrap(),
+            &env(),
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+        )
+        .expect("the bootstrap config is servable");
+        let clock = ManualClock::new();
+        let secrets = super::secrets::testing::permissive();
+        let ledger = Arc::clone(secrets.ledger());
+        let reconciler = Arc::new(Reconciler::new(
+            Arc::clone(store) as Arc<dyn ControlPlaneStore>,
+            Arc::new(RevisionCompiler::with_secrets(
+                bootstrap(),
+                env(),
+                PolicyProjection::over(TenancyProjection),
+                secrets,
+            )),
+            Arc::new(state.clone()),
+            settings(),
+            None,
+            Arc::new(clock.clone()),
+        ));
+        Self {
+            store: Arc::clone(store),
+            state,
+            clock,
+            reconciler,
+            ledger,
+        }
+    }
+
     fn with_cache(store: &Arc<InMemoryControlPlane>, cache: LastKnownGood) -> Self {
         Self::build(store, "openai", Some(cache))
     }
@@ -390,6 +426,66 @@ async fn a_revision_that_fails_the_boot_gate_publishes_nothing() {
     // Nothing about what is being served changed.
     assert_eq!(replica.generation(), 0);
     assert_eq!(replica.served_aliases(), before);
+}
+
+/// A published policy this replica's backends cannot enforce is refused at the
+/// activation gate — before publication, so the config it arrived with does not
+/// half-apply either (#150).
+///
+/// The bootstrap here holds spend per replica, and a published cap is a
+/// fleet-wide statement: enforcing it locally would report a limit as held while
+/// every replica held its own copy of it.
+#[tokio::test]
+async fn a_policy_these_backends_cannot_enforce_is_refused_before_anything_is_published() {
+    use crate::desired_state::Slug;
+    use crate::policy::fixtures::body;
+
+    let store = control_plane();
+    let mut state = fixtures::state();
+    let policy = body(
+        crate::desired_state::policy::PolicyScope::Project {
+            tenant: fixtures::tenant_id(1),
+            project: fixtures::project_id(2),
+        },
+        1,
+        1_000,
+    );
+    state
+        .insert(policy.version(Slug::parse("policy").expect("a valid slug")))
+        .expect("a policy resource");
+    let published = publish(&store, "first", ExpectedRevision::Empty, state).await;
+
+    let replica = Replica::converging_policy(&store);
+    let outcome = replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Rejected { revision, reason }
+                if revision == Some(published) && reason == "unsupported"
+        ),
+        "{outcome:?}"
+    );
+    let report = replica.report();
+    assert_eq!(report.active, None, "nothing was published");
+    assert_eq!(replica.generation(), 0);
+    assert!(
+        replica.state.policy().draining().is_empty(),
+        "a refused candidate leaves no generation half-installed"
+    );
+    assert_eq!(
+        replica
+            .state
+            .policy()
+            .active("platform")
+            .budget
+            .expect("the file's limits still govern")
+            .subject_microdollars,
+        bootstrap().budget.limit_microdollars
+    );
 }
 
 /// A revision this build cannot read — here a tenant body written before tenancy

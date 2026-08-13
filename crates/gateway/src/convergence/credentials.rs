@@ -98,7 +98,7 @@ use super::tenancy::TenancyProjection;
 use crate::config::{Config, Credential, ProjectIdentity, ProviderWire};
 use crate::desired_state::credentials::{Credentials, ProviderCredential};
 use crate::desired_state::providers::Providers;
-use crate::desired_state::{DesiredState, SecretLifecycle, SecretOwner, WireFamily};
+use crate::desired_state::{DesiredState, RevisionId, SecretLifecycle, SecretOwner, WireFamily};
 
 /// Projects a revision's active provider credentials onto `[[credential]]`,
 /// leaving every other section as it was given.
@@ -123,9 +123,14 @@ impl RevisionProjection for RuntimeProjection {
         "runtime"
     }
 
-    fn project(&self, bootstrap: &Config, state: &DesiredState) -> Result<Config, ProjectionError> {
-        let namespaces = TenancyProjection.project(bootstrap, state)?;
-        CredentialProjection.project(&namespaces, state)
+    fn project(
+        &self,
+        bootstrap: &Config,
+        state: &DesiredState,
+        source: RevisionId,
+    ) -> Result<Config, ProjectionError> {
+        let namespaces = TenancyProjection.project(bootstrap, state, source)?;
+        CredentialProjection.project(&namespaces, state, source)
     }
 }
 
@@ -134,7 +139,12 @@ impl RevisionProjection for CredentialProjection {
         "credentials"
     }
 
-    fn project(&self, bootstrap: &Config, state: &DesiredState) -> Result<Config, ProjectionError> {
+    fn project(
+        &self,
+        bootstrap: &Config,
+        state: &DesiredState,
+        _source: RevisionId,
+    ) -> Result<Config, ProjectionError> {
         let credentials = Credentials::of(state).map_err(|error| ProjectionError::Body {
             reference: error.reference(),
             detail: error.to_string(),
@@ -457,7 +467,7 @@ mod tests {
     /// the reference, and asserting on it is asserting the pinning.
     fn projected(state: &DesiredState) -> Vec<(String, String, String, Option<SecretRef>)> {
         RuntimeProjection
-            .project(&bootstrap(), state)
+            .project(&bootstrap(), state, fixtures::revision_id(3))
             .expect("a projectable revision")
             .credential
             .into_iter()
@@ -827,7 +837,8 @@ mod tests {
             })
             .expect("a valid revision");
 
-        let Err(error) = RuntimeProjection.project(&bootstrap(), &state) else {
+        let Err(error) = RuntimeProjection.project(&bootstrap(), &state, fixtures::revision_id(3))
+        else {
             panic!("a credential for an undeclared provider must refuse the candidate");
         };
         assert!(
@@ -866,7 +877,8 @@ mod tests {
             })
             .expect("a valid revision");
 
-        let Err(error) = RuntimeProjection.project(&bootstrap(), &state) else {
+        let Err(error) = RuntimeProjection.project(&bootstrap(), &state, fixtures::revision_id(3))
+        else {
             panic!("a wire family mismatch must refuse the candidate");
         };
         assert!(
@@ -891,6 +903,7 @@ mod tests {
                     fixtures::secret_ref(CREDENTIAL),
                     SecretLifecycle::Active,
                 )]),
+                fixtures::revision_id(3),
             )
             .expect("a projectable revision");
 

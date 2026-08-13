@@ -143,6 +143,7 @@ pub const BOOTSTRAP_OWNED_FIELDS: &[&str] = &[
     "create_table",
     "dsn_env",
     "key_prefix",
+    "namespace_scope",
     "on_unavailable",
     "table",
 ];
@@ -434,8 +435,81 @@ pub struct BudgetPolicy {
     reservation_ttl_seconds: u64,
 }
 
+/// The bound a [`BudgetPolicy`] triple broke, named by the surface that read
+/// it: the stored document and the admin request spell the same three settings
+/// differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetBound {
+    /// The cap on one `(scope, subject)` pair.
+    SubjectLimit,
+    /// The cap on everything the scope spends.
+    NamespaceLimit,
+    /// How long a reservation is held.
+    ReservationTtl,
+}
+
+impl BudgetBound {
+    /// The name a stored `axond.policy.v1` document spells this bound with, so a
+    /// refusal an operator reads names the field they would edit.
+    pub const fn document_field(self) -> &'static str {
+        match self {
+            Self::SubjectLimit => BUDGET_LIMIT_FIELD,
+            Self::NamespaceLimit => NAMESPACE_BUDGET_LIMIT_FIELD,
+            Self::ReservationTtl => RESERVATION_TTL_FIELD,
+        }
+    }
+}
+
 impl BudgetPolicy {
+    /// A cap of zero is refused, on either scope, exactly as the bootstrap file
+    /// refuses one ([`Config::validate_budget`](crate::config::Config)): it
+    /// denies every request for the scope, which is a state no *cap* expresses
+    /// — the section's whole content is "spending here is finite and this is the
+    /// bound", and zero says the scope is closed. Closing a scope is the
+    /// tenancy layer's job (remove the projection, revoke the credentials), and
+    /// routing it through a limit would make a fat-fingered document indistinguishable
+    /// from a deliberate fleet-wide freeze.
     pub const fn new(
+        subject_limit_microdollars: u64,
+        namespace_limit_microdollars: Option<u64>,
+        reservation_ttl_seconds: u64,
+    ) -> Result<Self, InvalidPolicy> {
+        if subject_limit_microdollars == 0 {
+            return Err(InvalidPolicy::TooSmall {
+                value: subject_limit_microdollars,
+                min: 1,
+            });
+        }
+        if let Some(0) = namespace_limit_microdollars {
+            return Err(InvalidPolicy::TooSmall { value: 0, min: 1 });
+        }
+        if reservation_ttl_seconds == 0 {
+            return Err(InvalidPolicy::TooSmall {
+                value: reservation_ttl_seconds,
+                min: 1,
+            });
+        }
+        Ok(Self {
+            subject_limit_microdollars,
+            namespace_limit_microdollars,
+            reservation_ttl_seconds,
+        })
+    }
+
+    /// Read a triple a *stored* revision carries, which is a weaker rule than
+    /// the one an author is held to.
+    ///
+    /// A bound can tighten inside a stable schema, and this one did: a build
+    /// before this one accepted a zero cap through the admin API and wrote it
+    /// into a revision. Refusing to read that row would take the whole revision
+    /// out of service — and, since an administrative mutation builds its
+    /// candidate from the head revision, would leave no in-band way to correct
+    /// the number. So a stored zero cap reads back, is reported by
+    /// [`unenforceable_cap`](Self::unenforceable_cap), and is refused at
+    /// activation with the field named, while the replica keeps the policy it
+    /// already had. A zero reservation TTL is not in that position — no build
+    /// ever accepted one — so it stays a read refusal.
+    pub const fn stored(
         subject_limit_microdollars: u64,
         namespace_limit_microdollars: Option<u64>,
         reservation_ttl_seconds: u64,
@@ -451,6 +525,37 @@ impl BudgetPolicy {
             namespace_limit_microdollars,
             reservation_ttl_seconds,
         })
+    }
+
+    /// The cap this document states as zero, if it states one.
+    ///
+    /// Only a document [`stored`](Self::stored) by an earlier build can be in
+    /// this state; [`new`](Self::new) refuses to build one.
+    pub const fn unenforceable_cap(&self) -> Option<BudgetBound> {
+        if self.subject_limit_microdollars == 0 {
+            Some(BudgetBound::SubjectLimit)
+        } else if let Some(0) = self.namespace_limit_microdollars {
+            Some(BudgetBound::NamespaceLimit)
+        } else {
+            None
+        }
+    }
+
+    /// Which of the three bounds a rejected triple broke. Every caller of
+    /// [`BudgetPolicy::new`] names a field in its refusal, and the three share
+    /// one error, so the choice lives here rather than being re-derived — and
+    /// re-derived differently — at each surface.
+    pub const fn unmet_bound(
+        subject_limit_microdollars: u64,
+        namespace_limit_microdollars: Option<u64>,
+    ) -> BudgetBound {
+        if subject_limit_microdollars == 0 {
+            BudgetBound::SubjectLimit
+        } else if let Some(0) = namespace_limit_microdollars {
+            BudgetBound::NamespaceLimit
+        } else {
+            BudgetBound::ReservationTtl
+        }
     }
 
     /// The cap on one `(scope, subject)` pair.
@@ -481,7 +586,41 @@ pub struct ConcurrencyPolicy {
     lease_ttl_seconds: u64,
 }
 
+/// The bound a [`ConcurrencyPolicy`] pair broke.
+///
+/// Both settings share one error, so the choice of which one to name lives here
+/// rather than being re-derived — and re-derived differently — at the document
+/// reader and the admin surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcurrencyBound {
+    /// How many admissions one `(scope, subject)` pair may hold at once.
+    MaxInFlight,
+    /// How long an abandoned lease stays live.
+    LeaseTtl,
+}
+
+impl ConcurrencyBound {
+    /// The name an `axond.policy.v1` document spells this bound with, which is
+    /// also the name the admin request spells it with.
+    pub const fn document_field(self) -> &'static str {
+        match self {
+            Self::MaxInFlight => MAX_IN_FLIGHT_FIELD,
+            Self::LeaseTtl => LEASE_TTL_FIELD,
+        }
+    }
+}
+
 impl ConcurrencyPolicy {
+    /// Which setting a refused pair broke, so a refusal names the one the
+    /// caller would edit rather than the first one checked.
+    pub const fn unmet_bound(max_in_flight_per_subject: u64) -> ConcurrencyBound {
+        if max_in_flight_per_subject == 0 {
+            ConcurrencyBound::MaxInFlight
+        } else {
+            ConcurrencyBound::LeaseTtl
+        }
+    }
+
     pub const fn new(
         max_in_flight_per_subject: u64,
         lease_ttl_seconds: u64,
@@ -514,6 +653,11 @@ impl ConcurrencyPolicy {
 }
 
 /// The mint epoch below which a token issued for this scope is refused.
+///
+/// The epoch is a Unix timestamp in seconds, compared against a minted token's
+/// `iat` claim just as a bootstrap `[[gateway_token_epoch]]` entry is — not an
+/// opaque counter, so `3` revokes nothing and the current Unix time revokes
+/// every token issued so far.
 ///
 /// Revocation states a floor rather than a list, so a document stays a fixed
 /// shape and a mass revocation is one advancing integer. Advancing it only ever
@@ -674,23 +818,23 @@ impl PolicyBody {
         };
         let epoch = PolicyEpoch::new(record.integer(EPOCH_FIELD)?)
             .map_err(|source| bound(EPOCH_FIELD, source))?;
-        let budget = BudgetPolicy::new(
-            record.integer(BUDGET_LIMIT_FIELD)?,
-            record.optional_integer(NAMESPACE_BUDGET_LIMIT_FIELD)?,
-            record.integer(RESERVATION_TTL_FIELD)?,
-        )
-        .map_err(|source| bound(RESERVATION_TTL_FIELD, source))?;
+        let subject_limit = record.integer(BUDGET_LIMIT_FIELD)?;
+        let namespace_limit = record.optional_integer(NAMESPACE_BUDGET_LIMIT_FIELD)?;
+        let reservation_ttl = record.integer(RESERVATION_TTL_FIELD)?;
+        // `stored`, not `new`: a zero cap an earlier build wrote reads back and
+        // is refused at activation, so one bad number does not take the whole
+        // revision — and the correction that would replace it — out of service.
+        let budget = BudgetPolicy::stored(subject_limit, namespace_limit, reservation_ttl)
+            .map_err(|source| bound(RESERVATION_TTL_FIELD, source))?;
         let max_in_flight = record.integer(MAX_IN_FLIGHT_FIELD)?;
         let lease_ttl = record.integer(LEASE_TTL_FIELD)?;
         let concurrency = ConcurrencyPolicy::new(max_in_flight, lease_ttl).map_err(|source| {
             // Two fields share one bound, so the refusal names the one that broke
             // it rather than the first one checked.
-            let field = if max_in_flight == 0 {
-                MAX_IN_FLIGHT_FIELD
-            } else {
-                LEASE_TTL_FIELD
-            };
-            bound(field, source)
+            bound(
+                ConcurrencyPolicy::unmet_bound(max_in_flight).document_field(),
+                source,
+            )
         })?;
         Ok(Self {
             scope,
@@ -707,6 +851,20 @@ impl PolicyBody {
     /// review tooling, and a later activation slice reach the same answer.
     pub fn transition(&self, next: &Self) -> PolicyTransition {
         PolicyTransition::between(self, next)
+    }
+
+    /// How a fleet may move from this document to `next` when `next` *displaces*
+    /// it for a namespace rather than succeeding it for a scope: a project
+    /// publishing its own document over the tenant's, or dropping it again.
+    ///
+    /// Only the draining reasons. The two documents belong to different scopes,
+    /// so neither the scope nor the epoch comparison means anything here — an
+    /// epoch orders one scope's own publications, and a project's first epoch is
+    /// not behind its tenant's tenth. What does carry over is the values: a
+    /// namespace whose binding cap is cut still has holds that were admitted
+    /// under the wider one.
+    pub fn displaced_by(&self, next: &Self) -> PolicyTransition {
+        PolicyTransition::displacing(self, next)
     }
 
     /// Whether two documents state the same policy, ignoring the epoch they were
@@ -1214,7 +1372,29 @@ impl PolicyTransition {
         if from.same_content(to) {
             return Self::of(vec![TransitionReason::Republished]);
         }
+        Self::of(Self::fields(from, to))
+    }
 
+    /// See [`PolicyBody::displaced_by`]: the same field comparison, dropping
+    /// only the reasons a handover cannot be judged by.
+    ///
+    /// [`TransitionClass::Live`] reasons go, because a value that only loosens
+    /// strands nothing and the two scopes share no history to call it a
+    /// republication of. Everything that constrains the move stays: a drain is
+    /// still a drain when a different scope's document imposes it, and a
+    /// refusing value — a token floor that falls — is still restoring tokens an
+    /// operator revoked, whichever document lowers it.
+    fn displacing(from: &PolicyBody, to: &PolicyBody) -> Self {
+        Self::of(
+            Self::fields(from, to)
+                .into_iter()
+                .filter(|reason| reason.class() != TransitionClass::Live)
+                .collect(),
+        )
+    }
+
+    /// Every reason the two documents' values differ, ignoring scope and epoch.
+    fn fields(from: &PolicyBody, to: &PolicyBody) -> Vec<TransitionReason> {
         let mut reasons = Vec::new();
         let (old, new) = (&from.budget, &to.budget);
         push_ordered(
@@ -1268,7 +1448,7 @@ impl PolicyTransition {
             TransitionReason::TokenFloorRaised,
             TransitionReason::TokenFloorLowered,
         );
-        Self::of(reasons)
+        reasons
     }
 
     fn of(mut reasons: Vec<TransitionReason>) -> Self {
@@ -1670,14 +1850,14 @@ mod tests {
         let capped = PolicyBody::new(
             tenant_scope(),
             PolicyEpoch::FIRST,
-            BudgetPolicy::new(1_000_000, Some(0), 60).unwrap(),
+            BudgetPolicy::new(1_000_000, Some(1), 60).unwrap(),
             ConcurrencyPolicy::new(8, 30).unwrap(),
             RevocationPolicy::new(1),
         );
         assert_ne!(
             uncapped.checksum().unwrap(),
             capped.checksum().unwrap(),
-            "a scope-wide cap of zero is a different document from no cap at all"
+            "a scope-wide cap is a different document from no cap at all"
         );
         assert_eq!(
             PolicyBody::read(&capped.version(slug())).unwrap(),
@@ -1848,6 +2028,21 @@ mod tests {
                 source: InvalidPolicy::TooSmall { value: 0, min: 1 },
             })
         );
+        // A cap of zero is the one bound this build tightened over documents an
+        // earlier one stored, so it reads back rather than taking the revision
+        // out of service, and names itself for the refusal that follows at
+        // activation.
+        for (field, bound) in [
+            (BUDGET_LIMIT_FIELD, BudgetBound::SubjectLimit),
+            (NAMESPACE_BUDGET_LIMIT_FIELD, BudgetBound::NamespaceLimit),
+        ] {
+            let stored = PolicyBody::read(&edited(|fields| {
+                set(fields, field, CanonicalValue::integer(0u32));
+            }))
+            .expect("a stored zero cap still hydrates");
+            assert_eq!(stored.budget().unenforceable_cap(), Some(bound));
+            assert_eq!(bound.document_field(), field);
+        }
         assert!(matches!(
             PolicyBody::read(&edited(|fields| {
                 set(
@@ -1877,6 +2072,18 @@ mod tests {
         );
         assert_eq!(
             BudgetPolicy::new(1, None, 0),
+            Err(InvalidPolicy::TooSmall { value: 0, min: 1 })
+        );
+        // A cap of zero denies every request for the scope, which the bootstrap
+        // file refuses for the same reason: it is not a bound on spending, it is
+        // a closed scope wearing one. Refused on both scopes, so a published
+        // document cannot express what an authored one may not.
+        assert_eq!(
+            BudgetPolicy::new(0, None, 30),
+            Err(InvalidPolicy::TooSmall { value: 0, min: 1 })
+        );
+        assert_eq!(
+            BudgetPolicy::new(1, Some(0), 30),
             Err(InvalidPolicy::TooSmall { value: 0, min: 1 })
         );
     }
@@ -2372,8 +2579,9 @@ mod tests {
             "advancing only the epoch restates the same policy"
         );
 
-        // An absent optional cap is not a cap of zero, so the two never digest
-        // alike and one can never be carried forward as the other.
+        // An absent optional cap is a statement of its own, so a document that
+        // states one never digests like a document that has none, and neither
+        // can be carried forward as the other.
         let capped = |limit| {
             PolicyBody::new(
                 tenant_scope(),
@@ -2384,7 +2592,7 @@ mod tests {
             )
             .content()
         };
-        assert_ne!(capped(None), capped(Some(0)));
+        assert_ne!(capped(None), capped(Some(1)));
         assert_ne!(capped(Some(1)), capped(Some(2)));
     }
 

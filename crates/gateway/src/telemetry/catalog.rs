@@ -730,6 +730,21 @@ pub const CATALOG: &[MetricSpec] = &[
         labels: &[],
     },
     MetricSpec {
+        name: "axond.policy.unenforceable_denials",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[
+            Label::closed("axond.policy.condition", &["ungoverned", "layout"]),
+            // Responsibility first: the spend store and the concurrency store
+            // are usually the same backend, and the two denials are separate
+            // operator problems.
+            Label::closed(
+                "axond.policy.store",
+                &["budget:redis", "budget:postgres", "rate_limit:redis"],
+            ),
+        ],
+    },
+    MetricSpec {
         name: "axond.revocation.denials",
         kind: InstrumentKind::Counter,
         unit: None,

@@ -215,7 +215,7 @@ impl Reloader {
         current: &ConfigSnapshot,
         generation: u64,
     ) -> Result<ConfigSnapshot, ReloadError> {
-        let config = Config::load(&self.path)?;
+        let mut config = Config::load(&self.path)?;
         if config.mode != self.boot.mode {
             return Err(ReloadError::Config(ConfigError::Invalid(format!(
                 "`mode` is a bootstrap property: this process booted in `{}` mode and a reload \
@@ -224,6 +224,7 @@ impl Reloader {
                 config.mode.as_str()
             ))));
         }
+        carry_policy_forward(&mut config, &current.config);
         Ok(ConfigSnapshot::build_with(
             config,
             env,
@@ -234,6 +235,56 @@ impl Reloader {
 
     fn watch_settings(&self) -> Reload {
         self.state.config().config.reload.clone()
+    }
+}
+
+/// Carry the published policy a revision attached to each namespace onto a
+/// reload candidate.
+///
+/// The same reason approved pricing is carried: a published document is not in
+/// the file — [`Namespace::policy`](crate::config::Namespace::policy) is never
+/// read from TOML — so a candidate built from the file alone states that every
+/// namespace is governed by nothing. Publishing that would drop the caps a
+/// revision published *and* the revocation floor folded into the snapshot's
+/// token epochs, so a `SIGHUP` would silently un-revoke tokens an operator
+/// revoked fleet-wide. Which document governs a namespace is convergence's
+/// business; editing the file is not a publication, and this only refuses to
+/// lose one.
+///
+/// A governed namespace the file does not declare is carried whole, because in
+/// the mode documents are actually published in the file declares none at all:
+/// a stateful bootstrap is refused for stating `[[namespace]]`, so overlaying
+/// onto what the file lists would carry nothing in exactly the deployments this
+/// protects. The rest of what a revision projects onto a namespace — its
+/// credentials and gateway keys — is still dropped by a reload, which fails
+/// closed (a request is refused) where losing the floor fails open (a revoked
+/// token verifies again).
+fn carry_policy_forward(candidate: &mut Config, current: &Config) {
+    let governed: Vec<&crate::config::Namespace> = current
+        .namespace
+        .iter()
+        .filter(|namespace| namespace.policy.is_some())
+        .collect();
+    if governed.is_empty() {
+        return;
+    }
+    for namespace in &mut candidate.namespace {
+        if let Some(published) = governed
+            .iter()
+            .find(|governed| governed.id == namespace.id)
+            .and_then(|governed| governed.policy)
+        {
+            namespace.policy = Some(published);
+        }
+    }
+    for governed in governed {
+        if !candidate
+            .namespace
+            .iter()
+            .any(|namespace| namespace.id == governed.id)
+        {
+            candidate.namespace.push(governed.clone());
+        }
     }
 }
 
@@ -1676,6 +1727,127 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
         assert_eq!(
             listed_aliases(&state).await,
             vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
+        );
+    }
+
+    /// A published document is not in the file either, and the revocation floor
+    /// it states is folded into the snapshot's token epochs. A `SIGHUP` must not
+    /// be the way tokens an operator revoked fleet-wide start working again.
+    #[tokio::test]
+    async fn a_reload_does_not_ungovern_a_converged_snapshot() {
+        use crate::config::NamespacePolicy;
+        use crate::desired_state::fixtures::{revision_id, tenant_id};
+        use crate::desired_state::policy::{
+            BudgetPolicy, ConcurrencyPolicy, PolicyBody, PolicyEpoch, PolicyScope, RevocationPolicy,
+        };
+
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let body = PolicyBody::new(
+            PolicyScope::Tenant(tenant_id(1)),
+            PolicyEpoch::FIRST,
+            BudgetPolicy::new(9_000_000, Some(50_000_000), 900).expect("a valid budget"),
+            ConcurrencyPolicy::new(64, 600).expect("a valid concurrency policy"),
+            RevocationPolicy::new(1_700_000_000),
+        );
+        let policy = NamespacePolicy {
+            body,
+            generation: body.generation(revision_id(1)),
+        };
+        let mut config = Config::load(file.path()).expect("valid boot config");
+        for namespace in &mut config.namespace {
+            namespace.policy = Some(policy);
+        }
+        let converged =
+            ConfigSnapshot::build(config, &inbound_env(), 7).expect("the boot config compiles");
+        assert_eq!(
+            converged.gateway_token_epoch("platform", "someone"),
+            Some(1_700_000_000)
+        );
+        state.publish(converged);
+
+        // A real edit, so the candidate is published rather than skipped.
+        file.rewrite(&format!(
+            r#"{PLATFORM_ONLY}
+[[model]]
+name = "gpt-4o-mini"
+targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_microdollars_per_million = 150000, output_microdollars_per_million = 600000 }} }}]
+"#
+        ));
+        Reloader::new(file.path(), state.clone())
+            .reload_with_env(TRIGGER_WATCH, &inbound_env())
+            .expect("the candidate is valid");
+
+        let after = state.config();
+        assert_eq!(after.generation, 8);
+        assert_eq!(
+            after.config.namespace[0].policy,
+            Some(policy),
+            "the file cannot state a document, so a reload must carry the published one"
+        );
+        assert_eq!(
+            after.gateway_token_epoch("platform", "someone"),
+            Some(1_700_000_000),
+            "a reload un-revoked tokens the published floor was revoking"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_keeps_a_projected_namespace_the_file_does_not_declare() {
+        use crate::config::NamespacePolicy;
+        use crate::desired_state::fixtures::{revision_id, tenant_id};
+        use crate::desired_state::policy::{
+            BudgetPolicy, ConcurrencyPolicy, PolicyBody, PolicyEpoch, PolicyScope, RevocationPolicy,
+        };
+
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let body = PolicyBody::new(
+            PolicyScope::Tenant(tenant_id(1)),
+            PolicyEpoch::FIRST,
+            BudgetPolicy::new(9_000_000, Some(50_000_000), 900).expect("a valid budget"),
+            ConcurrencyPolicy::new(64, 600).expect("a valid concurrency policy"),
+            RevocationPolicy::new(1_700_000_000),
+        );
+        let policy = NamespacePolicy {
+            body,
+            generation: body.generation(revision_id(1)),
+        };
+        // The shape a converged stateful replica actually serves: the file
+        // declares no namespace at all, and the one being served was projected.
+        let mut config = Config::load(file.path()).expect("valid boot config");
+        let mut projected = config.namespace[0].clone();
+        projected.id = "acme-web".to_string();
+        projected.default = false;
+        projected.policy = Some(policy);
+        config.namespace.push(projected);
+        let converged =
+            ConfigSnapshot::build(config, &inbound_env(), 7).expect("the boot config compiles");
+        state.publish(converged);
+
+        file.rewrite(&format!(
+            r#"{PLATFORM_ONLY}
+[[model]]
+name = "gpt-4o-mini"
+targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_microdollars_per_million = 150000, output_microdollars_per_million = 600000 }} }}]
+"#
+        ));
+        Reloader::new(file.path(), state.clone())
+            .reload_with_env(TRIGGER_WATCH, &inbound_env())
+            .expect("the candidate is valid");
+
+        let after = state.config();
+        let carried = after
+            .config
+            .namespace
+            .iter()
+            .find(|namespace| namespace.id == "acme-web")
+            .expect("a governed namespace the file cannot declare survives the reload");
+        assert_eq!(carried.policy, Some(policy));
+        assert_eq!(
+            after.gateway_token_epoch("acme-web", "someone"),
+            Some(1_700_000_000),
+            "a reload un-revoked tokens the published floor was revoking"
         );
     }
 
