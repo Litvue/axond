@@ -429,7 +429,30 @@ require "a_publication_against_the_restored_head_is_accepted" accepted \
   "$([[ "$after_restore" == refused ]] && echo refused || echo accepted)" \
   "the restored journal is writable, not just readable"
 observe revision_after_restore "$after_restore"
-observe readiness_probe "$(curl -s -o /dev/null -w '%{http_code}' "${logical_endpoint}/readyz")"
+
+# The restored journal is durable before this replica has a projected serving
+# snapshot. That intermediate state must fail closed: a successful admin read
+# or a successful publication is not permission to put the replica in traffic.
+# Keep connection failure as a sentinel so the stage writes its artifact and
+# names an unreachable probe rather than aborting before `close` can retain it.
+probe_status() {
+  local body="$1" url="$2" status
+  status="$(curl -sS -o "$body" -w '%{http_code}' "$url" 2>/dev/null || true)"
+  printf '%s' "${status:-unreachable}"
+}
+readiness_status="$(probe_status "${workdir}/logical-readyz.body" "${logical_endpoint}/readyz")"
+inference_status="$(probe_status "${workdir}/logical-inference.body" "${logical_endpoint}/v1/models")"
+inference_error="$(jq -r '.error.type // "malformed"' "${workdir}/logical-inference.body" 2>/dev/null || printf 'malformed')"
+observe readiness_probe "$readiness_status"
+observe restored_readiness_status "$readiness_status"
+observe restored_inference_status "$inference_status"
+observe restored_inference_error "$inference_error"
+require "the_restored_replica_fails_readiness_closed" 503 "$readiness_status" \
+  "a restored journal without a projected serving snapshot is not routed traffic"
+require "the_restored_replica_refuses_inference_closed" 503 "$inference_status" \
+  "durable state is not presented as an empty or ready inference configuration"
+require "the_restored_replica_names_inference_refusal" inference_unavailable "$inference_error" \
+  "the refusal identifies the missing serving snapshot rather than an unrelated route error"
 
 restore_loss_checks=(the_restored_head_is_the_backed_up_head
   the_restored_revision_chain_is_whole the_restored_deployment_is_whole

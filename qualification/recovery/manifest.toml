@@ -365,8 +365,10 @@ up while that replica administers it, and restored into a database it never \
 wrote: the revision chain, its checksums, the tenancy and access projections, \
 the credential references, and the audit rows all come back, a replica booted \
 on the restored journal reads the same head, and a publication against that \
-head is accepted."""
-evidence = ["outage_timeline", "revisions", "restore_duration", "revision_loss_boundary"]
+head is accepted. Before a projected serving snapshot exists, that restored \
+replica fails readiness and inference closed rather than presenting durable \
+state as a ready serving configuration."""
+evidence = ["outage_timeline", "revisions", "restore_duration", "revision_loss_boundary", "fail_open_closed"]
 
 [[scenario.stage]]
 id = "administration"
