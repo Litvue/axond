@@ -118,7 +118,6 @@ use super::resource::{
     ResourceBody, ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber,
 };
 use super::revision::DesiredState;
-use super::tenancy::InvalidDisplayName;
 
 /// The policy body schema this build reads and writes.
 pub const POLICY_SCHEMA: &str = "axond.policy.v1";
@@ -1510,17 +1509,6 @@ impl BodyError for PolicyError {
             field,
             source,
         }
-    }
-
-    /// Unreachable: `axond.policy.v1` has no prose in it, so no field of a policy
-    /// body is read as a display name. The arm exists because the shared reader's
-    /// contract is total.
-    fn malformed_display_name(
-        reference: ResourceRef,
-        field: &'static str,
-        _source: InvalidDisplayName,
-    ) -> Self {
-        Self::FieldType { reference, field }
     }
 
     fn identity_mismatch(reference: ResourceRef, declared: String, identity: ResourceId) -> Self {

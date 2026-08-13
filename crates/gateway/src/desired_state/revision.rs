@@ -276,7 +276,6 @@ impl DesiredState {
         // tenant (#205).
         Models::of(self)?;
 
-
         Ok(())
     }
 
@@ -467,7 +466,6 @@ impl From<ModelError> for BodySkew {
         Self::Model(Box::new(error))
     }
 }
-
 
 impl BodySkew {
     /// The resource the refusal is about, whichever schema refused it.
