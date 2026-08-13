@@ -9,7 +9,7 @@ decomposes into five slices. They landed, and will land, at different depths:
 
 | Slice | Issue | Status | What exists today |
 | --- | --- | --- | --- |
-| `capacity` | [#217](https://github.com/Litvue/axond/issues/217) | `evidenced` | Driver, committed profiles, reduced tier on every change, heavy tier on demand, and two retained runs. |
+| `capacity` | [#217](https://github.com/Litvue/axond/issues/217) | `evidenced` | Driver, eight committed profiles — including multi-tenant isolation, admission shedding, and a bounded stalling backend — reduced tier on every change, heavy tier on demand, and two retained runs. |
 | `endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Driver and committed mix; the smoke tier runs in CI. The 12–24 hour tier has never been dispatched. |
 | `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `declared` | A committed scenario contract and a test that keeps it honest. No driver: stateful serving is not assembled yet. |
 | `fault` | [#218](https://github.com/Litvue/axond/issues/218) | `unbuilt` | Nothing. The fake upstream already injects the provider faults a matrix would drive. |
@@ -69,8 +69,8 @@ check out.
 
 | Record | Tier | Runner | Binary `sha256` | Branch commit (pre-squash) |
 | --- | --- | --- | --- | --- |
-| `qualification/capacity/evidence/reduced-local.toml` | reduced | local | `32503505f810` | `c5a35c6` |
-| `qualification/capacity/evidence/heavy-local.toml` | heavy | local | `32503505f810` | `c5a35c6` |
+| `qualification/capacity/evidence/reduced-local.toml` | reduced | local | `8e2cbb566e82` | `8ba8b96` |
+| `qualification/capacity/evidence/heavy-local.toml` | heavy | local | `8e2cbb566e82` | `8ba8b96` |
 
 Both were produced on an 8 vCPU cloud VM from a **debug build**, which is what
 `cargo test` builds. They are the first envelope, not a fleet baseline: a release
@@ -112,6 +112,14 @@ number is a regression rather than a different machine.
   rollout has to retain.
 - **All of them** — a second reference tier. Every number retained so far is
   single-replica.
+
+One question the packet is regularly asked for, and cannot answer: **stateful
+convergence**. A stateful replica boots and serves `/admin/v1`; what it refuses,
+per request, is inference, until revision convergence ships. So there is no
+stateful replica *serving* to converge, and a profile written against one today
+would measure the refusal and retain it as evidence of something else. That is
+why the `recovery` slice stays `declared` with a contract rather than a driver,
+and why no capacity profile claims it.
 
 ## Related
 

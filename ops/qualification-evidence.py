@@ -186,6 +186,31 @@ def render(results: list[dict], runner: str, note: str) -> str:
         ]
         if ttft:
             lines.append(f"ttft_p95_ms = {number(ttft['p95'], 2)}")
+        # What the profile was built to show, when it was built to show one.
+        # Absent means the profile did not measure it, which is why these are
+        # written only where the run recorded them rather than as zeroes: a
+        # zero here would read as "nothing crossed" on a run that never looked.
+        ceiling = result["occupancy"].get("admission_max_in_flight")
+        if ceiling is not None:
+            lines.append(f"admission_max_in_flight = {ceiling}")
+        tenancy = result.get("tenancy")
+        if tenancy is not None:
+            lines += [
+                f"tenants = {len(tenancy['by_namespace'])}",
+                f"foreign_credential_uses = {tenancy['foreign_credential_uses']}",
+                "misattributed_usage_records = "
+                f"{tenancy['misattributed_usage_records']}",
+            ]
+        deadlines = result.get("deadlines")
+        if deadlines is not None:
+            lines += [
+                f"upstream_bound_ms = {deadlines['bound_ms']}",
+                f"over_bound = {deadlines['over_bound']}",
+                f"max_latency_ms = {number(deadlines['max_latency_ms'], 2)}",
+            ]
+        recovery = result.get("recovery")
+        if recovery is not None:
+            lines.append(f"served_after_load = {str(recovery['served']).lower()}")
         lines += [
             f"peak_rss_kib = {rss['peak']}",
             f"rss_growth_kib = {max(rss['peak'], rss['settled']) - rss['baseline']}",

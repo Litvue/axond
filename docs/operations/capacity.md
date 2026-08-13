@@ -29,6 +29,23 @@ upstream over loopback and offers the profile's load at a fixed concurrency:
 | `mixed` | Both wire families, four routes, two providers, two credentials per provider, buffered and streamed interleaved. |
 | `response-size` | Buffered answers rotating over 1 KiB, 32 KiB, and 256 KiB bodies. |
 | `cancellation` | Streams where every second caller hangs up mid-answer. |
+| `tenants` | Two namespaces served at once, each with its own inbound key and its own credential pool, platform fallback off. |
+| `shedding` | More callers than the replica admits, each holding its slot while the upstream thinks. |
+| `backend-limits` | One healthy upstream per two that stall — one before response headers, one mid-body. |
+
+The last three profiles answer questions a throughput number cannot. `tenants`
+records, per namespace, what it offered, what it was served, what it was
+charged, and how many upstream calls carried *its own* credential — the
+credential itself is never recorded, only whose it was and how often. `shedding`
+boots a ceiling far below the load it offers, so what is measured is the refusal
+rather than the throughput. `backend-limits` boots a short transport bound and
+then stalls two upstreams out of three: every request has to end on the bound
+the replica declares rather than on the upstream relenting, and once a stalling
+target's circuit trips the rest are refused at once while the healthy target
+keeps serving every request sent to it. Those two — the profiles that boot a
+limit — also offer one more request after the load stops, because a ceiling that
+keeps a permit or a bound that keeps a slot is invisible in every other number
+on this page.
 
 Each run writes `target/capacity/<tier>/<profile>.json`: throughput, latency
 percentiles, TTFT and stream lifetime, RSS, CPU, sockets, occupancy, rejection
@@ -69,16 +86,29 @@ Intel Xeon Platinum 8559C, 31 GiB RAM, Linux 5.15.200, rustc 1.97.1, no queueing
 
 | Profile | Concurrency | Requests | Accepted req/s | p50 | p95 | p99 | TTFT p95 | Peak RSS | Peak sockets | CPU cores used |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `buffered` | 128 | 40 000 | 7 675 | 15.9 ms | 25.0 ms | 30.6 ms | — | 44 MiB | 344 | 4.6 |
-| `streaming` | 300 | 8 000 | 1 034 | 275 ms | 299 ms | 669 ms | 62 ms | 49 MiB | 733 | 3.1 |
-| `mixed` | 128 | 12 000 | 1 360 | 2.7 ms | 279 ms | 293 ms | 51 ms | 38 MiB | 283 | 2.3 |
-| `response-size` | 64 | 6 000 | 1 371 | 44.2 ms | 75.0 ms | 92.4 ms | — | 67 MiB | 156 | 4.1 |
-| `cancellation` | 300 | 8 000 | 1 668 | 270 ms | 303 ms | 479 ms | 65 ms | 54 MiB | 720 | 3.5 |
+| `buffered` | 128 | 40 000 | 7 643 | 16.0 ms | 25.3 ms | 31.5 ms | — | 48 MiB | 324 | 4.8 |
+| `streaming` | 300 | 8 000 | 1 028 | 274 ms | 293 ms | 668 ms | 59 ms | 54 MiB | 727 | 3.2 |
+| `mixed` | 128 | 12 000 | 1 366 | 2.9 ms | 279 ms | 285 ms | 51 ms | 42 MiB | 279 | 2.3 |
+| `response-size` | 64 | 6 000 | 1 377 | 43.7 ms | 75.4 ms | 94.2 ms | — | 71 MiB | 148 | 4.3 |
+| `cancellation` | 300 | 8 000 | 1 621 | 271 ms | 336 ms | 475 ms | 71 ms | 58 MiB | 710 | 3.7 |
+| `tenants` | 128 | 12 000 | 960 | 253 ms | 265 ms | 271 ms | 51 ms | 43 MiB | 298 | 2.2 |
+| `shedding` | 512 | 20 000 | 3.7 | 18.8 ms | 64.0 ms | 83.0 ms | — | 70 MiB | 1 803 | 1.3 |
+| `backend-limits` | 64 | 1 200 | 99 | 3.5 ms | 2 004 ms | 2 055 ms | — | 37 MiB | 139 | 0.1 |
 
 Throughput and latency move 10–25% between runs on a shared host, while the
 socket and memory columns barely move: read the first two as an order of
 magnitude and the last two as the shape of a replica's resource use. Compare two
 artifacts only when their `environment` blocks match.
+
+The last three rows are not throughput measurements and must not be read as
+one. `shedding` offers 20 000 callers at a ceiling of 8, so its accepted rate is
+the ceiling divided by how long one upstream answer takes; what it shows is the
+1 803 descriptors 512 simultaneous callers cost a replica that is refusing
+almost all of them, and that the refusal is cheap (1.3 cores). `backend-limits`
+spends most of its wall clock waiting on upstreams that never answer, so its
+latency columns are the 2 000 ms bound the replica declares rather than work it
+did, and its CPU is near zero for the same reason. `tenants` is a like-for-like
+interleave of `mixed` split across two namespaces, and costs what `mixed` costs.
 
 Streamed latency is dominated by the fake upstream's pacing (a fixed ~40-chunk
 answer), not by the gateway: read the stream rows as *concurrency the replica
@@ -88,16 +118,20 @@ buffered and streamed requests in one distribution.
 What the envelope says, in operator terms:
 
 - **Sockets scale with concurrency, roughly two per in-flight stream** — one
-  inbound, one upstream. 300 concurrent streams held ~730 descriptors. Size
-  `ulimit -n` and `admission.max_in_flight_streams` together.
+  inbound, one upstream. 300 concurrent streams held ~727 descriptors. A
+  refused caller costs an inbound descriptor too, until it is told no: the
+  `shedding` row above holds 2.5 times the sockets of any other profile while
+  admitting eight requests. Size `ulimit -n` for the load offered, not for the
+  load admitted, and set it alongside `admission.max_in_flight_streams`.
 - **Resident memory is bounded by concurrency and body size, not by request
-  count.** 40 000 buffered requests cost the same ~44 MiB as 400 would; 256 KiB
-  bodies at 64 concurrent cost ~67 MiB. Bodies are buffered before dispatch
+  count.** 40 000 buffered requests cost the same ~48 MiB as 400 would; 256 KiB
+  bodies at 64 concurrent cost ~71 MiB. Bodies are buffered before dispatch
   (ADR 0030), so `admission.max_request_bytes` × concurrency is the term to
   reason about.
-- **CPU saturates before memory.** Every profile used 2.3–4.6 cores of the 8
-  available at these concurrencies. On this workload shape, a replica is
-  CPU-bound; scale on CPU, and remember `[admission]` ceilings are *per replica*.
+- **CPU saturates before memory.** Every profile that served its load used
+  2.2–4.8 cores of the 8 available at these concurrencies. On this workload
+  shape, a replica is CPU-bound; scale on CPU, and remember `[admission]`
+  ceilings are *per replica*.
 
 ## Candidate SLOs
 
@@ -124,12 +158,29 @@ release-build qualification on known hardware before they can be promised.
 Hard failures, asserted on every reduced and heavy run, because none of them
 depends on how fast the runner was:
 
-- every offered request accepted (`min_accepted_fraction`),
+- every offered request accepted (`min_accepted_fraction`) — except where the
+  profile exists to be refused, where the refusal itself is bounded instead
+  (`min_rejected_fraction`, `max_rejected_fraction`, `max_error_fraction`) and
+  the floor on what was still served is a count (`min_accepted`), because a
+  replica behind a ceiling serves what the ceiling allows however many callers
+  arrive,
 - nothing shed (`max_rejections`) and no errors (`max_errors`),
+- no request outliving the bound the replica declares (`max_over_deadline`) and
+  no untyped failure (`max_untyped_errors`, counting both an error answered
+  without a typed body and a request that ended at the transport with no answer
+  at all),
+- no tenant served with a credential it does not own
+  (`max_foreign_credential_uses`) and no charge filed against a namespace that
+  did not send the request (`max_misattributed_usage_records`),
+- the replica still serving one request after the load stops
+  (`max_unserved_after_load`),
 - one usage record per admitted request (`max_missing_usage_records`), with
   cancelled streams settling as `client_cancelled`,
 - no upstream response body still open once every client is gone
   (`max_leaked_upstream_streams`),
+- and, for any of these, the measurement itself: a threshold whose measurement
+  block is absent from the artifact fails as `<threshold>_unmeasured` rather
+  than passing as a zero,
 - bounded resident-memory growth over the run (`max_rss_growth_kib`), measured
   from the baseline to whichever is higher of the sampled peak and the settled
   reading taken after the load stops.

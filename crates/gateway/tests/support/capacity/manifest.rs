@@ -40,6 +40,15 @@ pub struct Profile {
     /// for before hanging up, so the partial charge is a real one.
     #[serde(default)]
     pub cancel_after_output_chunks: Option<usize>,
+    /// Shedding only: the concurrency ceiling the profile boots the replica
+    /// with. Written here rather than left to a shipped default so the ceiling
+    /// a run was measured against is in the manifest and in the record.
+    #[serde(default)]
+    pub max_in_flight: Option<u64>,
+    /// Backend limits only: the transport bound the profile boots the replica
+    /// with, and therefore the wall clock every request must end inside.
+    #[serde(default)]
+    pub upstream_timeout_ms: Option<u64>,
     pub reduced: Scale,
     pub heavy: Scale,
     pub thresholds: Thresholds,
@@ -70,6 +79,9 @@ pub enum Workload {
     Mixed,
     ResponseSize,
     Cancellation,
+    Tenants,
+    Shedding,
+    BackendLimits,
 }
 
 impl Workload {
@@ -80,22 +92,85 @@ impl Workload {
             Self::Mixed => "mixed",
             Self::ResponseSize => "response_size",
             Self::Cancellation => "cancellation",
+            Self::Tenants => "tenants",
+            Self::Shedding => "shedding",
+            Self::BackendLimits => "backend_limits",
         }
     }
+
+    /// Every workload the driver implements. The manifest coverage test reads
+    /// this, so adding a variant without a committed profile fails rather than
+    /// leaving the new shape unqualified.
+    pub const ALL: [Self; 8] = [
+        Self::Buffered,
+        Self::Streaming,
+        Self::Mixed,
+        Self::ResponseSize,
+        Self::Cancellation,
+        Self::Tenants,
+        Self::Shedding,
+        Self::BackendLimits,
+    ];
 }
 
 /// The hard failures. Every one of these is a property of the *gateway* rather
 /// than of the machine it ran on: a shared runner changes throughput and
 /// latency, but it does not change whether a stream leaked a socket or whether
 /// every accepted request settled a usage record.
+///
+/// The absolute rejection and error counts are optional because two profiles
+/// exist to provoke exactly those outcomes: shedding is the point of the
+/// `shedding` profile and a bounded upstream failure is the point of
+/// `backend-limits`. A profile that omits them has to bound the same outcome as
+/// a fraction instead — `the_committed_manifest_covers_every_workload_with_thresholds`
+/// refuses one that bounds it neither way, so "optional" never means "ungated".
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct Thresholds {
-    pub min_accepted_fraction: f64,
-    pub max_rejections: u64,
-    pub max_errors: u64,
+    #[serde(default)]
+    pub min_accepted_fraction: Option<f64>,
+    /// The acceptance floor as a count, for a profile whose served share does
+    /// not scale with the load it offers: a replica behind a ceiling serves
+    /// what the ceiling allows however many callers arrive, so a fraction there
+    /// would only measure how much load the manifest asked for.
+    #[serde(default)]
+    pub min_accepted: Option<u64>,
+    #[serde(default)]
+    pub max_rejections: Option<u64>,
+    #[serde(default)]
+    pub max_errors: Option<u64>,
     pub max_missing_usage_records: u64,
     pub max_leaked_upstream_streams: i64,
     pub max_rss_growth_kib: u64,
+    /// Shedding: the ceiling has to bite, and it has to stop biting once the
+    /// offered load is inside it. A run that shed nothing measured a replica
+    /// that was never full; one that shed everything measured a replica that
+    /// stopped serving.
+    #[serde(default)]
+    pub min_rejected_fraction: Option<f64>,
+    #[serde(default)]
+    pub max_rejected_fraction: Option<f64>,
+    /// Backend limits: a bounded share of requests may fail, and every failure
+    /// has to carry a typed body rather than whatever the upstream leaked.
+    #[serde(default)]
+    pub max_error_fraction: Option<f64>,
+    #[serde(default)]
+    pub max_untyped_errors: Option<u64>,
+    /// Backend limits: requests that outlived the bound the replica itself
+    /// declares. This is the gateway's own promise, not a property of the
+    /// runner, so it is asserted with generous slack (see `DEADLINE_SLACK`).
+    #[serde(default)]
+    pub max_over_deadline: Option<u64>,
+    /// Tenants: upstream calls that carried a credential belonging to a
+    /// namespace other than the caller's.
+    #[serde(default)]
+    pub max_foreign_credential_uses: Option<u64>,
+    /// Tenants: usage rows attributed to a namespace that did not send them.
+    #[serde(default)]
+    pub max_misattributed_usage_records: Option<u64>,
+    /// Shedding and backend limits: a request offered after the load stops must
+    /// be served, or the permits the run consumed never came back.
+    #[serde(default)]
+    pub max_unserved_after_load: Option<u64>,
 }
 
 /// Which scale to run.

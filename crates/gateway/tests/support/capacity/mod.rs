@@ -13,4 +13,8 @@ pub mod run;
 pub use manifest::{Manifest, Profile, Tier, Workload};
 pub use probe::{ResourceReport, Span};
 pub use result::CapacityResult;
-pub use run::{Gauges, cancels, expected_cancellations, memory_verdict, output_events, run};
+pub use run::{
+    Gauges, Tenant, cancels, crossed_credential_uses, crossed_usage_records,
+    expected_cancellations, measured_verdict, memory_verdict, offered_per_tenant,
+    offered_to_healthy_backend, output_events, retuned, run, tenants, tuning, untyped_errors,
+};

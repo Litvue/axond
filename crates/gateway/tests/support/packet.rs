@@ -320,6 +320,29 @@ pub struct RecordProfile {
     pub latency_p99_ms: f64,
     #[serde(default)]
     pub ttft_p95_ms: Option<f64>,
+    /// The concurrency ceiling the profile booted, when it booted one below the
+    /// load it offered. Present only on a profile built to be shed by.
+    #[serde(default)]
+    pub admission_max_in_flight: Option<u64>,
+    /// The namespaces a multi-tenant profile served at once, and what crossed
+    /// between them. `None` means the profile served one namespace, which is
+    /// not the same claim as having served several and found nothing crossed.
+    #[serde(default)]
+    pub tenants: Option<u32>,
+    #[serde(default)]
+    pub foreign_credential_uses: Option<u64>,
+    #[serde(default)]
+    pub misattributed_usage_records: Option<u64>,
+    /// The bound the replica held its upstreams to, and how the run met it.
+    #[serde(default)]
+    pub upstream_bound_ms: Option<u64>,
+    #[serde(default)]
+    pub over_bound: Option<u64>,
+    #[serde(default)]
+    pub max_latency_ms: Option<f64>,
+    /// Whether the replica served one more request after the load stopped.
+    #[serde(default)]
+    pub served_after_load: Option<bool>,
     pub peak_rss_kib: u64,
     pub rss_growth_kib: u64,
     pub peak_sockets: u64,

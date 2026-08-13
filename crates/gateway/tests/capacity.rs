@@ -22,6 +22,8 @@
 
 mod support;
 
+use std::collections::BTreeMap;
+
 use support::capacity::{self, CapacityResult, Gauges, ResourceReport, Span, Tier, Workload};
 use support::upstream;
 
@@ -54,13 +56,7 @@ fn the_committed_manifest_covers_every_workload_with_thresholds() {
     ids.dedup();
     assert_eq!(unique, ids.len(), "profile ids must be unique: {ids:?}");
 
-    for workload in [
-        Workload::Buffered,
-        Workload::Streaming,
-        Workload::Mixed,
-        Workload::ResponseSize,
-        Workload::Cancellation,
-    ] {
+    for workload in Workload::ALL {
         assert!(
             manifest
                 .profiles
@@ -80,19 +76,291 @@ fn the_committed_manifest_covers_every_workload_with_thresholds() {
                 tier.as_str()
             );
         }
+        // Every threshold below is optional in the schema, because the profiles
+        // that exist to be refused cannot state their floor the way the others
+        // do. Optional must not become ungated: whatever form it takes, a
+        // profile says how much of its offered load has to be served and how
+        // much of it may fail — and the suite separately asserts that offered
+        // load is conserved, so a bound on one side bounds the other.
+        let thresholds = &profile.thresholds;
         assert!(
-            profile.thresholds.min_accepted_fraction > 0.0,
-            "{}: a profile without an acceptance threshold asserts nothing",
+            thresholds
+                .min_accepted_fraction
+                .is_some_and(|floor| floor > 0.0)
+                || thresholds.min_accepted.is_some_and(|floor| floor > 0),
+            "{}: a profile without an acceptance floor asserts nothing",
             profile.id
         );
-        if profile.workload == Workload::Cancellation {
-            assert!(
+        assert!(
+            thresholds.max_errors.is_some() || thresholds.max_error_fraction.is_some(),
+            "{}: nothing bounds how much of the offered load may fail",
+            profile.id
+        );
+        match profile.workload {
+            Workload::Cancellation => assert!(
                 profile.cancel_every.is_some(),
                 "{}: the cancellation workload needs `cancel_every`",
                 profile.id
-            );
+            ),
+            Workload::Shedding => {
+                let ceiling = profile
+                    .max_in_flight
+                    .expect("the shedding workload needs `max_in_flight`");
+                for tier in [Tier::Reduced, Tier::Heavy] {
+                    assert!(
+                        profile.scale(tier).concurrency as u64 > ceiling,
+                        "{} [{}]: a ceiling at or above the offered concurrency \
+                         would never shed, and the profile would pass by \
+                         measuring nothing",
+                        profile.id,
+                        tier.as_str()
+                    );
+                }
+                assert!(
+                    thresholds.min_rejected_fraction.unwrap_or_default() > 0.0,
+                    "{}: a shedding profile that need not shed asserts nothing",
+                    profile.id
+                );
+            }
+            Workload::BackendLimits => {
+                assert!(
+                    profile.upstream_timeout_ms.is_some(),
+                    "{}: the backend-limits workload needs `upstream_timeout_ms`",
+                    profile.id
+                );
+                assert_eq!(
+                    thresholds.max_over_deadline,
+                    Some(0),
+                    "{}: the bound the replica declares is the whole claim",
+                    profile.id
+                );
+            }
+            Workload::Tenants => assert_eq!(
+                (
+                    thresholds.max_foreign_credential_uses,
+                    thresholds.max_misattributed_usage_records
+                ),
+                (Some(0), Some(0)),
+                "{}: a multi-tenant profile that tolerates a crossed credential \
+                 or a misfiled charge is not an isolation claim",
+                profile.id
+            ),
+            Workload::Buffered | Workload::Streaming | Workload::Mixed | Workload::ResponseSize => {
+            }
         }
     }
+}
+
+/// The tenant rotation splits the offered load evenly and exactly, for any
+/// request count: a per-tenant expectation divided out of the total would be
+/// wrong whenever the count is not a whole number of rotations, and the
+/// isolation assertion is built on it.
+#[test]
+fn the_tenant_rotation_accounts_for_every_offered_request() {
+    for offered in 0..64u64 {
+        let per_tenant: Vec<u64> = capacity::tenants()
+            .iter()
+            .map(|tenant| capacity::offered_per_tenant(offered, tenant))
+            .collect();
+        assert_eq!(
+            per_tenant.iter().sum::<u64>(),
+            offered,
+            "every offered request belongs to exactly one tenant: {per_tenant:?}"
+        );
+        assert!(
+            per_tenant.iter().max().unwrap_or(&0) - per_tenant.iter().min().unwrap_or(&0) <= 1,
+            "{offered} offered requests split unevenly: {per_tenant:?}"
+        );
+    }
+}
+
+/// The isolation count is what an operator is asked to trust, and the shape of
+/// failure it must survive is the symmetric one: each customer served with the
+/// other's key. Two per-credential totals cannot see it — under a rotation that
+/// offers both tenants the same load, both totals balance exactly as they would
+/// on an honest run — so the count is paired, caller against credential.
+#[test]
+fn a_swap_between_two_tenants_is_not_a_clean_run() {
+    let tenants = capacity::tenants();
+    let [acme, globex] = [&tenants[0], &tenants[1]];
+    let dispatches = |pairs: [(&capacity::Tenant, &capacity::Tenant); 2]| {
+        pairs
+            .iter()
+            .map(|(caller, credential)| {
+                (
+                    upstream::Dispatch {
+                        caller: caller.namespace.to_owned(),
+                        credential: credential.credential(),
+                    },
+                    600,
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        capacity::crossed_credential_uses(&dispatches([(acme, acme), (globex, globex)])),
+        0,
+        "each tenant served with its own key is the clean run"
+    );
+    assert_eq!(
+        capacity::crossed_credential_uses(&dispatches([(acme, globex), (globex, acme)])),
+        1200,
+        "every request of a symmetric swap is a crossing, however even the totals are"
+    );
+    assert_eq!(
+        capacity::crossed_credential_uses(&BTreeMap::from([(
+            upstream::Dispatch {
+                caller: acme.namespace.to_owned(),
+                credential: upstream::credential_digest("a-key-this-run-never-configured"),
+            },
+            7,
+        )])),
+        7,
+        "a credential belonging to nobody in the run is foreign too"
+    );
+    // The upstream records a request that presented nothing rather than
+    // dropping it: an unrecorded call is one the isolation count cannot see, so
+    // a run that reached an upstream with no credential at all would have been
+    // the cleanest-looking run of the lot.
+    assert_eq!(
+        capacity::crossed_credential_uses(&BTreeMap::from([(
+            upstream::Dispatch {
+                caller: acme.namespace.to_owned(),
+                credential: upstream::UNCREDENTIALED.to_owned(),
+            },
+            3,
+        )])),
+        3,
+        "a request that carried no credential is nobody's, so it is foreign"
+    );
+}
+
+/// The ledger has the same blind spot the credential count had, and closes it
+/// the same way: a tenant reaches only its own aliases, so a row names the
+/// caller it should have been charged to.
+#[test]
+fn a_swap_of_the_charges_is_not_a_clean_run_either() {
+    let tenants = capacity::tenants();
+    let [acme, globex] = [&tenants[0], &tenants[1]];
+    let rows = |charged: [(&capacity::Tenant, &capacity::Tenant); 2]| {
+        charged
+            .iter()
+            .map(|(namespace, alias)| {
+                serde_json::json!({
+                    "namespace": namespace.namespace,
+                    "model": alias.chat_alias(),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        capacity::crossed_usage_records(&rows([(acme, acme), (globex, globex)])),
+        0,
+        "each tenant charged for what it asked for is the clean run"
+    );
+    assert_eq!(
+        capacity::crossed_usage_records(&rows([(acme, globex), (globex, acme)])),
+        2,
+        "a swapped pair of charges is two misattributions, not a balanced ledger"
+    );
+    assert_eq!(
+        capacity::crossed_usage_records(&[serde_json::json!({
+            "namespace": "a-namespace-this-run-never-configured",
+            "model": acme.chat_alias(),
+        })]),
+        1,
+        "a row filed under a namespace the run does not have is a crossing"
+    );
+    assert_eq!(
+        capacity::crossed_usage_records(&[serde_json::json!({
+            "namespace": acme.namespace,
+            "model": "an-alias-nobody-owns",
+        })]),
+        1,
+        "so is a row naming an alias nobody in the run owns"
+    );
+}
+
+/// The label standing for "no credential" has to be one no credential can
+/// produce, or a key could be mistaken for its own absence.
+#[test]
+fn the_uncredentialed_label_is_not_a_digest() {
+    for material in ["", "none", "Bearer none", "test-upstream-capacity-acme"] {
+        assert_ne!(
+            upstream::credential_digest(material),
+            upstream::UNCREDENTIALED,
+            "{material:?} digests to the label reserved for presenting nothing"
+        );
+    }
+}
+
+/// A profile that moves a bound moves it in the config the process boots. A
+/// string rewrite that matched nothing would leave the shared default in place
+/// while the artifact recorded the ceiling the manifest asked for — a run that
+/// never reached its own limit, retained as evidence that it did.
+#[test]
+fn a_profile_can_only_retune_a_bound_the_shared_tuning_declares() {
+    let tuning = capacity::tuning();
+    let moved = capacity::retuned(tuning, "max_in_flight", 8);
+    assert!(
+        moved.contains("\nmax_in_flight = 8\n"),
+        "the ceiling moves:\n{moved}"
+    );
+    assert!(
+        moved.contains("\nmax_in_flight_streams = 8192\n"),
+        "and the key that merely starts the same does not:\n{moved}"
+    );
+
+    for key in [
+        "max_in_flight",
+        "max_in_flight_streams",
+        "response_header_timeout_ms",
+        "buffered_body_timeout_ms",
+        "stream_idle_timeout_ms",
+    ] {
+        assert_ne!(
+            capacity::retuned(tuning, key, 1),
+            tuning,
+            "{key} is a bound a profile moves, so the tuning has to declare it"
+        );
+    }
+
+    let renamed = std::panic::catch_unwind(|| capacity::retuned(tuning, "max_in_flite", 8));
+    assert!(
+        renamed.is_err(),
+        "a bound the tuning does not declare must fail loudly rather than \
+         leaving the profile at the default it meant to move"
+    );
+}
+
+/// Two ways a threshold could be met by measuring nothing, and neither may
+/// pass: a failure with no answer at all is the most untyped failure there is,
+/// and a threshold whose measurement block is absent measured no property.
+#[test]
+fn a_threshold_cannot_be_satisfied_by_an_absent_measurement() {
+    let outcomes = |untyped: u64, transport: u64| support::capacity::result::Outcomes {
+        by_status: BTreeMap::new(),
+        rejections_by_error_type: BTreeMap::new(),
+        errors_by_error_type: BTreeMap::from([("untyped".to_owned(), untyped)]),
+        client_cancelled: 0,
+        transport_failures: transport,
+    };
+    assert_eq!(capacity::untyped_errors(&outcomes(0, 0)), 0);
+    assert_eq!(
+        capacity::untyped_errors(&outcomes(0, 3)),
+        3,
+        "a request that ended at the transport carries no typed body either"
+    );
+    assert_eq!(capacity::untyped_errors(&outcomes(2, 3)), 5);
+
+    let measured = capacity::measured_verdict("max_over_deadline", Some(0), 0);
+    assert!(measured.passed && measured.threshold == "max_over_deadline");
+    let unmeasured = capacity::measured_verdict("max_over_deadline", None, 0);
+    assert!(
+        !unmeasured.passed && unmeasured.threshold == "max_over_deadline_unmeasured",
+        "a declared threshold with no measurement behind it is a failure, not a \
+         zero: {unmeasured:?}"
+    );
 }
 
 async fn qualify(tier: Tier) {
@@ -333,6 +601,16 @@ fn every_heavy_invocation_runs_one_test_at_a_time() {
 /// else, and a streaming profile with no TTFT never opened a stream.
 fn assert_expected_outcomes(profile: &capacity::Profile, result: &CapacityResult) {
     let usage = &result.usage_records;
+    // Offered load is conserved: every caller was either served or told no, and
+    // none was left holding a request the replica quietly dropped. This is what
+    // lets a profile whose served share cannot be a fraction bound one side of
+    // the split and still be gated on both.
+    assert_eq!(
+        result.throughput.accepted + result.throughput.rejected + result.throughput.errors,
+        result.throughput.offered,
+        "{}: the offered load does not add up",
+        profile.id
+    );
     match profile.workload {
         Workload::Cancellation => {
             let cancelled = result.outcomes.client_cancelled;
@@ -385,10 +663,143 @@ fn assert_expected_outcomes(profile: &capacity::Profile, result: &CapacityResult
                 usage.by_status
             );
         }
+        Workload::Shedding => {
+            assert_eq!(
+                usage.by_status.get("ok").copied(),
+                Some(result.throughput.accepted + served_probe(result)),
+                "{}: every served request must settle as `ok`: {:?}",
+                profile.id,
+                usage.by_status
+            );
+            // Shed with the verdict that names the ceiling, rather than with
+            // a served-but-broken answer or a queue the caller cannot see.
+            assert_eq!(
+                error_types(&result.outcomes.rejections_by_error_type),
+                vec!["gateway_overloaded"],
+                "{}: a shed request must say the replica was full",
+                profile.id
+            );
+            assert!(
+                result.occupancy.admission_max_in_flight.is_some(),
+                "{}: a shedding run records the ceiling it booted",
+                profile.id
+            );
+        }
+        Workload::Tenants => {
+            let tenancy = result
+                .tenancy
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}: a multi-tenant run records tenancy", profile.id));
+            for tenant in capacity::tenants() {
+                let counts = tenancy
+                    .by_namespace
+                    .get(tenant.namespace)
+                    .unwrap_or_else(|| panic!("{}: {} sent nothing", profile.id, tenant.namespace));
+                assert_eq!(
+                    counts.offered,
+                    capacity::offered_per_tenant(result.throughput.offered, tenant),
+                    "{}: {} did not offer its share of the rotation",
+                    profile.id,
+                    tenant.namespace
+                );
+                // Without this, a run where one tenant was served nothing —
+                // the loudest isolation failure there is — would satisfy every
+                // count above by having nothing to misattribute.
+                assert!(
+                    counts.accepted > 0 && counts.upstream_calls > 0,
+                    "{}: {} was never served, so nothing about it was measured",
+                    profile.id,
+                    tenant.namespace
+                );
+                // The isolation counts are measured against what the replica
+                // dispatched rather than what it served, so that an upstream
+                // failure reads as a failure rather than as a crossed
+                // credential. This profile has no faults in it, so the two are
+                // the same number — and the equality is what keeps the
+                // one-directional counts as strict here as an exact match.
+                assert_eq!(
+                    counts.dispatched, counts.accepted,
+                    "{}: {} lost a dispatched request, so its isolation counts \
+                     are measured against a load it did not carry",
+                    profile.id, tenant.namespace
+                );
+            }
+            assert!(
+                result.ttft_ms.is_some(),
+                "{}: the tenants must include streams",
+                profile.id
+            );
+        }
+        Workload::BackendLimits => {
+            let deadlines = result
+                .deadlines
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}: a bounded run records its bound", profile.id));
+            assert!(
+                result.throughput.errors > 0,
+                "{}: no upstream was cut off, so no bound was exercised",
+                profile.id
+            );
+            assert!(
+                deadlines.max_latency_ms >= deadlines.bound_ms as f64,
+                "{}: nothing waited for the bound, so the profile measured \
+                 healthy upstreams: {deadlines:?}",
+                profile.id
+            );
+            // A stalling target trips its own circuit, and everything after
+            // that is shed rather than made to wait out the bound again. That
+            // is the replica protecting itself, so it is allowed — but only
+            // with that verdict, and only for the stalling targets: the
+            // healthy one owes an answer to every request sent to it.
+            assert_eq!(
+                error_types(&result.outcomes.rejections_by_error_type),
+                if result.throughput.rejected > 0 {
+                    vec!["all_provider_circuits_open"]
+                } else {
+                    Vec::new()
+                },
+                "{}: a shed request here must be a tripped circuit, nothing else",
+                profile.id
+            );
+            assert_eq!(
+                result.throughput.accepted,
+                capacity::offered_to_healthy_backend(result.throughput.offered),
+                "{}: a target that stalls must not cost the healthy target a \
+                 single request",
+                profile.id
+            );
+            // The charge a cut-off upstream still earns is the point: a bound
+            // that ends a request without settling it is a hole in the ledger.
+            assert_eq!(
+                usage.observed, usage.expected,
+                "{}: a request the replica dispatched must settle whatever the \
+                 upstream did: {:?}",
+                profile.id, usage.by_status
+            );
+        }
     }
+    let dispatched_failures = match profile.workload {
+        // The bound ends the request after it reached the upstream.
+        Workload::BackendLimits => result.throughput.errors - result.outcomes.transport_failures,
+        _ => 0,
+    };
     assert_eq!(
-        result.upstream.requests, result.throughput.accepted,
-        "{}: every accepted request must have reached the upstream exactly once",
+        result.upstream.requests,
+        result.throughput.accepted + dispatched_failures + served_probe(result),
+        "{}: every request the replica dispatched must have reached the \
+         upstream exactly once, and a shed one must not have reached it at all",
         profile.id
     );
+}
+
+/// The one request offered after the load stopped, when the profile asks for
+/// one. It is served by the same fake upstream and settles its own charge, so
+/// every count that reconciles against the load has to know about it.
+/// The verdicts a set of outcomes carried, in a stable order.
+fn error_types(tally: &BTreeMap<String, u64>) -> Vec<&str> {
+    tally.keys().map(String::as_str).collect()
+}
+
+fn served_probe(result: &CapacityResult) -> u64 {
+    u64::from(result.recovery.as_ref().is_some_and(|probe| probe.served))
 }

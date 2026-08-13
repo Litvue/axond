@@ -593,13 +593,20 @@ fn free_addr() -> SocketAddr {
     listener.local_addr().expect("a bound address")
 }
 
+/// The inline table every target in a test config is priced with. Public so a
+/// harness declaring its own models prices them the same way, since an unpriced
+/// target fails config parsing at boot.
+pub fn price() -> String {
+    format!(
+        "{{ input_microdollars_per_million = {INPUT_PRICE}, output_microdollars_per_million = {OUTPUT_PRICE} }}"
+    )
+}
+
 /// The config a boot with these arguments is given. Public so a harness can
 /// preflight the exact bytes a replica will be started from *before* starting
 /// it, which is the order a deployment gate runs in.
 pub fn config_toml(bind: SocketAddr, upstream: &str, tuning: &str, extra: &str) -> String {
-    let price = format!(
-        "{{ input_microdollars_per_million = {INPUT_PRICE}, output_microdollars_per_million = {OUTPUT_PRICE} }}"
-    );
+    let price = price();
     let model = |name: &str, provider: &str, target: &str| {
         format!(
             "[[model]]\nname = \"{name}\"\ntargets = [ {{ provider = \"{provider}\", model = \"{target}\", price = {price} }} ]\n\n"
