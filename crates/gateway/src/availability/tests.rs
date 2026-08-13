@@ -1883,3 +1883,30 @@ fn a_scope_renders_its_tenant_and_project() {
     );
     assert_ne!(tenant_wide, scoped);
 }
+
+/// A record whose looks a later conclusion discredited holds a watermark and no
+/// look, so it emits no row. It must still be named as cleared: otherwise the
+/// rows the conclusion removed sit in the database until the next restart reads
+/// them back as evidence.
+#[test]
+fn a_key_whose_looks_were_discredited_is_written_as_cleared() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let discredited = AvailabilityRecord {
+        definitive_at: Some(at(500)),
+        ..permitting()
+    };
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 300, None))
+        .record(key(scope, "gpt-4o"), discredited)
+        .build();
+
+    let write = EvidenceWrite::of_index(&index);
+
+    assert!(write.rows().is_empty(), "both looks were discredited");
+    assert_eq!(
+        write.cleared(),
+        [key(scope, "gpt-4o")],
+        "so the stored looks must go with them"
+    );
+}

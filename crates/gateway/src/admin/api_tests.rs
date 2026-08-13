@@ -1833,3 +1833,28 @@ async fn an_availability_read_by_a_tenants_own_administrator_names_no_authority(
     // replica's breaker is open.
     assert_eq!(body["targets"][0]["decided_by"], json!("undisclosed"));
 }
+
+/// An availability read is a read like the others: an operator watching a target
+/// through an incident conditions on the answer it already holds, and pays for a
+/// body only when the answer moved.
+#[tokio::test]
+async fn an_availability_read_a_caller_already_holds_answers_not_modified() {
+    let (index, mine, _) = two_tenant_index();
+    let deployment = Deployment::deriving(
+        FakeAdminAuthorizer::permissive(),
+        index,
+        RuntimeObservations::none(),
+    );
+    let path = format!("/availability?tenant={}", mine.tenant);
+
+    let (status, etag, body) = deployment.get_conditional(&path, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let validator = etag.expect("every administrative read carries a validator");
+    assert!(validator.starts_with('"'), "{validator}");
+    assert!(!body.is_empty());
+
+    let (status, repeat, body_again) = deployment.get_conditional(&path, Some(&validator)).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert_eq!(repeat.as_deref(), Some(validator.as_str()));
+    assert!(body_again.is_empty(), "a 304 carries no body");
+}

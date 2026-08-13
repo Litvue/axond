@@ -270,6 +270,18 @@ pub trait CandidateCompiler: Send + Sync {
         revision: &LoadedRevision,
         generation: u64,
     ) -> Result<ConfigSnapshot, CompileError>;
+
+    /// Tell the compiler the candidate it just produced will never be served.
+    ///
+    /// Compilation is asked for before the sink is asked to admit, so a refusal
+    /// at activation lands after any replica-local state the compilation moved
+    /// has already moved. Nothing in a snapshot needs this — a refused snapshot
+    /// is simply dropped — but availability is derived into a holder that
+    /// outlives snapshots, and leaving it describing a revision no snapshot ever
+    /// served would let a later re-projection fold looks over dimensions the
+    /// deployment refused. The default does nothing, for compilers that keep no
+    /// such state.
+    fn abandoned(&self) {}
 }
 
 /// The production compiler: projection, then the boot gate, then the snapshot.
@@ -443,6 +455,12 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
                 source: Box::new(source),
             })?;
         Ok(snapshot.with_availability(Arc::new(projected.into_index())))
+    }
+
+    fn abandoned(&self) {
+        if let Some(evidence) = self.availability.as_ref() {
+            evidence.abandon();
+        }
     }
 }
 

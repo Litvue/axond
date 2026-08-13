@@ -611,6 +611,23 @@ pub struct AvailabilityEvidence {
     /// from both the queue and every index. Nothing on the request path takes
     /// this.
     deriving: Mutex<()>,
+    /// What the last derivation replaced, for the caller that finds out
+    /// afterwards that its candidate was refused.
+    ///
+    /// Compilation derives before the sink is asked to admit, so a refusal at
+    /// activation arrives after this replica has already folded a revision's
+    /// dimensions in. Kept so [`abandon`](Self::abandon) can put the view back to
+    /// the revision still being served, rather than leaving a discovery loop to
+    /// re-project looks over dimensions no snapshot ever served.
+    replaced: Mutex<Option<Superseded>>,
+}
+
+/// The state one derivation replaced: enough to put it back.
+#[derive(Debug)]
+struct Superseded {
+    index: Arc<AvailabilityIndex>,
+    derived_from: Option<(Arc<DesiredState>, CredentialReadiness)>,
+    looks: Vec<DiscoveryObservation>,
 }
 
 impl AvailabilityEvidence {
@@ -622,6 +639,7 @@ impl AvailabilityEvidence {
             pending: Mutex::new(Vec::new()),
             derived_from: Mutex::new(None),
             deriving: Mutex::new(()),
+            replaced: Mutex::new(None),
         }
     }
 
@@ -710,9 +728,35 @@ impl AvailabilityEvidence {
                 return Err(error);
             }
         };
+        *self.lock(&self.replaced) = Some(Superseded {
+            index: previous,
+            derived_from: self.lock(&self.derived_from).clone(),
+            looks: pending,
+        });
         *self.lock(&self.index) = Arc::new(projected.index().clone());
         *self.lock(&self.derived_from) = Some((Arc::new(state.clone()), readiness.clone()));
         Ok(projected)
+    }
+
+    /// Undo the last derivation, because the candidate it was derived for was
+    /// never served.
+    ///
+    /// The dimensions go back to the revision this replica is still running and
+    /// the looks go back on the queue, in arrival order ahead of anything
+    /// observed since — a refused candidate must cost freshness, not evidence.
+    /// Idempotent: a derivation that was served leaves nothing to undo once the
+    /// next one supersedes it.
+    pub fn abandon(&self) {
+        let _deriving = self.lock(&self.deriving);
+        let Some(replaced) = self.lock(&self.replaced).take() else {
+            return;
+        };
+        *self.lock(&self.index) = replaced.index;
+        *self.lock(&self.derived_from) = replaced.derived_from;
+        let mut queued = self.lock(&self.pending);
+        let since: Vec<DiscoveryObservation> = queued.drain(..).collect();
+        queued.extend(replaced.looks);
+        queued.extend(since);
     }
 
     /// Fold whatever has been observed since into the revision already derived.

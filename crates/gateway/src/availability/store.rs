@@ -135,7 +135,14 @@ impl EvidenceWrite {
             rows: StoredObservation::of_index(index),
             cleared: index
                 .records()
-                .filter(|(_, record)| !record.holds_evidence())
+                // Holding *a look* rather than holding evidence: a record whose
+                // looks a later definitive conclusion discredited keeps its
+                // watermark and emits no row, so asking the broader question
+                // would leave exactly the discredited rows this half exists to
+                // remove.
+                .filter(|(_, record)| {
+                    record.discovery.is_none() && record.last_known_good.is_none()
+                })
                 .map(|(key, _)| key.clone())
                 .collect(),
         }

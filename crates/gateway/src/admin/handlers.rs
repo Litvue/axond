@@ -326,8 +326,9 @@ struct AvailabilityQuery {
 async fn availability(
     State(api): State<Arc<AdminApi>>,
     identity: AdminIdentity,
+    headers: HeaderMap,
     query: Result<Query<AvailabilityQuery>, QueryRejection>,
-) -> Result<Json<AvailabilityResult>, AdminError> {
+) -> Result<Conditional<AvailabilityResult>, AdminError> {
     let Query(query) = query.map_err(|rejection| AdminError::RequestInvalid {
         schema: "availability",
         detail: rejection.body_text(),
@@ -364,13 +365,19 @@ async fn availability(
     let authority = AvailabilityAuthority::of(
         api.holds_deployment_authority(&identity, AdminAction::ReadAvailability),
     );
-    Ok(Json(api.service.availability(
+    let result = api.service.availability(
         &grant,
         &scope,
         authority,
         api.availability.as_deref(),
         SystemTime::now(),
-    )?))
+    )?;
+    // Validated over the bytes, unlike `/convergence`: nothing in this answer
+    // moves on its own. A verdict is evaluated against `now`, but it only
+    // *changes* when evidence expires or a dimension does — which is the answer
+    // changing, exactly what a validator is for. So an operator polling a target
+    // through an incident pays for a body when something moved and not otherwise.
+    Ok(Conditional::new(&headers, result))
 }
 
 /// The scope a request names, from an optional tenant and project.

@@ -1035,3 +1035,58 @@ fn a_concurrent_derivation_does_not_swallow_a_look() {
         "the newest look reached the index rather than being derived over"
     );
 }
+
+/// Compilation derives before the sink is asked to admit, so a candidate refused
+/// at activation has already been folded in. What it derived must not outlive it
+/// — and the looks it consumed must not go with it.
+#[test]
+fn a_candidate_nobody_serves_leaves_neither_its_dimensions_nor_its_looks() {
+    let deployment = Deployment::new().entitled().governed();
+    let evidence = AvailabilityEvidence::new(catalogue());
+    evidence
+        .derive(&deployment.state, &resolved(40))
+        .expect("the served revision projects");
+
+    evidence.observe(DiscoveryObservation::new(
+        deployment.scope(),
+        target(),
+        DiscoveryResult::Present,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        at(110),
+    ));
+    // A candidate whose credential material never resolved: same revision, a
+    // dimension the running snapshot does not have.
+    evidence
+        .derive(&deployment.state, &CredentialReadiness::none())
+        .expect("the candidate projects");
+    assert_eq!(
+        evidence
+            .index()
+            .record(&deployment.key())
+            .expect("the target is described")
+            .entitlement,
+        Entitlement::Unknown
+    );
+
+    evidence.abandon();
+
+    let held = evidence.index();
+    let record = held
+        .record(&deployment.key())
+        .expect("the target is described");
+    assert_eq!(
+        record.entitlement,
+        Entitlement::Granted,
+        "the view describes the revision this replica is still serving"
+    );
+    let projected = evidence
+        .reproject()
+        .expect("that revision is the one to fold into")
+        .expect("it projects again");
+    assert_eq!(
+        verdict(&projected, &deployment.key(), 120).state,
+        AvailabilityState::Available,
+        "and the look the refused candidate consumed is still evidence"
+    );
+}
