@@ -332,6 +332,28 @@ async fn no_administrative_response_discloses_the_material_a_credential_names() 
         "a malformed secret reference must not be echoed: {refusal}"
     );
 
+    // Provider endpoints are another document field whose value can reach
+    // publication-time validation. The refusal names the required form, but
+    // never copies the endpoint that was pasted into the admin request.
+    let mut mispasted_endpoint = provider_document();
+    mispasted_endpoint["resource"]["provider"] = json!(fixtures::resource_id(99).to_string());
+    mispasted_endpoint["resource"]["endpoint"] = json!(PROVIDER_MATERIAL);
+    let (status, refusal) = console
+        .post(
+            "/providers",
+            "mispasted-provider-endpoint",
+            &revision,
+            &mispasted_endpoint,
+            false,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+    assert!(
+        refusal.contains("not an absolute http(s) origin"),
+        "an endpoint refusal should identify the expected form: {refusal}"
+    );
+    sweep.assert_absent("a mispasted provider endpoint refusal", &refusal);
+
     // The same disclosure boundary applies when material is pasted into a
     // different document field. Each value is deliberately invalid for its
     // field so the response exercises validation rather than publishing a
