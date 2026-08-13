@@ -144,8 +144,9 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
             let Some((authority, _)) = redirect(dsn, refused) else {
                 return Outcome::Skipped {
                     row: row.id.clone(),
-                    reason: "the configured connection string is not a URL the harness can \
-                             redirect through its fault proxy"
+                    reason: "the configured connection string is not a plaintext `redis://` or \
+                             `postgres://` URL the harness can redirect through its TCP fault \
+                             proxy"
                         .to_owned(),
                 };
             };

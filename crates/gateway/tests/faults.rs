@@ -142,6 +142,27 @@ fn assert_covers_both_policies(rows: &[Row], row: &Row) {
     }
 }
 
+/// The proxy the state-tier rows inject through carries TCP, so a DSN it cannot
+/// stand in front of must be reported as a skip rather than redirected into a
+/// handshake failure that would be read as the injected fault.
+#[test]
+fn only_a_dsn_the_fault_proxy_can_carry_is_redirected_through_it() {
+    let proxy = "127.0.0.1:7000".parse().expect("a loopback address");
+    let redirect = |dsn| fault::injector::redirect(dsn, proxy).map(|(_, dsn)| dsn);
+
+    assert_eq!(
+        redirect("redis://127.0.0.1:6399"),
+        Some("redis://127.0.0.1:7000".to_owned())
+    );
+    assert_eq!(
+        redirect("postgres://postgres:pw@127.0.0.1:55432/postgres"),
+        Some("postgres://postgres:pw@127.0.0.1:7000/postgres".to_owned())
+    );
+    for tls in ["rediss://127.0.0.1:6380", "rediss://example.invalid"] {
+        assert_eq!(redirect(tls), None, "a TLS endpoint cannot be proxied");
+    }
+}
+
 const EVERY_FAULT: [Fault; 22] = [
     Fault::ProviderRateLimited,
     Fault::ProviderRateLimitedFailover,

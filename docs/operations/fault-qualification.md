@@ -65,13 +65,20 @@ fails on is a property that does not move with the machine.
 # Provider and transport rows. No datastore needed.
 cargo test --locked --all-features --test faults -- --nocapture
 
-# All rows, including the state tiers.
-AXOND_TEST_REDIS_URL=redis://127.0.0.1:6379 \
-AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:5432/postgres \
+# All rows, including the state tiers, against the containers CONTRIBUTING.md
+# starts for the other stateful suites.
+AXOND_TEST_REDIS_URL=redis://127.0.0.1:6399 \
+AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:55432/postgres \
   cargo test --locked --all-features --test faults -- --nocapture
 ```
 
-Or `just faults`, which supplies both.
+Or `just faults`, which runs whichever rows the environment can serve: the
+state-tier connection strings are the suite's own, so exporting them adds the
+state-tier rows and leaving them unset skips those rows rather than failing on
+a datastore that is not there. The connection string must be one the harness can
+point at its fault proxy: a plaintext `redis://` or `postgres://` DSN. A TLS
+endpoint is skipped with that reason rather than redirected, because the proxy
+speaks TCP and would break the handshake instead of injecting the fault.
 
 State-tier rows skip when their connection string is unset and **fail** when
 `AXOND_TEST_REQUIRE_SERVICES=1`, which the CI stateful lane sets — so a skipped

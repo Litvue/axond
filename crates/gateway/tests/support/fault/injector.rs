@@ -241,11 +241,18 @@ async fn pump(
 }
 
 /// The `host:port` a DSN points at, and the DSN with that authority replaced by
-/// `addr`. Neither the input nor the output is ever recorded: the caller uses
+/// `addr` — `None` for a DSN the proxy cannot stand in front of, which the
+/// caller reports as a skip. The proxy carries TCP, so redirecting a TLS
+/// endpoint through it would fail the handshake and be read as the injected
+/// fault; only the plaintext schemes are accepted.
+/// Neither the input nor the output is ever recorded: the caller uses
 /// the rewritten DSN as the *value* of an env reference, exactly as an operator
 /// would, and the artifact names the variable rather than its contents.
 pub fn redirect(dsn: &str, addr: SocketAddr) -> Option<(String, String)> {
     let (scheme, rest) = dsn.split_once("://")?;
+    // Checked for its own sake rather than only as a default port: a TLS DSN
+    // that names its port would otherwise be redirected anyway.
+    default_port(scheme)?;
     let (authority, tail) = match rest.find(['/', '?']) {
         Some(at) => (&rest[..at], &rest[at..]),
         None => (rest, ""),
@@ -264,7 +271,7 @@ pub fn redirect(dsn: &str, addr: SocketAddr) -> Option<(String, String)> {
 
 fn default_port(scheme: &str) -> Option<u16> {
     match scheme {
-        "redis" | "rediss" => Some(6379),
+        "redis" => Some(6379),
         "postgres" | "postgresql" => Some(5432),
         _ => None,
     }
