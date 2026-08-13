@@ -597,6 +597,27 @@ def check_supported_backends(
     return failures
 
 
+def unblocked_lane(jobs: dict[str, Any], lane: str) -> str | None:
+    """Why a lane would not block a merge, or `None` when it would.
+
+    Listing a lane in `CI-Success`'s `needs` is not what makes it required:
+    that job runs `if: always()`, so it is reached whatever the lane did. What
+    blocks the merge is the explicit `needs.<lane>.result` assertion in its own
+    step — deleting only that line leaves a green `CI-Success` over a failed
+    drill, so both halves are checked.
+    """
+    success = jobs["CI-Success"]
+    if lane not in success["needs"]:
+        return f"CI-Success does not require {lane}"
+    assertion = f"needs.{lane}.result"
+    if not any(assertion in str(step.get("run", "")) for step in success["steps"]):
+        return (
+            f"CI-Success needs {lane} but never asserts {assertion}, and it runs with "
+            "`if: always()`, so it succeeds over a failed lane"
+        )
+    return None
+
+
 def check_recovery_drill(workflow: dict[str, Any], page: str, drill: str) -> list[str]:
     """The recovery objectives have an executable form, and CI runs it.
 
@@ -612,10 +633,9 @@ def check_recovery_drill(workflow: dict[str, Any], page: str, drill: str) -> lis
         failures.append(".github/workflows/ci.yml: the restore-drill lane is missing")
     elif not any("ops/restore-drill.sh" in str(step.get("run", "")) for step in lane["steps"]):
         failures.append(".github/workflows/ci.yml: the restore-drill lane does not run the drill")
-    elif "restore-drill" not in jobs["CI-Success"]["needs"]:
+    elif (reason := unblocked_lane(jobs, "restore-drill")) is not None:
         failures.append(
-            ".github/workflows/ci.yml: CI-Success does not require restore-drill, so a failed "
-            "recovery would not block a merge"
+            f".github/workflows/ci.yml: {reason}, so a failed recovery would not block a merge"
         )
     for wanted in ("ops/restore-drill.sh", "RPO", "RTO"):
         if wanted not in page:
@@ -648,10 +668,10 @@ def check_rollout_drill(workflow: dict[str, Any], page: str, drill: str) -> list
         failures.append(".github/workflows/ci.yml: the rollout-drill lane is missing")
     elif not any("ops/rollout-drill.sh" in str(step.get("run", "")) for step in lane["steps"]):
         failures.append(".github/workflows/ci.yml: the rollout-drill lane does not run the drill")
-    elif "rollout-drill" not in jobs["CI-Success"]["needs"]:
+    elif (reason := unblocked_lane(jobs, "rollout-drill")) is not None:
         failures.append(
-            ".github/workflows/ci.yml: CI-Success does not require rollout-drill, so a rollout "
-            "that cannot schedule would not block a merge"
+            f".github/workflows/ci.yml: {reason}, so a rollout that cannot schedule would not "
+            "block a merge"
         )
     if "ops/rollout-drill.sh" not in page:
         failures.append("docs/deployment/kubernetes.md: ops/rollout-drill.sh is not documented")
@@ -951,6 +971,16 @@ def self_test() -> int:
     unrequired = copy.deepcopy(workflow)
     unrequired["jobs"]["CI-Success"]["needs"].remove("restore-drill")
     expect_failure("optional drill lane", check_recovery_drill(unrequired, recovery, drill))
+    unasserted = copy.deepcopy(workflow)
+    for step in unasserted["jobs"]["CI-Success"]["steps"]:
+        if "run" in step:
+            step["run"] = re.sub(
+                r"^.*needs\.restore-drill\.result.*$", "", step["run"], flags=re.MULTILINE
+            )
+    expect_failure(
+        "a needed lane CI-Success never asserts",
+        check_recovery_drill(unasserted, recovery, drill),
+    )
     expect_failure(
         "drill without its asymmetric assertion",
         check_recovery_drill(
@@ -966,6 +996,16 @@ def self_test() -> int:
     optional_rollout["jobs"]["CI-Success"]["needs"].remove("rollout-drill")
     expect_failure(
         "optional rollout lane", check_rollout_drill(optional_rollout, kubernetes_page, rollout)
+    )
+    unasserted_rollout = copy.deepcopy(workflow)
+    for step in unasserted_rollout["jobs"]["CI-Success"]["steps"]:
+        if "run" in step:
+            step["run"] = re.sub(
+                r"^.*needs\.rollout-drill\.result.*$", "", step["run"], flags=re.MULTILINE
+            )
+    expect_failure(
+        "a needed rollout lane CI-Success never asserts",
+        check_rollout_drill(unasserted_rollout, kubernetes_page, rollout),
     )
     expect_failure(
         "rollout drill without its counterfactual",
