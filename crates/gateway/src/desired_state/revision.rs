@@ -32,7 +32,9 @@ use super::ids::{AuditEventId, MutationId, ResourceId, RevisionId, Slug};
 use super::models::{ModelError, Models};
 use super::mutation::{AuditEvent, ExpectedRevision, Mutation};
 use super::policy::{PolicyError, PolicySet};
+use super::providers::{ProviderError, Providers};
 use super::resource::{BlobRef, ResourceKind, ResourceRef, ResourceScope, ResourceVersion};
+use super::secrets::ForbiddenTransition;
 use super::tenancy::{Tenancy, TenancyError};
 
 /// Why a desired state is not a valid revision.
@@ -82,8 +84,17 @@ pub enum ValidationError {
     Tenancy(#[from] TenancyError),
     #[error("this revision's provider credentials are not valid: {0}")]
     Credential(#[from] CredentialError),
+    /// A credential's material was moved somewhere its current state does not
+    /// reach — staged material retired without ever serving, or withdrawn
+    /// material put back in service. The domain owns which moves exist; this is
+    /// how an administrative edit that asked for one that does not is refused
+    /// with the same typed failure every other invalid candidate carries.
+    #[error("this revision moves a credential's material illegally: {0}")]
+    CredentialTransition(#[from] ForbiddenTransition),
     #[error("this revision's policy is not valid: {0}")]
     Policy(#[from] PolicyError),
+    #[error("this revision's provider connections are not valid: {0}")]
+    Provider(#[from] ProviderError),
     /// Boxed so that this error — and every `Result` that carries it — stays the
     /// size it was before model bodies were typed.
     #[error("this revision's model contracts are not valid: {0}")]
@@ -139,6 +150,27 @@ impl DesiredState {
     /// carry forward into the next revision.
     pub fn declare_blob(&mut self, blob: BlobRef) -> &mut Self {
         self.blobs.insert(blob.digest, blob);
+        self
+    }
+
+    /// Drop declarations no resource references any more.
+    ///
+    /// An orphaned blob is a validation failure, and superseding the only
+    /// resource that referenced a payload orphans one: re-pointing a catalogue
+    /// row at a new snapshot would otherwise produce a candidate no author could
+    /// repair, because a declaration cannot be withdrawn one at a time. Content
+    /// addressing makes this safe — a digest nothing references contributes
+    /// nothing to the state — and it is the *author's* call, not validation's,
+    /// which is why it is an explicit step rather than a silent one inside
+    /// [`DesiredState::validate`].
+    pub fn retain_referenced_blobs(&mut self) -> &mut Self {
+        let referenced: BTreeSet<Checksum> = self
+            .resources
+            .values()
+            .filter_map(|resource| resource.body.blob())
+            .map(|blob| blob.digest)
+            .collect();
+        self.blobs.retain(|digest, _| referenced.contains(digest));
         self
     }
 
@@ -276,6 +308,13 @@ impl DesiredState {
         // optionally one of its projects — and a project that does not belong to
         // the tenant a credential names is tenancy's refusal to make, not a second
         // opinion about it here (#198).
+        // Provider connections before the credentials that authenticate to them:
+        // "is this endpoint dialable, and does this connection belong to the
+        // tenant it claims?" is a question about the provider row itself, and a
+        // credential naming an unreadable provider should be refused as the
+        // provider it is, not as a credential (#143).
+        Providers::of(self)?;
+
         Credentials::of(self)?;
 
         // A policy document states the scope it governs in tenancy's own terms

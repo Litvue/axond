@@ -101,27 +101,32 @@ pub fn load(path: &str) -> Result<Config, OpsError> {
         .map_err(|error| OpsError::Config(format!("failed to load config from `{path}`: {error}")))
 }
 
-/// Why `serve` will not start a replica against this config, if it will not.
+/// Why a stateful replica will not serve *inference*, if it will not.
 ///
-/// One definition for two callers: `serve` bails with it, and [`preflight`]
-/// reports it as a failed check, so an operator gating a rollout learns it from a
-/// command instead of from a crash loop. Both read the same function on purpose —
-/// when the runtime is wired to the control plane, deleting this makes both call
-/// sites fail to compile, rather than leaving a preflight that refuses every
-/// stateful deployment forever.
-pub fn serving_refusal(config: &Config) -> Option<&'static str> {
-    // Stateful bootstrap parses and validates (ADR 0027, #162), but the durable
-    // control plane it points at is not wired to the runtime (#141, #163, #142).
-    // A stateful cold boot must reach the control plane or fail loudly, so this
-    // refuses rather than serving the empty snapshot an unread control plane
-    // would leave behind.
+/// One definition for two callers: `serve` mounts it as the inference surface's
+/// refusal, and [`preflight`] reports it as a failed check, so an operator gating
+/// a rollout learns it from a command instead of from a crash loop.
+///
+/// It is no longer a refusal to *boot*: a stateful replica serves `/admin/v1`
+/// from the durable control plane (#143), which is how a deployment's desired
+/// state is written in the first place. What it cannot yet do is turn a revision
+/// into a runtime snapshot — a revision's resource bodies project through a
+/// [`RevisionProjection`](crate::convergence::RevisionProjection) that does not
+/// exist yet (#142) — and serving inference from the empty snapshot an
+/// unprojected control plane leaves behind would answer every caller as though
+/// the deployment were configured. So inference refuses, loudly and per request,
+/// rather than the process refusing to start.
+///
+/// When the projection lands, deleting this makes both call sites fail to
+/// compile, rather than leaving a refusal that outlives its reason.
+pub fn inference_refusal(config: &Config) -> Option<&'static str> {
     match config.mode {
         Mode::Stateless => None,
         Mode::Stateful => Some(
-            "`mode = \"stateful\"` is accepted by configuration validation, but the durable \
-             control plane it bootstraps is not implemented yet; a stateful replica must reach \
-             the control plane rather than serve an empty snapshot, so this process refuses to \
-             start. Use `mode = \"stateless\"` (the default) until the control plane ships.",
+            "`mode = \"stateful\"` serves `/admin/v1` against the control plane, but a published \
+             revision cannot yet be compiled into a runtime snapshot, so this replica refuses \
+             inference rather than serving an empty configuration. Use `mode = \"stateless\"` \
+             (the default) to serve inference until revision convergence ships.",
         ),
     }
 }

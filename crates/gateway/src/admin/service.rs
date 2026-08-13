@@ -341,6 +341,39 @@ impl AdminService {
         Ok(ConvergenceResult::of(report))
     }
 
+    /// Republish a retained revision's complete desired state as a new revision.
+    ///
+    /// A rollback is not a rewind: nothing is deleted, no revision is reopened,
+    /// and the chain keeps moving forward. It is an ordinary mutation whose
+    /// candidate happens to be a state that was published before, which is why it
+    /// goes through [`AdminService::apply`] and inherits every property that path
+    /// has — expected-revision preconditions, idempotent replay, complete
+    /// validation, dry run, diff, audit attribution, and one atomic publication.
+    ///
+    /// The target is hydrated whole rather than diffed onto the head: a revision
+    /// is complete, so "the state as of `target`" needs no replay of the
+    /// intervening changes and cannot half-apply.
+    pub async fn rollback(
+        &self,
+        grant: &AdminGrant,
+        request: &MutationRequest,
+        target: RevisionId,
+    ) -> Result<MutationOutcome, AdminError> {
+        let store = self.store()?;
+        if grant.action() != AdminAction::Rollback {
+            return Err(AdminError::Forbidden(AdminAuthError::ActionNotPermitted {
+                action: grant.action(),
+            }));
+        }
+        let restored = store.load_revision(target).await.map_err(log_store)?;
+        let restored = restored.state().clone();
+        self.apply(grant, request, &move |state: &mut DesiredState| {
+            state.clone_from(&restored);
+            Ok(())
+        })
+        .await
+    }
+
     /// Publish, or rehearse publishing, a complete candidate revision.
     ///
     /// The seven steps in this module's documentation, in order. A dry run stops
@@ -445,7 +478,27 @@ impl AdminService {
                 recorded_at: submitted_at,
             },
         };
-        let checksum = candidate.validated_checksum()?;
+        // A candidate built on a base that is no longer the head cannot be
+        // *judged* invalid: its invalidity may be an artefact of state the
+        // caller had not read — a project whose tenant another writer published
+        // is the ordinary case. The honest answer is the one the caller can act
+        // on, which is "re-read and retry", so staleness outranks invalidity
+        // here. A lost-response retry is unaffected: its candidate was valid
+        // when it was first built, and is rebuilt from the same base.
+        let checksum = match candidate.validated_checksum() {
+            Ok(checksum) => checksum,
+            Err(error) if !expected.matches(head) => {
+                debug!(
+                    rule = AdminError::from(error).rule(),
+                    "an invalid candidate was built on a stale base"
+                );
+                return Err(AdminError::RevisionConflict {
+                    expected,
+                    actual: head,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
         let diff = SemanticDiff::between(Some(current_state), &candidate.state)?;
         let base = base.map(|id| id.to_string());
 

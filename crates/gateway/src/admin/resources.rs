@@ -1,0 +1,682 @@
+//! The typed request documents `/admin/v1` accepts, and the edits they become.
+//!
+//! Every mutating administrative route is the same three steps, which is why
+//! they share one handler:
+//!
+//! 1. **Read a typed document.** A request body parses into a resource-specific
+//!    struct that names its identities explicitly and refuses unknown fields.
+//!    Nothing here reaches a backend, so a malformed body is
+//!    [`AdminError::RequestInvalid`] before the control plane is consulted.
+//! 2. **Turn it into a [`ResourcePlan`]:** the scope the change is attributed to,
+//!    and a [`DesiredStateEdit`] over the *complete* desired state.
+//! 3. **Hand both to [`super::service::AdminService::apply`]**, which owns everything else —
+//!    mode, authority, preconditions, complete-candidate validation, the diff,
+//!    dry-run purity, and one atomic publication.
+//!
+//! # Why identities are caller-supplied
+//!
+//! A create names the id it is creating. Minting one here would make a retry of
+//! a request whose response was lost build a *different* candidate under the
+//! same idempotency key, which the store correctly refuses as a reused key — the
+//! retry-safety property the protocol exists to provide would be defeated by the
+//! handler. The document a caller writes therefore names every id it creates,
+//! and resending that document is what makes a retry the same candidate.
+//!
+//! # Why an edit rather than a patch
+//!
+//! Each edit supersedes exactly the resource versions its document describes,
+//! against the state the service hydrated. It never removes a resource it was
+//! not asked about, and it never reaches a store: a handler that wanted to
+//! publish would have nothing to publish with.
+
+use std::sync::Arc;
+
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+
+use super::error::AdminError;
+use super::service::DesiredStateEdit;
+use crate::desired_state::{
+    AliasTarget, BlobKind, BlobRef, BudgetPolicy, CatalogOffering, Checksum, ConcurrencyPolicy,
+    DesiredState, DisplayName, ModelAliasBody, ModelEnablementBody, ModelLifecycle, ModelOwner,
+    ObservedPrice, OfferingId, PolicyBody, PolicyEpoch, PolicyScope, ProjectBody, ProjectId,
+    ProviderBody, ProviderCredentialBody, ResourceBody, ResourceId, ResourceKind, ResourceRef,
+    ResourceScope, ResourceVersion, ResourceVersionNumber, RevocationPolicy, SecretId,
+    SecretLifecycle, SecretOwner, SecretRef, SecretVersion, Slug, TenantBody, TenantId,
+    TenantLifecycle, ValidationError, WireFamily,
+};
+
+/// What a handler contributes to a mutation: where it applies, and what it does.
+pub struct ResourcePlan {
+    /// The scope the mutation is attributed to and authorized at — the scope of
+    /// the resource being changed, not the caller's own reach.
+    pub scope: ResourceScope,
+    pub edit: Arc<dyn DesiredStateEdit>,
+}
+
+impl ResourcePlan {
+    fn new<E>(scope: ResourceScope, edit: E) -> Self
+    where
+        E: Fn(&mut DesiredState) -> Result<(), ValidationError> + Send + Sync + 'static,
+    {
+        Self {
+            scope,
+            edit: Arc::new(edit),
+        }
+    }
+}
+
+/// A document one administrative route reads.
+pub trait AdminResourceRequest: DeserializeOwned + Send + Sync + 'static {
+    /// The schema name a refusal names, so a client learns which document it got
+    /// wrong rather than only that it got one wrong.
+    const SCHEMA: &'static str;
+
+    /// Resolve the document into the scope it changes and the edit it performs.
+    ///
+    /// Every failure here is a caller error about the *document* — an unparsable
+    /// id, a display name that is not one, an unknown wire family — never about
+    /// state, which this cannot see.
+    fn plan(self) -> Result<ResourcePlan, AdminError>;
+}
+
+/// The envelope every mutating route shares.
+///
+/// The resource document is nested rather than flattened so both halves can
+/// refuse unknown fields: a typo in a field name must not be read as an omission
+/// and published as a change the caller did not describe.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MutationEnvelope<R> {
+    /// The audit summary — why, in the author's words.
+    pub summary: String,
+    /// What kind of change this is, for the audit trail. Defaults to `update`,
+    /// which is the honest default for an upsert: a create says so.
+    #[serde(default)]
+    pub mutation: MutationKindInput,
+    pub resource: R,
+}
+
+/// The mutation kinds a caller may declare. Deliberately not
+/// [`MutationKind::Rollback`], which is the rollback route's own and not
+/// something an upsert may claim.
+///
+/// [`MutationKind::Rollback`]: crate::desired_state::MutationKind::Rollback
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationKindInput {
+    Create,
+    #[default]
+    Update,
+    Delete,
+    Rotate,
+}
+
+impl MutationKindInput {
+    pub const fn kind(self) -> crate::desired_state::MutationKind {
+        use crate::desired_state::MutationKind;
+        match self {
+            Self::Create => MutationKind::Create,
+            Self::Update => MutationKind::Update,
+            Self::Delete => MutationKind::Delete,
+            Self::Rotate => MutationKind::Rotate,
+        }
+    }
+}
+
+/// The body a rollback request carries: which retained revision to republish.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackRequest {
+    pub summary: String,
+    pub revision: String,
+    /// The scope the rollback is attributed to. Republishing a whole revision is
+    /// deployment-wide by nature, and a scoped grant cannot authorize it: the
+    /// field exists so the refusal is explicit rather than implied.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// The document `POST /admin/v1/tenants` reads.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantRequest {
+    pub tenant: String,
+    pub slug: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub lifecycle: Option<String>,
+}
+
+impl AdminResourceRequest for TenantRequest {
+    const SCHEMA: &'static str = "tenant";
+
+    fn plan(self) -> Result<ResourcePlan, AdminError> {
+        let tenant = tenant_id::<Self>(&self.tenant)?;
+        let slug = slug::<Self>(&self.slug)?;
+        let display_name = display_name::<Self>(&self.display_name)?;
+        let lifecycle = match self.lifecycle.as_deref() {
+            None => TenantLifecycle::Active,
+            Some(text) => {
+                TenantLifecycle::parse(text).ok_or_else(|| unknown::<Self>("lifecycle", text))?
+            }
+        };
+        // A tenant is deployment-scoped: creating one is not something a
+        // tenant-scoped administrator can authorize for themselves.
+        Ok(ResourcePlan::new(
+            ResourceScope::Deployment,
+            move |state: &mut DesiredState| {
+                let body = TenantBody::new(tenant, display_name.clone()).in_lifecycle(lifecycle);
+                let version = next_version(state, ResourceKind::Tenant, body.resource_id());
+                state.supersede(body.version_at(slug.clone(), version))?;
+                Ok(())
+            },
+        ))
+    }
+}
+
+/// The document `POST /admin/v1/projects` reads.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectRequest {
+    pub project: String,
+    pub tenant: String,
+    pub slug: String,
+    pub display_name: String,
+}
+
+impl AdminResourceRequest for ProjectRequest {
+    const SCHEMA: &'static str = "project";
+
+    fn plan(self) -> Result<ResourcePlan, AdminError> {
+        let project = project_id::<Self>(&self.project)?;
+        let tenant = tenant_id::<Self>(&self.tenant)?;
+        let slug = slug::<Self>(&self.slug)?;
+        let display_name = display_name::<Self>(&self.display_name)?;
+        let body = ProjectBody::new(project, tenant, display_name);
+        Ok(ResourcePlan::new(
+            body.scope(),
+            move |state: &mut DesiredState| {
+                let version = next_version(state, ResourceKind::Project, body.resource_id());
+                state.supersede(body.version_at(slug.clone(), version))?;
+                Ok(())
+            },
+        ))
+    }
+}
+
+/// The document `POST /admin/v1/providers` reads.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRequest {
+    pub provider: String,
+    pub tenant: String,
+    #[serde(default)]
+    pub project: Option<String>,
+    pub slug: String,
+    pub display_name: String,
+    pub wire_family: String,
+    pub endpoint: String,
+}
+
+impl AdminResourceRequest for ProviderRequest {
+    const SCHEMA: &'static str = "provider";
+
+    fn plan(self) -> Result<ResourcePlan, AdminError> {
+        let provider = resource_id::<Self>("provider", &self.provider)?;
+        let tenant = tenant_id::<Self>(&self.tenant)?;
+        let project = self
+            .project
+            .as_deref()
+            .map(project_id::<Self>)
+            .transpose()?;
+        let slug = slug::<Self>(&self.slug)?;
+        let display_name = display_name::<Self>(&self.display_name)?;
+        let wire_family = wire_family::<Self>(&self.wire_family)?;
+        let body = ProviderBody::for_tenant(
+            provider,
+            tenant,
+            display_name,
+            wire_family,
+            self.endpoint.clone(),
+        );
+        let body = match project {
+            Some(project) => body.owned_by_project(project),
+            None => body,
+        };
+        Ok(ResourcePlan::new(
+            body.scope(),
+            move |state: &mut DesiredState| {
+                let version = next_version(state, ResourceKind::Provider, body.resource_id());
+                state.supersede(body.version_at(slug.clone(), version))?;
+                Ok(())
+            },
+        ))
+    }
+}
+
+/// The document `POST /admin/v1/credentials` reads.
+///
+/// The secret is named, never carried: `secret` is a reference into the secret
+/// store, and no field on this document accepts material. A rotation is
+/// `rotate: true`, which advances the referenced version and re-stages it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialRequest {
+    pub credential: String,
+    pub tenant: String,
+    #[serde(default)]
+    pub project: Option<String>,
+    pub provider: String,
+    pub slug: String,
+    pub display_name: String,
+    pub secret: String,
+    #[serde(default)]
+    pub secret_version: Option<u64>,
+    #[serde(default)]
+    pub lifecycle: Option<String>,
+    #[serde(default)]
+    pub rotate: bool,
+}
+
+impl AdminResourceRequest for CredentialRequest {
+    const SCHEMA: &'static str = "provider-credential";
+
+    fn plan(self) -> Result<ResourcePlan, AdminError> {
+        let credential = resource_id::<Self>("credential", &self.credential)?;
+        let tenant = tenant_id::<Self>(&self.tenant)?;
+        let project = self
+            .project
+            .as_deref()
+            .map(project_id::<Self>)
+            .transpose()?;
+        let provider = resource_id::<Self>("provider", &self.provider)?;
+        let slug = slug::<Self>(&self.slug)?;
+        let display_name = display_name::<Self>(&self.display_name)?;
+        let secret = SecretId::parse(&self.secret)
+            .map_err(|error| malformed::<Self>("secret", &error.to_string()))?;
+        let version = match self.secret_version {
+            None => SecretVersion::FIRST,
+            Some(version) => SecretVersion::new(version)
+                .ok_or_else(|| malformed::<Self>("secret_version", "versions start at 1"))?,
+        };
+        let lifecycle = match self.lifecycle.as_deref() {
+            None => None,
+            Some(text) => Some(
+                SecretLifecycle::parse(text).ok_or_else(|| unknown::<Self>("lifecycle", text))?,
+            ),
+        };
+        let owner = match project {
+            Some(project) => SecretOwner::project(tenant, project),
+            None => SecretOwner::tenant(tenant),
+        };
+        let rotate = self.rotate;
+        Ok(ResourcePlan::new(
+            owner.scope(),
+            move |state: &mut DesiredState| {
+                let reference = state.version_of(ResourceKind::ProviderCredential, credential);
+                // A credential that exists moves from what it *is*: lifecycle is
+                // a transition the domain owns, not a field an author overwrites.
+                let previous = match reference {
+                    Some(resource) => Some(ProviderCredentialBody::read(resource)?),
+                    None => None,
+                };
+                let staged = ProviderCredentialBody::staged(
+                    credential,
+                    owner,
+                    provider,
+                    display_name.clone(),
+                    SecretRef::new(secret, version),
+                );
+                let body = match (previous, rotate) {
+                    (Some(previous), true) => previous.rotated(),
+                    (Some(previous), false) => previous,
+                    (None, _) => staged,
+                };
+                let body = match lifecycle {
+                    Some(lifecycle) => body.transitioned(lifecycle)?,
+                    None => body,
+                };
+                let next = next_version(state, ResourceKind::ProviderCredential, credential);
+                state.supersede(body.version_at(slug.clone(), next))?;
+                Ok(())
+            },
+        ))
+    }
+}
+
+/// The document `POST /admin/v1/catalogs` reads: the catalogue snapshot a model
+/// enablement pins.
+///
+/// The payload is not carried here — a snapshot is megabytes and lives in the
+/// catalogue store — so the document declares its content address and size, and
+/// the revision pins that digest.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogRequest {
+    pub catalog: String,
+    pub slug: String,
+    pub digest: String,
+    pub size_bytes: u64,
+}
+
+impl AdminResourceRequest for CatalogRequest {
+    const SCHEMA: &'static str = "catalog-snapshot";
+
+    fn plan(self) -> Result<ResourcePlan, AdminError> {
+        let catalog = resource_id::<Self>("catalog", &self.catalog)?;
+        let slug = slug::<Self>(&self.slug)?;
+        let digest = checksum::<Self>("digest", &self.digest)?;
+        let blob = BlobRef {
+            kind: BlobKind::CatalogSnapshot,
+            digest,
+            size_bytes: self.size_bytes,
+        };
+        Ok(ResourcePlan::new(
+            ResourceScope::Deployment,
+            move |state: &mut DesiredState| {
+                let version = next_version(state, ResourceKind::CatalogModel, catalog);
+                state.declare_blob(blob);
+                state.supersede(ResourceVersion::new(
+                    ResourceRef::new(ResourceKind::CatalogModel, catalog, version),
+                    ResourceScope::Deployment,
+                    slug.clone(),
+                    ResourceBody::Blob(blob),
+                ))?;
+                // Re-pointing a catalogue row at a new snapshot orphans the old
+                // payload's declaration, which is a validation failure no author
+                // could otherwise repair.
+                state.retain_referenced_blobs();
+                Ok(())
+            },
+        ))
+    }
+}
+
+/// The document `POST /admin/v1/models` reads: one offering, enabled for one
+/// scope, pinned to one catalogue snapshot.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelRequest {
+    pub enablement: String,
+    pub tenant: String,
+    #[serde(default)]
+    pub project: Option<String>,
+    pub slug: String,
+    pub offering: String,
+    pub catalog: String,
+    pub snapshot: String,
+    pub wire_family: String,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub observed_input_micros_per_million: Option<u64>,
+    #[serde(default)]
+    pub observed_output_micros_per_million: Option<u64>,
+}
+
+impl AdminResourceRequest for ModelRequest {
+    const SCHEMA: &'static str = "model-enablement";
+
+    fn plan(self) -> Result<ResourcePlan, AdminError> {
+        let enablement = resource_id::<Self>("enablement", &self.enablement)?;
+        let tenant = tenant_id::<Self>(&self.tenant)?;
+        let project = self
+            .project
+            .as_deref()
+            .map(project_id::<Self>)
+            .transpose()?;
+        let slug = slug::<Self>(&self.slug)?;
+        let offering = OfferingId::parse(&self.offering)
+            .map_err(|error| malformed::<Self>("offering", &error.to_string()))?;
+        let catalog = resource_id::<Self>("catalog", &self.catalog)?;
+        let snapshot = checksum::<Self>("snapshot", &self.snapshot)?;
+        let wire_family = wire_family::<Self>(&self.wire_family)?;
+        let state = match self.state.as_deref() {
+            None => ModelLifecycle::Enabled,
+            Some(text) => {
+                ModelLifecycle::parse(text).ok_or_else(|| unknown::<Self>("state", text))?
+            }
+        };
+        let observed = match (
+            self.observed_input_micros_per_million,
+            self.observed_output_micros_per_million,
+        ) {
+            (Some(input), Some(output)) => Some(ObservedPrice::new(input, output)),
+            (None, None) => None,
+            // Half a rate is not a rate: recording one side would publish a price
+            // nobody wrote.
+            _ => {
+                return Err(malformed::<Self>(
+                    "observed_input_micros_per_million",
+                    "an observed price needs both an input and an output rate",
+                ));
+            }
+        };
+        let owner = match project {
+            Some(project) => ModelOwner::project(tenant, project),
+            None => ModelOwner::tenant(tenant),
+        };
+        let body = ModelEnablementBody::new(
+            enablement,
+            owner,
+            CatalogOffering::new(offering, snapshot),
+            wire_family,
+        )
+        .transitioned(state);
+        let body = match observed {
+            Some(observed) => body.observing(observed),
+            None => body,
+        };
+        Ok(ResourcePlan::new(
+            owner.scope(),
+            move |state: &mut DesiredState| {
+                // The catalogue row is depended on at the version the state holds,
+                // so an enablement pins the snapshot that is actually published
+                // rather than a version the author guessed.
+                let pinned = state
+                    .version_of(ResourceKind::CatalogModel, catalog)
+                    .map_or(
+                        ResourceRef::new(
+                            ResourceKind::CatalogModel,
+                            catalog,
+                            ResourceVersionNumber::FIRST,
+                        ),
+                        |resource| resource.reference,
+                    );
+                let version = next_version(state, ResourceKind::ModelEnablement, enablement);
+                state.supersede(body.version_at(slug.clone(), version, pinned))?;
+                Ok(())
+            },
+        ))
+    }
+}
+
+/// One target of an alias, at the exact enablement version it was published
+/// against.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AliasTargetRequest {
+    pub enablement: String,
+    #[serde(default)]
+    pub version: Option<u64>,
+}
+
+/// The document `POST /admin/v1/aliases` reads.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AliasRequest {
+    pub alias: String,
+    pub tenant: String,
+    pub project: String,
+    pub slug: String,
+    pub wire_family: String,
+    #[serde(default)]
+    pub state: Option<String>,
+    pub targets: Vec<AliasTargetRequest>,
+}
+
+impl AdminResourceRequest for AliasRequest {
+    const SCHEMA: &'static str = "model-alias";
+
+    fn plan(self) -> Result<ResourcePlan, AdminError> {
+        let alias = resource_id::<Self>("alias", &self.alias)?;
+        let tenant = tenant_id::<Self>(&self.tenant)?;
+        let project = project_id::<Self>(&self.project)?;
+        let slug = slug::<Self>(&self.slug)?;
+        let wire_family = wire_family::<Self>(&self.wire_family)?;
+        let state = match self.state.as_deref() {
+            None => ModelLifecycle::Enabled,
+            Some(text) => {
+                ModelLifecycle::parse(text).ok_or_else(|| unknown::<Self>("state", text))?
+            }
+        };
+        let mut targets = Vec::with_capacity(self.targets.len());
+        for target in &self.targets {
+            let enablement = resource_id::<Self>("targets.enablement", &target.enablement)?;
+            let version = match target.version {
+                None => ResourceVersionNumber::FIRST,
+                Some(version) => ResourceVersionNumber::new(version)
+                    .ok_or_else(|| malformed::<Self>("targets.version", "versions start at 1"))?,
+            };
+            targets.push(AliasTarget::new(enablement, version));
+        }
+        let body =
+            ModelAliasBody::new(alias, tenant, project, wire_family, targets).transitioned(state);
+        Ok(ResourcePlan::new(
+            body.scope(),
+            move |state: &mut DesiredState| {
+                let version = next_version(state, ResourceKind::Alias, alias);
+                state.supersede(body.version_at(slug.clone(), version))?;
+                Ok(())
+            },
+        ))
+    }
+}
+
+/// The document `POST /admin/v1/policies` reads: budgets, limits, and revocation
+/// for one tenant or project.
+///
+/// What is deliberately absent is every bootstrap-owned field — which backend
+/// holds the ledger, its DSN, its key prefix, what happens when it is
+/// unreachable. Those are the process's, not the control plane's, and the policy
+/// body refuses them outright.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyRequest {
+    pub tenant: String,
+    #[serde(default)]
+    pub project: Option<String>,
+    pub slug: String,
+    pub epoch: u64,
+    pub subject_limit_microdollars: u64,
+    #[serde(default)]
+    pub namespace_limit_microdollars: Option<u64>,
+    pub reservation_ttl_seconds: u64,
+    pub max_in_flight_per_subject: u64,
+    pub lease_ttl_seconds: u64,
+    #[serde(default)]
+    pub minimum_token_epoch: u64,
+}
+
+impl AdminResourceRequest for PolicyRequest {
+    const SCHEMA: &'static str = "policy";
+
+    fn plan(self) -> Result<ResourcePlan, AdminError> {
+        let tenant = tenant_id::<Self>(&self.tenant)?;
+        let project = self
+            .project
+            .as_deref()
+            .map(project_id::<Self>)
+            .transpose()?;
+        let slug = slug::<Self>(&self.slug)?;
+        let epoch = PolicyEpoch::new(self.epoch)
+            .map_err(|error| malformed::<Self>("epoch", &error.to_string()))?;
+        let budget = BudgetPolicy::new(
+            self.subject_limit_microdollars,
+            self.namespace_limit_microdollars,
+            self.reservation_ttl_seconds,
+        )
+        .map_err(|error| malformed::<Self>("reservation_ttl_seconds", &error.to_string()))?;
+        let concurrency =
+            ConcurrencyPolicy::new(self.max_in_flight_per_subject, self.lease_ttl_seconds)
+                .map_err(|error| {
+                    malformed::<Self>("max_in_flight_per_subject", &error.to_string())
+                })?;
+        let revocation = RevocationPolicy::new(self.minimum_token_epoch);
+        let scope = match project {
+            Some(project) => PolicyScope::Project { tenant, project },
+            None => PolicyScope::Tenant(tenant),
+        };
+        let body = PolicyBody::new(scope, epoch, budget, concurrency, revocation);
+        Ok(ResourcePlan::new(
+            scope.resource_scope(),
+            move |state: &mut DesiredState| {
+                let version = next_version(state, ResourceKind::Policy, body.resource_id());
+                state.supersede(body.version_at(slug.clone(), version))?;
+                Ok(())
+            },
+        ))
+    }
+}
+
+/// The version a supersede publishes: the first, or one past what is there.
+fn next_version(state: &DesiredState, kind: ResourceKind, id: ResourceId) -> ResourceVersionNumber {
+    state
+        .version_of(kind, id)
+        .map_or(ResourceVersionNumber::FIRST, |resource| {
+            resource.reference.version.next()
+        })
+}
+
+fn resource_id<R: AdminResourceRequest>(
+    field: &'static str,
+    text: &str,
+) -> Result<ResourceId, AdminError> {
+    ResourceId::parse(text).map_err(|error| malformed::<R>(field, &error.to_string()))
+}
+
+fn tenant_id<R: AdminResourceRequest>(text: &str) -> Result<TenantId, AdminError> {
+    TenantId::parse(text).map_err(|error| malformed::<R>("tenant", &error.to_string()))
+}
+
+fn project_id<R: AdminResourceRequest>(text: &str) -> Result<ProjectId, AdminError> {
+    ProjectId::parse(text).map_err(|error| malformed::<R>("project", &error.to_string()))
+}
+
+fn slug<R: AdminResourceRequest>(text: &str) -> Result<Slug, AdminError> {
+    Slug::parse(text).map_err(|error| malformed::<R>("slug", &error.to_string()))
+}
+
+fn display_name<R: AdminResourceRequest>(text: &str) -> Result<DisplayName, AdminError> {
+    DisplayName::parse(text).map_err(|error| malformed::<R>("display_name", &error.to_string()))
+}
+
+fn checksum<R: AdminResourceRequest>(
+    field: &'static str,
+    text: &str,
+) -> Result<Checksum, AdminError> {
+    Checksum::parse(text).map_err(|error| malformed::<R>(field, &error.to_string()))
+}
+
+/// A wire family this build does not speak is a *compatibility* refusal, not a
+/// typo: a newer release may know it.
+fn wire_family<R: AdminResourceRequest>(text: &str) -> Result<WireFamily, AdminError> {
+    WireFamily::parse(text).ok_or_else(|| unknown::<R>("wire_family", text))
+}
+
+fn malformed<R: AdminResourceRequest>(field: &'static str, detail: &str) -> AdminError {
+    AdminError::RequestInvalid {
+        schema: R::SCHEMA,
+        detail: format!("`{field}`: {detail}"),
+    }
+}
+
+fn unknown<R: AdminResourceRequest>(field: &'static str, value: &str) -> AdminError {
+    AdminError::RequestInvalid {
+        schema: R::SCHEMA,
+        detail: format!("`{field}`: `{value}` is not a value this build knows"),
+    }
+}

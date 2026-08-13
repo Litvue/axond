@@ -549,6 +549,15 @@ impl TenantLifecycle {
         }
     }
 
+    /// The state a stored or requested identifier names, or `None` for text no
+    /// release wrote.
+    pub fn parse(input: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|state| state.as_str() == input)
+    }
+
     /// Whether a request may be served for this tenant's projects.
     pub const fn is_served(self) -> bool {
         matches!(self, Self::Active)

@@ -1458,6 +1458,12 @@ fn every_declared_code_is_reachable_distinct_and_prose_free() {
         AdminError::AuditSummaryInvalid,
         AdminError::DryRunInvalid,
         AdminError::HistoryLimitInvalid { max: 100 },
+        AdminError::RequestInvalid {
+            schema: "tenant",
+            // The caller's own document, echoed to the caller: unlike an
+            // operator detail, this is not the deployment's to keep.
+            detail: "`slug`: a slug is lowercase".to_owned(),
+        },
         AdminError::RouteNotFound,
         AdminError::MethodNotAllowed,
     ];
@@ -1930,10 +1936,14 @@ async fn a_precondition_header_that_is_not_readable_text_is_invalid_rather_than_
 }
 
 #[test]
-fn the_shipped_admin_table_is_empty_and_every_row_is_scoped_to_the_admin_prefix() {
-    // #143's handlers land as rows here; until then the boundary ships without
-    // any, and nothing mounts it in `serve`.
-    assert!(super::router::admin_route_specs().is_empty());
+fn every_shipped_row_is_scoped_to_the_admin_prefix_and_declares_its_action() {
+    for spec in super::router::admin_route_specs() {
+        assert!(
+            spec.path.starts_with('/') && !spec.path.starts_with(ADMIN_PREFIX),
+            "a shipped path is relative to the prefix: {}",
+            spec.path
+        );
+    }
     assert_eq!(ADMIN_PREFIX, "/admin/v1");
     for spec in test_specs() {
         assert!(

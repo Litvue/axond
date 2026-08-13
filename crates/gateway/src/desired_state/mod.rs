@@ -21,6 +21,7 @@
 //! | [`access`] | who may change it: the identity directory, the roles, and the authorization decision a mutation has to carry |
 //! | [`policy`] | the complete policy document of a tenant or a project, its generation, and how a change to it may be activated |
 //! | [`models`] | what a tenant may use and what a project calls it: typed model enablements and project-scoped aliases |
+//! | [`providers`] | where a tenant's traffic goes: the endpoint and dialect of one upstream connection, with no material in it |
 //!
 //! # Three properties everything else rests on
 //!
@@ -46,13 +47,13 @@
 //!
 //! It is not wired into the request path. The runtime remains stateless: nothing
 //! here is constructed by `serve`, and no snapshot is compiled from a revision
-//! yet. It is also not a complete body model: [`tenancy`], [`access`], [`policy`],
-//! and [`models`] are the only schemas the domain reads, and provider, catalogue,
-//! and pricing bodies remain owned by their own slices — [`access::Surface`] names
-//! those surfaces so they can be authorized against, which is not the same as
-//! authoring them. A policy document is a contract rather than an activation:
-//! nothing enforces one, and [`PolicyTransition`] states what enforcing a change
-//! *would* require of a fleet.
+//! yet. It is also not a complete body model: [`tenancy`], [`access`],
+//! [`policy`], [`models`], and [`providers`] are the schemas the domain reads,
+//! and catalogue and pricing bodies remain owned by their own slices —
+//! [`access::Surface`] names those surfaces so they can be authorized against,
+//! which is not the same as authoring them. A policy document is a contract
+//! rather than an activation: nothing enforces one, and [`PolicyTransition`]
+//! states what enforcing a change *would* require of a fleet.
 //!
 //! Nor is [`access`] request-path authorization. An inference request is
 //! authorized against the snapshot it captured when it started
@@ -70,6 +71,7 @@ pub mod ids;
 pub mod models;
 pub mod mutation;
 pub mod policy;
+pub mod providers;
 pub mod resource;
 pub mod revision;
 pub mod secrets;
@@ -124,6 +126,8 @@ pub use policy::{
     PolicyFence, PolicyGeneration, PolicyScope, PolicySet, PolicySnapshot, PolicyTransition,
     RevocationPolicy, TransitionClass, TransitionReason,
 };
+#[allow(unused_imports)]
+pub use providers::{PROVIDER_SCHEMA, Provider, ProviderBody, ProviderError, Providers};
 #[allow(unused_imports)]
 pub use resource::{
     BlobError, BlobKind, BlobRef, ResourceBody, ResourceKind, ResourceRef, ResourceScope,

@@ -45,15 +45,12 @@
 //!
 //! [adr]: https://github.com/Litvue/axond/blob/main/docs/adr/0027-stateless-and-stateful-operating-modes.md
 //!
-//! # Contract only
+//! # The table
 //!
-//! [`admin_route_specs`] is empty in this slice, and `serve` does not mount this
-//! router. Resource-specific handlers — providers, credentials, catalogues,
-//! prices, aliases, policy, tenants — are #143's, and each one is a spec plus an
-//! edit over the complete state, with the protocol properties above already held.
-//! What ships here is the boundary those handlers register into, its middleware,
-//! and the tests that hold it, mounted on a synthetic spec so the layer's
-//! behaviour is asserted rather than asserted-about.
+//! Every row is a resource document plus an edit: the handlers in
+//! [`super::handlers`] parse, plan, and delegate, and
+//! [`AdminService`] owns validation, preconditions, diffing, and publication.
+//! Adding a resource is a row here — never a second way to write state.
 //!
 //! [`AdminIdentity`]: super::auth::AdminIdentity
 //! [`MutationPreconditions`]: super::protocol::MutationPreconditions
@@ -73,8 +70,14 @@ use super::auth::{
     AdminAction, AdminAuthenticator, AdminAuthorizer, AdminGrant, AdminIdentity, AdminPresented,
 };
 use super::error::AdminError;
+use super::handlers;
 use super::protocol::{ADMIN_PREFIX, MutationPreconditions};
+use super::resources::{
+    AliasRequest, CatalogRequest, CredentialRequest, ModelRequest, PolicyRequest, ProjectRequest,
+    ProviderRequest, TenantRequest,
+};
 use super::service::AdminService;
+use crate::convergence::{RevisionReport, RevisionStatus};
 use crate::desired_state::ResourceScope;
 
 /// Everything an administrative handler needs: the service, and the two
@@ -83,6 +86,11 @@ pub struct AdminApi {
     pub service: Arc<AdminService>,
     pub authenticator: Arc<dyn AdminAuthenticator>,
     pub authorizer: Arc<dyn AdminAuthorizer>,
+    /// This replica's own convergence state, or `None` before a reconciler is
+    /// running. Read from the replica's cached status rather than from the
+    /// control plane, so "what am I serving" is answerable during an outage of
+    /// the store that would be needed to answer "what should I be serving".
+    pub convergence: Option<Arc<RevisionStatus>>,
 }
 
 impl AdminApi {
@@ -95,7 +103,25 @@ impl AdminApi {
             service,
             authenticator,
             authorizer,
+            convergence: None,
         }
+    }
+
+    /// Attach the replica's convergence status.
+    #[must_use]
+    pub fn with_convergence(mut self, status: Arc<RevisionStatus>) -> Self {
+        self.convergence = Some(status);
+        self
+    }
+
+    /// What this replica has converged onto. A replica with no reconciler — a
+    /// stateless one — has converged onto nothing, which the empty report says
+    /// without pretending to know more.
+    pub fn convergence_report(&self) -> RevisionReport {
+        self.convergence
+            .as_ref()
+            .map(|status| status.report())
+            .unwrap_or_default()
     }
 
     /// Establish an identity from what the request presented.
@@ -142,11 +168,79 @@ pub struct AdminRouteSpec {
 
 /// The administrative route table.
 ///
-/// Empty until #143 lands resource handlers. Deliberately a function returning a
-/// table rather than an absent module: the boundary, its middleware, and its
-/// tests exist now, so a handler is a row here plus an edit.
+/// Reads first, then the resource writes, then rollback. Every write is a
+/// `POST` upsert of one complete resource document rather than a `PATCH`: a
+/// partial write would have to merge against state the caller never saw, and
+/// the whole point of the expected-revision precondition is that a caller
+/// changes state it has read.
 pub fn admin_route_specs() -> Vec<AdminRouteSpec> {
-    Vec::new()
+    vec![
+        AdminRouteSpec {
+            path: "/state",
+            action: AdminAction::ReadState,
+            router: handlers::state_route,
+        },
+        AdminRouteSpec {
+            path: "/history",
+            action: AdminAction::ReadHistory,
+            router: handlers::history_route,
+        },
+        AdminRouteSpec {
+            path: "/audit/{revision}",
+            action: AdminAction::ReadAudit,
+            router: handlers::audit_route,
+        },
+        AdminRouteSpec {
+            path: "/convergence",
+            action: AdminAction::ReadConvergence,
+            router: handlers::convergence_route,
+        },
+        AdminRouteSpec {
+            path: "/tenants",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<TenantRequest>,
+        },
+        AdminRouteSpec {
+            path: "/projects",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<ProjectRequest>,
+        },
+        AdminRouteSpec {
+            path: "/providers",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<ProviderRequest>,
+        },
+        AdminRouteSpec {
+            path: "/credentials",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<CredentialRequest>,
+        },
+        AdminRouteSpec {
+            path: "/catalogs",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<CatalogRequest>,
+        },
+        AdminRouteSpec {
+            path: "/models",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<ModelRequest>,
+        },
+        AdminRouteSpec {
+            path: "/aliases",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<AliasRequest>,
+        },
+        AdminRouteSpec {
+            path: "/policies",
+            action: AdminAction::Publish,
+            router: handlers::publish_route::<PolicyRequest>,
+        },
+        AdminRouteSpec {
+            path: "/rollback",
+            action: AdminAction::Rollback,
+            router: handlers::rollback_route,
+        },
+    ]
 }
 
 /// Mount a table under [`ADMIN_PREFIX`].
@@ -181,6 +275,32 @@ pub(crate) fn mount(api: Arc<AdminApi>, specs: Vec<AdminRouteSpec>) -> Router {
 /// The administrative surface.
 pub fn router(api: Arc<AdminApi>) -> Router {
     mount(api, admin_route_specs())
+}
+
+/// The administrative surface a stateless deployment serves: every path, every
+/// method, refused as [`AdminError::StatefulModeRequired`].
+///
+/// Mounted rather than omitted, and refused *before* authentication rather than
+/// after, for two reasons. A stateless deployment has no administrative
+/// credential to authenticate against — `[[admin_breakglass]]` is rejected
+/// outside stateful mode — so `401` would be the answer to a question about the
+/// deployment's mode, which is not a secret and is exactly what the operator
+/// asked. And a `404` would be indistinguishable from an older build, leaving a
+/// tool to guess whether the surface is absent or the mode is wrong.
+///
+/// Nothing behind this can reach a backend: there is no state, no service, and
+/// no store — the refusal is the whole router.
+pub fn refusing_router() -> Router {
+    Router::new().nest(
+        ADMIN_PREFIX,
+        Router::new()
+            .fallback(stateful_mode_required)
+            .method_not_allowed_fallback(stateful_mode_required),
+    )
+}
+
+async fn stateful_mode_required() -> AdminError {
+    AdminError::StatefulModeRequired
 }
 
 /// An unknown `/admin/v1` path answers in the administrative envelope, so a

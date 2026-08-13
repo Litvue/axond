@@ -131,6 +131,15 @@ pub enum AdminError {
     DryRunInvalid,
     #[error("a history request may ask for at most {max} revisions")]
     HistoryLimitInvalid { max: u32 },
+    /// The request body is not the document the route reads. Separate from
+    /// [`AdminError::ValidationFailed`], which is about a *candidate revision*
+    /// the caller's edit produced: this one never got as far as an edit, so
+    /// nothing was read from the control plane to refuse it.
+    #[error("the request body is not a valid `{schema}` document: {detail}")]
+    RequestInvalid {
+        schema: &'static str,
+        detail: String,
+    },
     /// No such administrative route. Unlike `/v1`, where a `404` would be
     /// indistinguishable from a misconfigured `base_url`, an unknown
     /// `/admin/v1` path is a client error and says so in its own code.
@@ -166,6 +175,7 @@ impl AdminError {
         "audit_summary_invalid",
         "dry_run_invalid",
         "history_limit_invalid",
+        "admin_request_invalid",
         "admin_route_not_found",
         "admin_method_not_allowed",
     ];
@@ -193,6 +203,7 @@ impl AdminError {
             Self::AuditSummaryInvalid => "audit_summary_invalid",
             Self::DryRunInvalid => "dry_run_invalid",
             Self::HistoryLimitInvalid { .. } => "history_limit_invalid",
+            Self::RequestInvalid { .. } => "admin_request_invalid",
             Self::RouteNotFound => "admin_route_not_found",
             Self::MethodNotAllowed => "admin_method_not_allowed",
         }
@@ -212,7 +223,8 @@ impl AdminError {
             | Self::ValidationFailed { .. }
             | Self::AuditSummaryInvalid
             | Self::DryRunInvalid
-            | Self::HistoryLimitInvalid { .. } => StatusCode::BAD_REQUEST,
+            | Self::HistoryLimitInvalid { .. }
+            | Self::RequestInvalid { .. } => StatusCode::BAD_REQUEST,
             Self::RevisionConflict { .. }
             | Self::IdempotencyKeyReused { .. }
             | Self::ImmutableResourceVersion { .. } => StatusCode::CONFLICT,
@@ -258,7 +270,8 @@ impl AdminError {
             | Self::RevisionIncompatible { detail, .. }
             | Self::RevisionTooLarge { detail, .. }
             | Self::ControlPlaneUnavailable { detail }
-            | Self::ControlPlaneDenied { detail } => Some(detail),
+            | Self::ControlPlaneDenied { detail }
+            | Self::RequestInvalid { detail, .. } => Some(detail),
             _ => None,
         }
     }
@@ -386,9 +399,12 @@ fn validation_rule(error: &ValidationError) -> (&'static str, Option<ResourceRef
         // #243's credential records validate by their own rules; the resource is
         // named by the inner error's message, and the material never is.
         ValidationError::Credential(_) => ("provider_credential", None),
-        // #253's policy records validate by their own rules, and name the
-        // resource they are about without quoting its body.
+        ValidationError::CredentialTransition(_) => ("credential_transition", None),
+        // #253's policy records and #255's model contracts validate by their own
+        // rules, and name the resource they are about without quoting its body.
         ValidationError::Policy(policy) => ("policy", Some(policy.reference())),
+        ValidationError::Provider(_) => ("provider_connection", None),
+        ValidationError::Model(_) => ("model_contract", None),
         ValidationError::AuditMutationMismatch { .. } => ("audit_mutation_mismatch", None),
         ValidationError::Canonical(_) => ("not_canonical", None),
     }
