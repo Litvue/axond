@@ -92,8 +92,8 @@ pub(crate) mod oracle;
 #[allow(unused_imports)]
 pub use access::{
     AccessDenial, AccessRequest, Action, Authorization, Basis, Caller, Credential, Denial,
-    DenialReason, Directory, IDENTITY_SCHEMA, IdentityBody, IdentityError, IdentityKind, KeyError,
-    Principal, Role, Surface, WorkloadKey,
+    DenialPage, DenialReason, Directory, IDENTITY_SCHEMA, IdentityBody, IdentityError,
+    IdentityKind, KeyError, Principal, Role, Surface, WorkloadKey,
 };
 #[allow(unused_imports)]
 pub use canonical::{

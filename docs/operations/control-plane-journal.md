@@ -52,16 +52,87 @@ Two properties worth knowing before you plan capacity or retention:
   principal cannot be scoped into another tenant's project. Migration 0002 also
   adds row-level-security policies keyed on `axond.tenant_id`: a session that sets
   it sees deployment-wide rows and that tenant's, and a session that does not set
-  it — the publisher — is unrestricted. The policies cover every table that names
-  a tenant, including the two that name one indirectly: a grant is filtered
-  through its principal and an audit event through its mutation, so the
-  administrative journal and the roles it granted are inside the same wall as the
-  rows they describe. Authorization decisions stay in the service layer; the
-  policies are defence in depth.
-- **A retained name stays taken.** A tenant or project a later revision stops
-  declaring keeps its row and its name. Publishing a *different* tenant under a
+  it — the publisher — is unrestricted. Authorization decisions stay in the
+  service layer; the policies are defence in depth.
+
+  What is inside the wall: every table that names a tenant
+  (`axond_cp_resource_version`, `axond_cp_tenant`, `axond_cp_project`,
+  `axond_cp_principal`, `axond_cp_access_denial`, `axond_cp_mutation`), and every
+  table that names one indirectly, filtered through the row that owns it — a grant
+  through its principal, an audit event through its mutation, a manifest line and
+  a dependency edge through the resource version they point at, a deduplication
+  record through the mutation it replays. A refusal or a change that names *no*
+  tenant is shared state, but its actor is not: a deployment-scoped row attributed
+  to a workload is filtered by that workload's tenant too, so a pinned session
+  cannot read which service accounts of other tenants attempted what. A row that
+  names *this* tenant is this tenant's whoever attempted it — a refused
+  cross-tenant attempt is the event the trail is for, and hiding it from the
+  tenant it was aimed at would leave it readable by no one.
+
+  The publication chain — `axond_cp_head`, `axond_cp_revision`,
+  `axond_cp_revision_entry`, `axond_cp_revision_blob`, `axond_cp_blob`,
+  `axond_cp_resource_dependency` — has no tenant column to key a policy on, since
+  one revision is every tenant's desired state at one instant, so it is walled the
+  only way it can be: readable by the unpinned publisher and by nothing else. A
+  session pinned to a tenant reads its own rows through the tables above and none
+  of the chain that published them.
+
+  What is deliberately outside the wall is one table, `axond_cp_schema_migration`
+  — the schema's own version, which belongs to no tenant and is what an operator
+  reads to know which migrations ran. It is also exactly what a
+  `pg_class.relrowsecurity` audit reports as unprotected, so the list and the
+  database agree.
+
+  Two preconditions before you apply 0002 and 0003 to a deployment that is
+  already running. The policies are `FORCE`d so that they bind the table owner too — the
+  single-role install is the common one, and enabling row-level security that the
+  owning role bypasses would claim a wall that is not there — and `ALTER TABLE …
+  FORCE ROW LEVEL SECURITY` requires the migrating role to *own* every table it
+  names, so a deployment whose DDL is applied by a DBA role separate from the
+  application role must run them as the owner rather than as the migrator. And any
+  reader outside the gateway — a reporting job, a replica consumer — that already
+  sets `axond.tenant_id` on its sessions for its own reasons starts seeing
+  filtered rows the moment 0002 lands, silently and with no error: unset it there,
+  or accept that the reader is now tenant-scoped.
+- **A tenant a revision omits is retired, not left active.** A revision is the
+  whole desired state, so a tenant it stops declaring keeps its row — with its
+  projects, mutations, and audit trail — and that row is written to `lifecycle =
+  "deleted"`. Nothing serves an undeclared tenant, and this is what keeps the
+  column readable as the serving answer. Two consequences worth planning for: a
+  partial configuration retires every tenant it leaves out, so publish complete
+  desired state; and re-declaring the tenant in a later revision brings the row
+  back to whatever that revision says, history intact.
+
+  A revision that declares *no* tenant at all is the exception, and deliberately:
+  that is what every pre-tenancy revision in an upgraded deployment's journal
+  looks like, and rolling back to one republishes it. Reading that silence as a
+  deletion would make a rollback the most destructive operation the control plane
+  has, so a snapshot with no tenancy in it reconciles nothing. Emptying the tenant
+  list is therefore an explicit `lifecycle = "deleted"` on the last tenant rather
+  than an empty publication — which is also the only version of it an audit trail
+  can attribute.
+- **A retained project name stays taken.** A project a later revision stops
+  declaring keeps its row and its name. Publishing a *different* project under a
   retained name is refused rather than reported as a temporary failure: no retry
-  clears it, and the refusal names the conflict.
+  clears it, and the refusal names the conflict. Releasing a *tenant's* name is
+  automatic once it is retired — the uniqueness constraint ignores deleted rows —
+  and doing it while keeping the tenant declared means publishing it at
+  `lifecycle = "deleted"` and at the next version number of its *last published*
+  version — republishing a version number with different content is refused, so read the
+  current number out of the journal (`SELECT version FROM
+  axond_cp_resource_version WHERE resource_id = …`) rather than assuming it. Two
+  owners may also exchange names within one revision, and two principals may
+  exchange sign-ins or keys, since uniqueness is judged on the state a revision
+  declares rather than on the order its rows are written.
+- **A project's name has no release path yet.** A tenant's does, through
+  `lifecycle = "deleted"`; a project has no lifecycle, so once a revision stops
+  declaring a project its `(tenant, name)` stays taken for the life of the
+  deployment and re-using that name in that tenant is refused. Renaming the
+  retained project within the revision that drops it is the workaround: a project
+  that is still declared can be renamed, and uniqueness is judged on the declared
+  state. Giving a project the lifecycle a tenant has is a change to the tenancy
+  contract (#191) that its downstream consumers read, so it is follow-up work
+  rather than a widening smuggled into this slice.
 - **A disabled tenant serves nothing.** Only an active tenant's projects become
   servable namespaces. Disabling is what stops traffic; the rows stay for the
   history that points at them.
@@ -187,7 +258,15 @@ own schema changes out of band:
 ```bash
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0001_initial.sql
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0002_tenancy_access.sql
+psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0003_tenancy_constraints.sql
 ```
+
+0003 is where the deferrable name, identity, and ownership rules live, and it
+replaces the immediately-checked ones 0002 created — a deployment that applied
+0002 alone keeps refusing revisions in which two tenants trade names. It is a
+forward migration rather than an edit to 0002 for the reason the *Drifted* row
+below states: the ledger compares a recorded checksum against the shipped file,
+so an applied migration is immutable. Re-applying it is a no-op.
 
 That path does not write the ledger row, so the journal is then reported as
 *Unrecorded* — a ledger table that exists and records nothing — and both `status`

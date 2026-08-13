@@ -47,8 +47,8 @@ use async_trait::async_trait;
 
 use super::{BackendFailure, BackendKind, Capabilities, FailureCategory};
 use crate::desired_state::{
-    AccessDenial, AuditEvent, ExpectedRevision, IdempotencyKey, IntegrityError, LoadedRevision,
-    ResourceRef, RevisionCandidate, RevisionId, RevisionManifest, TenantId, ValidationError,
+    AccessDenial, AuditEvent, DenialPage, ExpectedRevision, IdempotencyKey, IntegrityError,
+    LoadedRevision, ResourceRef, RevisionCandidate, RevisionId, RevisionManifest, ValidationError,
 };
 
 /// The durable implementations a deployment may select for the control plane.
@@ -390,9 +390,30 @@ pub trait ControlPlaneStore: Send + Sync {
     /// trail must see attempts against their tenant, and must not see another
     /// tenant's. Deployment-scoped denials — refusals that named no tenant — are
     /// read with `None`, which only a platform-scoped caller may ask for.
+    ///
+    /// Scope-exact, and every refusal against the scope asked for is returned
+    /// whoever attempted it — including the cross-tenant attempt, which is the
+    /// event the trail exists for. Filtering the actor here as well would put such
+    /// a refusal on no page at all: not the targeted tenant's, by actor; not the
+    /// attempting tenant's, by scope; and not the deployment page, which is only
+    /// the rows that named no tenant.
+    ///
+    /// Which makes the *scope asked for* the whole authorization decision, and it
+    /// is decided above this trait: a tenant administrator's read passes their own
+    /// tenant, and `None` — the deployment page, the one place another tenant's
+    /// workload can appear as an actor — is a platform-scoped read. This store does
+    /// not re-derive that; it answers the scope it is given.
+    ///
+    /// Row-level security is a second wall rather than that decision. It engages
+    /// only for a session that pins `axond.tenant_id`, which the gateway's own
+    /// connections do not (they are the publisher, and the publisher writes every
+    /// tenant's rows); what it protects is every *other* reader of the same
+    /// database — a reporting job, a replica consumer, a psql session — where it
+    /// shares the deployment-scoped refusals and withholds the workload
+    /// attribution on the ones another tenant attempted.
     async fn denials(
         &self,
-        tenant: Option<TenantId>,
+        page: &DenialPage,
         limit: usize,
     ) -> Result<Vec<AccessDenial>, ControlPlaneError>;
 }
