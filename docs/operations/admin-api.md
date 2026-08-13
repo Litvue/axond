@@ -178,12 +178,15 @@ inherits from its tenant as well as what it overrides, because a project's
 enablements are overrides rather than a catalogue of its own.
 
 Because they publish no revision, they also write no `AuditEvent`: a successful
-stage, rotation, activation, revocation, or destruction is recorded as an
+stage, rotation, activation, revocation, or destruction is recorded only as an
 operational event on the `axond.admin.secrets` log target rather than in the
-control plane. Those events contain only actor, owner, opaque reference, and
-lifecycle metadata; retain them if you need to answer "who destroyed this
-version" later. Refusals of authority still record durably, as every other
-denial does.
+control plane. That is a process-log record, not a durable audit trail: its
+delivery and retention depend on the deployment's logging pipeline, and if it is
+dropped or expires there is no SecretStore audit history or backfill for
+`/admin/v1/audit/{revision}` to recover. The event contains only actor, owner,
+operation, opaque references, and lifecycle metadata. Refusals of authority are
+the exception and still record durably as access denials; a storage or lifecycle
+failure is not converted into an audit event either.
 
 Refusals from these routes describe the shape a field wants and never quote what
 was presented — a provider key pasted into `reference`, `secret`, `tenant`, or

@@ -2238,6 +2238,11 @@ async fn a_rotation_stages_the_next_version_beside_the_one_in_service() {
         .await;
     assert_eq!(versions["versions"][0]["lifecycle"], "disabled");
     assert_eq!(versions["versions"][0]["resolvable"], false);
+    assert_eq!(
+        deployment.store.published_revisions(),
+        0,
+        "secret material lifecycle calls do not publish a revision or AuditEvent"
+    );
 }
 
 /// The rotation an operator repeats — a retried request, or a second

@@ -127,6 +127,17 @@ Three properties follow from where the routes sit rather than from a rule:
   at once, and withdrawing it is exactly what fails the *next* candidate while
   the last-known-good snapshot keeps serving.
 
+**Audit follows the revision boundary.** `AuditEvent` belongs to a
+`ControlPlaneStore` mutation and is committed with the revision that records the
+desired state it changed. SecretStore stage, rotation, and lifecycle calls do
+not change that state, so they do not mint a synthetic revision or an audit row.
+Successful calls emit a material-free `axond.admin.secrets` operational log
+record instead. That log is subject to the deployment's normal delivery and
+retention guarantees; if it is lost, the actor and operation cannot be recovered
+from the control-plane audit endpoint. The separate credential-document
+publication remains a normal revision and is audited, and authorization denials
+remain durable access-denial records.
+
 **KEK rotation is an operator procedure, not a service.** The deployment KEK is
 referenced by `[secret_store]` and read once at boot, and this ADR deliberately
 ships no hosted key manager: rotating it means standing up the replacement

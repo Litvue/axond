@@ -8,9 +8,11 @@ running fleet when the database is unavailable.
 Stateful mode is still being assembled: this is the storage layer
 ([#165](https://github.com/Litvue/axond/issues/165)). Hydrating a revision into a
 runtime snapshot and converging replicas onto it are separate slices, so nothing
-described here is constructed by `serve` yet, and no `/admin/v1` route writes to
-it. Read [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md) for the
-mode as a whole.
+described here is constructed by `serve` yet. The mounted `/admin/v1` surface
+writes its desired-state routes to this journal; `/admin/v1/secrets` is the
+exception, because SecretStore material lifecycle calls write only the encrypted
+material store and no journal row or `AuditEvent`. Read [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md)
+for the mode as a whole.
 
 ## What is stored
 
