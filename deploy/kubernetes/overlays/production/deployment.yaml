@@ -56,10 +56,14 @@ spec:
               sleep:
                 seconds: 5
           # The memory request equals the limit: a gateway holding buffered
-          # request bodies should be Guaranteed rather than a candidate for
-          # eviction under node pressure. The limit stays at the base's 512Mi
-          # because the ConfigMap's `[admission]` ceilings are sized against it —
-          # raise `max_request_bytes`/`max_in_flight` and this limit together.
+          # request bodies then cannot use more memory than it requested, which
+          # makes it the last thing kubelet evicts under memory pressure. The
+          # QoS class is still Burstable, because the CPU limit is above its
+          # request on purpose — bursting through a spike is worth more here
+          # than the exemption Guaranteed would buy. The limit stays at the
+          # base's 512Mi because the ConfigMap's `[admission]` ceilings are
+          # sized against it — raise `max_request_bytes`/`max_in_flight` and
+          # this limit together.
           resources:
             requests:
               cpu: 500m

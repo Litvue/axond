@@ -80,7 +80,11 @@ def kustomize_command() -> list[str]:
         return ["kustomize", "build"]
     if shutil.which("kubectl"):
         return ["kubectl", "kustomize"]
-    raise RuntimeError("neither kustomize nor kubectl is available to render the manifests")
+    raise SystemExit(
+        "check-deploy-manifests: neither kustomize nor kubectl is installed, and this gate "
+        "renders the overlays rather than reading them; install one of the two (the CI runner "
+        "image ships both)"
+    )
 
 
 def render(directory: Path, components: tuple[Path, ...] = ()) -> list[Document]:

@@ -80,6 +80,14 @@ render() {
 step "Creating a three-worker cluster"
 # Three workers and a tainted control plane: exactly `replicas` schedulable
 # nodes, which is the cluster shape the deadlock needs.
+#
+# The control-plane node is part of that shape, not incidental to it. Topology
+# spread counts domains, and the default `nodeTaintsPolicy: Ignore` counts a
+# tainted node's domain too, so the control plane is a fourth hostname domain
+# holding zero axond Pods: the global minimum is 0, and a surge Pod on any
+# worker would take that worker to a skew of 2. Give the constraint
+# `nodeTaintsPolicy: Honor`, or let something schedule onto the control plane,
+# and the unscoped counterfactual below converges instead of deadlocking.
 cat >"${workdir}/kind.yaml" <<EOF
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4

@@ -59,8 +59,10 @@ evaluation:
   managed service) when a store runs elsewhere, and delete the ones this
   deployment does not configure;
 - requests raised to `500m`/`512Mi` with memory request equal to limit, so the
-  Pod is Guaranteed for memory and cannot be evicted under node pressure while
-  holding buffered request bodies;
+  Pod's memory usage can never exceed its request and it is the last candidate
+  kubelet evicts under memory pressure while holding buffered request bodies
+  (the CPU limit exceeds its request, so the QoS class is Burstable, not
+  Guaranteed);
 - a five-second `preStop` sleep, with `terminationGracePeriodSeconds: 45`
   covering it plus the process's own 25-second shutdown budget (see
   [Rollouts and termination](#rollouts-and-termination));
@@ -73,10 +75,10 @@ kubectl create namespace axond
 kubectl -n axond create secret generic axond-secrets \
   --from-literal=GW_INBOUND_PLATFORM_KEY=... \
   --from-literal=GW_PLATFORM_OPENAI_API_KEY=...
-digest="$(ops/pin-image-digest.sh --print 0.3.25)" # x-release-please-version
+digest="$(ops/pin-image-digest.sh --print 0.3.26)" # x-release-please-version
 SIGNER_IDENTITY=... GITHUB_REPOSITORY=Litvue/axond \
   ops/verify-image-evidence.sh "ghcr.io/litvue/axond@${digest}"
-ops/pin-image-digest.sh 0.3.25 # x-release-please-version
+ops/pin-image-digest.sh 0.3.26 # x-release-please-version
 kubectl apply -k deploy/kubernetes/overlays/production
 kubectl -n axond rollout status deployment/axond
 ```
@@ -107,8 +109,8 @@ the release you verified:
 
 ```bash
 ops/pin-image-digest.sh --check          # fails while the sentinel is unresolved
-ops/pin-image-digest.sh --print 0.3.25 # x-release-please-version, prints the digest
-ops/pin-image-digest.sh 0.3.25 # x-release-please-version, rewrites the overlay
+ops/pin-image-digest.sh --print 0.3.26 # x-release-please-version, prints the digest
+ops/pin-image-digest.sh 0.3.26 # x-release-please-version, rewrites the overlay
 ```
 
 Resolution insists on the multi-architecture index, so a digest naming one
