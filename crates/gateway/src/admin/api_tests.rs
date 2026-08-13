@@ -80,6 +80,37 @@ impl Deployment {
         .await
     }
 
+    /// A read, with its validator and the raw body: a `304` has no body to
+    /// parse, so a conditional read cannot be characterised through
+    /// [`Deployment::get`].
+    async fn get_conditional(
+        &self,
+        path: &str,
+        if_none_match: Option<&str>,
+    ) -> (StatusCode, Option<String>, Vec<u8>) {
+        let mut request = Request::get(format!("{ADMIN_PREFIX}{path}"))
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+        if let Some(validator) = if_none_match {
+            request = request.header(axum::http::header::IF_NONE_MATCH, validator);
+        }
+        let response = router(self.api.clone())
+            .oneshot(request.body(Body::empty()).expect("a request"))
+            .await
+            .expect("a response");
+        let status = response.status();
+        let etag = response
+            .headers()
+            .get(axum::http::header::ETAG)
+            .map(|value| value.to_str().expect("a readable validator").to_owned());
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("a body")
+            .to_bytes();
+        (status, etag, body.to_vec())
+    }
+
     /// Publish a document, with the preconditions a mutation must carry.
     async fn post(
         &self,
@@ -1208,6 +1239,143 @@ async fn history_is_bounded_newest_first_and_audit_names_the_actor() {
     assert_eq!(events[0]["actor"]["kind"], "human");
     assert_eq!(events[0]["actor"]["subject"], SUBJECT);
     assert_eq!(events[0]["summary"], "cap acme's spend and concurrency");
+}
+
+// ---------------------------------------------------------------------------
+// Conditional reads
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_read_a_caller_already_holds_answers_not_modified_without_a_body() {
+    let deployment = Deployment::new();
+    build(&deployment).await;
+
+    for path in ["/state", "/history", "/convergence"] {
+        let (status, etag, body) = deployment.get_conditional(path, None).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        let validator = etag.expect("every administrative read carries a validator");
+        // `/convergence` answers a weak validator, because its reported lag moves
+        // while nothing about the replica's convergence state does.
+        let expected = if path == "/convergence" { "W/\"" } else { "\"" };
+        assert!(validator.starts_with(expected), "{path}: {validator}");
+
+        let (status, repeat, body_again) = deployment.get_conditional(path, Some(&validator)).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED, "{path}");
+        // The validator is echoed on the `304`, so a poller keeps conditioning on
+        // the one it holds rather than falling back to full reads.
+        assert_eq!(repeat.as_deref(), Some(validator.as_str()), "{path}");
+        assert!(body_again.is_empty(), "{path}: a 304 carries no body");
+        assert!(!body.is_empty(), "{path}");
+
+        // `*` matches any current representation, and a read that answers has one.
+        let (status, _, _) = deployment.get_conditional(path, Some("*")).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn a_validator_stops_matching_once_the_state_it_described_changes() {
+    let deployment = Deployment::new();
+    let head = deployment
+        .publish(
+            "/tenants",
+            "key-1",
+            EXPECTED_REVISION_EMPTY,
+            &tenant_document(),
+        )
+        .await;
+    let (_, before, _) = deployment.get_conditional("/state", None).await;
+    let before = before.expect("a validator");
+
+    deployment
+        .publish("/projects", "key-2", &head, &project_document())
+        .await;
+
+    let (status, after, body) = deployment.get_conditional("/state", Some(&before)).await;
+    assert_eq!(status, StatusCode::OK);
+    let after = after.expect("a validator");
+    assert_ne!(after, before);
+    // The validator describes the bytes, not the revision: the projection a
+    // caller receives is the one its new validator was taken over.
+    let state: Value = serde_json::from_slice(&body).expect("a state view");
+    assert!(
+        state["resources"]
+            .as_array()
+            .expect("resources")
+            .iter()
+            .any(|resource| resource["kind"] == "project"),
+        "{state}",
+    );
+    let (status, _, _) = deployment.get_conditional("/state", Some(&after)).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+}
+
+#[tokio::test]
+async fn a_conditional_the_surface_cannot_use_is_answered_in_full() {
+    let deployment = Deployment::new();
+    build(&deployment).await;
+    let (_, validator, _) = deployment.get_conditional("/state", None).await;
+    let validator = validator.expect("a validator");
+
+    // A validator for another representation, a mangled one, and one this
+    // surface never issued: none may be read as a match, because a wrong `304`
+    // hands an operator a stale answer during an incident.
+    let (_, history, _) = deployment.get_conditional("/history", None).await;
+    let history = history.expect("a validator");
+    for conditional in [
+        history.clone(),
+        "\"not-a-checksum\"".to_owned(),
+        "garbage".to_owned(),
+        "W/\"not-a-checksum\"".to_owned(),
+        // Not an entity-tag: a doubled prefix names no representation, however
+        // closely the rest of it resembles the current one.
+        format!("W/W/{validator}"),
+    ] {
+        let (status, echoed, body) = deployment
+            .get_conditional("/state", Some(&conditional))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{conditional}");
+        assert_eq!(echoed.as_deref(), Some(validator.as_str()), "{conditional}");
+        assert!(!body.is_empty(), "{conditional}");
+    }
+
+    // A weak validator over the *current* representation can only be an
+    // intermediary weakening one that came from here, and still matches.
+    let (status, _, _) = deployment
+        .get_conditional("/state", Some(&format!("W/{validator}")))
+        .await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+}
+
+#[tokio::test]
+async fn a_conditional_read_is_still_authenticated_and_authorized() {
+    let deployment = Deployment::with_authorizer(FakeAdminAuthorizer::permissive());
+    build(&deployment).await;
+    let (_, validator, _) = deployment.get_conditional("/state", None).await;
+    let validator = validator.expect("a validator");
+
+    // A validator is not a credential: presenting one without an administrative
+    // credential is an unauthenticated read, not a free `304`.
+    let response = router(deployment.api.clone())
+        .oneshot(
+            Request::get(format!("{ADMIN_PREFIX}/state"))
+                .header(axum::http::header::IF_NONE_MATCH, &validator)
+                .body(Body::empty())
+                .expect("a request"),
+        )
+        .await
+        .expect("a response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response.headers().get(axum::http::header::ETAG).is_none());
+
+    // Nor does it bypass authorization: a caller without deployment authority
+    // is refused whether or not it names the representation.
+    let scoped = Deployment::with_authorizer(
+        FakeAdminAuthorizer::permissive().within(&[ResourceScope::Tenant(fixtures::tenant_id(1))]),
+    );
+    let (status, etag, _) = scoped.get_conditional("/state", Some(&validator)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(etag.is_none());
 }
 
 #[tokio::test]

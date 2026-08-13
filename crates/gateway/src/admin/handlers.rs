@@ -18,11 +18,12 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{MethodRouter, get, post};
 use serde::Deserialize;
 
 use super::auth::{AdminAction, AdminIdentity};
+use super::conditional::Conditional;
 use super::error::AdminError;
 use super::protocol::{AuditSummary, MutationPreconditions, MutationRequest};
 use super::reads::{
@@ -185,7 +186,8 @@ async fn rollback(
 async fn state(
     State(api): State<Arc<AdminApi>>,
     identity: AdminIdentity,
-) -> Result<Json<StateView>, AdminError> {
+    headers: HeaderMap,
+) -> Result<Conditional<StateView>, AdminError> {
     let grant = api
         .authorize(
             &identity,
@@ -194,7 +196,10 @@ async fn state(
             &ResourceScope::Deployment,
         )
         .await?;
-    Ok(Json(api.service.desired_state(&grant).await?))
+    Ok(Conditional::new(
+        &headers,
+        api.service.desired_state(&grant).await?,
+    ))
 }
 
 /// What a history read may ask for.
@@ -214,8 +219,9 @@ struct HistoryQuery {
 async fn history(
     State(api): State<Arc<AdminApi>>,
     identity: AdminIdentity,
+    headers: HeaderMap,
     query: Result<Query<HistoryQuery>, QueryRejection>,
-) -> Result<Json<RevisionPage>, AdminError> {
+) -> Result<Conditional<RevisionPage>, AdminError> {
     let Query(query) = query.map_err(|rejection| AdminError::RequestInvalid {
         schema: "history",
         detail: rejection.body_text(),
@@ -247,14 +253,15 @@ async fn history(
         .service
         .history(&grant, HistoryRequest { limit, start })
         .await?;
-    Ok(Json(page))
+    Ok(Conditional::new(&headers, page))
 }
 
 async fn audit(
     State(api): State<Arc<AdminApi>>,
     identity: AdminIdentity,
+    headers: HeaderMap,
     Path(revision): Path<String>,
-) -> Result<Json<AuditPage>, AdminError> {
+) -> Result<Conditional<AuditPage>, AdminError> {
     let grant = api
         .authorize(
             &identity,
@@ -267,7 +274,10 @@ async fn audit(
         schema: "audit",
         detail: format!("`revision`: {error}"),
     })?;
-    Ok(Json(api.service.audit(&grant, revision).await?))
+    Ok(Conditional::new(
+        &headers,
+        api.service.audit(&grant, revision).await?,
+    ))
 }
 
 /// What this replica has converged onto — answered from its own cached report,
@@ -275,7 +285,8 @@ async fn audit(
 async fn convergence(
     State(api): State<Arc<AdminApi>>,
     identity: AdminIdentity,
-) -> Result<Json<ConvergenceResult>, AdminError> {
+    headers: HeaderMap,
+) -> Result<Conditional<ConvergenceResult>, AdminError> {
     let grant = api
         .authorize(
             &identity,
@@ -285,7 +296,12 @@ async fn convergence(
         )
         .await?;
     let report = api.convergence_report();
-    Ok(Json(api.service.convergence(&grant, report.as_ref())?))
+    let result = api.service.convergence(&grant, report.as_ref())?;
+    // Validated over the state, not the bytes: `lag_ms` moves every millisecond
+    // a replica is behind, and the caller waiting on that is the one this read
+    // exists for.
+    let identity = result.identity();
+    Ok(Conditional::identified_by(&headers, result, &identity))
 }
 
 /// The scope a request names, from an optional tenant and project.

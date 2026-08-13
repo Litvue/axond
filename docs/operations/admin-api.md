@@ -146,6 +146,41 @@ Rollback never rewinds the journal. It reads an earlier revision's complete
 state and publishes it forward, so the history that produced an incident is
 still readable after the incident is undone.
 
+## Conditional reads
+
+Every read carries an `ETag` over the bytes of the response, and answers
+`304 Not Modified` — with the same validator and no body — to a request whose
+`If-None-Match` names it. A dashboard or a reconciler waiting for a revision to
+converge can therefore poll without paying for a control-plane read and a
+complete desired state on every tick.
+
+The validator is a digest of the projection, not a revision id: `/convergence`
+has no revision of its own to name, and a projection changes shape between
+releases while the revision does not. Treat it as opaque — compare it and echo
+it, and do not parse it. An `If-None-Match` this surface cannot read is treated
+as absent and answered in full, because a `304` against a validator nobody
+issued would hand an operator a stale answer mid-incident.
+
+`/state`, `/history` and `/audit/{revision}` are validated strongly, by their own
+bytes. `/convergence` is the exception: it reports how long this replica has been
+behind, so while it is behind its bytes differ on every read and a digest of them
+would never match — for exactly the caller that wants it to. That read is
+validated over the convergence *state* — everything but the growing `lag_ms`:
+the desired, loaded and active revisions, the snapshot source, the generation, the
+last convergence duration, the failure count and the rejection reason — and
+answers a weak validator, `W/"…"`. A `304` there may therefore withhold a body
+whose `lag_ms` has moved on; when a `200` arrives, the lag it reports is current.
+`If-None-Match` is compared weakly, so a caller sends back whatever validator it
+was given and needs no special handling.
+
+Every read also carries `Cache-Control: private, no-cache` and
+`Vary: Authorization`: these answers are per-caller — a tenant-scoped grant reads
+a narrower projection of the same revision — so an intermediary may keep a
+representation but must revalidate it, never serve it to another administrator.
+
+A validator is not a credential. A conditional read authenticates and is
+authorized exactly like an unconditional one, and a refusal carries no `ETag`.
+
 ## Scope
 
 An administrator's grant is deployment-, tenant-, or project-scoped, and a
