@@ -130,7 +130,7 @@ scope, and slug. Seven schemas exist today:
 | `axond.model-alias.v1` | a project-scoped name for an ordered list of enablements | `schema`, `alias_id`, `tenant_id`, `project_id`, `wire_family`, `state`, `targets` |
 | `axond.price-book.v1` | the deployment's approved price book | `schema`, `catalog_content_id`, `currency`, `unit`, `approval`, `rules` |
 
-Five rules hold for every body schema, present and future:
+Six rules hold for every body schema, present and future:
 
 - **The identifier is inside the checksummed body.** A replica reads the schema
   before it reads anything else, so a revision cannot be interpreted under a
@@ -158,7 +158,30 @@ Five rules hold for every body schema, present and future:
   validated nor refused — republish it from this build to have it checked. A
   model *enablement* has no such history, so an untyped enablement is
   `incompatible` like every other untyped body
-  ([ADR 0042](../adr/0042-model-enablement-and-alias-contracts.md)).
+  ([ADR 0042](../adr/0042-model-enablement-and-alias-contracts.md)). The
+  exception is the *absence* of the field and nothing else: an alias body that
+  carries a `schema` whose value is not text is read strictly and refused, so a
+  damaged marker cannot skip the alias rules unreported. Reads accommodate rows
+  already in the journal; the slice that gains an authoring path is where
+  refusing to *write* a new untyped alias belongs.
+- **A `schema` marker that is present and is not an identifier is damage, in
+  every schema.** Absence of the field is a body an older release wrote, and an
+  identifier this build does not know is a body a *newer* release wrote — both
+  `incompatible`, storage intact. A marker that is present and is not text is
+  neither: no release has ever written one, so it is reported as `corrupt`, and
+  the alert names the repair ("restore the row or republish the resource rather
+  than changing build"). The rule is the shared reader's, so it is the same for a
+  tenant, a project, a provider, a credential, a policy, a price book, an
+  enablement, and an alias — an operator is never told to roll a fleet forward
+  over a row a rewrite damaged.
+- **A sub-record is part of its schema.** `observed_price` and `approved_price`
+  in an enablement, and each entry of an alias's `targets`, define their own field
+  sets (`input_micros_per_million`/`output_micros_per_million`,
+  `price_id`/`version`, `enablement_id`/`version`). A key a newer release added
+  inside one is an unknown field — named by its path, as
+  `approved_price.effective_from` — and is the same `incompatible` refusal an
+  extra top-level field is, rather than a value read past and dropped. A value
+  that is missing or wrongly typed inside a sub-record is named by its path too.
 - **A body that declares a schema this build reads, and then is not one, is
   damage.** Past the identifier the field set is known, so a `v1` body missing a
   `v1` field, or carrying one whose type changed, is reported as `corrupt` and not

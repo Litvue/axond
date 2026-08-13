@@ -48,6 +48,17 @@ pub(super) trait BodyError: Sized {
         Self::unknown_field(reference, schema, field)
     }
     fn field_type(reference: ResourceRef, field: &'static str) -> Self;
+
+    /// A body whose `schema` is present and is not text, so the identifier that
+    /// decides how to read everything else is itself unreadable.
+    ///
+    /// Required rather than defaulted to the wrong-type refusal, because the two
+    /// call for opposite operator actions and every schema owes the same answer:
+    /// no release has ever written a marker that is not an identifier, so such a
+    /// row is damaged storage to restore or republish, never a build to roll
+    /// forward.
+    fn damaged_schema(reference: ResourceRef) -> Self;
+
     /// A field that must be a set of strings and is not.
     ///
     /// Defaulted to the wrong-type refusal, because "a set was expected here" is
@@ -161,7 +172,14 @@ impl<'a, E: BodyError> Record<'a, E> {
             fields,
             error: std::marker::PhantomData,
         };
-        let declared = record.string(SCHEMA_FIELD)?;
+        // Read directly rather than through `string`, so a marker that is
+        // present and not text is its own refusal: absence is a body written
+        // before this schema existed, while a non-text marker is a body no
+        // release wrote.
+        let CanonicalValue::String(declared) = record.value(SCHEMA_FIELD)? else {
+            return Err(E::damaged_schema(reference));
+        };
+        let declared = declared.as_str();
         let schema = *schemas
             .iter()
             .find(|candidate| **candidate == declared)
@@ -278,6 +296,43 @@ impl<'a, E: BodyError> Record<'a, E> {
             Some((_, CanonicalValue::String(text))) => Ok(Some(text)),
             Some(_) => Err(E::field_type(self.reference, field)),
         }
+    }
+
+    /// A nested record inside `field`, read as strictly as the body around it.
+    ///
+    /// A schema's sub-records are part of the schema, so a key they do not define
+    /// is an unknown field rather than a value to drop: a body a newer release
+    /// extended inside `approved_price` or inside a target must be a typed
+    /// compatibility refusal, exactly as one extended at the top level is.
+    /// The refusal names the path (`approved_price.effective_from`) so an
+    /// operator can tell which sub-record the field appeared in, which is what
+    /// separates this from [`nested`](Self::nested): the same strictness,
+    /// reported against the path rather than against the bare key.
+    pub(super) fn sub_record(
+        &self,
+        value: &'a CanonicalValue,
+        field: &'static str,
+        schema: &'static str,
+        known: &[&str],
+    ) -> Result<Self, E> {
+        let CanonicalValue::Map(fields) = value else {
+            return Err(E::field_type(self.reference, field));
+        };
+        if let Some((key, _)) = fields
+            .iter()
+            .find(|(key, _)| !known.contains(&key.as_str()))
+        {
+            return Err(E::unknown_field(
+                self.reference,
+                schema,
+                format!("{field}.{key}"),
+            ));
+        }
+        Ok(Self {
+            reference: self.reference,
+            fields,
+            error: std::marker::PhantomData,
+        })
     }
 
     /// A set-valued field of strings, refusing a list — order would be meaning —

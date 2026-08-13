@@ -579,6 +579,8 @@ pub enum BodySkew {
     Credential(CredentialError),
     #[error(transparent)]
     Policy(PolicyError),
+    #[error(transparent)]
+    Provider(ProviderError),
     /// Boxed for the same reason [`ValidationError::Model`] is.
     #[error(transparent)]
     Model(Box<ModelError>),
@@ -611,6 +613,12 @@ impl From<PolicyError> for BodySkew {
     }
 }
 
+impl From<ProviderError> for BodySkew {
+    fn from(error: ProviderError) -> Self {
+        Self::Provider(error)
+    }
+}
+
 impl From<ModelError> for BodySkew {
     fn from(error: ModelError) -> Self {
         Self::Model(Box::new(error))
@@ -630,6 +638,7 @@ impl BodySkew {
             Self::Tenancy(error) => error.reference(),
             Self::Credential(error) => error.reference(),
             Self::Policy(error) => error.reference(),
+            Self::Provider(error) => error.reference(),
             Self::Model(error) => error.reference(),
             Self::Pricing(error) => error.reference(),
         }
@@ -725,6 +734,9 @@ impl IntegrityError {
             }
             ValidationError::Policy(policy) if policy.is_incompatible() => {
                 Self::Incompatible(BodySkew::Policy(policy))
+            }
+            ValidationError::Provider(provider) if provider.is_incompatible() => {
+                Self::Incompatible(BodySkew::Provider(provider))
             }
             ValidationError::Model(model) if model.is_incompatible() => {
                 Self::Incompatible(BodySkew::Model(model))
