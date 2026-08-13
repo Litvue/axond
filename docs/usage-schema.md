@@ -149,7 +149,7 @@ fan-out accepted is not a record that was written, so these rows are telemetry
 rather than an accounting source.
 
 `[usage_journal] backend = "postgres"` opts into the **billing-grade** mode
-instead ([ADR 0035](./adr/0035-billing-grade-usage-outbox.md)): the event is
+instead ([ADR 0036](./adr/0036-billing-grade-usage-outbox.md)): the event is
 appended to a durable outbox before the request is answered, replayed into these
 same sinks until they acknowledge it, and a request whose event could not be made
 durable is answered `503 usage_not_durable` rather than `200`. The row shape does
