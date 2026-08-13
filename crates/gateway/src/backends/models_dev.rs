@@ -44,7 +44,9 @@
 //! addition does not freeze imports. Everything else is refused, with a pointer
 //! to the offending location:
 //!
-//! - a missing required field or a changed type (`"limit": {"context": "272000"}`);
+//! - a missing `id` or `name`, or a changed type
+//!   (`"limit": {"context": "272000"}`) — an omitted `modalities` or `limit` is
+//!   a record stating none, since every field inside them is itself optional;
 //! - an unrecognized enumerated value — a `status` or a modality — because
 //!   flattening one into "available" or dropping it would quietly change what an
 //!   operator sees;
@@ -340,7 +342,13 @@ struct WireModel {
     release_date: Option<String>,
     #[serde(default)]
     last_updated: Option<String>,
+    /// Absent is "unstated", not "changed meaning": a record that says nothing
+    /// about its modalities or limits is a record with none of them stated, and
+    /// refusing it would refuse the whole import over one offering. A *stated*
+    /// one of the wrong shape is still a type error.
+    #[serde(default)]
     modalities: WireModalities,
+    #[serde(default)]
     limit: WireLimit,
     #[serde(default)]
     cost: Option<WireCost>,
@@ -393,7 +401,7 @@ impl WireFlag {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct WireModalities {
     #[serde(default)]
     input: Vec<String>,
@@ -401,7 +409,7 @@ struct WireModalities {
     output: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct WireLimit {
     #[serde(default)]
     context: Option<u64>,
@@ -1892,6 +1900,28 @@ mod tests {
                 "`{malformed}` is not a JSON number"
             );
         }
+    }
+
+    /// A record that says nothing about its modalities or limits states none of
+    /// them, rather than costing the whole import: every field inside both is
+    /// itself optional, so there is no meaning to lose. A *stated* one of the
+    /// wrong shape is still refused — `drift.limit-type` covers that.
+    #[test]
+    fn a_record_stating_no_modalities_or_limits_is_a_record_stating_none() {
+        let payload = r#"{
+          "models": {},
+          "providers": {
+            "openai": {
+              "id": "openai", "name": "OpenAI",
+              "models": { "gpt-4o": { "id": "gpt-4o", "name": "GPT-4o" } }
+            }
+          }
+        }"#;
+        let snapshot = parse(payload).expect("an unstated field is not changed meaning");
+        let offering = &snapshot.content.models()[0].offerings[0];
+        assert_eq!(offering.facts.limits, ModelLimits::default());
+        assert!(offering.facts.input_modalities.is_empty());
+        assert!(offering.facts.output_modalities.is_empty());
     }
 
     #[test]

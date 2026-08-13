@@ -88,6 +88,18 @@ model rather than two models: what identifies an offering is
 `(provider, published_model_id)`, and a projection of distinct models is
 therefore a projection of the catalogue's models.
 
+**One normalization is a reconciliation rather than a transcription**, and it is
+the only one: the upstream states a single long-context schedule in two
+spellings, `tiers[]` and the older `context_over_200k` key, and where the two
+agree on rates the schedule is recorded once, at the legacy 200k boundary — the
+lower of the two, and therefore the boundary from which those rates already
+applied. Only the lowest tier above 200k can be that same schedule, so a
+differently-priced tier in between leaves both stated tiers standing. The stored
+threshold can therefore be lower than the `size` the payload literally states,
+which price activation must reconcile against the observation rather than
+against the document; a payload whose two spellings disagree on rates is refused
+outright.
+
 **A real excerpt of the source document is compiled into the binary** as an
 offline seed and parsed through the same strict adapter as a fetched payload, so
 the seed cannot drift from the parser and an air-gapped deployment still has a

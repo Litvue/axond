@@ -129,6 +129,22 @@ impl SourceValidators {
     pub fn is_empty(&self) -> bool {
         self.etag.is_none() && self.last_modified.is_none()
     }
+
+    /// Take each validator `stated` about content already held, keeping the held
+    /// value where the answer states none.
+    ///
+    /// An unstated validator is not a withdrawn one: intermediaries drop them,
+    /// and dropping the held value in turn would leave nothing to ask
+    /// conditionally with, turning every later refresh into a full transfer of a
+    /// document already in hand.
+    pub fn carry_over(&mut self, stated: Self) {
+        if let Some(etag) = stated.etag {
+            self.etag = Some(etag);
+        }
+        if let Some(last_modified) = stated.last_modified {
+            self.last_modified = Some(last_modified);
+        }
+    }
 }
 
 /// The identity of normalized catalogue content: the SHA-256 of its canonical
@@ -1870,11 +1886,20 @@ impl LastKnownGoodCatalog {
     /// its content's, and admitting content while reporting `Unchanged` is the one
     /// outcome this type exists to prevent. The two agree for anything
     /// [`source_snapshot`] built.
-    pub fn admit(&mut self, snapshot: CatalogSnapshot) -> Admission {
+    /// Validators are replaced wholesale only when the content is: a full answer
+    /// whose content turns out to be the content already active is the `304`
+    /// case with a body, so its validators are carried over the held ones by
+    /// [`SourceValidators::carry_over`] rather than replacing them — an
+    /// intermediary that serves identical bytes without an `ETag` must not cost
+    /// the tag that still describes them.
+    pub fn admit(&mut self, mut snapshot: CatalogSnapshot) -> Admission {
         let content_id = snapshot.content.content_id();
         let admission = match self.active.as_ref() {
             None => Admission::Initial { content_id },
             Some(active) if active.content.content_id() == content_id => {
+                let mut held = active.source.validators.clone();
+                held.carry_over(std::mem::take(&mut snapshot.source.validators));
+                snapshot.source.validators = held;
                 Admission::Unchanged { content_id }
             }
             Some(active) => Admission::Updated {
@@ -1912,13 +1937,7 @@ impl LastKnownGoodCatalog {
         let Some(active) = self.active.as_mut() else {
             return false;
         };
-        let held = &mut active.source.validators;
-        if let Some(etag) = validators.etag {
-            held.etag = Some(etag);
-        }
-        if let Some(last_modified) = validators.last_modified {
-            held.last_modified = Some(last_modified);
-        }
+        active.source.validators.carry_over(validators);
         active.source.fetched_at = checked_at;
         true
     }
@@ -2684,9 +2703,28 @@ mod tests {
             Some(&SourceValidators::etag("\"two\""))
         );
 
+        // An answer that states none keeps the held one: it still describes the
+        // content that stayed active, and dropping it would make every later
+        // refresh transfer the whole document again.
+        let admission = catalogue.admit(snapshot(content.clone(), SourceValidators::default()));
+        assert_eq!(
+            admission,
+            Admission::Unchanged {
+                content_id: content.content_id()
+            }
+        );
+        assert_eq!(
+            catalogue.validators(),
+            Some(&SourceValidators::etag("\"two\"")),
+            "an intermediary stripping the tag must not cost the tag"
+        );
+
         let updated = content_with_price(3);
         let admission = catalogue.admit(snapshot(updated, SourceValidators::default()));
         assert!(matches!(admission, Admission::Updated { diff, .. } if diff.has_price_changes()));
+        // New content, on the other hand, is described by the validators it
+        // arrived with and by nothing that came before it.
+        assert_eq!(catalogue.validators(), Some(&SourceValidators::default()));
     }
 
     fn content_with_price(input: u64) -> CatalogContent {
