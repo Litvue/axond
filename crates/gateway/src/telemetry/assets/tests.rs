@@ -178,6 +178,15 @@ fn the_derived_cadence_cannot_outrun_the_pipeline_that_watches_it() {
         "a round may take {cap:?} while AxondStatusObservationsStale calls {stale_threshold}ms \
          stale, so a deployment paced at the cap pages while observing normally"
     );
+    // And the replica agrees with the rule about the word: an operator paged for
+    // a stale observation reads `stale` on the status page rather than an `ok`
+    // the registry still believes in.
+    assert!(
+        crate::status::probes::MAX_STALENESS_BUDGET <= Duration::from_millis(stale_threshold),
+        "the registry keeps an observation usable for \
+         {:?} while the rule pages at {stale_threshold}ms",
+        crate::status::probes::MAX_STALENESS_BUDGET
+    );
 }
 
 /// Cardinality, from the asset side: the only drill-downs offered are the four

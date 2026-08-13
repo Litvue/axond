@@ -91,8 +91,10 @@ impl ControlPlaneProbe {
             refresh_interval,
             // Three rounds: one slow round and one missed round are not a stale
             // observation, and the rule that pages for a refresher which stopped
-            // entirely is `AxondStatusRefresherStalled`.
-            staleness_budget: refresh_interval.saturating_mul(3),
+            // entirely is `AxondStatusRefresherStalled`. Never past
+            // [`MAX_STALENESS_BUDGET`], so the replica has already coarsened the
+            // component to `stale` by the time the age rule pages for it.
+            staleness_budget: refresh_interval.saturating_mul(3).min(MAX_STALENESS_BUDGET),
             enabled: vec![Component::ControlPlane],
         }
     }
@@ -116,6 +118,16 @@ const MAX_SPACING: Duration = Duration::from_secs(30);
 /// below the exporter's window, and pinned against it by
 /// `the_derived_cadence_cannot_outrun_the_pipeline_that_watches_it`.
 pub const MAX_REFRESH_INTERVAL: Duration = Duration::from_secs(4 * 60);
+
+/// The oldest an observation may be before the replica itself calls it `stale`.
+///
+/// Held at or below `AxondStatusObservationsStale`'s threshold so the two agree
+/// on the word: an operator paged for a stale observation must find the
+/// component reported `degraded`/`stale` when they read
+/// `GET /admin/v1/status`, not an `ok` the registry still believes in. Pinned
+/// against the rule by
+/// `the_derived_cadence_cannot_outrun_the_pipeline_that_watches_it`.
+pub const MAX_STALENESS_BUDGET: Duration = Duration::from_secs(5 * 60);
 
 #[async_trait]
 impl ComponentProbe for ControlPlaneProbe {
@@ -290,6 +302,13 @@ mod tests {
                 pacing.refresh_interval <= MAX_REFRESH_INTERVAL,
                 "connect {connect_ms}ms, operation {operation_ms}ms outruns the pipeline: \
                  {pacing:?}"
+            );
+            // And the registry's own definition of stale stays inside the one
+            // the shipped rule pages on.
+            assert!(
+                pacing.staleness_budget <= MAX_STALENESS_BUDGET,
+                "connect {connect_ms}ms, operation {operation_ms}ms would page for an observation \
+                 the replica still calls fresh: {pacing:?}"
             );
         }
     }
