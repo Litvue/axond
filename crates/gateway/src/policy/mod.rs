@@ -218,24 +218,37 @@ impl PolicyRuntime {
         };
         let runtime = Arc::clone(self);
         handle.spawn(async move {
-            loop {
-                let until = {
-                    let lingering = runtime.lingering.lock().expect("not poisoned");
-                    match lingering.get(&generation) {
-                        Some(waiting) => waiting.until,
-                        None => return,
-                    }
-                };
-                if Instant::now() >= until {
-                    break;
-                }
+            while let Some(until) = runtime.release_lingering_if_expired(generation) {
                 tokio::time::sleep_until(until).await;
             }
-            runtime.release_lingering(generation);
         });
     }
 
-    /// Exit every hold that was waiting out `generation`'s reservation TTL.
+    /// Release the holds waiting under `generation` if their deadline has
+    /// passed, or answer the deadline still to wait for.
+    ///
+    /// One lock acquisition decides *and* removes, because the two cannot be
+    /// separated: between a timer deciding the deadline had passed and removing
+    /// the entry, another failed reserve would join the entry it can still see —
+    /// adding a hold and a later deadline that the removal would then throw away,
+    /// reporting a drain finished over spend the store may still hold.
+    fn release_lingering_if_expired(&self, generation: PolicyGeneration) -> Option<Instant> {
+        let held = {
+            let mut lingering = self.lingering.lock().expect("not poisoned");
+            let waiting = lingering.get(&generation)?;
+            if Instant::now() < waiting.until {
+                return Some(waiting.until);
+            }
+            lingering.remove(&generation)?.held
+        };
+        for _ in 0..held {
+            self.exit(Some(generation));
+        }
+        None
+    }
+
+    /// Exit every hold waiting out `generation`'s reservation TTL, deadline or
+    /// no deadline: for the caller that has no runtime to wait on.
     fn release_lingering(&self, generation: PolicyGeneration) {
         let Some(waiting) = self
             .lingering
@@ -461,6 +474,35 @@ mod tests {
         tokio::time::sleep(ttl).await;
         assert_eq!(runtime.outstanding(held), 0);
         assert!(runtime.lingering.lock().expect("not poisoned").is_empty());
+    }
+
+    /// A failure arriving at the deadline the shared timer is firing on joins
+    /// the *next* wait or starts one, and is never swept out with the batch it
+    /// missed: deciding the deadline has passed and removing the entry is one
+    /// step, so nothing can be added in between and released early.
+    #[tokio::test(start_paused = true)]
+    async fn a_hold_lingering_at_the_deadline_still_waits_out_its_own_ttl() {
+        let runtime = std::sync::Arc::new(runtime());
+        let held = generation(&body(scope(), 1, 1_000), 1);
+        let ttl = Duration::from_secs(300);
+
+        runtime.enter(Some(held));
+        runtime.linger(held, ttl);
+        tokio::time::sleep(ttl).await;
+
+        // Whether the timer has already swept the first one or is about to, the
+        // second joins a live entry or opens a new one — either way it owes a
+        // full TTL from now, and nothing releases it with the batch it missed.
+        runtime.enter(Some(held));
+        runtime.linger(held, ttl);
+
+        tokio::time::sleep(ttl - Duration::from_secs(1)).await;
+        assert!(
+            runtime.outstanding(held) >= 1,
+            "a hold taken at the deadline was released with the batch before it"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(runtime.outstanding(held), 0);
     }
 
     /// A namespace served under the bootstrap file has no generation, so it has
