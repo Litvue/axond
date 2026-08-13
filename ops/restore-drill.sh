@@ -102,11 +102,14 @@ docker run --detach --name "$container" \
   -c max_wal_senders=4 >/dev/null
 docker exec -u postgres "$container" mkdir -p "$archive"
 
+# Over TCP rather than the socket: the image's initdb-time server listens on the
+# socket alone, so a socket probe can report ready before the real server exists
+# and the first statement would race its shutdown.
 for _ in $(seq 60); do
-  if docker exec -u postgres "$container" pg_isready -q -p 5432; then break; fi
+  if docker exec -u postgres "$container" pg_isready -q -h 127.0.0.1 -p 5432; then break; fi
   sleep 1
 done
-docker exec -u postgres "$container" pg_isready -p 5432 >/dev/null ||
+docker exec -u postgres "$container" pg_isready -h 127.0.0.1 -p 5432 >/dev/null ||
   fail "postgres did not become ready"
 
 # One database per recovery, so the logical restore is checked against its source

@@ -62,7 +62,8 @@ evaluation:
 
 ```bash
 digest="$(ops/pin-image-digest.sh --print 0.3.21)"
-SIGNER_IDENTITY=... ops/verify-image-evidence.sh "ghcr.io/litvue/axond@${digest}"
+SIGNER_IDENTITY=... GITHUB_REPOSITORY=Litvue/axond \
+  ops/verify-image-evidence.sh "ghcr.io/litvue/axond@${digest}"
 ops/pin-image-digest.sh 0.3.21
 kubectl apply -k deploy/kubernetes/overlays/production
 kubectl -n axond rollout status deployment/axond

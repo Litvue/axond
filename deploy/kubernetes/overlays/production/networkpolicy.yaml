@@ -96,5 +96,7 @@ spec:
             matchLabels:
               app.kubernetes.io/name: opentelemetry-collector
       ports:
+        # Axond exports OTLP/HTTP only — a `grpc` protocol is a boot error — so
+        # the collector's HTTP receiver on 4318 is the only port it ever dials.
         - protocol: TCP
-          port: 4317
+          port: 4318

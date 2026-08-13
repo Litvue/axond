@@ -60,6 +60,7 @@ CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 SCHEMA_SOURCE = ROOT / "crates/gateway/src/backends/control_plane/schema.rs"
 REVOCATION_SOURCE = ROOT / "crates/gateway/src/revocation/redis.rs"
 DRILL = ROOT / "ops/restore-drill.sh"
+TELEMETRY_SOURCE = ROOT / "crates/gateway/src/telemetry/mod.rs"
 
 IMAGE_REPOSITORY = "ghcr.io/litvue/axond"
 # The digest the production overlay ships with. It is not a real image, and that
@@ -89,22 +90,21 @@ def render(directory: Path, components: tuple[Path, ...] = ()) -> list[Document]
     way an operator's own overlay would refer to a vendored copy.
     """
     if not components:
-        target = str(directory)
-        cwd: Path | None = None
-    else:
-        holder = tempfile.mkdtemp(prefix="axond-kustomize-")
-        relative = os.path.relpath(directory, holder)
+        return kustomize(str(directory), None)
+    with tempfile.TemporaryDirectory(prefix="axond-kustomize-") as holder:
         lines = [
             "apiVersion: kustomize.config.k8s.io/v1beta1",
             "kind: Kustomization",
             "resources:",
-            f"  - {relative}",
+            f"  - {os.path.relpath(directory, holder)}",
             "components:",
         ]
         lines.extend(f"  - {os.path.relpath(component, holder)}" for component in components)
         Path(holder, "kustomization.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
-        target = "."
-        cwd = Path(holder)
+        return kustomize(".", Path(holder))
+
+
+def kustomize(target: str, cwd: Path | None) -> list[Document]:
     completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
         [*kustomize_command(), target],
         cwd=cwd,
@@ -353,6 +353,37 @@ def check_network_policies(documents: list[Document]) -> list[str]:
     return failures
 
 
+def check_telemetry_egress(documents: list[Document], telemetry_source: str) -> list[str]:
+    """The collector egress port is the one axond's exporter can actually dial.
+
+    Axond exports OTLP over HTTP only, so an allowance for the gRPC receiver is a
+    policy that permits a flow that never happens while denying the one that does
+    — telemetry then stops with no error the cluster reports.
+    """
+    if 'Some("http/protobuf")' not in telemetry_source:
+        return [
+            "crates/gateway/src/telemetry/mod.rs no longer names the OTLP protocol this policy "
+            "was written for; re-derive the collector egress port"
+        ]
+    failures: list[str] = []
+    allowed: set[int] = set()
+    for policy in of_kind(documents, "NetworkPolicy"):
+        for rule in policy["spec"].get("egress", []):
+            selectors = [
+                peer.get("podSelector", {}).get("matchLabels", {}).get("app.kubernetes.io/name")
+                for peer in rule.get("to", [])
+            ]
+            if "opentelemetry-collector" not in selectors:
+                continue
+            allowed |= {port.get("port") for port in rule.get("ports", [])}
+    if allowed and allowed != {4318}:
+        failures.append(
+            f"overlays/production: telemetry egress allows {sorted(allowed)}, but axond exports "
+            "OTLP/HTTP only, whose receiver is 4318; a gRPC allowance drops every export"
+        )
+    return failures
+
+
 def check_service_port(documents: list[Document], label: str) -> list[str]:
     """The Service, the container port, and `[server] bind` name one port."""
     config = gateway_config(documents)
@@ -588,6 +619,7 @@ def gate(base: list[Document], production: list[Document], autoscaled: list[Docu
         *check_service_port(production, "overlays/production"),
         *check_topology_spread(production),
         *check_network_policies(production),
+        *check_telemetry_egress(production, TELEMETRY_SOURCE.read_text(encoding="utf-8")),
         *check_disruption_budget(production, autoscaled),
         *check_namespaces(base, "base"),
         *check_namespaces(production, "overlays/production"),
@@ -699,6 +731,25 @@ def self_test() -> int:
     stray = copy.deepcopy(production)
     one(stray, "Service")["metadata"].pop("namespace")
     expect_failure("namespace placement", check_namespaces(stray, "overlays/production"))
+
+    grpc = copy.deepcopy(production)
+    for policy in of_kind(grpc, "NetworkPolicy"):
+        for rule in policy["spec"].get("egress", []):
+            for peer in rule.get("to", []):
+                labels = peer.get("podSelector", {}).get("matchLabels", {})
+                if labels.get("app.kubernetes.io/name") == "opentelemetry-collector":
+                    rule["ports"] = [{"protocol": "TCP", "port": 4317}]
+    telemetry = TELEMETRY_SOURCE.read_text(encoding="utf-8")
+    expect_failure(
+        "telemetry egress on a port axond cannot dial",
+        check_telemetry_egress(grpc, telemetry),
+    )
+    expect_failure(
+        "telemetry egress derived from a protocol the gateway no longer names",
+        check_telemetry_egress(
+            production, telemetry.replace('Some("http/protobuf")', 'Some("grpc")')
+        ),
+    )
 
     workflow = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
     backends = STATEFUL_DOC.read_text(encoding="utf-8")

@@ -131,4 +131,4 @@ grep -Fq "$digest" "$tmp" || {
 }
 cat "$tmp" >"$overlay"
 echo "pinned ${image}@${digest} (${reference}) in ${overlay#"$repo_root"/}"
-echo "verify it before applying: SIGNER_IDENTITY=... ops/verify-image-evidence.sh ${image}@${digest}"
+echo "verify it before applying: SIGNER_IDENTITY=... GITHUB_REPOSITORY=Litvue/axond ops/verify-image-evidence.sh ${image}@${digest}"
