@@ -1,10 +1,14 @@
-# 53. Catalogue imports in a running deployment
+# 55. Catalogue imports in a running deployment
 
 Date: 2026-08-13
 
 ## Status
 
 Accepted
+
+Numbered 55 because 53 is request-path pricing (#147, PR #318) and 54 is
+resolving pinned catalogue offerings (#146, PR #319); this decision is the import
+side of #146 and is independent of both.
 
 Closes the two behaviours [ADR 0051](./0051-durable-catalogue-snapshots-and-refresh-orchestration.md)
 deliberately left absent: nothing configured a source or a store, and nothing
