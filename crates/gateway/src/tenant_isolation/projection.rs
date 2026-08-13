@@ -45,7 +45,11 @@ fn namespaces(config: &Config) -> BTreeMap<&str, &Namespace> {
 
 fn project(state: &DesiredState) -> Config {
     let config = TenancyProjection
-        .project(&crate::convergence::compile::testing::bootstrap(), state)
+        .project(
+            &crate::convergence::compile::testing::bootstrap(),
+            state,
+            fixtures::revision_id(1),
+        )
         .expect("two tenants project onto one deployment");
     config
         .validate_compiled()
