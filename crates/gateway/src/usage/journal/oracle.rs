@@ -376,9 +376,11 @@ impl UsageJournal for InMemoryUsageJournal {
             .get(&IdempotencyKey::from(delivery.event))
             .copied()
         else {
-            return Err(JournalError::NotOutstanding {
-                delivery: delivery.clone(),
-            });
+            // An event the journal no longer holds — pruned, or given up to make
+            // room — is "already acknowledged": nothing is left to redeliver, so
+            // refusing here would only make a consumer warn about a redelivery
+            // that cannot happen.
+            return Ok(());
         };
         // Read-only: a consumer is registered by claiming, not by talking about a
         // delivery. Creating its row here would let one spurious acknowledgement
@@ -422,9 +424,9 @@ impl UsageJournal for InMemoryUsageJournal {
             .get(&IdempotencyKey::from(delivery.event))
             .copied()
         else {
-            return Err(JournalError::NotOutstanding {
-                delivery: delivery.clone(),
-            });
+            // An event the journal no longer holds has no attempt left to give
+            // back and no later delivery a refund could disturb.
+            return Ok(());
         };
         let Some(state) = storage.consumers.get_mut(&delivery.consumer) else {
             return Err(JournalError::NotOutstanding {

@@ -725,7 +725,10 @@ impl UsageJournal for PostgresJournal {
                 if refunded == 0 {
                     // Either somebody else moved the delivery on, which is an
                     // ordinary race, or there is no delivery row at all — the
-                    // one case a consumer should hear about.
+                    // one case a consumer should hear about, and only while the
+                    // event itself is still here. An event retention or capacity
+                    // took has no attempt left to give back and no later delivery
+                    // to protect, so saying so is not an anomaly.
                     let exists = client
                         .query_opt(
                             "SELECT 1 FROM axond_usage_outbox e
@@ -735,7 +738,15 @@ impl UsageJournal for PostgresJournal {
                             &[&key, &name],
                         )
                         .await?;
-                    if exists.is_none() {
+                    if exists.is_none()
+                        && client
+                            .query_opt(
+                                "SELECT 1 FROM axond_usage_outbox WHERE request_id = $1",
+                                &[&key],
+                            )
+                            .await?
+                            .is_some()
+                    {
                         return Err(OpError::Journal(JournalError::NotOutstanding {
                             delivery: refused,
                         }));
@@ -890,10 +901,30 @@ impl PostgresJournal {
                         &[&key, &name],
                     )
                     .await?;
-                // No delivery row means this consumer was never handed the
-                // event — or it was pruned, which a consumer must read as
-                // "already acknowledged" rather than as an anomaly.
                 let Some(state) = state.filter(|row| row.get::<_, i32>(0) > 0) else {
+                    // Two different situations answer differently. The event is
+                    // still here and this consumer was never handed it: a stray
+                    // verdict, refused, and deliberately without creating the
+                    // delivery state that would register the consumer. Or the
+                    // event is gone — reclaimed for capacity, dropped, or pruned
+                    // while this worker held its claim — and an acknowledgement
+                    // of an event the journal no longer has is the contract's
+                    // "already acknowledged": there is nothing left to redeliver,
+                    // so answering `NotOutstanding` would only produce a warning
+                    // about a redelivery that cannot happen and undercount what
+                    // this replica actually delivered. A *quarantine* still
+                    // refuses, because its whole purpose is a poison count and a
+                    // row an operator can look at, and neither survives the row.
+                    let vanished = tx
+                        .query_opt(
+                            "SELECT 1 FROM axond_usage_outbox WHERE request_id = $1",
+                            &[&key],
+                        )
+                        .await?
+                        .is_none();
+                    if vanished && poison.is_none() {
+                        return Ok(());
+                    }
                     return Err(OpError::Journal(JournalError::NotOutstanding {
                         delivery: refused,
                     }));
@@ -1976,6 +2007,48 @@ mod tests {
             .expect("claim");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].event.id(), kept.id());
+    }
+
+    /// The same contract the oracle pins: an event that left the outbox while a
+    /// worker was delivering it is acknowledged, not refused as never handed out.
+    #[tokio::test]
+    async fn acknowledging_an_event_the_outbox_no_longer_holds_is_not_an_error() {
+        let Some((_, journal)) =
+            outbox("acked_gone", capacity(1, CapacityPolicy::DropOldest)).await
+        else {
+            return;
+        };
+        journal
+            .append(&event_for("GW_INBOUND_ACME_KEY"))
+            .await
+            .expect("append");
+        let billing = consumer("billing");
+        let claimed = journal
+            .claim(
+                &billing,
+                claim_at(1, Duration::from_secs(30), SystemTime::now()),
+            )
+            .await
+            .expect("claim");
+        // Dropped underneath the delivery, exactly as it would be if retention or
+        // a capacity reclaim had taken it.
+        journal
+            .append(&event_for("GW_INBOUND_ACME_KEY"))
+            .await
+            .expect("a lossy policy makes room rather than refusing");
+
+        journal
+            .ack(&claimed[0].id)
+            .await
+            .expect("nothing is left to redeliver, so this is not the worker's problem");
+        let error = journal
+            .quarantine(&claimed[0].id, PoisonReason::Malformed)
+            .await
+            .expect_err("a row that is gone cannot be set aside for an operator");
+        assert!(
+            matches!(error, JournalError::NotOutstanding { .. }),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

@@ -290,12 +290,20 @@ async fn a_delivery_that_was_never_claimed_cannot_be_acknowledged() {
         "{error:?}"
     );
 
+    // An id the journal holds no event for is indistinguishable from one it has
+    // pruned — no store keeps a tombstone per acknowledged event — so it is
+    // absorbed rather than refused. What matters is that it changes nothing.
     let unknown = DeliveryId {
         consumer: consumer("billing"),
         event: next_request_id(),
         attempt: 1,
     };
-    assert!(journal.ack(&unknown).await.is_err());
+    journal.ack(&unknown).await.expect("nothing to acknowledge");
+    let stats = journal
+        .stats(&consumer("billing"))
+        .await
+        .expect("no consumer was registered by it");
+    assert_eq!(stats.pending, 1, "{stats:?}");
 }
 
 #[tokio::test]
@@ -887,6 +895,43 @@ async fn drop_oldest_bounds_storage_and_counts_what_it_lost() {
     );
     let stats = journal.stats(&billing).await.expect("stats");
     assert_eq!(stats.dropped, 1, "a lossy policy has to report its cost");
+}
+
+/// A row can leave the journal while a consumer is still delivering it: a lossy
+/// capacity policy drops it, retention prunes it, or an append reclaims it to make
+/// room. The acknowledgement that follows has to be `Ok`, because there is nothing
+/// left to redeliver and a refusal would only make the consumer report a
+/// redelivery that cannot happen — and undercount what it really delivered.
+#[tokio::test]
+async fn acknowledging_an_event_the_journal_no_longer_holds_is_not_an_error() {
+    let journal = InMemoryUsageJournal::with_capacity(Capacity {
+        max_events: 1,
+        policy: CapacityPolicy::DropOldest,
+        ..Capacity::BILLING_GRADE
+    });
+    let billing = consumer("billing");
+    journal.append(&event()).await.expect("append");
+    let claimed = journal.claim(&billing, claim(1)).await.expect("claim");
+    // The destination write happens here, and the event is dropped underneath it.
+    journal
+        .append(&event_for("acme-two"))
+        .await
+        .expect("a lossy policy makes room rather than refusing");
+
+    journal
+        .ack(&claimed[0].id)
+        .await
+        .expect("the event it delivered is gone, which is not the consumer's fault");
+    // Quarantine is the exception: it exists to leave a poison count and a row an
+    // operator can look at, and a dropped row leaves neither to talk about.
+    let error = journal
+        .quarantine(&claimed[0].id, PoisonReason::Malformed)
+        .await
+        .expect_err("there is nothing left to set aside");
+    assert!(
+        matches!(error, JournalError::NotOutstanding { .. }),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]

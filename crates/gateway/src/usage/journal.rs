@@ -670,9 +670,17 @@ pub trait UsageJournal: Send + Sync {
     /// between the destination write and the acknowledgement must be recoverable
     /// by repeating the acknowledgement.
     ///
+    /// An acknowledgement of an event the journal no longer holds is `Ok` on the
+    /// same recovery grounds: retention, capacity reclamation, and `DropOldest`
+    /// can all remove a row while a consumer still holds a claim on it, and there
+    /// is nothing left to redeliver, so refusing would only report a redelivery
+    /// that cannot happen. [`quarantine`](Self::quarantine) is the exception —
+    /// see there.
+    ///
     /// A consumer is registered by [`claim`](Self::claim), and nothing else: an
-    /// acknowledgement from a consumer that never claimed is
-    /// [`JournalError::NotOutstanding`] and must not create delivery state for it.
+    /// acknowledgement from a consumer that never claimed — for an event the
+    /// journal still has — is [`JournalError::NotOutstanding`] and must not create
+    /// delivery state for it.
     /// Since only an event *every* registered consumer has finished with is
     /// prunable, a consumer conjured up by one stray acknowledgement would hold
     /// retention open forever.
@@ -695,6 +703,11 @@ pub trait UsageJournal: Send + Sync {
     /// a verdict on an event is only a consumer's to give once the event was
     /// handed to it; quarantining an already quarantined event is `Ok` and keeps
     /// the first reason.
+    ///
+    /// Unlike an acknowledgement, an event the journal no longer holds cannot be
+    /// quarantined: this verdict exists to leave a poison count and a row an
+    /// operator can inspect, and a removed row leaves neither, so it is
+    /// [`JournalError::NotOutstanding`] rather than a silent `Ok`.
     ///
     /// The two verdicts are exclusive, so an event this consumer already
     /// acknowledged cannot be condemned afterwards
