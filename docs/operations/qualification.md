@@ -114,11 +114,12 @@ number is a regression rather than a different machine.
   single-replica.
 
 One question the packet is regularly asked for, and cannot answer: **stateful
-convergence**. `serve` still refuses a stateful config, so there is no stateful
-replica to converge; a profile written against it today would measure the
-refusal and retain it as evidence of something else. That is why the `recovery`
-slice stays `declared` with a contract rather than a driver, and why no
-capacity profile claims it.
+convergence**. A stateful replica boots and serves `/admin/v1`; what it refuses,
+per request, is inference, until revision convergence ships. So there is no
+stateful replica *serving* to converge, and a profile written against one today
+would measure the refusal and retain it as evidence of something else. That is
+why the `recovery` slice stays `declared` with a contract rather than a driver,
+and why no capacity profile claims it.
 
 ## Related
 

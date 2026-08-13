@@ -165,6 +165,7 @@ def check_stale_claims(files: list[Path]) -> list[str]:
         "boot still refuses to start": STATEFUL_BOOTS,
         "refuses to serve an empty snapshot": STATEFUL_BOOTS,
         "declines a stateful config": STATEFUL_BOOTS,
+        "refuses a stateful config": STATEFUL_BOOTS,
         "never serves an empty snapshot": STATEFUL_BOOTS,
         # Narrowed to the stateful replica on purpose: a *gateway* refusing to
         # boot on an un-migrated budget layout or a cross-family alias is a live
