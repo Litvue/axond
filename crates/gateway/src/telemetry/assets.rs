@@ -842,7 +842,16 @@ pub fn validate_rules(
             }
             match rule.get("expr").and_then(Yaml::as_str) {
                 Some(expr) => {
-                    failures.extend(validate_expression(&format!("{asset}: {alert}"), expr))
+                    failures.extend(validate_expression(&format!("{asset}: {alert}"), expr));
+                    if let Some(term) = undefaulted_added_term(expr) {
+                        failures.push(AssetError::malformed(
+                            asset,
+                            format!(
+                                "alert `{alert}` adds `{term}`, which is empty until that counter has been incremented at least once; \
+                                 an addition with an empty side is empty, so default each term with `or vector(0)`"
+                            ),
+                        ));
+                    }
                 }
                 None => failures.push(AssetError::malformed(
                     asset,
@@ -910,6 +919,45 @@ pub fn validate_rules(
         }
     }
     (failures, covered)
+}
+
+/// The first added term of an expression that a missing series would silence.
+///
+/// A counter is created when it is first incremented, so on a deployment where
+/// the event has never happened the metric has no series and `sum(rate(...))` is
+/// an *empty* vector. Vector arithmetic with an empty side is empty, so `A + B`
+/// cannot page until both events have happened — and the moment one starts is
+/// exactly when the page is wanted. Each term therefore has to stand on its own,
+/// which `or vector(0)` does.
+fn undefaulted_added_term(expr: &str) -> Option<String> {
+    let mut terms = Vec::new();
+    let mut term = String::new();
+    let mut depth = 0usize;
+    let mut quote = None;
+    for character in expr.chars() {
+        match character {
+            _ if quote == Some(character) => quote = None,
+            _ if quote.is_some() => {}
+            '"' | '\'' => quote = Some(character),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '+' if depth == 0 => {
+                terms.push(std::mem::take(&mut term));
+                continue;
+            }
+            _ => {}
+        }
+        term.push(character);
+    }
+    if terms.is_empty() {
+        return None;
+    }
+    terms.push(term);
+    terms
+        .into_iter()
+        .map(|term| term.trim().to_owned())
+        // A scalar literal is always present; only a series needs a default.
+        .find(|term| !term.contains("vector(") && term.parse::<f64>().is_err())
 }
 
 /// Which documented failure modes no rule fires on.

@@ -420,6 +420,39 @@ fn an_alert_pointing_at_a_missing_runbook_section_is_refused() {
     ));
 }
 
+/// A counter with no series is an empty vector, and an addition with an empty
+/// side is empty — so an alert that adds two independent denial counters stays
+/// silent until *both* have fired at least once, which on most deployments is
+/// never. The shape looks like coverage and pages at nothing, so the gate refuses
+/// it unless each term is defaulted.
+#[test]
+fn an_alert_that_adds_two_counters_without_defaulting_them_is_refused() {
+    let source = rules_with(&format!(
+        "        expr: \"sum(rate(axond_budget_capacity_denials[5m])) + sum(rate(axond_rate_limit_capacity_denials[5m])) > 0\"\n        for: 5m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"s\"\n          description: \"d\"\n          runbook_url: \"{RUNBOOK_URL}#a-dependency-is-impaired\"\n"
+    ));
+    let anchors = BTreeSet::from(["a-dependency-is-impaired".to_owned()]);
+    let (failures, _) = validate_rules("drift", &source, &anchors);
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.to_string().contains("or vector(0)")),
+        "{failures:?}"
+    );
+
+    // Defaulted, the same rule is accepted — and a comparison against a scalar
+    // is not an addition at all.
+    for expr in [
+        "(sum(rate(axond_budget_capacity_denials[5m])) or vector(0)) + (sum(rate(axond_rate_limit_capacity_denials[5m])) or vector(0)) > 0",
+        "max(axond_revision_lag) > 1000",
+    ] {
+        let source = rules_with(&format!(
+            "        expr: \"{expr}\"\n        for: 5m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"s\"\n          description: \"d\"\n          runbook_url: \"{RUNBOOK_URL}#a-dependency-is-impaired\"\n"
+        ));
+        let (failures, _) = validate_rules("drift", &source, &anchors);
+        assert_eq!(failures, Vec::new(), "{expr}");
+    }
+}
+
 #[test]
 fn an_alert_without_a_hold_window_or_severity_is_refused() {
     let source = rules_with(

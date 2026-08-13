@@ -70,7 +70,7 @@ groups:
           runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#dependency-observations-have-gone-stale"
 
       - alert: AxondFailClosedDependencyDenials
-        expr: "sum(rate(axond_rate_limit_unavailable_denials[5m])) + sum(rate(axond_revocation_unavailable_denials[5m])) > 0"
+        expr: "(sum(rate(axond_rate_limit_unavailable_denials[5m])) or vector(0)) + (sum(rate(axond_revocation_unavailable_denials[5m])) or vector(0)) > 0"
         for: 5m
         labels:
           severity: critical
@@ -189,7 +189,7 @@ groups:
           runbook_url: "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#budget-or-rate-limit-capacity-is-exhausted"
 
       - alert: AxondBudgetCapacityExhausted
-        expr: "sum(rate(axond_budget_capacity_denials[5m])) + sum(rate(axond_rate_limit_capacity_denials[5m])) > 0"
+        expr: "(sum(rate(axond_budget_capacity_denials[5m])) or vector(0)) + (sum(rate(axond_rate_limit_capacity_denials[5m])) or vector(0)) > 0"
         for: 10m
         labels:
           severity: warning
