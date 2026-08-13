@@ -123,19 +123,21 @@ fn assert_qualifies(result: &StatefulEnduranceResult) {
             result.faults
         );
     }
-    // Durable loss is only ever excused by the fleet's own account of it. The
-    // excused half is capped at the reported drops by construction, so what
-    // has to be asserted is the unexcused remainder and the existence of the
-    // account: a run that lost rows while no process ever said it dropped a
-    // batch has an unexplained loss however the halves are split.
+    // Durable loss is only ever excused by the fleet's own account of it, in
+    // both halves. Outside the declared outage nothing is excused at all; the
+    // half inside it is bounded by what the processes reported dropping, and
+    // `durable_usage_loss_in_window` is the verdict that holds it there — so
+    // a run that lost rows while no process said it dropped a batch fails
+    // however the halves are split.
     assert_eq!(
         result.usage.durable_loss_outside_windows, 0,
         "rows went missing outside every declared outage: {:#?}",
         result.usage
     );
     assert!(
-        result.usage.durable_loss_total == 0 || result.usage.sink_drops.records_in_usage_window > 0,
-        "rows are missing and no process reported dropping any of them: {:#?}",
+        result.usage.durable_loss_in_window
+            <= stateful_endurance::run::excused_in_window(&result.usage.sink_drops),
+        "more rows are missing inside the outage than the fleet reported dropping: {:#?}",
         result.usage
     );
     // Both sides of the policy revision, or the gate passed without ever being
@@ -650,6 +652,60 @@ fn a_durable_loss_is_excused_by_when_it_happened() {
     assert_eq!(
         (bounded.total, bounded.outside, bounded.in_window),
         (2, 2, 0)
+    );
+}
+
+/// The other half: what the outage excuses is as large as the deployment said
+/// it lost, and no larger. A single report is an explanation for the records it
+/// named, not a licence for every row the run is missing.
+#[test]
+fn an_outage_excuses_only_the_rows_the_fleet_reported_losing() {
+    use stateful_endurance::result::SinkDrops;
+    use stateful_endurance::run::{DROP_LOG_SAMPLE, excused_in_window};
+
+    let reported = |records, sampled| SinkDrops {
+        records_in_usage_window: records,
+        sampled_records_in_usage_window: sampled,
+        ..SinkDrops::default()
+    };
+
+    // Nothing reported, nothing excused: a run that lost rows in silence fails
+    // however many it lost.
+    assert_eq!(excused_in_window(&reported(0, 0)), 0);
+
+    // A rejected batch is reported with its exact count, so that count is the
+    // bound — one report of a single record no longer excuses thousands.
+    assert_eq!(excused_in_window(&reported(1, 0)), 1);
+    assert_eq!(excused_in_window(&reported(534, 0)), 534);
+
+    // The buffer-full report is sampled, so a run reporting through it may have
+    // lost up to one interval more than its last report named. That allowance
+    // exists only where such a report was actually made.
+    assert_eq!(
+        excused_in_window(&reported(1_000, 1_000)),
+        1_000 + DROP_LOG_SAMPLE - 1
+    );
+}
+
+/// A replica that has not finished reloading is a slow reload, not a tenant
+/// reaching into another tenant's credentials. The difference decides which
+/// gate fails and whether the run is abandoned, so the probe reads a flag the
+/// fleet was *observed* to honour rather than one the driver published.
+#[test]
+fn a_slow_policy_reload_is_not_a_tenant_boundary_breach() {
+    let source = include_str!("support/stateful_endurance/run.rs");
+    assert!(
+        source.contains("self.state.observe_probe(served, self.policy_withdrawn, now);"),
+        "the boundary probe judges against the observed withdrawal"
+    );
+    assert!(
+        source.contains("self.policy_withdrawn = converged.is_some();"),
+        "which is set by convergence, not by publication"
+    );
+    // And the flag starts false, so nothing before the revision is a breach.
+    assert!(
+        source.contains("policy_withdrawn: false,"),
+        "the run begins with the probe tenant still permitted"
     );
 }
 

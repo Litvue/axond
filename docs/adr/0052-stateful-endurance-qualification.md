@@ -77,9 +77,12 @@ sink drops a batch rather than queueing for a database that is not there
 events out of each process's structured output and keeps them apart from its
 bounded scrollback, then charges missing rows against them:
 `max_durable_usage_loss_outside_windows = 0`, and loss inside the window is
-allowed only as far as the processes reported dropping. Attributing loss by
-comparing the harness's clock to a database's would excuse whatever happened to
-land near a window.
+allowed only as far as the processes reported dropping
+(`durable_usage_loss_in_window`). Which half a lost row falls in is decided by
+when it settled, on a window both sides can be counted over; how much of the
+in-window half is forgiven is decided by the reported drop counts. One reported
+drop is an account of the records it named, not of every row the run is
+missing.
 
 **A retired replica's accounting stays in the run.** Rolling restarts are part
 of the script, so a replaced process's flushed records and drop reports are

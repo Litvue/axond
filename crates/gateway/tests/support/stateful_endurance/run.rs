@@ -217,6 +217,7 @@ pub async fn run_with(
         dir: &dir,
         stem: dispatch.stem,
         revision: Revision::default(),
+        policy_withdrawn: false,
     }
     .run(&mut rx)
     .await;
@@ -650,6 +651,12 @@ struct Supervisor<'a> {
     dir: &'a Path,
     stem: &'a str,
     revision: Revision,
+    /// Whether the policy revision has been *observed* to have taken effect on
+    /// every replica, rather than merely published. A probe served before that
+    /// is a fleet that has not finished reloading, which the convergence bound
+    /// judges; only a probe served after it is a tenant reaching into another
+    /// tenant's pool.
+    policy_withdrawn: bool,
 }
 
 impl Supervisor<'_> {
@@ -736,7 +743,7 @@ impl Supervisor<'_> {
         let key = self.probe.key.clone();
         for base_url in self.rotation() {
             let served = self.probe_serves(&base_url, &key).await;
-            self.state.observe_probe(served, self.revision.policy, now);
+            self.state.observe_probe(served, self.policy_withdrawn, now);
         }
     }
 
@@ -804,6 +811,11 @@ impl Supervisor<'_> {
                 self.fleet.publish(self.revision);
                 self.state.note(now, event.as_str(), &self.revision.label());
                 let converged = self.await_refusal().await;
+                // Only once every replica has been seen to refuse: an
+                // unconverged revision is a convergence failure, and calling
+                // it an isolation breach would abandon the run on the wrong
+                // finding.
+                self.policy_withdrawn = converged.is_some();
                 self.state.observe_revision(
                     event,
                     self.revision,
@@ -1464,9 +1476,15 @@ impl State {
         *self.sink_drops.by_reason.entry(reason.clone()).or_default() += records;
         let (from, to) = self.usage_window;
         // Only the durable sink's losses are the database outage's. A stdout
-        // sink dropping a batch while Postgres is gone is unrelated to it.
-        if sink != "stdout" && now >= from && now < to {
+        // sink dropping a batch while Postgres is gone is unrelated to it. The
+        // closing edge is carried one drain interval, as it is for the records
+        // themselves: both are stamped with the tick they were drained on, and
+        // a report read a tick late must still account for what it lost.
+        if sink != "stdout" && now >= from && now < to + DRAIN_EVERY {
             self.sink_drops.records_in_usage_window += records;
+            if reason == SAMPLED_DROP_REASON {
+                self.sink_drops.sampled_records_in_usage_window += records;
+            }
         } else {
             self.sink_drops.records_outside_windows += records;
         }
@@ -1785,6 +1803,35 @@ pub fn reconcile_durable_loss(
     }
 }
 
+/// The reason whose reports the gateway samples rather than writes in full:
+/// the buffer-full drop is logged at the first record and then every
+/// [`DROP_LOG_SAMPLE`]th, so its reports can lag what was actually lost.
+/// Everything else — a rejected batch, an abandoned buffer — is reported with
+/// its exact count as it happens.
+pub const SAMPLED_DROP_REASON: &str = "buffer_full";
+/// The gateway's sampling interval for that report
+/// (`crates/gateway/src/usage/batch.rs`). Its reports carry the sink's running
+/// total, so what a run can have lost beyond the last one is the tail below the
+/// next boundary.
+pub const DROP_LOG_SAMPLE: u64 = 1_000;
+
+/// How much in-window durable loss the fleet's own reports account for.
+///
+/// The excused half of the loss is only as large as the deployment said it
+/// was. The one allowance is the sampled report's tail: a run whose in-window
+/// drops were reported as buffer-full may have lost up to one sampling interval
+/// more than the last report named, and nothing but the next report would say
+/// so. No allowance is made when nothing was reported that way, so a run that
+/// lost rows in silence is a failure whatever else it dropped.
+pub fn excused_in_window(drops: &SinkDrops) -> u64 {
+    let tail = if drops.sampled_records_in_usage_window > 0 {
+        DROP_LOG_SAMPLE - 1
+    } else {
+        0
+    };
+    drops.records_in_usage_window + tail
+}
+
 /// What the database held once everything had settled.
 struct DurableEvidence {
     counts: durable::Counts,
@@ -1900,6 +1947,14 @@ fn assemble(
             "durable_usage_loss_outside_windows",
             loss.outside as f64,
             slo.max_durable_usage_loss_outside_windows as f64,
+        ),
+        // The other half of the same reconciliation: what the outage excuses,
+        // bounded by what the deployment said it lost rather than merely by the
+        // fact that it said anything.
+        Verdict::at_most(
+            "durable_usage_loss_in_window",
+            loss.in_window as f64,
+            excused_in_window(&sink_drops) as f64,
         ),
         Verdict::at_most(
             "durable_usage_lag_ms",

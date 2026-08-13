@@ -133,7 +133,10 @@ Hard failures, asserted at both tiers:
   dropping — see below;
 - **no tenant boundary crossed** (`max_tenant_boundary_violations = 0`), which
   is also an early abort: the rest of a run that mixed two tenants' credentials
-  measures nothing;
+  measures nothing. Counted from the moment every replica has been *observed* to
+  honour the policy revision, not from the moment it was published — a replica
+  still reloading is a slow reload, and it fails the convergence bound rather
+  than this one;
 - **no error outside a declared fault window** (`max_unplanned_errors = 0`);
 - **every published revision converged** within `max_convergence_ms`, observed
   by a request rather than by a log line;
@@ -184,9 +187,17 @@ when the batch flushed. The difference is `durable_loss_outside_windows`, and it
 is gated at zero; the rest of the whole-run loss is `durable_loss_in_window`,
 which the outage accounts for. A row lost at a safe moment therefore stays a
 finding however many batches the sink reported dropping while the backend was
-gone. `sink_drops` remains the fleet's own account of the excused half, and the
-edge between the two is carried one drain interval past the declared close, so a
-record the driver sees a tick late is not read as a safe-time loss.
+gone. The edge between the two is carried one drain interval past the declared
+close, so a record the driver sees a tick late is not read as a safe-time loss.
+
+Being inside the window is not by itself an excuse. `durable_loss_in_window` is
+gated against `sink_drops.records_in_usage_window` — what the processes
+themselves said they lost — so a run that dropped one record and lost a thousand
+fails. The single allowance is the buffer-full report, which the gateway samples
+rather than writes in full: where the in-window drops were reported that way,
+`sink_drops.sampled_records_in_usage_window` is non-zero and the bound is
+widened by one sampling interval, the most the tail below the next report can
+hide. Where nothing was reported, nothing is excused.
 
 ## Reading an artifact
 
@@ -218,7 +229,8 @@ Fields worth knowing:
   received, split into the part the outage explains
   (`durable_loss_in_window`) and the part it does not
   (`durable_loss_outside_windows`, gated at zero), with the two counts the split
-  was made from beside them.
+  was made from beside them. Both halves are gated: the first against what the
+  fleet reported dropping, the second against nothing at all.
 - `telemetry.worst_usage_silence_ms` is the longest stretch under load in which
   the fleet produced no accounting at all, excluding the declared outages. A
   gateway that keeps answering while its usage records stop is invisible in a

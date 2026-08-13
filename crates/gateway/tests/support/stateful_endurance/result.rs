@@ -342,6 +342,12 @@ pub struct SinkDrops {
     /// Records dropped while the usage backend was declared out — the loss the
     /// contract allows (ADR 0009).
     pub records_in_usage_window: u64,
+    /// How many of those records were reported by a sampled report — the
+    /// buffer-full one, which the gateway writes at the first drop and then
+    /// every thousandth. A run whose in-window loss was reported that way can
+    /// legitimately have lost up to one interval more than it said, and the
+    /// gate on the excused half allows exactly that much and no more.
+    pub sampled_records_in_usage_window: u64,
     /// Records dropped at any other time, each of which is a finding.
     pub records_outside_windows: u64,
     /// The first few reports, in full, so a failing run says which sink lost
