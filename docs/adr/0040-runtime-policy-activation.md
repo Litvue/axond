@@ -66,7 +66,11 @@ is something an operator published. A publication is not allowed to create that
 state — a candidate serving a namespace no document governs is refused before it
 is installed — so the denial belongs to a bootstrap gap, not to a revision. In
 stateful mode the bootstrap file cannot declare a namespace at all, so "governed
-by a published document" is the only way a namespace is served.
+by a published document" is the only way a namespace is served. The condition
+belongs to the view rather than to the request, so it is counted per denial and
+explained in the log once per condition, backend and namespace, and at most once
+a minute thereafter: a bootstrap gap under production traffic must not turn the
+log into the outage.
 
 ### A hold carries the generation that granted it
 
@@ -108,7 +112,11 @@ than reporting as a scope's first binding — in both directions, so `draining` 
 complete. Epochs are not compared across it, because an epoch orders one scope's
 own publications; the values are, in full, so a handover cannot lower a token
 floor an operator raised to revoke credentials. Changing which document states a
-value is not a way to make a refused change performable.
+value is not a way to make a refused change performable. A scope hands over every
+namespace it governs at once, and the documents taking them over need not strand
+the same thing, so the drain reasons reported for it are the union across those
+namespaces — sorted and de-duplicated, so two replicas classifying one
+publication report the same list.
 
 ### Rolling back is publishing the old values forward
 

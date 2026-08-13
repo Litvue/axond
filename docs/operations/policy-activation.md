@@ -94,6 +94,11 @@ last known good policy keeps serving. Publish a tenant-level document as the
 floor **before** projecting namespaces to it; the preflight table's "every
 projected namespace is governed" row is that check.
 
+Every such denial is counted (`policy` denial metrics are per request); the log
+line explaining it is sampled — once per condition, backend and namespace, then
+at most once a minute for as long as it lasts — so a namespace that stays
+ungoverned under load produces an operator signal rather than a log flood.
+
 A stateful bootstrap cannot declare a namespace at all (`[[namespace]]` is a
 boot error under `mode = "stateful"`), so there is no file-governed namespace to
 exempt: in stateful mode every namespace is governed by a published document, or

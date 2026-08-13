@@ -347,6 +347,8 @@ pub(super) fn plan(
 /// outcome: refused if the document taking over lowers something this model
 /// never lowers, drained if it strands a hold, live otherwise.
 ///
+/// The drain reasons are the union across those namespaces, not the last one's.
+///
 /// Handovers are judged by value only (`PolicyBody::displaced_by`), because
 /// the two scopes have no shared epoch history — but "by value only" is not "by
 /// the loosening values only": a token floor that falls restores tokens an
@@ -356,11 +358,11 @@ fn handover(
     scope: PolicyScope,
     transitions: impl Iterator<Item = PolicyTransition>,
 ) -> Result<Option<Vec<TransitionReason>>, ActivationRefusal> {
-    let mut drain = None;
+    let mut drain: Vec<TransitionReason> = Vec::new();
     for transition in transitions {
         match transition.class() {
             TransitionClass::Live => {}
-            TransitionClass::Drain => drain = Some(transition.reasons().to_vec()),
+            TransitionClass::Drain => drain.extend_from_slice(transition.reasons()),
             TransitionClass::MigrationRequired => {
                 return Err(ActivationRefusal::Migration {
                     scope,
@@ -386,7 +388,13 @@ fn handover(
             }
         }
     }
-    Ok(drain)
+    // A scope hands over every namespace it governs at once, and they need not
+    // hand over to the same document: report the union, sorted and deduplicated,
+    // so an operator gating a migration reads every reason and two replicas
+    // classifying one publication report the same list.
+    drain.sort_unstable();
+    drain.dedup();
+    Ok((!drain.is_empty()).then_some(drain))
 }
 
 /// Whether these backends can enforce a document for `scope` at all, and whether
@@ -745,6 +753,13 @@ mod tests {
         }
     }
 
+    fn other_project() -> PolicyScope {
+        PolicyScope::Project {
+            tenant: tenant_id(1),
+            project: crate::desired_state::fixtures::project_id(2),
+        }
+    }
+
     /// The refusal a namespace-wide outage never gets to become: a namespace is
     /// projected before any document governs it, so every request to it would be
     /// denied. The candidate is refused, and what was already published stays.
@@ -858,6 +873,71 @@ mod tests {
             "a tighter document taking the namespace over is a drain, not a silent withdrawal"
         );
         assert!(activation.withdrawn().is_empty());
+    }
+
+    /// A scope hands over every namespace it governs at once, and the documents
+    /// taking them over need not strand the same thing. An operator gating a
+    /// migration on the drain reads all of it, in one order.
+    #[test]
+    fn a_scope_handing_over_several_namespaces_reports_every_reason_once() {
+        let held = detailed(project(), 1, 5_000, None, 300, 8, 60, 0);
+        let mut governs_both = governed(
+            "acme/core",
+            NamespacePolicy {
+                body: held,
+                generation: generation(&held, 1),
+            },
+        );
+        governs_both
+            .namespace
+            .push(crate::policy::view::tests::projected(
+                "acme/edge",
+                Some(NamespacePolicy {
+                    body: held,
+                    generation: generation(&held, 1),
+                }),
+            ));
+
+        // One namespace goes to a document with a lower spend cap, the other to
+        // one with a lower concurrency ceiling.
+        let cheaper = detailed(scope(), 1, 1_000, None, 300, 8, 60, 0);
+        let narrower = detailed(other_project(), 1, 5_000, None, 300, 4, 60, 0);
+        let mut handed_over = governed(
+            "acme/core",
+            NamespacePolicy {
+                body: cheaper,
+                generation: generation(&cheaper, 2),
+            },
+        );
+        handed_over
+            .namespace
+            .push(crate::policy::view::tests::projected(
+                "acme/edge",
+                Some(NamespacePolicy {
+                    body: narrower,
+                    generation: generation(&narrower, 2),
+                }),
+            ));
+
+        let activation = plan(
+            &PolicyView::of(&governs_both),
+            &PolicyView::of(&handed_over),
+            shared(),
+        )
+        .expect("both namespaces stay governed");
+        let handover = activation
+            .draining()
+            .iter()
+            .find(|(scope, _)| *scope == project())
+            .expect("the scope handing both namespaces over drains");
+        assert_eq!(
+            handover.1,
+            vec![
+                TransitionReason::BudgetLowered,
+                TransitionReason::ConcurrencyLowered
+            ],
+            "the union of what each namespace's new document strands, not the last one's"
+        );
     }
 
     /// A revision that moved an unrelated resource restates every document under

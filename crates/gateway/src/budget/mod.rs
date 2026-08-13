@@ -41,7 +41,7 @@ use async_trait::async_trait;
 
 use crate::config::{BudgetBackend, BudgetConfig, StoreUnavailable};
 use crate::desired_state::policy::PolicyGeneration;
-use crate::policy::{BudgetCaps, Ceilings};
+use crate::policy::{BudgetCaps, Ceilings, Unenforceable, should_report};
 use crate::telemetry::metrics;
 
 pub use postgres::PostgresBudget;
@@ -611,21 +611,30 @@ impl SharedSettings {
     pub(crate) fn caps(&self, backend: &'static str, namespace: &str) -> Option<Governing> {
         let policy = self.ceilings.active(namespace);
         let Some(caps) = policy.budget else {
-            tracing::warn!(
-                backend,
-                namespace,
-                "no policy governs this namespace, so its spend cap cannot be enforced; denying"
-            );
+            // Every one of these denials is counted; the explanation is sampled,
+            // because the condition belongs to the published view and repeating
+            // it per request scales the log with traffic rather than with the
+            // problem.
+            if should_report(Unenforceable::Ungoverned, backend, namespace) {
+                tracing::warn!(
+                    backend,
+                    namespace,
+                    "no policy governs this namespace, so its spend cap cannot be enforced; \
+                     denying every request for it until one is published"
+                );
+            }
             return None;
         };
         if caps.namespace_microdollars.is_some() != self.namespace_scope {
-            tracing::error!(
-                backend,
-                namespace,
-                namespace_scope = self.namespace_scope,
-                "the active policy's scope-wide cap disagrees with the key layout this process \
-                 booted on; denying rather than enforcing against the wrong ledgers"
-            );
+            if should_report(Unenforceable::Layout, backend, namespace) {
+                tracing::error!(
+                    backend,
+                    namespace,
+                    namespace_scope = self.namespace_scope,
+                    "the active policy's scope-wide cap disagrees with the key layout this \
+                     process booted on; denying rather than enforcing against the wrong ledgers"
+                );
+            }
             return None;
         }
         Some(Governing {
