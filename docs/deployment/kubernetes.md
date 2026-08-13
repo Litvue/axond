@@ -173,6 +173,96 @@ Autoscaling on CPU does not make `[admission]` ceilings fleet-wide — read
 [Scaling](#scaling) before enabling it, and treat
 `axond.admission.rejections` as the saturation signal that CPU may not show.
 
+## Stateful mode
+
+`deploy/kubernetes/overlays/production-stateful` is the production overlay plus
+the `deploy/kubernetes/components/stateful` component, and it deploys a fleet
+with a different lifecycle: a stateful replica boots, serves `/admin/v1` against
+the control plane, and refuses inference with a typed
+`503 inference_unavailable` until a published revision compiles into a runtime
+snapshot ([revision convergence](../operations/revision-convergence.md)). Until
+that ships, **no replica ever reports Ready**, and three defaults of a serving
+fleet become wrong at once. The component answers each:
+
+- **The upgrade.** `Recreate`, replacing the base's rolling update: a rolling
+  update with `maxUnavailable: 0` waits for an availability that never arrives,
+  so an upgrade of a stateful fleet stalls with one surge Pod and three
+  untouched replicas. `kubectl rollout status` also waits for availability, so
+  it times out on a completed upgrade too — watch `.status.updatedReplicas`
+  instead:
+
+  ```bash
+  kubectl -n axond get deployment axond \
+    -o jsonpath='{.status.updatedReplicas}/{.status.replicas}{"\n"}'
+  ```
+
+  Recovering a fleet already stalled that way takes two changes, not one:
+  restoring `strategy: Recreate` leaves the surge Pod carrying the target
+  template, so the Deployment has nothing new to converge on and stays where it
+  is. Restore the strategy *and* roll the template in the same edit — the drill
+  below asserts that pair, and that the strategy alone is not enough.
+
+- **Administrative access.** A second Service, `axond-admin`, with
+  `publishNotReadyAddresses: true`. The `axond` Service selects Ready endpoints
+  and therefore has none, which is what you want for inference — an ingress must
+  not route callers to a replica that refuses them — and is exactly wrong for
+  the surface you administer the control plane through. Reach it directly:
+
+  ```bash
+  kubectl -n axond port-forward service/axond-admin 8080:8080
+  curl -fsS -H "Authorization: Bearer ${GW_ADMIN_BREAKGLASS}" \
+    http://127.0.0.1:8080/admin/v1/tenants
+  ```
+
+- **Node drains.** `unhealthyPodEvictionPolicy: AlwaysAllow` on the disruption
+  budget. The default (`IfHealthyBudget`) evicts an unready Pod only while the
+  budget is otherwise satisfied, so on a fleet where no Pod is healthy it
+  refuses every eviction and a node drain never finishes.
+
+The schema is applied once, by the `axond-migrate` Job the component adds, not
+by the replicas: `axond migrate apply` is forward-only and idempotent, but a
+restart that let three replicas migrate concurrently is a database being
+rewritten while its peers read it. The Job runs before the replicas can serve,
+carries its own default-deny NetworkPolicy (DNS plus Postgres, nothing else),
+and does not wear `app.kubernetes.io/name: axond`, so it is neither a Service
+endpoint nor selected by the gateway's own policies. A Job is immutable once
+created, so an upgrade re-runs it explicitly:
+
+```bash
+kubectl delete job axond-migrate -n axond --ignore-not-found
+kubectl apply -k deploy/kubernetes/overlays/production-stateful
+kubectl wait --for=condition=complete job/axond-migrate -n axond --timeout=5m
+kubectl logs job/axond-migrate -n axond
+```
+
+The overlay pins its own images, because the production overlay's transformer
+never sees the Job: resolve the sentinel in
+`overlays/production-stateful/kustomization.yaml` the same way, and mind that
+`ops/pin-image-digest.sh` writes the production overlay only. The mounted
+`axond.toml` declares `mode = "stateful"`, the control-plane DSN, the SecretStore
+KEK, and a break-glass principal, and declares no providers, models, aliases, or
+tenants: in this mode the control plane owns them, and a bootstrap that also
+declares them fails to boot. Supply `GW_CONTROL_PLANE_DSN`,
+`GW_SECRET_STORE_KEK`, and `GW_ADMIN_BREAKGLASS` in the `axond-secrets` Secret,
+and see [Stateful backends](./stateful-backends.md) for choosing the stores and
+[backup and recovery](../operations/backup-and-recovery.md) for what has to be
+recoverable before the fleet holds anything.
+
+Whether the upgrade lands, whether `/admin/v1` is reachable, and whether a node
+drains are API-server outcomes no rendered manifest can answer, so each is
+proven on a real cluster with its counterfactual:
+
+```bash
+just stateful-deploy-drill        # ops/stateful-deploy-drill.sh on a three-worker
+                                  # kind cluster, ~5 minutes
+```
+
+The drill migrates once, asserts three Running and zero Ready replicas, probes
+`/healthz`, `/readyz`, inference, and `/admin/v1` through the admin Service, then
+requires a `RollingUpdate` to stall and the default disruption budget to refuse
+the eviction that `AlwaysAllow` permits. Run it when you change the strategy,
+the Services, the budget, or the migration Job.
+
 ## Configuration and secrets
 
 The stable `axond-config` ConfigMap name and `[reload] watch = true` allow a

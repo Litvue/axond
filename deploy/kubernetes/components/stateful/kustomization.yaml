@@ -1,0 +1,53 @@
+# `mode = "stateful"`: desired state lives in the Postgres control plane and is
+# administered through `/admin/v1`. What that means for a Kubernetes deployment
+# today is not a smaller version of the stateless one, because a stateful replica
+# boots, serves `/admin/v1`, and *refuses inference* until revision convergence
+# ships (docs/operations/stateful-integration.md, IG-01). A refusing replica
+# answers `/readyz` with `503`, so three things the stateless manifests rely on
+# stop being true, and this component is those three answers plus the schema
+# ordering:
+#
+#   - no replica is ever Ready, so the `axond` Service has no endpoints and
+#     `/admin/v1` is unreachable through it — `admin-service.yaml` publishes the
+#     not-ready addresses on a Service of its own;
+#   - a RollingUpdate waits for an availability that never arrives, so an upgrade
+#     hangs — `deployment.yaml` makes the strategy `Recreate`;
+#   - a PodDisruptionBudget counts Ready Pods, so with none the budget allows no
+#     eviction at all and every node drain blocks — `pdb.yaml` sets
+#     `unhealthyPodEvictionPolicy: AlwaysAllow`.
+#
+# The forward migration is `migrate-job.yaml`, run once before the replicas that
+# read the schema, never by a booting replica: `[control_plane] migrate` stays at
+# its default of false so a rolling restart cannot have one replica migrating a
+# database its peers are reading.
+#
+# Layer this above an overlay rather than inside it, the way the autoscaling
+# component is layered:
+#
+#   resources:
+#     - <path>/deploy/kubernetes/overlays/production
+#   components:
+#     - <path>/deploy/kubernetes/components/stateful
+#
+# Read `docs/deployment/kubernetes.md#stateful-mode` first: this component is a
+# deployment shape for an administrative control plane, not a serving gateway.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - admin-service.yaml
+  - migrate-job.yaml
+  - networkpolicy.yaml
+# Replaces the base's stateless configuration wholesale. A stateful bootstrap
+# that also declared a namespace, provider, credential, or model is a boot error
+# before the listener binds, so this is a replacement rather than a merge.
+configMapGenerator:
+  - name: axond-config
+    namespace: axond
+    behavior: replace
+    files:
+      - axond.toml
+generatorOptions:
+  disableNameSuffixHash: true
+patches:
+  - path: deployment.yaml
+  - path: pdb.yaml

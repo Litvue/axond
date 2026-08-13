@@ -53,6 +53,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BASE = ROOT / "deploy/kubernetes/base"
 PRODUCTION = ROOT / "deploy/kubernetes/overlays/production"
 AUTOSCALING = ROOT / "deploy/kubernetes/components/autoscaling"
+PRODUCTION_STATEFUL = ROOT / "deploy/kubernetes/overlays/production-stateful"
 KUBERNETES_DOC = ROOT / "docs/deployment/kubernetes.md"
 STATEFUL_DOC = ROOT / "docs/deployment/stateful-backends.md"
 RECOVERY_DOC = ROOT / "docs/operations/backup-and-recovery.md"
@@ -61,6 +62,7 @@ SCHEMA_SOURCE = ROOT / "crates/gateway/src/backends/control_plane/schema.rs"
 REVOCATION_SOURCE = ROOT / "crates/gateway/src/revocation/redis.rs"
 DRILL = ROOT / "ops/restore-drill.sh"
 ROLLOUT_DRILL = ROOT / "ops/rollout-drill.sh"
+STATEFUL_DRILL = ROOT / "ops/stateful-deploy-drill.sh"
 TELEMETRY_SOURCE = ROOT / "crates/gateway/src/telemetry/mod.rs"
 
 IMAGE_REPOSITORY = "ghcr.io/litvue/axond"
@@ -430,12 +432,15 @@ def check_service_port(documents: list[Document], label: str) -> list[str]:
                 f"{label}: container {container['name']!r} exposes {sorted(ports)} but the "
                 f"mounted config binds {bind_port}"
             )
-    for port in one(documents, "Service").get("spec", {}).get("ports", []):
-        if port.get("port") != bind_port:
-            failures.append(
-                f"{label}: the Service publishes {port.get('port')} but the mounted config "
-                f"binds {bind_port}"
-            )
+    # Every Service, not one: the stateful overlay publishes the administrative
+    # surface on a second Service, and it reaches the same listener.
+    for service in of_kind(documents, "Service"):
+        for port in service.get("spec", {}).get("ports", []):
+            if port.get("port") != bind_port:
+                failures.append(
+                    f"{label}: Service {service['metadata']['name']!r} publishes "
+                    f"{port.get('port')} but the mounted config binds {bind_port}"
+                )
     for policy in of_kind(documents, "NetworkPolicy"):
         for rule in policy["spec"].get("ingress", []):
             for port in rule.get("ports", []):
@@ -727,6 +732,161 @@ def check_component_layering(kustomization: str) -> list[str]:
     return []
 
 
+def check_stateful(documents: list[Document]) -> list[str]:
+    """The stateful overlay deploys the lifecycle the runtime actually has.
+
+    A stateful replica boots, serves `/admin/v1`, and refuses inference until
+    revision convergence ships, so it never reports Ready. Three defaults of a
+    serving fleet are wrong for one that does not, and each is a silent wrongness
+    — an upgrade that hangs, an administrative surface with no endpoints, a node
+    drain that never finishes — so each is asserted here rather than left to the
+    comment that explains it. The fourth assertion is the schema ordering: the
+    migration is a Job, and a booting replica is not allowed to apply it.
+    """
+    label = "overlays/production-stateful"
+    failures: list[str] = []
+    deployment = one(documents, "Deployment")
+
+    strategy = deployment["spec"].get("strategy", {})
+    if strategy.get("type") != "Recreate":
+        failures.append(
+            f"{label}: the Deployment upgrades with {strategy.get('type')!r}; a rolling update "
+            "waits for an availability a fleet refusing inference never reports, so the upgrade "
+            "stalls instead of landing"
+        )
+    if strategy.get("rollingUpdate") is not None:
+        failures.append(f"{label}: the Deployment keeps rollingUpdate settings beside Recreate")
+
+    budget = one(documents, "PodDisruptionBudget")
+    if budget["spec"].get("unhealthyPodEvictionPolicy") != "AlwaysAllow":
+        failures.append(
+            f"{label}: the disruption budget does not set unhealthyPodEvictionPolicy: "
+            "AlwaysAllow, so with no Ready Pod it allows no eviction at all and every node "
+            "drain blocks"
+        )
+
+    services = {service["metadata"]["name"]: service for service in of_kind(documents, "Service")}
+    admin = services.get("axond-admin")
+    if admin is None:
+        failures.append(
+            f"{label}: there is no axond-admin Service, so /admin/v1 is unreachable — the "
+            "inference Service has no endpoints while no replica is Ready"
+        )
+    else:
+        if not admin["spec"].get("publishNotReadyAddresses"):
+            failures.append(
+                f"{label}: the axond-admin Service does not publish not-ready addresses, which "
+                "is the only thing that gives it endpoints on this fleet"
+            )
+        if admin["spec"].get("selector") != SELECTOR:
+            failures.append(f"{label}: the axond-admin Service does not select the axond Pods")
+    if services.get("axond", {}).get("spec", {}).get("publishNotReadyAddresses"):
+        failures.append(
+            f"{label}: the inference Service publishes not-ready addresses, so an ingress would "
+            "route callers to a replica that refuses them"
+        )
+
+    jobs = of_kind(documents, "Job")
+    if len(jobs) != 1 or jobs[0]["metadata"]["name"] != "axond-migrate":
+        failures.append(f"{label}: the forward migration is not deployed as one axond-migrate Job")
+    else:
+        job = jobs[0]
+        pod = job["spec"]["template"]["spec"]
+        job_containers = pod.get("containers", [])
+        if ["migrate", "apply"] != job_containers[0].get("args", [])[:2]:
+            failures.append(f"{label}: the axond-migrate Job does not run `axond migrate apply`")
+        if pod.get("restartPolicy") != "Never":
+            failures.append(f"{label}: the axond-migrate Job restarts its Pod in place")
+        job_labels = job["spec"]["template"]["metadata"].get("labels", {})
+        if job_labels.get("app.kubernetes.io/name") == "axond":
+            failures.append(
+                f"{label}: the migration Pod carries the serving label, so it becomes a Service "
+                "endpoint and is selected by the gateway's NetworkPolicies"
+            )
+        selected = {
+            policy["spec"]["podSelector"].get("matchLabels", {}).get("app.kubernetes.io/name")
+            for policy in of_kind(documents, "NetworkPolicy")
+        }
+        if job_labels.get("app.kubernetes.io/name") not in selected:
+            failures.append(
+                f"{label}: no NetworkPolicy selects the migration Pod, so the Pod holding the "
+                "control-plane DSN has unrestricted egress under a default-deny overlay"
+            )
+
+    for document in (deployment, *jobs):
+        for container in document["spec"]["template"]["spec"].get("containers", []):
+            image = container["image"]
+            if f"{IMAGE_REPOSITORY}@{SENTINEL_DIGEST}" != image:
+                failures.append(
+                    f"{label}: container {container['name']!r} runs {image!r}; this overlay's "
+                    "own images: block has to pin every container — including the Job the "
+                    "production overlay's transformer never sees — to the sentinel digest"
+                )
+
+    config = gateway_config(documents)
+    if config.get("mode") != "stateful":
+        failures.append(f"{label}: the mounted config is not `mode = \"stateful\"`")
+    owned_by_the_control_plane = sorted(
+        key
+        for key in ("namespace", "provider", "credential", "model", "gateway_key", "alias")
+        if key in config
+    )
+    if owned_by_the_control_plane:
+        failures.append(
+            f"{label}: the bootstrap declares {owned_by_the_control_plane}, which the control "
+            "plane owns in this mode — a boot error before the listener binds"
+        )
+    if config.get("control_plane", {}).get("migrate"):
+        failures.append(
+            f"{label}: booting replicas may apply migrations, so a restart can have one replica "
+            "migrating a database its peers are reading; the Job is the migration"
+        )
+    return failures
+
+
+def check_stateful_drill(workflow: dict[str, Any], page: str, drill: str) -> list[str]:
+    """The stateful overlay's behaviour has a cluster proof, and CI runs it.
+
+    `check_stateful` reads the rendered shape. Whether `/admin/v1` is reachable,
+    whether an upgrade lands, and whether a Pod can be evicted are answers only an
+    API server gives, and each of the three has a counterfactual in the drill —
+    without them a change restoring the stateless defaults would still pass.
+    """
+    failures: list[str] = []
+    jobs = workflow["jobs"]
+    lane = jobs.get("stateful-deploy-drill")
+    if lane is None:
+        failures.append(".github/workflows/ci.yml: the stateful-deploy-drill lane is missing")
+    elif not any(
+        "ops/stateful-deploy-drill.sh" in str(step.get("run", "")) for step in lane["steps"]
+    ):
+        failures.append(
+            ".github/workflows/ci.yml: the stateful-deploy-drill lane does not run the drill"
+        )
+    elif (reason := unblocked_lane(jobs, "stateful-deploy-drill")) is not None:
+        failures.append(
+            f".github/workflows/ci.yml: {reason}, so a stateful deployment that cannot be "
+            "upgraded or drained would not block a merge"
+        )
+    if "ops/stateful-deploy-drill.sh" not in page:
+        failures.append(
+            "docs/deployment/kubernetes.md: ops/stateful-deploy-drill.sh is not documented"
+        )
+    for counterfactual, lost in (
+        ("RollingUpdate has to stall", "an upgrade that never lands would read as one that did"),
+        (
+            "the default budget has to refuse it",
+            "a budget that blocks every drain would read as one that permits them",
+        ),
+    ):
+        if counterfactual not in drill:
+            failures.append(
+                f"ops/stateful-deploy-drill.sh: the {counterfactual!r} counterfactual is gone; "
+                f"{lost}"
+            )
+    return failures
+
+
 def check_documented() -> list[str]:
     """The operator-facing page names the paths and the sentinel workflow."""
     page = KUBERNETES_DOC.read_text(encoding="utf-8")
@@ -734,7 +894,9 @@ def check_documented() -> list[str]:
     for path in (
         "deploy/kubernetes/base",
         "deploy/kubernetes/overlays/production",
+        "deploy/kubernetes/overlays/production-stateful",
         "deploy/kubernetes/components/autoscaling",
+        "deploy/kubernetes/components/stateful",
         "ops/pin-image-digest.sh",
     ):
         if path not in page:
@@ -763,8 +925,20 @@ def check_sentinel_refused() -> list[str]:
     return []
 
 
-def gate(base: list[Document], production: list[Document], autoscaled: list[Document]) -> list[str]:
+def gate(
+    base: list[Document],
+    production: list[Document],
+    autoscaled: list[Document],
+    stateful: list[Document],
+) -> list[str]:
     return [
+        *check_stateful(stateful),
+        *check_termination_budget(stateful, "overlays/production-stateful"),
+        *check_resources(stateful, "overlays/production-stateful"),
+        *check_service_port(stateful, "overlays/production-stateful"),
+        *check_topology_spread(stateful),
+        *check_namespaces(stateful, "overlays/production-stateful"),
+        *check_example_secret(stateful, base),
         *check_image_pinning(base, production),
         *check_termination_budget(base, "base"),
         *check_termination_budget(production, "overlays/production"),
@@ -787,14 +961,67 @@ def self_test() -> int:
     base = render(BASE)
     production = render(PRODUCTION)
     autoscaled = render(PRODUCTION, (AUTOSCALING,))
+    stateful = render(PRODUCTION_STATEFUL)
     failures: list[str] = []
 
     def expect_failure(name: str, produced: list[str]) -> None:
         if not produced:
             failures.append(f"self-test: {name} did not fail on a manifest it must reject")
 
-    if gate(base, production, autoscaled):
+    if gate(base, production, autoscaled, stateful):
         failures.append("self-test: the committed manifests must pass the gate")
+
+    rolling = copy.deepcopy(stateful)
+    one(rolling, "Deployment")["spec"]["strategy"] = {
+        "type": "RollingUpdate",
+        "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1},
+    }
+    expect_failure("a stateful fleet upgraded with RollingUpdate", check_stateful(rolling))
+
+    blocked = copy.deepcopy(stateful)
+    one(blocked, "PodDisruptionBudget")["spec"].pop("unhealthyPodEvictionPolicy")
+    expect_failure("a budget that blocks every drain", check_stateful(blocked))
+
+    unreachable_admin = copy.deepcopy(stateful)
+    for service in of_kind(unreachable_admin, "Service"):
+        if service["metadata"]["name"] == "axond-admin":
+            service["spec"].pop("publishNotReadyAddresses")
+    expect_failure("an admin Service with no endpoints", check_stateful(unreachable_admin))
+
+    routed = copy.deepcopy(stateful)
+    for service in of_kind(routed, "Service"):
+        if service["metadata"]["name"] == "axond":
+            service["spec"]["publishNotReadyAddresses"] = True
+    expect_failure("callers routed to a refusing replica", check_stateful(routed))
+
+    self_migrating = copy.deepcopy(stateful)
+    config = one(self_migrating, "ConfigMap")
+    config["data"]["axond.toml"] = config["data"]["axond.toml"].replace(
+        "[secret_store]", "migrate = true\n\n[secret_store]"
+    )
+    expect_failure("replicas allowed to migrate at boot", check_stateful(self_migrating))
+
+    statelessly_configured = copy.deepcopy(stateful)
+    config = one(statelessly_configured, "ConfigMap")
+    config["data"]["axond.toml"] += '\n[[namespace]]\nid = "platform"\n'
+    expect_failure("a bootstrap that also declares resources", check_stateful(statelessly_configured))
+
+    tagged_job = copy.deepcopy(stateful)
+    containers(one(tagged_job, "Job"))[0]["image"] = f"{IMAGE_REPOSITORY}:0.3.27"
+    expect_failure("a migration Job left on a mutable tag", check_stateful(tagged_job))
+
+    serving_label = copy.deepcopy(stateful)
+    one(serving_label, "Job")["spec"]["template"]["metadata"]["labels"] = dict(SELECTOR)
+    expect_failure("a migration Pod wearing the serving label", check_stateful(serving_label))
+
+    unpoliced = copy.deepcopy(stateful)
+    unpoliced[:] = [
+        document
+        for document in unpoliced
+        if document.get("kind") != "NetworkPolicy"
+        or not document["metadata"]["name"].startswith("axond-migrate")
+    ]
+    expect_failure("a migration Pod no NetworkPolicy selects", check_stateful(unpoliced))
 
     tagged = copy.deepcopy(production)
     containers(one(tagged, "Deployment"))[0]["image"] = f"{IMAGE_REPOSITORY}:latest"
@@ -1038,6 +1265,33 @@ def self_test() -> int:
         check_rollout_drill(workflow, kubernetes_page, rollout.replace("has to deadlock", "runs")),
     )
 
+    stateful_drill = STATEFUL_DRILL.read_text(encoding="utf-8")
+    if check_stateful_drill(workflow, kubernetes_page, stateful_drill):
+        failures.append("self-test: the committed stateful drill wiring must pass the gate")
+    optional_stateful = copy.deepcopy(workflow)
+    optional_stateful["jobs"]["CI-Success"]["needs"].remove("stateful-deploy-drill")
+    expect_failure(
+        "optional stateful deploy lane",
+        check_stateful_drill(optional_stateful, kubernetes_page, stateful_drill),
+    )
+    unasserted_stateful = copy.deepcopy(workflow)
+    for step in unasserted_stateful["jobs"]["CI-Success"]["steps"]:
+        if "run" in step:
+            step["run"] = re.sub(
+                r"^.*needs\.stateful-deploy-drill\.result.*$", "", step["run"], flags=re.MULTILINE
+            )
+    expect_failure(
+        "a needed stateful lane CI-Success never asserts",
+        check_stateful_drill(unasserted_stateful, kubernetes_page, stateful_drill),
+    )
+    for counterfactual in ("RollingUpdate has to stall", "the default budget has to refuse it"):
+        expect_failure(
+            f"stateful drill without {counterfactual!r}",
+            check_stateful_drill(
+                workflow, kubernetes_page, stateful_drill.replace(counterfactual, "runs")
+            ),
+        )
+
     for failure in failures:
         print(failure, file=sys.stderr)
     if failures:
@@ -1051,7 +1305,12 @@ def main(argv: list[str]) -> int:
     if "--self-test" in argv:
         return self_test()
     failures = [
-        *gate(render(BASE), render(PRODUCTION), render(PRODUCTION, (AUTOSCALING,))),
+        *gate(
+            render(BASE),
+            render(PRODUCTION),
+            render(PRODUCTION, (AUTOSCALING,)),
+            render(PRODUCTION_STATEFUL),
+        ),
         *check_component_layering(
             (PRODUCTION / "kustomization.yaml").read_text(encoding="utf-8")
         ),
@@ -1072,6 +1331,11 @@ def main(argv: list[str]) -> int:
             yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8")),
             KUBERNETES_DOC.read_text(encoding="utf-8"),
             ROLLOUT_DRILL.read_text(encoding="utf-8"),
+        ),
+        *check_stateful_drill(
+            yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8")),
+            KUBERNETES_DOC.read_text(encoding="utf-8"),
+            STATEFUL_DRILL.read_text(encoding="utf-8"),
         ),
     ]
     for failure in failures:

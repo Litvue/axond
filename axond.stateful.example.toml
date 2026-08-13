@@ -17,8 +17,13 @@
 #
 # Status: a replica boots against this file and serves `/admin/v1` against the
 # control plane, but it refuses inference until a published revision compiles
-# into a runtime snapshot, rather than serving an empty one (axond #142).
-# `axond check preflight` reports that refusal on its `serving` line.
+# into a runtime snapshot, rather than serving an empty one (axond #142). It
+# fails `/readyz` and answers inference `503 inference_unavailable` until then,
+# while `/healthz` stays live, so an orchestrator leaves the administrative
+# surface reachable on a fleet that is deliberately unready;
+# docs/deployment/kubernetes.md#stateful-mode has the deployment shape that
+# follows from it, and `axond check preflight` reports that refusal on its
+# `serving` line.
 
 mode = "stateful"
 

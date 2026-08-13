@@ -1,0 +1,35 @@
+# The production overlay in `mode = "stateful"`: same posture — digest-pinned
+# image, topology spread, default-deny NetworkPolicy, disruption budget, drain
+# window — plus the schema ordering and the three consequences of a replica that
+# serves `/admin/v1` and refuses inference until revision convergence ships. The
+# component's own header explains each one; `docs/deployment/kubernetes.md#stateful-mode`
+# has the apply order and what an operator sees afterwards.
+#
+# This is an overlay of `../production` rather than a component list inside it,
+# because Kustomize accumulates a Kustomization's components before applying that
+# same Kustomization's patches — the same reason `components/autoscaling` is
+# layered from above.
+#
+# The `images:` block below is what pins the migration Job as well as the
+# Deployment: the production overlay's own transformer runs before this overlay
+# adds the Job, so a digest set only there would leave the Job on a mutable tag.
+# `ops/pin-image-digest.sh` writes both, and `--check` fails while either still
+# carries the sentinel.
+#
+# Not applyable as committed, by design: the digest is the all-zero sentinel.
+#
+#   ops/pin-image-digest.sh 0.3.27
+#   SIGNER_IDENTITY=... GITHUB_REPOSITORY=Litvue/axond ops/verify-image-evidence.sh ghcr.io/litvue/axond@<digest>
+#   kubectl apply -k deploy/kubernetes/overlays/production-stateful
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../production
+components:
+  - ../../components/stateful
+images:
+  - name: ghcr.io/litvue/axond
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: axond

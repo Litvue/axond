@@ -398,7 +398,8 @@ jobs:
           shellcheck install.sh ops/publish-image-index.sh \
             ops/verify-image-evidence.sh ops/check-compose-platform.sh \
             ops/check-installer-download.sh ops/check-index-promotion.sh \
-            ops/pin-image-digest.sh ops/restore-drill.sh ops/rollout-drill.sh
+            ops/pin-image-digest.sh ops/restore-drill.sh ops/rollout-drill.sh \
+            ops/stateful-deploy-drill.sh
           # A failed download must name the kind of failure: the older-release
           # explanation belongs to a 404, and a transport failure must read as
           # retryable rather than as a missing artifact.
@@ -744,6 +745,48 @@ jobs:
           AXOND_ROLLOUT_IMAGE: axond-ci-rollout
         run: bash ops/rollout-drill.sh
 
+  # A stateful replica boots, serves `/admin/v1`, and refuses inference until
+  # revision convergence ships, so it never reports Ready — and three defaults of
+  # a serving fleet become wrong at once: the upgrade waits for an availability
+  # that never arrives, the Service that would carry `/admin/v1` has no
+  # endpoints, and the disruption budget blocks every eviction. Whether the
+  # overlay's answers work is an API-server outcome rather than a manifest
+  # property, so the drill runs each of the three against a real cluster with the
+  # counterfactual that keeps the result honest.
+  stateful-deploy-drill:
+    name: Stateful deploy drill (three nodes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Downloaded and checksummed for the same reason the rollout lane does it:
+      # the cluster tool is a supply-chain input the workflow policy's SHA
+      # pinning does not reach inside an action to cover.
+      - name: Install kind and kubectl
+        env:
+          KIND_VERSION: v0.30.0
+          KIND_SHA256: 517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889
+          KUBECTL_VERSION: v1.33.4
+          KUBECTL_SHA256: c2ba72c115d524b72aaee9aab8df8b876e1596889d2f3f27d68405262ce86ca1
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/kind \
+            "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  /tmp/kind" | sha256sum --check --strict
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          curl -fsSL -o /tmp/kubectl \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  /tmp/kubectl" | sha256sum --check --strict
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+      # This commit's own image, not a release: `serve` did not bring up
+      # `/admin/v1` in the last published one, so a drill on a tag would assert
+      # against a gateway older than the manifests it is checking.
+      - name: Build the image the overlay deploys
+        run: docker build --tag axond-ci-stateful .
+      - name: Deploy the stateful overlay and drill its lifecycle
+        env:
+          AXOND_STATEFUL_IMAGE: axond-ci-stateful
+        run: bash ops/stateful-deploy-drill.sh
+
   quickstart-smoke:
     name: Compose quickstart smoke
     runs-on: ubuntu-latest
@@ -778,6 +821,7 @@ jobs:
       - cosign-format
       - restore-drill
       - rollout-drill
+      - stateful-deploy-drill
       - quickstart-smoke
     runs-on: ubuntu-latest
     steps:
@@ -803,4 +847,5 @@ jobs:
           test "${{ needs.cosign-format.result }}" = success
           test "${{ needs.restore-drill.result }}" = success
           test "${{ needs.rollout-drill.result }}" = success
+          test "${{ needs.stateful-deploy-drill.result }}" = success
           test "${{ needs.quickstart-smoke.result }}" = success

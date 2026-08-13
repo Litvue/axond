@@ -1,0 +1,27 @@
+# `/admin/v1` on Pods that are deliberately not Ready.
+#
+# The base's `axond` Service keeps its ordinary semantics — endpoints only for
+# Ready Pods — so it stays empty while inference is refused, and an ingress in
+# front of it returns 503 instead of routing to a replica that would. Operators
+# still have to reach the administrative surface on those same Pods, which is
+# what `publishNotReadyAddresses` is for.
+#
+# Two consequences to accept before exposing this: requests are load-balanced
+# across replicas that are starting or draining as well as running, and the
+# admin surface authenticates with the breakglass credential and, once #252
+# lands, OIDC. Keep it inside the cluster, or behind an ingress that requires
+# operator identity, rather than beside the public inference Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: axond-admin
+  namespace: axond
+spec:
+  type: ClusterIP
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: axond
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

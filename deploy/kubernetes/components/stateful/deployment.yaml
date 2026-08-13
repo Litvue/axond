@@ -1,0 +1,21 @@
+# A refusing replica never reports Ready, and a RollingUpdate is defined in
+# terms of availability: it creates the surge Pod, waits for it to become
+# available, and — with `maxUnavailable: 0` — never takes an old Pod down. The
+# rollout does not slow down, it stops, and `kubectl rollout status` returns
+# `ProgressDeadlineExceeded` on a fleet whose new Pods are all running correctly.
+#
+# `Recreate` is the honest strategy while the fleet serves `/admin/v1` only:
+# there is no inference traffic to keep flowing across the upgrade, and the
+# administrative surface is unavailable for the length of one Pod restart.
+# Restore the base's RollingUpdate at the same time inference stops being
+# refused — the `axond migrate apply` in front of the upgrade is what keeps the
+# two versions from disagreeing about the schema in that window.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: axond
+  namespace: axond
+spec:
+  strategy:
+    $patch: replace
+    type: Recreate

@@ -1,0 +1,76 @@
+# The forward migration, run once, before the replicas that read the schema.
+#
+# `axond migrate apply` is forward-only and idempotent, and it is the only
+# command in this manifest set that writes DDL: a rerun against a current schema
+# reports it and exits 0. It runs as a Job rather than as an initContainer
+# because an initContainer runs once per Pod — a three-replica rollout would race
+# three migrations against one database — and rather than as
+# `[control_plane] migrate = true` for the same reason.
+#
+# A Job's `spec` is immutable, so an upgrade that ships new migrations deletes
+# this one first. That is the documented order in
+# `docs/deployment/kubernetes.md#stateful-mode`:
+#
+#   kubectl delete job axond-migrate -n axond --ignore-not-found
+#   kubectl apply -k <your overlay>
+#   kubectl wait --for=condition=complete job/axond-migrate -n axond --timeout=5m
+#
+# `kubectl logs job/axond-migrate -n axond` is the record of what it applied, and
+# `axond migrate status` — the same binary, read-only — is what a rehearsal or a
+# post-restore check runs instead.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: axond-migrate
+  namespace: axond
+spec:
+  backoffLimit: 3
+  # Kept long enough to read the logs of a completed migration, short enough that
+  # a stale Job is not what the next upgrade collides with.
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        # Deliberately not `axond`: that label is the Service selector and the
+        # NetworkPolicy peer for a serving replica, and this Pod is neither.
+        app.kubernetes.io/name: axond-migrate
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          # Kustomize's image transformer rewrites this alongside the Deployment,
+          # so an overlay pinning a digest migrates with the same bytes it serves.
+          image: ghcr.io/litvue/axond:0.3.27 # x-release-please-version
+          imagePullPolicy: IfNotPresent
+          args:
+            - migrate
+            - apply
+            - --config
+            - /etc/axond/axond.toml
+          envFrom:
+            - secretRef:
+                name: axond-secrets
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/axond
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: axond-config
