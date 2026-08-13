@@ -167,3 +167,6 @@ a restore of your archive proves your archive.
   limits.
 - [Production checklist](../deployment/production-checklist.md) — the review this
   page is the recovery half of.
+- [Recovery qualification](./recovery-qualification.md) — the fleet-level
+  contract its `backup-restore` and `point-in-time-recovery` scenarios rehearse
+  this procedure under, once its harness exists.
