@@ -175,6 +175,11 @@ stays active, so nothing is served from a half-parsed document and no request
 path changes. That also means the only evidence is the signals above — hence the
 alert at two consecutive refusals rather than one.
 
+The count is a property of the catalogue rather than of whatever drives it:
+`LastKnownGoodCatalog::record_refresh` takes the whole refresh outcome, so a
+fetch that never reached a parse still counts and a confirmed `304` still ends
+the run, and the scheduler slice has no separate bookkeeping to get wrong.
+
 None of this is an availability incident. Catalogue freshness is not an
 admission, entitlement, billing, readiness, or liveness dependency: a stale
 catalogue degrades metadata quality (a new model or a changed published price is

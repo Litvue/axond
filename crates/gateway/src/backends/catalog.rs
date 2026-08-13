@@ -2228,6 +2228,41 @@ impl LastKnownGoodCatalog {
         }
     }
 
+    /// Record a whole refresh — the one entry point that keeps the run of
+    /// refusals honest whichever way the refresh ended.
+    ///
+    /// [`admit_result`](Self::admit_result) only sees imports that got as far as
+    /// a parse, and a refresh can fail before that (transport, an oversized
+    /// body, a URL that serves no catalogue) or succeed without one
+    /// ([`CatalogRefresh::Unchanged`]). Routing every outcome through here is
+    /// what makes `consecutive_refusals` a property of the catalogue rather than
+    /// of a caller's diligence: a fetch failure counts, and a confirmed
+    /// unchanged answer ends the run and ages the active snapshot forward.
+    ///
+    /// `Ok(None)` is the one odd answer: a `304` before any first import
+    /// confirms content that is not held, so there is nothing to record.
+    pub fn record_refresh<E: Refusable>(
+        &mut self,
+        refreshed: Result<CatalogRefresh, E>,
+        checked_at: SystemTime,
+    ) -> Result<Option<Admission>, (E, Option<&CatalogSnapshot>)> {
+        match refreshed {
+            Ok(CatalogRefresh::Unchanged { validators }) => {
+                if !self.record_unchanged(validators, checked_at) {
+                    return Ok(None);
+                }
+                Ok(self.active.as_ref().map(|active| Admission::Unchanged {
+                    content_id: active.content.content_id(),
+                }))
+            }
+            Ok(CatalogRefresh::Updated(snapshot)) => Ok(Some(self.admit(*snapshot))),
+            Err(error) => {
+                self.record_refusal(error.refusal());
+                Err((error, self.active.as_ref()))
+            }
+        }
+    }
+
     /// Count a refusal that happened before there was anything to admit — a
     /// transport failure, an oversized body — so "this catalogue has stopped
     /// advancing" does not depend on how far the import got.
@@ -3359,6 +3394,51 @@ mod tests {
                 .contains('/'),
             "the reason is a vocabulary word, never the pointer or the URL beside it"
         );
+    }
+
+    /// Every way a refresh can end goes through one entry point, so the run of
+    /// refusals cannot depend on a scheduler remembering to count a failure that
+    /// never reached a parse, or to credit a `304`.
+    #[test]
+    fn one_entry_point_counts_a_refresh_however_it_ended() {
+        let mut catalogue = LastKnownGoodCatalog::new();
+        let imported_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let first = catalogue
+            .record_refresh::<CatalogError>(
+                Ok(CatalogRefresh::Updated(Box::new(snapshot(
+                    content(vec![offering("openai", "gpt-4o", Some(price(1, 2)))]),
+                    SourceValidators::etag("\"one\""),
+                )))),
+                imported_at,
+            )
+            .expect("an admitted import");
+        assert!(matches!(first, Some(Admission::Initial { .. })));
+
+        // A fetch that never produced a document to parse still counts.
+        let unreachable = CatalogError::unavailable("test", "connection refused".to_owned());
+        let (error, active) = catalogue
+            .record_refresh(Err(unreachable), imported_at)
+            .expect_err("a refused refresh");
+        assert_eq!(error.refused_by().reason(), RefusalReason::Unreachable);
+        assert!(
+            active.is_some(),
+            "and the last good catalogue keeps serving through it"
+        );
+        assert_eq!(catalogue.report(imported_at).consecutive_refusals, 1);
+
+        let checked_at = imported_at + Duration::from_secs(600);
+        let confirmed = catalogue
+            .record_refresh::<CatalogError>(
+                Ok(CatalogRefresh::Unchanged {
+                    validators: SourceValidators::etag("\"one\""),
+                }),
+                checked_at,
+            )
+            .expect("a confirmed answer");
+        assert!(matches!(confirmed, Some(Admission::Unchanged { .. })));
+        let report = catalogue.report(checked_at);
+        assert_eq!(report.consecutive_refusals, 0, "a 304 ends the run");
+        assert_eq!(report.active_age(), Some(Duration::ZERO));
     }
 
     #[tokio::test]
