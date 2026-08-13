@@ -12,6 +12,11 @@ Use GitHub's private vulnerability reporting for this repository:
 [**Report a vulnerability**](https://github.com/Litvue/axond/security/advisories/new).
 That opens a draft advisory visible only to you and the maintainers, and it is
 the only reporting channel — there is no security mailing list to fall back to.
+The repository's *New issue* chooser links the same form
+([`.github/ISSUE_TEMPLATE/config.yml`](./.github/ISSUE_TEMPLATE/config.yml)), and
+`ops/check-docs.py` fails if that link and this page ever name different
+channels, so the button a reporter reaches first cannot route a vulnerability
+into a public issue.
 
 A useful report contains:
 

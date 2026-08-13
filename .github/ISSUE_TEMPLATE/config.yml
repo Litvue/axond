@@ -1,0 +1,28 @@
+# The issue chooser, which is where a reporter who has found a vulnerability
+# actually starts: `SECURITY.md` is a tab away, while "New issue" is the button
+# in front of them. These links put the private channel on that page, so the
+# default path for a security report is the draft advisory rather than a public
+# issue that discloses it on the way to being triaged.
+#
+# Blank issues stay enabled deliberately — this repository's own planning issues
+# are plain prose, and a chooser that forbids them would push contributors to
+# mis-file rather than to describe. The chooser is shown because these links
+# exist, so the routing is visible either way.
+#
+# `ops/check-docs.py` holds the advisory URL here to the one `SECURITY.md`
+# publishes, so a moved reporting channel cannot leave this page pointing at the
+# old one.
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/Litvue/axond/security/advisories/new
+    about: >-
+      Vulnerabilities go through GitHub's private vulnerability reporting, not a
+      public issue: credential handling, tenant isolation, minted tokens, the
+      release artifacts, and the installers. Opens a draft advisory visible only
+      to you and the maintainers.
+  - name: Security policy, supported versions, and response targets
+    url: https://github.com/Litvue/axond/blob/main/SECURITY.md
+    about: >-
+      What is in scope, which releases receive fixes, the acknowledgement and
+      triage targets, and how a fix and its advisory ship.
