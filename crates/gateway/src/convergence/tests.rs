@@ -427,6 +427,46 @@ async fn a_failed_force_refresh_does_not_publish() {
     assert_eq!(replica.served_aliases(), before);
 }
 
+/// A refused refresh has refreshed nothing, and the revision id it would key
+/// off is unchanged, so the request outlives the attempt: the next ordinary
+/// convergence recompiles instead of skipping as already converged.
+#[tokio::test]
+async fn a_refused_force_refresh_is_retried_by_the_next_convergence() {
+    let store = control_plane();
+    let published = publish(&store, "first", ExpectedRevision::Empty, fixtures::state()).await;
+    let (replica, refuse) = Replica::toggleable(&store);
+    replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+    refuse.store(true, Ordering::Release);
+    let refused = replica
+        .reconciler
+        .force_refresh_once(telemetry::CONVERGENCE_NOTIFIED)
+        .await;
+    assert!(matches!(refused, Outcome::Rejected { .. }), "{refused:?}");
+
+    refuse.store(false, Ordering::Release);
+    let outcome = replica
+        .reconciler
+        .converge_once(telemetry::CONVERGENCE_POLLED)
+        .await;
+
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Published { revision, generation, .. }
+                if revision == published && generation == 2
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        replica.generation(),
+        2,
+        "the refresh eventually took effect"
+    );
+}
+
 /// A second revision converges on top of the first, and the replica ends up
 /// serving the newer alias set rather than a union of both.
 #[tokio::test]
