@@ -13,6 +13,11 @@
 //! - for a blob, its **digest and size**, which are already public identifiers of
 //!   immutable content.
 //!
+//! Its dependency edges are rendered in full, because they are references rather
+//! than material and because rewiring an alias onto a different credential
+//! version is otherwise invisible: same slug, same body, only a version number
+//! moved.
+//!
 //! So the diff answers "what changed" and never "to what". A test drives a state
 //! whose bodies contain secret-looking values and asserts they appear nowhere in
 //! the serialized diff.
@@ -139,11 +144,25 @@ pub struct ResourceDelta {
     pub body: Option<BodyView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_body: Option<BodyView>,
-    /// Whether the resource was renamed by this change — the one derived field,
+    /// The exact resource versions this one requires. Rendered because rewiring
+    /// an alias onto a different credential version changes nothing else a
+    /// reviewer can see — not the slug, and not the body checksum — and "what
+    /// does this now point at" is the question a review of a reference change
+    /// exists to answer. References, not material: these are the same edges
+    /// [`StateView`](super::reads::StateView) already projects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_depends_on: Option<Vec<String>>,
+    /// Whether the resource was renamed by this change — a derived field,
     /// because a rename is what a reviewer most often scans for and comparing two
     /// optional slugs by eye is where that goes wrong.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub renamed: bool,
+    /// Whether this change altered the resource's dependencies, derived for the
+    /// same reason as [`renamed`](Self::renamed).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub rewired: bool,
 }
 
 /// A blob's appearance or disappearance. A blob is immutable content, so it is
@@ -278,6 +297,16 @@ fn blob_delta(change: ChangeKind, blob: &BlobRef) -> BlobDelta {
     }
 }
 
+/// A version's dependency edges, in the set's own order so two replicas render
+/// them identically.
+fn references(resource: &ResourceVersion) -> Vec<String> {
+    resource
+        .depends_on
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
 fn added(resource: &ResourceVersion) -> Result<ResourceDelta, ValidationError> {
     Ok(ResourceDelta {
         change: ChangeKind::Added.as_str(),
@@ -290,7 +319,10 @@ fn added(resource: &ResourceVersion) -> Result<ResourceDelta, ValidationError> {
         previous_version: None,
         body: Some(BodyView::of(&resource.body)?),
         previous_body: None,
+        depends_on: Some(references(resource)),
+        previous_depends_on: None,
         renamed: false,
+        rewired: false,
     })
 }
 
@@ -306,7 +338,10 @@ fn removed(resource: &ResourceVersion) -> Result<ResourceDelta, ValidationError>
         previous_version: Some(resource.reference.version.get()),
         body: None,
         previous_body: Some(BodyView::of(&resource.body)?),
+        depends_on: None,
+        previous_depends_on: Some(references(resource)),
         renamed: false,
+        rewired: false,
     })
 }
 
@@ -322,6 +357,9 @@ fn updated(old: &ResourceVersion, new: &ResourceVersion) -> Result<ResourceDelta
         previous_version: Some(old.reference.version.get()),
         body: Some(BodyView::of(&new.body)?),
         previous_body: Some(BodyView::of(&old.body)?),
+        depends_on: Some(references(new)),
+        previous_depends_on: Some(references(old)),
         renamed: old.slug != new.slug,
+        rewired: old.depends_on != new.depends_on,
     })
 }

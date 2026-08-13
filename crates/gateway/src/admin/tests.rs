@@ -1210,6 +1210,61 @@ fn a_diff_is_stable_complete_and_matches_resources_by_identity() {
 }
 
 #[test]
+fn a_diff_shows_a_rewiring_that_nothing_else_about_the_resource_would_reveal() {
+    // The alias keeps its slug and its body and only stops pointing at the
+    // credential. Without the dependency edges the delta would be a bare
+    // `updated` row with a version bump and an unchanged body checksum — the one
+    // change a reviewer of a reference edit most needs to see.
+    let tenant = fixtures::tenant_id(1);
+    let catalog = fixtures::blob_backed_catalog(5);
+    let credential = fixtures::credential(&tenant, 3, "primary");
+    let base = fixtures::state();
+    let alias = base
+        .get(&fixtures::reference(ResourceKind::Alias, 4))
+        .expect("the fixture alias");
+
+    let mut rewired = DesiredState::new();
+    rewired.declare_blob(*catalog.body.blob().expect("a blob body"));
+    rewired
+        .insert(fixtures::tenant(1, "acme"))
+        .and_then(|state| state.insert(fixtures::project(&tenant, 2, "core")))
+        .and_then(|state| state.insert(credential.clone()))
+        .and_then(|state| state.insert(catalog.clone()))
+        .and_then(|state| {
+            state.insert(
+                ResourceVersion::new(
+                    alias.reference.at(alias.reference.version.next()),
+                    alias.scope.clone(),
+                    alias.slug.clone(),
+                    alias.body.clone(),
+                )
+                .depending_on([catalog.reference]),
+            )
+        })
+        .expect("dropping an edge leaves valid desired state");
+
+    let diff = SemanticDiff::between(Some(&base), &rewired).expect("a diff");
+    assert_eq!(diff.summary.updated, 1);
+    let delta = &diff.resources[0];
+    assert!(delta.rewired);
+    assert!(!delta.renamed);
+    assert_eq!(delta.slug, delta.previous_slug);
+    assert_eq!(delta.body, delta.previous_body);
+    let previous = delta
+        .previous_depends_on
+        .as_ref()
+        .expect("the edges it had");
+    let current = delta.depends_on.as_ref().expect("the edges it has");
+    assert!(previous.contains(&credential.reference.to_string()));
+    assert!(!current.contains(&credential.reference.to_string()));
+    assert!(current.contains(&catalog.reference.to_string()));
+
+    // An unchanged resource is still not rewired, so the flag means what it says.
+    let unchanged = SemanticDiff::between(Some(&base), &fixtures::state()).expect("a diff");
+    assert!(unchanged.is_empty());
+}
+
+#[test]
 fn a_state_view_describes_resources_without_their_bodies() {
     let view = StateView::of(None).expect("an empty state view");
     assert!(view.revision.is_none());
