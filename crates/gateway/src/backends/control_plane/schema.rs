@@ -533,6 +533,13 @@ fn altered(table: &str, clause: &str) -> Option<Expectation> {
 /// fail-closed answer an `UPDATE` gets.
 fn unrolled(statement: &str) -> Option<Vec<Expectation>> {
     let body = quoted(statement)?;
+    // The file-level scan skips a `$tag$ ... $tag$` region whole, so this is the
+    // first look inside it: the same fail-closed rule applies, or a literal that
+    // does not end where this reading says it does would swallow the rest of the
+    // block and shorten the evidence rather than void it.
+    if !lexed(body) {
+        return None;
+    }
     interpreted(&statements(body))
 }
 
@@ -1889,6 +1896,39 @@ fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baselin
             // for. Longest first, so a database that really is at v3 is recorded
             // as v3 rather than refused for the indexes v3 took away.
             Fit::Baseline => {
+                // The prefix accounts for what it declares, but a forward-only
+                // history is applied in order: something only a version *above* it
+                // leaves means this database is not that prefix, whatever else
+                // matches. Recording it anyway would state a history the database
+                // does not have and leave `apply` to run files over objects that
+                // are already there, so a skipped middle version is refused rather
+                // than rounded down.
+                if let Some(skipped) = migrations[length..]
+                    .iter()
+                    .zip(&declared[length..])
+                    .find(|(_, items)| {
+                        // Everything that version leaves of its own is there: it
+                        // ran. One such object on its own is not enough to say so,
+                        // because an earlier version can create the same thing
+                        // inline in a `CREATE TABLE` this parse reads as a table
+                        // and nothing more.
+                        let mut proof = items.iter().filter(|item| item.present && item.proof);
+                        proof.clone().next().is_some()
+                            && proof.all(|item| confirmed.contains(&item.what))
+                    })
+                    .map(|(migration, _)| migration)
+                {
+                    return Baseline::Inconsistent {
+                        message: format!(
+                            "v{} `{}` declares objects that are present while an earlier version's \
+                             are not; this database is not a prefix of the shipped migration \
+                             history, so no baseline describes it. State the history with `INSERT \
+                             INTO {MIGRATION_TABLE} (version, name, checksum)` if you own the \
+                             change that applied it.",
+                            skipped.version, skipped.name,
+                        ),
+                    };
+                }
                 return Baseline::Applied {
                     versions: migrations[..length]
                         .iter()
@@ -3316,5 +3356,64 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS one (id integer);\n-- and that is all"
         ));
         assert!(lexed("CREATE POLICY p ON one USING (id = $1);\n"));
+
+        // The same rule inside a block. The file-level scan skips a `$$ ... $$`
+        // region whole, so this is the first reading of its contents: a literal
+        // that does not close where it says would otherwise swallow the rest of
+        // the block and shorten its evidence instead of voiding it.
+        let inside = Migration {
+            version: 9,
+            name: "unlexable_block",
+            sql: "DO $$\nBEGIN\n  \
+                  EXECUTE format('ALTER TABLE one ADD COLUMN note text DEFAULT E''a\\''b''');\n  \
+                  ALTER TABLE one ENABLE ROW LEVEL SECURITY;\nEND\n$$;\n",
+        };
+        assert_eq!(
+            evidence(&inside),
+            None,
+            "a region a block's own body does not close makes the migration unconfirmable"
+        );
+    }
+
+    /// A forward-only history is applied in order, so objects only a later
+    /// version creates mean this database is not the prefix underneath it — even
+    /// when that prefix accounts for everything it declares. Rounding down would
+    /// record a history the database does not have and leave `apply` to run the
+    /// skipped file over objects that are already there.
+    #[test]
+    fn a_skipped_middle_version_is_refused_rather_than_recorded_as_the_prefix_below_it() {
+        const V1: Migration = Migration {
+            version: 1,
+            name: "first",
+            sql: "CREATE TABLE IF NOT EXISTS one (id integer);\n",
+        };
+        const V2: Migration = Migration {
+            version: 2,
+            name: "second",
+            sql: "CREATE TABLE IF NOT EXISTS two (id integer);\n",
+        };
+        const V3: Migration = Migration {
+            version: 3,
+            name: "third",
+            sql: "CREATE TABLE IF NOT EXISTS three (id integer);\n",
+        };
+        let shipped = [V1, V2, V3];
+
+        let Baseline::Inconsistent { message } =
+            reconcile(&shipped, &HashSet::from([table("one"), table("three")]))
+        else {
+            panic!("v3's table without v2's is not a prefix of the shipped history");
+        };
+        assert!(
+            message.contains("v3 `third` declares objects that are present"),
+            "the refusal names the version whose objects are there out of order: {message}"
+        );
+
+        // The prefix itself is still adoptable when nothing above it is there.
+        assert_eq!(
+            reconcile(&shipped, &HashSet::from([table("one")])),
+            Baseline::Applied { versions: vec![1] },
+            "v1 alone is the ordinary hand-applied prefix"
+        );
     }
 }

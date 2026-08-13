@@ -293,6 +293,21 @@ question, and anything outside the shape refused.
   that does — "the query names nothing" would otherwise be false of every database
   that ran it.
 
+Reading the longest prefix cuts both ways, so the search is bounded from above as
+well: a prefix is the baseline only if no version *over* it is evidently applied —
+everything that version leaves of its own being present means the files went on in a
+different order, or one was skipped, and the prefix underneath is then a history this
+database does not have. That is a refusal naming the later version rather than a
+recorded prefix, because recording one leaves `apply` to run the skipped file over
+objects that are already there. All of that version's own proof is required, not one
+object of it: an earlier file can declare the same constraint inline in a
+`CREATE TABLE`, which this parse reads as a table and nothing more, so a single
+shared object is not evidence of what wrote it. And the body of a `DO $$ ... $$`
+block goes through the same lexical check the file does before its statements are
+read, since the file-level scan skips the region whole and a literal inside it that
+does not close where this parse says would shorten the block's evidence instead of
+voiding it.
+
 The evidence-sharing rule is unchanged in substance and stated once more, because
 the third shape widens what counts as sharing: a version needs one thing **more
 than one shipped migration does not act on**. Two files creating the same object,
