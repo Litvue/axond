@@ -34,6 +34,7 @@ docs-check:
     bash -n ops/verify-image-evidence.sh
     bash -n ops/pin-image-digest.sh
     bash -n ops/restore-drill.sh
+    bash -n ops/rollout-drill.sh
     bash ops/check-compose-platform.sh
     bash ops/check-installer-download.sh
     bash ops/check-index-promotion.sh
@@ -59,6 +60,13 @@ deploy-check:
 # docs/operations/backup-and-recovery.md.
 restore-drill:
     bash ops/restore-drill.sh
+
+# Roll the production overlay out on a real three-worker kind cluster, then prove
+# the same rollout deadlocks once the per-node skew stops being counted per
+# ReplicaSet. Needs Docker, kind, kubectl, and kustomize. About three minutes;
+# documented in docs/deployment/kubernetes.md.
+rollout-drill:
+    bash ops/rollout-drill.sh
 
 # Refresh the manifest gate's lockfile, excluding releases newer than a week.
 deploy-lock:

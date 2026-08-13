@@ -298,7 +298,7 @@ jobs:
           shellcheck install.sh ops/publish-image-index.sh \
             ops/verify-image-evidence.sh ops/check-compose-platform.sh \
             ops/check-installer-download.sh ops/check-index-promotion.sh \
-            ops/pin-image-digest.sh ops/restore-drill.sh
+            ops/pin-image-digest.sh ops/restore-drill.sh ops/rollout-drill.sh
           # A failed download must name the kind of failure: the older-release
           # explanation belongs to a 404, and a transport failure must read as
           # retryable rather than as a missing artifact.
@@ -577,6 +577,47 @@ jobs:
       - name: Restore a logical dump and recover to a chosen point in time
         run: bash ops/restore-drill.sh
 
+  # Whether a rolling update completes is a scheduling outcome, not a manifest
+  # property: kube-scheduler counting skew across ReplicaSets decides it, and no
+  # rendered manifest can answer it. So the production overlay is rolled out on a
+  # real three-worker cluster — the shape where `maxUnavailable: 0` and a hard
+  # per-node spread deadlock each other — and the drill then removes the scoping
+  # and requires the same rollout to hang, which is what keeps the first result
+  # from passing for the wrong reason.
+  rollout-drill:
+    name: Rollout drill (three nodes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Downloaded and checksummed rather than taken from an action, because the
+      # cluster tool is as much a supply-chain input as the actions are, and the
+      # workflow policy's SHA pinning does not reach inside one.
+      - name: Install kind and kubectl
+        env:
+          KIND_VERSION: v0.30.0
+          KIND_SHA256: 517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889
+          KUBECTL_VERSION: v1.33.4
+          KUBECTL_SHA256: c2ba72c115d524b72aaee9aab8df8b876e1596889d2f3f27d68405262ce86ca1
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/kind \
+            "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  /tmp/kind" | sha256sum --check --strict
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          curl -fsSL -o /tmp/kubectl \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  /tmp/kubectl" | sha256sum --check --strict
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+      # The overlay's digest sentinel names no servable image, and the workspace
+      # version is unpublished until release, so the drill deploys this commit's
+      # own image.
+      - name: Build the image the overlay deploys
+        run: docker build --tag axond-ci-rollout .
+      - name: Roll the production overlay out on three nodes
+        env:
+          AXOND_ROLLOUT_IMAGE: axond-ci-rollout
+        run: bash ops/rollout-drill.sh
+
   quickstart-smoke:
     name: Compose quickstart smoke
     runs-on: ubuntu-latest
@@ -609,6 +650,7 @@ jobs:
       - docker-smoke
       - cosign-format
       - restore-drill
+      - rollout-drill
       - quickstart-smoke
     runs-on: ubuntu-latest
     steps:
@@ -632,4 +674,5 @@ jobs:
           test "${{ needs.docker-smoke.result }}" = success
           test "${{ needs.cosign-format.result }}" = success
           test "${{ needs.restore-drill.result }}" = success
+          test "${{ needs.rollout-drill.result }}" = success
           test "${{ needs.quickstart-smoke.result }}" = success

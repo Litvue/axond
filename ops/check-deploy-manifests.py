@@ -60,6 +60,7 @@ CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 SCHEMA_SOURCE = ROOT / "crates/gateway/src/backends/control_plane/schema.rs"
 REVOCATION_SOURCE = ROOT / "crates/gateway/src/revocation/redis.rs"
 DRILL = ROOT / "ops/restore-drill.sh"
+ROLLOUT_DRILL = ROOT / "ops/rollout-drill.sh"
 TELEMETRY_SOURCE = ROOT / "crates/gateway/src/telemetry/mod.rs"
 
 IMAGE_REPOSITORY = "ghcr.io/litvue/axond"
@@ -581,6 +582,65 @@ def check_recovery_drill(workflow: dict[str, Any], page: str, drill: str) -> lis
     return failures
 
 
+def check_rollout_drill(workflow: dict[str, Any], page: str, drill: str) -> list[str]:
+    """The spread constraints have a scheduling proof, and CI runs it.
+
+    Whether a rolling update completes is decided by kube-scheduler, not by the
+    manifest, so `check_topology_spread` can only assert the shape that makes it
+    possible. The drill is the scheduling half: a real three-node cluster, a real
+    rolling update, and — the assertion that keeps the first result honest — the
+    same rollout deadlocking once the skew stops being counted per ReplicaSet. A
+    drill reduced to its happy path would pass on a manifest whose surge Pod can
+    never be placed.
+    """
+    failures: list[str] = []
+    jobs = workflow["jobs"]
+    lane = jobs.get("rollout-drill")
+    if lane is None:
+        failures.append(".github/workflows/ci.yml: the rollout-drill lane is missing")
+    elif not any("ops/rollout-drill.sh" in str(step.get("run", "")) for step in lane["steps"]):
+        failures.append(".github/workflows/ci.yml: the rollout-drill lane does not run the drill")
+    elif "rollout-drill" not in jobs["CI-Success"]["needs"]:
+        failures.append(
+            ".github/workflows/ci.yml: CI-Success does not require rollout-drill, so a rollout "
+            "that cannot schedule would not block a merge"
+        )
+    if "ops/rollout-drill.sh" not in page:
+        failures.append("docs/deployment/kubernetes.md: ops/rollout-drill.sh is not documented")
+    if "has to deadlock" not in drill:
+        failures.append(
+            "ops/rollout-drill.sh: the counterfactual is gone; without a rollout that must hang, "
+            "the drill no longer shows the scoped skew is what makes the shipped one converge"
+        )
+    return failures
+
+
+def check_component_layering(kustomization: str) -> list[str]:
+    """The autoscaling component is layered above the overlay, never inside it.
+
+    Kustomize accumulates a Kustomization's components before applying that same
+    Kustomization's patches. A component listed here would have its
+    `remove /spec/replicas` undone by the overlay's own `deployment.yaml` patch,
+    so the rendered Deployment would keep `replicas` and every apply would fight
+    the HPA for the field — the exact failure the component exists to prevent,
+    and one that renders without error. The gate renders the component the
+    supported way, so nothing else would catch the inlined arrangement.
+    """
+    inlined = [
+        component
+        for component in yaml.safe_load(kustomization).get("components") or []
+        if "components/" in str(component)
+    ]
+    if inlined:
+        return [
+            "overlays/production: the kustomization declares components "
+            f"({', '.join(inlined)}); a component's patches run before this overlay's own, so "
+            "spec.replicas is removed and then re-added. Layer components in an overlay above "
+            "this one instead"
+        ]
+    return []
+
+
 def check_documented() -> list[str]:
     """The operator-facing page names the paths and the sentinel workflow."""
     page = KUBERNETES_DOC.read_text(encoding="utf-8")
@@ -790,6 +850,16 @@ def self_test() -> int:
         check_supported_backends(backends, images, floor, revocation.replace("PXAT", "EX")),
     )
 
+    production_kustomization = (PRODUCTION / "kustomization.yaml").read_text(encoding="utf-8")
+    if check_component_layering(production_kustomization):
+        failures.append("self-test: the committed overlay must not be read as inlining a component")
+    expect_failure(
+        "an autoscaling component inlined into the overlay it patches",
+        check_component_layering(
+            production_kustomization + "components:\n  - ../../components/autoscaling\n"
+        ),
+    )
+
     if check_recovery_drill(workflow, recovery, drill):
         failures.append("self-test: the committed drill wiring must pass the gate")
     unrequired = copy.deepcopy(workflow)
@@ -800,6 +870,20 @@ def self_test() -> int:
         check_recovery_drill(
             workflow, recovery, drill.replace("the write after the target is not replayed", "present")
         ),
+    )
+
+    kubernetes_page = KUBERNETES_DOC.read_text(encoding="utf-8")
+    rollout = ROLLOUT_DRILL.read_text(encoding="utf-8")
+    if check_rollout_drill(workflow, kubernetes_page, rollout):
+        failures.append("self-test: the committed rollout drill wiring must pass the gate")
+    optional_rollout = copy.deepcopy(workflow)
+    optional_rollout["jobs"]["CI-Success"]["needs"].remove("rollout-drill")
+    expect_failure(
+        "optional rollout lane", check_rollout_drill(optional_rollout, kubernetes_page, rollout)
+    )
+    expect_failure(
+        "rollout drill without its counterfactual",
+        check_rollout_drill(workflow, kubernetes_page, rollout.replace("has to deadlock", "runs")),
     )
 
     for failure in failures:
@@ -816,6 +900,9 @@ def main(argv: list[str]) -> int:
         return self_test()
     failures = [
         *gate(render(BASE), render(PRODUCTION), render(PRODUCTION, (AUTOSCALING,))),
+        *check_component_layering(
+            (PRODUCTION / "kustomization.yaml").read_text(encoding="utf-8")
+        ),
         *check_documented(),
         *check_sentinel_refused(),
         *check_supported_backends(
@@ -828,6 +915,11 @@ def main(argv: list[str]) -> int:
             yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8")),
             RECOVERY_DOC.read_text(encoding="utf-8"),
             DRILL.read_text(encoding="utf-8"),
+        ),
+        *check_rollout_drill(
+            yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8")),
+            KUBERNETES_DOC.read_text(encoding="utf-8"),
+            ROLLOUT_DRILL.read_text(encoding="utf-8"),
         ),
     ]
     for failure in failures:

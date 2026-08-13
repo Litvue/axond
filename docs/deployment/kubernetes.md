@@ -103,13 +103,24 @@ placeholder.
 
 `deploy/kubernetes/components/autoscaling` is a Kustomize component, not part of
 the overlay, because an HPA is a claim that request load and CPU move together
-for your traffic — measure that before adopting it. Append it to your own
-overlay:
+for your traffic — measure that before adopting it. Take it from an overlay *of*
+the production overlay:
 
 ```yaml
+# my-cluster/kustomization.yaml
+resources:
+  - ../deploy/kubernetes/overlays/production
 components:
-  - ../../components/autoscaling
+  - ../deploy/kubernetes/components/autoscaling
 ```
+
+Adding the component to `overlays/production/kustomization.yaml` instead does not
+work, and fails quietly: Kustomize accumulates a Kustomization's components
+before applying that same Kustomization's patches, so the component removes
+`spec.replicas` and the overlay's own `deployment.yaml` patch then puts it back.
+The rendered Deployment keeps `replicas: 3`, and every apply fights the HPA for
+the field — which is the failure the component exists to avoid. Layering it above
+the overlay, as here and as the manifest gate renders it, runs the removal last.
 
 It adds an HPA at 60% CPU utilization between 3 and 12 replicas, and removes
 `spec.replicas` from the Deployment so an apply does not fight the autoscaler for
@@ -246,3 +257,22 @@ the flush short.
 Keep `maxUnavailable: 0`, a PodDisruptionBudget, and enough replicas: they are
 what keeps capacity up during the drain. Clients should still retry requests
 that end before response commitment.
+
+`maxUnavailable: 0` and a hard per-node spread interact: on a cluster with as
+many schedulable nodes as replicas, a surge Pod counted against the Pods it
+replaces cannot be placed, and nothing is allowed to terminate to make room —
+the rollout hangs with a `Pending` Pod and `didn't match pod topology spread
+constraints`. The overlay avoids it with `matchLabelKeys: [pod-template-hash]`,
+which is a scheduling outcome no rendered manifest can verify, so it is proven
+on a real cluster:
+
+```bash
+just rollout-drill                # ops/rollout-drill.sh on a three-worker kind
+                                  # cluster, ~3 minutes
+```
+
+The drill rolls the overlay out, then removes `matchLabelKeys` and requires the
+same rollout to deadlock — the assertion that keeps the first result meaningful.
+It renders the overlay with a runnable image instead of the digest sentinel and
+never writes to `deploy/`. Run it when you change the spread constraints, the
+rollout strategy, or the replica count.
