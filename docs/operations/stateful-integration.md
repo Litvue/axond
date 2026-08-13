@@ -54,9 +54,10 @@ wave 0  (landed)   revision journal · convergence loop · LKG cache · prefligh
                    #207 catalogue import                   #143 admin API/CLI served
                    #251 approved price books               #247 catalogue aliases
                    #252 tenancy/principals/RBAC/audit      #255 model enablement
+                   #238 authenticated dependency status    #295 store → credential pools
+                   #244 empty-ledger reconciliation and adoption
                         │
-wave 1  (in flight) #276 runtime policy activation          #244 empty-ledger adoption
-                                                            #249 usage outbox
+wave 1  (in flight) #276 runtime policy activation          #249 usage outbox
                         │
 wave 2  (integration) IG-01 … IG-05: boot → connect → hydrate → compile → publish → serve
                         │
@@ -73,9 +74,14 @@ dependencies land.
 
 Every gate has an identifier, the #160 release gate it discharges, the wiring
 integration owns, what it depends on, and the harness scenario that proves it.
-`Status` is either `wired` (the scenario runs and asserts the property) or
-`blocked` (the scenario asserts that the system still refuses inference rather
-than pretending otherwise, and names what it waits for).
+`Status` is one of three:
+
+- `wired` — the scenario runs and asserts the property on a running process.
+- `partial` — a running process proves the path that exists, and the `Depends on`
+  cell names the part a contract slice still owns. Never a status a gate can hold
+  without a service-backed scenario.
+- `blocked` — the scenario asserts that the system still refuses inference rather
+  than pretending otherwise, and names what it waits for.
 
 `Depends on` lists only what is still outstanding — an unlanded contract slice,
 or an earlier gate that has to serve first. A dependency that lands moves to
@@ -88,10 +94,10 @@ here without a scenario, or a scenario without a row, fails the suite.
 | Gate | #160 release gate | Integration wiring | Depends on | Evidence | Status |
 | --- | --- | --- | --- | --- | --- |
 | IG-01 | Explicit operating modes | `serve` boots stateless with no datastore, and a stateful bootstrap either reaches its control plane and serves `/admin/v1` — refusing inference while no revision is compiled — or fails loudly on the reference it could not resolve | | `stateless_boot_serves_with_no_control_plane`, `stateful_boot_serves_administration_and_refuses_inference`, `stateful_boot_refuses_an_unresolved_reference` | wired |
-| IG-02 | Postgres-first control plane | Operator preflight, forward-only migration, and the connect a replica performs before it serves | #244 | `preflight_describes_a_stateless_install`, `migrate_prepares_a_control_plane_before_replicas_start` | wired |
+| IG-02 | Postgres-first control plane | Operator preflight, forward-only migration, and the connect a replica performs before it serves | | `preflight_describes_a_stateless_install`, `migrate_prepares_a_control_plane_before_replicas_start` | wired |
 | IG-03 | Configuration changes take effect atomically, without a restart | Hydrate the head revision, compile it into a whole snapshot, publish it atomically, keep serving the previous one when compilation or the database fails | #276 | `hydrate_compile_publish_is_one_atomic_step` | blocked |
 | IG-04 | Provider secrets rotate without redeployment | Resolve every credential a candidate snapshot needs through the SecretStore during compilation, never on the request path | IG-03 | `secrets_resolve_during_compilation_only` | blocked |
-| IG-05 | Every mutation validated, revisioned, authorized, audited | The authenticated `/admin/v1` path from request to published revision, including breakglass | | `an_admin_mutation_publishes_an_audited_revision` | blocked |
+| IG-05 | Every mutation validated, revisioned, authorized, audited | The authenticated `/admin/v1` path from request to published revision: preconditions, idempotent replay, revision conflicts, and the audit event that attributes the credential. Breakglass end to end; OIDC principals against scoped grants once a replica authenticates one | admin OIDC authenticator | `an_admin_mutation_publishes_an_audited_revision` | partial |
 | IG-06 | No control-plane reads on ordinary inference | Routing, catalogue, authentication, and pricing read only the published snapshot | IG-03 | `inference_touches_no_control_plane_connection` | blocked |
 | IG-07 | Control-plane loss leaves last-known-good serving | Bounded backoff, staleness reporting, and cold boot from the signed last-known-good cache | IG-03 | `control_plane_loss_keeps_the_last_known_good_snapshot_serving` | blocked |
 | IG-08 | Bounded, observable runtime | Readiness reflects convergence rather than process liveness; `/status` reports desired, loaded, active, and lag | IG-03 | `readiness_and_status_report_convergence` | blocked |
@@ -126,8 +132,17 @@ not against their branches, and not duplicating the compilation a contract slice
 owns. It replaces `hydrate_compile_publish_is_one_atomic_step`'s refusal
 assertion with a scenario that publishes a revision, waits for the snapshot it
 compiles into, and asserts inference is served from it, and moves the IG-03 row
-with it. IG-05's authenticated administrative path can move independently of
-compilation, since `/admin/v1` already serves.
+with it. IG-05's authenticated administrative path moved independently of
+compilation, since `/admin/v1` already serves: a breakglass mutation is
+validated, published as a revision, replayed under its idempotency key, refused
+when it expects a superseded revision, and read back with the audit event that
+attributes it — all on a running replica against a real control plane. It is
+`partial` rather than `wired` because the credential doing all of that is
+breakglass; a replica does not yet authenticate an OIDC principal, so
+authorizing one against a scoped grant has no running process to assert against.
+That a deployment can be administered before it can serve inference is the
+honest shape of stateful mode today: durable desired state is written and
+audited, and nothing projects it into the request path yet.
 
 IG-11 is furthest out, and the [qualification
 packet](./qualification.md) says why in the terms it owns: capacity is
