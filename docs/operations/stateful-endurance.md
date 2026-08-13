@@ -6,7 +6,7 @@ Tier 0 replica with no datastore and no control plane
 ([ADR 0040](../adr/0040-endurance-qualification-harness.md)); this page soaks a
 fleet whose catalogue, credential pool, tenant policy, provider, usage database,
 and processes all change while it is serving
-([ADR 0048](../adr/0048-stateful-endurance-qualification.md)) — the failures that
+([ADR 0049](../adr/0049-stateful-endurance-qualification.md)) — the failures that
 only appear when duration and change happen at once:
 
 - an accounting row lost to a restart, a rotation, or a database that went away
@@ -43,13 +43,13 @@ the same order:
 
 | At | Event | What the run then looks for |
 | --- | --- | --- |
-| 8% | Catalogue revision — a new alias is published and every replica reloaded | the `chat-catalogue-v2` alias begins serving |
-| 16% | Credential revision — the pool is rotated | a usage record attributed to `fake-openai-rotated` |
-| 24% | Policy revision — the probe tenant loses `allow_platform_fallback` | the probe tenant stops being served |
-| 30% | The provider is slowed by 250 ms at the gate | latency moves; nothing fails |
-| 42% | The provider is taken away — connections refused and cut | refusals typed as circuit-open, and recovery afterwards |
-| 63% | The usage database is taken away | dropped sink batches, reported by the process and reconciled |
-| 84% | Rolling restart — each replica is drained and replaced one at a time | no request refused for want of a ready replica, and the flushed rows arrive |
+| 6% | Catalogue revision — a new alias is published and every replica reloaded | the `chat-catalogue-v2` alias begins serving *on every replica* |
+| 13% | Credential revision — the pool is rotated | a usage record attributed to `fake-openai-rotated` |
+| 20% | Policy revision — the probe tenant loses `allow_platform_fallback` | every replica stops serving the probe tenant |
+| 26% | The provider is slowed by 250 ms at the gate | latency moves; nothing fails |
+| 34% | The provider is taken away — connections refused and cut | refusals typed as circuit-open, and recovery afterwards |
+| 52% | The usage database is taken away | dropped sink batches, reported by the process and reconciled |
+| 72% | Rolling restart — each replica is drained and replaced one at a time | no request refused for want of a ready replica, the flushed rows arrive, and the run keeps offering load afterwards |
 
 The gaps between them are sized for the *shorter* tier. Attribution runs past
 the end of a fault by `recovery_allowance_ms`, which is an absolute duration
@@ -94,8 +94,8 @@ series.
 
 ## What a run leaves behind
 
-`target/stateful-endurance/<tier>/<tier>.json` is the result, and
-`<tier>.replica-N.samples.jsonl` beside it is every resource sample each
+`target/stateful-endurance/<tier>/<profile>.json` is the result, and
+`<profile>.replica-N.samples.jsonl` beside it is every resource sample each
 replica — including the ones that were retired and replaced — was observed to
 take, written as it went.
 
@@ -134,7 +134,10 @@ Hard failures, asserted at both tiers:
   by a request rather than by a log line;
 - **no request refused for want of a ready replica** during the rolling restart
   (`max_restart_unavailable = 0`), and no readiness gap longer than
-  `max_readiness_gap_ms`;
+  `max_readiness_gap_ms`. The restart is scheduled early enough that the run
+  keeps offering load after the last replacement joined, and
+  `restart.offered_after_last_replacement` is asserted non-zero: a restart the
+  load finished before is one an idle deployment would survive;
 - **every declared fault recovered** within `max_recovery_ms`, measured from the
   moment the fault is lifted to the first request that settles a usage record
   afterwards. A window with no such request never recovered, and fails;
@@ -187,6 +190,15 @@ Fields worth knowing:
   reporting the signal.
 - `faults[].gate` is what the loopback gate did — accepted, refused, cut,
   delayed — which is how a run shows the fault it declared actually met traffic.
+- `usage.durable_loss_total` is every emitted record the database never
+  received, split into the part the outage explains
+  (`durable_loss_in_window`) and the part it does not
+  (`durable_loss_outside_windows`, gated at zero). Loss with no drop report
+  behind it fails whichever side of the split it lands on.
+- `telemetry.worst_usage_silence_ms` is the longest stretch under load in which
+  the fleet produced no accounting at all, excluding the declared outages. A
+  gateway that keeps answering while its usage records stop is invisible in a
+  total that only counts what arrived by the end.
 - `restart.flushed_on_exit` counts the usage rows a retiring replica emitted
   while draining; they are reconciled with the rest, so a restart cannot hide a
   row by taking the process that owed it away.

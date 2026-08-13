@@ -71,7 +71,9 @@ pub struct Dispatch<'a> {
     /// The soak tier's duration override, read from the environment by the
     /// caller so a test can prove the tiering without setting a variable.
     pub duration_ms: Option<&'a str>,
-    /// The artifact's file stem.
+    /// The artifact's file stem. The profile's id rather than the tier's name,
+    /// which is the directory: two profiles run one after another must not
+    /// write over each other's artifact, series, keys and ledger.
     pub stem: &'a str,
 }
 
@@ -87,7 +89,7 @@ pub async fn run(
         manifest_text,
         Dispatch {
             duration_ms: duration.as_deref(),
-            stem: tier.as_str(),
+            stem: &profile.id,
         },
     )
     .await
@@ -130,14 +132,13 @@ pub async fn run_with(
     let environment = {
         let replica = &fleet.replicas[0];
         let portable = fleet.deployment.portable(&replica.process.config);
-        let mut environment = Environment::collect(
+        Environment::collect(
             &portable,
             replica.process.bind(),
             &upstream_gate.base_url(),
+            super::manifest::MANIFEST_RELATIVE,
             manifest_text,
-        );
-        environment.manifest.path = super::manifest::MANIFEST_RELATIVE.to_owned();
-        environment
+        )
     };
 
     let dir = fleet::artifact_dir(tier.as_str());
@@ -304,6 +305,17 @@ pub fn requested(tier: Tier, scale: &Scale, dispatched: Option<&str>) -> (Durati
 pub fn segment_ms(scale: &Scale, duration: Duration, min_segments: u64) -> u64 {
     let fitting = duration.as_millis() as u64 / (min_segments + 1);
     scale.segment_ms.min(fitting.max(1))
+}
+
+/// Whether a request was in flight for any part of a declared fault. The span
+/// rather than the instant it was offered: a stream that had been running for
+/// two seconds when the provider was taken away failed because of the outage,
+/// and charging it to the deployment because it began a moment before the
+/// window opened would make the gate depend on how long requests happen to
+/// take.
+pub fn touched(windows: &[(Duration, Duration)], at: Duration, latency_ms: f64) -> bool {
+    let ended = at + Duration::from_secs_f64((latency_ms / 1000.0).max(0.0));
+    windows.iter().any(|(from, to)| ended >= *from && at < *to)
 }
 
 fn authority(base_url: &str) -> &str {
@@ -657,6 +669,10 @@ impl Supervisor<'_> {
     /// last tick. Continuously, so what the driver holds is bounded by the
     /// drain interval rather than by the run's length.
     fn drain(&mut self, rx: &mut UnboundedReceiver<Attempt>, now: Duration) {
+        // Before the records of this tick are absorbed: every record drained
+        // here is stamped with `now`, so a silence measured afterwards would
+        // always be zero however long the fleet had been quiet.
+        self.state.observe_usage_silence(now);
         while let Ok(attempt) = rx.try_recv() {
             self.state.absorb_attempt(&attempt);
         }
@@ -689,23 +705,25 @@ impl Supervisor<'_> {
     /// The probes that decide whether a tenant ever reached past its own
     /// boundary. Cheap, and run for the whole length of the run rather than
     /// once at the start: an isolation property that only holds before the
-    /// first revision is not an isolation property.
+    /// first revision is not an isolation property. Every replica is asked,
+    /// because a boundary one replica still honours is not a boundary.
     async fn boundary_probes(&mut self, now: Duration) {
-        let served = self.probe_serves(&self.probe.key.clone()).await;
-        self.state.observe_probe(served, self.revision.policy, now);
+        let key = self.probe.key.clone();
+        for base_url in self.rotation() {
+            let served = self.probe_serves(&base_url, &key).await;
+            self.state.observe_probe(served, self.revision.policy, now);
+        }
     }
 
-    /// Whether the probe tenant is being served. `Some(true)` is a served
-    /// request, `Some(false)` a typed `no_credential` refusal, and `None` an
-    /// answer this run cannot interpret — which is neither evidence of
-    /// isolation nor of its absence.
-    async fn probe_serves(&self, key: &str) -> Option<bool> {
-        let base_url = self
-            .rotation
-            .lock()
-            .expect("the rotation lock")
-            .first()
-            .cloned()?;
+    fn rotation(&self) -> Vec<String> {
+        self.rotation.lock().expect("the rotation lock").clone()
+    }
+
+    /// Whether the probe tenant is being served by this replica. `Some(true)`
+    /// is a served request, `Some(false)` a typed `no_credential` refusal, and
+    /// `None` an answer this run cannot interpret — which is neither evidence
+    /// of isolation nor of its absence.
+    async fn probe_serves(&self, base_url: &str, key: &str) -> Option<bool> {
         let response = self
             .client
             .post(format!("{base_url}{}", plan::CHAT))
@@ -826,31 +844,19 @@ impl Supervisor<'_> {
         }
     }
 
-    /// Poll for an alias until it serves, or the convergence bound passes.
+    /// Poll until every replica in rotation serves an alias, or the
+    /// convergence bound passes. Every replica, because a revision one of two
+    /// replicas picked up is a revision the deployment did not converge on.
     async fn await_alias(&mut self, alias: &str) -> Option<Duration> {
         let began = Instant::now();
         let bound = Duration::from_millis(self.slo.max_convergence_ms);
         while began.elapsed() <= bound {
-            let base_url = self
-                .rotation
-                .lock()
-                .expect("the rotation lock")
-                .first()
-                .cloned();
-            if let Some(base_url) = base_url
-                && self
-                    .client
-                    .post(format!("{base_url}{}", plan::CHAT))
-                    .bearer_auth(crate::support::gateway::GATEWAY_KEY)
-                    .timeout(PROBE_TIMEOUT)
-                    .json(&json!({
-                        "model": alias,
-                        "messages": [{ "role": "user", "content": "convergence probe" }],
-                    }))
-                    .send()
-                    .await
-                    .is_ok_and(|response| response.status().is_success())
-            {
+            let rotation = self.rotation();
+            let mut all = !rotation.is_empty();
+            for base_url in rotation {
+                all &= self.serves_alias(&base_url, alias).await;
+            }
+            if all {
                 return Some(began.elapsed());
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -858,14 +864,33 @@ impl Supervisor<'_> {
         None
     }
 
-    /// Poll the probe tenant until it is refused, or the convergence bound
-    /// passes.
+    async fn serves_alias(&self, base_url: &str, alias: &str) -> bool {
+        self.client
+            .post(format!("{base_url}{}", plan::CHAT))
+            .bearer_auth(crate::support::gateway::GATEWAY_KEY)
+            .timeout(PROBE_TIMEOUT)
+            .json(&json!({
+                "model": alias,
+                "messages": [{ "role": "user", "content": "convergence probe" }],
+            }))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+    }
+
+    /// Poll until every replica in rotation refuses the probe tenant, or the
+    /// convergence bound passes.
     async fn await_refusal(&mut self) -> Option<Duration> {
         let began = Instant::now();
         let bound = Duration::from_millis(self.slo.max_convergence_ms);
         let key = self.probe.key.clone();
         while began.elapsed() <= bound {
-            if self.probe_serves(&key).await == Some(false) {
+            let rotation = self.rotation();
+            let mut all = !rotation.is_empty();
+            for base_url in rotation {
+                all &= self.probe_serves(&base_url, &key).await == Some(false);
+            }
+            if all {
                 return Some(began.elapsed());
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1004,7 +1029,8 @@ struct State {
     sink_drops: SinkDrops,
     usage_window: (Duration, Duration),
     fault_windows: Vec<(Duration, Duration)>,
-    last_record_at: Duration,
+    /// When the last usage record arrived, absent until the first one does.
+    last_record_at: Option<Duration>,
     samplers: Vec<(String, Sampler)>,
     /// Where each replica's series was written, keyed by replica and relative
     /// to the workspace: a reader following the artifact has to land on the
@@ -1020,6 +1046,9 @@ struct State {
     /// not arrived yet.
     awaiting_recovery: Vec<usize>,
     restart: Restart,
+    /// What had been offered when the last replacement joined, so the artifact
+    /// can say how much load the restart was actually measured across.
+    offered_at_last_replacement: u64,
     replacement_never_ready: bool,
     tenancy: Tenancy,
     telemetry: Telemetry,
@@ -1173,7 +1202,7 @@ impl State {
             sink_drops: SinkDrops::default(),
             usage_window: schedule.usage_outage_window(duration),
             fault_windows: schedule.attribution_windows(duration),
-            last_record_at: Duration::ZERO,
+            last_record_at: None,
             samplers: Vec::new(),
             sample_paths: BTreeMap::new(),
             live: BTreeMap::new(),
@@ -1190,7 +1219,9 @@ impl State {
                 all_exits_bounded: true,
                 all_exits_clean: true,
                 flushed_on_exit: 0,
+                offered_after_last_replacement: 0,
             },
+            offered_at_last_replacement: 0,
             replacement_never_ready: false,
             tenancy: Tenancy {
                 probes: 0,
@@ -1214,10 +1245,8 @@ impl State {
         }
     }
 
-    fn in_fault_window(&self, at: Duration) -> bool {
-        self.fault_windows
-            .iter()
-            .any(|(from, to)| at >= *from && at < *to)
+    fn touched_fault_window(&self, at: Duration, latency_ms: f64) -> bool {
+        touched(&self.fault_windows, at, latency_ms)
     }
 
     fn start_sampler(&mut self, id: &str, pid: u32, interval: Duration, dir: &Path, stem: &str) {
@@ -1294,7 +1323,7 @@ impl State {
             self.ttft.record(ttft);
         }
         let failed = matches!(attempt.outcome, Outcome::Unplanned | Outcome::Rejected);
-        if failed && self.in_fault_window(attempt.at) {
+        if failed && self.touched_fault_window(attempt.at, attempt.latency_ms) {
             // Inside a declared window the error is the point of the window.
             self.errors_in_fault_windows += 1;
             self.consecutive_unplanned = 0;
@@ -1330,7 +1359,7 @@ impl State {
     fn absorb_record(&mut self, record: &Value, now: Duration) {
         self.records_observed += 1;
         self.open.usage_records += 1;
-        self.last_record_at = now;
+        self.last_record_at = Some(now);
         match record["request_id"].as_str() {
             Some(id) => self.ledger.record(fingerprint(id)),
             None => self.unexpected_statuses += 1,
@@ -1434,6 +1463,33 @@ impl State {
             rss_kib: open.rss_kib,
         });
         self.open.started_ms = ended_ms;
+    }
+
+    /// The longest stretch, while load was being offered, in which the fleet
+    /// produced no accounting at all. A gateway that keeps answering while its
+    /// usage records stop is the failure this measures, and it is invisible in
+    /// a total that only says how many arrived by the end.
+    ///
+    /// Only stretches with no excuse are measured. A stretch overlapping a
+    /// declared fault or the usage-backend outage is one the run asked for, and
+    /// the stretch before the first record is the fleet starting rather than
+    /// the fleet falling silent.
+    fn observe_usage_silence(&mut self, now: Duration) {
+        let Some(last) = self.last_record_at else {
+            return;
+        };
+        let (usage_from, usage_to) = self.usage_window;
+        let overlaps = |from: Duration, to: Duration| now >= from && last < to;
+        if overlaps(usage_from, usage_to)
+            || self
+                .fault_windows
+                .iter()
+                .any(|(opened, closed)| overlaps(*opened, *closed))
+        {
+            return;
+        }
+        let silence = now.saturating_sub(last).as_millis() as u64;
+        self.telemetry.worst_usage_silence_ms = self.telemetry.worst_usage_silence_ms.max(silence);
     }
 
     fn observe_readiness(&mut self, any_ready: bool, now: Duration) {
@@ -1577,6 +1633,7 @@ impl State {
     ) {
         self.restart.replicas_restarted += 1;
         self.restart.worst_return_ms = self.restart.worst_return_ms.max(took.as_millis() as u64);
+        self.offered_at_last_replacement = self.offered;
         if !ready {
             self.replacement_never_ready = true;
         }
@@ -1688,12 +1745,17 @@ fn assemble(
         resources,
         revisions,
         faults,
-        restart,
+        mut restart,
+        offered_at_last_replacement,
         tenancy,
         telemetry,
         timeline,
         ..
     } = state;
+    if restart.replicas_restarted > 0 {
+        restart.offered_after_last_replacement =
+            offered.saturating_sub(offered_at_last_replacement);
+    }
     let tally = ledger.tally();
     let duplicates = records_observed.saturating_sub(tally.distinct);
     let missing = owed.saturating_sub(tally.distinct);
@@ -1895,6 +1957,7 @@ fn assemble(
             durable: durable.counts,
             durable_lag_ms: durable.settled.lag_ms,
             durable_settled: durable.settled.within_bound,
+            durable_loss_total: durable_loss,
             durable_loss_outside_windows: durable_loss_outside,
             durable_loss_in_window,
             durable_duplicate_rows: durable.counts.rows.saturating_sub(durable.counts.distinct),

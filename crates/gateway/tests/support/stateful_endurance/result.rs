@@ -258,6 +258,10 @@ pub struct Restart {
     /// Usage records flushed by replicas on their way out. Evidence that the
     /// accounting of a replaced replica was not lost with it.
     pub flushed_on_exit: u64,
+    /// Requests offered after the last replacement joined the rotation. A
+    /// restart the load finished before is a restart nothing was measured
+    /// across, so `unavailable = 0` would be satisfied by an idle deployment.
+    pub offered_after_last_replacement: u64,
 }
 
 /// Whether a tenant ever reached past its own boundary.
@@ -294,6 +298,10 @@ pub struct Usage {
     /// How long the durable table took to stop growing after the load stopped.
     pub durable_lag_ms: u64,
     pub durable_settled: bool,
+    /// Records the run emitted that never reached the database, whether or not
+    /// a declared outage excuses them. Kept beside the two halves below so a
+    /// reader can see what was excused rather than only what remained.
+    pub durable_loss_total: u64,
     /// Records emitted outside every declared fault window that never reached
     /// the database. The gate: a sink may drop a batch while its backend is
     /// gone (ADR 0009), and may not lose a record at any other time.

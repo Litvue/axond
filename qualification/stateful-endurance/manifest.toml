@@ -61,17 +61,17 @@ segment_ms = 900000
 # attribution span at ninety seconds and outside it at twelve hours, which is
 # two different qualifications rather than one at two scales.
 [profile.schedule]
-catalogue_revision_at = 0.08
-credential_revision_at = 0.16
-policy_revision_at = 0.24
-upstream_latency_at = 0.30
+catalogue_revision_at = 0.06
+credential_revision_at = 0.13
+policy_revision_at = 0.20
+upstream_latency_at = 0.26
 upstream_latency_for = 0.06
 # What the fault gate in front of the provider adds to every connection while
 # the latency window is open.
 upstream_latency_ms = 250
-upstream_outage_at = 0.42
+upstream_outage_at = 0.34
 upstream_outage_for = 0.06
-usage_backend_outage_at = 0.63
+usage_backend_outage_at = 0.52
 usage_backend_outage_for = 0.06
 # A record settled a couple of seconds either side of the outage is the
 # outage's. The driver's clock and the gateway's `recorded_at` are set moments
@@ -87,7 +87,11 @@ usage_outage_attribution_slack_ms = 3000
 # artifact records how long each window actually took to recover and the SLO
 # bounds it.
 recovery_allowance_ms = 10000
-rolling_restart_at = 0.84
+# Early enough that the run keeps offering load well after the last replacement
+# joined. A restart at the very end would be a restart nothing was measured
+# across: no requests offered afterwards makes `max_restart_unavailable = 0`
+# something an idle deployment satisfies. The tail is asserted, not assumed.
+rolling_restart_at = 0.72
 
 # What a passing run means. Every threshold is a property of the gateway rather
 # than of the machine it ran on: how fast the runner is moves throughput, not

@@ -124,7 +124,18 @@ impl Deployment {
         ] {
             // No trailing newline: a static key is exact bytes, and a newline
             // makes the file unusable as a bearer token.
-            std::fs::write(self.key_dir.join(name), key).expect("a tenant key file is written");
+            let path = self.key_dir.join(name);
+            std::fs::write(&path, key).expect("a tenant key file is written");
+            // Mode 0600, as the sibling stateful harness writes its secret-
+            // naming fixtures: a live inbound bearer token under `target/`
+            // should not be readable by every local user for the length of a
+            // twelve-hour run.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .expect("a tenant key file is private");
+            }
         }
     }
 

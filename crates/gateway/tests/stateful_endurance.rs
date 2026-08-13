@@ -119,10 +119,19 @@ fn assert_qualifies(result: &StatefulEnduranceResult) {
             result.faults
         );
     }
-    // Durable loss is only ever excused by the fleet's own account of it.
+    // Durable loss is only ever excused by the fleet's own account of it. The
+    // excused half is capped at the reported drops by construction, so what
+    // has to be asserted is the unexcused remainder and the existence of the
+    // account: a run that lost rows while no process ever said it dropped a
+    // batch has an unexplained loss however the halves are split.
+    assert_eq!(
+        result.usage.durable_loss_outside_windows, 0,
+        "rows went missing outside every declared outage: {:#?}",
+        result.usage
+    );
     assert!(
-        result.usage.durable_loss_in_window <= result.usage.sink_drops.records_in_usage_window,
-        "more rows are missing than the processes reported dropping: {:#?}",
+        result.usage.durable_loss_total == 0 || result.usage.sink_drops.records_in_usage_window > 0,
+        "rows are missing and no process reported dropping any of them: {:#?}",
         result.usage
     );
     // Both sides of the policy revision, or the gate passed without ever being
@@ -139,6 +148,15 @@ fn assert_qualifies(result: &StatefulEnduranceResult) {
         "the probe tenant was never refused after its policy revision, so isolation was not \
          observed: {:#?}",
         result.tenancy
+    );
+    // A restart the load finished before proves nothing: `unavailable = 0` and
+    // the readiness gap are both satisfied by a deployment nobody was asking
+    // for anything.
+    assert!(
+        result.restart.offered_after_last_replacement > 0,
+        "no request was offered after the last replacement, so the restart was not measured \
+         under load: {:#?}",
+        result.restart
     );
 }
 
@@ -329,6 +347,17 @@ fn the_script_is_the_same_at_both_tiers() {
                     scheduled.event.as_str()
                 );
             }
+            // And the restart has to leave the run time to keep offering load
+            // after the last replacement joined. A restart in the final seconds
+            // is one no request was measured across, which is the difference
+            // between a fleet that stayed available under load and a fleet
+            // nobody asked for anything.
+            let restart = duration.mul_f64(profile.schedule.rolling_restart_at);
+            assert!(
+                duration.saturating_sub(restart) >= 2 * allowance,
+                "{} [{label}]: the restart leaves no room to offer load afterwards",
+                profile.id
+            );
         }
     }
 }
@@ -392,5 +421,26 @@ fn a_dispatched_run_is_segmented_to_fit() {
         stateful_endurance::run::segment_ms(profile.scale(Tier::Soak), full, slo.min_segments),
         profile.soak.segment_ms,
         "a full-length soak keeps the manifest's segment length"
+    );
+}
+
+/// A failure is charged to a declared fault when the request was in flight for
+/// any part of it, not only when it happened to be offered inside it. A stream
+/// running when the provider is taken away fails because of the outage, and an
+/// attribution keyed on the offer instant would make the gate depend on how
+/// long requests happen to take.
+#[test]
+fn a_request_in_flight_when_a_fault_opens_is_the_faults() {
+    let windows = [(Duration::from_secs(30), Duration::from_secs(40))];
+    let touched = |at_ms: u64, latency_ms: f64| {
+        stateful_endurance::run::touched(&windows, Duration::from_millis(at_ms), latency_ms)
+    };
+    assert!(touched(29_000, 2_000.0), "it was still running at 31s");
+    assert!(touched(35_000, 10.0), "it was offered inside the window");
+    assert!(touched(39_990, 5_000.0), "it began just inside the window");
+    assert!(!touched(20_000, 1_000.0), "it was over before 30s");
+    assert!(
+        !touched(41_000, 1_000.0),
+        "it began after the window closed"
     );
 }
