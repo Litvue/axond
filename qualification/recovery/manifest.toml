@@ -1,0 +1,290 @@
+# The committed recovery manifest: every scenario the recovery harness runs,
+# what evidence each one retains, what it is gated on, and — while a scenario is
+# still blocked — which slice has to land before its driver can exist.
+#
+# This is the contract for axond #219 (part of #156). The capacity harness
+# (`qualification/capacity/manifest.toml`, ADR 0033) qualifies a Tier 0 replica
+# under load; this one qualifies a Tier 2 deployment losing and regaining its
+# control plane. Both keep their inputs as committed data so a result can be
+# reproduced from the repository alone.
+#
+# `capability` selects a scenario the driver implements: a manifest cannot
+# describe an outage the harness has no code for. `status` is the honest state
+# of that code — `executable` means the driver runs it today, `blocked` means the
+# scenario is specified and its driver is waiting on the slices in
+# `[[scenario.blocked_on]]`. Nothing here is a placeholder for a scenario nobody
+# has thought through: a blocked entry still declares its evidence and its gate,
+# so landing the dependency is a matter of writing the driver, not of deciding
+# what the scenario means.
+#
+# `gate` fields are the hard failures, and they are deliberately restricted to
+# properties that do not move with the machine: whether requests were still
+# answered, whether the replica converged inside its declared bound, how much
+# durable state a restore lost, what readiness said at the end, and whether
+# administrative authentication ever admitted an unauthenticated caller.
+# Wall-clock restore duration, outage duration, and lag *samples* are recorded
+# and never asserted — a shared runner cannot bound them without flaking.
+#
+# `max_serving_error_fraction` bounds the errors among requests a scenario
+# actually offers; it is not a promise that a scenario serves at all. A scenario
+# whose `readiness` is `refuses` offers no inference traffic — it omits the
+# `serving_behavior` evidence class — so its zero is vacuous rather than a
+# serving guarantee, and a driver must not read it as licence to expect answers
+# from a replica that refused to become ready. The converse holds too: a
+# scenario whose `readiness` is `serves` must retain `serving_behavior`, so the
+# ceiling is evaluated against requests that were actually offered rather than
+# passing by default.
+
+schema_version = 1
+
+# ── Serving through the outage ───────────────────────────────────────────────
+
+[[scenario]]
+id = "control-plane-outage"
+capability = "control_plane_outage"
+status = "blocked"
+description = """
+A replica serving a converged revision loses Postgres. Inference continues from \
+the immutable active snapshot, administrative writes fail retryably, the \
+replica reports reason `unavailable` and a growing lag, and readiness never \
+claims a healthy control plane."""
+evidence = [
+    "outage_timeline",
+    "serving_behavior",
+    "revisions",
+    "convergence_lag",
+    "fail_open_closed",
+    "audit_auth",
+]
+
+[scenario.gate]
+max_serving_error_fraction = 0.0
+max_convergence_lag_seconds = 60
+max_data_loss_revisions = 0
+readiness = "serves"
+admin_writes = "unavailable"
+max_unauthenticated_admin_successes = 0
+
+[[scenario.blocked_on]]
+issue = 148
+needs = "a revision projection a replica can actually serve, so `serving_behavior` is measured against traffic rather than asserted about an empty snapshot"
+
+[[scenario.blocked_on]]
+issue = 149
+needs = "tenant model enablement and aliases, so the requests offered during the outage resolve to a target"
+
+# ── Cold boot, three cache states ────────────────────────────────────────────
+
+[[scenario]]
+id = "cold-boot-valid-cache"
+capability = "cold_boot_valid_cache"
+status = "blocked"
+description = """
+A replica boots while the control plane is unreachable and restores the signed \
+last-known-good cache: it becomes ready, serves the cached revision, and reports \
+`source = last-known-good` until the control plane returns."""
+evidence = ["outage_timeline", "serving_behavior", "revisions", "cold_start", "fail_open_closed"]
+
+[scenario.gate]
+max_serving_error_fraction = 0.0
+max_convergence_lag_seconds = 60
+max_data_loss_revisions = 0
+readiness = "serves"
+admin_writes = "unavailable"
+max_unauthenticated_admin_successes = 0
+
+[[scenario.blocked_on]]
+issue = 148
+needs = "a projection, so a restored cache compiles into a snapshot that answers requests"
+
+[[scenario]]
+id = "cold-boot-no-cache"
+capability = "cold_boot_no_cache"
+status = "blocked"
+description = """
+A replica boots during the same outage with no cache file. It refuses readiness \
+rather than serving an empty configuration, and says so with the control plane \
+named as the reason."""
+evidence = ["outage_timeline", "cold_start", "fail_open_closed", "audit_auth"]
+
+[scenario.gate]
+max_serving_error_fraction = 0.0
+max_convergence_lag_seconds = 60
+max_data_loss_revisions = 0
+readiness = "refuses"
+admin_writes = "unavailable"
+max_unauthenticated_admin_successes = 0
+
+[[scenario.blocked_on]]
+issue = 158
+needs = "the production deployment overlay whose readiness contract this scenario is evidence for"
+
+[[scenario]]
+id = "cold-boot-invalid-cache"
+capability = "cold_boot_invalid_cache"
+status = "blocked"
+description = """
+The same boot against a cache that fails its authentication — an edited record, \
+a foreign signing key, a truncated file. The replica refuses readiness and \
+reports the cache's own failure, never the hand-written state."""
+evidence = ["outage_timeline", "cold_start", "fail_open_closed", "audit_auth"]
+
+[scenario.gate]
+max_serving_error_fraction = 0.0
+max_convergence_lag_seconds = 60
+max_data_loss_revisions = 0
+readiness = "refuses"
+admin_writes = "unavailable"
+max_unauthenticated_admin_successes = 0
+
+[[scenario.blocked_on]]
+issue = 158
+needs = "the deployment overlay that provisions the cache signing key, so a wrong-key boot is the deployed failure mode rather than a synthetic one"
+
+# ── Coming back ──────────────────────────────────────────────────────────────
+
+[[scenario]]
+id = "recovery-convergence"
+capability = "recovery_convergence"
+status = "blocked"
+description = """
+Postgres returns, having accepted revisions the fleet never saw. Every replica — \
+the one that served through the outage, the one that cold-booted from cache, and \
+the one that refused to start — converges to the desired revision without \
+intervention, and lag returns inside the declared bound."""
+evidence = ["outage_timeline", "revisions", "convergence_lag", "serving_behavior", "audit_auth"]
+
+[scenario.gate]
+max_serving_error_fraction = 0.0
+max_convergence_lag_seconds = 60
+max_data_loss_revisions = 0
+readiness = "serves"
+admin_writes = "accepted"
+max_unauthenticated_admin_successes = 0
+
+[[scenario.blocked_on]]
+issue = 148
+needs = "a projection, so convergence has a runtime snapshot to publish"
+
+[[scenario.blocked_on]]
+issue = 150
+needs = "dynamically configurable budgets, rate limits, and revocation, so a converged revision changes policy a request can be observed under"
+
+[[scenario]]
+id = "secret-rotation"
+capability = "secret_rotation"
+status = "blocked"
+description = """
+A provider credential is rotated through the secret store and published as a new \
+revision. Replicas pick up the new material by converging — no restart, no \
+redeployment, no configuration file edit — and in-flight requests finish under \
+the snapshot they started on."""
+evidence = ["revisions", "convergence_lag", "serving_behavior", "audit_auth"]
+
+[scenario.gate]
+max_serving_error_fraction = 0.0
+max_convergence_lag_seconds = 60
+max_data_loss_revisions = 0
+readiness = "serves"
+admin_writes = "accepted"
+max_unauthenticated_admin_successes = 0
+
+[[scenario.blocked_on]]
+issue = 145
+needs = "the SecretStore implementation and the zero-redeploy credential lifecycle this scenario is the evidence for"
+
+[[scenario.blocked_on]]
+issue = 148
+needs = "credential entitlement reconciliation, so a rotated credential is observable in what a replica serves"
+
+# ── Losing the database, and getting it back ─────────────────────────────────
+
+[[scenario]]
+id = "backup-restore"
+capability = "backup_restore"
+status = "blocked"
+description = """
+The control-plane database is lost and restored from a backup taken while the \
+fleet was serving. Revisions, tenancy, secret metadata, pricing, and audit rows \
+all come back together; the restored journal hydrates its head revision; and the \
+replicas that kept serving converge onto it rather than fighting it."""
+evidence = [
+    "outage_timeline",
+    "revisions",
+    "restore_duration",
+    "data_loss_boundary",
+    "serving_behavior",
+    "convergence_lag",
+    "audit_auth",
+]
+
+[scenario.gate]
+max_serving_error_fraction = 0.0
+max_convergence_lag_seconds = 120
+max_data_loss_revisions = 0
+readiness = "serves"
+admin_writes = "accepted"
+max_unauthenticated_admin_successes = 0
+
+[[scenario.blocked_on]]
+issue = 144
+needs = "durable tenants, projects, principals, RBAC, and audit boundaries, so a restore has tenancy and audit state to compare rather than only a revision chain"
+
+[[scenario.blocked_on]]
+issue = 145
+needs = "stored secret metadata, so the restore is checked to bring wrapped material and its lifecycle back with the revisions that reference it"
+
+[[scenario.blocked_on]]
+issue = 146
+needs = "imported catalogue snapshots, so a restored revision's blob references point at content that has to survive with it"
+
+[[scenario.blocked_on]]
+issue = 147
+needs = "effective-dated price books, so the restore covers pricing state and not only routing state"
+
+[[scenario.blocked_on]]
+issue = 158
+needs = "the operator restore procedure this scenario rehearses"
+
+[[scenario]]
+id = "point-in-time-recovery"
+capability = "point_in_time_recovery"
+status = "blocked"
+description = """
+Recovery to a chosen point rather than to a backup: publish, take the recovery \
+target, publish again, then recover to the target. The data-loss boundary is \
+measured — which revisions, audit events, and usage records survived and which \
+did not — instead of being asserted to be zero."""
+evidence = [
+    "outage_timeline",
+    "revisions",
+    "restore_duration",
+    "data_loss_boundary",
+    "serving_behavior",
+    "convergence_lag",
+    "audit_auth",
+]
+
+[scenario.gate]
+max_serving_error_fraction = 0.0
+max_convergence_lag_seconds = 120
+# Recovery to a target *before* the last publication loses the revisions
+# published after it. The boundary is the point of the scenario: what is gated
+# is that nothing published before the target is missing, which the driver
+# measures as loss relative to the target rather than to the newest revision.
+max_data_loss_revisions = 0
+readiness = "serves"
+admin_writes = "accepted"
+max_unauthenticated_admin_successes = 0
+
+[[scenario.blocked_on]]
+issue = 155
+needs = "the explicit decision on the durable usage outbox and globally unique request ids: whether a recovery boundary is measured over usage records at all, and against which identity"
+
+[[scenario.blocked_on]]
+issue = 158
+needs = "the operator recovery procedure, including which PITR target an operator is told to choose"
+
+[[scenario.blocked_on]]
+issue = 159
+needs = "the hardened workflow this scenario's lane runs in, since a recovery lane runs a database with archiving enabled and publishes its evidence as an artifact"
