@@ -301,15 +301,19 @@ psql "$GW_CONTROL_PLANE_DSN" -c "SELECT conrelid::regclass, conname, convalidate
   FROM pg_constraint WHERE contype = 'f' AND NOT convalidated ORDER BY conname"
 ```
 
-One consequence for the mixed-version window the *Upgrade* order below describes:
-an old binary publishing against a 0004 schema does not record the owners history
-names, so a publication whose journal rows name a tenant its revision does not
-declare is refused by these keys rather than stored. The refusal says so — a
-foreign-key violation on a journal write is reported as a refusal naming the
-constraint, not as a retryable outage, because no retry clears it — and the remedy
-is to roll the publisher forward or publish a revision that declares the tenant.
-Only a publisher writes journal rows, so a replica still on the old binary is
-unaffected.
+One consequence for the mixed-version window the *Upgrade* order below describes.
+A binary older than 0004 does not record the owners history names, so if it
+publishes against a 0004 schema, a publication whose journal rows name a tenant its
+revision does not declare is refused by these keys rather than stored — and that
+binary reports the refusal as a **retryable outage**, because its journal writes
+predate the classification that knows better, so the caller retries against a state
+no retry reaches. What it looks like: repeated publication failures, with
+`ERROR: insert or update on table "axond_cp_resource_version" violates foreign key
+constraint` in the PostgreSQL log. The remedy is to roll the publisher forward
+(0004's binary records the owner instead, and classifies a violation as a refusal
+naming the constraint) or to publish a revision that declares the tenant. Only a
+publisher writes journal rows, so replicas still on the old binary are unaffected —
+which is why the upgrade order below puts the publisher first.
 
 Republishing history still works, including a rollback to a pre-tenancy revision:
 before it writes journal rows, the publishing transaction records an owner for

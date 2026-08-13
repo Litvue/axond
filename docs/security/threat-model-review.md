@@ -520,7 +520,11 @@ The three risks this area exists to bound, and where each is answered:
   tenant. Ownership stops at the tenant, the boundary row-level security is keyed
   on; a journal row's project stays a domain check, because a project has no
   lifecycle to publish and a synthesized project row would be indistinguishable
-  from a declared one.
+  from a declared one. What the keys state is that the tenant has a *row* —
+  declared, retained, or recorded for history — which a retired tenant has satisfied
+  since 0002; "the revision that stores this row declares its tenant" stays the
+  service layer's, and the recording step runs after the deferred keys settle so a
+  publication cannot supply its own principals' ownership.
 - **Identifier enumeration.** A refusal tells the caller `forbidden` and nothing
   else. Whether a tenant exists, whether a principal resolved, and which half of
   an OIDC pair was wrong are recorded in the denial row and never returned, so a

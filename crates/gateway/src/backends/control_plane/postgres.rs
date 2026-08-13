@@ -1445,10 +1445,9 @@ async fn project_tenancy(
     // Last, and after that settle on purpose. This step records owner rows for
     // tenants only history names, and every ownership key above is deferred: doing
     // it earlier would put a row there for a tenant an *identity* names and the
-    // revision does not declare, and the principal key — the database's own,
-    // independent refusal of an administrator placed in an undeclared tenant —
-    // would then find its owner already present. It is checked first, against the
-    // tenants the revision declares, and only then is history's owner recorded.
+    // revision does not declare, so the principal key would find the owner this
+    // same publication had just written for it. Settled first, then recorded, so a
+    // publication cannot supply its own principals' ownership.
     record_referenced_tenants(transaction, &revision, candidate).await?;
     Ok(())
 }
@@ -1479,10 +1478,18 @@ async fn project_tenancy(
 /// this step, so a rollback to a pre-tenancy revision still retires nothing and a
 /// live tenant is never demoted by history mentioning it.
 ///
-/// Called last, once the deferred ownership keys have been settled, so that the one
-/// row this could otherwise have made writable — a principal scoped into a tenant
-/// the revision does not declare — is still refused by the database on its own
-/// rather than only by [`Directory::of`].
+/// Called last, once the deferred ownership keys have been settled, so that a
+/// publication cannot manufacture the owner row its *own* principals need: a
+/// principal scoped into a tenant this revision does not declare is refused by the
+/// principal key, not only by [`Directory::of`].
+///
+/// What that key states, exactly, is the tenant has a *row* — declared, retained,
+/// or recorded here by an earlier revision — not that the current revision declares
+/// it. A tenant retired to `lifecycle = 'deleted'` already satisfied it before
+/// 0004, since retirement keeps the row; recording history's owners widens the set
+/// of such rows rather than changing what the key says. "The current revision
+/// declares this principal's tenant" is a property of one revision, which is
+/// [`Directory::of`]'s to check.
 async fn record_referenced_tenants(
     transaction: &Transaction<'_>,
     revision: &str,
