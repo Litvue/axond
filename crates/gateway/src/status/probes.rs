@@ -105,10 +105,20 @@ impl ControlPlaneProbe {
             refresh_interval,
             // Three rounds: one slow round and one missed round are not a stale
             // observation, and the rule that pages for a refresher which stopped
-            // entirely is `AxondStatusRefresherStalled`. Never past
+            // entirely is `AxondStatusRefresherStalled`. Never below the longest
+            // gap two publications can be apart either — the loop waits an
+            // interval *after* a round finishes, so that gap is the interval plus
+            // a round, not the interval — and never past
             // [`MAX_STALENESS_BUDGET`], so the replica has already coarsened the
             // component to `stale` by the time the age rule pages for it.
-            staleness_budget: refresh_interval.saturating_mul(3).min(MAX_STALENESS_BUDGET),
+            staleness_budget: refresh_interval
+                .saturating_mul(3)
+                .max(
+                    refresh_interval
+                        .saturating_add(probe_timeout)
+                        .saturating_add(spacing),
+                )
+                .min(MAX_STALENESS_BUDGET),
             enabled: vec![Component::ControlPlane],
         }
     }
@@ -136,7 +146,13 @@ const MAX_SPACING: Duration = Duration::from_secs(30);
 /// generous `operation_timeout_ms` would page continuously while healthy. Kept
 /// below the exporter's window, and pinned against it by
 /// `the_derived_cadence_cannot_outrun_the_pipeline_that_watches_it`.
-pub const MAX_REFRESH_INTERVAL: Duration = Duration::from_secs(4 * 60);
+///
+/// Two minutes rather than something closer to the exporter's window because
+/// the budget below has to cover a whole publication gap (an interval plus a
+/// round) *and* stay under the rule's threshold: a slower cadence than this
+/// cannot satisfy both, and would call a control plane stale that is being
+/// observed exactly as configured.
+pub const MAX_REFRESH_INTERVAL: Duration = Duration::from_secs(2 * 60);
 
 /// The oldest a control-plane observation may be before the replica itself
 /// calls it `stale`.
@@ -361,6 +377,15 @@ mod tests {
                 "connect {connect_ms}ms, operation {operation_ms}ms outruns the pipeline: \
                  {pacing:?}"
             );
+            // A round is scheduled an interval after the last one *finished*, so
+            // two publications can be that far apart plus a whole round; a budget
+            // under that calls a control plane stale that is being observed
+            // exactly as configured.
+            assert!(
+                pacing.staleness_budget > pacing.refresh_interval + pacing.probe_timeout,
+                "connect {connect_ms}ms, operation {operation_ms}ms would report stale between two \
+                 healthy rounds: {pacing:?}"
+            );
             // And the registry's own definition of stale stays inside the one
             // the shipped rule pages on.
             assert!(
@@ -400,6 +425,8 @@ mod tests {
         assert_eq!(pacing.probe_timeout, MAX_REFRESH_INTERVAL - SPACING);
         assert!(pacing.probe_timeout < bounds);
         assert_eq!(pacing.staleness_budget, MAX_STALENESS_BUDGET);
+        // Even at the cap, a whole publication gap fits inside the budget.
+        assert!(pacing.staleness_budget > pacing.refresh_interval + pacing.probe_timeout);
         assert_eq!(pacing.validate(), Ok(()));
 
         let rendered = logs.rendered();

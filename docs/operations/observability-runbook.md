@@ -31,12 +31,15 @@ points at a section of this page.
   `operation_timeout_ms` buys a prompter diagnostic; nothing else does, because
   cutting a round short reports an outage the store is not having.
 
-  The cadence is capped at four minutes even so, below the exporter's
-  `metric_expiration` and the stall rule's lookback: a refresher that published
-  more slowly than the pipeline retains its series would leave the same gap a
-  dead one leaves, and page continuously while healthy. A control plane
-  configured to take longer than that is reported `unavailable`/`timeout` rather
-  than reported on less often.
+  The cadence is capped at two minutes even so, and the staleness budget covers
+  a whole publication gap (an interval plus a round) while staying under the
+  five-minute threshold `AxondStatusObservationsStale` pages on. Both bounds
+  exist for the same reason: a refresher publishing more slowly than the
+  pipeline retains its series leaves the same gap a dead one leaves, and a
+  budget shorter than the gap between two healthy rounds calls a control plane
+  stale that is being observed exactly as configured. A control plane configured
+  to take longer than the cap is reported `unavailable`/`timeout` rather than
+  reported on less often, and the replica logs that at boot.
 * **Revision convergence.** No reconciler is constructed either (the
   `convergence` module is contract-only until a projection from resource bodies
   to a servable config lands), so every `axond_revision_*` series — `lag`,
