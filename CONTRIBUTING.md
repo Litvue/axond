@@ -106,7 +106,10 @@ raising the MSRV follows
 - **Warnings are errors.** CI runs clippy with `-D warnings`; keep it clean.
 - **Public API breaks and MSRV bumps are minor releases.** Both are covered by
   [the compatibility contract](./docs/compatibility.md) and gated in CI; neither
-  is a patch.
+  is a patch. They are also the *only* things that make a pre-1.0 release a
+  minor, and they get there through a breaking commit title — everything else,
+  features included, ships as a patch. See
+  [version classification](./docs/maintainers/releasing.md#version-classification).
 - **Report vulnerabilities privately.** See [`SECURITY.md`](./SECURITY.md).
 - **Workflow steps are pinned to commit SHAs.** Every `uses:` names a full commit
   SHA with the version in a trailing comment; a tag or branch ref fails the

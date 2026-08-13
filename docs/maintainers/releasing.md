@@ -79,12 +79,50 @@ or policy; it will fail at the same PR-creation boundary.
 
 1. Ensure the release PR is current and green.
 2. Review version, changelog, Cargo metadata/lockfile, and release-managed docs
-   version markers.
+   version markers, and confirm the bump is the one
+   [the classification rules](#version-classification) call for.
 3. Merge the release PR.
 4. Observe the tag/release workflow.
 5. Verify artifacts externally with `docs/installation.md`.
 6. Confirm all three crates are visible and `cargo install axond --locked`
    succeeds.
+
+## Version classification
+
+Pre-1.0, release-please is configured with `bump-minor-pre-major` and
+`bump-patch-for-minor-pre-major`, so the bump follows from the Conventional
+Commit types on `main`:
+
+| What landed | Bump |
+| --- | --- |
+| A breaking commit (`feat!`/`fix!` or a `BREAKING CHANGE` footer) | minor |
+| Anything else release-please collects, `feat` included | patch |
+
+`chore` is `hidden` in the changelog sections, so it stays out of the notes; a
+`main` that has nothing but hidden commits on it may not open a release PR at
+all, which is not a classification to audit but an absence of one.
+
+A feature riding in a patch is therefore the configured behaviour, not a
+misclassification: `0.x` gives a patch no compatibility promise a minor keeps, so
+the distinction that matters is the one
+[`CONTRIBUTING.md`](../../CONTRIBUTING.md) names — a **public API break or an MSRV
+raise is a minor**, and both reach that bump through a breaking commit title, not
+by editing the version in the release PR.
+
+So a release PR is correctly classified when, for the commits it rolls up:
+
+- the `api-compat` lane passed on it, naming the published baseline it compared
+  against — `gateway-core`/`gateway-transport` only; a change confined to the
+  binary `axond` crate has no Rust API surface to break;
+- [`ops/api-compat-overrides.toml`](../../ops/api-compat-overrides.toml) has no
+  entry for that baseline, since an entry means a reviewed break, which is a
+  minor;
+- `rust-version` is unchanged and the `msrv` lane passed.
+
+When a break or an MSRV raise did land without a breaking commit title, the fix
+is a new commit on `main` that carries one — release-please then recomputes the
+version. Do not hand-edit the version in the release PR: the next push
+regenerates it.
 
 ## After the first multi-architecture release
 
