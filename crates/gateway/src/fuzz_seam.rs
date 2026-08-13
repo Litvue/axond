@@ -18,8 +18,10 @@
 //! secret: the verifier material below is committed synthetic test material.
 #![cfg(fuzzing)]
 // Only the handful of items the seams below reach are live in this target; the
-// rest of the crate is compiled for its `crate::` paths.
-#![allow(dead_code)]
+// rest of the crate is compiled for its `crate::` paths. A re-export whose only
+// consumer is `main.rs` is unused here for the same reason, since this target
+// compiles the modules without the binary that drives them.
+#![allow(dead_code, unused_imports)]
 
 // Keep this list identical to `main.rs`. `tests/fuzz_seam.rs` fails if it drifts.
 mod admin;
