@@ -51,7 +51,8 @@ impl PriceIdentity {
         }
     }
 
-    /// The price-book resource version, as `price-book/<id>@v<n>`.
+    /// The price-book resource version, as a `ResourceRef` renders it:
+    /// `price/<resource id>@v<n>`.
     pub fn book(&self) -> String {
         self.book.to_string()
     }
