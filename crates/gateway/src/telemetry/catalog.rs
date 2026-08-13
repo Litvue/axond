@@ -247,6 +247,12 @@ const REQUEST_STATUS: Label = Label::closed(
 const TARGET_PROVIDER: Label = Label::open("axond.target.provider", LabelClass::Configured);
 const TARGET_MODEL: Label = Label::open("axond.target.model", LabelClass::Configured);
 const STATUS_COMPONENT: Label = Label::closed("axond.status.component", crate::status::COMPONENTS);
+/// `axond.catalog.reason`: why an import was refused, bounded by
+/// [`RefusalReason`](crate::backends::catalog::RefusalReason).
+const CATALOG_REFUSAL_REASON: Label = Label::closed(
+    "axond.catalog.reason",
+    crate::backends::catalog::REFUSAL_REASONS,
+);
 
 /// The method vocabulary, which is a bound rather than an assumption: HTTP
 /// permits extension methods, so [`http`](super::http) maps anything outside
@@ -646,6 +652,30 @@ pub const CATALOG: &[MetricSpec] = &[
             STATUS_COMPONENT,
             Label::closed("axond.status.outcome", &["observed", "failed", "disabled"]),
         ],
+    },
+    // The catalogue's import health. A refused import leaves the previous
+    // catalogue active, so the refusal is invisible in every other series: these
+    // three are what make "metadata has stopped advancing" observable. The
+    // reason is the only dimension — the pointer, the source URL, the content id,
+    // and the error text are all unbounded over one upstream document, and they
+    // travel on the log line and the operator status surface instead.
+    MetricSpec {
+        name: "axond.catalog.refusals",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[CATALOG_REFUSAL_REASON],
+    },
+    MetricSpec {
+        name: "axond.catalog.active_age",
+        kind: InstrumentKind::Gauge,
+        unit: Some("ms"),
+        labels: &[],
+    },
+    MetricSpec {
+        name: "axond.catalog.consecutive_refusals",
+        kind: InstrumentKind::Gauge,
+        unit: None,
+        labels: &[],
     },
 ];
 
@@ -1116,6 +1146,54 @@ mod tests {
         );
         validate_label_value("axond.request.count", "axond.namespace", "tenant-a")
             .expect("a configured dimension has no vocabulary to violate");
+    }
+
+    /// The refusal vocabulary is duplicated as strings for the const catalogue,
+    /// so the duplicate has to be exactly the enum — in order, with nothing
+    /// extra. A reason the enum can emit but the catalogue does not accept is a
+    /// series a real refusal would fail to record.
+    #[test]
+    fn every_refusal_reason_is_catalogued() {
+        let reasons: Vec<&str> = crate::backends::catalog::RefusalReason::ALL
+            .iter()
+            .map(|reason| reason.as_str())
+            .collect();
+        assert_eq!(
+            crate::backends::catalog::REFUSAL_REASONS,
+            reasons.as_slice(),
+            "the refusal vocabulary and its string duplicate have drifted"
+        );
+        for reason in reasons {
+            validate_label_value("axond.catalog.refusals", "axond.catalog.reason", reason)
+                .expect("every emitted refusal reason is catalogued");
+        }
+    }
+
+    /// The catalogue's operator surface carries a content id; its metrics must
+    /// not. A digest is unbounded over a deployment's lifetime, which is exactly
+    /// what a label may not be.
+    #[test]
+    fn catalog_metrics_carry_only_the_bounded_reason() {
+        for spec in CATALOG
+            .iter()
+            .filter(|spec| spec.name.starts_with("axond.catalog."))
+        {
+            for label in spec.labels {
+                assert_eq!(
+                    label.class,
+                    LabelClass::Closed,
+                    "catalogue metric {} carries the unbounded label {}",
+                    spec.name,
+                    label.key
+                );
+                validate_default_label_key(label.key).unwrap_or_else(|error| {
+                    panic!(
+                        "catalogue metric {} carries {}: {error}",
+                        spec.name, label.key
+                    )
+                });
+            }
+        }
     }
 
     #[test]
