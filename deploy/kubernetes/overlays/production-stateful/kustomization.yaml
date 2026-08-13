@@ -19,7 +19,7 @@
 #
 # Not applyable as committed, by design: the digest is the all-zero sentinel.
 #
-#   ops/pin-image-digest.sh 0.3.27
+#   ops/pin-image-digest.sh 0.3.28
 #   SIGNER_IDENTITY=... GITHUB_REPOSITORY=Litvue/axond ops/verify-image-evidence.sh ghcr.io/litvue/axond@<digest>
 #   kubectl apply -k deploy/kubernetes/overlays/production-stateful
 apiVersion: kustomize.config.k8s.io/v1beta1
