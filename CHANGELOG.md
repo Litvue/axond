@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.23](https://github.com/Litvue/axond/compare/v0.3.22...v0.3.23) (2026-08-13)
+
+
+### Features
+
+* **models:** define derived availability and discovery evaluation contracts ([#250](https://github.com/Litvue/axond/issues/250)) ([2d3a11c](https://github.com/Litvue/axond/commit/2d3a11c7d04462966f4d93850d35d3cefaa25380))
+
 ## [0.3.22](https://github.com/Litvue/axond/compare/v0.3.21...v0.3.22) (2026-08-13)
 
 
