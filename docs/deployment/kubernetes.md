@@ -218,6 +218,21 @@ fleet become wrong at once. The component answers each:
     http://127.0.0.1:8080/admin/v1/tenants
   ```
 
+  A port-forward works because its traffic originates on the node. Anything
+  else in the cluster does not: the inherited `axond-allow` policy admits only
+  the ingress controller's namespace, so a CI job or operator tool calling
+  `axond-admin` is dropped on a CNI that enforces NetworkPolicy even though the
+  Service has all three endpoints. Add its namespace to the ingress rule in
+  `overlays/production/networkpolicy.yaml` before relying on in-cluster access.
+
+  Widen it deliberately, because a Service is a name for a set of endpoints and
+  not a network boundary. `/admin/v1` and inference share one listener on 8080,
+  so every caller that policy admits to those Pods can reach the administrative
+  surface whichever Service it resolved — including the ingress controller that
+  fronts inference. Deny `/admin/v1` at that ingress, or run it on an ingress
+  that requires operator identity; the only authentication in front of it today
+  is the break-glass credential in `axond-secrets`.
+
 - **Node drains.** `unhealthyPodEvictionPolicy: AlwaysAllow` on the disruption
   budget. The default (`IfHealthyBudget`) evicts an unready Pod only while the
   budget is otherwise satisfied, so on a fleet where no Pod is healthy it

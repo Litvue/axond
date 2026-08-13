@@ -84,7 +84,7 @@ step "Building the gateway image"
 if [[ -z "$image" ]]; then
   image="axond-stateful-drill:$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo local)"
   docker build --tag "$image" "$root" >"${workdir}/build.log" 2>&1 ||
-    fail "docker build failed; see ${workdir}/build.log"
+    fail "docker build failed: $(tail -n 20 "${workdir}/build.log")"
 else
   docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image" >/dev/null ||
     fail "cannot pull ${image}"

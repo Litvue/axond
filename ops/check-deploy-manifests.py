@@ -295,7 +295,7 @@ def parse_quantity(quantity: str | int) -> int:
     return int(text)
 
 
-def check_topology_spread(documents: list[Document]) -> list[str]:
+def check_topology_spread(documents: list[Document], label: str) -> list[str]:
     """Replicas are spread across nodes at minimum, and zones where they exist."""
     deployment = one(documents, "Deployment")
     constraints = deployment["spec"]["template"]["spec"].get("topologySpreadConstraints", [])
@@ -303,11 +303,11 @@ def check_topology_spread(documents: list[Document]) -> list[str]:
     failures: list[str] = []
     for key in ("kubernetes.io/hostname", "topology.kubernetes.io/zone"):
         if key not in by_key:
-            failures.append(f"overlays/production: no topology spread constraint on {key}")
+            failures.append(f"{label}: no topology spread constraint on {key}")
     node = by_key.get("kubernetes.io/hostname")
     if node is not None and node.get("whenUnsatisfiable") != "DoNotSchedule":
         failures.append(
-            "overlays/production: the per-node spread constraint is best-effort; two replicas "
+            f"{label}: the per-node spread constraint is best-effort; two replicas "
             "of a fleet sized to survive one disruption must not share a node"
         )
     # A hard constraint that counts the Pods it is replacing deadlocks against
@@ -315,7 +315,7 @@ def check_topology_spread(documents: list[Document]) -> list[str]:
     # Pod is unschedulable and nothing may be evicted to make room for it.
     if node is not None and "pod-template-hash" not in node.get("matchLabelKeys", []):
         failures.append(
-            "overlays/production: the per-node spread constraint counts every axond Pod, so a "
+            f"{label}: the per-node spread constraint counts every axond Pod, so a "
             "rolling update's surge Pod exceeds its own skew and never schedules; scope the skew "
             "with matchLabelKeys: [pod-template-hash]"
         )
@@ -323,7 +323,7 @@ def check_topology_spread(documents: list[Document]) -> list[str]:
         selector = constraint.get("labelSelector", {}).get("matchLabels")
         if selector != SELECTOR:
             failures.append(
-                f"overlays/production: the {key} spread constraint selects {selector!r} rather "
+                f"{label}: the {key} spread constraint selects {selector!r} rather "
                 f"than the Deployment's own {SELECTOR!r}, so it spreads a different set of Pods"
             )
     return failures
@@ -954,7 +954,7 @@ def gate(
         *check_termination_budget(stateful, "overlays/production-stateful"),
         *check_resources(stateful, "overlays/production-stateful"),
         *check_service_port(stateful, "overlays/production-stateful"),
-        *check_topology_spread(stateful),
+        *check_topology_spread(stateful, "overlays/production-stateful"),
         *check_namespaces(stateful, "overlays/production-stateful"),
         *check_example_secret(stateful, base),
         *check_image_pinning(base, production),
@@ -964,7 +964,7 @@ def gate(
         *check_resources(production, "overlays/production"),
         *check_service_port(base, "base"),
         *check_service_port(production, "overlays/production"),
-        *check_topology_spread(production),
+        *check_topology_spread(production, "overlays/production"),
         *check_network_policies(production),
         *check_telemetry_egress(production, TELEMETRY_SOURCE.read_text(encoding="utf-8")),
         *check_disruption_budget(production, autoscaled),
@@ -1110,21 +1110,21 @@ def self_test() -> int:
         ]
         if constraint["topologyKey"] != "kubernetes.io/hostname"
     ]
-    expect_failure("topology spread", check_topology_spread(flat))
+    expect_failure("topology spread", check_topology_spread(flat, "overlays/production"))
 
     stacked = copy.deepcopy(production)
     for constraint in one(stacked, "Deployment")["spec"]["template"]["spec"][
         "topologySpreadConstraints"
     ]:
         constraint["whenUnsatisfiable"] = "ScheduleAnyway"
-    expect_failure("per-node spread enforcement", check_topology_spread(stacked))
+    expect_failure("per-node spread enforcement", check_topology_spread(stacked, "overlays/production"))
 
     fleet_wide = copy.deepcopy(production)
     for constraint in one(fleet_wide, "Deployment")["spec"]["template"]["spec"][
         "topologySpreadConstraints"
     ]:
         constraint.pop("matchLabelKeys", None)
-    expect_failure("a hard spread that deadlocks its own rollout", check_topology_spread(fleet_wide))
+    expect_failure("a hard spread that deadlocks its own rollout", check_topology_spread(fleet_wide, "overlays/production"))
 
     open_egress = copy.deepcopy(production)
     for policy in of_kind(open_egress, "NetworkPolicy"):
