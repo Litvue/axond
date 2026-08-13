@@ -1,4 +1,4 @@
-# 40. Callable offering identity: keying the normalized model projection
+# 41. Callable offering identity: keying the normalized model projection
 
 Date: 2026-08-12
 
@@ -6,14 +6,14 @@ Date: 2026-08-12
 
 Accepted
 
-Extends [ADR 0038](./0038-catalogue-source-imports.md), which settled how a
+Extends [ADR 0040](./0040-catalogue-source-imports.md), which settled how a
 catalogue is imported and identified. This decision covers how the imported
 catalogue is *keyed* for consumers, and changes nothing about parsing, import
 semantics, or the three snapshot identities.
 
 ## Context
 
-ADR 0038 files an offering under the model it is an offering of — the
+ADR 0040 files an offering under the model it is an offering of — the
 provider-neutral, authored id (`xiaomi/mimo-v2-flash`) — and keeps the
 provider's own string in `published_model_id`. That filing answers "who offers
 this model?" and is the reason a provider publishing one model under two
@@ -64,7 +64,7 @@ re-deriving them from string shapes.
 refuses a repeated offering within a model, which is all a source document can
 express; the projection refuses the same collision across models
 (`ProjectionError::AmbiguousCallable`) because that is where a request has to
-resolve to one model. Combined with ADR 0038's refusal of ambiguous tails at
+resolve to one model. Combined with ADR 0040's refusal of ambiguous tails at
 import, no consumer of a projection ever has to guess.
 
 **A projection has its own content identity.** `ProjectionId` is a checksum of
@@ -100,7 +100,7 @@ entitlement in #205, a route — has to reconsider.
 
 ### State tier
 
-Tier 0 (config-only), unchanged from ADR 0038. This is an I/O-free projection of
+Tier 0 (config-only), unchanged from ADR 0040. This is an I/O-free projection of
 content already in hand: it borrows from a `CatalogContent`, reads nothing, and
 writes nothing. Nothing here is reachable from the request path, and the parser
 and import slice stay inert — no `/v1/models`, no admin handler, no persistence,
