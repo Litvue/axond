@@ -1,0 +1,189 @@
+# Stateful endurance qualification
+
+What a *deployment* looks like after hours of mixed traffic, rather than what
+one process looks like. [Endurance qualification](./endurance.md) soaks a single
+Tier 0 replica with no datastore and no control plane
+([ADR 0040](../adr/0040-endurance-qualification-harness.md)); this page soaks a
+fleet whose catalogue, credential pool, tenant policy, provider, usage database,
+and processes all change while it is serving
+([ADR 0048](../adr/0048-stateful-endurance-qualification.md)) — the failures that
+only appear when duration and change happen at once:
+
+- an accounting row lost to a restart, a rotation, or a database that went away
+  and came back;
+- a revision that converged on one replica and not on the one that replaced it;
+- a tenant that keeps reaching a pool its policy no longer lets it borrow;
+- a circuit that opens for a declared outage and never closes again.
+
+Where this sits in what production qualification has and has not measured — the
+soak tier has not been dispatched — is the
+[qualification packet](./qualification.md).
+
+## What the harness runs
+
+`qualification/stateful-endurance/manifest.toml` is the committed input: one
+profile, `mixed-stateful-endurance`, at two tiers. The driver boots two real
+`axond` replicas against a real PostgreSQL usage sink and a deterministic fake
+upstream reached through a loopback fault gate, puts a round-robin balancer in
+front of them, and offers a closed-loop mixed workload drawn from a seeded
+rotation.
+
+Every request is a point in four dimensions, as in the stateless soak:
+
+| Dimension | Values |
+| --- | --- |
+| Tenant | `platform` (operator credentials), `stateful-byok` (its own), `stateful-fallback` (none, `allow_platform_fallback`), and `stateful-probe`, which only probes tenant policy. |
+| Provider and route | `fake-openai` over `/v1/chat/completions`, `/v1/embeddings`, `/v1/responses`; `fake-anthropic` over `/v1/messages`. |
+| Wire | Buffered and streamed, interleaved. |
+| Ending | `complete`, `cancelled`, `dropped` (the upstream dies mid-stream), `faulted` (it refuses first). |
+
+What makes this run stateful is the script offered *underneath* that workload.
+Each event is a fraction of the run, so both tiers execute the same script in
+the same order:
+
+| At | Event | What the run then looks for |
+| --- | --- | --- |
+| 10% | Catalogue revision — a new alias is published and every replica reloaded | the `chat-catalogue-v2` alias begins serving |
+| 20% | Credential revision — the pool is rotated | a usage record attributed to `fake-openai-rotated` |
+| 30% | Policy revision — the probe tenant loses `allow_platform_fallback` | the probe tenant stops being served |
+| 40% | The provider is slowed by 250 ms at the gate | latency moves; nothing fails |
+| 52% | The provider is taken away — connections refused and cut | refusals typed as circuit-open, and recovery afterwards |
+| 66% | The usage database is taken away | dropped sink batches, reported by the process and reconciled |
+| 80% | Rolling restart — each replica is drained and replaced one at a time | no request refused for want of a ready replica, and the flushed rows arrive |
+
+| Tier | Duration | Concurrency | Sample interval | Segment |
+| --- | --- | --- | --- | --- |
+| `smoke` | 60 s | 8 | 200 ms | 10 s |
+| `soak` | 12 h | 24 | 1 s | 15 min |
+
+The smoke tier is the same code, manifest, script, and gates as the soak; only
+the time between the events differs.
+
+## Run it
+
+The harness needs a PostgreSQL it may create a schema in. Without
+`AXOND_TEST_POSTGRES_DSN` the run is skipped rather than shortened — a stateful
+qualification without a datastore is not a smaller one.
+
+```bash
+export AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:5432/postgres
+
+# The smoke tier and the deterministic checks. Part of the normal suite, and of
+# the `Stateful tests` lane in CI.
+cargo test --locked --all-features --test stateful_endurance -- --nocapture
+
+# The soak tier: twelve hours, by name.
+just stateful-endurance
+
+# A shorter dispatched run — forty minutes here. The override applies to the
+# soak tier alone, so the smoke tier in the same binary keeps its committed
+# minute. Segments shrink to match.
+just stateful-endurance 2400000
+```
+
+The `Endurance` workflow's second job runs this soak monthly and on dispatch,
+against a PostgreSQL service container, and uploads the result with its time
+series.
+
+## What a run leaves behind
+
+`target/stateful-endurance/<tier>/<tier>.json` is the result, and
+`<tier>.replica-N.samples.jsonl` beside it is every resource sample each
+replica — including the ones that were retired and replaced — was observed to
+take, written as it went.
+
+The result carries the measurements and the identity of everything that produced
+them: the SHA-256 of the binary, of the normalised config, and of the manifest
+and every fixture; the seed; the duration offered (`profile.duration_ms`) next
+to the manifest's (`profile.manifest_duration_ms`) and which of the two was used
+(`run.duration_source`); the PostgreSQL server version and the ephemeral schema
+name; the toolchain, git commit and dirty flag; and the host's CPU, kernel, core
+count and memory. **Numbers from artifacts whose provenance differs are not
+comparable.**
+
+It carries no credential. The normalised config replaces the ephemeral ports and
+the per-run key directory, tenant keys are delivered as files under the run
+directory and named rather than quoted, and the usage DSN travels as the *name*
+of the environment variable the replicas read it from. Credential evidence is
+label attribution — `fake-openai-rotated` — not material.
+
+## What fails, and what does not
+
+Hard failures, asserted at both tiers:
+
+- **exactly one usage record per dispatched request** — none missing, none
+  duplicated, none carrying a status the plan cannot account for;
+- **no durable row lost outside a declared window**
+  (`max_durable_usage_loss_outside_windows = 0`). Rows lost *inside* the
+  database outage are excused only as far as the processes' own reports of
+  dropped batches account for them — see below;
+- **no tenant boundary crossed** (`max_tenant_boundary_violations = 0`), which
+  is also an early abort: the rest of a run that mixed two tenants' credentials
+  measures nothing;
+- **no error outside a declared fault window** (`max_unplanned_errors = 0`);
+- **every published revision converged** within `max_convergence_ms`, observed
+  by a request rather than by a log line;
+- **no request refused for want of a ready replica** during the rolling restart
+  (`max_restart_unavailable = 0`), and no readiness gap longer than
+  `max_readiness_gap_ms`;
+- **every declared fault recovered** within `max_recovery_ms`, measured from the
+  moment the fault is lifted to the first request that settles a usage record
+  afterwards. A window with no such request never recovered, and fails;
+- **bounded resident growth** (`max_rss_growth_kib`), over enough segments to
+  fit a trend through (`min_segments`). The soak tier adds the per-hour drift
+  gate a short run cannot support.
+
+Recorded and **never** asserted: throughput, latency percentiles, TTFT, CPU. A
+shared runner cannot bound them without flaking.
+
+## Declared outages, and what they are allowed to cost
+
+Two backends are never out at once, so every error can be attributed to one
+window. Inside a window the errors are the point and are counted as
+`workload.errors_in_fault_windows` rather than against the unplanned gate.
+
+Attribution runs past the end of a fault by `recovery_allowance_ms`, because a
+backend that goes away trips the circuit breakers in front of it and those have
+a cooldown (`failover.cooldown_seconds`); a breaker that reopened the instant
+the backend returned would be a breaker that never protected anything. What is
+not allowed is never recovering, which is what `max_recovery_ms` bounds.
+
+The usage-database outage is the interesting one. The durable sink batches,
+reconnects, retries once, and then drops the batch rather than growing a queue
+for a database that is not there ([ADR 0009](../adr/0009-durable-usage-sinks.md)).
+A dropped batch is a logged event, and the harness keeps those events apart from
+its bounded scrollback: `usage.sink_drops` records how many batches were
+dropped, how many records they held, why, and whether each fell inside the
+declared window. Durable loss is excused only up to
+`sink_drops.records_in_usage_window` — a row that went missing with no process
+saying it dropped it is a finding, whenever it happened.
+
+## Reading an artifact
+
+```bash
+jq '{tier: .profile.tier, offered: .workload.offered, usage: .usage,
+     revisions: [.revisions[] | {event, converged_ms}],
+     faults: [.faults[] | {event, errors_inside, recovered_ms}],
+     restart: .restart, tenancy: .tenancy,
+     failed: [.verdicts[] | select(.passed == false)]}' \
+  target/stateful-endurance/soak/soak.json
+```
+
+Fields worth knowing:
+
+- `run.stop` is why the run ended: `duration_elapsed` is the normal ending, and
+  anything else names the abort condition that cut it short.
+- `revisions[].converged_ms` is measured from publication to the first request
+  that *observed* the new behaviour, so it includes the reload rather than
+  reporting the signal.
+- `faults[].gate` is what the loopback gate did — accepted, refused, cut,
+  delayed — which is how a run shows the fault it declared actually met traffic.
+- `restart.flushed_on_exit` counts the usage rows a retiring replica emitted
+  while draining; they are reconciled with the rest, so a restart cannot hide a
+  row by taking the process that owed it away.
+- `tenancy.probe_served_before_policy` and `probe_refused_after_policy` are the
+  same probe on either side of the policy revision. Both must be non-zero, or
+  the isolation gate passed without ever being tested.
+- `resources[]` is per replica *incarnation*, so a rolling restart produces more
+  entries than the fleet has replicas; `growth_kib` is against that
+  incarnation's own baseline.

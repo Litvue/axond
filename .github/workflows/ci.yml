@@ -285,6 +285,18 @@ jobs:
           name: recovery-evidence
           path: target/recovery/*.json
           if-no-files-found: warn
+      # The stateful endurance smoke tier: the same driver, manifest, and gates
+      # the `Endurance` workflow dispatches for twelve hours, at a minute. It
+      # only runs where a database is configured, which is this lane.
+      - name: Publish the stateful endurance smoke results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stateful-endurance-results-smoke
+          path: |
+            target/stateful-endurance/smoke/*.json
+            target/stateful-endurance/smoke/*.samples.jsonl
+          if-no-files-found: warn
       # This lane has the control plane the forward-only rollback fence needs, so
       # its rollout artifacts are the ones that record the fence as evaluated.
       - name: Publish the stateful rollout results

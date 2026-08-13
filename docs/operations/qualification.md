@@ -10,7 +10,7 @@ decomposes into five slices. They landed, and will land, at different depths:
 | Slice | Issue | Status | What exists today |
 | --- | --- | --- | --- |
 | `capacity` | [#217](https://github.com/Litvue/axond/issues/217) | `evidenced` | Driver, eight committed profiles — including multi-tenant isolation, admission shedding, and a bounded stalling backend — reduced tier on every change, heavy tier on demand, and two retained runs. |
-| `endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Driver and committed mix; the smoke tier runs in CI. The 12–24 hour tier has never been dispatched. |
+| `endurance` | [#221](https://github.com/Litvue/axond/issues/221) | `harnessed` | Two drivers and committed mixes — one stateless, one against a fleet with a durable usage sink — whose smoke tiers run in CI. Neither 12–24 hour tier has been dispatched. |
 | `recovery` | [#219](https://github.com/Litvue/axond/issues/219) | `harnessed` | Driver, committed scenarios, and nine stages running against a real Postgres in two lanes — the outage, the cold boots, convergence, a logical restore, and a point-in-time recovery. Every scenario still has a blocked stage: stateful serving is not assembled yet. |
 | `fault` | [#218](https://github.com/Litvue/axond/issues/218) | `unbuilt` | Nothing. The fake upstream already injects the provider faults a matrix would drive. |
 | `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `harnessed` | Driver, committed scenarios, and a reduced tier in CI. The heavy tier has never been dispatched, and mixed-version serving waits on a stateful replica. |
@@ -31,8 +31,10 @@ the manifest it names is a test failure.
   and no slice has retained a run of a fleet. #156 stays open until every slice
   is `evidenced`; `closure.satisfied` in the packet is derived from the slices,
   so it cannot be set by hand.
-- **Not evidence about stateful serving.** Everything measured so far is Tier 0:
-  one process, no Redis, no Postgres, no control plane. See
+- **Not evidence about stateful serving.** Every retained record is Tier 0: one
+  process, no Redis, no Postgres, no control plane. The stateful endurance
+  harness does drive a fleet with a durable usage sink, but only its one-minute
+  smoke tier has run, and a correctness run is not a measurement. See
   [recovery qualification](./recovery-qualification.md) for what stateful
   recovery will have to show.
 - **Not a fleet baseline.** Both retained runs are local (see below).
@@ -100,8 +102,8 @@ number is a regression rather than a different machine.
 
 - **`endurance`** — a dispatched 12–24 hour run. The drift thresholds that only
   hours can exercise (`max_rss_drift_kib_per_hour` and its neighbours) have no
-  run behind them, so the soak tier is a declared bound rather than a measured
-  one.
+  run behind them, so the soak tiers are declared bounds rather than measured
+  ones.
 - **`recovery`** — every stage that needs a served request: serving through the
   outage, from a restored cache, and across a recovery, plus the rotation whose
   evidence is a request authenticated with rotated material. They wait on the
@@ -133,6 +135,9 @@ and why no capacity profile claims it.
 - [Recovery qualification](./recovery-qualification.md) — the stateful outage,
   cold-boot, convergence, rotation, and restore scenarios, the two lanes that
   run them, and what each retains.
+- [Stateful endurance qualification](./stateful-endurance.md) — the same
+  workload offered to a fleet whose catalogue, credentials, policy, provider,
+  database, and processes change while it serves.
 - [Upgrades and rollback](./upgrades.md) — the compatibility and rollback rules
   the rollout slice will qualify.
 - [ADR 0033](../adr/0033-capacity-qualification-harness.md) — why a run is
@@ -141,5 +146,8 @@ and why no capacity profile claims it.
   contract is committed before its driver.
 - [ADR 0040](../adr/0040-endurance-qualification-harness.md) — why the endurance
   harness measures its own accumulators before it measures the gateway.
+- [ADR 0048](../adr/0048-stateful-endurance-qualification.md) — why the stateful
+  soak attributes every excused error and lost row to something the deployment
+  itself emitted.
 - [ADR 0045](../adr/0045-qualification-packet-and-evidence-records.md) — the
   packet and evidence-record schemas, and the ladder derived from them.

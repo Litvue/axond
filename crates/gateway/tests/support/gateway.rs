@@ -107,14 +107,27 @@ struct Output {
     /// asserts over all of them — and drained by the endurance harness, which
     /// reconciles each batch as it lands.
     usage: Vec<Value>,
+    /// The process's own reports of usage batches it dropped, kept apart from
+    /// the bounded scrollback. A harness reconciling durable rows against
+    /// emitted records needs every one of these to say *why* a row is missing,
+    /// and losing one to the line bound would turn documented backpressure into
+    /// an unexplained loss.
+    usage_drops: Vec<Value>,
 }
 
 impl Output {
     fn ingest(&mut self, line: String) {
-        if let Ok(value) = serde_json::from_str::<Value>(&line)
-            && value.get("schema_version").is_some()
-        {
-            self.usage.push(value);
+        if let Ok(value) = serde_json::from_str::<Value>(&line) {
+            if value.get("schema_version").is_some() {
+                self.usage.push(value);
+            } else if let Some(fields) = value.get("fields")
+                && fields
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| message.contains("usage batch dropped"))
+            {
+                self.usage_drops.push(fields.clone());
+            }
         }
         if self.lines.len() == RETAINED_LINES {
             self.lines.pop_front();
@@ -175,6 +188,9 @@ pub struct Axond {
     /// exactly what it qualified.
     pub config: String,
     child: Child,
+    /// The file the process reads its config from, kept so a suite can publish
+    /// a new revision to the running replica.
+    config_path: PathBuf,
     /// This boot's own config directory, removed with the process that read it.
     config_dir: PathBuf,
     output: Arc<Mutex<Output>>,
@@ -329,6 +345,7 @@ impl Axond {
             boot_key,
             config,
             child,
+            config_path: path,
             config_dir: dir,
             output,
             readers,
@@ -417,6 +434,29 @@ impl Axond {
         format!("{}{path}", self.base_url)
     }
 
+    /// The address this process is bound to, for a caller rendering the next
+    /// revision of the config it is already serving.
+    pub fn bind(&self) -> &str {
+        self.base_url
+            .strip_prefix("http://")
+            .expect("a loopback base URL")
+    }
+
+    /// Publish a new revision of the config to the running process and signal
+    /// it to load it (ADR 0011). Reject-and-keep, so a refused revision leaves
+    /// the process serving the one it had — which is a property a suite may be
+    /// asking about.
+    pub fn publish(&mut self, config: &str) {
+        std::fs::write(&self.config_path, config).expect("the revision is written");
+        self.config = config.to_owned();
+        let status = Command::new("kill")
+            .arg("-HUP")
+            .arg(self.pid().to_string())
+            .status()
+            .expect("kill(1) runs");
+        assert!(status.success(), "SIGHUP was delivered");
+    }
+
     /// What the process has written to stdout/stderr, for failure output and
     /// for assertions over the raw text: its most recent lines.
     pub fn output(&self) -> String {
@@ -456,6 +496,13 @@ impl Axond {
     /// than holding every record until the end.
     pub fn drain_usage_records(&self) -> Vec<Value> {
         std::mem::take(&mut self.output.lock().expect("output lock").usage)
+    }
+
+    /// Take the process's reports of dropped usage batches since the last
+    /// drain: one entry per report, carrying the sink, the reason, and how many
+    /// records went with it.
+    pub fn drain_usage_drops(&self) -> Vec<Value> {
+        std::mem::take(&mut self.output.lock().expect("output lock").usage_drops)
     }
 
     /// Wait until at least `count` usage records have been written. Settlement

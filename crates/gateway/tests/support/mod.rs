@@ -16,6 +16,7 @@ pub mod recovery;
 pub mod rollout;
 pub mod schema;
 pub mod stateful;
+pub mod stateful_endurance;
 pub mod tenancy;
 pub mod upstream;
 
