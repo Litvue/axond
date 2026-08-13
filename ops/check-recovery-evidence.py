@@ -24,6 +24,10 @@ is enforced rather than trusted. The secret is named by the environment variable
 holding it rather than passed as an argument, which would put it in the process
 listing the caller took care to keep it out of.
 
+Freshness is checked with `--since-unix-ms`: an artifact a previous run left in
+`target/recovery/` reads exactly like one this run wrote, so a lane is asked to
+say when it started and an older artifact is refused.
+
 `--self-test` runs the checker against synthetic artifacts, one per way an
 artifact can lie, because a checker that accepts everything is indistinguishable
 from a lane that passed.
@@ -67,6 +71,7 @@ def check(
     directory: Path,
     runner: str,
     forbid: list[str],
+    since_unix_ms: int = 0,
 ) -> list[str]:
     key = f"{scenario['id']}/{stage['id']}"
     path = directory / f"{scenario['id']}.{stage['id']}.json"
@@ -111,6 +116,12 @@ def check(
         for entry in verdicts
         if entry.get("outcome") == "failed"
     )
+    started = artifact.get("run", {}).get("started_at_unix_ms", 0)
+    if since_unix_ms and started < since_unix_ms:
+        problems.append(
+            f"{key}: the artifact began at {started}, before this run started at "
+            f"{since_unix_ms}, so it was left by an earlier run and this stage did not run"
+        )
     if not artifact.get("timeline"):
         problems.append(f"{key}: the artifact retains no timeline, so it describes no recovery")
     if not problems:
@@ -138,6 +149,7 @@ def self_test() -> int:
             "runner": runner,
             "capability": scenario["capability"],
             "evidence": stage["evidence"],
+            "run": {"started_at_unix_ms": 2_000},
             "timeline": [{"at_ms": 1, "event": "restored", "detail": "a restore happened"}],
             "observations": {"live_revisions": 5},
             "gates": [],
@@ -189,12 +201,24 @@ def self_test() -> int:
                 verb = "rejected" if problems else "accepted"
                 complaints.append(f"{name}: the checker {verb} it: {'; '.join(problems)}")
 
+        # Freshness is the one lie a single artifact cannot tell on its own: it
+        # depends on when the run asking about it began.
+        path.write_text(json.dumps(artifact()), encoding="utf-8")
+        for name, since, want_ok in [
+            ("an artifact from this run", 1_000, True),
+            ("an artifact an earlier run left behind", 3_000, False),
+        ]:
+            problems = check(scenario, stage, Path(directory), runner, [], since)
+            if bool(problems) == want_ok:
+                verb = "rejected" if problems else "accepted"
+                complaints.append(f"{name}: the checker {verb} it: {'; '.join(problems)}")
+
     if complaints:
         print("the recovery evidence checker does not catch what it claims:", file=sys.stderr)
         for complaint in complaints:
             print(f"  {complaint}", file=sys.stderr)
         return 1
-    print(f"the evidence checker catches {len(cases) - 1} ways an artifact can lie")
+    print(f"the evidence checker catches {len(cases)} ways an artifact can lie")
     return 0
 
 
@@ -221,6 +245,12 @@ def main() -> int:
             "the drill's credential; unset or empty names are ignored"
         ),
     )
+    parser.add_argument(
+        "--since-unix-ms",
+        type=int,
+        default=0,
+        help="refuse an artifact that began before this instant, in Unix milliseconds",
+    )
     args = parser.parse_args()
     forbid = [os.environ.get(name, "") for name in args.forbid_env]
     if args.self_test:
@@ -230,7 +260,9 @@ def main() -> int:
 
     problems: list[str] = []
     for scenario, stage in owed(args.runner):
-        problems.extend(check(scenario, stage, args.dir, args.runner, forbid))
+        problems.extend(
+            check(scenario, stage, args.dir, args.runner, forbid, args.since_unix_ms)
+        )
 
     if problems:
         print(f"\nrecovery evidence is not complete for the {args.runner} lane:", file=sys.stderr)

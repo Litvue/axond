@@ -163,7 +163,8 @@ ops/check-recovery-evidence.py --runner restore-drill
 Each lane owes an artifact for every stage the manifest gives it. The checker
 reads the manifest, then refuses a missing artifact, a wrong schema version, a
 wrong scenario, stage, lane, capability or evidence set, a failed gate or check,
-an empty timeline, and any artifact carrying a forbidden string. CI runs it in
+an empty timeline, an artifact an earlier run left behind (`--since-unix-ms`),
+and any artifact carrying a string named by `--forbid-env`. CI runs it in
 both lanes before uploading `target/recovery/`, so a lane that produced no
 evidence fails the build instead of uploading nothing.
 

@@ -253,6 +253,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-targets: false
+      - name: Note when this lane started
+        run: echo "lane_started_ms=$(($(date +%s%N) / 1000000))" >>"$GITHUB_ENV"
       - run: cargo test -p axond --all-features --locked
         env:
           AXOND_TEST_REDIS_URL: redis://127.0.0.1:6379
@@ -264,7 +266,9 @@ jobs:
       # its own, so it is checked against the manifest rather than inferred from
       # the upload: every stage the manifest gives this lane owes a file here.
       - name: Check the stateful lane retained its evidence
-        run: python3 ops/check-recovery-evidence.py --runner stateful-tests
+        run: |
+          python3 ops/check-recovery-evidence.py --runner stateful-tests \
+            --since-unix-ms "$lane_started_ms"
       # `warn` on the upload: an earlier target failing stops the suite before
       # the recovery stages run, and that lane's finding is the failing test.
       - name: Publish the recovery evidence

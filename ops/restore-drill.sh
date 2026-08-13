@@ -133,6 +133,9 @@ close() {
   python3 "$evidence" finish --log "$log" || failed_stages+=("$(basename "$log" .log)")
 }
 failed_stages=()
+# When this run began, so the checker can reject an artifact a previous run left
+# behind: a stale file is indistinguishable from a stage that ran.
+drill_started_ms=$(($(date +%s%N) / 1000000))
 
 # psql inside the container: the client is the server's own, so no version skew,
 # and `ON_ERROR_STOP` makes a failed statement a failed drill.
@@ -626,13 +629,19 @@ close
 
 # ---------------------------------------------------------------------------
 step "Checking the lane retained evidence for every stage it owes"
-python3 "${root}/ops/check-recovery-evidence.py" --runner restore-drill \
-  --forbid-env GW_DRILL_BREAKGLASS --forbid-env GW_DRILL_KEK ||
-  fail "the evidence is incomplete"
-
+check_evidence() {
+  python3 "${root}/ops/check-recovery-evidence.py" --runner restore-drill \
+    --since-unix-ms "$drill_started_ms" \
+    --forbid-env GW_DRILL_BREAKGLASS --forbid-env GW_DRILL_KEK
+}
+# A stage that failed is named before the checker's verdict, because the
+# checker reads that stage's own failed check as incomplete evidence and would
+# otherwise replace the diagnosis with a report that something is missing.
 if ((${#failed_stages[@]})); then
+  check_evidence || true
   fail "these stages failed: ${failed_stages[*]} (their artifacts are in target/recovery/)"
 fi
+check_evidence || fail "the evidence is incomplete"
 
 printf '\nrestore drill passed: a deployment published through axond admin came back\n'
 printf 'from a logical restore and from a point-in-time recovery, each read and\n'
