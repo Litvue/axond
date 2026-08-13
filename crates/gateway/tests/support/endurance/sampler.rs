@@ -120,7 +120,7 @@ impl Sampler {
         let file = File::create(path).expect("the endurance sample file is writable");
         let task = tokio::spawn({
             let shared = shared.clone();
-            let baseline = baseline;
+            // `baseline` is `Copy`, so the task takes its own.
             async move {
                 let mut writer = BufWriter::new(file);
                 if let Some(baseline) = baseline {
