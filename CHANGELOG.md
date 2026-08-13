@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.25](https://github.com/Litvue/axond/compare/v0.3.24...v0.3.25) (2026-08-13)
+
+
+### Features
+
+* **admin:** add the /admin/v1 protocol and service boundary ([#254](https://github.com/Litvue/axond/issues/254)) ([face242](https://github.com/Litvue/axond/commit/face242150facd876b26fcaa257c7a8d9a23002f))
+
+
+### Tests
+
+* **qualification:** bound and prove the endurance harness's own accumulators ([#281](https://github.com/Litvue/axond/issues/281)) ([5d65d24](https://github.com/Litvue/axond/commit/5d65d24df32cad647e6754f5168f62a622924b48))
+
 ## [0.3.24](https://github.com/Litvue/axond/compare/v0.3.23...v0.3.24) (2026-08-13)
 
 
