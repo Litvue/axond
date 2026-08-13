@@ -532,12 +532,13 @@ async fn serve() -> anyhow::Result<()> {
     let resources = state.clone();
     // A replica that cannot compile a revision into a snapshot still administers
     // one: the administrative surface is mounted either way, and only inference
-    // is replaced by its refusal.
+    // is replaced by its refusal. The replica diagnostic is mounted either way
+    // too — an unconverged replica is precisely the one an operator asks about.
     let inference = match inference_refusal {
         None => routes::router(state),
         Some(reason) => {
             tracing::warn!(reason, "inference is refused on this replica");
-            routes::unconverged_router(reason)
+            routes::unconverged_router(reason).merge(routes::diagnostic_router(state))
         }
     };
     let app = inference

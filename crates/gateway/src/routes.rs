@@ -71,10 +71,28 @@ use crate::usage::{Status, UsageRecord};
 
 pub fn router(state: AppState) -> Router {
     let minting_enabled = state.config().gateway_minting.is_some();
+    mount(route_specs(minting_enabled), state)
+}
+
+/// The replica diagnostics alone, for a process that serves no inference.
+///
+/// An unconverged replica is exactly the one an operator most needs to ask about
+/// — it is refusing inference and its convergence is the reason — so the
+/// diagnostic is mounted beside [`unconverged_router`] rather than being lost
+/// with the inference surface it happens to be declared next to.
+pub fn diagnostic_router(state: AppState) -> Router {
+    let specs = route_specs(state.config().gateway_minting.is_some())
+        .into_iter()
+        .filter(|spec| spec.auth == AuthPosture::Diagnostic)
+        .collect();
+    mount(specs, state)
+}
+
+fn mount(specs: Vec<RouteSpec>, state: AppState) -> Router {
     // The inbound body bound is declared rather than inherited: axum's own
     // default would otherwise be the process's real memory ceiling per request.
     let max_request_bytes = state.0.admission.limits().max_request_bytes;
-    route_specs(minting_enabled)
+    specs
         .into_iter()
         .fold(Router::new(), |router, spec| {
             let route = (spec.router)().layer(DefaultBodyLimit::max(max_request_bytes));
@@ -131,7 +149,8 @@ pub fn router(state: AppState) -> Router {
 /// `200` — the process is healthy and is administrable — while readiness stays
 /// `503` and every inference path answers `reason` in the gateway's own error
 /// envelope. Nothing here holds an [`AppState`]: there is no configuration to
-/// hold, which is the whole point.
+/// hold, which is the whole point. The replica diagnostic does hold one, so it
+/// is mounted alongside by [`diagnostic_router`] rather than from here.
 pub fn unconverged_router(reason: &'static str) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -7022,6 +7041,67 @@ max_ttl = "15m"
         let (status, body) = answer(format!("{}/tenants", crate::admin::ADMIN_PREFIX)).await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
         assert!(body.contains("stateful_mode_required"), "{body}");
+    }
+
+    /// A replica that refuses inference because it cannot compile a revision is
+    /// the one an operator most needs to interrogate, and the runbook sends them
+    /// to this route for exactly that incident. It serves no inference surface,
+    /// so the diagnostic is mounted beside the refusal — without the refusal's
+    /// fallback swallowing it, and while every other path still refuses.
+    #[tokio::test]
+    async fn the_status_diagnostic_answers_on_a_replica_that_refuses_inference() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let app = unconverged_router("no snapshot yet").merge(diagnostic_router(state));
+        let answer = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::get(path)
+                            .header(
+                                axum::http::header::AUTHORIZATION,
+                                format!("Bearer {OPERATOR_KEY}"),
+                            )
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                (status, String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
+
+        let (status, body) = answer("/admin/v1/status").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the inference refusal swallowed the diagnostic: {body}"
+        );
+        assert!(body.contains("\"object\":\"status\""), "{body}");
+
+        let (status, body) = answer("/v1/models").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("inference_unavailable"), "{body}");
+
+        // And it is still the authenticated projection, not an open one.
+        let response = unconverged_router("no snapshot yet")
+            .merge(diagnostic_router(status_state(ReplicaObservability {
+                status: observed_registry(),
+                revision: None,
+            })))
+            .oneshot(
+                Request::get("/admin/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// A status read is a cache read: the handler returns the last observation

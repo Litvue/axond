@@ -86,7 +86,9 @@ curl -sS -H "Authorization: Bearer $AXOND_KEY" \
 ```
 
 This answers throughout a shutdown — it is a diagnostic rather than served work,
-so admission closing does not close it. The caller's authority decides the
+so admission closing does not close it — and on a replica that refuses inference
+because it cannot compile a revision yet, which is the one you are most likely to
+be asking about. The caller's authority decides the
 answer: an operator's scope-less static
 `[[gateway_key]]` in the default namespace sees every component, exact ages, and
 the revision summary, while any other caller sees only request-path components
