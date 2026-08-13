@@ -79,7 +79,13 @@ unsafe impl GlobalAlloc for Capped {
         }
         PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
         // SAFETY: the layout is the caller's, forwarded unchanged.
-        unsafe { System.alloc(layout) }
+        let pointer = unsafe { System.alloc(layout) };
+        if pointer.is_null() {
+            // Nothing was handed out, so nothing is live: only `dealloc`
+            // subtracts, and a refusal leaves no pointer to deallocate.
+            LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+        pointer
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
