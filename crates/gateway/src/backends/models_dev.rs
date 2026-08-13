@@ -977,15 +977,22 @@ fn price(
             // publish one schedule twice; the legacy threshold is kept because
             // it is the lower of the two and therefore the one that already
             // decided the rate everywhere the two overlap.
+            //
+            // Only the *lowest* tier above the legacy threshold can be that
+            // same schedule. A differently-priced tier in between means the two
+            // do not describe one boundary — `[(250k, X), (272k, legacy)]` with
+            // the legacy key is three rates in a row, and lowering 272k to 200k
+            // would drop the legacy rate above 272k in favour of `X`.
             None => match tiers
                 .iter()
                 .enumerate()
-                .filter(|(_, tier)| tier.rates == legacy.rates && tier.threshold > threshold)
+                .filter(|(_, tier)| tier.threshold > threshold)
                 .min_by_key(|(_, tier)| tier.threshold)
-                .map(|(index, _)| index)
             {
-                Some(migrated) => tiers[migrated].threshold = threshold,
-                None => tiers.push(legacy),
+                Some((index, lowest)) if lowest.rates == legacy.rates => {
+                    tiers[index].threshold = threshold;
+                }
+                _ => tiers.push(legacy),
             },
         }
     }
@@ -1715,6 +1722,24 @@ mod tests {
                 (272_000, ObservedRate::from_nanos(20_000_000_000)),
             ],
             "two thresholds charging differently are two tiers"
+        );
+        assert_eq!(
+            tiers(
+                r#"{"input": 5, "output": 30,
+                    "tiers": [{"input": 20, "output": 60,
+                               "tier": {"type": "context", "size": 250000}},
+                              {"input": 10, "output": 45,
+                               "tier": {"type": "context", "size": 272000}}],
+                    "context_over_200k": {"input": 10, "output": 45}}"#
+            ),
+            vec![
+                (200_000, ObservedRate::from_nanos(10_000_000_000)),
+                (250_000, ObservedRate::from_nanos(20_000_000_000)),
+                (272_000, ObservedRate::from_nanos(10_000_000_000)),
+            ],
+            "a differently-priced tier in between means the matching one is a \
+             boundary of its own: lowering it to 200k would charge 20 above \
+             272k, where the payload says 10"
         );
     }
 
