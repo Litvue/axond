@@ -58,14 +58,22 @@ readiness view, the routing rule has a witness other than the driver.
 `forwards_after_withdrawal` is zero by construction — selection reads readiness
 and withdrawal under one lock, so a request chosen from a ready member cannot
 land in it — and is recorded as the invariant it is. What a run actually asserts
-is `dispatches_after_withdrawal`: the dispatch instants the balancer logged,
-recompared after the fact with the withdrawal instant it recorded. That number
-can be non-zero, and it is the one the zero gate is decided on: the dispatch
-instant is taken when the request is actually handed to the replica, not when it
-was selected, so a withdrawal that lands in between is caught rather than
-defined away. A unit test produces exactly that race — it holds a request at
-that seam, withdraws the member, and lets it go — so the gate is known to be
-capable of failing rather than merely asserted to be.
+is recomputed from the events instead: the dispatch instants the balancer
+logged, compared after the fact with the withdrawal instant it recorded, where
+the dispatch instant is taken when the request is actually handed to the
+replica rather than when it was selected. A unit test produces exactly that race
+— it holds a request at that seam, withdraws the member, and lets it go — so the
+gate is known to be capable of failing rather than merely asserted to be.
+
+The zero gate is `dispatches_beyond_drain_grace`, not every dispatch later than
+the withdrawal. The two differ by the window the replica itself honours: within
+`drain_grace_ms` admission is still open, so a hand-over the scheduler happened
+to delay across the withdrawal instant is served exactly as it would be in
+production, and gating on it would turn task scheduling at heavy scale into a
+red run about nothing. Past the grace the replica refuses work, so a dispatch
+there is a balancer that is still routing to a drained member. Both counts and
+the worst observed lag are kept in the artifact, so the margin is visible rather
+than inferred.
 
 **The subjects are real processes at two revisions.** A revision is the (binary,
 config) pair a process was started from. The incoming revision serves an alias
@@ -101,7 +109,11 @@ one.
 `axond migrate status` are run as subprocesses against the incoming revision's
 own config file, in the order the upgrade guide gives, and the rollout refuses
 to start if either fails. Their argv and their operator-visible output are kept
-in the artifact; no DSN or secret value is.
+in the artifact; no DSN or secret value is. That is enforced rather than
+assumed: every value a command was given is replaced by the name it came from
+before the output is retained, and anything URL-shaped is dropped whole, so a
+failure path that echoes its environment cannot turn an uploaded artifact into a
+credential.
 
 **The artifact carries the capacity harness's provenance.** Same SHA-256 helpers,
 same hardware, toolchain, and source blocks, so a rollout result and a capacity

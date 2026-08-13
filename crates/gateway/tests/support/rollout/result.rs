@@ -265,7 +265,18 @@ pub struct DrainRecord {
     /// the balancer logged against the withdrawal instant it recorded. The
     /// witness that can still catch a balancer whose selection stops enforcing
     /// the rule, because it compares events rather than trusting the selection.
+    /// Evidence, not a gate: a dispatch a scheduler delayed across the
+    /// withdrawal instant lands here too, and the replica still serves it.
     pub dispatches_after_withdrawal: u64,
+    /// Of those, the ones later than the replica's own drain grace, when it has
+    /// stopped admitting work. This is the gated one: it cannot be produced by
+    /// task scheduling, only by a balancer still routing to a drained replica.
+    pub dispatches_beyond_drain_grace: u64,
+    /// How late the latest dispatch after the withdrawal was, so the margin
+    /// against the grace window is visible rather than inferred.
+    pub worst_dispatch_lag_ms: Option<u128>,
+    /// The grace window the two above are judged against.
+    pub drain_grace_ms: u64,
     /// The buffered request that was already in flight when the signal landed.
     pub buffered_in_flight: InFlight,
     /// The stream that was open, and could not finish, when the signal landed.

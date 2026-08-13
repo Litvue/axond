@@ -129,6 +129,32 @@ impl Member {
             .count() as u64
     }
 
+    /// The witness the zero-tolerance gate is decided on: dispatches later
+    /// than the withdrawal *by more than the replica's own drain grace*.
+    ///
+    /// The plain count above cannot carry that gate. Selection reads readiness
+    /// and the forward happens afterwards, so any preemption straddling the
+    /// withdrawal instant makes it non-zero — at heavy scale that is a red run
+    /// produced by the harness' scheduler, not by the balancer. The grace
+    /// window is the same one the replica honours: a request handed over within
+    /// it is still served, because admission has not closed yet. Past it, the
+    /// replica is refusing work, so a dispatch there is a real routing defect.
+    pub fn dispatches_beyond(&self, withdrawn_at: Duration, grace: Duration) -> u64 {
+        self.dispatches_after(withdrawn_at + grace)
+    }
+
+    /// How late the latest dispatch to this member was, measured from the
+    /// withdrawal: the evidence behind the gate, kept whether or not it passed.
+    pub fn worst_dispatch_lag(&self, withdrawn_at: Duration) -> Option<Duration> {
+        self.dispatches
+            .lock()
+            .expect("ingress lock")
+            .iter()
+            .filter(|at| **at > withdrawn_at)
+            .map(|at| *at - withdrawn_at)
+            .max()
+    }
+
     /// Stamp a dispatch: the instant the balancer actually handed the request
     /// to this member, which is the event a drain is judged on. Deliberately
     /// *not* the instant it was selected — a balancer whose selection is stale
@@ -511,10 +537,33 @@ async fn proxy(State(state): State<Arc<IngressState>>, request: Request) -> Resp
             .await;
         let retries = refused.len() as u32;
         match sent {
-            // A replica that has begun draining refuses new work. That is the
-            // contract working, not a lost request: the balancer places it on a
-            // member that is still serving.
+            // A replica that has begun draining refuses new work with the
+            // typed `draining` error. That is the contract working, not a lost
+            // request: the balancer places it on a member that is still
+            // serving. An *untyped* `503` is a replica shedding load for some
+            // other reason, which is an answer like any other and is reported
+            // as the error it is rather than retried away.
             Ok(response) if response.status() == StatusCode::SERVICE_UNAVAILABLE => {
+                let headers = response.headers().clone();
+                let body = response.bytes().await.unwrap_or_default();
+                if !is_draining(&body) {
+                    state.forwards.lock().expect("ingress lock").push(Forward {
+                        replica: member.id.clone(),
+                        revision: member.revision.clone(),
+                        status: 503,
+                        at_ms: state.elapsed().as_millis(),
+                        retries,
+                    });
+                    caller.attempts.push(Attempt {
+                        replica: member.id.clone(),
+                        status: Some(503),
+                        refused_while_draining: false,
+                    });
+                    state.record_caller(caller);
+                    return stamped(&member, StatusCode::SERVICE_UNAVAILABLE, &headers)
+                        .body(Body::from(body))
+                        .expect("the relayed refusal builds");
+                }
                 member.refusals.fetch_add(1, Ordering::SeqCst);
                 member.draining_refusals.fetch_add(1, Ordering::SeqCst);
                 caller.attempts.push(Attempt {
@@ -578,12 +627,25 @@ fn forwarded(headers: &HeaderMap) -> HeaderMap {
     out
 }
 
-/// Stream the member's answer back to the caller, stamped with who served it.
-/// Streamed, not buffered: a balancer that collects an SSE body before relaying
-/// it would hide every streaming property the harness is here to measure.
-fn relayed(member: &Member, status: StatusCode, response: reqwest::Response) -> Response {
+/// Whether a `503` is the gateway's typed drain refusal rather than some other
+/// unavailability. Only the typed one may be retried onto another member and
+/// excused in the usage ledger, because only it means "this replica is going
+/// away, the work never started".
+fn is_draining(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value["error"]["type"].as_str().map(str::to_owned))
+        .is_some_and(|kind| kind == "draining")
+}
+
+/// The answer's own headers plus the two that say who served it.
+fn stamped(
+    member: &Member,
+    status: StatusCode,
+    headers: &HeaderMap,
+) -> axum::http::response::Builder {
     let mut builder = Response::builder().status(status);
-    for (name, value) in response.headers() {
+    for (name, value) in headers {
         if matches!(name.as_str(), "content-length" | "transfer-encoding") {
             continue;
         }
@@ -598,6 +660,13 @@ fn relayed(member: &Member, status: StatusCode, response: reqwest::Response) -> 
         }
     }
     builder
+}
+
+/// Stream the member's answer back to the caller, stamped with who served it.
+/// Streamed, not buffered: a balancer that collects an SSE body before relaying
+/// it would hide every streaming property the harness is here to measure.
+fn relayed(member: &Member, status: StatusCode, response: reqwest::Response) -> Response {
+    stamped(member, status, &response.headers().clone())
         .body(Body::from_stream(response.bytes_stream().map(
             |chunk| -> Result<_, std::io::Error> {
                 chunk.map_err(|error| std::io::Error::other(error.to_string()))
@@ -680,6 +749,36 @@ mod withdrawal_rules {
         );
     }
 
+    /// The gate's contract, stated as a test: a dispatch inside the drain grace
+    /// is not a defect — the replica is still admitting, and only the scheduler
+    /// decided which side of the withdrawal instant it landed on — while one
+    /// past the grace is, because by then the replica refuses work.
+    #[test]
+    fn only_dispatches_past_the_drain_grace_count_against_the_gate() {
+        let grace = Duration::from_millis(500);
+        let member = member();
+        member.observe(true, Duration::from_millis(10));
+        member.observe(false, Duration::from_millis(1_000));
+        member.dispatched(Duration::from_millis(1_002));
+        member.dispatched(Duration::from_millis(1_400));
+
+        let withdrawn_at = member.withdrawn_at().expect("the drain is dated");
+        assert_eq!(member.dispatches_after(withdrawn_at), 2);
+        assert_eq!(member.dispatches_beyond(withdrawn_at, grace), 0);
+        assert_eq!(
+            member.worst_dispatch_lag(withdrawn_at),
+            Some(Duration::from_millis(400))
+        );
+
+        member.dispatched(Duration::from_millis(1_600));
+        assert_eq!(
+            member.dispatches_beyond(withdrawn_at, grace),
+            1,
+            "past the grace the replica no longer admits, so this is routing at \
+             a drained member rather than a scheduling artefact"
+        );
+    }
+
     /// The race itself, produced rather than argued about: a request is held
     /// between selection and forwarding, the member it was placed on is
     /// withdrawn while it waits, and it is then let go. Selection was entitled
@@ -757,6 +856,76 @@ mod withdrawal_rules {
         );
     }
 
+    /// The typed refusal is the contract: the replica says it is going away,
+    /// so the balancer moves the request and the ledger knows the refusing
+    /// member may hold a record for work it had begun.
+    #[tokio::test]
+    async fn a_typed_draining_refusal_is_retried_onto_another_member() {
+        let draining =
+            stub_answering(503, r#"{"error":{"type":"draining","message":"draining"}}"#).await;
+        let serving = stub_replica().await;
+        let ingress = Ingress::start(Duration::from_secs(3600), Instant::now()).await;
+        let refuser = ingress.add("previous-0", "previous", &draining);
+        let server = ingress.add("next-0", "next", &serving);
+        refuser.observe(true, ingress.state.elapsed());
+        server.observe(true, ingress.state.elapsed());
+
+        let status = reqwest::get(ingress.url("/v1/models"))
+            .await
+            .expect("the caller is answered")
+            .status();
+
+        assert!(status.is_success(), "the retry found a serving member");
+        assert_eq!(refuser.draining_refusals(), 1);
+        let caller = ingress
+            .state
+            .callers()
+            .pop()
+            .expect("the caller request is recorded");
+        assert_eq!(
+            caller.draining_refusals().collect::<Vec<_>>(),
+            ["previous-0"]
+        );
+        assert_eq!(caller.answered_by().expect("answered").replica, "next-0");
+    }
+
+    /// An untyped `503` is a replica failing, not a replica draining. Retrying
+    /// it would hide the failure behind a healthy-looking run, and counting it
+    /// as a drain refusal would let it excuse a surplus usage record.
+    #[tokio::test]
+    async fn an_untyped_service_unavailable_is_an_ordinary_answer() {
+        let shedding = stub_answering(503, "upstream capacity exhausted").await;
+        let serving = stub_replica().await;
+        let ingress = Ingress::start(Duration::from_secs(3600), Instant::now()).await;
+        let shedder = ingress.add("previous-0", "previous", &shedding);
+        let server = ingress.add("next-0", "next", &serving);
+        shedder.observe(true, ingress.state.elapsed());
+        server.observe(true, ingress.state.elapsed());
+
+        let response = reqwest::get(ingress.url("/v1/models"))
+            .await
+            .expect("the caller is answered");
+
+        assert_eq!(response.status().as_u16(), 503);
+        assert_eq!(
+            response.text().await.expect("the body relays"),
+            "upstream capacity exhausted",
+            "the replica's own answer reaches the caller instead of a retry"
+        );
+        assert_eq!(shedder.draining_refusals(), 0);
+        assert_eq!(shedder.refusals(), 0);
+        let caller = ingress
+            .state
+            .callers()
+            .pop()
+            .expect("the caller request is recorded");
+        assert_eq!(caller.draining_refusals().count(), 0);
+        assert!(
+            caller.answered_by().is_none(),
+            "an unavailable answer owes no usage record"
+        );
+    }
+
     /// A replica that answers everything, standing in for a real one: these
     /// tests are about the balancer's bookkeeping, not the gateway's.
     async fn stub_replica() -> String {
@@ -767,6 +936,23 @@ mod withdrawal_rules {
         let addr = listener.local_addr().expect("the stub has an address");
         tokio::spawn(async move {
             let app = axum::Router::new().fallback(|| async { "ok" });
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// A replica that answers every request with one fixed status and body,
+    /// which is how the two shapes of `503` are told apart.
+    async fn stub_answering(status: u16, body: &'static str) -> String {
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .expect("the stub binds");
+        let addr = listener.local_addr().expect("the stub has an address");
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move || async move {
+                (StatusCode::from_u16(status).expect("a valid status"), body)
+            });
             let _ = axum::serve(listener, app).await;
         });
         format!("http://{addr}")

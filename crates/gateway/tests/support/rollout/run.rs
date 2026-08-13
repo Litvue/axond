@@ -465,6 +465,7 @@ impl Harness {
         );
 
         let thresholds = self.scenario.thresholds;
+        let drain_grace = Duration::from_millis(self.scenario.shutdown.drain_grace_ms);
         let removal_bound = Duration::from_millis(thresholds.max_readiness_removal_ms.max(1) * 4)
             .max(Duration::from_secs(2));
         let slack = Duration::from_millis(thresholds.max_drain_exit_slack_ms);
@@ -546,6 +547,18 @@ impl Harness {
             dispatches_after_withdrawal: member
                 .withdrawn_at()
                 .map_or(0, |at| member.dispatches_after(at)),
+            // Only dispatches past the replica's own grace window are a defect:
+            // inside it the replica is still admitting, so a hand-over the
+            // scheduler delayed across the withdrawal instant is served exactly
+            // as it would be in production.
+            dispatches_beyond_drain_grace: member
+                .withdrawn_at()
+                .map_or(0, |at| member.dispatches_beyond(at, drain_grace)),
+            worst_dispatch_lag_ms: member
+                .withdrawn_at()
+                .and_then(|at| member.worst_dispatch_lag(at))
+                .map(|lag| lag.as_millis()),
+            drain_grace_ms: self.scenario.shutdown.drain_grace_ms,
             buffered_in_flight: InFlight {
                 status: buffered.status,
                 completed_after_signal_ms: buffered.ended_after(signalled).as_millis(),
@@ -855,22 +868,25 @@ fn stateful_config(schema: &str) -> String {
 /// would read.
 fn axond(args: &[&str], env: &[(&str, &str)]) -> CommandRecord {
     let mut command = Command::new(env!("CARGO_BIN_EXE_axond"));
-    command
-        .args(args)
-        .env("GW_INBOUND_KEY", GATEWAY_KEY)
+    let secrets: Vec<(&str, &str)> = [
+        ("GW_INBOUND_KEY", GATEWAY_KEY),
         // The gate resolves every reference the config makes, including the
         // per-boot key a replica is given, so the command's environment is the
         // one a replica would boot with.
-        .env(gateway::BOOT_KEY_ENV, "gate-boot-key")
-        .env("GW_FAKE_OPENAI_KEY", gateway::OPENAI_KEY)
-        .env("GW_FAKE_ANTHROPIC_KEY", gateway::ANTHROPIC_KEY)
-        .env(gateway::OPENAI_SECONDARY_ENV, gateway::OPENAI_KEY_SECONDARY)
-        .env(
+        (gateway::BOOT_KEY_ENV, "gate-boot-key"),
+        ("GW_FAKE_OPENAI_KEY", gateway::OPENAI_KEY),
+        ("GW_FAKE_ANTHROPIC_KEY", gateway::ANTHROPIC_KEY),
+        (gateway::OPENAI_SECONDARY_ENV, gateway::OPENAI_KEY_SECONDARY),
+        (
             gateway::ANTHROPIC_SECONDARY_ENV,
             gateway::ANTHROPIC_KEY_SECONDARY,
-        )
-        .env("RUST_LOG", "warn");
-    for (name, value) in env {
+        ),
+    ]
+    .into_iter()
+    .chain(env.iter().copied())
+    .collect();
+    command.args(args).env("RUST_LOG", "warn");
+    for (name, value) in &secrets {
         command.env(name, value);
     }
     let output = command.output().expect("the axond binary runs");
@@ -880,12 +896,54 @@ fn axond(args: &[&str], env: &[(&str, &str)]) -> CommandRecord {
             .collect(),
         exit_code: output.status.code(),
         succeeded: output.status.success(),
-        output: format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        output: redacted(
+            &format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            &secrets,
         ),
     }
+    // `args` are not part of the environment, so they are recorded verbatim:
+    // the harness never passes a credential on the command line.
+}
+
+/// Command output goes into an uploaded artifact, so it may only carry what an
+/// operator could paste into a ticket. Every value the command was given is
+/// treated as a credential and replaced by the name it came from, and any
+/// database URL is dropped whole — a failure path that echoes its environment
+/// must not turn the artifact into a secret.
+fn redacted(text: &str, secrets: &[(&str, &str)]) -> String {
+    let mut out = text.to_owned();
+    for (name, value) in secrets {
+        // Short values would match unrelated text; nothing this harness passes
+        // as a credential is that short.
+        if value.len() >= 8 {
+            out = out.replace(value, &format!("${{{name}}}"));
+        }
+    }
+    scrub_urls(&out)
+}
+
+/// Replace every `scheme://…` run with a placeholder. Coarse on purpose: a DSN
+/// the harness never learned (one the binary composed, say) is still a DSN.
+fn scrub_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let scheme_start = rest[..at]
+            .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '+' && c != '-' && c != '.')
+            .map_or(0, |index| index + 1);
+        let end = rest[at..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ')'))
+            .map_or(rest.len(), |offset| at + offset);
+        out.push_str(&rest[..scheme_start]);
+        out.push_str("${redacted-url}");
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The two revisions the rollout moves between, with the artifact identity of
@@ -1060,6 +1118,59 @@ fn reconcile(
             }
         })
         .collect()
+}
+
+/// What may reach an uploaded artifact, decided by test rather than by trusting
+/// every future failure path of every operator command not to echo its
+/// environment.
+///
+/// Plain `#[test]`s: this is an integration test crate, where `cfg(test)` is
+/// never set and a `cfg(test)` module would be compiled out.
+mod artifact_redaction {
+    use super::*;
+
+    #[test]
+    fn command_output_carries_no_credential_it_was_given() {
+        let dsn = "postgres://postgres:hunter2@127.0.0.1:55432/postgres";
+        let kek = "0".repeat(64);
+        let secrets = [
+            ("GW_CONTROL_PLANE_DSN", dsn),
+            ("GW_KEK", kek.as_str()),
+            ("GW_BREAKGLASS", "fence-breakglass"),
+        ];
+        let output = redacted(
+            &format!("error: connecting to {dsn} failed\nkek={kek}\nbreakglass=fence-breakglass\n"),
+            &secrets,
+        );
+
+        for secret in [dsn, kek.as_str(), "fence-breakglass", "hunter2"] {
+            assert!(
+                !output.contains(secret),
+                "the artifact still carries `{secret}`:\n{output}"
+            );
+        }
+        assert!(
+            output.contains("${GW_KEK}") && output.contains("${GW_BREAKGLASS}"),
+            "the evidence still names what was redacted:\n{output}"
+        );
+        assert!(output.contains("connecting to"), "the message survives");
+    }
+
+    /// A URL the harness never handed over — one the binary composed itself, or
+    /// one a library logged — is still a credential, so the scrub is by shape
+    /// rather than only by known value.
+    #[test]
+    fn an_unknown_database_url_is_scrubbed_by_shape() {
+        let output = redacted(
+            "checking postgresql://admin:s3cret@db.internal:5432/axond, then done",
+            &[],
+        );
+
+        assert_eq!(
+            output, "checking ${redacted-url}, then done",
+            "the URL is gone whether or not the harness knew it"
+        );
+    }
 }
 
 /// The usage reconciliation, exercised on hand-built ledgers: these are the
@@ -1260,7 +1371,7 @@ fn verdicts(result: &RolloutResult) -> Vec<Verdict> {
                 .map(|drain| {
                     drain
                         .requests_after_withdrawal
-                        .max(drain.dispatches_after_withdrawal)
+                        .max(drain.dispatches_beyond_drain_grace)
                 })
                 .max()
                 .unwrap_or_default() as f64,
