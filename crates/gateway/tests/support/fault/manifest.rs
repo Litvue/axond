@@ -249,6 +249,21 @@ impl Fault {
         matches!(self, Self::RedisRecovery | Self::PostgresRecovery)
     }
 
+    /// Whether the injection leaves an upstream response the gateway has to
+    /// abandon — a stalled header, an unfinished body, an idle stream. Such a
+    /// row's cleanup evidence only says something if the fixture opened one,
+    /// so the harness checks that it did rather than reading a zero as clean.
+    pub fn abandons_upstream(self) -> bool {
+        matches!(
+            self,
+            Self::ResponseHeaderTimeout
+                | Self::BufferedBodyTimeout
+                | Self::StreamIdleBeforeBytes
+                | Self::StreamIdleAfterBytes
+                | Self::StreamTruncation
+        )
+    }
+
     /// Whether the fault is only meaningful for a streamed request.
     pub fn requires_stream(self) -> bool {
         matches!(

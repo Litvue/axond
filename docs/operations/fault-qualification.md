@@ -42,10 +42,10 @@ Each row writes `target/faults/<family>/<row>.json`, carrying:
 | Section | What it is evidence of |
 | --- | --- |
 | `injection` | The fault, how it was injected, the delay or outage window, and when the request began. |
-| `classification` | The status, typed error, phase, whether output was already relayed, and — for a recovery row — what the tier answered while it was down. |
+| `classification` | The status, typed error, phase, how many bytes of *provider* output were relayed before the failure — the gateway's own in-band error event does not count — and, for a recovery row, what the tier answered while it was down. |
 | `deadline` | The bound the row is ended by, its configured value, and the elapsed time against the row's ceiling. |
 | `retries` | Attempts spent, dispatches the provider saw, and the configured `max_attempts`. |
-| `cleanup` | Upstream streams opened and still open at the end, and whether the process exited cleanly on `SIGTERM`. |
+| `cleanup` | Upstream responses opened and still open when the caller was gone, how long the release took, and whether the process exited cleanly on `SIGTERM`. A stalled buffered attempt is counted as well as a stream, so a header- or body-bound row proves the abandoned response was released rather than reporting a zero nothing ever contributed to. |
 | `usage` | Records settled by the measured request, their statuses, the cost, and whether the record carries a request id. |
 | `telemetry` | Exports received by a real OTLP collector, the instruments and spans observed, and any the row named and did not get. |
 | `leakage` | Every surface scanned — caller response, usage records, process output, OTLP payloads — with byte counts and any finding. |
@@ -84,7 +84,11 @@ rows could not attribute what it recorded to the fault it injected.
 A row's `verdicts` are the gate; the rest is context. To compare two artifacts,
 compare their `environment` first — the binary, config, manifest, and fixture
 hashes, plus toolchain and host. Results whose provenance differs are not
-comparable.
+comparable. The config hash is taken over the config with its per-run values
+replaced by placeholders — the gateway and fake-upstream ports, the injector
+ports the transport rows point a provider at, and the run-scoped key prefix a
+state-tier row keeps its keys under — so two runs of the same row on the same
+build agree, and a real change of the row's wiring still does not.
 
 Some expectations are worth knowing before reading one:
 

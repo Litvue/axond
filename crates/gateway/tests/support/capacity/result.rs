@@ -167,9 +167,35 @@ impl Environment {
         manifest_relative: &str,
         manifest_text: &str,
     ) -> Self {
-        let normalized = config
+        Self::collect_normalizing(
+            config,
+            bind,
+            upstream,
+            &[],
+            manifest_relative,
+            manifest_text,
+        )
+    }
+
+    /// As [`Environment::collect`], for a harness whose config carries further
+    /// per-run values — an injector's port, a run-scoped key prefix. Each is
+    /// replaced by its placeholder before hashing, because a config hash that
+    /// changes every run makes two results of the same row incomparable, which
+    /// is the one thing the hash exists to decide.
+    pub fn collect_normalizing(
+        config: &str,
+        bind: &str,
+        upstream: &str,
+        also: &[(String, &str)],
+        manifest_relative: &str,
+        manifest_text: &str,
+    ) -> Self {
+        let mut normalized = config
             .replace(bind, "127.0.0.1:GATEWAY_PORT")
             .replace(upstream, "http://127.0.0.1:UPSTREAM_PORT");
+        for (value, placeholder) in also {
+            normalized = normalized.replace(value.as_str(), placeholder);
+        }
         let binary = PathBuf::from(env!("CARGO_BIN_EXE_axond"));
         Self {
             binary: BinaryMeta {

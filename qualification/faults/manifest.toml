@@ -162,7 +162,7 @@ metrics = ["axond.request.count", "axond.upstream.timeouts"]
 id = "stream-idle-before-bytes"
 family = "transport"
 fault = "stream_idle_before_bytes"
-description = "A stream that goes silent before its first provider event ends on the idle bound as an in-band SSE error: the response head is already committed, so the failure cannot be a status."
+description = "A stream that goes silent before its first provider event ends on the idle bound as an in-band SSE error: the response head is already committed, so the failure cannot be a status, but no provider output was ever relayed."
 streamed = true
 deadline_ms = 5000
 
@@ -172,7 +172,7 @@ error_type = "upstream_stream_error"
 attempts = 1
 upstream_requests = 1
 usage_status = "upstream_error"
-relayed_output = true
+relayed_output = false
 metrics = ["axond.request.count", "axond.upstream.timeouts"]
 
 [[row]]

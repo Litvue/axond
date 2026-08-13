@@ -80,6 +80,9 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 /// Extra delay the latency rows inject into every datastore read.
 const LATENCY_SETTLE: Duration = Duration::from_millis(200);
+/// How long the usage stream must stand still before a request that has already
+/// answered is taken to have settled everything it was going to.
+const USAGE_QUIET_WINDOW: Duration = Duration::from_millis(400);
 
 /// The result of asking the harness to run a row.
 pub enum Outcome {
@@ -181,10 +184,15 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
         .strip_prefix("http://")
         .expect("a loopback base URL")
         .to_owned();
-    let environment = Environment::collect(
+    let environment = Environment::collect_normalizing(
         &gateway.config,
         &bind,
         &upstream.base_url,
+        &[
+            (format!("http://{refused}"), "http://127.0.0.1:REFUSED_PORT"),
+            (tls.base_url(), "https://127.0.0.1:TLS_PORT"),
+            (key_prefix_root(), "axond-fault-PID"),
+        ],
         manifest::MANIFEST_RELATIVE,
         manifest_text,
     );
@@ -199,9 +207,10 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
 
     let mut outage = None;
     let mut during_outage_status = None;
+    let outage_began_at = Instant::now();
     if let Some(backend) = backend.as_ref() {
         let began = unix_ms();
-        let began_at = Instant::now();
+        let began_at = outage_began_at;
         match row.fault {
             Fault::RedisLatency | Fault::PostgresLatency => {
                 backend.proxy.set(Mode::Latency(Duration::from_millis(
@@ -237,7 +246,12 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
 
     // Everything below is attributed to the measured request alone: a backend
     // row has already sent a priming request and possibly an outage probe, and
-    // their records and dispatches are not this row's.
+    // their records and dispatches are not this row's. Settlement is detached
+    // from the response, so the earlier records are waited out rather than
+    // assumed written: one still in flight would be read as this row's.
+    if backend.is_some() {
+        await_quiet_usage(&gateway).await;
+    }
     let records_before = gateway.usage_records().len();
     let upstream_before = upstream.state.requests().len() as u64;
     let run_started_at = SystemTime::now();
@@ -247,16 +261,23 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
     let elapsed = started.elapsed();
 
     // Counted once the measured request is in: a connection is severed by the
-    // proxy's watcher, not by the call that flipped the mode.
+    // proxy's watcher, not by the call that flipped the mode. A row that never
+    // restores the tier is still down here, so its window runs to now.
     if let (Some(outage), Some(backend)) = (outage.as_mut(), backend.as_ref()) {
         outage.connections_carried = backend.proxy.accepted() - carried_before;
         outage.connections_severed = backend.proxy.severed();
+        if outage.restored_at_unix_ms.is_none() {
+            outage.duration_ms = outage_began_at.elapsed().as_millis();
+        }
     }
 
     let records = await_usage_records(&gateway, records_before, row.expect.usage_records).await;
     let upstream_requests = upstream.state.requests().len() as u64 - upstream_before;
     let cleanup_started = Instant::now();
     let cleaned = await_upstream_release(&upstream).await;
+    // Read before the process is stopped: a settle time that also contained the
+    // shutdown could not be used to spot a slow release.
+    let settled_within_ms = cleanup_started.elapsed().as_millis();
 
     gateway.terminate();
     let exit = gateway.await_exit(SHUTDOWN_TIMEOUT).await;
@@ -325,7 +346,7 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
         cleanup: Cleanup {
             upstream_streams_opened: upstream.state.opened_streams(),
             upstream_streams_open_at_end: upstream.state.open_streams(),
-            settled_within_ms: cleanup_started.elapsed().as_millis(),
+            settled_within_ms,
             process_exited_cleanly: exit.is_some_and(|status| status.success()),
         },
         telemetry: Telemetry {
@@ -398,15 +419,14 @@ async fn request(gateway: &Axond, alias: &str, streamed: bool) -> ObservedReques
     // A streamed answer: the relayed bytes are the evidence that output was
     // committed before the fault, which is what forbids a retry.
     let mut body_text = String::new();
-    let mut relayed_output_bytes = 0;
     let mut first_byte_ms = None;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else { break };
         first_byte_ms.get_or_insert_with(|| started.elapsed().as_millis());
-        relayed_output_bytes += chunk.len() as u64;
         body_text.push_str(&String::from_utf8_lossy(&chunk));
     }
+    let relayed_output_bytes = provider_output_bytes(&body_text);
     let error_type = body_text
         .lines()
         .filter_map(|line| line.strip_prefix("data: "))
@@ -420,6 +440,26 @@ async fn request(gateway: &Axond, alias: &str, streamed: bool) -> ObservedReques
         relayed_output_bytes,
         first_byte_ms,
     }
+}
+
+/// The provider's own output in a relayed stream: everything up to the
+/// gateway's in-band error event. Counting that event too would make a stream
+/// that carried no provider output look committed, which is exactly the
+/// distinction the idle-before-bytes and idle-after-bytes rows exist to draw.
+fn provider_output_bytes(body: &str) -> u64 {
+    let mut bytes = 0;
+    for event in body.split_inclusive("\n\n") {
+        let gateway_error = event
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .any(|event| event["error"]["type"].is_string());
+        if gateway_error {
+            break;
+        }
+        bytes += event.len() as u64;
+    }
+    bytes
 }
 
 /// The transport phase a typed message names, when it names one. The messages
@@ -616,7 +656,7 @@ fn wiring_for(
         _ => {
             let service = row.fault.service().expect("a backend row names a service");
             let policy = row.fault.on_unavailable().expect("a backend row has one");
-            let prefix = format!("axond-fault-{}-{}", std::process::id(), row.id);
+            let prefix = format!("{}-{}", key_prefix_root(), row.id);
             let extra = match service {
                 Service::Redis => format!(
                     r#"
@@ -683,6 +723,13 @@ reservation_ttl_seconds = 60
     }
 }
 
+/// The run-scoped prefix a backend row's keys and rows live under, so two
+/// harnesses sharing a datastore cannot read each other's state. It carries the
+/// process id, and is normalised out of the recorded config for that reason.
+fn key_prefix_root() -> String {
+    format!("axond-fault-{}", std::process::id())
+}
+
 fn dsn_for(service: Service) -> Option<String> {
     match std::env::var(service.dsn_env()) {
         Ok(dsn) if !dsn.trim().is_empty() => Some(dsn),
@@ -693,6 +740,25 @@ fn dsn_for(service: Service) -> Option<String> {
                 service.dsn_env()
             );
             None
+        }
+    }
+}
+
+/// Wait until no further usage record appears, so a record already in flight
+/// is not mistaken for the next request's. Settlement is detached from the
+/// response, and a priming or probe request's record can land after it.
+async fn await_quiet_usage(gateway: &Axond) {
+    let deadline = Instant::now() + SETTLE_TIMEOUT;
+    let mut settled = gateway.usage_records().len();
+    let mut quiet_since = Instant::now();
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let now = gateway.usage_records().len();
+        if now != settled {
+            settled = now;
+            quiet_since = Instant::now();
+        } else if quiet_since.elapsed() >= USAGE_QUIET_WINDOW {
+            return;
         }
     }
 }
@@ -928,6 +994,13 @@ fn judge(row: &Row, mut result: FaultResult, cleaned_up: bool) -> FaultResult {
             "upstream_cleanup",
             cleaned_up && result.cleanup.upstream_streams_open_at_end <= 0,
             format!("{} open", result.cleanup.upstream_streams_open_at_end),
+        ),
+        // A row that abandons an upstream response must have opened one, or its
+        // clean count is clean only because nothing was ever at risk.
+        Verdict::holds(
+            "upstream_abandoned_response_tracked",
+            !row.fault.abandons_upstream() || result.cleanup.upstream_streams_opened > 0,
+            format!("{} opened", result.cleanup.upstream_streams_opened),
         ),
         Verdict::holds(
             "clean_shutdown",
