@@ -43,11 +43,18 @@ impl Migration {
 }
 
 /// Every migration this build ships, in application order.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "control_plane_0001_initial",
-    sql: include_str!("../../../sql/control_plane_0001_initial.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "control_plane_0001_initial",
+        sql: include_str!("../../../sql/control_plane_0001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "control_plane_0002_tenancy_access",
+        sql: include_str!("../../../sql/control_plane_0002_tenancy_access.sql"),
+    },
+];
 
 /// The schema version this build requires.
 pub fn required_version() -> i32 {
@@ -567,29 +574,28 @@ mod tests {
     /// maximum is right, so a version-count check would call the database current.
     #[test]
     fn a_hole_in_the_applied_prefix_is_incomplete_rather_than_current_or_behind() {
+        // A version past the newest this build ships is a future version before
+        // it is a hole: the ledger is ahead, and this build cannot judge what it
+        // has never seen.
+        let beyond = required_version() + 1;
         let status = classify(&[foreign(
-            2,
-            "control_plane_0002_later",
+            beyond,
+            "control_plane_9999_later",
             &Checksum::of(b"later").to_string(),
         )]);
         assert_eq!(
             status,
             SchemaStatus::Ahead {
-                applied: 2,
+                applied: beyond,
                 required: required_version()
             },
-            "this build ships one migration, so v2 is a future version before it is a hole"
         );
 
-        // With v2 shipped, the same ledger is a hole: v1 is missing.
-        let versions = [2];
-        let missing: Vec<i32> = (1..=2)
-            .filter(|version| !versions.contains(version))
-            .collect();
-        let status = SchemaStatus::Incomplete {
-            applied: 2,
-            missing,
-        };
+        // Within the shipped range, the same shape of ledger is a hole: the
+        // newest is right, and an earlier version never ran.
+        let applied = required_version();
+        let missing: Vec<i32> = (1..applied).collect();
+        let status = SchemaStatus::Incomplete { applied, missing };
         assert!(!status.is_migratable());
         assert!(!status.is_current());
         assert!(status.to_string().contains("missing v1"), "{status}");

@@ -43,8 +43,9 @@ use super::schema::{self, MINIMUM_SERVER_VERSION_NUM, SchemaStatus};
 use super::{ControlPlaneError, ControlPlaneStore};
 use crate::backends::{Capabilities, Capability};
 use crate::desired_state::{
-    AuditEvent, IntegrityError, LoadedRevision, Mutation, ResourceRef, ResourceVersion,
-    ResourceVersionNumber, RevisionCandidate, RevisionId, RevisionManifest, SerializerVersion,
+    AccessDenial, Action, AuditEvent, Credential, DenialReason, Directory, IntegrityError,
+    LoadedRevision, Mutation, ResourceRef, ResourceVersion, ResourceVersionNumber,
+    RevisionCandidate, RevisionId, RevisionManifest, SerializerVersion, Surface, Tenancy, TenantId,
     Uuid7Generator,
 };
 
@@ -731,7 +732,8 @@ impl ControlPlaneStore for PostgresControlPlane {
                     .query(
                         "SELECT audit_event_id, mutation_id, actor_kind, actor_issuer, \
                          actor_subject, actor_component, event_kind, target_kind, target_id, \
-                         target_version, summary, recorded_at \
+                         target_version, summary, recorded_at, actor_tenant_id, \
+                         actor_principal_id \
                          FROM axond_cp_audit_event WHERE revision_id = $1 \
                          ORDER BY recorded_at DESC, audit_event_id DESC",
                         &[&id.to_string()],
@@ -741,6 +743,83 @@ impl ControlPlaneStore for PostgresControlPlane {
                 rows.iter()
                     .map(|row| {
                         audit_event(row).map_err(|error| ControlPlaneError::corrupt(id, error))
+                    })
+                    .collect()
+            })
+        })
+        .await
+    }
+
+    async fn record_denial(&self, denial: &AccessDenial) -> Result<(), ControlPlaneError> {
+        let denial = denial.clone();
+        self.run(move |client| {
+            Box::pin(async move {
+                let actor = rows::actor_columns(&denial.actor);
+                let scope = rows::scope_columns(&denial.scope);
+                client
+                    .execute(
+                        "INSERT INTO axond_cp_access_denial \
+                         (denial_id, actor_kind, actor_issuer, actor_subject, actor_component, \
+                         actor_tenant_id, actor_principal_id, surface, action, scope_kind, \
+                         tenant_id, project_id, reason, recorded_at) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                         ON CONFLICT (denial_id) DO NOTHING",
+                        &[
+                            &denial.id.to_string(),
+                            &actor.kind,
+                            &actor.issuer,
+                            &actor.subject,
+                            &actor.component,
+                            &actor.tenant,
+                            &actor.principal,
+                            &denial.surface.as_str(),
+                            &denial.action.as_str(),
+                            &scope.kind,
+                            &scope.tenant,
+                            &scope.project,
+                            &denial.reason.as_str(),
+                            &denial.recorded_at,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| unavailable("record denied action", &error))?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    async fn denials(
+        &self,
+        tenant: Option<TenantId>,
+        limit: usize,
+    ) -> Result<Vec<AccessDenial>, ControlPlaneError> {
+        let tenant = tenant.map(|tenant| tenant.to_string());
+        // Clamped rather than rejected: this is a page size, and an administrator
+        // asking for everything gets the first page rather than an error.
+        let limit = i64::try_from(limit.clamp(1, 1_000)).unwrap_or(1_000);
+        self.run(move |client| {
+            Box::pin(async move {
+                // `IS NOT DISTINCT FROM` so `None` selects the deployment-scoped
+                // denials rather than every row: a refusal that named no tenant is
+                // a platform-scoped read, not a wildcard.
+                let rows = client
+                    .query(
+                        "SELECT denial_id, actor_kind, actor_issuer, actor_subject, \
+                         actor_component, actor_tenant_id, actor_principal_id, surface, action, \
+                         scope_kind, tenant_id, project_id, reason, recorded_at \
+                         FROM axond_cp_access_denial \
+                         WHERE tenant_id IS NOT DISTINCT FROM $1 \
+                         ORDER BY recorded_at DESC, denial_id DESC LIMIT $2",
+                        &[&tenant, &limit],
+                    )
+                    .await
+                    .map_err(|error| unavailable("read denied actions", &error))?;
+                rows.iter()
+                    .map(|row| {
+                        access_denial(row).map_err(|error| {
+                            corrupt_storage(format!("a denied action is unreadable: {error}"))
+                        })
                     })
                     .collect()
             })
@@ -861,6 +940,13 @@ async fn publish(
             .map_err(|error| unavailable("write blob reference", &error))?;
     }
 
+    // Ownership and identity first, because the resource versions below carry
+    // foreign keys into them: a version scoped to a tenant this revision does not
+    // declare, or naming another tenant's project, is unwritable rather than
+    // merely unvalidated. Same transaction, so "projected" and "published" cannot
+    // come apart.
+    project_tenancy(transaction, id, candidate).await?;
+
     for resource in candidate.state.resources() {
         insert_resource_version(transaction, resource).await?;
     }
@@ -966,6 +1052,153 @@ async fn publish(
         .map_err(|error| unavailable("advance the head", &error))?;
 
     Ok(Published::Manifest(manifest))
+}
+
+/// Project the revision's tenancy and identity directory into the tables the
+/// database's own constraints are written against.
+///
+/// Why project at all, when the revision already holds it: canonical bytes are
+/// opaque to SQL, so a foreign key cannot point into them and a row-level
+/// security policy cannot read them. Ownership and identity are the two things an
+/// operator has to be able to state about the database rather than about the
+/// service in front of it, so they exist twice — as the published truth, and as
+/// rows that constrain it.
+///
+/// Tenants and projects are upserted and never deleted. Retained rows are what
+/// history references: a resource version published last year names its project,
+/// and a deletion here would either break that foreign key or orphan the audit
+/// trail that proves what was billed. A tenant that goes away goes to
+/// `lifecycle = 'deleted'`, which is a transition, not an erasure — physical
+/// erasure is separate compliance work with its own retention argument.
+///
+/// Principals *are* deleted when a revision stops declaring them, because a
+/// revoked administrator whose grants linger is the whole failure this table
+/// exists to make visible. Their history is unaffected: attribution is copied
+/// onto the mutation and the audit event, never joined from here.
+async fn project_tenancy(
+    transaction: &Transaction<'_>,
+    revision: RevisionId,
+    candidate: &RevisionCandidate,
+) -> Result<(), ControlPlaneError> {
+    let tenancy =
+        Tenancy::of(&candidate.state).map_err(|error| ControlPlaneError::Invalid(error.into()))?;
+    let directory = Directory::of(&candidate.state, &tenancy)
+        .map_err(|error| ControlPlaneError::Invalid(error.into()))?;
+    let revision = revision.to_string();
+
+    for tenant in tenancy.tenants() {
+        transaction
+            .execute(
+                "INSERT INTO axond_cp_tenant (tenant_id, slug, lifecycle, revision_id) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (tenant_id) DO UPDATE SET slug = EXCLUDED.slug, \
+                 lifecycle = EXCLUDED.lifecycle, revision_id = EXCLUDED.revision_id, \
+                 updated_at = now()",
+                &[
+                    &tenant.body.tenant().to_string(),
+                    &tenant.slug.as_str(),
+                    &tenant.body.lifecycle().as_str(),
+                    &revision,
+                ],
+            )
+            .await
+            .map_err(|error| unavailable("project tenant", &error))?;
+    }
+
+    for project in tenancy.projects() {
+        transaction
+            .execute(
+                "INSERT INTO axond_cp_project (project_id, tenant_id, slug, revision_id) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (project_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id, \
+                 slug = EXCLUDED.slug, revision_id = EXCLUDED.revision_id, updated_at = now()",
+                &[
+                    &project.body.project().to_string(),
+                    &project.body.tenant().to_string(),
+                    &project.slug.as_str(),
+                    &revision,
+                ],
+            )
+            .await
+            .map_err(|error| unavailable("project project", &error))?;
+    }
+
+    let declared: Vec<String> = directory
+        .principals()
+        .map(|principal| principal.body.principal().to_string())
+        .collect();
+    transaction
+        .execute(
+            "DELETE FROM axond_cp_principal WHERE NOT (principal_id = ANY($1))",
+            &[&declared],
+        )
+        .await
+        .map_err(|error| unavailable("revoke undeclared principals", &error))?;
+
+    for principal in directory.principals() {
+        let scope = rows::scope_columns(&principal.scope);
+        let (issuer, subject, digest) = match principal.body.credential() {
+            Credential::Oidc { issuer, subject } => {
+                (Some(issuer.clone()), Some(subject.clone()), None)
+            }
+            // The digest, never the key: a minted key is displayed once, at
+            // creation, and a database read cannot recover it.
+            Credential::MintedKey { digest } => {
+                (None, None, digest.map(|digest| digest.to_string()))
+            }
+        };
+        transaction
+            .execute(
+                "INSERT INTO axond_cp_principal \
+                 (principal_id, resource_id, identity_kind, scope_kind, tenant_id, project_id, \
+                 slug, display_name, issuer, subject, key_digest, revision_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                 ON CONFLICT (principal_id) DO UPDATE SET \
+                 resource_id = EXCLUDED.resource_id, identity_kind = EXCLUDED.identity_kind, \
+                 scope_kind = EXCLUDED.scope_kind, tenant_id = EXCLUDED.tenant_id, \
+                 project_id = EXCLUDED.project_id, slug = EXCLUDED.slug, \
+                 display_name = EXCLUDED.display_name, issuer = EXCLUDED.issuer, \
+                 subject = EXCLUDED.subject, key_digest = EXCLUDED.key_digest, \
+                 revision_id = EXCLUDED.revision_id, updated_at = now()",
+                &[
+                    &principal.body.principal().to_string(),
+                    &principal.reference.id.to_string(),
+                    &principal.body.kind().as_str(),
+                    &scope.kind,
+                    &scope.tenant,
+                    &scope.project,
+                    &principal.slug.as_str(),
+                    &principal.body.display_name().as_str(),
+                    &issuer,
+                    &subject,
+                    &digest,
+                    &revision,
+                ],
+            )
+            .await
+            .map_err(|error| unavailable("project principal", &error))?;
+
+        // Grants are replaced, not merged: a revision that dropped a role has
+        // revoked it, and an `INSERT ... ON CONFLICT DO NOTHING` would leave the
+        // dropped row behind as an authority nobody granted.
+        transaction
+            .execute(
+                "DELETE FROM axond_cp_principal_role WHERE principal_id = $1",
+                &[&principal.body.principal().to_string()],
+            )
+            .await
+            .map_err(|error| unavailable("revoke roles", &error))?;
+        for role in principal.body.roles() {
+            transaction
+                .execute(
+                    "INSERT INTO axond_cp_principal_role (principal_id, role) VALUES ($1, $2)",
+                    &[&principal.body.principal().to_string(), &role.as_str()],
+                )
+                .await
+                .map_err(|error| unavailable("grant role", &error))?;
+        }
+    }
+    Ok(())
 }
 
 /// Refuse a republication that would redefine a version an earlier revision pins.
@@ -1080,8 +1313,9 @@ async fn insert_mutation(
         .execute(
             "INSERT INTO axond_cp_mutation \
              (mutation_id, actor_kind, actor_issuer, actor_subject, actor_component, \
-             mutation_kind, scope_kind, tenant_id, project_id, idempotency_key, submitted_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+             mutation_kind, scope_kind, tenant_id, project_id, idempotency_key, submitted_at, \
+             actor_tenant_id, actor_principal_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
             &[
                 &mutation.id.to_string(),
                 &actor.kind,
@@ -1094,6 +1328,8 @@ async fn insert_mutation(
                 &scope.project,
                 &mutation.idempotency_key.as_str(),
                 &mutation.submitted_at,
+                &actor.tenant,
+                &actor.principal,
             ],
         )
         .await
@@ -1126,8 +1362,8 @@ async fn insert_audit_event(
             "INSERT INTO axond_cp_audit_event \
              (audit_event_id, revision_id, mutation_id, actor_kind, actor_issuer, actor_subject, \
              actor_component, event_kind, target_kind, target_id, target_version, summary, \
-             recorded_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+             recorded_at, actor_tenant_id, actor_principal_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
             &[
                 &audit.id.to_string(),
                 &revision.to_string(),
@@ -1142,6 +1378,8 @@ async fn insert_audit_event(
                 &target.map(|target| version_text(target.version)),
                 &audit.summary,
                 &audit.recorded_at,
+                &actor.tenant,
+                &actor.principal,
             ],
         )
         .await
@@ -1177,6 +1415,8 @@ fn audit_event(row: &Row) -> Result<AuditEvent, IntegrityError> {
     let target_version: Option<i64> = row.get(9);
     let summary: String = row.get(10);
     let recorded_at: SystemTime = row.get(11);
+    let actor_tenant: Option<String> = row.get(12);
+    let actor_principal: Option<String> = row.get(13);
     let target = match (target_kind, target_id, target_version) {
         (None, None, None) => None,
         (Some(kind), Some(id), Some(version)) => Some(ResourceRef::new(
@@ -1198,10 +1438,49 @@ fn audit_event(row: &Row) -> Result<AuditEvent, IntegrityError> {
             issuer.as_deref(),
             subject.as_deref(),
             component.as_deref(),
+            actor_tenant.as_deref(),
+            actor_principal.as_deref(),
         )?,
         kind: rows::mutation_kind(&event_kind)?,
         target,
         summary,
+        recorded_at,
+    })
+}
+
+fn access_denial(row: &Row) -> Result<AccessDenial, IntegrityError> {
+    let id: String = row.get(0);
+    let actor_kind: String = row.get(1);
+    let issuer: Option<String> = row.get(2);
+    let subject: Option<String> = row.get(3);
+    let component: Option<String> = row.get(4);
+    let actor_tenant: Option<String> = row.get(5);
+    let actor_principal: Option<String> = row.get(6);
+    let surface: String = row.get(7);
+    let action: String = row.get(8);
+    let scope_kind: String = row.get(9);
+    let tenant: Option<String> = row.get(10);
+    let project: Option<String> = row.get(11);
+    let reason: String = row.get(12);
+    let recorded_at: SystemTime = row.get(13);
+    Ok(AccessDenial {
+        id: rows::audit_event_id(&id)?,
+        actor: rows::actor(
+            &actor_kind,
+            issuer.as_deref(),
+            subject.as_deref(),
+            component.as_deref(),
+            actor_tenant.as_deref(),
+            actor_principal.as_deref(),
+        )?,
+        surface: Surface::parse(&surface).ok_or_else(|| {
+            rows::unreadable(format!("`{surface}` is not an administrative surface"))
+        })?,
+        action: Action::parse(&action)
+            .ok_or_else(|| rows::unreadable(format!("`{action}` is not an action")))?,
+        scope: rows::scope(&scope_kind, tenant.as_deref(), project.as_deref())?,
+        reason: DenialReason::parse(&reason)
+            .ok_or_else(|| rows::unreadable(format!("`{reason}` is not a denial reason")))?,
         recorded_at,
     })
 }
@@ -1215,12 +1494,14 @@ mod tests {
     use crate::backends::{BackendFailure, FailureCategory};
     use crate::desired_state::fixtures::{
         DESIRED_STATE_RESOURCES, candidate, project_alias, project_id, reference, state,
-        state_a_pre_tenancy_build_published, state_with_renamed_alias, state_with_second_tenant,
-        state_with_two_blobs, tenant, tenant_id,
+        state_a_pre_tenancy_build_published, state_with_directory, state_with_renamed_alias,
+        state_with_revoked_workload, state_with_second_tenant, state_with_two_blobs, tenant,
+        tenant_body, tenant_id, workload_key,
     };
     use crate::desired_state::{
-        Actor, AuditEventId, DesiredState, ExpectedRevision, MutationId, ResourceKind, Uuid7,
-        ValidationError, oracle::InMemoryControlPlane,
+        Actor, AuditEventId, Checksum, DesiredState, ExpectedRevision, MutationId, PrincipalId,
+        ResourceKind, ResourceScope, ResourceVersionNumber, Slug, TenantLifecycle, Uuid7,
+        ValidationError, WorkloadKey, oracle::InMemoryControlPlane,
     };
 
     /// Each test owns a schema, so the journal's fixed object names do not make
@@ -1611,7 +1892,7 @@ mod tests {
         for resource in state().resources() {
             let resource = if resource.reference.kind == ResourceKind::Tenant {
                 let mut renamed = resource.clone();
-                renamed.slug = crate::desired_state::Slug::parse("renamed").expect("slug");
+                renamed.slug = Slug::parse("renamed").expect("slug");
                 renamed
             } else {
                 resource.clone()
@@ -2749,6 +3030,502 @@ mod tests {
                 .expect("hydrate")
                 .state(),
             &state()
+        );
+    }
+
+    /// Test-only reads and writes against the projection, which the store
+    /// deliberately has no read API for: nothing in the gateway authorizes
+    /// against these rows — the directory of the current revision does that — so
+    /// they exist to be constrained, not to be queried.
+    impl PostgresControlPlane {
+        async fn column(&self, sql: &str) -> Vec<String> {
+            let sql = sql.to_owned();
+            self.run(move |client| {
+                let sql = sql.clone();
+                Box::pin(async move {
+                    client
+                        .query(&sql, &[])
+                        .await
+                        .map(|rows| {
+                            rows.iter()
+                                .map(|row| {
+                                    row.try_get::<_, Option<String>>(0)
+                                        .expect("a text column")
+                                        .unwrap_or_else(|| "<null>".to_owned())
+                                })
+                                .collect()
+                        })
+                        .map_err(|error| unavailable("read a projected column", &error))
+                })
+            })
+            .await
+            .expect("the read itself must succeed")
+        }
+
+        /// A statement whose *failure* is the assertion: what a service-layer bug
+        /// would try to write, and what the database refuses on its own.
+        async fn attempt(&self, statement: &str) -> Result<(), ControlPlaneError> {
+            let sql = statement.to_owned();
+            self.run(move |client| {
+                let sql = sql.clone();
+                Box::pin(async move {
+                    client
+                        .batch_execute(&sql)
+                        .await
+                        .map_err(|error| unavailable("attempt a write", &error))
+                })
+            })
+            .await
+        }
+    }
+
+    /// A digest of the shape the projection writes, for the constraint tests that
+    /// need a *valid* digest so the constraint under test is the one that fires.
+    const DIGEST: &str =
+        "'sha256:0000000000000000000000000000000000000000000000000000000000000000'";
+
+    fn denial(seed: u64, scope: ResourceScope, reason: DenialReason) -> AccessDenial {
+        AccessDenial {
+            id: AuditEventId::new(uuid(seed)),
+            actor: Actor::Human {
+                issuer: "https://idp.example".to_owned(),
+                subject: "dev".to_owned(),
+            },
+            surface: Surface::Credential,
+            action: Action::Rotate,
+            scope,
+            reason,
+            recorded_at: journal_now() + Duration::from_secs(seed),
+        }
+    }
+
+    /// The projection is the database's own copy of who owns what and who may do
+    /// what, written in the transaction that published it.
+    #[tokio::test]
+    async fn publishing_a_revision_projects_the_owners_and_the_directory_it_declares() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let first = store
+            .publish_revision(candidate(
+                ExpectedRevision::Empty,
+                "directory",
+                state_with_directory(),
+            ))
+            .await
+            .expect("a revision declaring a directory publishes");
+
+        assert_eq!(
+            store
+                .column("SELECT slug FROM axond_cp_tenant ORDER BY slug")
+                .await,
+            vec!["acme"]
+        );
+        assert_eq!(
+            store.column("SELECT lifecycle FROM axond_cp_tenant").await,
+            vec!["active"]
+        );
+        assert_eq!(
+            store
+                .column("SELECT slug FROM axond_cp_project ORDER BY slug")
+                .await,
+            vec!["core"]
+        );
+        assert_eq!(
+            store
+                .column("SELECT slug FROM axond_cp_principal ORDER BY slug")
+                .await,
+            vec!["admin", "deployer", "dev", "root"]
+        );
+        assert_eq!(
+            store
+                .column("SELECT role FROM axond_cp_principal_role ORDER BY role")
+                .await,
+            vec!["developer", "operator", "platform-admin", "tenant-admin"]
+        );
+        // The revision that projected each row is recorded, so an operator can ask
+        // which publication a grant came from.
+        assert_eq!(
+            store
+                .column("SELECT DISTINCT revision_id FROM axond_cp_principal")
+                .await,
+            vec![first.id.to_string()]
+        );
+
+        // A minted key is stored as a digest and nothing else: the material never
+        // reaches the database, and a human never has a digest column at all.
+        let digests = store
+            .column("SELECT key_digest FROM axond_cp_principal ORDER BY slug")
+            .await;
+        assert_eq!(
+            digests.iter().filter(|digest| *digest != "<null>").count(),
+            1
+        );
+        for digest in &digests {
+            assert!(
+                !digest.contains(WorkloadKey::PREFIX),
+                "a key reached the database: {digest}"
+            );
+        }
+        assert!(
+            digests
+                .iter()
+                .any(|digest| *digest == Checksum::of(workload_key(0xd0).as_bytes()).to_string()),
+            "{digests:?}"
+        );
+
+        // A revision that stops declaring a principal revokes it: the row and its
+        // grants are gone, because a grant nobody published is authority nobody
+        // granted. The tenant it belonged to stays, because history points at it.
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(first.id),
+                "revoked",
+                state_with_revoked_workload(),
+                71,
+            ))
+            .await
+            .expect("a revision that drops a principal publishes");
+        assert_eq!(
+            store
+                .column("SELECT slug FROM axond_cp_principal ORDER BY slug")
+                .await,
+            vec!["admin", "dev", "root"]
+        );
+        assert_eq!(
+            store
+                .column("SELECT count(*)::text FROM axond_cp_principal_role")
+                .await,
+            vec!["3"]
+        );
+        assert_eq!(
+            store.column("SELECT slug FROM axond_cp_tenant").await,
+            vec!["acme"]
+        );
+    }
+
+    /// Disabling and then deleting a tenant is a transition on the projected row,
+    /// and neither transition takes the tenant's history with it.
+    #[tokio::test]
+    async fn a_tenant_lifecycle_transition_is_a_row_update_and_never_a_delete() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let mut previous = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "active", state()))
+            .await
+            .expect("an active tenant publishes")
+            .id;
+        for (index, lifecycle) in [TenantLifecycle::Disabled, TenantLifecycle::Deleted]
+            .into_iter()
+            .enumerate()
+        {
+            let mut state = state();
+            let mut version = ResourceVersionNumber::FIRST.next();
+            for _ in 0..index {
+                version = version.next();
+            }
+            state
+                .supersede(
+                    tenant_body(1, "Acme")
+                        .in_lifecycle(lifecycle)
+                        .version_at(Slug::parse("acme").expect("a slug"), version),
+                )
+                .expect("a later version of the same tenant");
+            previous = store
+                .publish_revision(candidate_with_mutation(
+                    ExpectedRevision::Exactly(previous),
+                    lifecycle.as_str(),
+                    state,
+                    80 + u64::try_from(index).expect("two transitions") * 2,
+                ))
+                .await
+                .expect("a lifecycle transition publishes")
+                .id;
+            assert_eq!(
+                store.column("SELECT lifecycle FROM axond_cp_tenant").await,
+                vec![lifecycle.as_str()]
+            );
+            assert_eq!(
+                store.column("SELECT slug FROM axond_cp_project").await,
+                vec!["core"],
+                "a tenant's projects are not erased by its lifecycle"
+            );
+        }
+        assert!(
+            store.count("axond_cp_audit_event").await >= 3,
+            "the trail of a deleted tenant is retained"
+        );
+    }
+
+    /// The half of #144 that is a database property rather than a service one: a
+    /// row naming another tenant's project, or a tenant nothing declared, is
+    /// unwritable even by a caller that skipped every validation above.
+    #[tokio::test]
+    async fn a_projected_row_cannot_name_an_absent_tenant_or_another_tenants_project() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        store
+            .publish_revision(candidate(
+                ExpectedRevision::Empty,
+                "directory",
+                state_with_directory(),
+            ))
+            .await
+            .expect("a revision declaring a directory publishes");
+        let tenant = tenant_id(1);
+        let project = project_id(2);
+        let stranger = tenant_id(11);
+
+        // A project of a tenant that does not exist.
+        let refusal = store
+            .attempt(&format!(
+                "INSERT INTO axond_cp_project (project_id, tenant_id, slug, revision_id) \
+                 VALUES ('{}', '{stranger}', 'smuggled', 'rev_x')",
+                project_id(12)
+            ))
+            .await
+            .expect_err("a project needs an existing tenant");
+        assert!(refusal.to_string().contains("foreign key"), "{refusal}");
+
+        // A principal scoped into a project owned by another tenant: the
+        // composite key is what makes this a contradiction rather than a pair of
+        // separately valid ids.
+        let refusal = store
+            .attempt(&format!(
+                "INSERT INTO axond_cp_principal (principal_id, resource_id, identity_kind, \
+                 scope_kind, tenant_id, project_id, slug, display_name, key_digest, revision_id) \
+                 VALUES ('{}', 'res_x', 'workload', 'project', '{stranger}', '{project}', \
+                 'confused', 'Confused', {DIGEST}, 'rev_x')",
+                PrincipalId::new(uuid(44))
+            ))
+            .await
+            .expect_err("a project belongs to exactly one tenant");
+        assert!(refusal.to_string().contains("foreign key"), "{refusal}");
+
+        // A human with a key digest, and a workload with an issuer: the two
+        // credential shapes are not mixable, whatever the service layer believes.
+        for (kind, columns, values) in [
+            (
+                "human",
+                "issuer, subject, key_digest",
+                format!("'https://idp.example', 'smuggled', {DIGEST}"),
+            ),
+            (
+                "workload",
+                "issuer, subject",
+                "'https://idp.example', 's'".to_owned(),
+            ),
+        ] {
+            let refusal = store
+                .attempt(&format!(
+                    "INSERT INTO axond_cp_principal (principal_id, resource_id, identity_kind, \
+                     scope_kind, tenant_id, slug, display_name, {columns}, revision_id) \
+                     VALUES ('{}', 'res_x', '{kind}', 'tenant', '{tenant}', 'mixed', 'Mixed', \
+                     {values}, 'rev_x')",
+                    PrincipalId::new(uuid(45))
+                ))
+                .await
+                .expect_err("one identity kind, one credential shape");
+            assert!(refusal.to_string().contains("check"), "{refusal}");
+        }
+
+        // And a role outside the vocabulary this build reads.
+        let refusal = store
+            .attempt(&format!(
+                "INSERT INTO axond_cp_principal_role (principal_id, role) VALUES ('{}', 'root')",
+                PrincipalId::new(uuid(33))
+            ))
+            .await
+            .expect_err("the role vocabulary is closed");
+        assert!(refusal.to_string().contains("check"), "{refusal}");
+    }
+
+    /// Denied actions are the half of the trail successful revisions cannot hold,
+    /// and they are read per tenant so one tenant's refusals are not another's
+    /// reconnaissance.
+    #[tokio::test]
+    async fn denied_actions_are_recorded_and_read_back_per_tenant_newest_first() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let tenant = tenant_id(1);
+        let other = tenant_id(11);
+        let mine = [
+            denial(90, ResourceScope::Tenant(tenant), DenialReason::OutOfScope),
+            denial(
+                91,
+                ResourceScope::Project {
+                    tenant,
+                    project: project_id(2),
+                },
+                DenialReason::RoleLacksAction,
+            ),
+        ];
+        let theirs = denial(92, ResourceScope::Tenant(other), DenialReason::CrossTenant);
+        let deployment = denial(
+            93,
+            ResourceScope::Deployment,
+            DenialReason::TenantNotAdministrable,
+        );
+        for denial in mine.iter().chain([&theirs, &deployment]) {
+            store.record_denial(denial).await.expect("record a refusal");
+        }
+        // Recording is idempotent on the denial's own id, so a retry after a
+        // timeout does not double-count an attempt.
+        store
+            .record_denial(&mine[0])
+            .await
+            .expect("a retry is not a second attempt");
+
+        let read = store.denials(Some(tenant), 10).await.expect("read");
+        assert_eq!(read, vec![mine[1].clone(), mine[0].clone()]);
+        assert_eq!(
+            store.denials(Some(other), 10).await.expect("read"),
+            vec![theirs.clone()],
+            "one tenant's refusals are not another's"
+        );
+        // `None` is the deployment-scoped page, not a wildcard.
+        assert_eq!(
+            store.denials(None, 10).await.expect("read"),
+            vec![deployment]
+        );
+        // A limit is a page size.
+        assert_eq!(
+            store.denials(Some(tenant), 1).await.expect("read"),
+            vec![mine[1].clone()]
+        );
+        assert!(
+            store.denials(Some(tenant), 0).await.expect("read").len() == 1,
+            "a zero limit is clamped to a page rather than refused"
+        );
+        // A workload's refusal is attributed to its principal, not to a person.
+        let mut workload = denial(94, ResourceScope::Tenant(tenant), DenialReason::CrossTenant);
+        workload.actor = Actor::Workload {
+            tenant,
+            principal: PrincipalId::new(uuid(33)),
+        };
+        store.record_denial(&workload).await.expect("record");
+        assert_eq!(
+            store
+                .denials(Some(tenant), 1)
+                .await
+                .expect("read")
+                .first()
+                .map(|denial| denial.actor.clone()),
+            Some(workload.actor.clone())
+        );
+    }
+
+    /// Row-level security, against a role that cannot bypass it: the wall behind
+    /// the service layer, tested the only way it can be — as a session that is
+    /// pinned to one tenant and still asks for everything.
+    #[tokio::test]
+    async fn a_session_pinned_to_one_tenant_reads_no_other_tenants_rows() {
+        let Some((store, dsn, schema)) = journal().await else {
+            return;
+        };
+        store
+            .publish_revision(candidate(
+                ExpectedRevision::Empty,
+                "two tenants",
+                state_with_second_tenant(),
+            ))
+            .await
+            .expect("two tenants publish");
+        store
+            .record_denial(&denial(
+                95,
+                ResourceScope::Tenant(tenant_id(11)),
+                DenialReason::CrossTenant,
+            ))
+            .await
+            .expect("record a refusal against the other tenant");
+
+        // A login role with no bypass, granted only reads: the shape of a
+        // read-only replica consumer or a reporting job.
+        let role = format!("{schema}_reader");
+        store
+            .attempt(&format!(
+                "CREATE ROLE {role} LOGIN PASSWORD 'reader'; \
+                 GRANT USAGE ON SCHEMA {schema} TO {role}; \
+                 GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {role}"
+            ))
+            .await
+            .expect("create the reading role");
+
+        let mut config: Config = dsn.parse().expect("test dsn");
+        config.user(&role).password("reader");
+        config.connect_timeout(Duration::from_secs(5));
+        let (client, connection) = config
+            .connect(crate::usage::tls_connector())
+            .await
+            .expect("connect as the reading role");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!(
+                "SET search_path TO {schema}; SET axond.tenant_id = '{}'",
+                tenant_id(1)
+            ))
+            .await
+            .expect("pin the session to one tenant");
+
+        for (table, expected) in [
+            ("axond_cp_tenant", vec![tenant_id(1).to_string()]),
+            ("axond_cp_project", vec![tenant_id(1).to_string()]),
+        ] {
+            let rows: Vec<String> = client
+                .query(&format!("SELECT tenant_id FROM {table}"), &[])
+                .await
+                .expect("read as the pinned session")
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            assert_eq!(rows, expected, "{table} leaked another tenant's rows");
+        }
+        let denials: i64 = client
+            .query_one("SELECT count(*) FROM axond_cp_access_denial", &[])
+            .await
+            .expect("read")
+            .get(0);
+        assert_eq!(denials, 0, "another tenant's refusals are not visible");
+
+        // Deployment-wide rows stay readable — the pinned session is a tenant's
+        // view of shared state, not a broken one — and its own tenant's resources
+        // are all it sees of tenant-scoped state.
+        let scoped: Vec<String> = client
+            .query(
+                "SELECT DISTINCT tenant_id FROM axond_cp_resource_version \
+                 WHERE tenant_id IS NOT NULL",
+                &[],
+            )
+            .await
+            .expect("read")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(scoped, vec![tenant_id(1).to_string()]);
+        let deployment: i64 = client
+            .query_one(
+                "SELECT count(*) FROM axond_cp_resource_version WHERE tenant_id IS NULL",
+                &[],
+            )
+            .await
+            .expect("read")
+            .get(0);
+        assert!(deployment > 0, "shared state is not hidden from a tenant");
+
+        // The unpinned publisher still sees both tenants, or the migration would
+        // have hidden rows from the writer.
+        assert_eq!(
+            store
+                .column("SELECT tenant_id FROM axond_cp_tenant ORDER BY tenant_id")
+                .await
+                .len(),
+            2
         );
     }
 
