@@ -3,7 +3,8 @@
 What one Axond replica looks like after hours of mixed traffic, rather than
 after two minutes of it. Capacity qualification answers *how much, right now*
 ([capacity qualification](./capacity.md), [ADR 0033](../adr/0033-capacity-qualification-harness.md));
-this page answers *and what is left behind afterwards* — the two failures that
+this page answers *and what is left behind afterwards*
+([ADR 0040](../adr/0040-endurance-qualification-harness.md)) — the two failures that
 only a long run makes visible:
 
 - a resource that never comes back: memory, descriptors, sockets, or an upstream
@@ -47,25 +48,46 @@ runs, and that the drift gates need a run long enough to have a slope.
 ## Run it
 
 ```bash
-# The smoke tier. Part of the normal suite; also runs in CI.
-cargo test --locked --all-features --test endurance -- --nocapture
-
-# The soak tier: twelve hours. `--test-threads=1` keeps the two tiers from
-# offering load at the same time.
-AXOND_ENDURANCE=1 cargo test --locked --all-features --test endurance -- \
+# The smoke tier, the sequential two-tier regression, and the deterministic
+# checks. Part of the normal suite; also runs in CI.
+cargo test --locked --all-features --test endurance -- \
   --nocapture --test-threads=1
+
+# The soak tier: twelve hours, by name. The rest of the binary already ran in
+# the suite, and offering its load again here would only contend with the soak.
+just endurance
 
 # A shorter dispatched run — forty minutes here. The override applies to the
 # soak tier alone, so the smoke tier in the same binary keeps its committed
 # fifteen seconds. Segments shrink to match, so the run still produces the
 # segments the trend gates are evaluated over.
-AXOND_ENDURANCE=1 AXOND_ENDURANCE_DURATION_MS=2400000 \
-  cargo test --locked --all-features --test endurance -- \
-    --nocapture --test-threads=1
+just endurance 2400000
 ```
 
 The `Endurance` workflow runs the soak tier monthly and on dispatch (with an
-optional duration override) and uploads both the result and its time series.
+optional duration override) and uploads both the result and its time series. It
+invokes the soak test by name for the same reason `just endurance` does.
+
+## What the harness holds while it runs
+
+A twelve-hour run at the committed concurrency settles millions of requests, so
+nothing the driver accumulates may scale with the run:
+
+- finished attempts and parsed usage records are folded into running aggregates
+  every 250 ms — `run.drain_interval_ms`, counted by `run.drains` — regardless
+  of segment length, so a fifteen-minute segment retains no more than the
+  smoke tier's 2.5-second one;
+- request identities are fingerprinted and appended to sixty-four sharded files
+  under `target/endurance/<tier>/<profile>-fingerprints/` rather than held in a
+  whole-run set. Equal identities share a shard, so the duplicate count is
+  exact while only one shard is ever in memory;
+  `reconciliation.fingerprints` records the shard count, the peak shard, and
+  that exactness;
+- raw gateway output and fake-upstream request bodies are ring-buffered, with
+  exact counters kept separately, so bounded history never becomes a miscount.
+
+The fingerprint shards are working files, not evidence: they are rewritten by
+the next run of the same tier and are not uploaded with the artifacts.
 
 ## What a run leaves behind
 
@@ -78,8 +100,10 @@ The result carries the measurements (throughput, latency, TTFT, stream lifetime,
 RSS, CPU, descriptors, sockets, occupancy, per-segment medians, usage-record
 reconciliation) and the identity of everything that produced them: the SHA-256
 of the binary, of the normalised config, of the manifest and every fixture; the
-seed; the requested duration and whether it came from the manifest or from the
-environment; the fake upstream's address; the toolchain, git commit and dirty
+seed; the duration the run was actually offered (`run.requested_duration_ms`,
+`profile.duration_ms`) next to the one the manifest commits
+(`profile.manifest_duration_ms`) and which of the two it used
+(`run.duration_source`); the fake upstream's address; the toolchain, git commit and dirty
 flag, and the host's CPU, kernel, core count, and memory. **Numbers from
 artifacts whose provenance differs are not comparable.**
 
@@ -169,6 +193,11 @@ Fields worth knowing:
   artifact keeps: the retained sample is decimated across the whole run rather
   than truncated to its first minutes, so the percentiles still describe all of
   it.
+- `profile.duration_ms` is the duration the run was offered and
+  `profile.manifest_duration_ms` the tier's committed one; they differ whenever
+  `run.duration_source` is `environment`. A dispatched duration is only ever
+  read at the soak tier — the smoke tier shares the binary and keeps its
+  committed seconds.
 - `environment.config.normalized_toml` is the config the process actually
   booted, with the ephemeral ports and the per-run key directory replaced. It
   names environment variables and files, and carries no credential.

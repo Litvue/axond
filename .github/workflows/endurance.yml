@@ -54,13 +54,16 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-targets: false
-      # `--test-threads=1`: the smoke tier lives in the same binary, and two
-      # tiers offering load at once would measure each other's contention rather
-      # than the replica.
+      # The soak test by name. The smoke tier, the sequential regression, and
+      # the deterministic checks share this binary and all run in `CI`; offering
+      # their load again here would only give the dispatched hours a second
+      # workload to contend with. `--test-threads=1` keeps that true of anything
+      # the filter still admits.
       - name: Soak the mixed workload
         run: |
           cargo test --locked --all-features --test endurance -- \
-            --nocapture --test-threads=1
+            the_endurance_soak_tier_qualifies_and_publishes_its_evidence \
+            --exact --nocapture --test-threads=1
         env:
           AXOND_ENDURANCE: '1'
           # `inputs` is unset on the monthly schedule, which therefore takes

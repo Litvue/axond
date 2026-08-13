@@ -263,6 +263,180 @@ fn the_idle_settle_segment_is_kept_out_of_the_trend_and_the_segment_count() {
     );
 }
 
+/// What the driver holds has to be bounded by the drain tick, not by the
+/// segment. A fifteen-minute segment that folded only on its boundary would
+/// keep every finished attempt and every parsed usage record of fifteen
+/// minutes of traffic in memory — the accumulation this harness exists to
+/// detect, in the harness, growing with a manifest field rather than with a
+/// leak.
+#[test]
+fn the_drain_interval_is_bounded_independently_of_the_segment_length() {
+    let (manifest, _) = endurance::manifest::load();
+    let committed: Vec<u64> = manifest
+        .profiles
+        .iter()
+        .flat_map(|profile| [profile.smoke.segment_ms, profile.soak.segment_ms])
+        .collect();
+    // A segment length from one millisecond to a day, plus the committed ones.
+    for segment_ms in [1, 10, 250, 2_500, 60_000, 900_000, 86_400_000]
+        .into_iter()
+        .chain(committed)
+    {
+        let interval = endurance::drain_interval(segment_ms);
+        assert!(
+            interval.as_millis() as u64 <= 250,
+            "a {segment_ms} ms segment folds only every {interval:?}"
+        );
+        assert!(
+            interval.as_millis() as u64 <= segment_ms.max(1) && !interval.is_zero(),
+            "a {segment_ms} ms segment folds every {interval:?}"
+        );
+    }
+    // The fifteen-minute soak segment and the 2.5-second smoke segment fold at
+    // the same rate: what the driver retains does not scale with the manifest.
+    assert_eq!(
+        endurance::drain_interval(900_000),
+        endurance::drain_interval(2_500),
+        "the soak retains a whole segment more than the smoke does"
+    );
+}
+
+/// Duplicate detection is only worth the method that looked for it, and the
+/// method has to survive a run that settles millions of records. The ledger
+/// spills every identity and counts it a shard at a time: exact, because equal
+/// identities always share a shard, and bounded, because the driver only ever
+/// holds one shard's worth.
+#[test]
+fn the_fingerprint_ledger_counts_duplicates_exactly_without_holding_the_run() {
+    let dir = std::env::temp_dir().join(format!("axond-endurance-ledger-{}", std::process::id()));
+    let mut ledger = endurance::ledger::Ledger::create(&dir);
+    // Sixty thousand identities, of which every hundredth arrives twice and
+    // one arrives three times: a loss-free run with known duplication.
+    let identities = 60_000_u64;
+    let mut expected_duplicates = 0;
+    for id in 0..identities {
+        ledger.record(id);
+        if id.is_multiple_of(100) {
+            ledger.record(id);
+            expected_duplicates += 1;
+        }
+    }
+    ledger.record(7);
+    expected_duplicates += 1;
+
+    let tally = ledger.tally();
+    assert_eq!(
+        (tally.distinct, tally.duplicates),
+        (identities, expected_duplicates),
+        "the sharded count is not the exact one: {tally:?}"
+    );
+    assert_eq!(tally.recorded, identities + expected_duplicates);
+    // The bound the whole-run set did not have: no shard is the run.
+    assert!(
+        tally.peak_shard_fingerprints < tally.recorded / 8,
+        "one shard held {} of {} identities",
+        tally.peak_shard_fingerprints,
+        tally.recorded
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Both tiers in one process, one after the other, with a soak duration
+/// dispatched over them — which is how the endurance workflow invokes this
+/// binary. The smoke tier has to keep its committed seconds while the soak
+/// takes the dispatched duration, and each tier has to publish an artifact
+/// that says which run it was. Run sequentially and asserted here rather than
+/// left to the harness's test order, which guarantees nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_two_tiers_run_in_sequence_and_each_records_the_duration_it_was_offered() {
+    let (manifest, text) = endurance::manifest::load();
+    let profile = manifest
+        .profiles
+        .first()
+        .expect("the manifest commits a profile");
+    // Short enough to stay in the ordinary test path, long enough that the
+    // soak tier's segments still number the eight it is gated on.
+    let dispatched = "20000";
+
+    let smoke = endurance::run_with(
+        profile,
+        Tier::Smoke,
+        &text,
+        endurance::Dispatch {
+            duration_ms: Some(dispatched),
+            stem: &format!("{}.sequential", profile.id),
+        },
+    )
+    .await;
+    let soak = endurance::run_with(
+        profile,
+        Tier::Soak,
+        &text,
+        endurance::Dispatch {
+            duration_ms: Some(dispatched),
+            stem: &format!("{}.sequential", profile.id),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        (
+            smoke.run.duration_source,
+            smoke.profile.duration_ms,
+            smoke.profile.manifest_duration_ms
+        ),
+        (
+            "manifest",
+            profile.smoke.duration_ms,
+            profile.smoke.duration_ms
+        ),
+        "the smoke tier took the soak's dispatched duration"
+    );
+    assert_eq!(
+        (
+            soak.run.duration_source,
+            soak.profile.duration_ms,
+            soak.profile.manifest_duration_ms
+        ),
+        ("environment", 20_000, profile.soak.duration_ms),
+        "the soak tier did not record the duration it was offered"
+    );
+
+    for result in [&smoke, &soak] {
+        let path = result.write_as(&format!("{}.sequential", result.profile.id));
+        assert!(path.exists(), "{} published no artifact", result.profile.id);
+        assert_planned_workload(profile, result);
+        assert!(
+            result.failures().is_empty(),
+            "{} [{}] failed: {:?}",
+            result.profile.id,
+            result.profile.tier,
+            result.failures()
+        );
+        // Folded on the tick rather than on the boundary, at both tiers: the
+        // soak's fifteen-minute segments shrink with the dispatched duration,
+        // but the drains are the same quarter-second either way.
+        assert_eq!(result.run.drain_interval_ms, 250);
+        assert!(
+            result.run.drains > result.segments.len() as u64 * 4,
+            "{} [{}]: {} drains over {} segments reads as folding on the boundary",
+            result.profile.id,
+            result.profile.tier,
+            result.run.drains,
+            result.segments.len()
+        );
+        assert!(
+            result.reconciliation.fingerprints.exact
+                && result.reconciliation.fingerprints.peak_shard_fingerprints
+                    <= result.reconciliation.fingerprints.recorded,
+            "{} [{}]: duplicate detection did not say how it looked: {:?}",
+            result.profile.id,
+            result.profile.tier,
+            result.reconciliation.fingerprints
+        );
+    }
+}
+
 async fn qualify(tier: Tier) {
     let (manifest, text) = endurance::manifest::load();
     let mut failures = Vec::new();
