@@ -930,10 +930,11 @@ async fn convergence_is_projected_from_replica_state_without_reading_the_backend
 
 /// A state whose bodies contain unmistakably secret-looking values.
 ///
-/// Deliberately not a provider credential: since #243 a credential body cannot
-/// carry material at all, so it would prove nothing here. Redaction has to hold
-/// for *any* body, including one whose schema this slice knows nothing about,
-/// because the projections never read a body — they carry its checksum.
+/// Deliberately not a provider credential (since #243 a credential body cannot
+/// carry material at all) and not a policy (#253 types those too), so the body
+/// belongs to a kind whose schema this slice knows nothing about. Redaction has
+/// to hold for *any* body, because the projections never read one — they carry
+/// its checksum.
 fn state_with_secret_looking_bodies() -> DesiredState {
     let tenant = fixtures::tenant_id(1);
     let mut state = DesiredState::new();
@@ -941,7 +942,7 @@ fn state_with_secret_looking_bodies() -> DesiredState {
         .insert(fixtures::tenant(1, "acme"))
         .and_then(|state| {
             state.insert(ResourceVersion::new(
-                fixtures::reference(ResourceKind::Policy, 3),
+                fixtures::reference(ResourceKind::Price, 3),
                 ResourceScope::Tenant(tenant),
                 Slug::parse("primary").expect("a slug"),
                 ResourceBody::Inline(CanonicalValue::map([(
@@ -978,7 +979,7 @@ async fn no_secret_looking_value_reaches_a_diff_a_state_read_or_a_response() {
             .insert(fixtures::tenant(1, "acme"))
             .and_then(|state| {
                 state.insert(ResourceVersion::new(
-                    fixtures::reference(ResourceKind::Policy, 3)
+                    fixtures::reference(ResourceKind::Price, 3)
                         .at(crate::desired_state::ResourceVersionNumber::FIRST.next()),
                     ResourceScope::Tenant(tenant),
                     Slug::parse("primary").expect("a slug"),
@@ -1011,7 +1012,7 @@ async fn no_secret_looking_value_reaches_a_diff_a_state_read_or_a_response() {
         .diff
         .resources
         .iter()
-        .find(|delta| delta.kind == "policy")
+        .find(|delta| delta.kind == "price")
         .expect("the body-bearing resource changed");
     let before = delta.previous_body.as_ref().expect("a previous body");
     let after = delta.body.as_ref().expect("a new body");

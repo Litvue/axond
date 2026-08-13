@@ -386,6 +386,9 @@ fn validation_rule(error: &ValidationError) -> (&'static str, Option<ResourceRef
         // #243's credential records validate by their own rules; the resource is
         // named by the inner error's message, and the material never is.
         ValidationError::Credential(_) => ("provider_credential", None),
+        // #253's policy records validate by their own rules, and name the
+        // resource they are about without quoting its body.
+        ValidationError::Policy(policy) => ("policy", Some(policy.reference())),
         ValidationError::AuditMutationMismatch { .. } => ("audit_mutation_mismatch", None),
         ValidationError::Canonical(_) => ("not_canonical", None),
     }
