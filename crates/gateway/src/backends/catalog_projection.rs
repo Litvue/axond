@@ -53,8 +53,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::catalog::{
-    CatalogContent, CatalogContentId, ModelFacts, ModelId, ObservedPrice, ProviderId,
-    ProviderOffering,
+    CatalogContent, CatalogContentId, ModelFacts, ModelId, ObservedPrice, ProviderEndpoint,
+    ProviderId, ProviderOffering,
 };
 use crate::desired_state::{Canonical, CanonicalError, CanonicalValue, Checksum};
 
@@ -224,8 +224,17 @@ impl<'a> CallableOffering<'a> {
 
     /// The offering's content, with the id it is published under left out — the
     /// comparison that tells a renamed callable offering from an unrelated one.
-    fn content(&self) -> (&ModelFacts, Option<&ObservedPrice>) {
-        (&self.offering.facts, self.offering.price.as_ref())
+    ///
+    /// Everything a caller is answered by is compared: what the provider states,
+    /// what it charges, and where it is reached. [`ProviderOffering::overrides`]
+    /// and [`ProviderOffering::pointer`] are not, being provenance for those
+    /// facts within one `(provider, model)` group rather than facts of their own.
+    fn content(&self) -> (&ModelFacts, Option<&ObservedPrice>, &ProviderEndpoint) {
+        (
+            &self.offering.facts,
+            self.offering.price.as_ref(),
+            &self.offering.endpoint,
+        )
     }
 }
 
@@ -657,7 +666,7 @@ impl ProjectionDiff {
 /// that reaches a different model, or that a different provider publishes, is a
 /// different offering by construction, never a renaming of this one. Within a
 /// group, the only pairing is by the offering's content — same facts, same
-/// price, different id — because that is the evidence that the *same* offering
+/// price, same endpoint, different id — because that is the evidence that the *same* offering
 /// is now published under a new id, which is what a rename asserts and what a
 /// caller acts on by rewriting requests. Two ids of one model whose content
 /// differs are a removal and an addition however convenient a pairing would be:
@@ -741,6 +750,8 @@ mod tests {
         include_str!("fixtures/models_dev/catalog.cross-provider-renamed.json");
     const CROSS_PROVIDER_SUBSTITUTED: &str =
         include_str!("fixtures/models_dev/catalog.cross-provider-substituted.json");
+    const CROSS_PROVIDER_RELOCATED: &str =
+        include_str!("fixtures/models_dev/catalog.cross-provider-relocated.json");
     const UNAUTHORED: &str = include_str!("fixtures/models_dev/catalog.aliases-unauthored.json");
     const AMBIGUOUS: &str = include_str!("fixtures/models_dev/drift.model-key-ambiguous.json");
 
@@ -982,6 +993,28 @@ mod tests {
         );
         assert!(diff.breaks_requests());
         assert!(!diff.resolves_elsewhere());
+    }
+
+    /// Nor is it a rename when the offering states everything else the same but
+    /// is reached somewhere else: the endpoint is part of what a caller is
+    /// answered by, so a moved offering is not the same offering under a new id.
+    #[test]
+    fn an_id_replaced_by_one_at_another_endpoint_is_not_a_rename() {
+        let before = content(CROSS_PROVIDER);
+        let after = content(CROSS_PROVIDER_RELOCATED);
+        let previous = ModelProjection::project(&before).expect("a projection");
+        let current = ModelProjection::project(&after).expect("a projection");
+
+        assert_eq!(
+            current.diff(&previous).counts(),
+            ProjectionDiffCounts {
+                added: 1,
+                removed: 2,
+                renamed: 0,
+                refiled: 0,
+            },
+            "the price and the facts match, and the endpoint does not"
+        );
     }
 
     /// Adding an alias is an addition, and nothing else: the ids that already
