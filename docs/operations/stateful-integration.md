@@ -50,11 +50,11 @@ wave 0  (landed)   revision journal · convergence loop · LKG cache · prefligh
                    #253 axond.policy.v1 documents          #250 derived availability
                    #254 /admin/v1 protocol boundary        #275 SecretStore (#145)
                    #207 catalogue import                   #143 admin API/CLI served
+                   #251 approved price books
                         │
-wave 1  (in flight) #252 tenancy/principals/RBAC/audit      #251 approved price books
-                    #255 model enablement + project aliases #244 empty-ledger adoption
-                    #276 runtime policy activation          #249 usage outbox
-                    #247 provider-local catalogue aliases
+wave 1  (in flight) #252 tenancy/principals/RBAC/audit      #244 empty-ledger adoption
+                    #255 model enablement + project aliases #249 usage outbox
+                    #276 runtime policy activation          #247 catalogue aliases
                         │
 wave 2  (integration) IG-01 … IG-05: boot → connect → hydrate → compile → publish → serve
                         │
@@ -85,15 +85,15 @@ here without a scenario, or a scenario without a row, fails the suite.
 
 | Gate | #160 release gate | Integration wiring | Depends on | Evidence | Status |
 | --- | --- | --- | --- | --- | --- |
-| IG-01 | Explicit operating modes | `serve` boots stateless with no datastore, and a stateful bootstrap either reaches its control plane or fails loudly — never serves an empty snapshot | #252, #255, #251 | `stateless_boot_serves_with_no_control_plane`, `stateful_boot_refuses_to_serve_an_empty_snapshot` | blocked |
+| IG-01 | Explicit operating modes | `serve` boots stateless with no datastore, and a stateful bootstrap either reaches its control plane or fails loudly — never serves an empty snapshot | #252, #255 | `stateless_boot_serves_with_no_control_plane`, `stateful_boot_refuses_to_serve_an_empty_snapshot` | blocked |
 | IG-02 | Postgres-first control plane | Operator preflight, forward-only migration, and the connect a replica performs before it serves | #244 | `preflight_describes_a_stateless_install`, `migrate_prepares_a_control_plane_before_replicas_start` | wired |
-| IG-03 | Configuration changes take effect atomically, without a restart | Hydrate the head revision, compile it into a whole snapshot, publish it atomically, keep serving the previous one when compilation or the database fails | IG-01, #252, #255, #251, #276 | `hydrate_compile_publish_is_one_atomic_step` | blocked |
+| IG-03 | Configuration changes take effect atomically, without a restart | Hydrate the head revision, compile it into a whole snapshot, publish it atomically, keep serving the previous one when compilation or the database fails | IG-01, #252, #255, #276 | `hydrate_compile_publish_is_one_atomic_step` | blocked |
 | IG-04 | Provider secrets rotate without redeployment | Resolve every credential a candidate snapshot needs through the SecretStore during compilation, never on the request path | IG-03 | `secrets_resolve_during_compilation_only` | blocked |
 | IG-05 | Every mutation validated, revisioned, authorized, audited | The authenticated `/admin/v1` path from request to published revision, including breakglass | IG-01, #252 | `an_admin_mutation_publishes_an_audited_revision` | blocked |
 | IG-06 | No control-plane reads on ordinary inference | Routing, catalogue, authentication, and pricing read only the published snapshot | IG-03 | `inference_touches_no_control_plane_connection` | blocked |
 | IG-07 | Control-plane loss leaves last-known-good serving | Bounded backoff, staleness reporting, and cold boot from the signed last-known-good cache | IG-03 | `control_plane_loss_keeps_the_last_known_good_snapshot_serving` | blocked |
 | IG-08 | Bounded, observable runtime | Readiness reflects convergence rather than process liveness; `/status` reports desired, loaded, active, and lag | IG-03, #238 | `readiness_and_status_report_convergence` | blocked |
-| IG-09 | Every request records the effective price version | The compiled snapshot carries the approved price-book identity into each usage record | #251, #249 | `every_usage_record_names_the_price_version` | blocked |
+| IG-09 | Every request records the effective price version | The compiled snapshot carries the approved price-book identity into each usage record | IG-03, #249 | `every_usage_record_names_the_price_version` | blocked |
 | IG-10 | Tenant catalogue views isolated and explained | The tenant-facing catalogue is projected from the snapshot and explains effective availability | #255, #247 | `a_tenant_catalogue_is_isolated_and_explains_itself` | blocked |
 | IG-11 | Published capacity and failure-recovery evidence | Stateful profiles in the qualification harness: convergence under load, control-plane outage, rolling upgrade | IG-01 … IG-08, #156 | `stateful_qualification_profiles_are_published` | blocked |
 
@@ -110,12 +110,11 @@ availability contracts (#250), the `/admin/v1` boundary and its served runtime
 SecretStore (#275), on top of the wave-0 journal, convergence loop, and
 last-known-good cache. What a stateful boot still cannot resolve is
 *who* a request belongs to and *what* it may reach: tenancy, principals, and RBAC
-(#252), model enablement and project aliases (#255), and the approved price book
-whose identity a compiled snapshot carries (#251). A boot wired before those land
-would hydrate a revision it cannot fully compile.
+(#252) and model enablement and project aliases (#255). A boot wired before those
+land would hydrate a revision it cannot fully compile.
 
-So the next integration pull request is IG-01, opened when #252, #255, and #251
-are on main — not against their branches, and not duplicating the compilation a
+So the next integration pull request is IG-01, opened when #252 and #255 are on
+main — not against their branches, and not duplicating the compilation a
 contract slice owns. It replaces
 `stateful_boot_refuses_to_serve_an_empty_snapshot` with a scenario that boots a
 replica against a migrated control plane and asserts it serves the head revision,
