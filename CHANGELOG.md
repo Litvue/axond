@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.19](https://github.com/Litvue/axond/compare/v0.3.18...v0.3.19) (2026-08-13)
+
+
+### Documentation
+
+* **release:** drop the amd64 quickstart fallback now that the pinned tag is an index ([#246](https://github.com/Litvue/axond/issues/246)) ([63774bf](https://github.com/Litvue/axond/commit/63774bfab6b0a21495efb2e4767b5e0740e39b22))
+
+
+### Tests
+
+* **compat:** add a TypeScript provider-SDK compatibility lane ([#229](https://github.com/Litvue/axond/issues/229)) ([e7a13a7](https://github.com/Litvue/axond/commit/e7a13a7f971b6ebc5db1f2fe430f7f722e2360ea))
+* **gateway:** prove boot identity before trusting a readiness probe ([#245](https://github.com/Litvue/axond/issues/245)) ([afb8674](https://github.com/Litvue/axond/commit/afb8674c49c93b46df0096ca7fdde8279a53a6dc))
+
 ## [0.3.18](https://github.com/Litvue/axond/compare/v0.3.17...v0.3.18) (2026-08-12)
 
 
