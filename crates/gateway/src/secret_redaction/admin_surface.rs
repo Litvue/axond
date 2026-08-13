@@ -351,8 +351,8 @@ async fn no_administrative_response_discloses_the_material_a_credential_names() 
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
     assert!(
-        refusal.contains("not an absolute http(s) origin"),
-        "an endpoint refusal should identify the expected form: {refusal}"
+        refusal.contains("\"rule\":\"provider_connection\""),
+        "an endpoint refusal should expose the stable provider rule: {refusal}"
     );
     sweep.assert_absent("a mispasted provider endpoint refusal", &refusal);
 
