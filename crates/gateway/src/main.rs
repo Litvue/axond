@@ -53,6 +53,12 @@ mod mint;
 // `serve`.
 mod ops;
 mod principals;
+// The recovery qualification driver (#219). Tests only: it holds a replica's
+// reconciler, its cache, and a real Postgres journal at once, and takes the
+// database away from underneath them, which is not reachable from outside the
+// binary while stateful boot is not wired to `serve`.
+#[cfg(test)]
+mod qualification;
 mod rate_limit;
 mod redis_support;
 mod reload;

@@ -2,16 +2,21 @@
 //!
 //! Scenarios are data for the same reason capacity profiles are (ADR 0033): the
 //! run has to be reproducible from the repository. What is different here is
-//! that most of the scenarios cannot run yet — stateful serving is assembled by
-//! slices that have not landed — so the manifest also carries the dependency
-//! that blocks each one, and this module is what keeps that map honest rather
-//! than aspirational.
+//! that a scenario becomes executable in halves — the control-plane half runs
+//! against a real Postgres today, the serving half waits on a projection a
+//! replica can serve — so a scenario is a set of [`Stage`]s, each with its own
+//! status, its own evidence, and its own blockers. This module is what keeps
+//! that map honest rather than aspirational.
 //!
 //! The types below are the contract. A scenario the driver has no
 //! [`Capability`] for cannot be written, an evidence field outside [`Evidence`]
-//! cannot be retained, and a scenario that claims to be `executable` has to be
-//! one the driver actually implements.
+//! cannot be retained, and a scenario is executable exactly when every stage of
+//! it is. Which *stages* the driver runs is asserted where the driver lives, in
+//! the gateway's own `qualification::recovery` tests: that check needs the
+//! registry and the manifest in one place, and the registry is not reachable
+//! from an integration test.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use figment::Figment;
@@ -27,13 +32,12 @@ pub const MANIFEST_RELATIVE: &str = "qualification/recovery/manifest.toml";
 pub const CONTRACT_RELATIVE: &str = "docs/operations/recovery-qualification.md";
 
 /// The manifest schema this harness understands.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 
-/// The slices axond #219 waits on. A scenario may only be blocked on one of
-/// these, and between them the scenarios must account for all of them: an issue
-/// that no scenario names is a dependency nobody is waiting for, and a
-/// dependency nobody is waiting for is a sign the scenario that needed it was
-/// dropped.
+/// The slices axond #219 waits on. A stage may only be blocked on one of
+/// these, and between them the stages must account for all of them: an issue
+/// that no stage names is a dependency nobody is waiting for, and a dependency
+/// nobody is waiting for is a sign the stage that needed it was dropped.
 pub const BLOCKING_ISSUES: [u32; 10] = [144, 145, 146, 147, 148, 149, 150, 155, 158, 159];
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -44,25 +48,59 @@ pub struct Manifest {
     pub scenarios: Vec<Scenario>,
 }
 
-/// One recovery scenario: what happens, what is kept, and what makes it fail.
+/// One recovery scenario: what happens, what makes it fail, and the stages it
+/// is assembled from.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scenario {
     pub id: String,
     pub capability: Capability,
-    pub status: Status,
     pub description: String,
-    pub evidence: Vec<Evidence>,
     pub gate: Gate,
+    #[serde(rename = "stage")]
+    pub stages: Vec<Stage>,
+}
+
+impl Scenario {
+    /// Executable exactly when every stage is. Derived rather than declared:
+    /// a scenario-level status could be optimistic about a stage that is not.
+    pub fn status(&self) -> Status {
+        if self
+            .stages
+            .iter()
+            .all(|stage| stage.status == Status::Executable)
+        {
+            Status::Executable
+        } else {
+            Status::Blocked
+        }
+    }
+
+    /// Every evidence class the scenario's stages retain between them.
+    pub fn evidence(&self) -> BTreeSet<Evidence> {
+        self.stages
+            .iter()
+            .flat_map(|stage| stage.evidence.iter().copied())
+            .collect()
+    }
+}
+
+/// One half of a scenario: a piece of it that is either driven today or waiting
+/// on a named slice.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Stage {
+    pub id: String,
+    pub status: Status,
+    /// What the stage observes, in prose, for the reader who is deciding
+    /// whether the evidence answers their question.
+    pub covers: String,
+    pub evidence: Vec<Evidence>,
     #[serde(default)]
     pub blocked_on: Vec<Dependency>,
 }
 
-/// Whether the driver runs this scenario today.
-///
-/// Kept in the manifest rather than inferred, so the state of the harness is
-/// reviewable in one file — and cross-checked against
-/// [`Capability::is_implemented`], so it cannot be optimistic.
+/// Whether the driver runs this stage today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
@@ -97,18 +135,6 @@ impl Capability {
         Self::BackupRestore,
         Self::PointInTimeRecovery,
     ];
-
-    /// Whether the driver can run this scenario in this build.
-    ///
-    /// Nothing is implemented yet: a stateful replica cannot serve, because a
-    /// revision's resource bodies are owned by slices that have not landed, so
-    /// there is no serving, convergence, or restore behaviour to observe. This
-    /// is the single place that changes when a driver arrives, and the contract
-    /// test reads it, so a manifest entry cannot claim to be executable before
-    /// the code is.
-    pub const fn is_implemented(self) -> bool {
-        false
-    }
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -222,7 +248,7 @@ pub enum AdminWrites {
     Unavailable,
 }
 
-/// One slice a blocked scenario waits on, and what the scenario needs from it.
+/// One slice a blocked stage waits on, and what the stage needs from it.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Dependency {
