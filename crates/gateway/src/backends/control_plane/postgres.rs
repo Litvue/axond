@@ -5361,13 +5361,14 @@ mod tests {
             return;
         };
         // All of them, in order: 0002 declares the tenancy tables, 0003 replaces
-        // the rules it got wrong and 0004 keys the journal, so a hand-run upgrade
-        // is the set rather than any one of them.
+        // the rules it got wrong, 0004 keys the journal and 0005 adds the
+        // discovery evidence table, so a hand-run upgrade is the set rather than
+        // any one of them.
         let upgrade: Vec<_> = schema::MIGRATIONS
             .iter()
             .filter(|migration| migration.version > 1)
             .collect();
-        assert_eq!(upgrade.len(), 3, "the upgrade migrations ship");
+        assert_eq!(upgrade.len(), 4, "the upgrade migrations ship");
 
         for migration in &upgrade {
             store
