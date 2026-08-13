@@ -20,7 +20,7 @@ use tower::util::ServiceExt as _;
 
 use super::harness::{
     FakeProvider, PROVIDER_MATERIAL, ROTATED_MATERIAL, Replica, bootstrap, bootstrap_env,
-    chat_request, first, material, owner, state_pinning, sweep,
+    chat_request, first, material, owner, state_pinning, state_sharing, sweep,
 };
 use crate::backends::fakes::InMemorySecrets;
 use crate::backends::secrets::{SecretResolver as _, SecretStore as _};
@@ -156,6 +156,36 @@ async fn a_rotation_publishes_new_material_without_cutting_an_in_flight_request(
     // Resolution happened twice — once per compilation — and not once per
     // request: material is taken out of the store off the request path.
     assert_eq!(replica.compiler.resolutions(), 2);
+}
+
+/// Exposure is counted in versions unwrapped, not in bodies pointing at them.
+///
+/// Two credentials sharing one secret version are one read of the store, and
+/// the materialization is what makes that true. A count that grew per
+/// credential instead would overstate exposure the moment a revision had more
+/// than one credential, and the assertions built on it would stop meaning what
+/// they say.
+#[tokio::test]
+async fn two_credentials_sharing_a_version_take_material_out_of_the_store_once() {
+    let provider = FakeProvider::serving().await;
+    let replica = Replica::new(&provider);
+    replica
+        .secrets
+        .seed(owner(), first(), PROVIDER_MATERIAL, SecretLifecycle::Active);
+    replica
+        .publish(
+            "shared",
+            state_sharing(first(), ResourceVersionNumber::FIRST),
+        )
+        .await;
+    let published = replica.converge().await;
+    assert!(
+        matches!(published, Outcome::Published { .. }),
+        "{published:?}"
+    );
+
+    assert_eq!(replica.compiler.resolutions(), 1);
+    assert_eq!(replica.compiler.ledger().retained(), vec![first()]);
 }
 
 /// A candidate whose material cannot be resolved is refused *whole*: the
