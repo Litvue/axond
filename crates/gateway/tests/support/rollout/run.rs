@@ -959,7 +959,7 @@ fn revisions(upstream: &str, shutdown: ShutdownBounds) -> Vec<RevisionMeta> {
     [Revision::previous(), Revision::next()]
         .into_iter()
         .map(|revision| {
-            let config = gateway::config_toml(bind, upstream, &revision.tuning(shutdown))
+            let config = gateway::config_toml(bind, upstream, &revision.tuning(shutdown), "")
                 .replace(upstream, "http://127.0.0.1:UPSTREAM_PORT");
             RevisionMeta {
                 label: revision.label.to_owned(),

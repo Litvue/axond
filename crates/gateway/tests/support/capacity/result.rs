@@ -124,13 +124,20 @@ pub struct RunMeta {
 
 impl RunMeta {
     pub fn new(started_at: SystemTime, elapsed: Duration) -> Self {
+        Self::for_harness("axond capacity harness", started_at, elapsed)
+    }
+
+    /// The same provenance for a sibling harness. The name is part of the
+    /// artifact because a fault result and a capacity result answer different
+    /// questions and must never be read as one another's.
+    pub fn for_harness(harness: &'static str, started_at: SystemTime, elapsed: Duration) -> Self {
         Self {
             started_at_unix_ms: started_at
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis(),
             elapsed_ms: elapsed.as_millis(),
-            harness: "axond capacity harness",
+            harness,
             harness_version: env!("CARGO_PKG_VERSION"),
         }
     }
@@ -150,8 +157,16 @@ pub struct Environment {
 impl Environment {
     /// Collect everything a reader needs to reproduce or reject a comparison.
     /// `config` is the generated gateway config; the addresses in it are
-    /// ephemeral, so it is normalised before it is hashed.
-    pub fn collect(config: &str, bind: &str, upstream: &str, manifest_text: &str) -> Self {
+    /// ephemeral, so it is normalised before it is hashed. `manifest_relative`
+    /// names which committed manifest `manifest_text` came from, so an artifact
+    /// from one harness is not read as another's.
+    pub fn collect(
+        config: &str,
+        bind: &str,
+        upstream: &str,
+        manifest_relative: &str,
+        manifest_text: &str,
+    ) -> Self {
         let normalized = config
             .replace(bind, "127.0.0.1:GATEWAY_PORT")
             .replace(upstream, "http://127.0.0.1:UPSTREAM_PORT");
@@ -170,7 +185,7 @@ impl Environment {
                 normalized_toml: normalized,
             },
             manifest: InputMeta {
-                path: manifest::MANIFEST_RELATIVE.to_owned(),
+                path: manifest_relative.to_owned(),
                 sha256: manifest::sha256_hex(manifest_text.as_bytes()),
             },
             fixtures: fixtures(),

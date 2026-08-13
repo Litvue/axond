@@ -164,6 +164,16 @@ endurance duration_ms="":
 rollout:
     AXOND_ROLLOUT=1 cargo test --locked --all-features --test rollout -- --nocapture --test-threads=1
 
+# One row at a time: each boots its own replica, and a shared one could not
+# attribute what it recorded to the fault it injected. The provider and
+# transport rows need nothing; the state-tier rows want the datastores the
+# stateful suites use, and skip without them.
+# The committed fault matrix, publishing its evidence to target/faults/.
+faults:
+    AXOND_TEST_REDIS_URL="${AXOND_TEST_REDIS_URL:-redis://127.0.0.1:6379}" \
+    AXOND_TEST_POSTGRES_DSN="${AXOND_TEST_POSTGRES_DSN:-postgres://postgres:axond-ci@127.0.0.1:5432/postgres}" \
+    cargo test --locked --all-features --test faults -- --nocapture --test-threads=1
+
 # Run the gateway against ./axond.toml (copy axond.example.toml first).
 run:
     cargo run -p axond

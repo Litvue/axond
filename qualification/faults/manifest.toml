@@ -1,0 +1,368 @@
+# The committed fault matrix (issue #218).
+#
+# One row per injected fault. The harness (`crates/gateway/tests/faults.rs`)
+# boots a real `axond` process per row against a deterministic fake provider —
+# and, for the backend rows, a TCP fault proxy in front of a real Redis or
+# Postgres — and writes one JSON artifact per row under `target/faults/`.
+#
+# What a row asserts is a property of the gateway, never of the machine: the
+# status and typed error a caller sees, how many attempts the walk spent, how
+# many dispatches the provider saw, what the request settled as, and that the
+# bound the row names is what ended it. Milliseconds appear only as ceilings.
+#
+# Rows whose `fault` names Redis or Postgres are skipped when
+# `AXOND_TEST_REDIS_URL` / `AXOND_TEST_POSTGRES_DSN` are unset, and CI sets
+# `AXOND_TEST_REQUIRE_SERVICES=1` so a skip there is a failure.
+
+schema_version = 1
+
+# --- provider verdicts -------------------------------------------------------
+
+[[row]]
+id = "provider-rate-limited"
+family = "provider"
+fault = "provider_rate_limited"
+description = "A 429 from the only target: the caller gets a typed verdict, not a hung request."
+deadline_ms = 10000
+
+[row.expect]
+status = 502
+error_type = "provider_dependency_failed"
+attempts = 1
+upstream_requests = 1
+usage_status = "upstream_error"
+metrics = ["axond.request.count", "axond.upstream.errors"]
+
+[[row]]
+id = "provider-rate-limited-failover"
+family = "provider"
+fault = "provider_rate_limited_failover"
+description = "A 429 on the first target is failed over to a standby, and costs exactly one retry."
+deadline_ms = 10000
+
+# A failed-over request settles as a success, and `axond.upstream.errors` is
+# counted from the settled record rather than per attempt, so the retry shows up
+# in the record's attempt count, not in an error counter.
+[row.expect]
+status = 200
+attempts = 2
+upstream_requests = 2
+usage_status = "ok"
+relayed_output = true
+metrics = ["axond.request.count"]
+
+[[row]]
+id = "provider-server-error"
+family = "provider"
+fault = "provider_server_error"
+description = "A 500 from the only target is relayed as a typed gateway verdict."
+deadline_ms = 10000
+
+[row.expect]
+status = 502
+error_type = "provider_dependency_failed"
+attempts = 1
+upstream_requests = 1
+usage_status = "upstream_error"
+metrics = ["axond.request.count", "axond.upstream.errors"]
+
+[[row]]
+id = "provider-server-error-failover"
+family = "provider"
+fault = "provider_server_error_failover"
+description = "A 500 on the first target is failed over to a standby rather than surfaced."
+deadline_ms = 10000
+
+[row.expect]
+status = 200
+attempts = 2
+upstream_requests = 2
+usage_status = "ok"
+relayed_output = true
+metrics = ["axond.request.count"]
+
+# --- the path to the provider ------------------------------------------------
+
+[[row]]
+id = "transport-dns-failure"
+family = "transport"
+fault = "dns_failure"
+description = "A provider host that cannot resolve fails fast and names no endpoint."
+deadline_ms = 10000
+
+[row.expect]
+status = 502
+error_type = "upstream_transport"
+attempts = 1
+upstream_requests = 0
+usage_status = "upstream_error"
+metrics = ["axond.request.count", "axond.upstream.errors"]
+
+[[row]]
+id = "transport-connect-refused"
+family = "transport"
+fault = "connect_refused"
+description = "A refused TCP connect is a transport verdict, not a provider one."
+deadline_ms = 10000
+
+[row.expect]
+status = 502
+error_type = "upstream_transport"
+attempts = 1
+upstream_requests = 0
+usage_status = "upstream_error"
+metrics = ["axond.request.count", "axond.upstream.errors"]
+
+[[row]]
+id = "transport-tls-handshake"
+family = "transport"
+fault = "tls_handshake"
+description = "A port that answers a TLS handshake with garbage fails in TLS, bounded by the connect budget."
+deadline_ms = 10000
+
+[row.expect]
+status = 502
+error_type = "upstream_transport"
+attempts = 1
+upstream_requests = 0
+usage_status = "upstream_error"
+metrics = ["axond.request.count", "axond.upstream.errors"]
+
+[[row]]
+id = "transport-response-header-timeout"
+family = "transport"
+fault = "response_header_timeout"
+description = "Headers that never arrive end on the header bound rather than on the client's patience."
+deadline_ms = 5000
+
+[row.expect]
+status = 504
+error_type = "upstream_timeout"
+attempts = 1
+upstream_requests = 1
+usage_status = "upstream_error"
+metrics = ["axond.request.count", "axond.upstream.timeouts"]
+
+[[row]]
+id = "transport-buffered-body-timeout"
+family = "transport"
+fault = "buffered_body_timeout"
+description = "A buffered body that never finishes ends on the body bound, and the upstream is released."
+deadline_ms = 5000
+
+[row.expect]
+status = 504
+error_type = "upstream_timeout"
+attempts = 1
+upstream_requests = 1
+usage_status = "upstream_error"
+metrics = ["axond.request.count", "axond.upstream.timeouts"]
+
+[[row]]
+id = "stream-idle-before-bytes"
+family = "transport"
+fault = "stream_idle_before_bytes"
+description = "A stream that goes silent before its first provider event ends on the idle bound as an in-band SSE error: the response head is already committed, so the failure cannot be a status."
+streamed = true
+deadline_ms = 5000
+
+[row.expect]
+status = 200
+error_type = "upstream_stream_error"
+attempts = 1
+upstream_requests = 1
+usage_status = "upstream_error"
+relayed_output = true
+metrics = ["axond.request.count", "axond.upstream.timeouts"]
+
+[[row]]
+id = "stream-idle-after-bytes"
+family = "transport"
+fault = "stream_idle_after_bytes"
+description = "A stream that goes silent after relaying provider output cannot be retried: bytes are committed, so the failure is in-band and the request settles as an error."
+streamed = true
+deadline_ms = 5000
+
+[row.expect]
+status = 200
+error_type = "upstream_stream_error"
+attempts = 1
+upstream_requests = 1
+usage_status = "upstream_error"
+relayed_output = true
+metrics = ["axond.request.count", "axond.upstream.timeouts"]
+
+[[row]]
+id = "stream-truncation"
+family = "transport"
+fault = "stream_truncation"
+description = "A stream that dies mid-event settles as an error rather than as a truncated success."
+streamed = true
+deadline_ms = 5000
+
+[row.expect]
+status = 200
+error_type = "upstream_stream_error"
+attempts = 1
+upstream_requests = 1
+usage_status = "upstream_error"
+relayed_output = true
+metrics = ["axond.request.count"]
+
+[[row]]
+id = "oversized-response-body"
+family = "transport"
+fault = "oversized_response_body"
+description = "A buffered body above the byte bound is refused rather than buffered into the replica."
+deadline_ms = 10000
+
+[row.expect]
+status = 502
+error_type = "upstream_body_too_large"
+attempts = 1
+upstream_requests = 1
+usage_status = "upstream_error"
+metrics = ["axond.request.count", "axond.upstream.errors"]
+
+[[row]]
+id = "oversized-error-body"
+family = "transport"
+fault = "oversized_error_body"
+description = "An oversized provider *error* body is bounded too, and the caller still gets a typed verdict rather than the provider's megabytes."
+deadline_ms = 10000
+
+[row.expect]
+status = 502
+error_type = "provider_dependency_failed"
+attempts = 1
+upstream_requests = 1
+usage_status = "upstream_error"
+metrics = ["axond.request.count", "axond.upstream.errors"]
+
+# --- state tiers -------------------------------------------------------------
+
+[[row]]
+id = "redis-latency"
+family = "backend"
+fault = "redis_latency"
+description = "A slow rate-limit store delays admission and is still served: latency is not an outage."
+deadline_ms = 15000
+injected_latency_ms = 150
+
+[row.expect]
+status = 200
+attempts = 1
+upstream_requests = 1
+usage_status = "ok"
+relayed_output = true
+metrics = ["axond.request.count"]
+
+[[row]]
+id = "redis-outage-fail-closed"
+family = "backend"
+fault = "redis_outage_fail_closed"
+description = "With `on_unavailable = \"deny\"` a lost rate-limit store refuses the request rather than serving unenforced."
+deadline_ms = 15000
+
+[row.expect]
+status = 503
+error_type = "rate_limit_unavailable"
+attempts = 0
+upstream_requests = 0
+usage_records = 0
+usage_status = "none"
+metrics = ["axond.rate_limit.unavailable_denials"]
+
+[[row]]
+id = "redis-outage-fail-open"
+family = "backend"
+fault = "redis_outage_fail_open"
+description = "With `on_unavailable = \"allow\"` a lost rate-limit store serves unenforced rather than failing the request."
+deadline_ms = 15000
+
+[row.expect]
+status = 200
+attempts = 1
+upstream_requests = 1
+usage_status = "ok"
+relayed_output = true
+metrics = ["axond.request.count"]
+
+[[row]]
+id = "redis-recovery"
+family = "backend"
+fault = "redis_recovery"
+description = "A rate-limit store that comes back is used again, with no restart and no stuck denial."
+deadline_ms = 15000
+
+[row.expect]
+status = 200
+during_outage_status = 503
+attempts = 1
+upstream_requests = 1
+usage_status = "ok"
+relayed_output = true
+metrics = ["axond.request.count", "axond.rate_limit.unavailable_denials"]
+
+[[row]]
+id = "postgres-latency"
+family = "backend"
+fault = "postgres_latency"
+description = "A slow budget store delays the reservation and is still served and charged."
+deadline_ms = 20000
+injected_latency_ms = 150
+
+[row.expect]
+status = 200
+attempts = 1
+upstream_requests = 1
+usage_status = "ok"
+relayed_output = true
+metrics = ["axond.request.count"]
+
+[[row]]
+id = "postgres-outage-fail-closed"
+family = "backend"
+fault = "postgres_outage_fail_closed"
+description = "With `on_unavailable = \"deny\"` a lost budget store refuses the request rather than spending an unbounded amount."
+deadline_ms = 20000
+
+[row.expect]
+status = 503
+error_type = "budget_unavailable"
+attempts = 0
+upstream_requests = 0
+usage_records = 0
+usage_status = "none"
+metrics = ["axond.http.server.requests"]
+
+[[row]]
+id = "postgres-outage-fail-open"
+family = "backend"
+fault = "postgres_outage_fail_open"
+description = "With `on_unavailable = \"allow\"` a lost budget store serves the request unmetered rather than refusing it."
+deadline_ms = 20000
+
+[row.expect]
+status = 200
+attempts = 1
+upstream_requests = 1
+usage_status = "ok"
+relayed_output = true
+metrics = ["axond.request.count"]
+
+[[row]]
+id = "postgres-recovery"
+family = "backend"
+fault = "postgres_recovery"
+description = "A budget store that comes back is reconnected to on the next request, with no restart."
+deadline_ms = 20000
+
+[row.expect]
+status = 200
+during_outage_status = 503
+attempts = 1
+upstream_requests = 1
+usage_status = "ok"
+relayed_output = true
+metrics = ["axond.request.count"]

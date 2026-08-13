@@ -148,6 +148,15 @@ jobs:
           name: rollout-results-reduced
           path: target/rollout/**/*.json
           if-no-files-found: warn
+      # The provider and transport fault rows run in the same suite; the
+      # state-tier rows skip here and run in the stateful lane below.
+      - name: Publish the stateless fault-matrix results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fault-results-stateless
+          path: target/faults/**/*.json
+          if-no-files-found: warn
 
   stateful-tests:
     name: Stateful tests
@@ -205,6 +214,15 @@ jobs:
         with:
           name: rollout-results-stateful
           path: target/rollout/**/*.json
+          if-no-files-found: warn
+      # The full fault matrix, state tiers included: `AXOND_TEST_REQUIRE_SERVICES`
+      # makes a skipped backend row a failure here rather than a quiet gap.
+      - name: Publish the fault-matrix results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fault-results
+          path: target/faults/**/*.json
           if-no-files-found: warn
 
   sdk-compat:

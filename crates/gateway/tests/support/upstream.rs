@@ -40,6 +40,9 @@ pub mod target {
     pub const DROP_STREAM: &str = "drop-stream";
     /// An upstream that answers `500` before any byte is relayed.
     pub const FAIL: &str = "fail-500";
+    /// An upstream that answers `429` before any byte is relayed: the provider
+    /// verdict that is attributable to the credential rather than to the target.
+    pub const RATE_LIMITED: &str = "rate-limited-429";
     /// Accepts the request and never sends response headers.
     pub const NO_HEADERS: &str = "no-headers";
     /// Thinks for a while and *then* answers, like a non-streamed completion:
@@ -319,6 +322,13 @@ async fn handle(
             StatusCode::INTERNAL_SERVER_ERROR,
             [("content-type", "application/json")],
             json!({ "error": { "type": "server_error", "message": "fixture failure" } })
+                .to_string(),
+        )
+            .into_response(),
+        target::RATE_LIMITED => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("content-type", "application/json"), ("retry-after", "1")],
+            json!({ "error": { "type": "rate_limit_error", "message": "fixture rate limit" } })
                 .to_string(),
         )
             .into_response(),
