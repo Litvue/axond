@@ -171,6 +171,7 @@ def check_stale_claims(files: list[Path]) -> list[str]:
         "replica refuses to boot": STATEFUL_BOOTS,
         "replica still refuses to boot": STATEFUL_BOOTS,
         "stateful boot refuses to start": STATEFUL_BOOTS,
+        'refuses `mode = "stateful"`': STATEFUL_BOOTS,
     }
     failures: list[str] = []
     # Beyond Markdown, because this claim is made in an operator's config, in the
@@ -188,9 +189,12 @@ def check_stale_claims(files: list[Path]) -> list[str]:
         ROOT / "crates/gateway/tests/stateful_integration.rs",
         ROOT / "crates/gateway/tests/support/stateful.rs",
     ]:
-        text = source.read_text(encoding="utf-8")
+        # Whitespace-insensitive, because these pages are hard-wrapped: a phrase
+        # that spans a line break is the same claim, and matching the raw text
+        # would miss it for no reason a reader could see.
+        text = " ".join(source.read_text(encoding="utf-8").split())
         for phrase, reason in forbidden.items():
-            if phrase in text:
+            if " ".join(phrase.split()) in text:
                 failures.append(
                     f"{source.relative_to(ROOT)}: stale phrase {phrase!r} ({reason})"
                 )
