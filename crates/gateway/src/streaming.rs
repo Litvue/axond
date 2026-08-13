@@ -896,8 +896,12 @@ impl Accounting {
         let budget_key = self.ctx.budget_key.clone();
         let reservation = self.ctx.reservation.clone();
         spawn_settlement(async move {
+            // The record first, so a billing-grade deployment has the event
+            // durable before the hold is settled. A stream cannot be refused
+            // after it has been relayed, so a failure here is reported and
+            // counted rather than returned.
+            state.0.usage.record_terminal(&record).await;
             state.0.budget.settle(&budget_key, &reservation, cost).await;
-            state.0.usage.record(&record).await;
         });
     }
 }

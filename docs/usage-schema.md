@@ -144,10 +144,17 @@ observable:
 Alert on the second one. A sustained non-zero rate means the buffer
 (`buffer_capacity`) or the destination is undersized for the offered load.
 
-This is the **telemetry-grade** delivery mode, and it is the only one the gateway
-offers today. The opt-in **billing-grade** mode — an accepted request's event is
-durable before the request settles, replayed until a consumer acknowledges it —
-is specified as the `UsageJournal` contract in `crates/gateway/src/usage/journal.rs`
-and tracked by [#155](https://github.com/Litvue/axond/issues/155). Nothing
-constructs a journal yet, so no configuration turns it on and no sink's behaviour
-changes.
+This is the **telemetry-grade** delivery mode and it is the default: a record the
+fan-out accepted is not a record that was written, so these rows are telemetry
+rather than an accounting source.
+
+`[usage_journal] backend = "postgres"` opts into the **billing-grade** mode
+instead ([ADR 0034](./adr/0034-billing-grade-usage-outbox.md)): the event is
+appended to a durable outbox before the request is answered, replayed into these
+same sinks until they acknowledge it, and a request whose event could not be made
+durable is answered `503 usage_not_durable` rather than `200`. The row shape does
+not change — the guarantee about whether the row eventually exists does. Delivery
+is still at-least-once, so the deduplication advice above is unchanged and
+becomes load-bearing: the outbox *will* redeliver after a crash, always with the
+same `request_id`. Setup, recovery, poison handling, and alerts are in the
+[usage outbox guide](./operations/usage-outbox.md).

@@ -24,6 +24,7 @@ use crate::admission::MAX_PERMITS;
 use crate::aliases::AliasScope;
 use crate::desired_state::{ProjectId, SecretRef, TenantId};
 use crate::principals::Capability;
+use crate::usage::journal::{Capacity, CapacityPolicy, ConsumerId};
 use crate::usage::{BatchSettings, validate_table_name};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -94,6 +95,11 @@ pub struct Config {
     /// JSON line per record on stdout (ADR 0002).
     #[serde(default)]
     pub usage_sink: Vec<UsageSinkConfig>,
+    /// Durable, replayed usage delivery. Defaults to `backend = "none"`: the
+    /// telemetry-grade path stays exactly as it is and no datastore joins the
+    /// default deployment (ADR 0002, ADR 0034).
+    #[serde(default)]
+    pub usage_journal: UsageJournalConfig,
     /// Spend cap enforcement. Defaults to no budget at all, so nothing drags a
     /// datastore onto the default path (ADR 0002).
     #[serde(default)]
@@ -145,7 +151,7 @@ impl Mode {
 /// reference to resolve, and figment's resulting type error would carry the
 /// secret into the load diagnostic. Kept in step with `Config` by
 /// `the_override_key_list_matches_every_config_field`.
-const OVERRIDE_KEYS: [&str; 24] = [
+const OVERRIDE_KEYS: [&str; 25] = [
     "mode",
     "server",
     "control_plane",
@@ -166,6 +172,7 @@ const OVERRIDE_KEYS: [&str; 24] = [
     "gateway_token_epoch",
     "gateway_token",
     "usage_sink",
+    "usage_journal",
     "budget",
     "rate_limit",
     "admission",
@@ -1177,6 +1184,163 @@ impl UsageSinkConfig {
 }
 
 const DEFAULT_USAGE_TABLE: &str = "axond_usage";
+
+/// Billing-grade usage delivery: durable append before the request is answered,
+/// replayed until the destinations acknowledge it (ADR 0034).
+///
+/// Off by default, and off in every configuration written so far, because the
+/// guarantee costs a datastore on the request path. Turning it on is the operator
+/// saying that a missing usage row is a missing invoice line.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct UsageJournalConfig {
+    pub backend: UsageJournalBackend,
+    /// Name of the env var holding the outbox connection string. Required for
+    /// `postgres`; the DSN is a secret, so it is referenced rather than inlined.
+    pub dsn_env: Option<String>,
+    /// The schema the outbox tables live in, if not the connection's default. A
+    /// plain unqualified identifier: it is interpolated into `SET search_path`.
+    pub schema: Option<String>,
+    /// Apply the shipped outbox DDL at boot. Off by default, like every other
+    /// store here.
+    pub create_schema: bool,
+    /// The consumer name delivery state is kept under. Stable across restarts:
+    /// renaming it starts delivery again from the beginning of the retained
+    /// outbox, which is a replay of everything still there.
+    pub consumer: String,
+    /// Events the outbox holds before `capacity_policy` applies.
+    pub max_events: u64,
+    /// Attempts one event gets before it is quarantined as poison.
+    pub max_delivery_attempts: u32,
+    /// How long an acknowledged event is retained. Must exceed the longest
+    /// retry horizon a caller can have, because pruning forgets the idempotency
+    /// key.
+    pub retain_acknowledged_seconds: u64,
+    /// What a full outbox does. `refuse` is the only policy that keeps the
+    /// billing-grade promise.
+    pub capacity_policy: UsageCapacityPolicy,
+    /// What a request does when its event could not be journaled.
+    pub on_undurable: UndurablePolicy,
+    /// Bound on the append a request waits for, and on every other outbox
+    /// operation.
+    pub operation_timeout_ms: u64,
+    pub connect_timeout_ms: u64,
+    /// Connections the outbox holds open. Two is the useful minimum: one for the
+    /// request path's appends, one for the delivery worker's claims.
+    pub connections: usize,
+    /// Events one claim takes.
+    pub claim_batch: usize,
+    /// How long a claimed batch stays invisible to other claimants. Must exceed
+    /// the slowest write the destinations do.
+    pub lease_seconds: u64,
+    /// How long the worker waits after finding nothing to deliver.
+    pub poll_interval_ms: u64,
+}
+
+impl Default for UsageJournalConfig {
+    fn default() -> Self {
+        Self {
+            backend: UsageJournalBackend::None,
+            dsn_env: None,
+            schema: None,
+            create_schema: false,
+            consumer: DEFAULT_USAGE_CONSUMER.to_owned(),
+            max_events: Capacity::BILLING_GRADE.max_events,
+            max_delivery_attempts: Capacity::BILLING_GRADE.max_delivery_attempts,
+            retain_acknowledged_seconds: Capacity::BILLING_GRADE.retain_acknowledged.as_secs(),
+            capacity_policy: UsageCapacityPolicy::Refuse,
+            on_undurable: UndurablePolicy::Refuse,
+            operation_timeout_ms: 5_000,
+            connect_timeout_ms: 5_000,
+            connections: 2,
+            claim_batch: 256,
+            lease_seconds: 30,
+            poll_interval_ms: 250,
+        }
+    }
+}
+
+const DEFAULT_USAGE_CONSUMER: &str = "billing";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UsageJournalBackend {
+    /// No journal: telemetry-grade delivery, exactly as before.
+    #[default]
+    None,
+    /// A durable outbox in PostgreSQL (`ops/postgres/usage_outbox_v1.sql`).
+    Postgres,
+}
+
+impl UsageJournalBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Postgres => "postgres",
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::Postgres)
+    }
+}
+
+/// The TOML spelling of [`CapacityPolicy`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UsageCapacityPolicy {
+    #[default]
+    Refuse,
+    DropOldest,
+}
+
+impl UsageCapacityPolicy {
+    pub fn policy(self) -> CapacityPolicy {
+        match self {
+            Self::Refuse => CapacityPolicy::Refuse,
+            Self::DropOldest => CapacityPolicy::DropOldest,
+        }
+    }
+}
+
+/// What a request does when the journal could not make its event durable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UndurablePolicy {
+    /// Answer `503 usage_not_durable`. The default, and the only setting under
+    /// which a bill cannot silently miss a line: the caller learns the request
+    /// was not recorded and can retry it.
+    #[default]
+    Refuse,
+    /// Answer the request anyway and count the event as lost. Telemetry-grade
+    /// behaviour for the failure case, chosen deliberately.
+    Serve,
+}
+
+impl UndurablePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Refuse => "refuse",
+            Self::Serve => "serve",
+        }
+    }
+
+    pub fn refuses(self) -> bool {
+        matches!(self, Self::Refuse)
+    }
+}
+
+impl UsageJournalConfig {
+    /// The bounds the journal reports about itself.
+    pub fn capacity(&self) -> Capacity {
+        Capacity {
+            max_events: self.max_events,
+            max_delivery_attempts: self.max_delivery_attempts,
+            retain_acknowledged: Duration::from_secs(self.retain_acknowledged_seconds),
+            policy: self.capacity_policy.policy(),
+        }
+    }
+}
 
 fn default_buffer_capacity() -> usize {
     10_000
@@ -2875,6 +3039,105 @@ impl Config {
                     ConfigError::Invalid(format!("usage_sink `postgres`: {message}"))
                 })?;
             }
+        }
+        self.validate_usage_journal()
+    }
+
+    /// The journal's fields are checked as a set too, and the check is where a
+    /// deployment learns that a setting it chose cannot hold the guarantee it
+    /// asked for: an outbox with no destination, or a destination that cannot
+    /// report a failed write, is refused rather than run.
+    fn validate_usage_journal(&self) -> Result<(), ConfigError> {
+        let journal = &self.usage_journal;
+        if !journal.backend.is_enabled() {
+            // Every other field is inert without a backend, so a half-written
+            // section is not an error — it is a section that does nothing.
+            return Ok(());
+        }
+        match journal.dsn_env.as_deref().map(str::trim) {
+            Some(dsn_env) if !dsn_env.is_empty() => {}
+            _ => {
+                return Err(ConfigError::Invalid(
+                    "usage_journal `postgres`: `dsn_env` must name the env var holding the \
+                     connection string"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(schema) = journal.schema.as_deref() {
+            validate_table_name(schema).map_err(|message| {
+                ConfigError::Invalid(format!("usage_journal `schema`: {message}"))
+            })?;
+            if schema.contains('.') {
+                return Err(ConfigError::Invalid(format!(
+                    "usage_journal `schema`: `{schema}` is qualified, but a search path takes one \
+                     unqualified schema name"
+                )));
+            }
+        }
+        ConsumerId::parse(&journal.consumer).map_err(|message| {
+            ConfigError::Invalid(format!("usage_journal `consumer`: {message}"))
+        })?;
+        if journal.max_events == 0 {
+            return Err(ConfigError::Invalid(
+                "usage_journal: max_events must be at least 1".into(),
+            ));
+        }
+        if journal.max_delivery_attempts == 0 {
+            return Err(ConfigError::Invalid(
+                "usage_journal: max_delivery_attempts must be at least 1, or no event is ever \
+                 delivered"
+                    .into(),
+            ));
+        }
+        if journal.claim_batch == 0 {
+            return Err(ConfigError::Invalid(
+                "usage_journal: claim_batch must be at least 1".into(),
+            ));
+        }
+        if journal.connections == 0 {
+            return Err(ConfigError::Invalid(
+                "usage_journal: connections must be at least 1".into(),
+            ));
+        }
+        for (field, value) in [
+            ("operation_timeout_ms", journal.operation_timeout_ms),
+            ("connect_timeout_ms", journal.connect_timeout_ms),
+            ("poll_interval_ms", journal.poll_interval_ms),
+            ("lease_seconds", journal.lease_seconds),
+            (
+                "retain_acknowledged_seconds",
+                journal.retain_acknowledged_seconds,
+            ),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "usage_journal: {field} must be at least 1"
+                )));
+            }
+        }
+        if self.usage_sink.is_empty() {
+            return Err(ConfigError::Invalid(
+                "usage_journal `postgres`: at least one `[[usage_sink]]` must be configured — the \
+                 journal is the durable path *to* the sinks, and with none of them an \
+                 acknowledgement would mean nothing"
+                    .into(),
+            ));
+        }
+        if let Some(sink) = self
+            .usage_sink
+            .iter()
+            .find(|sink| sink.kind == UsageSinkKind::Otlp)
+        {
+            // The OTel SDK's batch processor owns the write and does not tell us
+            // whether it landed, so acknowledging on its behalf would drop
+            // events while reporting success.
+            return Err(ConfigError::Invalid(format!(
+                "usage_journal `postgres`: a `{}` sink cannot be a billing-grade destination, \
+                 because it cannot report a failed write. Export usage telemetry from a \
+                 deployment without a journal, or use a sink that acknowledges",
+                sink.kind.as_str()
+            )));
         }
         Ok(())
     }

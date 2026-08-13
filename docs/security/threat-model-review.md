@@ -381,6 +381,7 @@ whose tenant isolation is not actually in place.
 
 **Threat model and ADRs.** [ADR 0007](../adr/0007-telemetry-model.md),
 [ADR 0009](../adr/0009-durable-usage-sinks.md),
+[ADR 0034](../adr/0034-billing-grade-usage-outbox.md),
 [ADR 0017](../adr/0017-state-tiers-and-optional-backends.md), and
 [ADR 0027](../adr/0027-stateless-and-stateful-operating-modes.md) hold the
 telemetry, durability, and tier positions; section 3 of the security review is
@@ -390,11 +391,24 @@ store it did not need, is an ADR with the template's state-tier declaration.
 Free-form caller input must not become a metric attribute — that is a
 cardinality *and* a disclosure decision.
 
+A change to the *delivery guarantee* is part of this trigger too, not just a
+change to the row. The billing-grade usage outbox
+([ADR 0034](../adr/0034-billing-grade-usage-outbox.md)) puts a durable write on
+the request path for deployments that opt in, so the review question is
+availability as much as disclosure: with the defaults, an outbox that is full or
+unreachable refuses requests, and the escapes from that (`capacity_policy =
+"drop-oldest"`, `on_undurable = "serve"`) are accounted losses rather than silent
+ones. Anything that changes which of those a deployment gets — a default, a
+refusal, a retention or capacity bound, what may be pruned to make room — owes
+that argument. Quarantined events are deliberately not prunable: an operator's
+evidence must not be deleted to free capacity.
+
 **Release impact.** Schema changes are ordered operator work: name the DDL that
 must be applied before writers, whether mixed versions may run, and the rollback
 limit, in the [upgrade guide](../operations/upgrades.md) and the
 [control-plane journal](../operations/control-plane-journal.md) or
-[usage schema](../usage-schema.md) as appropriate. A field removed or renamed in
+[usage schema](../usage-schema.md) or the [usage
+outbox](../operations/usage-outbox.md) as appropriate. A field removed or renamed in
 a usage row breaks somebody's billing pipeline and is a documented contract
 change, not an implementation detail.
 

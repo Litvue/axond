@@ -1384,8 +1384,12 @@ async fn serve(
         Ok(response) => {
             let usage = to_usage(&response.usage);
             let cost = served.price.cost_microdollars(usage);
-            reservation.settle(cost).await;
-            record_usage(
+            // Recorded *before* the settlement and before the response is
+            // acknowledged: in billing-grade mode this is the durable append, and
+            // a request whose usage is not durable must not be answered `200`.
+            // In telemetry-grade mode the fan-out cannot fail, so the order is
+            // unobservable.
+            let durable = record_usage(
                 &state,
                 RecordArgs {
                     identity: &identity,
@@ -1407,6 +1411,11 @@ async fn serve(
                 },
             )
             .await;
+            // Settled either way: the spend was incurred upstream whether or not
+            // the record survived, and leaving the hold to expire would
+            // double-count the next request.
+            reservation.settle(cost).await;
+            durable?;
             Ok(Json(response.body).into_response())
         }
         Err(err) => {
@@ -1417,7 +1426,10 @@ async fn serve(
             // zero — the streamed path, which can measure what it relayed,
             // charges its partial spend.
             reservation.release().await;
-            record_usage(
+            // The upstream failure is what the caller is told about, so the
+            // record is best-effort here: a `503` about the outbox would hide the
+            // provider error that actually ended the request.
+            record_usage_terminal(
                 &state,
                 RecordArgs {
                     identity: &identity,
@@ -2520,7 +2532,31 @@ struct RecordArgs<'a> {
     attempts: u32,
 }
 
-async fn record_usage(state: &AppState, args: RecordArgs<'_>) {
+/// Build the record and hand it to usage delivery. The `Err` is billing-grade
+/// only: it means the event is not durable and the configured policy is to
+/// refuse rather than serve.
+async fn record_usage(state: &AppState, args: RecordArgs<'_>) -> Result<(), GatewayError> {
+    let (record, ttft_ms, attempts) = build_record(args);
+    telemetry::record_request(&record, ttft_ms, attempts);
+    state
+        .0
+        .usage
+        .record(&record)
+        .await
+        .map_err(|error| GatewayError::UsageNotDurable {
+            reason: error.reason,
+        })
+}
+
+/// Record where the request is already ending for another reason, so a failure
+/// to journal can only be reported and counted.
+async fn record_usage_terminal(state: &AppState, args: RecordArgs<'_>) {
+    let (record, ttft_ms, attempts) = build_record(args);
+    telemetry::record_request(&record, ttft_ms, attempts);
+    state.0.usage.record_terminal(&record).await;
+}
+
+fn build_record(args: RecordArgs<'_>) -> (UsageRecord, Option<u64>, u32) {
     let ttft_ms = args.ttft_ms;
     let attempts = args.attempts;
     let record = UsageRecord {
@@ -2545,8 +2581,7 @@ async fn record_usage(state: &AppState, args: RecordArgs<'_>) {
         latency_ms: args.latency_ms,
         attempts,
     };
-    telemetry::record_request(&record, ttft_ms, attempts);
-    state.0.usage.record(&record).await;
+    (record, ttft_ms, attempts)
 }
 
 #[cfg(test)]
@@ -2554,7 +2589,7 @@ mod tests {
     use super::*;
     use crate::aliases::AliasScope;
     use crate::budget::NoBudget;
-    use crate::config::Config;
+    use crate::config::{Config, UndurablePolicy};
     use crate::convergence::status::testing::ManualClock;
     use crate::convergence::{Rejection, RevisionStatus, SnapshotSource};
     use crate::desired_state::fixtures::revision_id;
@@ -2564,7 +2599,8 @@ mod tests {
     use crate::status::registry::{CachedStatusRegistry, StatusRefresher, StatusSettings};
     use crate::status::{Component, ComponentObservation, ComponentState, StatusReason};
     use crate::usage::identity::RequestId;
-    use crate::usage::{StdoutSink, UsageFanout, UsageSink};
+    use crate::usage::journal::{self, UsageJournal as _};
+    use crate::usage::{StdoutSink, UsageDelivery, UsageFanout, UsageSink};
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use http_body_util::BodyExt;
@@ -6035,6 +6071,110 @@ targets = [{{ provider = "openai", model = "gpt-4o", price = {{ input_microdolla
         assert_eq!(records[0].target_model, "m-b");
         assert_eq!(records[0].credential_id, "cred-b");
         assert_eq!(records[0].attempts, 2);
+    }
+
+    /// One provider that answers, whose usage delivery is billing-grade over the
+    /// given outbox. Everything else is the ordinary buffered path.
+    fn billing_state(base_url: &str, journal: Arc<dyn journal::UsageJournal>) -> AppState {
+        let cfg = Config::from_toml_str(&format!(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "pa"
+kind = "openai"
+base_url = "{base_url}"
+
+{GATEWAY_KEY}
+
+[[credential]]
+namespace = "platform"
+provider = "pa"
+env = "KA"
+id = "cred-a"
+
+[[model]]
+name = "gpt-4o"
+targets = [{{ provider = "pa", model = "m-a", price = {{ input_microdollars_per_million = 1000000, output_microdollars_per_million = 1000000 }} }}]
+"#
+        ))
+        .unwrap();
+        AppState::with_resources(
+            cfg,
+            &env_with([("KA", "ka")]),
+            Arc::new(UsageDelivery::billing(journal, UndurablePolicy::Refuse)),
+            Box::new(NoBudget),
+            Box::new(NoLimit),
+            Box::new(crate::revocation::NoDenylist),
+            ReplicaObservability::stateless(),
+        )
+        .unwrap()
+    }
+
+    /// The billing-grade promise as a caller sees it: a `200` means the event is
+    /// already in the outbox, so a reader of the outbox alone can reconstruct
+    /// every request that was reported as served.
+    #[tokio::test]
+    async fn a_billing_grade_request_is_answered_only_once_its_usage_is_durable() {
+        let (url, _) = controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let outbox = Arc::new(journal::oracle::InMemoryUsageJournal::new());
+        let state = billing_state(&url, outbox.clone());
+
+        let response = router(state).oneshot(chat_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let claimed = outbox
+            .claim(
+                &journal::ConsumerId::parse("billing").unwrap(),
+                journal::Claim {
+                    max_events: 8,
+                    lease: Duration::from_secs(30),
+                    now: SystemTime::now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1, "the served request is journaled");
+        let record = claimed[0].event.record();
+        assert_eq!(record.status.as_str(), "ok");
+        assert_eq!(record.target_provider, "pa");
+        RequestId::parse(&record.request_id).expect("the journaled event carries its identity");
+    }
+
+    /// The refusal that makes the promise worth anything: with nowhere durable to
+    /// put the event, the request is answered `503 usage_not_durable` rather than
+    /// `200` for spend nothing can bill. The upstream call already happened — the
+    /// gateway cannot un-spend it — so the refusal is about what it *claims*, and
+    /// a `[usage_journal] on_undurable = "serve"` deployment gets the other trade.
+    #[tokio::test]
+    async fn a_full_outbox_refuses_the_request_rather_than_reporting_unbillable_success() {
+        let (url, hits) =
+            controllable_upstream(Arc::new(AtomicBool::new(true)), StatusCode::OK).await;
+        let outbox = Arc::new(journal::oracle::InMemoryUsageJournal::with_capacity(
+            journal::Capacity {
+                max_events: 0,
+                ..journal::Capacity::BILLING_GRADE
+            },
+        ));
+        let state = billing_state(&url, outbox.clone());
+
+        let response = router(state).oneshot(chat_request()).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "usage_not_durable");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the provider did answer");
+        assert!(
+            outbox
+                .stats(&journal::ConsumerId::parse("billing").unwrap())
+                .await
+                .unwrap()
+                .is_drained(),
+            "nothing was journaled, which is what the refusal reports"
+        );
     }
 
     /// The identity contract as the buffered path delivers it: every settled

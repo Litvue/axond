@@ -44,20 +44,25 @@
 //! redelivery is distinguishable from a first attempt in logs and metrics without
 //! being distinguishable as a billable event.
 //!
-//! # Not enabled here
+//! # Opt-in, and off unless configured
 //!
-//! No journal is constructed by `serve`, no configuration selects one, and the
-//! settlement order is unchanged: this slice is the contract plus its executable
-//! oracle, in the same posture as [`crate::backends`] and
-//! [`crate::desired_state`]. The Postgres outbox worker that implements it — and
-//! the append-before-settlement ordering that makes
-//! [`DeliveryMode::BillingGrade`] true rather than merely named — is the next
-//! slice.
+//! [`PostgresJournal`] implements the contract and [`DeliveryWorker`] drains it
+//! into the configured sinks, but neither exists unless `[usage_journal]` names
+//! a backend: with no such section the runtime keeps exactly the telemetry-grade
+//! path it had, and no deployment acquires a datastore dependency by upgrading.
+//! Billing-grade mode is where the append happens *before* the request is
+//! answered, which is what makes [`DeliveryMode::BillingGrade`] true rather than
+//! merely named — see [`crate::usage::UsageDelivery`].
 
 #[cfg(test)]
 pub(crate) mod oracle;
+mod postgres;
 #[cfg(test)]
 mod tests;
+mod worker;
+
+pub use postgres::{PostgresJournal, PostgresJournalSettings};
+pub use worker::{DeliveryWorker, DrainReport, WorkerHandle, WorkerSettings};
 
 use std::fmt;
 use std::time::{Duration, SystemTime};
@@ -231,6 +236,10 @@ impl UsageEvent {
     /// because that is the one a consumer may already have delivered. A store
     /// implements this as equality of the columns it wrote, not of the row it
     /// was handed.
+    // Contract surface: the conformance suite and the in-memory oracle are the
+    // only callers, because a store answers the same question in its own terms
+    // (the Postgres one compares the stored `jsonb`).
+    #[allow(dead_code)]
     pub fn is_same_fact_as(&self, other: &Self) -> bool {
         self.record == other.record
     }
@@ -385,6 +394,10 @@ pub enum Appended {
 }
 
 impl Appended {
+    /// Where the event sits in the journal, whether this append wrote it or
+    /// recognised it. Contract surface: the suite asserts a retried append
+    /// reports the *first* position.
+    #[allow(dead_code)]
     pub fn position(&self) -> u64 {
         match self {
             Self::Accepted { position } | Self::AlreadyPresent { position } => *position,
@@ -414,6 +427,9 @@ pub enum PoisonReason {
     /// from blocking every later event for the same ordering key.
     AttemptsExhausted,
 }
+
+/// Every value [`PoisonReason::as_str`] can produce, for the metric catalogue.
+pub const POISON_REASONS: &[&str] = &["malformed", "rejected", "attempts_exhausted"];
 
 impl PoisonReason {
     pub fn as_str(self) -> &'static str {
@@ -692,4 +708,17 @@ pub trait UsageJournal: Send + Sync {
     /// This consumer's depth, in-flight count, oldest pending age, quarantine
     /// count, and the capacity they are bounded by.
     async fn stats(&self, consumer: &ConsumerId) -> Result<JournalStats, JournalError>;
+
+    /// Forget what retention no longer holds, and report how many events that
+    /// was.
+    ///
+    /// Separate from the delivery path because it is the one operation that is
+    /// nobody's dependency: an append at [`Capacity::max_events`] reclaims what it
+    /// needs itself, so this only keeps a journal that is *not* under pressure
+    /// from growing to its limit and paying for the exact counts that go with it.
+    /// The default is the honest answer for a store that has nothing to prune.
+    async fn maintain(&self, now: SystemTime) -> Result<u64, JournalError> {
+        let _ = now;
+        Ok(0)
+    }
 }

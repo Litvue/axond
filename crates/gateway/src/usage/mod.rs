@@ -20,10 +20,6 @@
 
 mod batch;
 pub mod identity;
-// Contract only, like [`crate::desired_state`]: the Postgres outbox worker that
-// implements the journal is the next slice of #155, so nothing here is
-// constructed by `serve` and the runtime's delivery mode stays telemetry-grade.
-#[allow(dead_code)]
 pub mod journal;
 mod otlp;
 mod postgres;
@@ -33,19 +29,29 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::config::{UsageSinkConfig, UsageSinkKind};
+use crate::config::{
+    UndurablePolicy, UsageJournalBackend, UsageJournalConfig, UsageSinkConfig, UsageSinkKind,
+};
 use crate::credentials::CredentialSource;
+use crate::usage::journal::{
+    DeliveryMode, DeliveryWorker, JournalError, PostgresJournal, PostgresJournalSettings,
+    UsageEvent, UsageJournal, WorkerHandle, WorkerSettings,
+};
 
 pub use batch::{BatchSettings, BatchedSink};
+pub use journal::{ConsumerId, DrainReport};
 pub use otlp::OtlpUsageSink;
 pub use postgres::{PostgresSink, PostgresSinkSettings, tls_connector, validate_table_name};
 
 /// The terminal outcome of a request. Every terminated request produces
 /// exactly one record — including failures, cancellations, and partial
 /// streams — so spend reconciles (delta B6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+///
+/// `Deserialize` as well as `Serialize`, because a journaled record is read back
+/// by the delivery worker that writes it to a sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)] // Ok/UpstreamError wired now; the rest as streaming + cancellation land
 pub enum Status {
@@ -370,6 +376,253 @@ impl UsageSinkError {
     }
 }
 
+/// Whether a sink may buffer, which is the same question as whether a write it
+/// accepted is allowed to be lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Buffering {
+    /// Batch behind a bounded queue that drops when full. The telemetry-grade
+    /// default: it keeps sinks off the request path.
+    Batched,
+    /// Write through, so the caller learns whether the row landed. What a
+    /// journal consumer needs, because it acknowledges on the answer.
+    WriteThrough,
+}
+
+/// How usage leaves the request path, in whichever mode the deployment chose.
+///
+/// The two modes are deliberately one type rather than two call sites in
+/// [`crate::routes`]: the request path asks for an event to be recorded and gets
+/// back either nothing to worry about or a refusal, and which of the two is
+/// possible is a property of the configuration rather than of the route.
+pub struct UsageDelivery {
+    /// The telemetry-grade fan-out. Empty in billing-grade mode, where the sinks
+    /// belong to the delivery worker.
+    fanout: UsageFanout,
+    journal: Option<Arc<dyn UsageJournal>>,
+    on_undurable: UndurablePolicy,
+}
+
+/// A usage event that could not be made durable, and the request that must now
+/// decide what to do about it.
+#[derive(Debug, thiserror::Error)]
+#[error("the usage event for `{request_id}` could not be journaled ({reason}): {detail}")]
+pub struct NotDurable {
+    pub request_id: String,
+    /// Stable, low-cardinality: the same value the metric carries.
+    pub reason: &'static str,
+    pub detail: String,
+}
+
+impl UsageDelivery {
+    /// Telemetry-grade: best effort, non-blocking, lossy under overload.
+    pub fn telemetry(fanout: UsageFanout) -> Self {
+        Self {
+            fanout,
+            journal: None,
+            on_undurable: UndurablePolicy::Serve,
+        }
+    }
+
+    /// Billing-grade: the record is durable before this returns, or the request
+    /// is told it was not.
+    pub fn billing(journal: Arc<dyn UsageJournal>, on_undurable: UndurablePolicy) -> Self {
+        Self {
+            fanout: UsageFanout::new(Vec::new()),
+            journal: Some(journal),
+            on_undurable,
+        }
+    }
+
+    pub fn mode(&self) -> DeliveryMode {
+        self.journal
+            .as_ref()
+            .map_or(DeliveryMode::TelemetryGrade, |journal| journal.mode())
+    }
+
+    /// Record one terminated request's usage.
+    ///
+    /// In telemetry-grade mode this is the fan-out and cannot fail. In
+    /// billing-grade mode it is a durable append, and the `Err` is the request
+    /// path's cue: under [`UndurablePolicy::Refuse`] the caller is told the
+    /// request was not recorded rather than being billed for nothing.
+    pub async fn record(&self, record: &UsageRecord) -> Result<(), NotDurable> {
+        let Some(journal) = self.journal.as_ref() else {
+            self.fanout.record(record).await;
+            return Ok(());
+        };
+        let event = match UsageEvent::new(ObservedRecord::now(record.clone())) {
+            Ok(event) => event,
+            Err(error) => {
+                return self.undurable(record, "invalid_event", error.to_string());
+            }
+        };
+        match journal.append(&event).await {
+            Ok(appended) => {
+                crate::telemetry::metrics::record_usage_journal_append(
+                    journal.name(),
+                    if appended.is_new() {
+                        "accepted"
+                    } else {
+                        // A retried append of an identical event. Not an error:
+                        // the fact is already durable exactly once.
+                        "already_present"
+                    },
+                );
+                Ok(())
+            }
+            Err(error) => {
+                let reason = match &error {
+                    JournalError::AtCapacity { .. } => "at_capacity",
+                    JournalError::Conflict { .. } => "conflict",
+                    _ => "backend",
+                };
+                self.undurable(record, reason, error.to_string())
+            }
+        }
+    }
+
+    /// Count the failure, and let the configured policy decide whether the
+    /// request survives it.
+    fn undurable(
+        &self,
+        record: &UsageRecord,
+        reason: &'static str,
+        detail: String,
+    ) -> Result<(), NotDurable> {
+        let journal = self
+            .journal
+            .as_ref()
+            .map_or("none", |journal| journal.name());
+        crate::telemetry::metrics::record_usage_journal_append(journal, reason);
+        if self.on_undurable.refuses() {
+            return Err(NotDurable {
+                request_id: record.request_id.clone(),
+                reason,
+                detail,
+            });
+        }
+        // Served anyway, by explicit configuration: the event is gone, and it is
+        // counted where every other lost usage record is counted.
+        tracing::error!(
+            request_id = %record.request_id,
+            reason,
+            detail = %detail,
+            "usage event was not journaled and the request was served anyway"
+        );
+        crate::telemetry::metrics::record_usage_journal_lost(journal, reason, 1);
+        Ok(())
+    }
+
+    /// Record where the caller has no way to refuse: a stream that has already
+    /// been relayed, or a cancellation. The event is still appended durably
+    /// first; what changes is that a failure can only be reported, so it is
+    /// counted as a loss rather than returned.
+    pub async fn record_terminal(&self, record: &UsageRecord) {
+        if let Err(error) = self.record(record).await {
+            let journal = self
+                .journal
+                .as_ref()
+                .map_or("none", |journal| journal.name());
+            tracing::error!(
+                request_id = %error.request_id,
+                reason = error.reason,
+                detail = %error.detail,
+                "a terminated request's usage event could not be journaled and cannot be refused"
+            );
+            crate::telemetry::metrics::record_usage_journal_lost(journal, error.reason, 1);
+        }
+    }
+
+    /// Flush what is buffered. Telemetry-grade only: a journal's backlog is
+    /// durable, so it is drained by the worker's own bounded shutdown rather
+    /// than flushed here.
+    pub async fn flush(&self, budget: Duration) -> FlushReport {
+        self.fanout.flush(budget).await
+    }
+}
+
+/// The usage write path a process booted with: how records leave the request,
+/// and the worker that delivers them when they are journaled.
+pub struct UsageRuntime {
+    pub delivery: Arc<UsageDelivery>,
+    /// Present exactly when a journal is configured.
+    pub worker: Option<WorkerHandle>,
+}
+
+/// Build the usage write path from configuration.
+///
+/// Connecting happens here, so a deployment that asked for billing-grade
+/// delivery and cannot reach its outbox refuses to boot rather than discovering
+/// at the first request that it must fail closed.
+pub async fn build_runtime(
+    sinks: &[UsageSinkConfig],
+    journal: &UsageJournalConfig,
+    env: &HashMap<String, String>,
+) -> Result<UsageRuntime, UsageSinkError> {
+    if journal.backend == UsageJournalBackend::None {
+        let sinks = build_sinks(sinks, env, Buffering::Batched).await?;
+        return Ok(UsageRuntime {
+            delivery: Arc::new(UsageDelivery::telemetry(UsageFanout::new(sinks))),
+            worker: None,
+        });
+    }
+    let dsn_env = journal.dsn_env.as_deref().unwrap_or_default();
+    let dsn = env
+        .get(dsn_env)
+        .filter(|dsn| !dsn.trim().is_empty())
+        .ok_or_else(|| {
+            UsageSinkError::invalid(
+                "journal",
+                format!("`{dsn_env}` is unset or empty in the environment"),
+            )
+        })?;
+    let store = PostgresJournal::connect(
+        dsn,
+        PostgresJournalSettings {
+            schema: journal.schema.clone(),
+            create_schema: journal.create_schema,
+            capacity: journal.capacity(),
+            connect_timeout: Duration::from_millis(journal.connect_timeout_ms),
+            operation_timeout: Duration::from_millis(journal.operation_timeout_ms),
+            connections: journal.connections,
+        },
+    )
+    .await
+    .map_err(|error| UsageSinkError::invalid("journal", error.to_string()))?;
+    let store: Arc<dyn UsageJournal> = Arc::new(store);
+    let capacity = store.capacity();
+    if capacity.policy.can_lose_events() {
+        tracing::warn!(
+            journal = store.name(),
+            policy = capacity.policy.as_str(),
+            max_events = capacity.max_events,
+            "the usage journal may drop accepted events when it fills; \
+             `capacity_policy = \"refuse\"` is the billing-grade setting"
+        );
+    }
+    let consumer = ConsumerId::parse(&journal.consumer)
+        .map_err(|error| UsageSinkError::invalid("journal", error.to_string()))?;
+    // Write-through, because the worker acknowledges on what the sink returns: a
+    // batching sink would have it acknowledge a row that does not exist yet.
+    let sinks = build_sinks(sinks, env, Buffering::WriteThrough).await?;
+    let worker = DeliveryWorker::new(
+        Arc::clone(&store),
+        Arc::new(sinks),
+        WorkerSettings {
+            consumer,
+            claim_batch: journal.claim_batch,
+            lease: Duration::from_secs(journal.lease_seconds),
+            poll_interval: Duration::from_millis(journal.poll_interval_ms),
+            maintain_interval: Duration::from_secs(60),
+        },
+    )
+    .spawn();
+    Ok(UsageRuntime {
+        delivery: Arc::new(UsageDelivery::billing(store, journal.on_undurable)),
+        worker: Some(worker),
+    })
+}
+
 /// Build the configured sinks, or the stdout default when none are declared.
 ///
 /// Connecting and (optionally) creating the table happens here so a
@@ -378,6 +631,7 @@ impl UsageSinkError {
 pub async fn build_sinks(
     configs: &[UsageSinkConfig],
     env: &HashMap<String, String>,
+    buffering: Buffering,
 ) -> Result<Vec<Box<dyn UsageSink>>, UsageSinkError> {
     if configs.is_empty() {
         return Ok(vec![Box::new(StdoutSink)]);
@@ -406,10 +660,16 @@ pub async fn build_sinks(
                     },
                 )
                 .await?;
-                sinks.push(Box::new(BatchedSink::spawn(
-                    Arc::new(sink),
-                    config.batch_settings(),
-                )));
+                match buffering {
+                    Buffering::Batched => sinks.push(Box::new(BatchedSink::spawn(
+                        Arc::new(sink),
+                        config.batch_settings(),
+                    ))),
+                    // The journal is the buffer, and it is a durable one, so the
+                    // sink's own queue would only add a place for a row to be
+                    // lost after it was acknowledged.
+                    Buffering::WriteThrough => sinks.push(Box::new(sink)),
+                }
             }
         }
     }
@@ -463,6 +723,83 @@ mod tests {
         }
     }
 
+    /// A billing-grade delivery over the in-memory contract oracle. The journal's
+    /// own tests cover the storage; these cover the decision the request path
+    /// makes about the answer it gets back.
+    fn billing(capacity: journal::Capacity, on_undurable: UndurablePolicy) -> UsageDelivery {
+        let journal = Arc::new(journal::oracle::InMemoryUsageJournal::with_capacity(
+            capacity,
+        ));
+        UsageDelivery::billing(journal, on_undurable)
+    }
+
+    fn bounded(max_events: u64) -> journal::Capacity {
+        journal::Capacity {
+            max_events,
+            ..journal::Capacity::BILLING_GRADE
+        }
+    }
+
+    #[tokio::test]
+    async fn telemetry_grade_delivery_cannot_refuse_a_request() {
+        let delivery = UsageDelivery::telemetry(UsageFanout::new(vec![Box::new(StdoutSink)]));
+        assert_eq!(delivery.mode(), DeliveryMode::TelemetryGrade);
+        // The existing default: the record goes out best effort, and the request
+        // path has nothing to decide.
+        delivery
+            .record(&sample_record())
+            .await
+            .expect("telemetry-grade delivery is infallible");
+    }
+
+    #[tokio::test]
+    async fn a_journaled_event_is_durable_before_the_request_is_answered() {
+        let delivery = billing(bounded(8), UndurablePolicy::Refuse);
+        let record = sample_record();
+        delivery.record(&record).await.expect("append");
+        // The retry of an identical event is not a second charge and not an
+        // error: the fact is durable exactly once.
+        delivery
+            .record(&record)
+            .await
+            .expect("an identical append is already durable");
+    }
+
+    #[tokio::test]
+    async fn a_full_journal_refuses_the_request_rather_than_billing_for_nothing() {
+        let delivery = billing(bounded(1), UndurablePolicy::Refuse);
+        delivery.record(&sample_record()).await.expect("append");
+        let error = delivery
+            .record(&sample_record())
+            .await
+            .expect_err("a full journal cannot make the next event durable");
+        assert_eq!(error.reason, "at_capacity");
+        // The reason is what the operator alerts on, and the request id is what
+        // ties the refusal to the request that was not recorded.
+        assert!(error.to_string().contains(&error.request_id), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_deployment_that_chose_to_serve_anyway_is_served_and_the_loss_counted() {
+        let delivery = billing(bounded(1), UndurablePolicy::Serve);
+        delivery.record(&sample_record()).await.expect("append");
+        // Explicitly configured: availability over accounting, with the event
+        // gone rather than silently deferred.
+        delivery
+            .record(&sample_record())
+            .await
+            .expect("`serve` does not refuse the request");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_record_that_cannot_be_journaled_does_not_unwind_the_response() {
+        let delivery = billing(bounded(1), UndurablePolicy::Refuse);
+        delivery.record(&sample_record()).await.expect("append");
+        // A stream whose bytes were already relayed: there is no answer left to
+        // refuse, so the failure can only be counted.
+        delivery.record_terminal(&sample_record()).await;
+    }
+
     #[tokio::test]
     async fn a_write_through_sink_has_nothing_to_flush() {
         let fanout = UsageFanout::new(vec![Box::new(StdoutSink)]);
@@ -505,7 +842,9 @@ mod tests {
 
     #[tokio::test]
     async fn no_configured_sink_keeps_the_stdout_default() {
-        let sinks = build_sinks(&[], &HashMap::new()).await.expect("defaults");
+        let sinks = build_sinks(&[], &HashMap::new(), Buffering::Batched)
+            .await
+            .expect("defaults");
         assert_eq!(sinks.len(), 1);
         assert_eq!(sinks[0].name(), "stdout");
     }
@@ -517,7 +856,7 @@ mod tests {
             dsn_env: Some("AXOND_TEST_MISSING_DSN".to_string()),
             ..UsageSinkConfig::default()
         };
-        let err = build_sinks(&[config], &HashMap::new())
+        let err = build_sinks(&[config], &HashMap::new(), Buffering::Batched)
             .await
             .err()
             .expect("missing dsn must fail at boot");

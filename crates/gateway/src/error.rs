@@ -36,6 +36,12 @@ pub enum GatewayError {
     },
     #[error("budget store is unavailable")]
     BudgetUnavailable,
+    /// A billing-grade deployment could not journal the request's usage event
+    /// and is configured to refuse rather than serve a request it cannot bill
+    /// for. The upstream work is already done; what is refused is the
+    /// *acknowledgement* of a request whose spend would otherwise go unrecorded.
+    #[error("usage could not be recorded durably: {reason}")]
+    UsageNotDurable { reason: &'static str },
     #[error("rate-limit store is unavailable")]
     RateLimitUnavailable,
     #[error("continuation affinity unavailable for Responses target `{provider}/{model}`")]
@@ -119,6 +125,10 @@ impl GatewayError {
             // Fail-closed: the cap cannot be enforced, so the request is a
             // dependency failure rather than an over-cap caller (ADR 0010).
             Self::BudgetUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            // Same fail-closed reasoning as the budget store, applied to the
+            // usage outbox: billing-grade delivery promised the event is durable
+            // before the response is acknowledged, and it is not.
+            Self::UsageNotDurable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::RateLimitUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::ContinuationAffinityUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::RevocationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -175,6 +185,7 @@ impl GatewayError {
             Self::BudgetExceeded(_) => "budget_exceeded",
             Self::RequestCostCeilingExceeded { .. } => "request_cost_ceiling_exceeded",
             Self::BudgetUnavailable => "budget_unavailable",
+            Self::UsageNotDurable { .. } => "usage_not_durable",
             Self::RateLimitUnavailable => "rate_limit_unavailable",
             Self::ContinuationAffinityUnavailable { .. } => "continuation_affinity_unavailable",
             Self::RevocationUnavailable => "revocation_unavailable",

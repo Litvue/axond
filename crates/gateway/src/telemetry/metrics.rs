@@ -37,6 +37,16 @@ struct Instruments {
     usage_written: Counter<u64>,
     usage_dropped: Counter<u64>,
     usage_flushes: Counter<u64>,
+    journal_appends: Counter<u64>,
+    journal_deliveries: Counter<u64>,
+    journal_quarantined: Counter<u64>,
+    journal_undeliverable: Counter<u64>,
+    journal_lost: Counter<u64>,
+    journal_depth: Gauge<u64>,
+    journal_in_flight: Gauge<u64>,
+    journal_quarantine_depth: Gauge<u64>,
+    journal_oldest_pending: Gauge<u64>,
+    journal_capacity: Gauge<u64>,
     shutdown_phase: Gauge<u64>,
     shutdown_rejections: Counter<u64>,
     shutdown_abandoned: Counter<u64>,
@@ -156,6 +166,66 @@ impl Instruments {
             usage_flushes: meter
                 .u64_counter("axond.usage.flushes")
                 .with_description("Shutdown flushes of a buffered usage sink, by sink and outcome.")
+                .build(),
+            journal_appends: meter
+                .u64_counter("axond.usage.journal.appends")
+                .with_description(
+                    "Billing-grade usage appends, by journal and outcome. Anything other than \
+                     `accepted` or `already_present` means the request was not journaled.",
+                )
+                .build(),
+            journal_deliveries: meter
+                .u64_counter("axond.usage.journal.deliveries")
+                .with_description(
+                    "Journaled usage events handed to their destinations, by consumer and \
+                     outcome. `redelivered` is expected: delivery is at-least-once.",
+                )
+                .build(),
+            journal_quarantined: meter
+                .u64_counter("axond.usage.journal.quarantined")
+                .with_description(
+                    "Usage events set aside as poison, by consumer and reason. Each one needs an \
+                     operator.",
+                )
+                .build(),
+            journal_undeliverable: meter
+                .u64_counter("axond.usage.journal.undeliverable")
+                .with_description(
+                    "Journaled events this build declined to deliver, by reason: written by a \
+                     newer schema, or unreadable.",
+                )
+                .build(),
+            journal_lost: meter
+                .u64_counter("axond.usage.journal.lost")
+                .with_description(
+                    "Usage events a billing-grade deployment gave up, by reason. Every increment \
+                     is a missing billable fact and should be alerted on.",
+                )
+                .build(),
+            journal_depth: meter
+                .u64_gauge("axond.usage.journal.depth")
+                .with_description("Journaled usage events awaiting delivery, by consumer.")
+                .build(),
+            journal_in_flight: meter
+                .u64_gauge("axond.usage.journal.in_flight")
+                .with_description("Journaled usage events under an unexpired lease, by consumer.")
+                .build(),
+            journal_quarantine_depth: meter
+                .u64_gauge("axond.usage.journal.quarantined_events")
+                .with_description("Quarantined usage events still retained, by consumer.")
+                .build(),
+            journal_oldest_pending: meter
+                .u64_gauge("axond.usage.journal.oldest_pending_age")
+                .with_unit("s")
+                .with_description(
+                    "Age of the oldest undelivered journaled event. The delivery lag to alert on.",
+                )
+                .build(),
+            journal_capacity: meter
+                .u64_gauge("axond.usage.journal.capacity")
+                .with_description(
+                    "The journal's event bound, so depth can be read as a fraction of it.",
+                )
                 .build(),
             shutdown_phase: meter
                 .u64_gauge("axond.shutdown.phase")
@@ -452,6 +522,129 @@ pub fn record_usage_flush(sink: &'static str, outcome: &'static str) {
             KeyValue::new("axond.usage_sink", sink),
             KeyValue::new("axond.flush_outcome", outcome),
         ],
+    );
+}
+
+/// One billing-grade append's outcome. `outcome` is the bounded vocabulary in
+/// [`crate::usage::UsageDelivery`]: `accepted` and `already_present` are the only
+/// two under which the event is durable.
+pub fn record_usage_journal_append(journal: &'static str, outcome: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.journal_appends.add(
+        1,
+        &[
+            KeyValue::new("axond.usage_journal", journal),
+            KeyValue::new("axond.journal.outcome", outcome),
+        ],
+    );
+}
+
+/// Deliveries of journaled events. `redelivered` counts attempts after the
+/// first, which at-least-once delivery makes normal rather than exceptional.
+pub fn record_usage_journal_deliveries(
+    journal: &'static str,
+    consumer: &str,
+    outcome: &'static str,
+    count: u64,
+) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    if count == 0 {
+        return;
+    }
+    instruments.journal_deliveries.add(
+        count,
+        &[
+            KeyValue::new("axond.usage_journal", journal),
+            KeyValue::new("axond.usage_journal.consumer", consumer.to_owned()),
+            KeyValue::new("axond.journal.delivery", outcome),
+        ],
+    );
+}
+
+/// An event taken out of the delivery path for an operator to decide about.
+pub fn record_usage_journal_quarantined(
+    journal: &'static str,
+    consumer: &str,
+    reason: &'static str,
+) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.journal_quarantined.add(
+        1,
+        &[
+            KeyValue::new("axond.usage_journal", journal),
+            KeyValue::new("axond.usage_journal.consumer", consumer.to_owned()),
+            KeyValue::new("axond.journal.poison_reason", reason),
+        ],
+    );
+}
+
+/// An event this build left alone: written by a newer schema, or unreadable.
+/// Distinct from a loss, because the event is still journaled.
+pub fn record_usage_journal_undeliverable(journal: &'static str, reason: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.journal_undeliverable.add(
+        1,
+        &[
+            KeyValue::new("axond.usage_journal", journal),
+            KeyValue::new("axond.journal.reason", reason),
+        ],
+    );
+}
+
+/// Billable facts a billing-grade deployment gave up. The one usage metric that
+/// should never move.
+pub fn record_usage_journal_lost(journal: &'static str, reason: &'static str, count: u64) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.journal_lost.add(
+        count,
+        &[
+            KeyValue::new("axond.usage_journal", journal),
+            KeyValue::new("axond.journal.loss_reason", reason),
+        ],
+    );
+}
+
+/// Publish one observation of a journal's backlog. Gauges rather than counters:
+/// what an operator watches is how far behind delivery is right now.
+pub fn record_usage_journal_stats(
+    journal: &'static str,
+    consumer: &str,
+    stats: &crate::usage::journal::JournalStats,
+) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    let labels = [
+        KeyValue::new("axond.usage_journal", journal),
+        KeyValue::new("axond.usage_journal.consumer", consumer.to_owned()),
+    ];
+    instruments.journal_depth.record(stats.pending, &labels);
+    instruments
+        .journal_in_flight
+        .record(stats.in_flight, &labels);
+    instruments
+        .journal_quarantine_depth
+        .record(stats.quarantined, &labels);
+    instruments.journal_oldest_pending.record(
+        stats
+            .oldest_pending_age
+            .map(|age| age.as_secs())
+            .unwrap_or_default(),
+        &labels,
+    );
+    instruments.journal_capacity.record(
+        stats.capacity.max_events,
+        &[KeyValue::new("axond.usage_journal", journal)],
     );
 }
 

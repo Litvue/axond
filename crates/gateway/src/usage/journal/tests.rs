@@ -14,8 +14,10 @@ use super::super::tests::sample_record;
 use super::oracle::InMemoryUsageJournal;
 use super::*;
 
-/// A settled record for `subject`, with a fresh event identity.
-fn event_for(subject: &str) -> UsageEvent {
+/// A settled record for `subject`, with a fresh event identity. Shared with the
+/// worker's and the Postgres outbox's tests, which assert the same contract
+/// against a different implementation of it.
+pub(crate) fn event_for(subject: &str) -> UsageEvent {
     let mut record = sample_record();
     record.request_id = next_request_id().to_string();
     record.subject = subject.to_owned();
@@ -26,7 +28,7 @@ fn event() -> UsageEvent {
     event_for("GW_INBOUND_ACME_KEY")
 }
 
-fn consumer(name: &str) -> ConsumerId {
+pub(crate) fn consumer(name: &str) -> ConsumerId {
     ConsumerId::parse(name).expect("a valid consumer name")
 }
 

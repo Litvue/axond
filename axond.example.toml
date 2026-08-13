@@ -460,6 +460,57 @@ poll_interval_ms = 2_000  # how often the watcher compares contents; floor 100
 # [[usage_sink]]
 # kind = "stdout"
 
+# ── Billing-grade usage delivery (optional) ───────────────────────────────────
+# Omit for the default: the sinks above are best effort, off the request path,
+# and a stalled destination drops records with a count rather than delaying a
+# request. Good telemetry, not an accounting source.
+#
+# Turn this on and every settled usage event is appended to a durable outbox
+# *before the request is answered*, then replayed into those same sinks until
+# they acknowledge it: at-least-once, replayed after a restart, ordered per
+# (namespace, subject), deduplicated by the consumer on `request_id`. Apply
+# ops/postgres/usage_outbox_v1.sql first, and read
+# docs/operations/usage-outbox.md — this adds a failure mode to the request
+# path. See docs/adr/0034-billing-grade-usage-outbox.md.
+
+# [usage_journal]
+# # none (default) | postgres.
+# backend = "postgres"
+# # Env var holding the outbox connection string; a secret, so referenced by
+# # name. `sslmode=require` turns on TLS.
+# dsn_env = "AXOND_USAGE_JOURNAL_DSN"
+# # Schema the outbox tables live in. One unqualified identifier.
+# schema = "billing"
+# # Apply the shipped outbox DDL at boot. Off by default: most deployments give
+# # the gateway's role no DDL rights.
+# create_schema = false
+# # Name the delivery state is kept under. Stable across restarts — a new name
+# # replays everything still retained as first deliveries.
+# consumer = "billing"
+# # Bounds. `max_events` is the outbox's size, and retention must exceed the
+# # longest retry horizon a caller has: pruning an acknowledged event forgets
+# # its idempotency key, so a much later retry would append a second copy.
+# max_events = 1_000_000
+# max_delivery_attempts = 8
+# retain_acknowledged_seconds = 86_400
+# # What a full outbox does: refuse (default; answers 503 usage_not_durable and
+# # keeps the promise) | drop-oldest (bounded but lossy, counted durably).
+# capacity_policy = "refuse"
+# # What a request does when its event could not be journaled: refuse (default)
+# # | serve (answer anyway and count the event as lost).
+# on_undurable = "refuse"
+# # Bounds on the append a request waits for, and on connecting.
+# operation_timeout_ms = 5_000
+# connect_timeout_ms = 5_000
+# # Two is the useful minimum: one for appends, one for the worker's claims.
+# connections = 2
+# # Delivery worker: events per claim, how long a claim stays invisible to
+# # other claimants (also how long recovery from a dead worker takes), and how
+# # long to wait after finding nothing.
+# claim_batch = 256
+# lease_seconds = 30
+# poll_interval_ms = 250
+
 # ---------------------------------------------------------------------------
 # Budget — spend caps on the request path
 # ---------------------------------------------------------------------------
