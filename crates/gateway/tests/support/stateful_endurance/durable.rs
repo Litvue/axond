@@ -35,12 +35,36 @@ pub fn quoted(value: &str) -> String {
     format!("'{escaped}'")
 }
 
+/// Whether every host the DSN names is the loopback interface. Only a loopback
+/// database is put behind the gate: the gate binds `127.0.0.1`, so a loopback
+/// connection reaches it under the same name it would have used anyway, and any
+/// TLS the sink negotiates is verified against that same name. A database
+/// somewhere else is a different name and, under the default `prefer`, a
+/// handshake the gate cannot stand in for — so it is left alone rather than
+/// having its credentials rewritten towards a plaintext forwarder.
+fn is_loopback(config: &tokio_postgres::Config) -> bool {
+    use tokio_postgres::config::Host;
+
+    !config.get_hosts().is_empty()
+        && config.get_hosts().iter().all(|host| match host {
+            Host::Tcp(host) => {
+                host == "localhost"
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+            }
+            // A Unix socket is already local, but it is not something a TCP
+            // forwarder can front.
+            _ => false,
+        })
+}
+
 /// The DSN a replica is given so its usage sink reaches the database through
 /// `gate`, and how it reaches it. A free function so the rebuild can be tested
 /// against credentials a run would rather not have in its fixtures.
 pub fn through_gate(dsn: &str, gate: &str) -> (String, Reach) {
     let config: tokio_postgres::Config = dsn.parse().expect("the test DSN is a valid one");
-    if config.get_ssl_mode() == tokio_postgres::config::SslMode::Require {
+    if config.get_ssl_mode() == tokio_postgres::config::SslMode::Require || !is_loopback(&config) {
         return (dsn.to_owned(), Reach::Direct);
     }
     let (host, port) = gate
@@ -88,9 +112,11 @@ pub struct Durable {
 pub enum Reach {
     /// Through the gate, so the usage backend can be made to disappear.
     Gated,
-    /// Directly, because the DSN asks for TLS and a byte-forwarding gate cannot
-    /// stand in front of a TLS handshake to a different name. The outage is
-    /// then not evaluated rather than silently skipped.
+    /// Directly, because the DSN asks for TLS, or names a database that is not
+    /// on the loopback interface and so may negotiate it: a byte-forwarding
+    /// gate cannot stand in front of a TLS handshake to a different name, and
+    /// rewriting the DSN would hand the credentials to a plaintext forwarder.
+    /// The outage is then not evaluated rather than silently skipped.
     Direct,
 }
 

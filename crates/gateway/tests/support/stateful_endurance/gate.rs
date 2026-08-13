@@ -66,11 +66,20 @@ struct State {
     counters: Counters,
 }
 
-/// A running gate. Dropping it stops accepting; the connections it has already
-/// joined end with the run's runtime.
+/// A running gate. Dropping it stops accepting: the accept loop is aborted and
+/// its listening socket closed, so a run does not leave a listener behind for
+/// the next profile to be measured with. The connections it has already joined
+/// end with the run's runtime.
 pub struct Gate {
     pub addr: SocketAddr,
     state: Arc<State>,
+    accepting: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Gate {
+    fn drop(&mut self) {
+        self.accepting.abort();
+    }
 }
 
 impl Gate {
@@ -89,15 +98,19 @@ impl Gate {
             counters: Counters::default(),
         });
 
-        let accepting = state.clone();
-        tokio::spawn(async move {
+        let serving = state.clone();
+        let accepting = tokio::spawn(async move {
             while let Ok((inbound, _)) = listener.accept().await {
-                let state = accepting.clone();
+                let state = serving.clone();
                 tokio::spawn(async move { serve(inbound, state).await });
             }
         });
 
-        Self { addr, state }
+        Self {
+            addr,
+            state,
+            accepting,
+        }
     }
 
     /// Where a client should be pointed to reach the backend through the gate.
@@ -141,6 +154,11 @@ impl Gate {
 }
 
 async fn serve(mut inbound: TcpStream, state: Arc<State>) {
+    // Subscribed before the outage is read rather than after the backend is
+    // joined: a `watch` receiver marks the value it was created on as seen, so
+    // a cut published while this connection was being set up would otherwise be
+    // missed and the connection would outlive the outage that meant to kill it.
+    let mut cuts = state.generation.subscribe();
     if state.outage.load(Ordering::SeqCst) {
         state.counters.refused.fetch_add(1, Ordering::Relaxed);
         return;
@@ -154,9 +172,14 @@ async fn serve(mut inbound: TcpStream, state: Arc<State>) {
         state.counters.refused.fetch_add(1, Ordering::Relaxed);
         return;
     };
+    // Re-read after connecting: an outage declared while the backend was being
+    // dialled is one this connection is on the wrong side of.
+    if state.outage.load(Ordering::SeqCst) {
+        state.counters.refused.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     state.counters.accepted.fetch_add(1, Ordering::Relaxed);
 
-    let mut cuts = state.generation.subscribe();
     tokio::select! {
         _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
         _ = cuts.changed() => {

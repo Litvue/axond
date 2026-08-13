@@ -560,11 +560,18 @@ pub struct Retired {
     pub flushed: u64,
 }
 
+/// How long a readiness question may go unanswered before the replica counts as
+/// not ready. An orchestrator does not wait forever for `/readyz` either, and
+/// the driver's tick, drain and script all queue behind this call.
+pub const READY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Whether a replica may be reached at all: `/readyz`, as an orchestrator asks
-/// it.
+/// it. A replica that accepts the connection and then says nothing is not
+/// ready, rather than a request the run waits on indefinitely.
 pub async fn ready(client: &reqwest::Client, base_url: &str) -> bool {
     client
         .get(format!("{base_url}/readyz"))
+        .timeout(READY_TIMEOUT)
         .send()
         .await
         .is_ok_and(|response| response.status().is_success())

@@ -75,6 +75,16 @@ The harness needs a PostgreSQL it may create a schema in. Without
 `AXOND_TEST_POSTGRES_DSN` the run is skipped rather than shortened — a stateful
 qualification without a datastore is not a smaller one.
 
+Point it at a database on this machine if you want the usage-backend outage
+evaluated. The replicas reach a loopback database through the fault gate, which
+is how it can be taken away mid-run; a DSN asking for TLS, or naming a host
+somewhere else — which under libpq's default `prefer` may still negotiate TLS —
+is handed to the replicas untouched, since a byte forwarder cannot stand in
+front of a handshake to another name and rewriting the address would hand those
+credentials to a plaintext hop. The artifact then records the backend as reached
+`direct` and the outage as not evaluated, rather than the run silently
+downgrading the connection it was given.
+
 ```bash
 export AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:5432/postgres
 

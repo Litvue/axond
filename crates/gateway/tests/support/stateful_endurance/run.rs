@@ -55,6 +55,14 @@ const PROBE_EVERY: Duration = Duration::from_secs(1);
 /// How long a probe or convergence request may take before it counts as a
 /// failure to answer.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the driver waits for a replica to accept a connection. Generous
+/// against a loaded runner, and finite against a replica that never will.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long any one request the driver makes may take. Well past the slowest
+/// thing the script asks for — a stream through a gate delayed by a quarter of
+/// a second — and short enough that a replica which stops answering ends the
+/// request rather than the run.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the durable table must stop growing for before it is called
 /// settled.
 const DURABLE_QUIET: Duration = Duration::from_secs(2);
@@ -154,10 +162,16 @@ pub async fn run_with(
 
     // One client for the workers and the driver alike, as the stateless drivers
     // do: a pool per worker would put the driver's own descriptors and sockets
-    // into the picture the fleet's resources are read from.
+    // into the picture the fleet's resources are read from. Both timeouts are
+    // the run's own: a replica that accepts a connection and then answers
+    // nothing is a finding this harness should measure and end on, not a
+    // request that hangs the tick, the drain and the script behind it until
+    // libtest gives up on the whole binary.
     let client = Arc::new(
         reqwest::Client::builder()
             .pool_max_idle_per_host(scale.concurrency.max(1))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .expect("the driver's HTTP client builds"),
     );

@@ -716,7 +716,7 @@ fn a_slow_policy_reload_is_not_a_tenant_boundary_breach() {
 #[test]
 fn a_replicas_dsn_carries_awkward_credentials_intact() {
     let (rebuilt, reach) = stateful_endurance::durable::through_gate(
-        "postgres://a%20user:p%40ss%20w%27o%5Crd@db.internal:5432/some%20db?application_name=axond",
+        "postgres://a%20user:p%40ss%20w%27o%5Crd@127.0.0.1:5432/some%20db?application_name=axond",
         "127.0.0.1:6543",
     );
     assert_eq!(reach, stateful_endurance::durable::Reach::Gated);
@@ -734,8 +734,112 @@ fn a_replicas_dsn_carries_awkward_credentials_intact() {
 
     // A TLS DSN is handed over untouched: a byte-forwarding gate cannot stand
     // in front of a handshake to a different name.
-    let tls = "postgres://user:pw@db.internal:5432/postgres?sslmode=require";
+    let tls = "postgres://user:pw@127.0.0.1:5432/postgres?sslmode=require";
     let (passed, reach) = stateful_endurance::durable::through_gate(tls, "127.0.0.1:6543");
     assert_eq!(passed, tls);
     assert_eq!(reach, stateful_endurance::durable::Reach::Direct);
+
+    // So is a database that is not on this machine. Its default mode is
+    // `prefer`, which still attempts a handshake, and rewriting the address
+    // would both point that handshake at the gate's name and hand a remote
+    // server's credentials to a plaintext forwarder. The outage is then not
+    // evaluated, which the artifact says, rather than the run quietly
+    // downgrading the connection it was given.
+    let remote = "postgres://user:pw@db.internal:5432/postgres";
+    let (passed, reach) = stateful_endurance::durable::through_gate(remote, "127.0.0.1:6543");
+    assert_eq!(passed, remote);
+    assert_eq!(reach, stateful_endurance::durable::Reach::Direct);
+
+    // `localhost` is this machine by another name, and the gate binds it too.
+    let (_, reach) = stateful_endurance::durable::through_gate(
+        "postgres://user:pw@localhost:5432/postgres",
+        "127.0.0.1:6543",
+    );
+    assert_eq!(reach, stateful_endurance::durable::Reach::Gated);
+}
+
+/// A gate is a fault, and a fault that misses its moment is evidence the run
+/// did not gather: a connection set up as the backend is taken away must be
+/// cut, and a gate must stop listening when the run that made it ends.
+#[tokio::test]
+async fn a_gate_cuts_what_it_joined_and_stops_when_it_is_dropped() {
+    use stateful_endurance::gate::{Gate, Mode};
+
+    // The cut is subscribed to before the outage is read, so an outage declared
+    // while a connection is being joined to the backend is not missed. A race
+    // this narrow cannot be observed reliably, so the ordering is asserted
+    // where it is decided.
+    let source = include_str!("support/stateful_endurance/gate.rs");
+    let subscribes = source
+        .find("let mut cuts = state.generation.subscribe();")
+        .expect("the connection subscribes to the cut");
+    let reads = source
+        .find("if state.outage.load(Ordering::SeqCst) {")
+        .expect("the connection reads the outage");
+    assert!(subscribes < reads, "the cut is subscribed to first");
+
+    let backend = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the fixture backend binds");
+    let backend_addr = backend.local_addr().expect("the backend has an address");
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = backend.accept().await {
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 64];
+                // Echo until the peer goes away, so a live connection stays
+                // live and a cut one is visible as a closed read.
+                while let Ok(read) = tokio::io::AsyncReadExt::read(&mut inbound, &mut buffer).await
+                {
+                    if read == 0
+                        || tokio::io::AsyncWriteExt::write_all(&mut inbound, &buffer[..read])
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    let addr = {
+        let gate = Gate::start(&backend_addr.to_string()).await;
+        let mut through = tokio::net::TcpStream::connect(gate.addr)
+            .await
+            .expect("the gate accepts");
+        tokio::io::AsyncWriteExt::write_all(&mut through, b"ping")
+            .await
+            .expect("the gate forwards");
+        let mut echoed = [0u8; 4];
+        tokio::io::AsyncReadExt::read_exact(&mut through, &mut echoed)
+            .await
+            .expect("the backend answers through the gate");
+
+        // The outage cuts what the gate had already joined.
+        gate.set(Mode::Outage);
+        let mut buffer = [0u8; 4];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut through, &mut buffer),
+        )
+        .await
+        .expect("the cut connection ends rather than outliving the outage");
+        assert!(matches!(read, Ok(0) | Err(_)), "the connection was cut");
+        assert_eq!(gate.counts().cut, 1);
+        gate.addr
+    };
+
+    // And the listener does not outlive the gate: the next profile is measured
+    // without this run's sockets still bound.
+    tokio::task::yield_now().await;
+    let after = tokio::net::TcpStream::connect(addr).await;
+    assert!(
+        after.is_err() || {
+            let mut orphaned = after.expect("checked");
+            tokio::io::AsyncWriteExt::write_all(&mut orphaned, b"ping")
+                .await
+                .is_err()
+        },
+        "a dropped gate keeps accepting connections"
+    );
 }

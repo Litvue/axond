@@ -231,6 +231,13 @@ jobs:
   stateful-tests:
     name: Stateful tests
     runs-on: ubuntu-latest
+    # Nothing in this lane may cut the endurance smoke tier off mid-run: its
+    # ninety seconds are the workload's own duration, after which the driver
+    # settles, reconciles and writes its artifact — a run killed part-way
+    # publishes no evidence and proves nothing. The bound here is a hang bound,
+    # far above the whole lane's work, so a wedged replica or backend ends the
+    # job instead of holding a runner for the default six hours.
+    timeout-minutes: 60
     services:
       redis:
         image: redis:7.4.2-alpine
@@ -293,6 +300,13 @@ jobs:
       # and the run's gates are the deployment's behaviour — records reconciled,
       # tenants isolated, revisions converged, restarts served — not throughput
       # or latency, which are recorded and never asserted for this reason.
+      #
+      # How it ends: on its own script, every time. The driver stops when the
+      # manifest's duration has elapsed (or on a declared abort condition,
+      # recorded as `run.stop`), then drains, settles and writes the artifact
+      # this step publishes. No step timeout is placed on it, and every request
+      # it makes is individually bounded, so a hung replica ends the run's own
+      # request rather than being cut off by a clock outside the run.
       - name: Publish the stateful endurance smoke results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
