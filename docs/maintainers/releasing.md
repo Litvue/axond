@@ -47,6 +47,13 @@ release resumes at the first missing crate.
   arrive as public issues.
 - `packages: write`, `id-token: write`, and attestation permissions in the
   release jobs.
+- The `area:operations` label, which
+  [`.github/dependabot.yml`](../../.github/dependabot.yml) applies to its pin
+  bumps. Dependabot rejects its whole configuration on an unknown label and
+  reports it only on the repository's Dependabot page, so a renamed label would
+  stop the Action pins from being refreshed silently —
+  [`ops/dependabot-labels.sh`](../../ops/dependabot-labels.sh) fails the
+  `workflow-policy` lane instead.
 
 The crates.io token owner must have a verified email address.
 
@@ -243,6 +250,104 @@ land it as a **minor** release with a changelog entry that says why. To raise
 only the pinned developer toolchain, bump `rust-toolchain.toml` and the workflow
 pins and leave `rust-version` alone; the `msrv` lane then keeps proving the older
 floor still builds.
+
+## Workflow Action pins
+
+The policy behind this section is
+[ADR 0035](../adr/0035-pinned-github-actions.md). The release jobs can reach the
+release GitHub App token, `CARGO_REGISTRY_TOKEN`, and the keyless signing
+identity, so a third-party Action running there is as privileged as this runbook.
+`owner/action@v3` is a pointer the upstream owner can move, so every `uses:` in
+`.github/workflows` names a full commit SHA with the version in a trailing
+comment:
+
+```yaml
+- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+```
+
+The required `workflow-policy` lane runs
+[`ops/workflow-policy.py`](../../ops/workflow-policy.py), which rejects a tag or
+branch ref, a short SHA, a pin with no readable version comment, a workflow with
+no `permissions:` block, `permissions: write-all`, an unanchored
+`SIGNER_IDENTITY`, and a `cosign verify` that does not restrict the certificate
+identity and issuer — in the workflows and in the shell under `ops/`, which is
+where [`ops/verify-image-evidence.sh`](../../ops/verify-image-evidence.sh)
+actually verifies the release images. It also requires one reviewed pin per
+action across all workflows, so two lanes cannot silently run different builds of
+the same Action.
+The lane proves it still rejects those with `ops/workflow-policy.py --self-test`
+before it checks the repository, and then lints the workflows with
+[`ops/actionlint.sh`](../../ops/actionlint.sh). That script runs one pinned
+`actionlint` version, reached two ways: the checksum-verified release archive for
+this host (Linux and macOS,
+x86-64 and arm64, each with its own checksum from the release's
+`checksums.txt`), otherwise the same version as a digest-pinned container image —
+which is the path GitHub-hosted runners take, because they answer 503 for the
+release asset, and the path any other host takes rather than downloading a binary
+it cannot execute. Bumping `actionlint` means updating the version, all four
+checksums, and the image digest together. A binary merely sitting on `PATH` is
+deliberately *not* used — nothing but its own `--version` vouches for it, and
+trusting it would make the pinned paths decorative on any machine that has one.
+Point `AXOND_ACTIONLINT` at a build you placed yourself to skip the download; the
+script still refuses it unless it reports the pinned version. Locally:
+
+```bash
+just workflow-policy   # pins, permissions, signer restrictions, Dependabot labels
+just actionlint        # workflow linting; downloads the pinned actionlint
+```
+
+Everything in that lane is offline except the label check
+([`ops/dependabot-labels.sh`](../../ops/dependabot-labels.sh)), which needs an
+authenticated `gh` and reports that it skipped when there is none. It also skips
+outside `Litvue/axond` — labels are not copied when a repository is forked, and
+Dependabot only ever reads this configuration where it lives, so a fork running
+the same required lane would otherwise fail on a label that cannot matter to it.
+On CI it uses
+the job's own `github.token` for a read-only label query and prints what it
+verified, so the lane carries its own evidence:
+
+```
+dependabot labels exist on Litvue/axond (area:operations)
+```
+
+The job keeps the workflow's `contents: read` and adds nothing: listing labels is
+Issues-scoped, and GitHub serves it without any permission while the repository is
+public. If `axond` ever becomes private, that query starts returning 403 and the
+check says so and fails rather than reporting a verified label — the fix is
+`issues: read` on this job alone, not a wider workflow grant.
+
+Its `--self-test` (also run in the lane) covers the ways the check could pass
+while verifying nothing: a neighbouring `- package-ecosystem:` entry read as a
+label, a config that moved or was renamed, and a `labels:` key written in a shape
+the reader cannot see (an inline `[…]` list). All three fail rather than report
+success.
+
+If a host has neither a supported release archive nor `docker`, the script says
+so and fails instead of linting with an unpinned version.
+
+[`.github/dependabot.yml`](../../.github/dependabot.yml) opens one grouped
+`ci(deps):` pull request a week that moves the pins and their comments forward
+together. Reviewing a pin bump — Dependabot's or your own — means checking that
+the SHA is the commit the claimed tag points at in the upstream repository, not
+just that the comment reads plausibly:
+
+```bash
+gh api repos/actions/checkout/commits/v7.0.1 --jq .sha
+```
+
+Bumping a pin by hand follows the same rule: resolve the tag to its SHA, write
+both, and let the lane confirm the format. Where an action publishes no usable
+release tag the comment names the upstream branch the SHA was taken from
+(`dtolnay/rust-toolchain@… # stable`), which is also the pin most likely to need
+a manual refresh. Dependabot only ever rewrites a SHA pin to another SHA and
+edits the comment to match — it cannot turn a pin into a `@v1` tag ref, and the
+lane would reject one if it did — but for that branch pin it may propose the SHA
+behind the upstream `v1` tag with the comment rewritten to `# v1`. That is still
+immutable, and it is a deliberate change of which upstream ref the pin follows:
+take it only if tracking the tag is what you want, and keep `# stable` otherwise.
+A proposed *major* bump is not a pin change: read the upstream
+release notes for renamed inputs and changed defaults before taking it, because
+the pinned SHA is what CI will run until someone changes it again.
 
 ## Security releases
 

@@ -336,6 +336,14 @@ const EXPECTED_MINTED_CLASSES: &[(&str, &str)] = &[
     ("foreign-audience", "token_wrong_audience"),
     ("lifetime-past-the-policy-ceiling", "token_invalid_lifetime"),
     ("empty-subject", "token_missing_claim"),
+    // An empty alias is not a name, so the whole claim is refused rather than
+    // partially honoured.
+    ("alias-scoped", "token_alias_claim_invalid"),
+    // `iat` is bounded from above as well as below: the lifetime check refuses an
+    // `iat` more than the clock skew ahead of now, so a token stamped billions of
+    // years out is refused even though its `exp - iat` is a legal 300 seconds.
+    // Pinned so that upper bound cannot quietly disappear.
+    ("issued-far-in-the-future", "token_invalid_lifetime"),
     (
         "issued-before-the-namespace-epoch",
         "token_issued_before_epoch",

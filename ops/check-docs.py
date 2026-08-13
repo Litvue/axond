@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -343,6 +344,43 @@ def self_test() -> int:
     assert len(omitted) == 1, omitted
     assert "'ops/binary-smoke.py' runs in the release workflow" in omitted[0], omitted
 
+    with tempfile.TemporaryDirectory() as raw:
+        records = Path(raw)
+        (records / "0031-first.md").write_text("# 31. First\n", encoding="utf-8")
+        assert check_adr_numbering(records) == []
+        # The collision this gate exists for: two branches both took 0031.
+        (records / "0031-second.md").write_text("# 31. Second\n", encoding="utf-8")
+        collision = check_adr_numbering(records)
+        assert len(collision) == 1, collision
+        assert "ADR 0031 is already" in collision[0], collision
+        # A renamed file whose heading kept the old number is just as ambiguous.
+        (records / "0031-second.md").unlink()
+        (records / "0032-renumbered.md").write_text("# 31. First\n", encoding="utf-8")
+        heading = check_adr_numbering(records)
+        assert len(heading) == 1 and "does not start with" in heading[0], heading
+        # A malformed name or an empty record is reported, not raised: a gate that
+        # tracebacks tells a contributor nothing about what to rename.
+        (records / "0032-renumbered.md").unlink()
+        (records / "003-short.md").write_text("# 3. Short\n", encoding="utf-8")
+        short = check_adr_numbering(records)
+        assert len(short) == 1 and "four-digit ADR number" in short[0], short
+        (records / "003-short.md").unlink()
+        (records / "0032-empty.md").write_text("", encoding="utf-8")
+        empty_record = check_adr_numbering(records)
+        assert len(empty_record) == 1, empty_record
+        assert "does not start with" in empty_record[0], empty_record
+
+    package = '[package]\nname = "axond"\n\n[[bin]]\nname = "axond"\n'
+    distinct = f'{package}\n[lib]\nname = "axond_fuzz_seam"\n'
+    assert documented_target_failures("m", distinct) == []
+    assert documented_target_failures("m", package) == []
+    # The clash, spelled out and — the easier one to reintroduce — defaulted to
+    # the package name by leaving `[lib] name` off entirely.
+    for clashing in (f'{package}\n[lib]\nname = "axond"\n', f"{package}\n[lib]\n"):
+        shadowed = documented_target_failures("m", clashing)
+        assert len(shadowed) == 1, shadowed
+        assert "after a binary of the same crate" in shadowed[0], shadowed
+
     print("check-docs: release-path gate self-test passed")
     return 0
 
@@ -397,6 +435,40 @@ def check_review_trigger_tests() -> list[str]:
     return failures
 
 
+def documented_target_failures(relative: str, text: str) -> list[str]:
+    """The library-versus-binary name clash in one manifest, if it has one."""
+    library = re.search(r"^\[lib\]$(.*?)(?=^\[|\Z)", text, re.M | re.S)
+    if not library:
+        return []
+    named = re.search(r'^name = "([^"]+)"', library.group(1), re.M)
+    if named:
+        name = named.group(1)
+    else:
+        # An omitted `[lib] name` defaults to the package name, which for a
+        # package whose binary is named after it *is* the clash. Resolve it the
+        # way Cargo does rather than skipping the manifest.
+        package = re.search(r"^\[package\]$(.*?)(?=^\[|\Z)", text, re.M | re.S)
+        packaged = (
+            re.search(r'^name = "([^"]+)"', package.group(1), re.M) if package else None
+        )
+        if not packaged:
+            return [f"{relative}: neither `[package]` nor `[lib]` names the library"]
+        name = packaged.group(1)
+    binaries = [
+        match.group(1)
+        for match in re.finditer(
+            r"^\[\[bin\]\]$.*?^name = \"([^\"]+)\"", text, re.M | re.S
+        )
+    ]
+    if name not in binaries:
+        return []
+    return [
+        f"{relative}: the library is named {name!r} after a binary of the same "
+        "crate, so `cargo doc` documents only one of them and the other's modules "
+        "are no longer rustdoc-linted"
+    ]
+
+
 def check_documented_targets() -> list[str]:
     """No crate names a library after one of its own binaries.
 
@@ -409,24 +481,44 @@ def check_documented_targets() -> list[str]:
     """
     failures: list[str] = []
     for manifest in sorted((ROOT / "crates").glob("*/Cargo.toml")):
-        text = manifest.read_text(encoding="utf-8")
-        library = re.search(r"^\[lib\]$(.*?)(?=^\[|\Z)", text, re.M | re.S)
-        if not library:
-            continue
-        name = re.search(r'^name = "([^"]+)"', library.group(1), re.M)
-        if not name:
-            continue
-        binaries = [
-            match.group(1)
-            for match in re.finditer(
-                r"^\[\[bin\]\]$.*?^name = \"([^\"]+)\"", text, re.M | re.S
+        failures.extend(
+            documented_target_failures(
+                str(manifest.relative_to(ROOT)),
+                manifest.read_text(encoding="utf-8"),
             )
-        ]
-        if name.group(1) in binaries:
+        )
+    return failures
+
+
+def check_adr_numbering(directory: Path | None = None) -> list[str]:
+    """One decision per ADR number, and the heading agrees with the filename.
+
+    Two records sharing a number makes every "ADR 00NN" reference ambiguous, and
+    the collision is easy to create: the number is chosen when the branch is cut,
+    not when it merges.
+    """
+    failures: list[str] = []
+    by_number: dict[str, Path] = {}
+    for record in sorted((directory or ROOT / "docs/adr").glob("[0-9]*.md")):
+        number = record.name[:4]
+        if not number.isdigit():
             failures.append(
-                f"{manifest.relative_to(ROOT)}: the library is named {name.group(1)!r} "
-                "after a binary of the same crate, so `cargo doc` documents only one "
-                "of them and the other's modules are no longer rustdoc-linted"
+                f"docs/adr/{record.name}: the filename must start with a "
+                "four-digit ADR number"
+            )
+            continue
+        first = by_number.setdefault(number, record)
+        if first is not record:
+            failures.append(
+                f"docs/adr/{record.name}: ADR {number} is already "
+                f"{first.name}; renumber one of them"
+            )
+        lines = record.read_text(encoding="utf-8").splitlines()
+        heading = lines[0] if lines else ""
+        if not heading.startswith(f"# {int(number)}. "):
+            failures.append(
+                f"docs/adr/{record.name}: heading {heading!r} does not start with "
+                f"'# {int(number)}. '"
             )
     return failures
 
@@ -452,6 +544,7 @@ def main(argv: list[str]) -> int:
     failures.extend(check_review_trigger_tests())
     failures.extend(check_front_door_size())
     failures.extend(check_documented_targets())
+    failures.extend(check_adr_numbering())
     if failures:
         for failure in failures:
             print(f"documentation check failed: {failure}", file=sys.stderr)
