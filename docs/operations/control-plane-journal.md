@@ -317,8 +317,11 @@ which is why the upgrade order below puts the publisher first.
 
 Republishing history still works, including a rollback to a pre-tenancy revision:
 before it writes journal rows, the publishing transaction records an owner for
-every tenant those rows name and the revision does not declare, at `lifecycle =
-"deleted"` — referenced by history, declared by nothing. Such a row is not a
+every tenant the *state's resources* name and the revision does not declare, at
+`lifecycle = "deleted"` — referenced by history, declared by nothing. Resources
+only: the scope a mutation is made at and the tenant a change is attributed to
+describe a change being made now rather than history, so one naming a tenant this
+deployment has no row for is refused instead of given one. Such a row is not a
 tenant anybody granted (nothing serves it, its name is not held against a declared
 tenant, and only a revision declaring it can turn it into one), and an owner row
 that already exists is never rewritten, so a rollback demotes no live tenant.

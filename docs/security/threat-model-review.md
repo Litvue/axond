@@ -523,8 +523,12 @@ The three risks this area exists to bound, and where each is answered:
   from a declared one. What the keys state is that the tenant has a *row* —
   declared, retained, or recorded for history — which a retired tenant has satisfied
   since 0002; "the revision that stores this row declares its tenant" stays the
-  service layer's, and the recording step runs after the deferred keys settle so a
-  publication cannot supply its own principals' ownership.
+  service layer's. Two things keep a publication from widening that set to its own
+  benefit: the recording step runs after the deferred keys settle, so it cannot
+  supply the ownership its own principals need, and it covers the state's resource
+  scopes only — the mutation scope and actor attribution travelling with a
+  publication get no owner row, so a caller cannot leave one behind for an
+  identifier it merely names.
 - **Identifier enumeration.** A refusal tells the caller `forbidden` and nothing
   else. Whether a tenant exists, whether a principal resolved, and which half of
   an OIDC pair was wrong are recorded in the denial row and never returned, so a

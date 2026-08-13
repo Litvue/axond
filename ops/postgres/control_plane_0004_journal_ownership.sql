@@ -20,13 +20,16 @@
 --    journal row cannot name a tenant this deployment has no row for.
 --
 -- 2. The publishing projection makes that satisfiable for history too. Before it
---    writes journal rows it records an owner for every tenant those rows name and
---    the revision does not declare, at `lifecycle = 'deleted'` — the vocabulary's
---    own word for a tenant that is neither served nor administrable, which is
---    exactly what an undeclared tenant is. So republishing a pre-tenancy revision
---    still succeeds, and what it leaves behind is a tenant row that says
---    "referenced by history, declared by nothing" rather than a live tenant
---    nobody granted.
+--    writes journal rows it records an owner for every tenant the state's
+--    resources name and the revision does not declare, at `lifecycle = 'deleted'`
+--    — the vocabulary's own word for a tenant that is neither served nor
+--    administrable, which is exactly what an undeclared tenant is. So
+--    republishing a pre-tenancy revision still succeeds, and what it leaves
+--    behind is a tenant row that says "referenced by history, declared by
+--    nothing" rather than a live tenant nobody granted. Resources only: a
+--    mutation's scope and an actor's tenant describe a change being made now, so
+--    one naming a tenant this deployment has no row for is refused by these keys
+--    rather than handed a row that would satisfy the principal key afterwards.
 --
 -- No `VALIDATE CONSTRAINT` step follows, and none is pending: validation would
 -- scan for exactly the historical rows point 1 exempts, so it would fail on any

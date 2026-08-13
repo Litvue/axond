@@ -1490,6 +1490,15 @@ async fn project_tenancy(
 /// of such rows rather than changing what the key says. "The current revision
 /// declares this principal's tenant" is a property of one revision, which is
 /// [`Directory::of`]'s to check.
+///
+/// Which is why the set recorded is the *state's* resource scopes and nothing else.
+/// A resource is history — a pre-tenancy revision carries tenant-scoped resources
+/// and declares no tenant, and republishing it has to keep working. The mutation
+/// scope and the actor attribution travelling with a publication are not history:
+/// they describe a change being made now, so a mutation or an actor naming a tenant
+/// this deployment has no row for is refused by 0004's keys rather than handed one,
+/// which keeps a publication from widening the set of rows the principal key accepts
+/// by way of its own attribution.
 async fn record_referenced_tenants(
     transaction: &Transaction<'_>,
     revision: &str,
@@ -1499,9 +1508,6 @@ async fn record_referenced_tenants(
         .state
         .resources()
         .filter_map(|resource| rows::scope_columns(&resource.scope).tenant)
-        .chain(rows::scope_columns(&candidate.mutation.scope).tenant)
-        .chain(rows::actor_columns(&candidate.mutation.actor).tenant)
-        .chain(rows::actor_columns(&candidate.audit.actor).tenant)
         .collect();
     referenced.sort_unstable();
     referenced.dedup();
@@ -4843,6 +4849,47 @@ mod tests {
                 .await
                 .is_empty(),
             "a refused publication stores nothing, owner rows included"
+        );
+    }
+
+    /// A publication cannot widen the set of tenants the owner rows cover by way of
+    /// its own attribution.
+    ///
+    /// The recording step covers the state's resource scopes, because a resource is
+    /// history a rollback has to be able to republish. A mutation's scope and an
+    /// actor's tenant are not history — they describe a change being made now — so
+    /// they get no owner row, and 0004's keys refuse them. Were it otherwise, a
+    /// publication could name any tenant identifier in its attribution and leave a
+    /// row behind that the principal key would accept for every later revision.
+    #[tokio::test]
+    async fn a_publication_cannot_leave_an_owner_row_behind_by_attributing_itself_to_one() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let stranger = tenant_id(11);
+        let mut candidate = candidate(
+            ExpectedRevision::Empty,
+            "borrowed attribution",
+            state_with_directory(),
+        );
+        candidate.mutation.actor = Actor::Workload {
+            tenant: stranger,
+            principal: principal_id(49),
+        };
+        candidate.audit.actor = candidate.mutation.actor.clone();
+        let refusal = store.publish_revision(candidate).await.expect_err(
+            "a change attributed to a tenant this deployment has no row for is refused",
+        );
+        assert!(
+            matches!(refusal, ControlPlaneError::Denied { .. }),
+            "and refused permanently rather than retried as an outage: {refusal:?}"
+        );
+        assert!(
+            !store
+                .column("SELECT tenant_id FROM axond_cp_tenant")
+                .await
+                .contains(&stranger.to_string()),
+            "and leaves no owner row for the tenant it named"
         );
     }
 
