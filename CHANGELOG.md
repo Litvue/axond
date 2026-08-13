@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.33](https://github.com/Litvue/axond/compare/v0.3.32...v0.3.33) (2026-08-13)
+
+
+### Features
+
+* **convergence:** add force refresh for unchanged revisions ([#315](https://github.com/Litvue/axond/issues/315)) ([4d05b94](https://github.com/Litvue/axond/commit/4d05b9439c32f1854b93a3da1bcb5539e106804c))
+
 ## [0.3.32](https://github.com/Litvue/axond/compare/v0.3.31...v0.3.32) (2026-08-13)
 
 

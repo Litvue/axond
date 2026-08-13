@@ -65,7 +65,7 @@ spec:
         - name: migrate
           # Kustomize's image transformer rewrites this alongside the Deployment,
           # so an overlay pinning a digest migrates with the same bytes it serves.
-          image: ghcr.io/litvue/axond:0.3.32 # x-release-please-version
+          image: ghcr.io/litvue/axond:0.3.33 # x-release-please-version
           imagePullPolicy: IfNotPresent
           args:
             - migrate
