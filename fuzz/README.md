@@ -34,7 +34,7 @@ sanitizer runtime, and they reach `axond`'s parsers through a seam only
 `--cfg fuzzing` compiles, which no other consumer can switch on. Nothing at the
 repository root builds it, so this project runs its own `cargo fmt --check` and
 `cargo clippy -- -D warnings` in the same CI lane as the smoke.
-[ADR 0048](../docs/adr/0048-fuzzing-the-untrusted-input-parsers.md) records the
+[ADR 0049](../docs/adr/0049-fuzzing-the-untrusted-input-parsers.md) records the
 decision and what it costs.
 
 That flag reaches every dependency rather than just `axond` — Cargo has no
