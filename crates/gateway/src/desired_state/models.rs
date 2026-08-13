@@ -159,6 +159,17 @@ const OBSERVED_PRICE_FIELDS: &[&str] = &[INPUT_MICROS_FIELD, OUTPUT_MICROS_FIELD
 const APPROVED_PRICE_FIELDS: &[&str] = &[PRICE_ID_FIELD, VERSION_FIELD];
 const ALIAS_TARGET_FIELDS: &[&str] = &[ENABLEMENT_ID_FIELD, VERSION_FIELD];
 
+/// A value inside a nested record is named by its path, the way an unknown key
+/// inside one is, so a refusal names the value an operator has to go and fix
+/// rather than the record it sits in — and so `version` says which of the two
+/// records it belongs to.
+const OBSERVED_INPUT_PATH: &str = "observed_price.input_micros_per_million";
+const OBSERVED_OUTPUT_PATH: &str = "observed_price.output_micros_per_million";
+const APPROVED_PRICE_ID_PATH: &str = "approved_price.price_id";
+const APPROVED_VERSION_PATH: &str = "approved_price.version";
+const TARGET_ENABLEMENT_ID_PATH: &str = "targets.enablement_id";
+const TARGET_VERSION_PATH: &str = "targets.version";
+
 /// Why an offering identity could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidOfferingId {
@@ -942,20 +953,20 @@ fn lifecycle(record: &ModelRecord<'_>) -> Result<ModelLifecycle, ModelError> {
     })
 }
 
-/// A field of a nested record, named for the outer field so a refusal an operator
-/// reads names the field the schema documents.
+/// A required value of a nested record, named by its `path` — `approved_price.price_id`
+/// rather than `approved_price` — so an absence names the value that is absent.
 ///
 /// The sub-record itself is opened by [`Record::nested`], which holds it to its
 /// own field list, so a key a newer release added inside it is an unknown field
 /// rather than a value this build drops.
 fn nested<'a>(
     sub: &ModelRecord<'a>,
-    field: &'static str,
     name: &'static str,
+    path: &'static str,
 ) -> Result<&'a CanonicalValue, ModelError> {
     sub.optional_value(name).ok_or(ModelError::MissingField {
         reference: sub.reference(),
-        field,
+        field: path,
     })
 }
 
@@ -1245,11 +1256,11 @@ impl ModelEnablementBody {
                     MODEL_ENABLEMENT_SCHEMA,
                     OBSERVED_PRICE_FIELDS,
                 )?;
-                let input = nested(&sub, OBSERVED_PRICE_FIELD, INPUT_MICROS_FIELD)?;
-                let output = nested(&sub, OBSERVED_PRICE_FIELD, OUTPUT_MICROS_FIELD)?;
+                let input = nested(&sub, INPUT_MICROS_FIELD, OBSERVED_INPUT_PATH)?;
+                let output = nested(&sub, OUTPUT_MICROS_FIELD, OBSERVED_OUTPUT_PATH)?;
                 Some(ObservedPrice::new(
-                    micros(&record, input, INPUT_MICROS_FIELD)?,
-                    micros(&record, output, OUTPUT_MICROS_FIELD)?,
+                    micros(&record, input, OBSERVED_INPUT_PATH)?,
+                    micros(&record, output, OBSERVED_OUTPUT_PATH)?,
                 ))
             }
         };
@@ -1262,22 +1273,22 @@ impl ModelEnablementBody {
                     MODEL_ENABLEMENT_SCHEMA,
                     APPROVED_PRICE_FIELDS,
                 )?;
-                let price = nested(&sub, APPROVED_PRICE_FIELD, PRICE_ID_FIELD)?;
-                let version = nested(&sub, APPROVED_PRICE_FIELD, VERSION_FIELD)?;
+                let price = nested(&sub, PRICE_ID_FIELD, APPROVED_PRICE_ID_PATH)?;
+                let version = nested(&sub, VERSION_FIELD, APPROVED_VERSION_PATH)?;
                 let CanonicalValue::String(text) = price else {
                     return Err(ModelError::FieldType {
                         reference: resource.reference,
-                        field: PRICE_ID_FIELD,
+                        field: APPROVED_PRICE_ID_PATH,
                     });
                 };
                 let price = ResourceId::parse(text).map_err(|source| ModelError::MalformedId {
                     reference: resource.reference,
-                    field: PRICE_ID_FIELD,
+                    field: APPROVED_PRICE_ID_PATH,
                     source,
                 })?;
                 Some(ApprovedPrice::version(
                     price,
-                    version_number(&record, version, VERSION_FIELD)?,
+                    version_number(&record, version, APPROVED_VERSION_PATH)?,
                 ))
             }
         };
@@ -1564,23 +1575,23 @@ impl ModelAliasBody {
                     MODEL_ALIAS_SCHEMA,
                     ALIAS_TARGET_FIELDS,
                 )?;
-                let enablement = nested(&sub, TARGETS_FIELD, ENABLEMENT_ID_FIELD)?;
-                let version = nested(&sub, TARGETS_FIELD, VERSION_FIELD)?;
+                let enablement = nested(&sub, ENABLEMENT_ID_FIELD, TARGET_ENABLEMENT_ID_PATH)?;
+                let version = nested(&sub, VERSION_FIELD, TARGET_VERSION_PATH)?;
                 let CanonicalValue::String(text) = enablement else {
                     return Err(ModelError::FieldType {
                         reference: resource.reference,
-                        field: ENABLEMENT_ID_FIELD,
+                        field: TARGET_ENABLEMENT_ID_PATH,
                     });
                 };
                 let enablement =
                     ResourceId::parse(text).map_err(|source| ModelError::MalformedId {
                         reference: resource.reference,
-                        field: ENABLEMENT_ID_FIELD,
+                        field: TARGET_ENABLEMENT_ID_PATH,
                         source,
                     })?;
                 Ok(AliasTarget::new(
                     enablement,
-                    version_number(&record, version, VERSION_FIELD)?,
+                    version_number(&record, version, TARGET_VERSION_PATH)?,
                 ))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -2793,6 +2804,129 @@ mod tests {
         assert!(
             matches!(model_error(&error), Some(ModelError::UnknownField { .. })),
             "{error}"
+        );
+    }
+
+    /// Rewrite the first target of a typed alias, as a body carrying a damaged
+    /// target would have been written.
+    fn with_first_target(
+        resource: &ResourceVersion,
+        mutate: impl FnOnce(&mut Vec<(String, CanonicalValue)>),
+    ) -> ResourceVersion {
+        with_fields(resource, |fields| {
+            let (_, value) = fields
+                .iter_mut()
+                .find(|(name, _)| name == TARGETS_FIELD)
+                .expect("a typed alias carries targets");
+            let CanonicalValue::List(targets) = value else {
+                panic!("targets is a list");
+            };
+            let CanonicalValue::Map(target) = &mut targets[0] else {
+                panic!("a target is a nested record");
+            };
+            mutate(target);
+        })
+    }
+
+    #[test]
+    fn a_value_missing_inside_a_nested_record_is_named_by_its_path() {
+        // An operator repairing a refused revision is told which value to write,
+        // so a sub-record's absence names the value rather than the record around
+        // it — and `version` says which record it belongs to.
+        let enablement = enablement_body(30, owner_tenant(), "gpt-4o")
+            .observing(observed_price())
+            .approving(approved_price(40))
+            .version(Slug::parse("gpt-4o").unwrap(), catalog_reference());
+        for (outer, field, path) in [
+            (
+                OBSERVED_PRICE_FIELD,
+                INPUT_MICROS_FIELD,
+                OBSERVED_INPUT_PATH,
+            ),
+            (
+                OBSERVED_PRICE_FIELD,
+                OUTPUT_MICROS_FIELD,
+                OBSERVED_OUTPUT_PATH,
+            ),
+            (APPROVED_PRICE_FIELD, PRICE_ID_FIELD, APPROVED_PRICE_ID_PATH),
+            (APPROVED_PRICE_FIELD, VERSION_FIELD, APPROVED_VERSION_PATH),
+        ] {
+            let damaged = with_fields(&enablement, |fields| {
+                let (_, value) = fields
+                    .iter_mut()
+                    .find(|(name, _)| name == outer)
+                    .expect("the fixture body carries the nested record");
+                let CanonicalValue::Map(nested) = value else {
+                    panic!("{outer} is a nested record");
+                };
+                nested.retain(|(name, _)| name != field);
+            });
+            let error = ModelEnablementBody::read(&damaged)
+                .expect_err("a sub-record missing a value is refused");
+            assert_eq!(
+                error,
+                ModelError::MissingField {
+                    reference: damaged.reference,
+                    field: path
+                }
+            );
+            assert!(
+                !error.is_incompatible(),
+                "a value this build reads is damage, not skew: {error}"
+            );
+        }
+
+        // A wrongly typed inner value is named by its path too, so the two
+        // refusals point at the same place.
+        let damaged = with_fields(&enablement, |fields| {
+            let (_, value) = fields
+                .iter_mut()
+                .find(|(name, _)| name == APPROVED_PRICE_FIELD)
+                .expect("the fixture body carries an approved price");
+            let CanonicalValue::Map(nested) = value else {
+                panic!("approved_price is a nested record");
+            };
+            set(nested, PRICE_ID_FIELD, CanonicalValue::integer(1));
+        });
+        assert_eq!(
+            ModelEnablementBody::read(&damaged).expect_err("a price id that is not text"),
+            ModelError::FieldType {
+                reference: damaged.reference,
+                field: APPROVED_PRICE_ID_PATH
+            }
+        );
+
+        let alias = typed_alias(
+            &tenant_id(1),
+            &project_id(2),
+            32,
+            "fast",
+            &[reference_of(30)],
+        );
+        for (field, path) in [
+            (ENABLEMENT_ID_FIELD, TARGET_ENABLEMENT_ID_PATH),
+            (VERSION_FIELD, TARGET_VERSION_PATH),
+        ] {
+            let damaged = with_first_target(&alias, |target| {
+                target.retain(|(name, _)| name != field);
+            });
+            assert_eq!(
+                ModelAliasBody::read(&damaged).expect_err("a target missing a value is refused"),
+                ModelError::MissingField {
+                    reference: damaged.reference,
+                    field: path
+                }
+            );
+        }
+        let damaged = with_first_target(&alias, |target| {
+            set(target, ENABLEMENT_ID_FIELD, CanonicalValue::integer(1));
+        });
+        assert_eq!(
+            ModelAliasBody::read(&damaged).expect_err("a target id that is not text"),
+            ModelError::FieldType {
+                reference: damaged.reference,
+                field: TARGET_ENABLEMENT_ID_PATH
+            }
         );
     }
 
