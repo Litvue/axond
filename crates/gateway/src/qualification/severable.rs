@@ -141,20 +141,27 @@ pub(crate) fn redirect(dsn: &str, port: u16) -> Option<String> {
     Some(format!("{scheme}://{credentials}127.0.0.1:{port}{tail}"))
 }
 
+/// PostgreSQL's default port, used when a DSN names a host and no port, exactly
+/// as a client would.
+const DEFAULT_PORT: u16 = 5432;
+
 /// The address a DSN points at, for the link to forward to.
-pub(crate) fn upstream(dsn: &str) -> Option<SocketAddr> {
+///
+/// Resolved rather than parsed: a CI database is as likely to be `postgres:5432`
+/// or `db.internal` as a numeric address, and refusing a name would skip every
+/// stage on exactly the deployments worth qualifying. Multi-host and Unix-socket
+/// DSNs are still refused — there is no single link to cut.
+pub(crate) async fn upstream(dsn: &str) -> Option<SocketAddr> {
     let config: tokio_postgres::Config = dsn.parse().ok()?;
-    let port = *config.get_ports().first()?;
-    let host = config.get_hosts().first()?;
-    let tokio_postgres::config::Host::Tcp(host) = host else {
+    let hosts = config.get_hosts();
+    let [tokio_postgres::config::Host::Tcp(host)] = hosts else {
         return None;
     };
-    let addr = if host == "localhost" {
-        "127.0.0.1".to_owned()
-    } else {
-        host.clone()
-    };
-    format!("{addr}:{port}").parse().ok()
+    let port = config.get_ports().first().copied().unwrap_or(DEFAULT_PORT);
+    tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .ok()?
+        .next()
 }
 
 #[cfg(test)]
@@ -191,5 +198,31 @@ mod tests {
         assert_eq!(redirect("host=db port=5432 user=postgres", 6100), None);
         assert_eq!(redirect("mysql://db:3306/axond", 6100), None);
         assert_eq!(redirect("postgres://a:5432,b:5432/axond", 6100), None);
+    }
+
+    /// A DSN with no port is a DSN on 5432, and a name is resolved rather than
+    /// refused: both are how an operator's DSN is actually written.
+    #[tokio::test]
+    async fn a_named_host_resolves_and_a_missing_port_defaults() {
+        let resolved = upstream("postgres://postgres@localhost/axond")
+            .await
+            .expect("localhost resolves");
+        assert!(resolved.ip().is_loopback());
+        assert_eq!(resolved.port(), DEFAULT_PORT);
+        assert_eq!(
+            upstream("postgres://postgres@127.0.0.1:6543/axond").await,
+            Some(([127, 0, 0, 1], 6543).into())
+        );
+    }
+
+    /// No single address means no single link to cut, so the harness refuses
+    /// instead of qualifying one arbitrary member of a failover set.
+    #[tokio::test]
+    async fn a_dsn_without_one_tcp_host_has_no_link() {
+        assert_eq!(upstream("postgres://a:5432,b:5432/axond").await, None);
+        assert_eq!(
+            upstream("host=/var/run/postgresql dbname=axond").await,
+            None
+        );
     }
 }

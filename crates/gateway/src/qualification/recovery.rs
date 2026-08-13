@@ -38,10 +38,14 @@
 //! bound asserted against wall clock is the convergence bound the manifest
 //! declares in whole seconds.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
+use tokio::sync::Mutex;
 use tokio_postgres::Config;
 
 use super::evidence::Recorder;
@@ -49,16 +53,21 @@ use super::severable::{self, SeverableLink};
 use crate::backends::BackendFailure;
 use crate::backends::control_plane::postgres::{ControlPlaneSettings, PostgresControlPlane};
 use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
+use crate::backends::secrets::envelope::DeploymentKek;
+use crate::backends::secrets::postgres::{PostgresSecrets, SecretStoreSettings};
+use crate::backends::secrets::{KekRef, SecretMaterial, SecretResolver, SecretStore};
 use crate::budget::NoBudget;
 use crate::convergence::compile::testing::{AliasProjection, bootstrap, env};
 use crate::convergence::lkg::testing::{KEY, cache_path};
 use crate::convergence::reconciler::category_reason;
 use crate::convergence::{
-    BackoffPolicy, BootstrapError, ConvergenceSettings, LastKnownGood, Reconciler,
-    RevisionCompiler, SnapshotSource, SystemClock,
+    BackoffPolicy, BootstrapError, ConvergenceSettings, LastKnownGood, MaterialLedger, Reconciler,
+    RevisionCompiler, SecretMaterialization, SnapshotSource, SystemClock,
 };
+use crate::desired_state::credentials::ProviderCredentialBody;
+use crate::desired_state::secrets::{SecretOwner, SecretRef};
 use crate::desired_state::{
-    DesiredState, ExpectedRevision, RevisionId, RevisionManifest, fixtures,
+    DesiredState, ExpectedRevision, ResourceKind, RevisionId, RevisionManifest, fixtures,
 };
 use crate::state::AppState;
 use crate::usage::{UsageFanout, UsageSink};
@@ -164,14 +173,21 @@ impl StageSpec {
 
     fn recorder(&self, deployment: &Deployment) -> Recorder {
         let classes: Vec<&str> = self.evidence.iter().map(String::as_str).collect();
-        Recorder::new(
+        let mut recorder = Recorder::new(
             &self.scenario,
             &self.stage,
             &self.capability,
             &classes,
             &deployment.schema,
             &deployment.schema_identity,
-        )
+        );
+        // Which secret store compiled these revisions, and whether the stage's
+        // outage crossed it: a reader judging a rotation or restore claim needs
+        // to know the material path was real and which side of the cut it was
+        // on. References and paths only — never material.
+        recorder.observe("secret_store", deployment.secrets.name());
+        recorder.observe("secret_store_path", "operator-dsn (not severed)");
+        recorder
     }
 }
 
@@ -187,6 +203,18 @@ struct Deployment {
     /// evidence?".
     schema_identity: String,
     link: SeverableLink,
+    /// The deployment's encrypted secret store, holding the material the
+    /// credentials in these revisions point at.
+    ///
+    /// Reached on the operator's DSN rather than through [`Self::link`], because
+    /// the link models a *journal* outage: the secret store is a separate
+    /// dependency whose own outage — and the shared-database case where one cut
+    /// takes both — belongs to the blocked `secret-rotation` scenario. Every
+    /// artifact records which path was used, so no reader has to infer it.
+    secrets: Arc<PostgresSecrets>,
+    /// One staged secret version per credential owner, so republishing a
+    /// variation of the same desired state does not silently rotate material.
+    material: Mutex<BTreeMap<SecretOwner, SecretRef>>,
 }
 
 impl Deployment {
@@ -196,6 +224,7 @@ impl Deployment {
     async fn open() -> Option<Self> {
         let operator_dsn = crate::test_services::postgres_dsn()?;
         let upstream = severable::upstream(&operator_dsn)
+            .await
             .expect("the configured control-plane DSN names a TCP host the harness can reach");
         let schema = format!(
             "recovery_{}",
@@ -225,11 +254,26 @@ impl Deployment {
         let dsn = severable::redirect(&operator_dsn, link.port())
             .expect("the configured control-plane DSN can be redirected through the link");
 
+        let secrets = PostgresSecrets::connect(
+            &operator_dsn,
+            SecretStoreSettings {
+                schema: Some(schema.clone()),
+                create_table: true,
+                connect_timeout: Duration::from_secs(5),
+                operation_timeout: Duration::from_secs(10),
+            },
+            qualification_kek(),
+        )
+        .await
+        .expect("an encrypted secret store in the qualification schema");
+
         let mut deployment = Self {
             dsn,
             schema,
             schema_identity: String::new(),
             link,
+            secrets: Arc::new(secrets),
+            material: Mutex::new(BTreeMap::new()),
         };
         // Migrating here rather than inside a stage keeps the schema this build
         // owns out of every stage's outage window, and gives the artifact the
@@ -261,6 +305,77 @@ impl Deployment {
                 .await
                 .expect("boot against a current schema"),
         )
+    }
+
+    /// `state`, with every provider credential repointed at material this
+    /// deployment really staged in its encrypted secret store.
+    ///
+    /// The fixtures pin references no store was ever asked to hold, and a
+    /// candidate whose material does not resolve is refused before it is
+    /// published — correctly, and by the production compiler. So the harness
+    /// stages material the way an administrator does, per owner, and publishes
+    /// desired state that names what the store actually holds.
+    async fn materialized(&self, state: DesiredState) -> DesiredState {
+        let mut materialized = DesiredState::new();
+        for blob in state.blobs() {
+            materialized.declare_blob(*blob);
+        }
+        for resource in state.resources() {
+            let repointed = if resource.reference.kind == ResourceKind::ProviderCredential {
+                match ProviderCredentialBody::read(resource) {
+                    Ok(body) => {
+                        let secret = self.staged_for(body.owner()).await;
+                        ProviderCredentialBody::staged(
+                            body.credential(),
+                            body.owner(),
+                            body.provider(),
+                            body.display_name().clone(),
+                            secret,
+                        )
+                        .version_at(resource.slug.clone(), resource.reference.version)
+                    }
+                    // An untyped credential body carries no reference to repoint,
+                    // and compilation does not resolve one: it passes through.
+                    Err(_) => resource.clone(),
+                }
+            } else {
+                resource.clone()
+            };
+            materialized
+                .insert(repointed)
+                .expect("repointing a credential preserves every reference");
+        }
+        materialized
+    }
+
+    /// The version this owner's material is stored under, staging it on first
+    /// use. Staged rather than active because that is the lifecycle a newly
+    /// loaded credential has, and staged material is resolvable by design.
+    async fn staged_for(&self, owner: SecretOwner) -> SecretRef {
+        let mut material = self.material.lock().await;
+        if let Some(reference) = material.get(&owner) {
+            return *reference;
+        }
+        let staged = self
+            .secrets
+            .stage(
+                owner,
+                SecretMaterial::new(QUALIFICATION_MATERIAL.to_owned()),
+            )
+            .await
+            .expect("the secret store accepts the qualification material")
+            .reference;
+        material.insert(owner, staged);
+        staged
+    }
+
+    /// A materialization the replicas compile through: the real encrypted store,
+    /// with a ledger of its own so one replica's retained versions are its own.
+    fn materialization(&self) -> Arc<SecretMaterialization> {
+        Arc::new(SecretMaterialization::new(
+            Arc::clone(&self.secrets) as Arc<dyn SecretResolver>,
+            MaterialLedger::new(),
+        ))
     }
 
     fn settings(&self, migrate: bool) -> ControlPlaneSettings {
@@ -303,10 +418,11 @@ impl Replica {
         .expect("the bootstrap config is servable");
         let reconciler = Arc::new(Reconciler::new(
             store as Arc<dyn ControlPlaneStore>,
-            Arc::new(RevisionCompiler::new(
+            Arc::new(RevisionCompiler::with_secrets(
                 bootstrap(),
                 env(),
                 AliasProjection { provider: "openai" },
+                deployment.materialization(),
             )),
             Arc::new(state.clone()),
             settings(),
@@ -331,6 +447,26 @@ impl Replica {
             .map(|model| model.name.clone())
             .collect()
     }
+}
+
+/// The material the qualification credentials authenticate with.
+///
+/// A literal, and deliberately an obviously fake one: it is sealed under a
+/// throwaway KEK, written to a schema this run created, and never reaches an
+/// artifact — the evidence records references and counts, never material.
+const QUALIFICATION_MATERIAL: &str = "sk-recovery-qualification-not-a-live-key";
+
+/// The deployment KEK for one qualification run.
+///
+/// Generated per process from a fixed pattern rather than read from the
+/// environment: the harness seals material it staged itself, so a key that
+/// outlives the run would be a key somebody could be tempted to reuse.
+fn qualification_kek() -> DeploymentKek {
+    DeploymentKek::parse(
+        KekRef("AXOND_RECOVERY_QUALIFICATION_KEK".to_owned()),
+        &BASE64.encode([0x5a_u8; 32]),
+    )
+    .expect("32 base64 bytes are a key")
 }
 
 /// Tight but valid pacing. Nothing here polls — every step is an explicit
@@ -386,7 +522,7 @@ async fn control_plane_outage_journal_outage() {
         &administrator,
         ExpectedRevision::Empty,
         "recovery-baseline",
-        fixtures::state(),
+        deployment.materialized(fixtures::state()).await,
     )
     .await
     .expect("the journal accepts the baseline revision");
@@ -415,7 +551,9 @@ async fn control_plane_outage_journal_outage() {
         &administrator,
         ExpectedRevision::Exactly(baseline.id),
         "recovery-during-outage",
-        fixtures::state_with_renamed_alias(),
+        deployment
+            .materialized(fixtures::state_with_renamed_alias())
+            .await,
     )
     .await
     .expect_err("an administrative write cannot succeed without the journal");
@@ -511,7 +649,7 @@ async fn cold_boot_valid_cache_cold_boot() {
         &administrator,
         ExpectedRevision::Empty,
         "cold-boot-cache",
-        fixtures::state(),
+        deployment.materialized(fixtures::state()).await,
     )
     .await
     .expect("the journal accepts the baseline revision");
@@ -632,7 +770,7 @@ async fn cold_boot_no_cache_cold_boot() {
         &administrator,
         ExpectedRevision::Empty,
         "cold-boot-no-cache",
-        fixtures::state(),
+        deployment.materialized(fixtures::state()).await,
     )
     .await
     .expect("the journal accepts the baseline revision");
@@ -726,7 +864,7 @@ async fn cold_boot_invalid_cache_cold_boot() {
         &administrator,
         ExpectedRevision::Empty,
         "cold-boot-invalid",
-        fixtures::state(),
+        deployment.materialized(fixtures::state()).await,
     )
     .await
     .expect("the journal accepts the baseline revision");
@@ -873,7 +1011,7 @@ async fn recovery_convergence_journal_recovery() {
         &administrator,
         ExpectedRevision::Empty,
         "recovery-head-baseline",
-        fixtures::state(),
+        deployment.materialized(fixtures::state()).await,
     )
     .await
     .expect("the journal accepts the baseline revision");
@@ -924,8 +1062,10 @@ async fn recovery_convergence_journal_recovery() {
     // never saw, which is what recovery has to reconcile.
     let mut head = baseline.id;
     for (index, state) in [
-        fixtures::state_with_renamed_alias(),
-        fixtures::state_with_policy(),
+        deployment
+            .materialized(fixtures::state_with_renamed_alias())
+            .await,
+        deployment.materialized(fixtures::state_with_policy()).await,
     ]
     .into_iter()
     .enumerate()
@@ -957,7 +1097,9 @@ async fn recovery_convergence_journal_recovery() {
         &administrator,
         ExpectedRevision::Exactly(head),
         "recovery-after-restore",
-        fixtures::state_with_second_tenant(),
+        deployment
+            .materialized(fixtures::state_with_second_tenant())
+            .await,
     )
     .await
     .expect("administrative writes are accepted once the journal returns");
@@ -1106,6 +1248,14 @@ fn finish(recorder: Recorder) {
     let artifact = recorder.finish();
     let path = artifact.write();
     println!("{} -> {}", artifact.summary(), path.display());
+    // Evidence is retained and published as a CI artifact, so the rule that no
+    // material reaches it is checked rather than trusted.
+    let retained = std::fs::read_to_string(&path).expect("the artifact just written is readable");
+    assert!(
+        !retained.contains(QUALIFICATION_MATERIAL),
+        "{}: an artifact must retain references and counts, never secret material",
+        path.display()
+    );
     let failures = artifact.failures();
     assert!(
         failures.is_empty(),
