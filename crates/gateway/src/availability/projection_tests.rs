@@ -507,6 +507,119 @@ fn evidence_survives_the_next_projection() {
     assert_eq!(verdict.observed_at, Some(at(90)));
 }
 
+/// The other half of that rule: a key the revision in hand no longer describes
+/// loses the permit the previous one derived. It keeps its evidence — the look
+/// was still taken — but every dimension is re-stated by the revision or not at
+/// all, so the answer falls to a refusal rather than outliving its authority.
+#[test]
+fn a_target_the_revision_stopped_describing_stops_being_permitted() {
+    let deployment = Deployment::new().entitled().governed();
+    let observation = DiscoveryObservation::new(
+        deployment.scope(),
+        target(),
+        DiscoveryResult::Present,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        at(90),
+    );
+    let first = project(&deployment, &catalogue(), &resolved(40), [observation]).into_index();
+    assert_eq!(
+        first.evaluate(&deployment.key(), at(100)).state,
+        AvailabilityState::Available
+    );
+
+    // The catalogue snapshot the enablement pinned is no longer in hand, so this
+    // projection can name nothing: the same shape a rollback that dropped the
+    // enablement produces.
+    let unnameable = Catalogue::active(CatalogueListing::of(
+        crate::desired_state::Checksum::of(b"a catalogue naming nothing"),
+        &CatalogContent::new(
+            Vec::new(),
+            vec![CatalogModelEntry {
+                id: ModelId::parse("claude-3").expect("a well-formed model id"),
+                neutral: None,
+                offerings: Vec::new(),
+            }],
+        )
+        .expect("a catalogue with one model"),
+    ));
+    let again = AvailabilityProjection::new(&unnameable, &resolved(40))
+        .project(&deployment.state, &first, None)
+        .expect("the revision projects again");
+
+    assert_eq!(again.undescribed(), 1);
+    let verdict = verdict(&again, &deployment.key(), 100);
+    assert_eq!(verdict.state, AvailabilityState::Unavailable);
+    assert_eq!(verdict.decided_by, DecidedBy::Catalogue);
+    assert!(!verdict.permits_attempt());
+    assert!(
+        again
+            .index()
+            .record(&deployment.key())
+            .expect("the evidence outlives the description")
+            .discovery
+            .is_some(),
+        "the look was still taken, and a later revision may describe the target again"
+    );
+}
+
+/// A key nobody ever learned anything about leaves nothing behind: only evidence
+/// survives a re-derivation, so the index does not accumulate records for scopes
+/// a revision has forgotten.
+#[test]
+fn a_forgotten_key_with_no_evidence_leaves_no_record() {
+    let deployment = Deployment::new().entitled().governed();
+    let first = project(&deployment, &catalogue(), &resolved(40), None).into_index();
+    assert!(first.record(&deployment.key()).is_some());
+
+    let empty = DesiredState::new();
+    let again = AvailabilityProjection::new(&catalogue(), &resolved(40))
+        .project(&empty, &first, None)
+        .expect("an empty revision projects");
+
+    assert_eq!(again.undescribed(), 0);
+    assert!(again.index().record(&deployment.key()).is_none());
+}
+
+/// A refused projection applied nothing, so it must not consume anything either:
+/// the looks it was handed are still the newest evidence this replica holds.
+#[test]
+fn a_refused_projection_keeps_the_looks_it_could_not_apply() {
+    let deployment = Deployment::new().entitled().governed();
+    let evidence = AvailabilityEvidence::new(catalogue());
+    evidence.observe(DiscoveryObservation::new(
+        deployment.scope(),
+        target(),
+        DiscoveryResult::Present,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        at(90),
+    ));
+
+    let mut unreadable = DesiredState::new();
+    unreadable
+        .insert(ResourceVersion::new(
+            fixtures::reference(crate::desired_state::ResourceKind::ModelEnablement, 30),
+            crate::desired_state::ResourceScope::Deployment,
+            Slug::parse("unreadable").expect("a well-formed slug"),
+            crate::desired_state::ResourceBody::Inline(
+                crate::desired_state::CanonicalValue::map::<String>([]),
+            ),
+        ))
+        .expect("a distinct reference");
+    evidence
+        .derive(&unreadable, &resolved(40))
+        .expect_err("a revision this build cannot read refuses the projection");
+
+    let projected = evidence
+        .derive(&deployment.state, &resolved(40))
+        .expect("the next revision projects");
+
+    let verdict = verdict(&projected, &deployment.key(), 100);
+    assert_eq!(verdict.state, AvailabilityState::Available);
+    assert_eq!(verdict.observed_at, Some(at(90)));
+}
+
 /// A discovery outage degrades to last-known-good and then ages into `stale`. It
 /// never becomes a refusal, and it never silently upgrades.
 #[test]

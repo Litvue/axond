@@ -48,10 +48,15 @@ think" fails at the only moment it matters.
 **The projection derives dimensions from a revision and never touches
 evidence.** `AvailabilityProjection::project` reads the revision's catalogue
 pins, enablements, provider connections, credentials, and policies, and files one
-record per `(scope, target)`. It starts from the previous index, so discovery
-evidence, the retained last-known-good look, and the definitive watermark are
-carried across every publication. Each authority keeps its own column, each
-ignorant answer is a refusal or an uncertainty, and an enablement whose offering
+record per `(scope, target)`. It starts from the previous index's *evidence
+alone*, so discovery evidence, the retained last-known-good look, and the
+definitive watermark are carried across every publication while no dimension
+outlives the revision that stated it: a key this revision no longer describes —
+a rollback that dropped an enablement, a catalogue snapshot no longer in hand —
+keeps its looks under fail-closed dimensions and reads `unavailable`, counted as
+`undescribed`, and a key that held no evidence simply ceases to exist.
+Each authority keeps its own column, each ignorant answer is a refusal or an
+uncertainty, and an enablement whose offering
 no catalogue listing in hand carries produces *no record at all* rather than a
 permissive one — counted, so a projection that quietly stopped describing a
 catalogue does not look like a tenant that enabled nothing.

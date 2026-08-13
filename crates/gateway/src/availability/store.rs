@@ -133,6 +133,13 @@ pub trait ObservationStore: Send + Sync {
     /// Per key rather than per row, so a record whose retained look was
     /// discredited stops having one: an upsert alone would leave the discredited
     /// row behind for the next restart to believe.
+    ///
+    /// A key both of whose slots were discredited emits no row at all, so the
+    /// writer that owns discovery must name such keys to clear them rather than
+    /// relying on [`StoredObservation::of_index`] alone. Nothing writes yet, and
+    /// the consequence of getting it wrong is bounded: a restart re-folds a look
+    /// through the same retention path, which discredits it again as soon as the
+    /// conclusion that discredited it is observed.
     async fn save(&self, rows: &[StoredObservation]) -> Result<(), ControlPlaneError>;
 }
 

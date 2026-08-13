@@ -1676,6 +1676,63 @@ async fn an_availability_read_must_name_the_tenant_it_asks_about() {
     assert_eq!(body["error"]["type"], "admin_request_invalid");
 }
 
+/// A project's enablements are *overrides* of its tenant's, so a project that
+/// has overridden nothing may still call everything its tenant enabled — and the
+/// read says so rather than reporting a project with no models.
+#[tokio::test]
+async fn an_availability_read_of_a_project_carries_what_the_project_inherits() {
+    let tenant = fixtures::tenant_id(1);
+    let project = fixtures::project_id(2);
+    let scope = ScopeRef::tenant(tenant);
+    let inherited = TargetRef::parse("openai", "gpt-4o").expect("a well-formed target");
+    let overridden = TargetRef::parse("openai", "o3").expect("a well-formed target");
+    let index = AvailabilityIndex::builder()
+        .record(
+            AvailabilityKey::new(scope, inherited.clone()),
+            entitled(DiscoveryObservation::new(
+                scope,
+                inherited,
+                DiscoveryResult::Present,
+                DiscoveryCompleteness::Complete,
+                DiscoverySource::ProviderListing,
+                SystemTime::now(),
+            )),
+        )
+        .record(
+            AvailabilityKey::new(
+                ScopeRef {
+                    tenant,
+                    project: Some(project),
+                },
+                overridden,
+            ),
+            AvailabilityRecord {
+                enablement: Enablement::NotEnabled,
+                ..AvailabilityRecord::enabled()
+            },
+        )
+        .build();
+    let deployment = Deployment::deriving(
+        FakeAdminAuthorizer::permissive(),
+        index,
+        RuntimeObservations::none(),
+    );
+
+    let (status, body) = deployment
+        .get(&format!("/availability?tenant={tenant}&project={project}"))
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let targets = body["targets"].as_array().expect("targets");
+    assert_eq!(targets.len(), 2, "{body}");
+    assert_eq!(targets[0]["model"], json!("gpt-4o"));
+    assert_eq!(targets[0]["state"], json!("available"));
+    // The project's own record still replaces what it overrides, including when
+    // the override is a refusal.
+    assert_eq!(targets[1]["model"], json!("o3"));
+    assert_eq!(targets[1]["state"], json!("denied"));
+}
+
 /// This replica's own circuits are overlaid at the instant of the question, so
 /// two replicas answer honestly rather than one answering for the fleet.
 #[tokio::test]

@@ -36,6 +36,13 @@
 //! silently, because a projection that quietly stopped describing half a
 //! catalogue would otherwise look identical to a tenant that enabled nothing.
 //!
+//! The same holds in the other direction, for a key an *earlier* revision
+//! described and this one does not — a rollback that dropped an enablement, a
+//! project that was deleted, a catalogue snapshot no longer in hand. Its record
+//! keeps the evidence discovery paid for and loses every dimension, so it reads
+//! `unavailable (catalogue_absent)` rather than the permit the previous revision
+//! derived, and it is counted in [`ProjectedAvailability::undescribed`].
+//!
 //! # Four durable dimensions and one that is not
 //!
 //! The first four are facts of a *revision*, so they are derived once, when one
@@ -51,7 +58,8 @@
 //! # Evidence survives the projection
 //!
 //! A projection *re-derives the dimensions*; it does not re-derive evidence. It
-//! starts from the previous index ([`AvailabilityIndexBuilder::from_index`]), so
+//! starts from the previous index's evidence alone
+//! ([`AvailabilityIndexBuilder::carrying_evidence`]), so
 //! discovery evidence, the retained last-known-good look, and the definitive
 //! watermark are carried across every publication — a revision that changes a
 //! price does not reset what discovery established, and a discovery outage
@@ -338,6 +346,7 @@ impl RuntimeObservations {
 pub struct ProjectedAvailability {
     index: AvailabilityIndex,
     unnameable: usize,
+    undescribed: usize,
     skewed: usize,
     superseded: usize,
     misfiled: usize,
@@ -357,6 +366,13 @@ impl ProjectedAvailability {
     /// catalogue snapshots it has lost.
     pub const fn unnameable(&self) -> usize {
         self.unnameable
+    }
+
+    /// Keys the previous index held evidence for that this revision no longer
+    /// describes. Their records survive for the evidence, under fail-closed
+    /// dimensions: nothing a revision withdrew keeps reporting as permitted.
+    pub const fn undescribed(&self) -> usize {
+        self.undescribed
     }
 
     /// Enablements pinned to a superseded catalogue snapshot. Not a failure — an
@@ -412,7 +428,8 @@ impl<'a> AvailabilityProjection<'a> {
         let credentials = Credentials::of(state)?;
         let policies = PolicySet::of(state)?;
 
-        let mut builder = AvailabilityIndexBuilder::from_index(previous);
+        let mut builder = AvailabilityIndexBuilder::carrying_evidence(previous);
+        let mut described = BTreeSet::new();
         let mut unnameable = 0;
         let mut skewed = 0;
 
@@ -437,15 +454,28 @@ impl<'a> AvailabilityProjection<'a> {
                 credential,
                 ..AvailabilityRecord::default()
             };
-            builder = builder.record(AvailabilityKey::new(scope, target), record);
+            let key = AvailabilityKey::new(scope, target);
+            described.insert(key.clone());
+            builder = builder.record(key, record);
         }
 
         for observation in observations {
             builder = builder.observe(observation);
         }
 
+        // Keys the revision in hand does not describe kept their evidence and lost
+        // their dimensions, so they read `unavailable` rather than the permit an
+        // earlier revision derived. Counted, because a target that stops being
+        // described is an operator-visible change — a rollback that dropped an
+        // enablement, or a catalogue snapshot this deployment no longer holds.
+        let undescribed = previous
+            .records()
+            .filter(|(key, record)| record.holds_evidence() && !described.contains(*key))
+            .count();
+
         Ok(ProjectedAvailability {
             unnameable,
+            undescribed,
             skewed,
             superseded: builder.superseded(),
             misfiled: builder.misfiled(),
@@ -614,8 +644,23 @@ impl AvailabilityEvidence {
         let catalogue = Arc::clone(&self.lock(&self.catalogue));
         let previous = self.index();
         let pending: Vec<DiscoveryObservation> = self.lock(&self.pending).drain(..).collect();
-        let projected = AvailabilityProjection::new(&catalogue, readiness)
-            .project(state, &previous, pending)?;
+        let projected = match AvailabilityProjection::new(&catalogue, readiness).project(
+            state,
+            &previous,
+            pending.clone(),
+        ) {
+            Ok(projected) => projected,
+            Err(error) => {
+                // A refused projection applied nothing, so the looks are still the
+                // newest evidence this replica holds and the next attempt needs them.
+                // Ahead of anything queued since, so the queue stays in arrival order.
+                let mut queued = self.lock(&self.pending);
+                let since: Vec<DiscoveryObservation> = queued.drain(..).collect();
+                queued.extend(pending);
+                queued.extend(since);
+                return Err(error);
+            }
+        };
         *self.lock(&self.index) = Arc::new(projected.index().clone());
         Ok(projected)
     }
@@ -692,6 +737,41 @@ impl<'a> AvailabilityView<'a> {
             &AvailabilityKey::new(ScopeRef::tenant(scope.tenant), target.clone()),
             now,
         )
+    }
+
+    /// Every target one scope may call, in target order: the ones filed under it
+    /// and the ones it inherits.
+    ///
+    /// What an operator asking about a project means. A project is not a
+    /// separate catalogue — it holds *overrides* of the tenant's enablements — so
+    /// answering only from records filed under the project would report a
+    /// project with no override of its own as a project that may call nothing.
+    /// Each target is decided by [`evaluate_effective`](Self::evaluate_effective),
+    /// so an override still replaces what it overrides, including a disabling
+    /// one, and nothing outside the project's own tenant is reachable.
+    pub fn evaluate_inherited_scope(
+        &self,
+        scope: ScopeRef,
+        now: SystemTime,
+    ) -> Vec<(TargetRef, Availability)> {
+        if scope.is_tenant_wide() {
+            return self.evaluate_scope(scope, now);
+        }
+        let inherited = ScopeRef::tenant(scope.tenant);
+        let targets: BTreeSet<TargetRef> = self
+            .index
+            .evaluate_scope(&inherited, now)
+            .into_iter()
+            .chain(self.index.evaluate_scope(&scope, now))
+            .map(|(target, _)| target)
+            .collect();
+        targets
+            .into_iter()
+            .map(|target| {
+                let verdict = self.evaluate_effective(scope, &target, now);
+                (target, verdict)
+            })
+            .collect()
     }
 
     /// Every target filed under one scope, in target order.

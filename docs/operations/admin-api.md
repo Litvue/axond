@@ -145,7 +145,10 @@ health — and never claims a model is available because the catalogue carries i
 ([ADR 0048](../adr/0048-stateful-availability-projection-and-discovery-persistence.md)).
 A replica that derives no view answers `"deriving": false` rather than an empty
 list of targets, and a grant narrower than the deployment sees a verdict with the
-discovery source dropped and operator-only reasons coarsened.
+discovery source dropped and operator-only reasons coarsened. Asking about a
+project answers with what the project inherits from its tenant as well as what it
+overrides, because a project's enablements are overrides rather than a catalogue
+of its own.
 
 Budgets and limits are policy fields rather than a route of their own: they are
 published as a `policies` document, and history is therefore one chain rather

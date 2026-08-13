@@ -421,6 +421,11 @@ impl AdminService {
     /// grant narrower than the deployment sees the namespace projection of each
     /// verdict, which keeps the deployment's discovery machinery out of a tenant's
     /// answer.
+    ///
+    /// A project is answered with what it inherits as well as what it overrides:
+    /// its enablements are overrides of its tenant's, so reporting only its own
+    /// records would tell an operator a project may call nothing whenever it has
+    /// overridden nothing.
     pub fn availability(
         &self,
         grant: &AdminGrant,
@@ -449,7 +454,8 @@ impl AdminService {
         };
         let index = reader.index();
         let runtime = reader.runtime();
-        let targets = AvailabilityView::new(&index, &runtime).evaluate_scope(reference, now);
+        let targets =
+            AvailabilityView::new(&index, &runtime).evaluate_inherited_scope(reference, now);
         let status = if grant.scope() == &ResourceScope::Deployment {
             StatusScope::Deployment
         } else {

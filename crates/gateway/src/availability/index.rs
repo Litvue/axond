@@ -189,6 +189,12 @@ impl AvailabilityRecord {
         }
     }
 
+    /// Whether anything has ever been learned about this key: a look in either
+    /// slot, or a conclusion the key once reached.
+    pub const fn holds_evidence(&self) -> bool {
+        self.discovery.is_some() || self.last_known_good.is_some() || self.definitive_at.is_some()
+    }
+
     /// The observation evaluation should read: the current one when it is
     /// definitive, and the retained last-known-good one otherwise.
     ///
@@ -454,6 +460,36 @@ impl AvailabilityIndexBuilder {
     pub fn from_index(index: &AvailabilityIndex) -> Self {
         Self {
             records: index.records.clone(),
+            superseded: 0,
+            misfiled: 0,
+        }
+    }
+
+    /// Start from an existing index's *evidence*, holding no dimension it
+    /// derived.
+    ///
+    /// What a re-derivation needs: discovery evidence is learned and must
+    /// survive, while every dimension is a fact of a revision and must be stated
+    /// again by the revision in hand. A key the new revision no longer describes
+    /// therefore keeps its looks and its watermark under fail-closed dimensions
+    /// rather than its former permit, and a key that held no evidence at all
+    /// simply ceases to exist.
+    pub fn carrying_evidence(index: &AvailabilityIndex) -> Self {
+        Self {
+            records: index
+                .records
+                .iter()
+                .filter(|(_, record)| record.holds_evidence())
+                .map(|(key, record)| {
+                    let evidence = AvailabilityRecord {
+                        discovery: record.discovery.clone(),
+                        last_known_good: record.last_known_good.clone(),
+                        definitive_at: record.definitive_at,
+                        ..AvailabilityRecord::default()
+                    };
+                    (key.clone(), evidence)
+                })
+                .collect(),
             superseded: 0,
             misfiled: 0,
         }
