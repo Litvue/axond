@@ -27,7 +27,11 @@ def markdown_files() -> list[Path]:
     files.extend((ROOT / "docs").rglob("*.md"))
     files.extend((ROOT / "crates").rglob("README.md"))
     files.extend((ROOT / "tests").rglob("README.md"))
-    return sorted(set(files))
+    # Only committed documentation is ours to check; an installed dependency
+    # tree (the TypeScript compatibility lane's `node_modules`) is not.
+    return sorted(
+        path for path in set(files) if "node_modules" not in path.relative_to(ROOT).parts
+    )
 
 
 def check_relative_links(files: list[Path]) -> list[str]:

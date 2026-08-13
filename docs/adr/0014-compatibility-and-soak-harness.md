@@ -113,3 +113,18 @@ nightly cannot rot into something nobody runs.
   fixtures stays a deliberate, reviewed act.
 - The long soak can only fail out of band, so a leak introduced at a scale the
   short run does not reach is caught within a week rather than at the PR.
+
+## Amendment: a second SDK runtime
+
+The SDK pillar was extended to the vendors' **Node** SDKs in `tests/compat-ts/`,
+a required `sdk-compat-ts` lane holding the same fixtures and the same generated
+config as the Python lane. The reason is not a second opinion on the same bytes:
+a TypeScript caller is what a large share of customers actually run, its SDKs
+disagree with the Python ones on defaults that reach the wire — the Node
+embeddings client asks for `base64` unless told otherwise — and the lane is
+compiled with `tsc --strict`, so the gateway is also held to what the SDKs' own
+type definitions describe rather than to what a dynamically-typed client
+tolerates. Pins are exact down to the Node runtime (`.nvmrc`) and enforced by
+`ops/compat-ts-pins.py`, and nothing enters the Rust dependency graph. Go stays
+deferred: it would re-assert this wire, and the case for a third runtime is the
+stateful/admin API, which is not stable yet.

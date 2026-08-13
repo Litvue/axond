@@ -1,0 +1,22 @@
+{
+  // What "compatible" means at the type level, shared by the lane and by the
+  // negative cases in `negative/` that prove these settings still bite. Emit
+  // settings live with each project, so neither inherits the other's build
+  // outputs or `.tsbuildinfo`.
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["es2023"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+    "strict": true,
+    // Deliberate: the vendors' shipped declarations are checked, not trusted. An
+    // SDK release whose own `.d.ts` stops type-checking is a compatibility fact,
+    // and `negative/` proves this stays enforced.
+    "skipLibCheck": false,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true
+  }
+}
