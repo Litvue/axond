@@ -2342,4 +2342,81 @@ targets = [
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
+
+    /// A rotation that cannot reopen upstream is the one transport failure with
+    /// no other surface to fall back on: the caller is told only that the
+    /// transport failed, so if the operator's log does not carry the reason
+    /// nothing does.
+    #[tokio::test]
+    async fn a_rotation_that_cannot_reopen_leaves_the_reason_in_the_log() {
+        const FAILURE: &str = "error sending request for url \
+                               (http://provider.internal:9443/v1/chat/completions)";
+
+        let logged = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink = logged.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || CollectingWriter(sink.clone()))
+            .with_ansi(false)
+            .finish();
+
+        let _log = tracing::subscriber::set_default(subscriber);
+        let output = {
+            let opener = |_lease: CredentialLease, _attempt: u32, _index: usize| {
+                Box::pin(async { Err(TransportError::Http(FAILURE.to_owned())) })
+                    as futures::future::BoxFuture<'static, _>
+            };
+            let response = relay_opened(
+                state_for("http://127.0.0.1:1", Arc::new(Ledger::default())),
+                context(),
+                OpenAiCompatibleAdapter::openai()
+                    .stream_decoder(Surface::ChatCompletions)
+                    .expect("decoder"),
+                futures::stream::iter(vec![Ok(Bytes::from_static(
+                    b"data: {\"error\":{\"type\":\"rate_limit_exceeded\"}}\n\n",
+                ))])
+                .boxed(),
+                Instant::now(),
+                Framing::OpenAiSse,
+                Some(RotationHandle::new(
+                    vec![test_lease("b")],
+                    test_lease("a"),
+                    1,
+                    opener,
+                    |_| {},
+                    |_| {},
+                )),
+            );
+            let mut body = response.into_body().into_data_stream();
+            let mut output = String::new();
+            while let Some(chunk) = body.next().await {
+                output.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+            }
+            output
+        };
+
+        assert!(
+            output.contains("upstream transport failure") && !output.contains("provider.internal"),
+            "the caller is not told the endpoint it never chose: {output}"
+        );
+        let log = String::from_utf8(logged.lock().expect("log").clone()).expect("utf-8 log");
+        assert!(
+            log.contains("upstream attempt failed on the transport")
+                && log.contains("provider.internal:9443"),
+            "the operator keeps the reason the rotation could not reopen: {log}"
+        );
+    }
+
+    /// Collects a subscriber's output where a test can read it back.
+    struct CollectingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CollectingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 }
