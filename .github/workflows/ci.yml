@@ -176,6 +176,17 @@ jobs:
           AXOND_TEST_REDIS_URL: redis://127.0.0.1:6379
           AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
           AXOND_TEST_REQUIRE_SERVICES: "1"
+      # The recovery stages that run today are part of the suite above, and
+      # their point is the evidence they retain (ADR 0037), so it is kept.
+      # `warn`: an earlier target failing stops the suite before the recovery
+      # stages run, and that lane's finding is the failing test.
+      - name: Publish the recovery evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: recovery-evidence
+          path: target/recovery/*.json
+          if-no-files-found: warn
 
   sdk-compat:
     name: Provider-SDK compatibility

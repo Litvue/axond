@@ -1,23 +1,23 @@
-//! The recovery qualification contract (axond #219), asserted before the driver
-//! that will satisfy it exists.
+//! The recovery qualification contract (axond #219), asserted against the
+//! manifest the driver reads.
 //!
 //! A stateful deployment's recovery story — serving through a control-plane
 //! outage, cold-booting from the signed last-known-good cache, converging once
 //! Postgres returns, rotating a credential without a redeployment, and restoring
-//! the journal from a backup or to a point in time — cannot be exercised yet:
-//! the resource bodies a revision is made of belong to slices that have not
-//! landed, so a stateful replica has nothing to serve and there is no recovery
-//! behaviour to observe.
+//! the journal from a backup or to a point in time — is only half runnable
+//! today. The control-plane half runs against a real Postgres and writes its
+//! evidence to `target/recovery/`; the serving half needs a projection a replica
+//! can serve, and is a blocked stage rather than a claim.
 //!
-//! What can be pinned down now is the contract. `qualification/recovery/manifest.toml`
-//! declares every scenario, the evidence it retains, the gate that makes it a
-//! failure, and the slice each blocked scenario waits on; the tests here are
-//! what keep that file from decaying into a wish list while the dependencies
-//! land. They fail when a scenario loses its gate, when the evidence #219
-//! requires stops being covered, when a dependency edge is dropped or invented,
-//! when the prose contract and the manifest disagree, and — the one that matters
-//! most while the harness is unimplemented — when a scenario claims to be
-//! executable and no driver runs it.
+//! `qualification/recovery/manifest.toml` declares every scenario, the stages it
+//! is assembled from, the evidence each stage retains, the gate that makes the
+//! scenario a failure, and the slice each blocked stage waits on. The tests here
+//! are what keep that file from decaying into a wish list. They fail when a
+//! scenario loses its gate, when the evidence #219 requires stops being covered,
+//! when a dependency edge is dropped or invented, when a blocked stage claims
+//! its scenario is executable, and when the prose contract and the manifest
+//! disagree. Whether the *driver* runs the stages the manifest calls executable
+//! is asserted next to the driver, in `qualification::recovery`.
 
 mod support;
 
@@ -97,7 +97,7 @@ fn every_scenario_carries_a_gate_that_can_fail() {
 #[test]
 fn the_serving_gate_and_the_serving_evidence_agree() {
     for scenario in &recovery::load().scenarios {
-        let retains_serving = scenario.evidence.contains(&Evidence::ServingBehavior);
+        let retains_serving = scenario.evidence().contains(&Evidence::ServingBehavior);
         match scenario.gate.readiness {
             Readiness::Refuses => assert!(
                 !retains_serving,
@@ -115,17 +115,17 @@ fn the_serving_gate_and_the_serving_evidence_agree() {
     }
 }
 
-/// Every evidence class #219 requires is retained by some scenario, and no
-/// scenario declares one twice. A harness that ran every outage and kept no
-/// data-loss boundary would still produce artifacts, and the artifacts would
-/// read as evidence.
+/// Every evidence class #219 requires is retained by some stage, and no stage
+/// declares one twice. A harness that ran every outage and kept no data-loss
+/// boundary would still produce artifacts, and the artifacts would read as
+/// evidence.
 #[test]
 fn the_committed_scenarios_retain_every_required_evidence_class() {
     let manifest = recovery::load();
     let retained: BTreeSet<Evidence> = manifest
         .scenarios
         .iter()
-        .flat_map(|scenario| scenario.evidence.iter().copied())
+        .flat_map(|scenario| scenario.evidence())
         .collect();
 
     for class in Evidence::ALL {
@@ -137,25 +137,69 @@ fn the_committed_scenarios_retain_every_required_evidence_class() {
     }
 
     for scenario in &manifest.scenarios {
-        let unique: BTreeSet<Evidence> = scenario.evidence.iter().copied().collect();
-        assert_eq!(
-            unique.len(),
-            scenario.evidence.len(),
-            "{}: evidence classes are declared more than once",
-            scenario.id
-        );
+        for stage in &scenario.stages {
+            let unique: BTreeSet<Evidence> = stage.evidence.iter().copied().collect();
+            assert_eq!(
+                unique.len(),
+                stage.evidence.len(),
+                "{}/{}: evidence classes are declared more than once",
+                scenario.id,
+                stage.id
+            );
+            assert!(
+                !stage.evidence.is_empty(),
+                "{}/{}: a stage that retains nothing proves nothing",
+                scenario.id,
+                stage.id
+            );
+            assert!(
+                !stage.covers.trim().is_empty(),
+                "{}/{}: a stage without a description is not reproducible by a reader",
+                scenario.id,
+                stage.id
+            );
+        }
+    }
+}
+
+/// A stage is one half of a scenario, and the halves must partition it: two
+/// stages retaining the same evidence class means one of them is not the stage
+/// that produces it, and a reader cannot tell which artifact to look in.
+#[test]
+fn no_two_stages_of_a_scenario_claim_the_same_evidence() {
+    for scenario in &recovery::load().scenarios {
+        let mut ids = BTreeSet::new();
+        let mut seen: BTreeMap<Evidence, &str> = BTreeMap::new();
+        for stage in &scenario.stages {
+            assert!(
+                ids.insert(stage.id.as_str()),
+                "{}: stage `{}` is declared twice",
+                scenario.id,
+                stage.id
+            );
+            for class in &stage.evidence {
+                if let Some(other) = seen.insert(*class, stage.id.as_str()) {
+                    panic!(
+                        "{}: stages `{other}` and `{}` both retain {}",
+                        scenario.id,
+                        stage.id,
+                        class.as_str()
+                    );
+                }
+            }
+        }
         assert!(
-            !scenario.evidence.is_empty(),
-            "{}: a scenario that retains nothing proves nothing",
+            !scenario.stages.is_empty(),
+            "{}: a scenario with no stages runs nothing",
             scenario.id
         );
     }
 }
 
-/// The dependency map, in both directions: a blocked scenario names the slices
-/// it waits on and what it needs from each, and between them the scenarios
-/// account for every slice #219 is waiting on. An issue no scenario names is
-/// either a dependency that is not really one, or a scenario that was dropped.
+/// The dependency map, in both directions: a blocked stage names the slices it
+/// waits on and what it needs from each, and between them the stages account
+/// for every slice #219 is waiting on. An issue no stage names is either a
+/// dependency that is not really one, or a stage that was dropped.
 #[test]
 fn the_dependency_map_is_complete_in_both_directions() {
     let manifest = recovery::load();
@@ -163,74 +207,79 @@ fn the_dependency_map_is_complete_in_both_directions() {
     let mut named: BTreeSet<u32> = BTreeSet::new();
 
     for scenario in &manifest.scenarios {
-        let id = &scenario.id;
-        match scenario.status {
-            Status::Blocked => assert!(
-                !scenario.blocked_on.is_empty(),
-                "{id}: a blocked scenario must name what blocks it"
-            ),
-            Status::Executable => assert!(
-                scenario.blocked_on.is_empty(),
-                "{id}: an executable scenario cannot still be waiting on a slice"
-            ),
-        }
+        for stage in &scenario.stages {
+            let id = format!("{}/{}", scenario.id, stage.id);
+            match stage.status {
+                Status::Blocked => assert!(
+                    !stage.blocked_on.is_empty(),
+                    "{id}: a blocked stage must name what blocks it"
+                ),
+                Status::Executable => assert!(
+                    stage.blocked_on.is_empty(),
+                    "{id}: an executable stage cannot still be waiting on a slice"
+                ),
+            }
 
-        let mut issues = BTreeSet::new();
-        for dependency in &scenario.blocked_on {
-            assert!(
-                known.contains(&dependency.issue),
-                "{id}: #{} is not one of the slices #219 waits on",
-                dependency.issue
-            );
-            assert!(
-                issues.insert(dependency.issue),
-                "{id}: #{} is named twice",
-                dependency.issue
-            );
-            assert!(
-                dependency.needs.len() > 20,
-                "{id}: #{} needs a reason a reader can act on, not {:?}",
-                dependency.issue,
-                dependency.needs
-            );
-            named.insert(dependency.issue);
+            let mut issues = BTreeSet::new();
+            for dependency in &stage.blocked_on {
+                assert!(
+                    known.contains(&dependency.issue),
+                    "{id}: #{} is not one of the slices #219 waits on",
+                    dependency.issue
+                );
+                assert!(
+                    issues.insert(dependency.issue),
+                    "{id}: #{} is named twice",
+                    dependency.issue
+                );
+                assert!(
+                    dependency.needs.len() > 20,
+                    "{id}: #{} needs a reason a reader can act on, not {:?}",
+                    dependency.issue,
+                    dependency.needs
+                );
+                named.insert(dependency.issue);
+            }
         }
     }
 
     let unclaimed: Vec<u32> = known.difference(&named).copied().collect();
     assert!(
         unclaimed.is_empty(),
-        "no scenario waits on {unclaimed:?}; either the slice is not a blocker or a scenario was dropped"
+        "no stage waits on {unclaimed:?}; either the slice is not a blocker or a stage was dropped"
     );
 }
 
-/// The honesty gate. `status = "executable"` is a claim about code, and the code
-/// is [`Capability::is_implemented`]: flipping a manifest entry without writing
-/// the driver fails here, and writing the driver without flipping the entry
-/// fails here too.
+/// The honesty gate at the scenario level: a scenario is executable exactly
+/// when every stage of it is, so a scenario cannot be reported as qualified
+/// while the half that offers traffic is still waiting on a slice.
 #[test]
-fn a_scenario_is_executable_only_when_a_driver_runs_it() {
+fn a_scenario_is_executable_only_when_every_stage_of_it_is() {
     for scenario in &recovery::load().scenarios {
-        let implemented = scenario.capability.is_implemented();
-        let claimed = scenario.status == Status::Executable;
-        assert_eq!(
-            claimed,
-            implemented,
-            "{}: the manifest says {}, the driver says {}",
-            scenario.id,
-            if claimed { "executable" } else { "blocked" },
-            if implemented {
-                "it is implemented"
-            } else {
-                "it is not implemented"
-            }
-        );
+        let blocked: Vec<&str> = scenario
+            .stages
+            .iter()
+            .filter(|stage| stage.status == Status::Blocked)
+            .map(|stage| stage.id.as_str())
+            .collect();
+        match scenario.status() {
+            Status::Executable => assert!(
+                blocked.is_empty(),
+                "{}: reported executable while {blocked:?} are blocked",
+                scenario.id
+            ),
+            Status::Blocked => assert!(
+                !blocked.is_empty(),
+                "{}: reported blocked with every stage executable",
+                scenario.id
+            ),
+        }
     }
 }
 
 /// The prose contract and the manifest describe one harness. An operator reads
-/// the first; the driver will read the second; a scenario or a blocker that
-/// exists in only one of them is how the two come to disagree.
+/// the first; the driver reads the second; a scenario, a stage, or a blocker
+/// that exists in only one of them is how the two come to disagree.
 #[test]
 fn the_prose_contract_and_the_manifest_agree() {
     let manifest = recovery::load();
@@ -243,6 +292,15 @@ fn the_prose_contract_and_the_manifest_agree() {
             recovery::CONTRACT_RELATIVE,
             scenario.id
         );
+        for stage in &scenario.stages {
+            assert!(
+                contract.contains(&format!("`{}/{}`", scenario.id, stage.id)),
+                "{} does not say what the {}/{} stage covers",
+                recovery::CONTRACT_RELATIVE,
+                scenario.id,
+                stage.id
+            );
+        }
     }
     for issue in BLOCKING_ISSUES {
         assert!(
