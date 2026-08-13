@@ -220,14 +220,17 @@ kube -n axond wait --for=jsonpath='{.status.phase}'=Running pod \
 # Polled rather than sampled: the Job and the Deployment are applied together,
 # so the replicas legitimately crash-loop until the schema lands, and kubelet's
 # backoff reaches five minutes. A single reading would fail a healthy fleet that
-# is merely still in a backoff it is about to leave for good.
+# is merely still in a backoff it is about to leave for good, and the window has
+# to clear that cap with room to spare: a replica that entered it just before the
+# Job completed waits the full five minutes, and the three do not enter it
+# together.
 running_containers() {
   kube -n axond get pods -l app.kubernetes.io/name=axond \
     -o jsonpath='{range .items[*]}{.status.containerStatuses[*].state.running.startedAt}{"\n"}{end}' |
     grep -c . || true
 }
 serving=0
-for _ in $(seq 1 90); do
+for _ in $(seq 1 156); do
   serving="$(running_containers)"
   [[ "$serving" == 3 ]] && break
   sleep 5

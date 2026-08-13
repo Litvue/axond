@@ -514,7 +514,9 @@ def check_namespaces(documents: list[Document], label: str) -> list[str]:
     ]
 
 
-def check_example_secret(production: list[Document], base: list[Document]) -> list[str]:
+def check_example_secret(
+    production: list[Document], base: list[Document], label: str
+) -> list[str]:
     """The base's published placeholder Secret does not survive into production.
 
     The base ships one so an evaluation renders something bootable, and its values
@@ -534,7 +536,7 @@ def check_example_secret(production: list[Document], base: list[Document]) -> li
         leaked = sorted(set(secret.get("stringData", {}).values()) & published)
         if leaked:
             failures.append(
-                f"overlays/production: Secret {name!r} still carries the base's published "
+                f"{label}: Secret {name!r} still carries the base's published "
                 f"placeholders {leaked}; delete the resource in the overlay so an operator has "
                 "to supply the credential rather than serving with one from this repository"
             )
@@ -981,7 +983,7 @@ def gate(
         *check_service_port(stateful, "overlays/production-stateful"),
         *check_topology_spread(stateful, "overlays/production-stateful"),
         *check_namespaces(stateful, "overlays/production-stateful"),
-        *check_example_secret(stateful, base),
+        *check_example_secret(stateful, base, "overlays/production-stateful"),
         *check_image_pinning(base, production),
         *check_termination_budget(base, "base"),
         *check_termination_budget(production, "overlays/production"),
@@ -995,7 +997,7 @@ def gate(
         *check_disruption_budget(production, autoscaled),
         *check_namespaces(base, "base"),
         *check_namespaces(production, "overlays/production"),
-        *check_example_secret(production, base),
+        *check_example_secret(production, base, "overlays/production"),
     ]
 
 
@@ -1223,7 +1225,10 @@ def self_test() -> int:
 
     inherited = copy.deepcopy(production)
     inherited.extend(copy.deepcopy(of_kind(base, "Secret")))
-    expect_failure("the base's example Secret inherited", check_example_secret(inherited, base))
+    expect_failure(
+        "the base's example Secret inherited",
+        check_example_secret(inherited, base, "overlays/production"),
+    )
 
     stray = copy.deepcopy(production)
     one(stray, "Service")["metadata"].pop("namespace")
