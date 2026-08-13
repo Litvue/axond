@@ -529,6 +529,35 @@ fn a_metric_matched_against_another_vector_is_still_validated() {
     }
 }
 
+/// `without` and `ignoring` name the labels a result *drops*, so naming one the
+/// instrument never declared is legal — `sum without (le)` over a histogram is
+/// the ordinary spelling. Only `by` and `on` keep the labels they name, and only
+/// those have to be declared.
+#[test]
+fn an_excluded_label_does_not_have_to_be_one_the_instrument_declares() {
+    for expr in [
+        "sum without (axond_namespace) (rate(axond_status_refreshes[5m]))",
+        "sum without (le) (rate(axond_request_duration_bucket[5m]))",
+        "axond_status_refreshes / ignoring(axond_namespace) axond_status_refreshes",
+    ] {
+        assert_eq!(dashboard_failures(expr), Vec::new(), "{expr}");
+    }
+    // The kept-label modifiers are unaffected: the same label under `by` is still
+    // drift, since the result would carry a dimension the instrument has not got.
+    let failures =
+        dashboard_failures("sum by (axond_namespace) (rate(axond_status_refreshes[5m]))");
+    assert!(
+        matches!(
+            failures.as_slice(),
+            [AssetError::Catalog {
+                source: catalog::CatalogError::UndeclaredLabel { metric, .. },
+                ..
+            }] if metric == "axond.status.refreshes"
+        ),
+        "{failures:?}"
+    );
+}
+
 /// A Prometheus name is ASCII. A stray letter from somewhere else has to be a
 /// refusal with a message: consuming nothing and continuing would spin.
 #[test]

@@ -205,6 +205,11 @@ struct Scope {
 /// binary operator's vector matching.
 const MODIFIERS: &[&str] = &["by", "without", "on", "ignoring"];
 
+/// The modifiers whose labels the result keeps, and which therefore have to be
+/// labels the instrument declares. `without` and `ignoring` name labels to drop,
+/// so naming one an instrument does not carry is legal rather than drift.
+const RETAINING_MODIFIERS: &[&str] = &["by", "on"];
+
 /// PromQL's aggregation operators — the only identifiers that may be followed by
 /// a grouping modifier instead of their argument list.
 const AGGREGATIONS: &[&str] = &[
@@ -250,6 +255,10 @@ fn selectors(expr: &str) -> Result<Expression, String> {
     // Set when the previous identifier was an aggregation modifier, so the
     // identifiers in the parenthesised list that follows are label keys.
     let mut grouping_depth: Option<usize> = None;
+    // Whether the list being read names the labels kept (`by`, `on`) rather than
+    // the labels dropped (`without`, `ignoring`). Only the former have to be
+    // declared: `sum without (le) (x)` legally names a label `x` does not carry.
+    let mut retains_labels = false;
     // The labels of the modifier list being read, then of a closed list waiting
     // for the body it modifies.
     let mut reading: Vec<String> = Vec::new();
@@ -280,7 +289,10 @@ fn selectors(expr: &str) -> Result<Expression, String> {
                 depth = depth.saturating_sub(1);
                 if grouping_depth == Some(depth + 1) {
                     grouping_depth = None;
-                    pending = std::mem::take(&mut reading);
+                    let labels = std::mem::take(&mut reading);
+                    if retains_labels {
+                        pending = labels;
+                    }
                 }
                 while open.last().is_some_and(|scope| scope.body_depth > depth) {
                     close_scope(&mut open, &mut found.grouping);
@@ -333,6 +345,7 @@ fn selectors(expr: &str) -> Result<Expression, String> {
                 if opens_a_call(&word, &bytes[index..]) {
                     if MODIFIERS.contains(&word.as_str()) {
                         grouping_depth = Some(depth + 1);
+                        retains_labels = RETAINING_MODIFIERS.contains(&word.as_str());
                     } else {
                         argument_list = true;
                     }
