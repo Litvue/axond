@@ -78,14 +78,18 @@ projection traces back to the catalogue it came from.
 `Removed`, `Renamed`, and `Refiled` (the id still works but now names another
 model). A rename is its own class, not a removal beside an addition, because the
 pair is what a caller has to act on. Renames are only ever looked for within one
-`(provider, model)` group, and only between offerings whose content matches —
-everything a caller is answered by: the stated facts, the observed price, and the
-endpoint it is reached at. That match is the evidence that the *same* offering
-moved; override provenance and payload pointers are excluded, being records of
-where those facts came from rather than facts of their own. Anything left over
-stays an addition or a removal: two ids of one model that differ in price,
-limits, or endpoint are not substitutes, and reporting them as a rename would
-tell an operator to move traffic onto different terms.
+`(provider, model)` group, and only between offerings that are the same offering
+republished: same price, same endpoint, same stated capabilities, modalities,
+limits, lifecycle, and provenance dates. What a rename tolerates is a changed
+label — the display name and the last-updated date — because a provider that
+renames the id callers send normally relabels the offering in the same breath,
+and a label is not a term of service; requiring an identical one would reclassify
+most real renames as an unrelated pair. Override provenance and payload pointers
+are excluded too, being records of where the facts came from rather than facts of
+their own. Anything left over stays an addition or a removal: two ids of one
+model that differ in price, limits, or endpoint are not substitutes, and
+reporting them as a rename would tell an operator to move traffic onto different
+terms.
 Facts, prices, and lifecycle are *not* re-reported here — those are
 `CatalogDiff`'s classes, and reporting them twice would make a refresh's change
 count depend on how many views a caller built. Two predicates separate the two

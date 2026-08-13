@@ -53,8 +53,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::catalog::{
-    CatalogContent, CatalogContentId, ModelFacts, ModelId, ObservedPrice, ProviderEndpoint,
-    ProviderId, ProviderOffering,
+    CatalogContent, CatalogContentId, ModelFacts, ModelField, ModelId, ObservedPrice, ProviderId,
+    ProviderOffering,
 };
 use crate::desired_state::{Canonical, CanonicalError, CanonicalValue, Checksum};
 
@@ -222,19 +222,30 @@ impl<'a> CallableOffering<'a> {
         self.offering.published_model_id == self.model.as_str()
     }
 
-    /// The offering's content, with the id it is published under left out — the
-    /// comparison that tells a renamed callable offering from an unrelated one.
+    /// Whether `other` is this same offering, published under a different id.
     ///
-    /// Everything a caller is answered by is compared: what the provider states,
-    /// what it charges, and where it is reached. [`ProviderOffering::overrides`]
-    /// and [`ProviderOffering::pointer`] are not, being provenance for those
-    /// facts within one `(provider, model)` group rather than facts of their own.
-    fn content(&self) -> (&ModelFacts, Option<&ObservedPrice>, &ProviderEndpoint) {
-        (
-            &self.offering.facts,
-            self.offering.price.as_ref(),
-            &self.offering.endpoint,
-        )
+    /// Everything a caller is answered by has to be the same: what it charges,
+    /// where it is reached, and every stated fact about what it can do —
+    /// capabilities, modalities, limits, lifecycle, provenance dates. What may
+    /// differ is how the record labels itself, because a provider that renames
+    /// the id callers send usually relabels the offering in the same breath
+    /// (`Xiaomi/Mimo-V2-Flash` becoming `Mimo-V2-Flash`) and restates when it
+    /// last touched the record. A label is not a term of service, and requiring
+    /// an identical one would reclassify most real renames as an unrelated
+    /// withdrawal beside an unrelated addition.
+    ///
+    /// [`ProviderOffering::overrides`] and [`ProviderOffering::pointer`] are not
+    /// compared either: they record where these facts came from, not what they
+    /// are.
+    fn is_republication_of(&self, other: &Self) -> bool {
+        self.offering.price == other.offering.price
+            && self.offering.endpoint == other.offering.endpoint
+            && self
+                .offering
+                .facts
+                .differences(&other.offering.facts)
+                .iter()
+                .all(|field| matches!(field, ModelField::DisplayName | ModelField::LastUpdated))
     }
 }
 
@@ -665,13 +676,14 @@ impl ProjectionDiff {
 /// A rename is only ever looked for within one `(provider, model)` group: an id
 /// that reaches a different model, or that a different provider publishes, is a
 /// different offering by construction, never a renaming of this one. Within a
-/// group, the only pairing is by the offering's content — same facts, same
-/// price, same endpoint, different id — because that is the evidence that the *same* offering
-/// is now published under a new id, which is what a rename asserts and what a
-/// caller acts on by rewriting requests. Two ids of one model whose content
-/// differs are a removal and an addition however convenient a pairing would be:
-/// telling an operator to send `to` where they sent `from` is wrong when the two
-/// are not substitutes.
+/// group, the only pairing is
+/// [republication](CallableOffering::is_republication_of) — the same terms, the
+/// same endpoint, the same stated capabilities, under a different id — because
+/// that is the evidence that the *same* offering is now published under a new id,
+/// which is what a rename asserts and what a caller acts on by rewriting
+/// requests. Two ids of one model that are not the same offering stay a removal
+/// and an addition however convenient a pairing would be: telling an operator to
+/// send `to` where they sent `from` is wrong when the two are not substitutes.
 fn renames(
     withdrawn: &mut Vec<&CallableOffering<'_>>,
     appeared: &mut Vec<&CallableOffering<'_>>,
@@ -702,7 +714,7 @@ fn renames(
         for from in before {
             let Some(position) = unpaired_after
                 .iter()
-                .position(|to| withdrawn[from].content() == appeared[*to].content())
+                .position(|to| withdrawn[from].is_republication_of(appeared[*to]))
             else {
                 continue;
             };
@@ -752,6 +764,8 @@ mod tests {
         include_str!("fixtures/models_dev/catalog.cross-provider-substituted.json");
     const CROSS_PROVIDER_RELOCATED: &str =
         include_str!("fixtures/models_dev/catalog.cross-provider-relocated.json");
+    const CROSS_PROVIDER_RELABELLED: &str =
+        include_str!("fixtures/models_dev/catalog.cross-provider-relabelled.json");
     const UNAUTHORED: &str = include_str!("fixtures/models_dev/catalog.aliases-unauthored.json");
     const AMBIGUOUS: &str = include_str!("fixtures/models_dev/drift.model-key-ambiguous.json");
 
@@ -993,6 +1007,34 @@ mod tests {
         );
         assert!(diff.breaks_requests());
         assert!(!diff.resolves_elsewhere());
+    }
+
+    /// A provider that renames the id callers send normally relabels the
+    /// offering too, and says it touched the record: neither is a term of
+    /// service, so neither turns the rename into an unrelated pair.
+    #[test]
+    fn a_renamed_id_relabelled_in_the_same_breath_is_still_a_rename() {
+        let before = content(CROSS_PROVIDER);
+        let after = content(CROSS_PROVIDER_RELABELLED);
+        let previous = ModelProjection::project(&before).expect("a projection");
+        let current = ModelProjection::project(&after).expect("a projection");
+        let diff = current.diff(&previous);
+
+        assert_eq!(
+            diff.counts(),
+            ProjectionDiffCounts {
+                added: 0,
+                removed: 1,
+                renamed: 1,
+                refiled: 0,
+            },
+            "the display name and the last-updated date changed with the id"
+        );
+        assert!(diff.changes().iter().any(|change| matches!(
+            change,
+            CallableChange::Renamed { from, to, .. }
+                if from == "xiaomi/mimo-v2-flash" && to == "mimo-v2-flash"
+        )));
     }
 
     /// Nor is it a rename when the offering states everything else the same but
