@@ -67,11 +67,11 @@ Intel Xeon Platinum 8559C, 31 GiB RAM, Linux 5.15.200, rustc 1.97.1, no queueing
 
 | Profile | Concurrency | Requests | Accepted req/s | p50 | p95 | p99 | TTFT p95 | Peak RSS | Peak sockets | CPU cores used |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `buffered` | 128 | 40 000 | 8 177 | 14.9 ms | 23.6 ms | 28.9 ms | — | 44 MiB | 347 | 4.9 |
-| `streaming` | 300 | 8 000 | 1 047 | 271 ms | 290 ms | 639 ms | 62 ms | 49 MiB | 739 | 3.2 |
-| `mixed` | 128 | 12 000 | 1 368 | 2.6 ms | 277 ms | 285 ms | 51 ms | 39 MiB | 291 | 2.3 |
-| `response-size` | 64 | 6 000 | 1 215 | 49.8 ms | 83.4 ms | 99.7 ms | — | 67 MiB | 147 | 4.3 |
-| `cancellation` | 300 | 8 000 | 1 568 | 273 ms | 326 ms | 501 ms | 77 ms | 54 MiB | 720 | 4.0 |
+| `buffered` | 128 | 40 000 | 7 675 | 15.9 ms | 25.0 ms | 30.6 ms | — | 44 MiB | 344 | 4.6 |
+| `streaming` | 300 | 8 000 | 1 034 | 275 ms | 299 ms | 669 ms | 62 ms | 49 MiB | 733 | 3.1 |
+| `mixed` | 128 | 12 000 | 1 360 | 2.7 ms | 279 ms | 293 ms | 51 ms | 38 MiB | 283 | 2.3 |
+| `response-size` | 64 | 6 000 | 1 371 | 44.2 ms | 75.0 ms | 92.4 ms | — | 67 MiB | 156 | 4.1 |
+| `cancellation` | 300 | 8 000 | 1 668 | 270 ms | 303 ms | 479 ms | 65 ms | 54 MiB | 720 | 3.5 |
 
 Throughput and latency move 10–25% between runs on a shared host, while the
 socket and memory columns barely move: read the first two as an order of
@@ -93,7 +93,7 @@ What the envelope says, in operator terms:
   bodies at 64 concurrent cost ~67 MiB. Bodies are buffered before dispatch
   (ADR 0030), so `admission.max_request_bytes` × concurrency is the term to
   reason about.
-- **CPU saturates before memory.** Every profile used 2.3–4.9 cores of the 8
+- **CPU saturates before memory.** Every profile used 2.3–4.6 cores of the 8
   available at these concurrencies. On this workload shape, a replica is
   CPU-bound; scale on CPU, and remember `[admission]` ceilings are *per replica*.
 
