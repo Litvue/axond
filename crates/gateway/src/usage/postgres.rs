@@ -164,17 +164,14 @@ impl PostgresSink {
     /// table that will be created before the first flush would be a new failure
     /// mode rather than a caught one.
     async fn missing_columns(&self, client: &Client) -> Result<Vec<String>, tokio_postgres::Error> {
-        let (schema, table) = self
-            .table
-            .split_once('.')
-            .map_or(("public", self.table.as_str()), |(schema, table)| {
-                (schema, table)
-            });
         let rows = client
             .query(
-                "SELECT column_name FROM information_schema.columns \
-                 WHERE table_schema = $1 AND table_name = $2",
-                &[&schema, &table],
+                "SELECT a.attname \
+                 FROM pg_attribute AS a \
+                 WHERE a.attrelid = to_regclass($1) \
+                   AND a.attnum > 0 \
+                   AND NOT a.attisdropped",
+                &[&self.table],
             )
             .await?;
         let present: Vec<String> = rows.iter().map(|row| row.get::<_, String>(0)).collect();
@@ -661,6 +658,47 @@ mod tests {
         assert_eq!(rows[0].get::<_, &str>(1), "acme");
         assert_eq!(rows[0].get::<_, i64>(2), 640);
         assert_eq!(rows[0].get::<_, i64>(3), 812);
+    }
+
+    /// The writer and its boot gate must resolve an unqualified table through
+    /// the same connection search path. Looking only in `public` would treat
+    /// an unmigrated table in the configured schema as absent and let the
+    /// writer boot before dropping every insert.
+    #[tokio::test]
+    async fn the_schema_gate_follows_the_connection_search_path() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let suffix = std::process::id();
+        let schema = format!("axond_usage_search_path_{suffix}");
+        let table = format!("axond_usage_{suffix}");
+        let sink = PostgresSink {
+            table: table.clone(),
+            config: dsn.parse().expect("static test dsn"),
+            client: tokio::sync::Mutex::new(None),
+        };
+        let client = sink.connect_client().await.expect("connect");
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA IF NOT EXISTS {schema}; \
+                 DROP TABLE IF EXISTS {schema}.{table}; \
+                 CREATE TABLE {schema}.{table} (schema_version integer); \
+                 SET search_path TO {schema}"
+            ))
+            .await
+            .expect("create an intentionally unmigrated table on the search path");
+
+        let missing = sink
+            .missing_columns(&client)
+            .await
+            .expect("inspect the table resolved through search_path");
+        assert!(missing.iter().any(|column| column == "price_book"));
+        assert!(missing.iter().any(|column| column == "signer_kid"));
+
+        client
+            .batch_execute(&format!("DROP TABLE {schema}.{table}"))
+            .await
+            .expect("drop the test table");
     }
 
     #[tokio::test]

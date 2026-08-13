@@ -1596,6 +1596,12 @@ async fn dispatch_with_failover(
         // circuit: it is configured and discoverable, but nothing approved says
         // what it costs, so it cannot be dispatched under a budget hold.
         let Some(price) = prices.get(index) else {
+            if continuation {
+                return Err(GatewayError::ContinuationAffinityUnavailable {
+                    provider: target.provider.clone(),
+                    model: target.model.clone(),
+                });
+            }
             walk.note_unpriced(&model.name, prices.ineligible(index));
             continue;
         };
@@ -1881,6 +1887,12 @@ async fn stream_with_failover(
         }
         // Ineligible: discoverable, but not dispatchable under a budget hold.
         let Some(price) = prices.get(index) else {
+            if continuation {
+                return Err(GatewayError::ContinuationAffinityUnavailable {
+                    provider: target.provider.clone(),
+                    model: target.model.clone(),
+                });
+            }
             walk.note_unpriced(&model.name, prices.ineligible(index));
             continue;
         };
@@ -3215,7 +3227,8 @@ targets = [
     /// refusal does.
     #[tokio::test]
     async fn a_pinned_target_without_an_approved_price_is_a_typed_pricing_refusal() {
-        let refused = router(state_pinned_to_an_unpriced_offering())
+        let state = state_pinned_to_an_unpriced_offering();
+        let refused = router(state.clone())
             .oneshot(
                 authorized("/v1/responses")
                     .body(Body::from(
@@ -3260,6 +3273,61 @@ targets = [
                 "the refusal `{message}` discloses `{internal}`"
             );
         }
+
+        let continuation = router(state.clone())
+            .oneshot(
+                authorized("/v1/responses")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "gpt-4o",
+                            "input": "hi",
+                            "previous_response_id": "resp-from-unpriced-target"
+                        }))
+                        .expect("body"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("a response");
+        assert_eq!(continuation.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_slice(
+            &continuation
+                .into_body()
+                .collect()
+                .await
+                .expect("a body")
+                .to_bytes(),
+        )
+        .expect("an error document");
+        assert_eq!(body["error"]["type"], "continuation_affinity_unavailable");
+
+        let streaming = router(state)
+            .oneshot(
+                authorized("/v1/responses")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "gpt-4o",
+                            "input": "hi",
+                            "stream": true,
+                            "previous_response_id": "resp-from-unpriced-target"
+                        }))
+                        .expect("body"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("a response");
+        assert_eq!(streaming.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_slice(
+            &streaming
+                .into_body()
+                .collect()
+                .await
+                .expect("a body")
+                .to_bytes(),
+        )
+        .expect("an error document");
+        assert_eq!(body["error"]["type"], "continuation_affinity_unavailable");
     }
 
     fn minting_state() -> AppState {
