@@ -41,12 +41,12 @@ Each row writes `target/faults/<family>/<row>.json`, carrying:
 
 | Section | What it is evidence of |
 | --- | --- |
-| `injection` | The fault, how it was injected, the delay or outage window, and when the request began. |
+| `injection` | The fault, how it was injected, the delay or outage window, and when the request began. The window is gated on covering what it explains: a row that leaves the tier down was down through the measured request, and a recovery row's window runs to the restore point it recorded. |
 | `classification` | The status, typed error, phase, how many bytes of *provider* output were relayed before the failure — the gateway's own in-band error event does not count — and, for a recovery row, what the tier answered while it was down. |
 | `deadline` | The bound the row is ended by, its configured value, and the elapsed time against the row's ceiling. |
 | `retries` | Attempts spent, dispatches the provider saw, and the configured `max_attempts`. |
-| `cleanup` | Upstream responses opened and still open when the caller was gone, how long the release took, and whether the process exited cleanly on `SIGTERM`. A stalled buffered attempt is counted as well as a stream, so a header- or body-bound row proves the abandoned response was released rather than reporting a zero nothing ever contributed to. |
-| `usage` | Records settled by the measured request, their statuses, the cost, and whether the record carries a request id. |
+| `cleanup` | Upstream responses opened and still open when the caller was gone, how long the release took, and whether the process exited cleanly on `SIGTERM`. A stalled buffered attempt is counted as well as a stream, so a header- or body-bound row proves the abandoned response was released rather than reporting a zero nothing ever contributed to. The release time is read before the process is stopped and gated on a ceiling, so a body freed only by shutdown fails the row. |
+| `usage` | Records settled by the measured request, their statuses, the cost, and whether the record carries a request id. A record is the measured request's when the identity it carries was minted after that request was sent — a backend row's priming request and outage probe are recognised and excluded by their own identities, however late their records land, rather than being waited out. |
 | `telemetry` | Exports received by a real OTLP collector, the instruments and spans observed, and any the row named and did not get. |
 | `leakage` | Every surface scanned — caller response, usage records, process output, OTLP payloads — with byte counts and any finding. |
 | `verdicts` | Every check, with expected and observed, so a passing row is auditable and a failing row is diagnosable from the artifact alone. |
@@ -63,13 +63,15 @@ fails on is a property that does not move with the machine.
 
 ```bash
 # Provider and transport rows. No datastore needed.
-cargo test --locked --all-features --test faults -- --nocapture
+AXOND_FAULT_MATRIX=1 \
+  cargo test --locked --all-features --test faults -- --nocapture --test-threads=1
 
 # All rows, including the state tiers, against the containers CONTRIBUTING.md
 # starts for the other stateful suites.
+AXOND_FAULT_MATRIX=1 \
 AXOND_TEST_REDIS_URL=redis://127.0.0.1:6399 \
 AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:55432/postgres \
-  cargo test --locked --all-features --test faults -- --nocapture
+  cargo test --locked --all-features --test faults -- --nocapture --test-threads=1
 ```
 
 Or `just faults`, which runs whichever rows the environment can serve: the
@@ -82,9 +84,18 @@ speaks TCP and would break the handshake instead of injecting the fault.
 
 State-tier rows skip when their connection string is unset and **fail** when
 `AXOND_TEST_REQUIRE_SERVICES=1`, which the CI stateful lane sets — so a skipped
-backend row there is a failure, not a quiet gap. The rows run one at a time on
-purpose: each boots its own process, and a matrix that shared a replica between
-rows could not attribute what it recorded to the fault it injected.
+backend row there is a failure, not a quiet gap.
+
+The rows run one at a time, in a lane of their own. Each boots its own process,
+and a matrix that shared a replica between rows could not attribute what it
+recorded to the fault it injected. Ordering within the test binary is not enough
+for that either: under `cargo test --workspace` the other binaries are loading
+the same machine, and a row measuring an injected 150 ms of Redis latency would
+be measuring them too. `AXOND_FAULT_MATRIX=1` is what admits the rows, and only
+the dedicated step (`just faults`, or the fault-qualification steps in the CI
+`Tests` and `Stateful tests` jobs, which run this binary on its own with
+`--test-threads=1`) sets it. Everything else in the suite runs the binary's
+assertions without the rows.
 
 ## Reading a result
 
@@ -93,8 +104,9 @@ compare their `environment` first — the binary, config, manifest, and fixture
 hashes, plus toolchain and host. Results whose provenance differs are not
 comparable. The config hash is taken over the config with its per-run values
 replaced by placeholders — the gateway and fake-upstream ports, the injector
-ports the transport rows point a provider at, and the run-scoped key prefix a
-state-tier row keeps its keys under — so two runs of the same row on the same
+ports the transport rows point a provider at, the run-scoped key prefix a Redis
+row keeps its keys under, and the run-scoped table a Postgres row keeps its
+spend in and drops on the way out — so two runs of the same row on the same
 build agree, and a real change of the row's wiring still does not.
 
 Some expectations are worth knowing before reading one:

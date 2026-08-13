@@ -55,6 +55,12 @@ const RESPONSE_HEADER_TIMEOUT_MS: u64 = 600;
 const BUFFERED_BODY_TIMEOUT_MS: u64 = 600;
 const STREAM_IDLE_TIMEOUT_MS: u64 = 600;
 const OVERALL_TIMEOUT_MS: u64 = 20_000;
+/// What a Redis row gives the tier before it treats it as unavailable. Well
+/// clear of the 150 ms the latency row injects: the rows have a lane to
+/// themselves, but a shared runner is still a shared runner, and a bound a busy
+/// machine can trip on its own would qualify the machine rather than the
+/// gateway.
+const REDIS_TIMEOUT_MS: u64 = 2_000;
 
 /// The variable a backend row's connection string arrives in. The generated
 /// config references it by name, exactly as a deployment does: no DSN is ever
@@ -80,9 +86,14 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 /// Extra delay the latency rows inject into every datastore read.
 const LATENCY_SETTLE: Duration = Duration::from_millis(200);
-/// How long the usage stream must stand still before a request that has already
-/// answered is taken to have settled everything it was going to.
-const USAGE_QUIET_WINDOW: Duration = Duration::from_millis(400);
+/// How long a row that must settle *no* record waits before concluding none is
+/// coming. Rows that expect records wait for those records by identity.
+const USAGE_ABSENCE_WINDOW: Duration = Duration::from_millis(750);
+
+/// How long the upstream may take to be released once the caller is gone.
+/// Recorded and gated: a release that happens only at process shutdown is a
+/// leak for as long as the process lives, and an ungated field cannot say so.
+pub const CLEANUP_SETTLE_BOUND_MS: u128 = 5_000;
 
 /// The result of asking the harness to run a row.
 pub enum Outcome {
@@ -193,6 +204,7 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
             (format!("http://{refused}"), "http://127.0.0.1:REFUSED_PORT"),
             (tls.base_url(), "https://127.0.0.1:TLS_PORT"),
             (key_prefix_root(), "axond-fault-PID"),
+            (budget_table_root(), "axond_fq_PID"),
         ],
         manifest::MANIFEST_RELATIVE,
         manifest_text,
@@ -204,14 +216,16 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
     if backend.is_some() {
         let _ = request(&gateway, &wiring.alias, row.streamed).await;
     }
+    // Both counters are baselined here, before anything is injected: the proxy
+    // also counts a connection it could not carry during the priming request,
+    // and an outage that is credited with those severed fewer than it claims.
     let carried_before = backend.as_ref().map_or(0, |b| b.proxy.accepted());
+    let severed_before = backend.as_ref().map_or(0, |b| b.proxy.severed());
 
     let mut outage = None;
     let mut during_outage_status = None;
-    let outage_began_at = Instant::now();
     if let Some(backend) = backend.as_ref() {
         let began = unix_ms();
-        let began_at = outage_began_at;
         match row.fault {
             Fault::RedisLatency | Fault::PostgresLatency => {
                 backend.proxy.set(Mode::Latency(Duration::from_millis(
@@ -235,10 +249,14 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
             }
         }
         if !matches!(row.fault, Fault::RedisLatency | Fault::PostgresLatency) {
+            // The window is measured on the same clock as the endpoints it is
+            // reported against, so the two cannot disagree by the millisecond
+            // each of two clocks would round away on its own.
+            let restored = row.fault.recovers().then(unix_ms);
             outage = Some(Outage {
                 began_at_unix_ms: began,
-                restored_at_unix_ms: row.fault.recovers().then(unix_ms),
-                duration_ms: began_at.elapsed().as_millis(),
+                restored_at_unix_ms: restored,
+                duration_ms: restored.unwrap_or_else(unix_ms) - began,
                 connections_carried: 0,
                 connections_severed: 0,
             });
@@ -248,12 +266,8 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
     // Everything below is attributed to the measured request alone: a backend
     // row has already sent a priming request and possibly an outage probe, and
     // their records and dispatches are not this row's. Settlement is detached
-    // from the response, so the earlier records are waited out rather than
-    // assumed written: one still in flight would be read as this row's.
-    if backend.is_some() {
-        await_quiet_usage(&gateway).await;
-    }
-    let records_before = gateway.usage_records().len();
+    // from the response, so an earlier record can land after this point — it is
+    // recognised by the mint time its identity carries rather than waited out.
     let upstream_before = upstream.state.requests().len() as u64;
     let run_started_at = SystemTime::now();
     let started_at = unix_ms();
@@ -266,13 +280,14 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
     // restores the tier is still down here, so its window runs to now.
     if let (Some(outage), Some(backend)) = (outage.as_mut(), backend.as_ref()) {
         outage.connections_carried = backend.proxy.accepted() - carried_before;
-        outage.connections_severed = backend.proxy.severed();
+        outage.connections_severed = backend.proxy.severed() - severed_before;
         if outage.restored_at_unix_ms.is_none() {
-            outage.duration_ms = outage_began_at.elapsed().as_millis();
+            outage.duration_ms = unix_ms() - outage.began_at_unix_ms;
         }
     }
 
-    let records = await_usage_records(&gateway, records_before, row.expect.usage_records).await;
+    let settled = await_usage_records(&gateway, started_at, row.expect.usage_records).await;
+    let records = settled.measured;
     let upstream_requests = upstream.state.requests().len() as u64 - upstream_before;
     let cleanup_started = Instant::now();
     let cleaned = await_upstream_release(&upstream).await;
@@ -286,9 +301,15 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
     // process is gone.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    if service == Some(Service::Postgres)
+        && let Some(dsn) = dsn.as_deref()
+    {
+        drop_budget_table(dsn, &budget_table(&row.id)).await;
+    }
+
     let output = gateway.output();
     let measured = records.last().cloned();
-    let usage = usage_outcome(&records, measured.as_ref());
+    let usage = usage_outcome(&records, measured.as_ref(), &settled.counts);
     let attempts = measured
         .as_ref()
         .and_then(|record| record["attempts"].as_u64())
@@ -658,6 +679,7 @@ fn wiring_for(
             let service = row.fault.service().expect("a backend row names a service");
             let policy = row.fault.on_unavailable().expect("a backend row has one");
             let prefix = format!("{}-{}", key_prefix_root(), row.id);
+            let table = budget_table(&row.id);
             let extra = match service {
                 Service::Redis => format!(
                     r#"
@@ -668,8 +690,8 @@ on_unavailable = "{policy}"
 key_prefix = "{prefix}"
 max_in_flight_per_subject = 256
 lease_ttl_seconds = 60
-timeout_ms = 500
-connect_timeout_ms = 500
+timeout_ms = {REDIS_TIMEOUT_MS}
+connect_timeout_ms = {REDIS_TIMEOUT_MS}
 "#
                 ),
                 Service::Postgres => format!(
@@ -679,9 +701,8 @@ backend = "postgres"
 dsn_env = "{STATE_DSN_ENV}"
 on_unavailable = "{policy}"
 limit_microdollars = 1000000000000
-table = "axond_fault_budget"
+table = "{table}"
 create_table = true
-key_prefix = "{prefix}"
 reservation_ttl_seconds = 60
 "#
                 ),
@@ -705,7 +726,7 @@ reservation_ttl_seconds = 60
                 how,
                 bound,
                 match service {
-                    Service::Redis => Some(500),
+                    Service::Redis => Some(REDIS_TIMEOUT_MS),
                     Service::Postgres => None,
                 },
             )
@@ -724,11 +745,55 @@ reservation_ttl_seconds = 60
     }
 }
 
-/// The run-scoped prefix a backend row's keys and rows live under, so two
-/// harnesses sharing a datastore cannot read each other's state. It carries the
-/// process id, and is normalised out of the recorded config for that reason.
+/// The run-scoped prefix a Redis row's keys live under, so two harnesses
+/// sharing a datastore cannot read each other's state. It carries the process
+/// id, and is normalised out of the recorded config for that reason.
 fn key_prefix_root() -> String {
     format!("axond-fault-{}", std::process::id())
+}
+
+/// The same isolation for a Postgres row, which `key_prefix` cannot give it:
+/// that setting namespaces Redis keys, and the Postgres store keys its spend by
+/// table and `(namespace, subject)`. The table is what has to be run-scoped,
+/// and the row drops it again on the way out.
+///
+/// Kept short: the store derives a fence trigger named `<table>_namespace_fence`
+/// from it, and Postgres rejects an identifier of 64 characters or more.
+pub fn budget_table(row: &str) -> String {
+    let row: String = row
+        .trim_start_matches("postgres-")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let table = format!("{}_{}", budget_table_root(), row);
+    assert!(
+        table.len() + "_namespace_fence".len() < 64,
+        "`{table}` leaves no room for the store's derived identifiers"
+    );
+    table
+}
+
+fn budget_table_root() -> String {
+    format!("axond_fq{}", std::process::id())
+}
+
+/// Drop a Postgres row's tables once the row is done, so a run leaves the
+/// database as it found it. Connected directly rather than through the fault
+/// proxy, which by then may be holding an outage open.
+async fn drop_budget_table(dsn: &str, table: &str) {
+    let Ok((client, connection)) = tokio_postgres::connect(dsn, tokio_postgres::NoTls).await else {
+        return;
+    };
+    let pump = tokio::spawn(connection);
+    for statement in [
+        format!("DROP TABLE IF EXISTS {table}_reservation"),
+        format!("DROP TABLE IF EXISTS {table}_namespace"),
+        format!("DROP TABLE IF EXISTS {table}"),
+    ] {
+        let _ = client.execute(&statement, &[]).await;
+    }
+    drop(client);
+    let _ = pump.await;
 }
 
 fn dsn_for(service: Service) -> Option<String> {
@@ -745,41 +810,74 @@ fn dsn_for(service: Service) -> Option<String> {
     }
 }
 
-/// Wait until no further usage record appears, so a record already in flight
-/// is not mistaken for the next request's. Settlement is detached from the
-/// response, and a priming or probe request's record can land after it.
-async fn await_quiet_usage(gateway: &Axond) {
-    let deadline = Instant::now() + SETTLE_TIMEOUT;
-    let mut settled = gateway.usage_records().len();
-    let mut quiet_since = Instant::now();
-    while Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let now = gateway.usage_records().len();
-        if now != settled {
-            settled = now;
-            quiet_since = Instant::now();
-        } else if quiet_since.elapsed() >= USAGE_QUIET_WINDOW {
-            return;
-        }
+/// How the driver decides a record is the measured request's, named in the
+/// artifact so a reader knows what the attribution is worth.
+pub const ATTRIBUTED_BY: &str = "request_id_mint_time";
+
+/// The mint time a record's identity carries. `request_id` is a prefixed UUIDv7
+/// (RFC 9562), whose first 48 bits are the milliseconds since the epoch at
+/// which it was minted — which is when the gateway accepted the request, before
+/// anything it settles. `None` for an identity that cannot be read as one.
+pub fn minted_at_unix_ms(request_id: &str) -> Option<u128> {
+    let uuid = request_id.strip_prefix("req_")?;
+    let hex: String = uuid.chars().filter(|c| *c != '-').take(12).collect();
+    if hex.len() < 12 {
+        return None;
     }
+    u128::from_str_radix(&hex, 16).ok()
 }
 
-/// The records the measured request settled: everything written after `before`.
-/// A row expecting none still waits, because a record it should not have
-/// written is the finding.
-async fn await_usage_records(gateway: &Axond, before: usize, expected: u64) -> Vec<Value> {
+/// What a settled stream of records belongs to.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Attribution {
+    pub measured: u64,
+    /// Records an earlier request settled, recognised by an identity minted
+    /// before the measured request was sent.
+    pub earlier: u64,
+    /// Records carrying no identity a mint time can be read from.
+    pub unattributable: u64,
+}
+
+/// Split settled records by the identity each carries. A record minted at or
+/// after the measured request was sent is the measured request's; one minted
+/// before it belongs to the priming request or the outage probe, however late
+/// it lands.
+pub fn attribute(records: &[Value], minted_after_unix_ms: u128) -> (Vec<Value>, Attribution) {
+    let mut measured = Vec::new();
+    let mut counts = Attribution::default();
+    for record in records {
+        match record["request_id"].as_str().and_then(minted_at_unix_ms) {
+            Some(minted) if minted >= minted_after_unix_ms => {
+                counts.measured += 1;
+                measured.push(record.clone());
+            }
+            Some(_) => counts.earlier += 1,
+            None => counts.unattributable += 1,
+        }
+    }
+    (measured, counts)
+}
+
+struct Settled {
+    measured: Vec<Value>,
+    counts: Attribution,
+}
+
+/// The records the measured request settled, recognised by their identities. A
+/// row expecting none still waits, because a record it should not have written
+/// is the finding.
+async fn await_usage_records(gateway: &Axond, minted_after: u128, expected: u64) -> Settled {
     let deadline = Instant::now() + SETTLE_TIMEOUT;
-    let quiet = Instant::now() + Duration::from_millis(750);
+    let absent = Instant::now() + USAGE_ABSENCE_WINDOW;
     loop {
-        let mut records = gateway.usage_records();
-        let settled = (records.len().saturating_sub(before)) as u64;
+        let (measured, counts) = attribute(&gateway.usage_records(), minted_after);
         let done = if expected == 0 {
-            Instant::now() >= quiet
+            Instant::now() >= absent
         } else {
-            settled >= expected
+            counts.measured >= expected
         };
         if done || Instant::now() >= deadline {
-            return records.split_off(before.min(records.len()));
+            return Settled { measured, counts };
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -800,7 +898,11 @@ async fn await_upstream_release(upstream: &FakeUpstream) -> bool {
     }
 }
 
-fn usage_outcome(records: &[Value], measured: Option<&Value>) -> UsageOutcome {
+fn usage_outcome(
+    records: &[Value],
+    measured: Option<&Value>,
+    counts: &Attribution,
+) -> UsageOutcome {
     let mut by_status: BTreeMap<String, u64> = BTreeMap::new();
     for record in records {
         let status = record["status"].as_str().unwrap_or("unknown").to_owned();
@@ -814,6 +916,9 @@ fn usage_outcome(records: &[Value], measured: Option<&Value>) -> UsageOutcome {
         carries_request_id: measured
             .and_then(|r| r["request_id"].as_str())
             .is_some_and(|id| !id.is_empty()),
+        attributed_by: ATTRIBUTED_BY.to_owned(),
+        records_before_measured: counts.earlier,
+        unattributable_records: counts.unattributable,
     }
 }
 
@@ -992,18 +1097,6 @@ fn judge(row: &Row, mut result: FaultResult, cleaned_up: bool) -> FaultResult {
             u128::from(row.deadline_ms),
         ),
         Verdict::holds(
-            "upstream_cleanup",
-            cleaned_up && result.cleanup.upstream_streams_open_at_end <= 0,
-            format!("{} open", result.cleanup.upstream_streams_open_at_end),
-        ),
-        // A row that abandons an upstream response must have opened one, or its
-        // clean count is clean only because nothing was ever at risk.
-        Verdict::holds(
-            "upstream_abandoned_response_tracked",
-            !row.fault.abandons_upstream() || result.cleanup.upstream_streams_opened > 0,
-            format!("{} opened", result.cleanup.upstream_streams_opened),
-        ),
-        Verdict::holds(
             "clean_shutdown",
             result.cleanup.process_exited_cleanly,
             result.cleanup.process_exited_cleanly.to_string(),
@@ -1050,13 +1143,29 @@ fn judge(row: &Row, mut result: FaultResult, cleaned_up: bool) -> FaultResult {
             u128::from(latency),
         ));
     }
+    verdicts.extend(cleanup_verdicts(
+        &result.cleanup,
+        cleaned_up,
+        row.fault.abandons_upstream(),
+    ));
     if let Some(outage) = result.injection.outage {
-        verdicts.push(Verdict::holds(
-            "outage_severed_connections",
-            outage.connections_severed > 0,
-            outage.connections_severed.to_string(),
+        verdicts.extend(outage_verdicts(
+            &outage,
+            result.injection.timing.started_at_unix_ms,
+            result.deadline.elapsed_ms,
         ));
     }
+    verdicts.push(Verdict::holds(
+        "usage_attributed_by_identity",
+        result.usage.unattributable_records == 0,
+        format!(
+            "{} by {}, {} earlier, {} unattributable",
+            result.usage.records,
+            result.usage.attributed_by,
+            result.usage.records_before_measured,
+            result.usage.unattributable_records
+        ),
+    ));
     if expect.usage_records > 0 {
         verdicts.push(Verdict::holds(
             "usage_carries_request_id",
@@ -1066,6 +1175,79 @@ fn judge(row: &Row, mut result: FaultResult, cleaned_up: bool) -> FaultResult {
     }
     result.verdicts = verdicts;
     result
+}
+
+/// What the cleanup evidence has to say for itself. The settle time is gated
+/// rather than merely recorded: an upstream released only when the process died
+/// was held for the whole life of the request that abandoned it.
+pub fn cleanup_verdicts(
+    cleanup: &Cleanup,
+    cleaned_up: bool,
+    abandons_upstream: bool,
+) -> Vec<Verdict> {
+    vec![
+        Verdict::holds(
+            "upstream_cleanup",
+            cleaned_up && cleanup.upstream_streams_open_at_end <= 0,
+            format!("{} open", cleanup.upstream_streams_open_at_end),
+        ),
+        // A row that abandons an upstream response must have opened one, or its
+        // clean count is clean only because nothing was ever at risk.
+        Verdict::holds(
+            "upstream_abandoned_response_tracked",
+            !abandons_upstream || cleanup.upstream_streams_opened > 0,
+            format!("{} opened", cleanup.upstream_streams_opened),
+        ),
+        Verdict::at_most(
+            "upstream_released_promptly",
+            cleanup.settled_within_ms,
+            CLEANUP_SETTLE_BOUND_MS,
+        ),
+    ]
+}
+
+/// What the recorded outage window has to say for itself. An outage that ended
+/// before the request it is supposed to explain explains nothing, and a
+/// recovery row's window has to reach the restore point it recorded.
+pub fn outage_verdicts(
+    outage: &Outage,
+    request_started_at_unix_ms: u128,
+    request_elapsed_ms: u128,
+) -> Vec<Verdict> {
+    let covered = match outage.restored_at_unix_ms {
+        // A recovery row restores the tier before the measured request, so its
+        // window is the interval it recorded, up to the restore point.
+        Some(restored) => {
+            restored >= outage.began_at_unix_ms
+                && restored <= request_started_at_unix_ms
+                && outage.duration_ms >= restored - outage.began_at_unix_ms
+        }
+        // A row that leaves the tier down was down for the request as well.
+        None => {
+            outage.began_at_unix_ms <= request_started_at_unix_ms
+                && outage.duration_ms
+                    >= request_started_at_unix_ms - outage.began_at_unix_ms + request_elapsed_ms
+        }
+    };
+    vec![
+        Verdict::holds(
+            "outage_severed_connections",
+            outage.connections_severed > 0,
+            outage.connections_severed.to_string(),
+        ),
+        Verdict::holds(
+            "outage_window_recorded",
+            covered,
+            format!(
+                "began {}, restored {:?}, {} ms against a request of {} ms at {}",
+                outage.began_at_unix_ms,
+                outage.restored_at_unix_ms,
+                outage.duration_ms,
+                request_elapsed_ms,
+                request_started_at_unix_ms
+            ),
+        ),
+    ]
 }
 
 fn unix_ms() -> u128 {

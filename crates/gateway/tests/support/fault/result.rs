@@ -193,6 +193,17 @@ pub struct UsageOutcome {
     pub cost_microdollars: Option<u64>,
     /// Whether the record carried the identity an operator correlates by.
     pub carries_request_id: bool,
+    /// How a record was decided to belong to the measured request. Position in
+    /// the stream and a quiet window are not attribution: a priming record that
+    /// lands late is still the priming request's, and the identity says so.
+    pub attributed_by: String,
+    /// Records this row settled for an earlier request — a backend row's
+    /// priming request and its outage probe — recognised by their identities
+    /// and excluded rather than waited out.
+    pub records_before_measured: u64,
+    /// Records whose identity could not be read at all, so nothing could be
+    /// attributed by it. Any at all is a finding.
+    pub unattributable_records: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -148,8 +148,13 @@ jobs:
           name: rollout-results-reduced
           path: target/rollout/**/*.json
           if-no-files-found: warn
-      # The provider and transport fault rows run in the same suite; the
-      # state-tier rows skip here and run in the stateful lane below.
+      # The fault matrix qualifies timing, so it does not run beside the rest of
+      # the suite: this step has the machine to itself, one row at a time. The
+      # state-tier rows skip without a datastore and run in the stateful lane.
+      - name: Qualify the provider and transport fault rows
+        run: cargo test -p axond --all-features --locked --test faults -- --test-threads=1
+        env:
+          AXOND_FAULT_MATRIX: "1"
       - name: Publish the stateless fault-matrix results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -216,7 +221,16 @@ jobs:
           path: target/rollout/**/*.json
           if-no-files-found: warn
       # The full fault matrix, state tiers included: `AXOND_TEST_REQUIRE_SERVICES`
-      # makes a skipped backend row a failure here rather than a quiet gap.
+      # makes a skipped backend row a failure here rather than a quiet gap, and
+      # the step runs the binary alone so an injected latency is the only load
+      # the row is measuring.
+      - name: Qualify the full fault matrix against Redis and Postgres
+        run: cargo test -p axond --all-features --locked --test faults -- --test-threads=1
+        env:
+          AXOND_TEST_REDIS_URL: redis://127.0.0.1:6379
+          AXOND_TEST_POSTGRES_DSN: postgres://postgres:axond-ci@127.0.0.1:5432/postgres
+          AXOND_TEST_REQUIRE_SERVICES: "1"
+          AXOND_FAULT_MATRIX: "1"
       - name: Publish the fault-matrix results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
