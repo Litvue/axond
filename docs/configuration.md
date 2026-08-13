@@ -144,9 +144,30 @@ unwrapped only while a snapshot is compiled; a request never unwraps a secret.
 | `dsn_env` | string | `[control_plane] dsn_env` | Name of the env var holding the store's connection string. Omit to reuse the control plane's own reference, which is the common single-database deployment. |
 | `kek_env` | string | — | Name of the env var holding the key-encryption key. |
 | `kek_file` | string | — | Path to a file holding the key-encryption key. |
+| `schema` | string | connection default | PostgreSQL schema `axond_secret` lives in. A single unqualified identifier, on the same rules as `[control_plane] schema`, because it becomes `SET search_path`. |
+| `create_table` | boolean | `true` | Whether a booting replica may apply the shipped `secret_store_v1.sql`. On by default, unlike `[control_plane] migrate`: the DDL is one `CREATE TABLE IF NOT EXISTS`, not a migration ledger a rollout can race on. An operator who applies it out of band turns this off and gets a refusal at boot instead of a schema change. |
 
 Exactly one of `kek_env` and `kek_file` must be non-empty; zero or both is
 rejected.
+
+The key is 32 bytes, base64-encoded (padded or not; surrounding whitespace and a
+trailing newline are tolerated, so a file written by `openssl rand -base64 32 >
+kek` works as-is). Anything else is refused at boot, naming the reference and the
+reason and never the material:
+
+```bash
+openssl rand -base64 32 > /etc/axond/secret-store.kek   # chmod 0400, root-owned
+```
+
+Material is sealed under a fresh per-version data key, that key is sealed under
+this KEK, and only the sealed bytes reach the database — so a dump, a backup, or
+a stolen replica of the store discloses nothing without the KEK, which is not in
+the database. Rotating the KEK is therefore not a config edit on its own: rows
+sealed under the previous key stop unwrapping, and the material has to be
+restaged under the new one. Timeouts are inherited from `[control_plane]`, since
+encrypted Postgres is normally the same database and two independent sets of
+bounds for one server is a knob with no decision behind it. See
+[ADR 0039](./adr/0039-envelope-encrypted-secret-store-and-snapshot-time-resolution.md).
 
 #### `[[admin_breakglass]]`
 

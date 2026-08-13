@@ -57,6 +57,7 @@ pub mod backoff;
 pub mod compile;
 pub mod lkg;
 pub mod reconciler;
+pub mod secrets;
 pub mod settings;
 pub mod status;
 pub mod tenancy;
@@ -75,6 +76,8 @@ pub use compile::{
 pub use lkg::{LastKnownGood, LastKnownGoodError};
 #[allow(unused_imports)]
 pub use reconciler::{BootstrapError, ChangeSignal, Outcome, Reconciler, SnapshotSink};
+#[allow(unused_imports)]
+pub use secrets::{MaterialLedger, ResolvedSecrets, RetainedMaterial, SecretMaterialization};
 #[allow(unused_imports)]
 pub use settings::{ConvergenceSettings, InvalidSettings};
 #[allow(unused_imports)]

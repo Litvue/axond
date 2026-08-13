@@ -13,10 +13,15 @@
 //!    [`Config::validate_compiled`], which *is* the whole-graph gate boot runs on
 //!    a file. An alias pointing at an undefined provider is refused identically
 //!    whether an operator wrote it in TOML or an administrator published it.
-//! 3. **Snapshot build.** [`ConfigSnapshot::build`] resolves credentials,
-//!    gateway keys, verifiers, and minting material, so every secret a candidate
-//!    needs is resolved *here*, off the request path, before anything is
-//!    published.
+//! 3. **Materialization.** [`SecretMaterialization`] unwraps every exact secret
+//!    version the revision's typed credentials pin, through the deployment's
+//!    `SecretStore`. This is the only step that awaits, and the only place
+//!    durable material enters the process.
+//! 4. **Snapshot build.** [`ConfigSnapshot::build_with`] resolves credentials,
+//!    gateway keys, verifiers, and minting material, and takes ownership of the
+//!    material step 3 unwrapped — so every secret a candidate needs is resolved
+//!    *here*, off the request path, before anything is published, and is held for
+//!    exactly as long as the snapshot is.
 //!
 //! Every failure is a value returned to the caller, never a partially applied
 //! change: nothing in this module can touch the running snapshot, because it
@@ -24,10 +29,15 @@
 //! structural rather than a rule the reconciler has to remember.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
 
 use crate::config::{Config, ConfigError};
 use crate::desired_state::{DesiredState, LoadedRevision, ResourceRef, RevisionId};
 use crate::state::{ConfigSnapshot, SnapshotError};
+
+use super::secrets::{MaterialLedger, SecretMaterialization};
 
 /// Filling the control-plane-owned sections of a config from desired state.
 ///
@@ -135,8 +145,14 @@ impl CompileError {
 /// Object-safe so the reconciler holds one `Arc<dyn CandidateCompiler>` rather
 /// than being generic over a projection that only exists in later slices — and so
 /// a test can drive convergence with a compiler that refuses on demand.
+///
+/// Asynchronous because compiling a candidate resolves durable secret material,
+/// which is a datastore call. Deliberately *only* here: the request path holds a
+/// published snapshot and never awaits a secret store, so a store outage delays
+/// convergence and cannot fail an inference request.
+#[async_trait]
 pub trait CandidateCompiler: Send + Sync {
-    fn compile(
+    async fn compile(
         &self,
         revision: &LoadedRevision,
         generation: u64,
@@ -154,14 +170,39 @@ pub struct RevisionCompiler<P> {
     /// projection resolves through, not to this map.
     env: HashMap<String, String>,
     projection: P,
+    /// How durable material is unwrapped for a candidate.
+    ///
+    /// A [`SecretMaterialization`], not a `SecretStore`: this component resolves
+    /// exact versions and cannot stage, rotate, or transition anything, so the
+    /// thing that holds plaintext is not the thing that can change what a
+    /// credential points at.
+    secrets: Arc<SecretMaterialization>,
 }
 
 impl<P: RevisionProjection> RevisionCompiler<P> {
-    pub const fn new(bootstrap: Config, env: HashMap<String, String>, projection: P) -> Self {
+    /// A compiler for a process with no secret store: file and env references
+    /// compile as they always have, and a revision carrying typed credentials is
+    /// refused rather than published without its material.
+    pub fn new(bootstrap: Config, env: HashMap<String, String>, projection: P) -> Self {
+        Self::with_secrets(
+            bootstrap,
+            env,
+            projection,
+            Arc::new(SecretMaterialization::stateless(MaterialLedger::new())),
+        )
+    }
+
+    pub const fn with_secrets(
+        bootstrap: Config,
+        env: HashMap<String, String>,
+        projection: P,
+        secrets: Arc<SecretMaterialization>,
+    ) -> Self {
         Self {
             bootstrap,
             env,
             projection,
+            secrets,
         }
     }
 
@@ -169,10 +210,17 @@ impl<P: RevisionProjection> RevisionCompiler<P> {
     pub fn projection_name(&self) -> &'static str {
         self.projection.name()
     }
+
+    /// The materialization this compiler resolves through, for diagnostics and
+    /// for the status surface that reports which versions are held.
+    pub fn secrets(&self) -> &Arc<SecretMaterialization> {
+        &self.secrets
+    }
 }
 
+#[async_trait]
 impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
-    fn compile(
+    async fn compile(
         &self,
         revision: &LoadedRevision,
         generation: u64,
@@ -191,7 +239,20 @@ impl<P: RevisionProjection> CandidateCompiler for RevisionCompiler<P> {
                 revision: id,
                 source,
             })?;
-        ConfigSnapshot::build(config, &self.env, generation).map_err(|source| {
+        // Material is unwrapped after the boot gate and before the snapshot: a
+        // revision that cannot be served at all does not touch the secret store,
+        // and material that cannot be unwrapped is a refusal rather than a
+        // snapshot with holes in it. Either way the resolved set is dropped here,
+        // which zeroizes it, and only a published snapshot keeps it alive.
+        let secrets = self
+            .secrets
+            .resolve(revision.state())
+            .await
+            .map_err(|source| CompileError::Projection {
+                revision: id,
+                source,
+            })?;
+        ConfigSnapshot::build_with(config, &self.env, generation, secrets).map_err(|source| {
             CompileError::Snapshot {
                 revision: id,
                 source,
@@ -318,12 +379,17 @@ mod tests {
     use super::*;
     use crate::desired_state::fixtures;
 
-    #[test]
-    fn a_projected_revision_compiles_into_a_snapshot_at_the_requested_generation() {
-        let compiler =
-            RevisionCompiler::new(bootstrap(), env(), AliasProjection { provider: "openai" });
+    #[tokio::test]
+    async fn a_projected_revision_compiles_into_a_snapshot_at_the_requested_generation() {
+        let compiler = RevisionCompiler::with_secrets(
+            bootstrap(),
+            env(),
+            AliasProjection { provider: "openai" },
+            crate::convergence::secrets::testing::permissive(),
+        );
         let snapshot = compiler
             .compile(&revision(), 7)
+            .await
             .expect("the projected config is servable");
         assert_eq!(snapshot.generation, 7);
         // The fixture holds one alias, which the projection turns into one model.
@@ -340,28 +406,36 @@ mod tests {
     /// revision whose alias points at a provider no one defined is rejected with
     /// the same error a file would produce, and nothing is returned that a caller
     /// could publish.
-    #[test]
-    fn a_revision_whose_alias_targets_an_undefined_provider_is_refused_by_the_boot_gate() {
-        let compiler = RevisionCompiler::new(
+    #[tokio::test]
+    async fn a_revision_whose_alias_targets_an_undefined_provider_is_refused_by_the_boot_gate() {
+        let compiler = RevisionCompiler::with_secrets(
             bootstrap(),
             env(),
             AliasProjection {
                 provider: "nonexistent",
             },
+            crate::convergence::secrets::testing::permissive(),
         );
         let error = compiler
             .compile(&revision(), 1)
+            .await
             .err()
             .expect("an undefined target cannot be served");
         assert_eq!(error.reason(), "validation");
         assert!(error.to_string().contains("undefined provider"), "{error}");
     }
 
-    #[test]
-    fn an_unreadable_revision_is_refused_before_any_configuration_is_built() {
-        let compiler = RevisionCompiler::new(bootstrap(), env(), RefusingProjection);
+    #[tokio::test]
+    async fn an_unreadable_revision_is_refused_before_any_configuration_is_built() {
+        let compiler = RevisionCompiler::with_secrets(
+            bootstrap(),
+            env(),
+            RefusingProjection,
+            crate::convergence::secrets::testing::permissive(),
+        );
         let error = compiler
             .compile(&revision(), 1)
+            .await
             .err()
             .expect("the projection refuses");
         assert_eq!(error.reason(), "projection");
@@ -370,15 +444,17 @@ mod tests {
 
     /// Secret resolution happens during compilation, so missing material is a
     /// refusal with a named *reference* and no leaked value.
-    #[test]
-    fn unresolvable_secret_material_refuses_the_candidate_without_disclosing_it() {
-        let compiler = RevisionCompiler::new(
+    #[tokio::test]
+    async fn unresolvable_secret_material_refuses_the_candidate_without_disclosing_it() {
+        let compiler = RevisionCompiler::with_secrets(
             bootstrap(),
             HashMap::new(),
             AliasProjection { provider: "openai" },
+            crate::convergence::secrets::testing::permissive(),
         );
         let error = compiler
             .compile(&revision(), 1)
+            .await
             .err()
             .expect("an unresolvable gateway key cannot be published");
         assert_eq!(error.reason(), "snapshot");

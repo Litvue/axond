@@ -339,12 +339,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_projected_revision_compiles_through_the_boot_gate_into_a_snapshot() {
-        let compiler = RevisionCompiler::new(bootstrap(), env(), TenancyProjection);
+    #[tokio::test]
+    async fn a_projected_revision_compiles_through_the_boot_gate_into_a_snapshot() {
+        let compiler = RevisionCompiler::with_secrets(
+            bootstrap(),
+            env(),
+            TenancyProjection,
+            crate::convergence::secrets::testing::permissive(),
+        );
         assert_eq!(compiler.projection_name(), "tenancy");
         let snapshot = compiler
             .compile(&revision(), 3)
+            .await
             .expect("a projected tenancy is servable");
         assert_eq!(snapshot.generation, 3);
         assert_eq!(namespaces(&snapshot.config), ["platform", "acme/core"]);
@@ -381,8 +387,8 @@ namespace = "acme/core"
     /// traffic lands, and projecting anyway would surface as the boot gate's
     /// generic "exactly one namespace must set `default = true`" one stage later,
     /// naming no cause an operator can act on.
-    #[test]
-    fn a_bootstrap_with_no_default_namespace_is_refused_rather_than_given_one() {
+    #[tokio::test]
+    async fn a_bootstrap_with_no_default_namespace_is_refused_rather_than_given_one() {
         let bootstrap = Config::from_toml_str(
             r#"
 mode = "stateful"
@@ -417,8 +423,14 @@ env = "GW_ADMIN_BREAKGLASS"
 
         // Compiled, it is a `projection` refusal naming the missing default,
         // rather than a `validation` one from the graph gate after the fact.
-        let Err(error) =
-            RevisionCompiler::new(bootstrap, env(), TenancyProjection).compile(&revision(), 1)
+        let Err(error) = RevisionCompiler::with_secrets(
+            bootstrap,
+            env(),
+            TenancyProjection,
+            crate::convergence::secrets::testing::permissive(),
+        )
+        .compile(&revision(), 1)
+        .await
         else {
             panic!("an incomplete bootstrap does not compile");
         };
