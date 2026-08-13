@@ -60,7 +60,9 @@ stored result, check out its `environment.source.git_commit` (with
 This table is the retained record
 [`qualification/capacity/evidence/heavy-local.toml`](../../qualification/capacity/evidence/heavy-local.toml),
 read in operator units; the record is the source, and a table that drifts from
-it is a bug. Heavy tier, one replica, **debug build** — `cargo test` builds
+it is a bug — `ops/check-docs.py` reads both and fails when they disagree, so a
+re-run that stops at the numbers below leaves the rules of thumb under them
+failing too. Heavy tier, one replica, **debug build** — `cargo test` builds
 unoptimized, so these understate release throughput substantially. Host: 8 vCPU
 Intel Xeon Platinum 8559C, 31 GiB RAM, Linux 5.15.200, rustc 1.97.1, no queueing
 (`admission.queue_capacity = 0`), the fake upstream on loopback.
@@ -86,7 +88,7 @@ buffered and streamed requests in one distribution.
 What the envelope says, in operator terms:
 
 - **Sockets scale with concurrency, roughly two per in-flight stream** — one
-  inbound, one upstream. 300 concurrent streams held ~750 descriptors. Size
+  inbound, one upstream. 300 concurrent streams held ~730 descriptors. Size
   `ulimit -n` and `admission.max_in_flight_streams` together.
 - **Resident memory is bounded by concurrency and body size, not by request
   count.** 40 000 buffered requests cost the same ~44 MiB as 400 would; 256 KiB
