@@ -78,20 +78,23 @@ pub fn router(state: AppState) -> Router {
         .into_iter()
         .fold(Router::new(), |router, spec| {
             let route = (spec.router)().layer(DefaultBodyLimit::max(max_request_bytes));
+            // A diagnostic takes no served-traffic slot, but it is not free
+            // either: its own small ceiling keeps a credential holder from
+            // polling it at unbounded concurrency, without letting served
+            // traffic at *its* ceiling make the replica unanswerable. Applied
+            // before authentication and therefore *inside* it: a slot is spent
+            // only once a caller has proved it may ask, so an anonymous flood
+            // cannot hold the ceiling closed against the operators it is for.
+            let route = if spec.auth.takes_a_diagnostic_slot() {
+                route.layer(from_fn_with_state(state.clone(), diagnostic_middleware))
+            } else {
+                route
+            };
             let route = if spec.auth.requires_a_credential() {
                 route.layer(from_fn_with_state(
                     (state.clone(), spec.capability),
                     authenticate_middleware,
                 ))
-            } else {
-                route
-            };
-            // A diagnostic takes no served-traffic slot, but it is not free
-            // either: its own small ceiling keeps a credential holder from
-            // polling it at unbounded concurrency, without letting served
-            // traffic at *its* ceiling make the replica unanswerable.
-            let route = if spec.auth.takes_a_diagnostic_slot() {
-                route.layer(from_fn_with_state(state.clone(), diagnostic_middleware))
             } else {
                 route
             };
@@ -6926,6 +6929,44 @@ max_ttl = "15m"
         );
         let (status, body) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// The ceiling is inside authentication, so a slot is spent only by a caller
+    /// that proved it may ask. Otherwise anyone reachable on the port could hold
+    /// all eight closed against the operators the route exists for — and hold
+    /// them for the length of a revocation-store round trip, during the very
+    /// outage the runbook sends operators here to triage.
+    #[tokio::test]
+    async fn an_unauthenticated_caller_cannot_spend_a_diagnostic_slot() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let held: Vec<_> = (0..crate::admission::MAX_IN_FLIGHT_DIAGNOSTICS)
+            .map(|_| {
+                state
+                    .0
+                    .admission
+                    .admit_diagnostic()
+                    .expect("under the ceiling")
+            })
+            .collect();
+
+        let (status, body) = status_response(state.clone(), None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an anonymous caller queued behind the ceiling: {body}"
+        );
+        let (status, _) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the ceiling did not apply to the caller it is for"
+        );
+        drop(held);
+        let (status, _) = status_response(state, Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// A status read is a cache read: the handler returns the last observation

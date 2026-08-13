@@ -96,6 +96,20 @@ pub enum AdmissionRejection {
 }
 
 impl AdmissionRejection {
+    /// Every rejection this replica can record, so the metric catalogue can
+    /// assert it declares each one rather than discovering the drift in a
+    /// dashboard that a new refusal silently falls outside of.
+    #[cfg(test)]
+    pub const ALL: [Self; 7] = [
+        Self::Tenant,
+        Self::TenantCapacity,
+        Self::Streams,
+        Self::Global,
+        Self::QueueFull,
+        Self::QueueTimeout,
+        Self::Diagnostics,
+    ];
+
     /// The stable machine-readable error type a caller matches on.
     pub fn code(self) -> &'static str {
         match self {
@@ -133,7 +147,7 @@ impl AdmissionRejection {
     }
 
     /// The bounded metric dimension for this rejection.
-    fn scope(self) -> &'static str {
+    pub(crate) fn scope(self) -> &'static str {
         match self {
             Self::Tenant | Self::TenantCapacity => RESOURCE_TENANT,
             Self::Streams => RESOURCE_STREAM,

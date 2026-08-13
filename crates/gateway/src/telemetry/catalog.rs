@@ -596,6 +596,7 @@ pub const CATALOG: &[MetricSpec] = &[
                     "gateway_overloaded",
                     "admission_queue_full",
                     "admission_queue_timeout",
+                    "diagnostic_concurrency_exceeded",
                 ],
             ),
         ],
@@ -888,6 +889,28 @@ mod tests {
         for method in recorded {
             validate_label_value("axond.http.server.requests", "http.request.method", method)
                 .expect("every recordable method is catalogued");
+        }
+    }
+
+    /// Every refusal admission can record carries both its resource and its
+    /// error code onto `axond.admission.rejections`, so both vocabularies have
+    /// to contain it: an undeclared value is one a dashboard drilling into the
+    /// shedding it caused is refused for naming.
+    #[test]
+    fn every_admission_rejection_is_catalogued_by_resource_and_code() {
+        for rejection in crate::admission::AdmissionRejection::ALL {
+            validate_label_value(
+                "axond.admission.rejections",
+                "axond.admission.resource",
+                rejection.scope(),
+            )
+            .expect("every rejection's resource is catalogued");
+            validate_label_value(
+                "axond.admission.rejections",
+                "axond.error.type",
+                rejection.code(),
+            )
+            .expect("every rejection's error code is catalogued");
         }
     }
 
