@@ -95,6 +95,13 @@ policy — is visible, and enumerating tenants through an administrative read is
 refused a layer above by `a_tenant_scoped_administrator_reads_no_deployment_wide_projection`.
 That is where the property lives; the test says so instead of hiding it.
 
+The same asymmetry holds for writes, and is asserted the same way: the policies
+that admit an ownerless row on the way in admit a pinned session *appending* one,
+so `a_pinned_session_cannot_write_another_tenants_rows` writes a deployment-scoped
+resource version and then shows it buys nothing — a version is desired state only
+once a revision carries it, the publication chain admits no pinned session at
+all, and no ownership row appears for the forgery.
+
 ## Not covered yet, and why
 
 These are the parts of [#225] that cannot be written against the current

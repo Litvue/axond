@@ -16,7 +16,11 @@
 //!   a principal in another tenant, cannot hand its own project to another tenant,
 //!   cannot forge a denial into another tenant's trail, and its `UPDATE`s and
 //!   `DELETE`s against another tenant's rows match nothing. The other tenant's
-//!   rows are read back afterwards, as the migrating role, unchanged.
+//!   rows are read back afterwards, as the migrating role, unchanged. What the
+//!   policies *do* admit — an ownerless, deployment-scoped row — is asserted in
+//!   the same scenario, together with the reason it gains nothing: the
+//!   publication chain admits no pinned session, so such a row can never become
+//!   part of a revision.
 //!
 //! Nothing here relies on the service layer, which is the point: these are the
 //! refusals that stand if the service layer above has a bug.
@@ -258,6 +262,51 @@ async fn a_pinned_session_cannot_write_another_tenants_rows() {
             "{attempt} affected rows the session should not be able to see"
         );
     }
+
+    // What the wall admits, stated rather than skipped, as on the read side: a
+    // deployment-scoped row carries no owner, and every policy that admits
+    // `tenant_id IS NULL` admits *writing* one — so a pinned session can append a
+    // deployment-scoped resource version, which is the shape a tenant declaration
+    // is stored in. It buys nothing, and that is the assertion: a resource version
+    // is desired state only once a revision carries it, and the publication chain
+    // admits no pinned session at all, so the forged version cannot be entered
+    // into a revision and no tenant appears for it.
+    let forged = fixtures::resource_id(96).to_string();
+    assert_eq!(
+        affected(
+            &session,
+            &format!(
+                "INSERT INTO axond_cp_resource_version (resource_kind, resource_id, version, \
+                 scope_kind, slug, body_form, body_inline, content_checksum, serializer) \
+                 VALUES ('tenant', '{forged}', 1, 'deployment', 'invented', 'inline', '\\x7b7d', \
+                 'sha256:{}', 'json')",
+                "0".repeat(64)
+            ),
+        )
+        .await,
+        1,
+        "a deployment-scoped write is refused now — if that was deliberate, this \
+         scenario should assert the refusal instead"
+    );
+    let chained = refused(
+        &session,
+        &format!(
+            "INSERT INTO axond_cp_revision_entry (revision_id, resource_kind, resource_id, version) \
+             VALUES ('{revision}', 'tenant', '{forged}', 1)"
+        ),
+    )
+    .await;
+    assert!(
+        chained.contains("row-level security"),
+        "a pinned session entered a forged version into the publication chain: {chained}"
+    );
+    assert!(
+        journal
+            .stored("SELECT t::text FROM axond_cp_tenant t WHERE slug = 'invented'")
+            .await
+            .is_empty(),
+        "a deployment-scoped write became a tenant of its own"
+    );
 
     let after = rows_of(&journal, &theirs).await;
     assert_eq!(

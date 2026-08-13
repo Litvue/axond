@@ -297,6 +297,12 @@ impl Drop for Journal {
     /// itself fails is a panic *unless* the test is already panicking, where a
     /// second panic would replace the assertion failure the operator needs to
     /// read with a teardown error.
+    ///
+    /// The roles go first and every statement is attempted whatever the ones
+    /// before it did: a role is a credential on a shared database, and a schema
+    /// drop that fails transiently must not be what decides whether the
+    /// credential outlives the test. Failures are collected and reported
+    /// together, so one leak does not hide another.
     fn drop(&mut self) {
         let dsn = self.dsn.clone();
         let schema = self.schema.clone();
@@ -308,18 +314,27 @@ impl Drop for Journal {
                 .expect("a cleanup runtime");
             runtime.block_on(async {
                 let client = connect(&dsn, None).await;
-                client
-                    .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-                    .await
-                    .expect("the scenario's schema is dropped");
+                let mut left_behind = Vec::new();
                 for role in roles {
-                    client
+                    if let Err(error) = client
                         .batch_execute(&format!(
                             "DROP OWNED BY {role} CASCADE; DROP ROLE IF EXISTS {role}"
                         ))
                         .await
-                        .expect("the scenario's role is dropped");
+                    {
+                        left_behind.push(format!("the login role {role}: {}", detail(&error)));
+                    }
                 }
+                if let Err(error) = client
+                    .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                    .await
+                {
+                    left_behind.push(format!("the schema {schema}: {}", detail(&error)));
+                }
+                assert!(
+                    left_behind.is_empty(),
+                    "a scenario could not clean up after itself: {left_behind:?}"
+                );
             });
         });
         if cleanup.join().is_err() && !std::thread::panicking() {
