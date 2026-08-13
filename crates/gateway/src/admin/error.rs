@@ -280,6 +280,9 @@ impl AdminError {
             | Self::RevisionTooLarge { revision, .. } => Some(*revision),
             Self::IdempotencyKeyReused { published, .. } => Some(*published),
             Self::RevisionUnreadable { revision, .. } => *revision,
+            // A conflict names the head the caller has to re-read, in the
+            // structured field rather than only in the prose.
+            Self::RevisionConflict { actual, .. } => *actual,
             _ => None,
         }
     }

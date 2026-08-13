@@ -16,9 +16,12 @@
 //!    hydrated whole. There is no partial read and no diff to apply: a revision
 //!    *is* the complete state, so a candidate is built from state that was
 //!    actually published rather than from the caller's idea of it.
-//! 4. **Build a complete candidate.** The handler's [`DesiredStateEdit`] rewrites
-//!    that state. What comes out is the full desired state of the deployment, not
-//!    a patch — which is what makes the next step meaningful.
+//! 4. **Build a complete candidate, then check what it actually changed.** The
+//!    handler's [`DesiredStateEdit`] rewrites that state. What comes out is the
+//!    full desired state of the deployment, not a patch — which is what makes the
+//!    next step meaningful, and also why the granted scope has to be checked
+//!    against the delta: an edit is physically able to touch a resource the
+//!    request did not claim.
 //! 5. **Validate the complete candidate.** Before publication, and by the same
 //!    call a store makes ([`RevisionCandidate::validated_checksum`]), so a dry run
 //!    and an apply cannot disagree about what is valid.
@@ -63,8 +66,26 @@ use crate::config::Mode;
 use crate::convergence::RevisionReport;
 use crate::desired_state::{
     AuditEvent, AuditEventId, DesiredState, ExpectedRevision, LoadedRevision, Mutation, MutationId,
-    RevisionCandidate, RevisionId, Uuid7Generator, ValidationError,
+    ResourceScope, RevisionCandidate, RevisionId, Uuid7Generator, ValidationError,
 };
+
+/// Whether a grant at `granted` may change a resource scoped to `resource`.
+///
+/// Containment, not equality: a deployment grant covers everything, a tenant
+/// grant covers that tenant's projects, and a project grant covers only itself.
+fn scope_covers(granted: &ResourceScope, resource: &ResourceScope) -> bool {
+    match granted {
+        ResourceScope::Deployment => true,
+        ResourceScope::Tenant(tenant) => resource.tenant() == Some(*tenant),
+        ResourceScope::Project { tenant, project } => matches!(
+            resource,
+            ResourceScope::Project {
+                tenant: other_tenant,
+                project: other_project,
+            } if other_tenant == tenant && other_project == project
+        ),
+    }
+}
 
 /// A change to desired state, expressed as a rewrite of the complete state.
 ///
@@ -175,6 +196,37 @@ impl AdminService {
     /// The store, or the typed refusal a stateless deployment owes.
     fn store(&self) -> Result<&Arc<dyn ControlPlaneStore>, AdminError> {
         self.store.as_ref().ok_or(AdminError::StatefulModeRequired)
+    }
+
+    /// Check that every resource the edit touched lies inside the granted scope.
+    ///
+    /// A candidate is the *complete* desired state, so an edit is physically able
+    /// to rewrite another tenant's resources while the request claims its own
+    /// scope. Domain validation would not object: cross-tenant rules are about
+    /// references, not about who submitted the change. This is therefore the only
+    /// place the grant's scope can be made to mean what it says, and it is checked
+    /// over the delta rather than the whole state so that a tenant-scoped
+    /// administrator can still publish a candidate that *contains* everyone
+    /// else's resources unchanged — which every candidate necessarily does.
+    fn within_scope(
+        granted: &ResourceScope,
+        before: &DesiredState,
+        after: &DesiredState,
+    ) -> Result<(), AdminError> {
+        let touched = before
+            .resources()
+            .filter(|resource| after.get(&resource.reference) != Some(resource))
+            .chain(
+                after
+                    .resources()
+                    .filter(|resource| before.get(&resource.reference) != Some(resource)),
+            );
+        for resource in touched {
+            if !scope_covers(granted, &resource.scope) {
+                return Err(AdminError::Forbidden(AdminAuthError::ScopeNotPermitted));
+            }
+        }
+        Ok(())
     }
 
     /// Check a grant covers the action about to be performed.
@@ -327,9 +379,11 @@ impl AdminService {
             .as_ref()
             .map_or(&empty, |revision: &LoadedRevision| revision.state());
 
-        // 4. The complete candidate.
+        // 4. The complete candidate, and the authority to have changed what it
+        // changed rather than only what it said it would.
         let mut candidate_state = current_state.clone();
         edit.edit(&mut candidate_state)?;
+        Self::within_scope(grant.scope(), current_state, &candidate_state)?;
 
         // 5 and 6. Validate the whole candidate, then diff two complete states.
         let mutation = MutationId::new(self.ids.next());

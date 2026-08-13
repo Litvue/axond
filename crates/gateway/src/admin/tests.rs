@@ -52,8 +52,10 @@ const SUBJECT: &str = "alice";
 /// unmistakable to look for.
 const SECRET_LOOKING: &str = "sk-live-51H9xNEVERLOGME";
 
+/// The fixture state contains tenants and a catalogue, which are
+/// deployment-scoped, so the grant that publishes it is too.
 fn scope() -> ResourceScope {
-    ResourceScope::Tenant(fixtures::tenant_id(1))
+    ResourceScope::Deployment
 }
 
 fn authenticator() -> Arc<FakeAdminAuthenticator> {
@@ -382,6 +384,49 @@ async fn a_grant_cannot_be_spent_on_another_action_or_another_scope() {
     assert_eq!(store.published_revisions(), 0);
 }
 
+#[tokio::test]
+async fn a_scoped_grant_cannot_change_a_resource_outside_its_scope() {
+    let store = Arc::new(InMemoryControlPlane::new());
+    let service = service(&store);
+
+    // A tenant-scoped administrator, mutating within its own scope by
+    // attribution, whose *edit* reaches a deployment-scoped resource.
+    let tenant = ResourceScope::Tenant(fixtures::tenant_id(1));
+    let mut scoped = request("key-1", ExpectedRevision::Empty, WriteMode::Apply);
+    scoped.scope = tenant.clone();
+    let error = service
+        .apply(
+            &AdminGrant::granted(human(), AdminAction::Publish, tenant.clone()),
+            &scoped,
+            &replace_with(fixtures::state()),
+        )
+        .await
+        .expect_err("a claimed scope is not the scope that was changed");
+    assert_eq!(error.code(), "admin_forbidden");
+    assert_eq!(store.published_revisions(), 0);
+
+    // The same grant may change what it does own: a rename inside the tenant.
+    let deployment = service
+        .apply(
+            &grant(AdminAction::Publish),
+            &request("key-2", ExpectedRevision::Empty, WriteMode::Apply),
+            &replace_with(fixtures::state()),
+        )
+        .await
+        .expect("a deployment-scoped publication");
+    let base = crate::desired_state::RevisionId::parse(deployment.revision().unwrap()).unwrap();
+    let mut scoped = request("key-3", ExpectedRevision::Exactly(base), WriteMode::Apply);
+    scoped.scope = tenant.clone();
+    service
+        .apply(
+            &AdminGrant::granted(human(), AdminAction::Publish, tenant),
+            &scoped,
+            &replace_with(fixtures::state_with_renamed_alias()),
+        )
+        .await
+        .expect("a tenant-scoped change to a tenant-scoped resource");
+}
+
 // ---------------------------------------------------------------------------
 // Preconditions
 // ---------------------------------------------------------------------------
@@ -474,7 +519,7 @@ fn an_audit_summary_is_bounded_and_printable() {
 async fn a_stale_expected_revision_conflicts_without_publishing() {
     let store = Arc::new(InMemoryControlPlane::new());
     let service = service(&store);
-    publish_fixture(&service, "key-1").await;
+    let head = publish_fixture(&service, "key-1").await;
 
     let error = service
         .apply(
@@ -496,6 +541,10 @@ async fn a_stale_expected_revision_conflicts_without_publishing() {
     // A conflict names the newest revision, so the caller knows what to re-read.
     let envelope = serde_json::to_value(error.envelope()).expect("a serializable envelope");
     assert_eq!(envelope["error"]["type"], "revision_conflict");
+    assert_eq!(
+        envelope["error"]["revision"], head,
+        "the head belongs in the structured field, not only in the message"
+    );
 }
 
 // ---------------------------------------------------------------------------
