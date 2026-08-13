@@ -16,6 +16,13 @@ license = "Apache-2.0 OR MIT"
 [package.metadata]
 cargo-fuzz = true
 
+# `.cargo/config.toml` passes `--cfg fuzzing` to every crate this workspace
+# builds, this package included, so declare the name here as `crates/gateway`
+# does: a toolchain that starts linting command-line cfgs must not turn the
+# required lane's `-D warnings` into a failure about the flag itself.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
 [features]
 # libFuzzer needs nightly and a sanitizer runtime, so the coverage-guided
 # targets are the default (that is what `cargo fuzz` builds) and the seed-replay
