@@ -353,9 +353,19 @@ mod tests {
     /// Every discriminant this module writes has to be a value the shipped DDL
     /// accepts. The `CHECK` lists and these `match` arms are two spellings of one
     /// closed vocabulary, and this is the only thing that keeps them equal.
+    ///
+    /// Every migration, concatenated, rather than the first one: a vocabulary a
+    /// later migration widens — `actor_kind = 'workload'` is the first — is
+    /// accepted by the schema a deployment actually runs, and a test reading only
+    /// migration 0001 would report the widening as a mismatch while missing every
+    /// vocabulary introduced after it.
     #[test]
     fn every_written_discriminant_is_accepted_by_the_shipped_ddl() {
-        let ddl = crate::backends::control_plane::schema::MIGRATIONS[0].sql;
+        let ddl: String = crate::backends::control_plane::schema::MIGRATIONS
+            .iter()
+            .map(|migration| migration.sql)
+            .collect();
+        let ddl = ddl.as_str();
         let tenant = TenantId::new(uuid(1));
         let project = ProjectId::new(uuid(2));
         let scopes = [
@@ -377,6 +387,10 @@ mod tests {
                 subject: "u-1".to_owned(),
             },
             Actor::Breakglass,
+            Actor::Workload {
+                tenant,
+                principal: crate::desired_state::PrincipalId::new(uuid(3)),
+            },
             Actor::System {
                 component: "catalog-refresh".to_owned(),
             },
@@ -386,6 +400,27 @@ mod tests {
                 ddl.contains(&format!("actor_kind = '{}'", columns.kind)),
                 "the DDL does not accept actor kind `{}`",
                 columns.kind
+            );
+        }
+        // The vocabularies migration 0002 introduced, checked the same way: an
+        // identity kind, a role, and a tenant lifecycle are all values this build
+        // writes into a `CHECK` list it does not compile against.
+        for kind in crate::desired_state::IdentityKind::ALL {
+            assert!(
+                ddl.contains(&format!("identity_kind = '{kind}'")),
+                "the DDL does not accept identity kind `{kind}`"
+            );
+        }
+        for role in crate::desired_state::Role::ALL {
+            assert!(
+                ddl.contains(&format!("'{role}'")),
+                "the DDL does not accept role `{role}`"
+            );
+        }
+        for lifecycle in crate::desired_state::TenantLifecycle::ALL {
+            assert!(
+                ddl.contains(&format!("'{lifecycle}'")),
+                "the DDL does not accept tenant lifecycle `{lifecycle}`"
             );
         }
         for body in [

@@ -1102,7 +1102,9 @@ async fn project_tenancy(
                 ],
             )
             .await
-            .map_err(|error| unavailable("project tenant", &error))?;
+            .map_err(|error| {
+                projection_failure("project tenant", "tenant", tenant.slug.as_str(), &error)
+            })?;
     }
 
     for project in tenancy.projects() {
@@ -1120,7 +1122,9 @@ async fn project_tenancy(
                 ],
             )
             .await
-            .map_err(|error| unavailable("project project", &error))?;
+            .map_err(|error| {
+                projection_failure("project project", "project", project.slug.as_str(), &error)
+            })?;
     }
 
     let declared: Vec<String> = directory
@@ -1176,7 +1180,14 @@ async fn project_tenancy(
                 ],
             )
             .await
-            .map_err(|error| unavailable("project principal", &error))?;
+            .map_err(|error| {
+                projection_failure(
+                    "project principal",
+                    "principal",
+                    principal.slug.as_str(),
+                    &error,
+                )
+            })?;
 
         // Grants are replaced, not merged: a revision that dropped a role has
         // revoked it, and an `INSERT ... ON CONFLICT DO NOTHING` would leave the
@@ -1396,6 +1407,36 @@ async fn insert_audit_event(
     Ok(())
 }
 
+/// Classify a projection write, so a constraint the projection cannot satisfy is
+/// not reported as weather.
+///
+/// A retained row is why this matters. The projection keeps tenants and projects
+/// a later revision stopped declaring, because history references them, and
+/// their slugs stay reserved with them — so a revision that re-uses the name of
+/// a dropped tenant or project violates a unique index. As an outage that is a
+/// caller retrying forever against a state no retry reaches; as a refusal it is
+/// an operator reading which name is taken. Which of the two conditions is a
+/// *product* mistake — that a name is reserved by a row nothing serves — is a
+/// separate question from how the failure is reported, and only the reporting is
+/// decided here.
+fn projection_failure(
+    operation: &str,
+    noun: &str,
+    slug: &str,
+    error: &tokio_postgres::Error,
+) -> ControlPlaneError {
+    if is_unique_violation(error) {
+        return denied(format!(
+            "the {noun} name `{slug}` is already held by a projected row: {}; a {noun} that an \
+             earlier revision declared keeps its name until it is deleted, so no retry clears this",
+            error
+                .as_db_error()
+                .map_or_else(|| error.to_string(), |db| db.message().to_owned())
+        ));
+    }
+    unavailable(operation, error)
+}
+
 fn is_unique_violation(error: &tokio_postgres::Error) -> bool {
     error
         .as_db_error()
@@ -1496,7 +1537,7 @@ mod tests {
         DESIRED_STATE_RESOURCES, candidate, project_alias, project_id, reference, state,
         state_a_pre_tenancy_build_published, state_with_directory, state_with_renamed_alias,
         state_with_revoked_workload, state_with_second_tenant, state_with_two_blobs, tenant,
-        tenant_body, tenant_id, workload_key,
+        tenant_body, tenant_id, two_tenant_directory_state, workload_key,
     };
     use crate::desired_state::{
         Actor, AuditEventId, Checksum, DesiredState, ExpectedRevision, MutationId, PrincipalId,
@@ -3204,6 +3245,111 @@ mod tests {
         );
     }
 
+    /// A revision is the whole directory, so a revision declaring no identity
+    /// declares that nobody is a principal — and the projection carries that out.
+    ///
+    /// Asserted rather than guarded against: the alternative reading, that an
+    /// empty directory is a mistake to refuse, would make the *only* way to revoke
+    /// the last principal impossible, and a deployment whose administrators are
+    /// all OIDC-issued has no reason to declare one. What must not happen is a
+    /// silent partial revocation, and that is what the `DELETE` above cannot do:
+    /// it removes exactly the principals this revision stopped declaring.
+    #[tokio::test]
+    async fn a_revision_declaring_no_identity_revokes_every_principal_and_keeps_its_tenants() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let first = store
+            .publish_revision(candidate(
+                ExpectedRevision::Empty,
+                "directory",
+                state_with_directory(),
+            ))
+            .await
+            .expect("a directory publishes");
+        assert_eq!(store.count("axond_cp_principal").await, 4);
+
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(first.id),
+                "no directory",
+                state(),
+                75,
+            ))
+            .await
+            .expect("a revision declaring no identity publishes");
+        assert_eq!(
+            store.count("axond_cp_principal").await,
+            0,
+            "an undeclared principal is a revoked one, and all of them were undeclared"
+        );
+        assert_eq!(
+            store.count("axond_cp_principal_role").await,
+            0,
+            "a grant does not outlive the principal that held it"
+        );
+        assert_eq!(
+            store.column("SELECT slug FROM axond_cp_tenant").await,
+            vec!["acme"],
+            "revoking a directory is not deleting a tenant"
+        );
+    }
+
+    /// A projected name a retained row still holds is a refusal, not weather.
+    ///
+    /// The failure is permanent by construction: the row holding the name is kept
+    /// on purpose, so every retry hits the same unique index. Reported as an
+    /// outage it would be an administrator retrying a publication that can never
+    /// succeed; reported as a refusal it names the taken name.
+    #[tokio::test]
+    async fn reusing_a_retained_tenants_name_is_refused_rather_than_reported_as_an_outage() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let first = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "acme", state()))
+            .await
+            .expect("the first tenant publishes");
+
+        // A different tenant, by id, claiming the name the first one still holds:
+        // the first tenant is no longer declared, but its row is retained because
+        // history points at it, and the name is retained with the row.
+        let mut reused = DesiredState::new();
+        reused
+            .insert(tenant(21, "acme"))
+            .expect("a state declaring one tenant is valid");
+        let error = store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(first.id),
+                "reuse",
+                reused,
+                77,
+            ))
+            .await
+            .expect_err("a name a projected row holds cannot be taken by another tenant");
+        assert_eq!(
+            error.category(),
+            FailureCategory::Denied,
+            "a permanent conflict must not be reported as retryable: {error}"
+        );
+        assert!(error.to_string().contains("acme"), "{error}");
+
+        // And the refusal left nothing behind: the first tenant's row is untouched
+        // and the revision that would have renamed the deployment's tenancy was
+        // not published.
+        assert_eq!(
+            store
+                .column("SELECT tenant_id FROM axond_cp_tenant")
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.desired_revision().await.expect("head"),
+            Some(first.id)
+        );
+    }
+
     /// Disabling and then deleting a tenant is a transition on the projected row,
     /// and neither transition takes the tenant's history with it.
     #[tokio::test]
@@ -3426,14 +3572,27 @@ mod tests {
         let Some((store, dsn, schema)) = journal().await else {
             return;
         };
-        store
+        let first = store
             .publish_revision(candidate(
                 ExpectedRevision::Empty,
                 "two tenants",
-                state_with_second_tenant(),
+                two_tenant_directory_state(),
             ))
             .await
             .expect("two tenants publish");
+        // A second change, attributed to the *other* tenant, so the journal holds
+        // one mutation and one audit event per tenant and "can this session read
+        // the other tenant's changes?" has something to read.
+        let mut theirs = candidate(
+            ExpectedRevision::Exactly(first.id),
+            "their change",
+            two_tenant_directory_state(),
+        );
+        theirs.mutation.scope = ResourceScope::Tenant(tenant_id(11));
+        store
+            .publish_revision(theirs)
+            .await
+            .expect("the other tenant's change publishes");
         store
             .record_denial(&denial(
                 95,
@@ -3492,6 +3651,63 @@ mod tests {
             .expect("read")
             .get(0);
         assert_eq!(denials, 0, "another tenant's refusals are not visible");
+
+        // Grants have no tenant column of their own: a grant is this tenant's
+        // exactly when the principal holding it is, and a session that could read
+        // the rest would learn who administers the tenants it cannot see.
+        let granted: Vec<String> = client
+            .query(
+                "SELECT DISTINCT p.slug FROM axond_cp_principal_role AS r \
+                 JOIN axond_cp_principal AS p USING (principal_id) ORDER BY p.slug",
+                &[],
+            )
+            .await
+            .expect("read")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            granted,
+            ["admin", "deployer", "dev", "root"],
+            "the grant table leaked another tenant's roles"
+        );
+        let orphaned: i64 = client
+            .query_one("SELECT count(*) FROM axond_cp_principal_role", &[])
+            .await
+            .expect("read")
+            .get(0);
+        assert_eq!(
+            orphaned, 4,
+            "a grant whose principal this session cannot see is a grant it cannot see"
+        );
+
+        // The administrative journal, and the audit trail hanging off it. A
+        // tenant-scoped change is another tenant's history; a deployment-scoped
+        // one is shared and stays readable.
+        let journal: Vec<Option<String>> = client
+            .query(
+                "SELECT DISTINCT tenant_id FROM axond_cp_mutation ORDER BY tenant_id",
+                &[],
+            )
+            .await
+            .expect("read")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            journal,
+            vec![Some(tenant_id(1).to_string())],
+            "the mutation journal leaked another tenant's changes"
+        );
+        let events: i64 = client
+            .query_one("SELECT count(*) FROM axond_cp_audit_event", &[])
+            .await
+            .expect("read")
+            .get(0);
+        assert_eq!(
+            events, 1,
+            "an audit event is visible exactly when the mutation it describes is"
+        );
 
         // Deployment-wide rows stay readable — the pinned session is a tenant's
         // view of shared state, not a broken one — and its own tenant's resources

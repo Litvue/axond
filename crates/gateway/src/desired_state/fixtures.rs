@@ -641,6 +641,39 @@ fn directory_state(with_workload: bool) -> DesiredState {
     state
 }
 
+/// Two tenants, each with its own administrator and its own project.
+///
+/// What an isolation case needs that [`state_with_directory`] cannot give it: a
+/// second tenant's principals and grants to *fail* to see. Neither tenant's
+/// resources reference the other's, so the state is valid for the same reason
+/// [`state_with_second_tenant`] is.
+pub(crate) fn two_tenant_directory_state() -> DesiredState {
+    let other = tenant_id(11);
+    let mut state = state_with_directory();
+    state
+        .insert(tenant(11, "globex"))
+        .and_then(|state| state.insert(project(&other, 12, "core")))
+        .and_then(|state| {
+            state.insert(human(
+                40,
+                "their-admin",
+                ResourceScope::Tenant(other),
+                &[Role::TenantAdmin],
+            ))
+        })
+        .and_then(|state| {
+            state.insert(workload(
+                41,
+                "their-deployer",
+                ResourceScope::Tenant(other),
+                &[Role::Operator],
+                Some(&workload_key(0xe1)),
+            ))
+        })
+        .expect("two tenants that reference nothing of each other's are valid");
+    state
+}
+
 /// A chain of `depth` aliases, each depending on the next.
 ///
 /// Nesting a hydration bound can be stated against: the chain is linear, so its

@@ -312,3 +312,66 @@ CREATE POLICY axond_cp_access_denial_isolation ON axond_cp_access_denial
         OR tenant_id IS NULL
         OR tenant_id = current_setting('axond.tenant_id', true)
     );
+
+-- The administrative journal. A pinned session that could read every mutation
+-- would learn which tenants exist and what was changed in them, which is the
+-- enumeration the opaque `forbidden` refusal and the per-tenant denial read
+-- exist to prevent; a journal outside the wall makes the wall decorative.
+ALTER TABLE axond_cp_mutation ENABLE ROW LEVEL SECURITY;
+ALTER TABLE axond_cp_mutation FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS axond_cp_mutation_isolation ON axond_cp_mutation;
+CREATE POLICY axond_cp_mutation_isolation ON axond_cp_mutation
+    USING (
+        coalesce(current_setting('axond.tenant_id', true), '') = ''
+        OR tenant_id IS NULL
+        OR tenant_id = current_setting('axond.tenant_id', true)
+    )
+    WITH CHECK (
+        coalesce(current_setting('axond.tenant_id', true), '') = ''
+        OR tenant_id IS NULL
+        OR tenant_id = current_setting('axond.tenant_id', true)
+    );
+
+-- The two tables with no tenant column of their own are filtered through the row
+-- that owns them: a grant through its principal, an audit event through its
+-- mutation. The subquery is itself subject to that table's policy, so the
+-- ownership question is answered by the same wall rather than by a second copy
+-- of it — and a grant whose principal a pinned session cannot see is a grant it
+-- cannot see either.
+ALTER TABLE axond_cp_principal_role ENABLE ROW LEVEL SECURITY;
+ALTER TABLE axond_cp_principal_role FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS axond_cp_principal_role_isolation ON axond_cp_principal_role;
+CREATE POLICY axond_cp_principal_role_isolation ON axond_cp_principal_role
+    USING (
+        coalesce(current_setting('axond.tenant_id', true), '') = ''
+        OR EXISTS (
+            SELECT 1 FROM axond_cp_principal AS owner
+            WHERE owner.principal_id = axond_cp_principal_role.principal_id
+        )
+    )
+    WITH CHECK (
+        coalesce(current_setting('axond.tenant_id', true), '') = ''
+        OR EXISTS (
+            SELECT 1 FROM axond_cp_principal AS owner
+            WHERE owner.principal_id = axond_cp_principal_role.principal_id
+        )
+    );
+
+ALTER TABLE axond_cp_audit_event ENABLE ROW LEVEL SECURITY;
+ALTER TABLE axond_cp_audit_event FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS axond_cp_audit_event_isolation ON axond_cp_audit_event;
+CREATE POLICY axond_cp_audit_event_isolation ON axond_cp_audit_event
+    USING (
+        coalesce(current_setting('axond.tenant_id', true), '') = ''
+        OR EXISTS (
+            SELECT 1 FROM axond_cp_mutation AS carried
+            WHERE carried.mutation_id = axond_cp_audit_event.mutation_id
+        )
+    )
+    WITH CHECK (
+        coalesce(current_setting('axond.tenant_id', true), '') = ''
+        OR EXISTS (
+            SELECT 1 FROM axond_cp_mutation AS carried
+            WHERE carried.mutation_id = axond_cp_audit_event.mutation_id
+        )
+    );

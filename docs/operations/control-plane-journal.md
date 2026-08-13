@@ -52,8 +52,19 @@ Two properties worth knowing before you plan capacity or retention:
   principal cannot be scoped into another tenant's project. Migration 0002 also
   adds row-level-security policies keyed on `axond.tenant_id`: a session that sets
   it sees deployment-wide rows and that tenant's, and a session that does not set
-  it — the publisher — is unrestricted. Authorization decisions stay in the
-  service layer; the policies are defence in depth.
+  it — the publisher — is unrestricted. The policies cover every table that names
+  a tenant, including the two that name one indirectly: a grant is filtered
+  through its principal and an audit event through its mutation, so the
+  administrative journal and the roles it granted are inside the same wall as the
+  rows they describe. Authorization decisions stay in the service layer; the
+  policies are defence in depth.
+- **A retained name stays taken.** A tenant or project a later revision stops
+  declaring keeps its row and its name. Publishing a *different* tenant under a
+  retained name is refused rather than reported as a temporary failure: no retry
+  clears it, and the refusal names the conflict.
+- **A disabled tenant serves nothing.** Only an active tenant's projects become
+  servable namespaces. Disabling is what stops traffic; the rows stay for the
+  history that points at them.
 - **Refusals are not revisions.** A denied administrative action publishes
   nothing, so it is recorded in `axond_cp_access_denial` rather than in the audit
   trail of a revision that does not exist. Denials are read per tenant, and the
