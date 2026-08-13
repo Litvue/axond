@@ -67,11 +67,11 @@ Intel Xeon Platinum 8559C, 31 GiB RAM, Linux 5.15.200, rustc 1.97.1, no queueing
 
 | Profile | Concurrency | Requests | Accepted req/s | p50 | p95 | p99 | TTFT p95 | Peak RSS | Peak sockets | CPU cores used |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `buffered` | 128 | 40 000 | 7 106 | 17.2 ms | 27.2 ms | 32.9 ms | — | 44 MiB | 333 | 4.7 |
-| `streaming` | 300 | 8 000 | 1 015 | 278 ms | 305 ms | 664 ms | 69 ms | 50 MiB | 754 | 3.5 |
-| `mixed` | 128 | 12 000 | 1 364 | 3.0 ms | 278 ms | 287 ms | 51 ms | 38 MiB | 301 | 2.5 |
-| `response-size` | 64 | 6 000 | 1 109 | 53.8 ms | 94.7 ms | 118 ms | — | 67 MiB | 149 | 4.3 |
-| `cancellation` | 300 | 8 000 | 1 608 | 272 ms | 329 ms | 480 ms | 69 ms | 55 MiB | 701 | 3.9 |
+| `buffered` | 128 | 40 000 | 8 632 | 14.1 ms | 22.0 ms | 27.2 ms | — | 43 MiB | 320 | 4.9 |
+| `streaming` | 300 | 8 000 | 1 028 | 272 ms | 307 ms | 653 ms | 62 ms | 50 MiB | 756 | 3.0 |
+| `mixed` | 128 | 12 000 | 1 372 | 2.4 ms | 277 ms | 281 ms | 50 ms | 39 MiB | 282 | 2.3 |
+| `response-size` | 64 | 6 000 | 1 495 | 40.4 ms | 68.4 ms | 80.9 ms | — | 67 MiB | 149 | 4.3 |
+| `cancellation` | 300 | 8 000 | 1 709 | 266 ms | 310 ms | 445 ms | 62 ms | 54 MiB | 705 | 3.7 |
 
 Throughput and latency move 10–25% between runs on a shared host, while the
 socket and memory columns barely move: read the first two as an order of
@@ -89,11 +89,11 @@ What the envelope says, in operator terms:
   inbound, one upstream. 300 concurrent streams held ~750 descriptors. Size
   `ulimit -n` and `admission.max_in_flight_streams` together.
 - **Resident memory is bounded by concurrency and body size, not by request
-  count.** 40 000 buffered requests cost the same ~44 MiB as 400 would; 256 KiB
+  count.** 40 000 buffered requests cost the same ~43 MiB as 400 would; 256 KiB
   bodies at 64 concurrent cost ~67 MiB. Bodies are buffered before dispatch
   (ADR 0030), so `admission.max_request_bytes` × concurrency is the term to
   reason about.
-- **CPU saturates before memory.** Every profile used 2.5–4.7 cores of the 8
+- **CPU saturates before memory.** Every profile used 2.3–4.9 cores of the 8
   available at these concurrencies. On this workload shape, a replica is
   CPU-bound; scale on CPU, and remember `[admission]` ceilings are *per replica*.
 
