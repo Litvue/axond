@@ -165,6 +165,12 @@ impl Tenant {
     pub fn credential(&self) -> String {
         credential_digest(self.upstream_key)
     }
+
+    /// The alias this tenant reaches for a buffered completion, and the one a
+    /// usage row of its should name.
+    pub fn chat_alias(&self) -> &'static str {
+        self.chat_alias
+    }
 }
 
 /// How many upstream calls were answered by a credential belonging to someone
@@ -192,6 +198,36 @@ pub fn crossed_credential_uses(dispatches: &BTreeMap<Dispatch, u64>) -> u64 {
         })
         .map(|(_, calls)| *calls)
         .sum()
+}
+
+/// How many usage rows were filed against a namespace that does not own the
+/// alias the row names — including a row naming an alias nobody in the run
+/// owns.
+///
+/// Paired for the same reason the credential count is: each tenant reaches its
+/// own aliases, so a row is checkable against the caller it should have been
+/// charged to. Two per-namespace totals are not — under a rotation that offers
+/// both tenants the same number of requests, a run that filed every ACME charge
+/// under GLOBEX and every GLOBEX charge under ACME leaves both totals where an
+/// honest run leaves them.
+pub fn crossed_usage_records(records: &[Value]) -> u64 {
+    let owners: BTreeMap<&'static str, &'static str> = TENANTS
+        .iter()
+        .chain(std::iter::once(&PLATFORM))
+        .flat_map(|tenant| {
+            [
+                (tenant.chat_alias, tenant.namespace),
+                (tenant.slow_alias, tenant.namespace),
+            ]
+        })
+        .collect();
+    records
+        .iter()
+        .filter(|record| {
+            let alias = record["model"].as_str().unwrap_or_default();
+            owners.get(alias).copied() != record["namespace"].as_str()
+        })
+        .count() as u64
 }
 
 /// The tenants a multi-tenant run serves, for a suite checking what the run
@@ -786,18 +822,20 @@ async fn recovery_probe(client: &reqwest::Client, base_url: &str, gauges: &Gauge
 /// customers served with each other's key leave both totals balanced, which is
 /// the one failure the profile exists to catch.
 ///
-/// The usage count stays one-directional: a namespace charged for *more*
-/// requests than it sent is a misattribution, while fewer is a request that
-/// failed before accounting — already a threshold breach of its own, and not a
-/// crossing. Reporting an ordinary upstream failure as a leak between customers
-/// would spend the credibility this measurement exists to have.
+/// The usage count is paired the same way, against the alias each row names,
+/// since a tenant reaches only its own aliases. Beside it, a namespace charged
+/// for *more* requests than it sent is counted too — a double charge names an
+/// alias its owner does own — while *fewer* is not: that is a request which
+/// failed before accounting, already a threshold breach of its own, and
+/// reporting an ordinary upstream failure as a leak between customers would
+/// spend the credibility this measurement exists to have.
 fn tenancy(
     attempts: &[Attempt],
     records: &[Value],
     dispatches: &BTreeMap<Dispatch, u64>,
 ) -> Tenancy {
     let mut by_namespace = BTreeMap::new();
-    let mut misattributed_usage_records = 0;
+    let mut misattributed_usage_records = crossed_usage_records(records);
     let foreign_credential_uses = crossed_credential_uses(dispatches);
     for tenant in &TENANTS {
         let accepted = attempts
@@ -844,17 +882,6 @@ fn tenancy(
             },
         );
     }
-    // A row filed under a namespace that sent nothing: platform fallback
-    // charging a tenant looks exactly like this, and the profile turns fallback
-    // off.
-    misattributed_usage_records += records
-        .iter()
-        .filter(|record| {
-            !TENANTS
-                .iter()
-                .any(|tenant| record["namespace"].as_str() == Some(tenant.namespace))
-        })
-        .count() as u64;
     Tenancy {
         by_namespace,
         foreign_credential_uses,

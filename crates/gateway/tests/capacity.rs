@@ -235,6 +235,52 @@ fn a_swap_between_two_tenants_is_not_a_clean_run() {
     );
 }
 
+/// The ledger has the same blind spot the credential count had, and closes it
+/// the same way: a tenant reaches only its own aliases, so a row names the
+/// caller it should have been charged to.
+#[test]
+fn a_swap_of_the_charges_is_not_a_clean_run_either() {
+    let tenants = capacity::tenants();
+    let [acme, globex] = [&tenants[0], &tenants[1]];
+    let rows = |charged: [(&capacity::Tenant, &capacity::Tenant); 2]| {
+        charged
+            .iter()
+            .map(|(namespace, alias)| {
+                serde_json::json!({
+                    "namespace": namespace.namespace,
+                    "model": alias.chat_alias(),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        capacity::crossed_usage_records(&rows([(acme, acme), (globex, globex)])),
+        0,
+        "each tenant charged for what it asked for is the clean run"
+    );
+    assert_eq!(
+        capacity::crossed_usage_records(&rows([(acme, globex), (globex, acme)])),
+        2,
+        "a swapped pair of charges is two misattributions, not a balanced ledger"
+    );
+    assert_eq!(
+        capacity::crossed_usage_records(&[serde_json::json!({
+            "namespace": "a-namespace-this-run-never-configured",
+            "model": acme.chat_alias(),
+        })]),
+        1,
+        "a row filed under a namespace the run does not have is a crossing"
+    );
+    assert_eq!(
+        capacity::crossed_usage_records(&[serde_json::json!({
+            "namespace": acme.namespace,
+            "model": "an-alias-nobody-owns",
+        })]),
+        1,
+        "so is a row naming an alias nobody in the run owns"
+    );
+}
+
 /// The label standing for "no credential" has to be one no credential can
 /// produce, or a key could be mistaken for its own absence.
 #[test]
