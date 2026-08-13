@@ -76,18 +76,19 @@ fn the_committed_manifest_covers_every_workload_with_thresholds() {
                 tier.as_str()
             );
         }
+        // Every threshold below is optional in the schema, because the profiles
+        // that exist to be refused cannot state their floor the way the others
+        // do. Optional must not become ungated: whatever form it takes, a
+        // profile says how much of its offered load has to be served and how
+        // much of it may fail — and the suite separately asserts that offered
+        // load is conserved, so a bound on one side bounds the other.
         let thresholds = &profile.thresholds;
         assert!(
-            thresholds.min_accepted_fraction > 0.0,
-            "{}: a profile without an acceptance threshold asserts nothing",
-            profile.id
-        );
-        // The absolute counts are optional because two profiles exist to
-        // provoke the outcome they bound. Optional must not become ungated: a
-        // profile bounds each of them as a count or as a fraction.
-        assert!(
-            thresholds.max_rejections.is_some() || thresholds.max_rejected_fraction.is_some(),
-            "{}: nothing bounds how much of the offered load may be shed",
+            thresholds
+                .min_accepted_fraction
+                .is_some_and(|floor| floor > 0.0)
+                || thresholds.min_accepted.is_some_and(|floor| floor > 0),
+            "{}: a profile without an acceptance floor asserts nothing",
             profile.id
         );
         assert!(
@@ -411,6 +412,16 @@ fn every_heavy_invocation_runs_one_test_at_a_time() {
 /// else, and a streaming profile with no TTFT never opened a stream.
 fn assert_expected_outcomes(profile: &capacity::Profile, result: &CapacityResult) {
     let usage = &result.usage_records;
+    // Offered load is conserved: every caller was either served or told no, and
+    // none was left holding a request the replica quietly dropped. This is what
+    // lets a profile whose served share cannot be a fraction bound one side of
+    // the split and still be gated on both.
+    assert_eq!(
+        result.throughput.accepted + result.throughput.rejected + result.throughput.errors,
+        result.throughput.offered,
+        "{}: the offered load does not add up",
+        profile.id
+    );
     match profile.workload {
         Workload::Cancellation => {
             let cancelled = result.outcomes.client_cancelled;
@@ -482,15 +493,6 @@ fn assert_expected_outcomes(profile: &capacity::Profile, result: &CapacityResult
             assert!(
                 result.occupancy.admission_max_in_flight.is_some(),
                 "{}: a shedding run records the ceiling it booted",
-                profile.id
-            );
-            // Offered load is conserved: every caller was either served or
-            // told no, and none was left holding a request the replica had
-            // quietly dropped.
-            assert_eq!(
-                result.throughput.accepted + result.throughput.rejected + result.throughput.errors,
-                result.throughput.offered,
-                "{}: the offered load does not add up",
                 profile.id
             );
         }

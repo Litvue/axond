@@ -126,7 +126,14 @@ impl Workload {
 /// refuses one that bounds it neither way, so "optional" never means "ungated".
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct Thresholds {
-    pub min_accepted_fraction: f64,
+    #[serde(default)]
+    pub min_accepted_fraction: Option<f64>,
+    /// The acceptance floor as a count, for a profile whose served share does
+    /// not scale with the load it offers: a replica behind a ceiling serves
+    /// what the ceiling allows however many callers arrive, so a fraction there
+    /// would only measure how much load the manifest asked for.
+    #[serde(default)]
+    pub min_accepted: Option<u64>,
     #[serde(default)]
     pub max_rejections: Option<u64>,
     #[serde(default)]

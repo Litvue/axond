@@ -157,13 +157,14 @@ concurrency = 512
 requests = 20000
 
 [profile.thresholds]
-# A shed request is the point of this profile, so the acceptance floor only says
-# that the replica kept serving at its ceiling while it shed. What the run has
-# to show is the rest: the ceiling bit, it did not swallow everything, nothing
-# failed, and the next caller after the storm was served.
-min_accepted_fraction = 0.0005
+# A shed request is the point of this profile, so the acceptance floor is a
+# count rather than a share: a replica behind a ceiling of 8 serves a ceiling's
+# worth whether 640 callers arrive or 20 000, and a fraction would only measure
+# how much load the tier asked for. What the run has to show is that the
+# ceiling bit, that it kept serving a full ceiling while it did, that nothing
+# failed, and that the next caller after the storm was served.
+min_accepted = 8
 min_rejected_fraction = 0.5
-max_rejected_fraction = 0.999
 max_errors = 0
 max_missing_usage_records = 0
 max_leaked_upstream_streams = 0

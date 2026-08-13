@@ -768,11 +768,6 @@ fn verdicts(result: &CapacityResult) -> Vec<Verdict> {
     let thresholds = &result.profile.thresholds;
     let offered = result.throughput.offered.max(1) as f64;
     let mut verdicts = vec![
-        Verdict::at_least(
-            "min_accepted_fraction",
-            result.throughput.accepted as f64 / offered,
-            thresholds.min_accepted_fraction,
-        ),
         Verdict::at_most(
             "max_missing_usage_records",
             result.usage_records.missing as f64,
@@ -788,6 +783,26 @@ fn verdicts(result: &CapacityResult) -> Vec<Verdict> {
         &result.resources,
         thresholds.max_rss_growth_kib,
     ));
+    verdicts.extend(
+        [
+            thresholds.min_accepted.map(|floor| {
+                Verdict::at_least(
+                    "min_accepted",
+                    result.throughput.accepted as f64,
+                    floor as f64,
+                )
+            }),
+            thresholds.min_accepted_fraction.map(|floor| {
+                Verdict::at_least(
+                    "min_accepted_fraction",
+                    result.throughput.accepted as f64 / offered,
+                    floor,
+                )
+            }),
+        ]
+        .into_iter()
+        .flatten(),
+    );
     verdicts.extend(
         [
             thresholds
