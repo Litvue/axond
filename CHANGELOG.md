@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.3.30](https://github.com/Litvue/axond/compare/v0.3.29...v0.3.30) (2026-08-13)
+
+
+### Features
+
+* **admin:** answer an administrative read a caller already holds as not modified ([#306](https://github.com/Litvue/axond/issues/306)) ([2f76106](https://github.com/Litvue/axond/commit/2f761060b8cf09b9317eb525ecb7d3c42cbf5533))
+* **catalog:** retain imported catalogues and drive their refresh ([#310](https://github.com/Litvue/axond/issues/310)) ([5e2bfc1](https://github.com/Litvue/axond/commit/5e2bfc1d93b9b54058e9ef29424d909fe95825bb))
+* **control-plane:** key journal rows to the tenant that owns them ([#309](https://github.com/Litvue/axond/issues/309)) ([e65bf5c](https://github.com/Litvue/axond/commit/e65bf5ce7ba005dbf1420e6f255d0bb77cf3b8c6))
+* **ops:** deploy a stateful fleet that serves admin while it refuses inference ([#301](https://github.com/Litvue/axond/issues/301)) ([f346b28](https://github.com/Litvue/axond/commit/f346b284385e00d3710e5e117840abbfe2763038))
+* **policy:** activate published policy at runtime with generation-held drains ([#276](https://github.com/Litvue/axond/issues/276)) ([16012df](https://github.com/Litvue/axond/commit/16012dfd139ccbef034a3f5c48da9721d4037cc5))
+* **usage:** optional billing-grade durable usage outbox and globally unique request IDs ([#249](https://github.com/Litvue/axond/issues/249)) ([5a9606b](https://github.com/Litvue/axond/commit/5a9606ba0ca5bf2ab185955283db91340b9f1c90))
+
+
+### Tests
+
+* **integration:** prove an audited admin mutation on a running stateful replica ([#296](https://github.com/Litvue/axond/issues/296)) ([998a75f](https://github.com/Litvue/axond/commit/998a75f6dec0b205a2d8c12d65d076672a3c87e6))
+* **qualification:** qualify a replica at its limits — tenants, shedding, and backend bounds ([#297](https://github.com/Litvue/axond/issues/297)) ([480f693](https://github.com/Litvue/axond/commit/480f6935c8b13a233a46662ea6ede3740db96f2a))
+* **recovery:** qualify restore and point-in-time recovery, and keep a failing stage's evidence ([#219](https://github.com/Litvue/axond/issues/219)) ([#299](https://github.com/Litvue/axond/issues/299)) ([895941a](https://github.com/Litvue/axond/commit/895941ac6caa7f05804d8880b4b9f9159e566e5c))
+* **security:** add fuzzing infrastructure and config/auth/query targets ([#233](https://github.com/Litvue/axond/issues/233)) ([a9ef4ee](https://github.com/Litvue/axond/commit/a9ef4ee5d1c0c20fe7f6b890342896d6c1c8f25d))
+* **security:** assert tenant isolation at the database, the service, and the projections ([#298](https://github.com/Litvue/axond/issues/298)) ([0afbc5a](https://github.com/Litvue/axond/commit/0afbc5a9a6a62d1968b3401acb42ed78ec3b49cd))
+* **security:** fuzz SSE framing and provider error decoding ([#267](https://github.com/Litvue/axond/issues/267)) ([0ac36d5](https://github.com/Litvue/axond/commit/0ac36d51b0f6395b9a3281409d542fd4d0d7fd1d))
+
 ## [0.3.29](https://github.com/Litvue/axond/compare/v0.3.28...v0.3.29) (2026-08-13)
 
 
