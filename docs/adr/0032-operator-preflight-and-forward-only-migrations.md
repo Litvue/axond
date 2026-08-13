@@ -317,9 +317,10 @@ and the fresh-install and upgrade orders are checkable rather than conventional.
 Costs: an operator step is added to a stateful upgrade — `apply` must run once,
 from one place, with the new binary, before replicas roll onto it. Preflight is
 deliberately stricter than boot about the config file's mode, so a config another
-account can rewrite fails the gate while it would start a gateway. And until the
-durable control plane is wired to the runtime, `serve` still refuses
-`mode = "stateful"`; a stateful preflight reports that as a failure rather than
-promising a boot that cannot happen, while the database checks it accompanies
-still run. Preflight reads that refusal from `serve`'s own definition, so the two
-cannot disagree and lifting the refusal removes the reported failure with it.
+account can rewrite fails the gate while it would start a gateway. And until a
+revision compiles into a runtime snapshot, a `mode = "stateful"` replica boots and
+serves `/admin/v1` but refuses *inference*; a stateful preflight reports that
+refusal as a failure rather than promising a deployment that can serve traffic,
+while the database checks it accompanies still run. Preflight reads that refusal
+from `serve`'s own definition, so the two cannot disagree and lifting the refusal
+removes the reported failure with it.
