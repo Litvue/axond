@@ -361,14 +361,28 @@ pub fn load() -> Packet {
 
 /// A slice's own manifest, read for the two things the packet checks a record
 /// against: the workloads it declares, and the digest of the bytes on disk.
+///
+/// A workload is a `[[profile]]` for the load-shaped slices and a
+/// `[[scenario]]` for the sequence-shaped ones (rollout, recovery). Both are
+/// read, because a record is held to the manifest it names whatever that
+/// manifest calls its unit of work.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SliceManifest {
-    #[serde(rename = "profile")]
-    pub profiles: Vec<SliceManifestProfile>,
+    #[serde(rename = "profile", default)]
+    pub profiles: Vec<SliceManifestWorkload>,
+    #[serde(rename = "scenario", default)]
+    pub scenarios: Vec<SliceManifestWorkload>,
+}
+
+impl SliceManifest {
+    /// Every workload the manifest declares, whatever it calls them.
+    pub fn workloads(&self) -> impl Iterator<Item = &SliceManifestWorkload> {
+        self.profiles.iter().chain(&self.scenarios)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SliceManifestProfile {
+pub struct SliceManifestWorkload {
     pub id: String,
 }
 
@@ -381,6 +395,12 @@ pub fn load_slice_manifest(relative: &str) -> (SliceManifest, String) {
     let manifest: SliceManifest = Figment::from(Toml::file(&path))
         .extract()
         .unwrap_or_else(|e| panic!("{} declares no readable workloads: {e}", path.display()));
+    assert!(
+        manifest.workloads().next().is_some(),
+        "{} declares neither a profile nor a scenario, so a record naming it \
+         could not be checked against anything",
+        path.display()
+    );
     (manifest, super::capacity::manifest::sha256_hex(&bytes))
 }
 
