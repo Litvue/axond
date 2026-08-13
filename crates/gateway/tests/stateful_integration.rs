@@ -224,6 +224,17 @@ fn every_gate_has_a_scenario_that_exists() {
     }
 }
 
+#[test]
+fn integration_kek_fixture_is_base64_encoded_32_bytes() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let encoded = stateful::integration_kek();
+    let decoded = STANDARD
+        .decode(encoded.as_bytes())
+        .expect("the stateful fixture KEK is valid base64");
+    assert_eq!(decoded.len(), 32, "the stateful fixture KEK is 32 bytes");
+}
+
 /// A `Wired` gate's evidence has to *run* somewhere a merge cannot skip.
 ///
 /// The datastore scenarios skip without `AXOND_TEST_POSTGRES_DSN`, the way the
@@ -289,10 +300,7 @@ fn stateful_bootstrap() -> (PathBuf, BTreeMap<&'static str, String>, SocketAddr)
             stateful::DSN_ENV,
             "postgres://axond@127.0.0.1:1/axond".to_owned(),
         ),
-        (
-            stateful::KEK_ENV,
-            "integration-test-kek-0123456789abcdef".to_owned(),
-        ),
+        (stateful::KEK_ENV, stateful::integration_kek()),
         (
             stateful::BREAKGLASS_ENV,
             "integration-test-breakglass".to_owned(),

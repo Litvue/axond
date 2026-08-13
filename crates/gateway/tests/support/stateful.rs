@@ -162,6 +162,18 @@ pub const DSN_ENV: &str = "GW_INTEGRATION_CONTROL_PLANE_DSN";
 pub const KEK_ENV: &str = "GW_INTEGRATION_KEK";
 pub const BREAKGLASS_ENV: &str = "GW_INTEGRATION_BREAKGLASS";
 
+/// A non-secret fixture value for the deployment KEK reference.
+///
+/// The configured SecretStore validates the referenced value during boot, so a
+/// stateful integration fixture must provide the same shape as an operator's
+/// value: base64 encoding of exactly 32 bytes. Encode it at runtime instead of
+/// committing the encoded material to the repository or emitting it in config.
+pub fn integration_kek() -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    STANDARD.encode([7u8; 32])
+}
+
 impl ControlPlane {
     /// `None` when no test database is configured.
     pub async fn create() -> Option<Self> {
@@ -197,8 +209,8 @@ impl ControlPlane {
         );
         let env = BTreeMap::from([
             (DSN_ENV, dsn.clone()),
-            // Fixture values for references the commands only have to resolve.
-            (KEK_ENV, "integration-test-kek-0123456789abcdef".to_owned()),
+            // Fixture values satisfy reference validation without being logged or inlined.
+            (KEK_ENV, integration_kek()),
             (BREAKGLASS_ENV, breakglass.clone()),
         ]);
         Some(Self {
