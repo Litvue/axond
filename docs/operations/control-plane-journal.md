@@ -296,8 +296,11 @@ the first on the DSN's own search path; a second install's journal further down 
 path is not evidence about this one). What it does instead of recording:
 
 - **No object present.** Nothing was applied out of band, so there is no baseline.
-  Refused, naming the way forward — drop the empty `axond_cp_schema_migration`
-  table and run `axond migrate apply`.
+  Refused, naming the schema it looked in and the way forward — drop the empty
+  `axond_cp_schema_migration` table and run `axond migrate apply`. The schema is
+  worth reading: a DSN whose `search_path` has more than one entry can have the
+  ledger answer from a schema further down it while the objects are sought in the
+  one this configuration writes to, which is where `apply` would create them.
 - **A migration only partly applied.** Some of what one file declares is there and
   some is not — a table, an index, or the seed row the shipped file ends with, which
   a `psql -f` outside a transaction can stop just short of. Neither "applied" nor

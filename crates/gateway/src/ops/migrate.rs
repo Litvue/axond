@@ -785,6 +785,13 @@ mod tests {
             "the refusal names the way forward for an unapplied database: {error}"
         );
         assert!(
+            error
+                .to_string()
+                .contains(&format!("schema `{}`", fixture.schema)),
+            "and names where it looked, because the ledger can answer from one schema on a \
+             search path while the objects are sought in another: {error}"
+        );
+        assert!(
             fixture.ledger().await.is_empty(),
             "a refused adoption must not record a baseline"
         );

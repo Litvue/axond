@@ -388,10 +388,22 @@ impl PostgresControlPlane {
                 let versions = match baseline {
                     Baseline::Applied { versions } => versions,
                     Baseline::Nothing => {
+                        // Naming the schema it looked in, because a DSN with a
+                        // multi-entry `search_path` can have the ledger answer from
+                        // one schema and the objects be sought in the one this
+                        // connection writes to. "Nothing is present" without a
+                        // *where* would read as a claim about the whole database.
+                        let searched: String = transaction
+                            .query_one("SELECT current_schema()", &[])
+                            .await
+                            .map_err(|error| {
+                                refused_or_unavailable("reading the current schema", &error)
+                            })?
+                            .get(0);
                         return Err(denied(format!(
-                            "no shipped migration's tables are present, so this database has no \
-                             applied schema to adopt; drop the empty `{}` table and run `axond \
-                             migrate apply`",
+                            "no shipped migration's tables are present in schema `{searched}`, so \
+                             this database has no applied schema to adopt there; drop the empty \
+                             `{}` table and run `axond migrate apply`",
                             schema::MIGRATION_TABLE
                         )));
                     }
