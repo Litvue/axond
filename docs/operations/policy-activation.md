@@ -105,6 +105,17 @@ keep being governed by the file that declared them.
 
 A publication is as disruptive as its worst field.
 
+### Handing a namespace between scopes
+
+A project publishing its own document over its tenant's — or deleting it so the
+tenant's applies again — is a **handover**, not a withdrawal: the namespace never
+stops being governed, so it is not refused. It is classified against the document
+it displaces rather than against the (absent) history of the scope that is new,
+so a project capping itself below its tenant is reported as a `drain` and its
+tenant's outstanding holds keep their terms. Only the epochs are not compared
+across the handover: an epoch orders one scope's own publications, and a
+project's first is not behind its tenant's tenth.
+
 ### Why a drain is safe
 
 Every reservation and every shared lease is stamped with the **generation** that
@@ -150,8 +161,12 @@ publication:
 
 1. Publish a document *without* the change and let the fleet converge onto it.
 2. Stop the fleet.
-3. Run `axond migrate apply` for the budget backend.
-4. Restart on a bootstrap that sets `[budget] namespace_scope` to the new value.
+3. Migrate the budget ledgers: `axond budget migrate-redis --config PATH` for
+   Redis, or apply `ops/postgres/budget_v2.sql` for Postgres. (Not `axond
+   migrate apply` — that is the control-plane schema, not these ledgers.) The
+   command wants the bootstrap the fleet will *start* on, so set
+   `[budget] namespace_scope = true` before running it.
+4. Restart on that bootstrap.
 5. Publish the document that states (or omits) `namespace_budget_limit_microdollars`.
 
 Until step 5, the replica refuses the document and keeps enforcing what it has,

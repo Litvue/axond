@@ -220,9 +220,24 @@ pub(super) fn plan(
             support,
         )?;
         let Some(current) = active.published().get(scope) else {
-            // Nothing was enforced for this scope, so there is no transition to
-            // classify: the first document a scope gets binds live.
-            activation.live.push(*scope);
+            // Nothing was enforced for *this scope*, but its namespaces may have
+            // been inheriting another one's document — a project publishing over
+            // its tenant's. Report the drain that handover really is, judged
+            // against the values that were binding. Only the drain: epochs are
+            // per-scope, so a different scope's epoch is not this one's history
+            // and cannot make the document stale, forked, or a layout change.
+            let drains = published
+                .namespaces
+                .iter()
+                .filter_map(|namespace| active.governing(namespace))
+                .map(|inherited| inherited.displaced_by(&published.body))
+                .find(|transition| transition.class() == TransitionClass::Drain);
+            match drains {
+                Some(transition) => activation
+                    .draining
+                    .push((*scope, transition.reasons().to_vec())),
+                None => activation.live.push(*scope),
+            }
             continue;
         };
         // `same_policy`, not equality: a generation names the revision that
@@ -266,12 +281,16 @@ pub(super) fn plan(
             continue;
         }
         // A tenant document governs every one of its projects' namespaces, and
-        // one of them still being served is enough: the others going away does
-        // not make the survivor's cap withdrawable.
+        // one of them still being served *uncapped* is enough: the others going
+        // away does not make the survivor's cap withdrawable. A namespace the
+        // candidate governs under a different document is a handover, not a
+        // withdrawal — a project publishing over its tenant's document, or
+        // dropping its own so the tenant's applies again, retires this scope
+        // while the namespace stays capped.
         if let Some(served) = current
             .namespaces
             .iter()
-            .find(|namespace| candidate.names(namespace))
+            .find(|namespace| candidate.ungoverned(namespace))
         {
             return Err(ActivationRefusal::Withdrawn {
                 scope: *scope,
@@ -316,9 +335,10 @@ fn supportable(
         (true, false) => Err(ActivationRefusal::Migration {
             scope,
             detail: "the document sets a scope-wide cap, but this deployment's budget store is \
-                     laid out without one. Stop the fleet, run `axond migrate apply` for the \
-                     budget backend, restart it on a bootstrap that sets `[budget] \
-                     namespace_scope = true`, and publish the document again"
+                     laid out without one. Stop the fleet, set `[budget] namespace_scope = true`, \
+                     migrate the ledgers (`axond budget migrate-redis`, or \
+                     `ops/postgres/budget_v2.sql`), restart on that bootstrap, and publish the \
+                     document again"
                 .to_owned(),
         }),
         (false, true) => Err(ActivationRefusal::Migration {
@@ -562,6 +582,66 @@ mod tests {
         let activation = plan(&active, &empty(), shared())
             .expect("every namespace the document governed is gone");
         assert_eq!(activation.withdrawn(), [scope()]);
+    }
+
+    /// Which document governs a namespace is allowed to change in both
+    /// directions. Only the namespace being left with nothing is a withdrawal.
+    #[test]
+    fn a_scope_handover_is_not_a_withdrawal_in_either_direction() {
+        let project = PolicyScope::Project {
+            tenant: tenant_id(1),
+            project: crate::desired_state::fixtures::project_id(1),
+        };
+        let tenants = view(&body(scope(), 1, 1_000), 1);
+        let projects = PolicyView::of(&governed(
+            "acme/core",
+            NamespacePolicy {
+                body: body(project, 1, 1_000),
+                generation: generation(&body(project, 1, 1_000), 2),
+            },
+        ));
+
+        plan(&tenants, &projects, shared())
+            .expect("a project publishing its own document still caps the namespace");
+        plan(&projects, &tenants, shared())
+            .expect("dropping it hands the namespace back to its tenant's document");
+    }
+
+    /// A scope's first document is new to *that scope*, but what it displaces is
+    /// what the namespace was actually enforcing. A tightening handover drains,
+    /// and says so, rather than being reported as a fresh binding.
+    #[test]
+    fn a_first_project_document_is_classified_against_what_it_displaces() {
+        let project = PolicyScope::Project {
+            tenant: tenant_id(1),
+            project: crate::desired_state::fixtures::project_id(1),
+        };
+        let tighter = body(project, 1, 500);
+        let looser = body(project, 1, 5_000);
+        let tenants = view(&body(scope(), 1, 1_000), 1);
+        let handover = |document: &crate::desired_state::policy::PolicyBody| {
+            PolicyView::of(&governed(
+                "acme/core",
+                NamespacePolicy {
+                    body: *document,
+                    generation: generation(document, 2),
+                },
+            ))
+        };
+
+        let activation = plan(&tenants, &handover(&tighter), shared())
+            .expect("a project may cap itself below its tenant");
+        assert_eq!(
+            activation.draining().len(),
+            1,
+            "cutting the cap a namespace was enforcing is a drain, whichever \
+             document states it"
+        );
+
+        let activation = plan(&tenants, &handover(&looser), shared())
+            .expect("raising the cap binds immediately");
+        assert!(activation.draining().is_empty());
+        assert_eq!(activation.live(), [project]);
     }
 
     /// A revision that moved an unrelated resource restates every document under

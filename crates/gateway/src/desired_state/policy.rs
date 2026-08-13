@@ -709,6 +709,20 @@ impl PolicyBody {
         PolicyTransition::between(self, next)
     }
 
+    /// How a fleet may move from this document to `next` when `next` *displaces*
+    /// it for a namespace rather than succeeding it for a scope: a project
+    /// publishing its own document over the tenant's, or dropping it again.
+    ///
+    /// Only the draining reasons. The two documents belong to different scopes,
+    /// so neither the scope nor the epoch comparison means anything here — an
+    /// epoch orders one scope's own publications, and a project's first epoch is
+    /// not behind its tenant's tenth. What does carry over is the values: a
+    /// namespace whose binding cap is cut still has holds that were admitted
+    /// under the wider one.
+    pub fn displaced_by(&self, next: &Self) -> PolicyTransition {
+        PolicyTransition::displacing(self, next)
+    }
+
     /// Whether two documents state the same policy, ignoring the epoch they were
     /// published under.
     ///
@@ -1214,7 +1228,22 @@ impl PolicyTransition {
         if from.same_content(to) {
             return Self::of(vec![TransitionReason::Republished]);
         }
+        Self::of(Self::fields(from, to))
+    }
 
+    /// See [`PolicyBody::displaced_by`]: the same field comparison, keeping only
+    /// what a namespace's outstanding holds care about.
+    fn displacing(from: &PolicyBody, to: &PolicyBody) -> Self {
+        Self::of(
+            Self::fields(from, to)
+                .into_iter()
+                .filter(|reason| reason.class() == TransitionClass::Drain)
+                .collect(),
+        )
+    }
+
+    /// Every reason the two documents' values differ, ignoring scope and epoch.
+    fn fields(from: &PolicyBody, to: &PolicyBody) -> Vec<TransitionReason> {
         let mut reasons = Vec::new();
         let (old, new) = (&from.budget, &to.budget);
         push_ordered(
@@ -1268,7 +1297,7 @@ impl PolicyTransition {
             TransitionReason::TokenFloorRaised,
             TransitionReason::TokenFloorLowered,
         );
-        Self::of(reasons)
+        reasons
     }
 
     fn of(mut reasons: Vec<TransitionReason>) -> Self {

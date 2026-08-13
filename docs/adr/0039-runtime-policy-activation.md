@@ -92,6 +92,13 @@ policy, and an outage or a refusal leaves last-known-good enforcement in place.
 
 `live` and `drain` activate; `migration-required` and `refused` do not.
 
+Which document governs a namespace may itself change — a project publishing over
+its tenant's, or dropping its own so the tenant's applies again. That is a
+handover: the namespace stays governed, so it is not a withdrawal, and it is
+classified against the values it displaces so a tightening handover drains rather
+than reporting as a scope's first binding. Epochs are not compared across it,
+because an epoch orders one scope's own publications.
+
 ### Rolling back is publishing the old values forward
 
 A rollback is a new document, a higher epoch, the previous values. It is

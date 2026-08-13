@@ -730,12 +730,14 @@ pub async fn migrate_redis(
     // down: every replica would refuse to boot on a layout its configuration
     // cannot read, and the documented way back is a spend reset. So the command
     // requires the configuration it is a migration *to*.
-    if config.namespace_limit_microdollars.is_none() {
+    if !config.enforces_namespace_scope() {
         return Err(BudgetError::invalid(
             "redis",
             "the Redis budget migration moves this `key_prefix` to the v2 layout, which only a \
-             gateway with `namespace_limit_microdollars` set can serve. Set it under `[budget]` \
-             first, then migrate, then start the fleet on that same configuration.",
+             gateway laid out for a scope-wide cap can serve. Declare it under `[budget]` first — \
+             `namespace_limit_microdollars` in stateless mode, `namespace_scope = true` in \
+             stateful mode, where the cap itself is published — then migrate, then start the \
+             fleet on that same configuration.",
         ));
     }
     let url = dsn(config, "redis", env)?;
@@ -897,6 +899,23 @@ mod tests {
         assert!(
             format!("{err}").contains("namespace_limit_microdollars"),
             "the error must name the missing setting: {err}"
+        );
+
+        // Stateful deployments declare the same layout with `namespace_scope`,
+        // because the cap itself is published rather than configured. The
+        // migration has to accept the declaration the fleet will boot on, or the
+        // documented procedure has no performable step.
+        let stateful = BudgetConfig {
+            namespace_scope: true,
+            dsn_env: Some("AXOND_TEST_MISSING_BUDGET_URL".to_owned()),
+            ..config
+        };
+        let err = migrate_redis(&stateful, &[], &HashMap::new())
+            .await
+            .expect_err("no DSN is set, so it fails past the layout gate");
+        assert!(
+            !format!("{err}").contains("Declare it under"),
+            "the layout is declared, so the refusal must be about the DSN: {err}"
         );
     }
 

@@ -184,9 +184,34 @@ impl PolicyView {
         &self.published
     }
 
-    /// Whether any namespace still carries the name `namespace`.
-    pub(super) fn names(&self, namespace: &str) -> bool {
-        self.by_namespace.contains_key(namespace)
+    /// Whether this view still serves `namespace` with no document governing it.
+    ///
+    /// The question a withdrawal has to ask. Serving it under a *different*
+    /// document is a handover, not a withdrawal: publishing a project's own
+    /// document over its tenant's, or deleting it so the tenant's applies again,
+    /// both retire one scope while the namespace stays fully governed.
+    pub(super) fn ungoverned(&self, namespace: &str) -> bool {
+        self.by_namespace
+            .get(namespace)
+            .is_some_and(|policy| policy.generation.is_none())
+    }
+
+    /// The document governing `namespace`, whichever scope published it.
+    ///
+    /// A namespace's first *project* document is a new scope, but not
+    /// necessarily a new set of values: it displaces the tenant document the
+    /// namespace was inheriting. Classifying that handover needs the values that
+    /// were actually binding, not the (absent) history of the new scope.
+    pub(super) fn governing(&self, namespace: &str) -> Option<&PolicyBody> {
+        self.published
+            .values()
+            .find(|published| {
+                published
+                    .namespaces
+                    .iter()
+                    .any(|governed| governed == namespace)
+            })
+            .map(|published| &published.body)
     }
 }
 
@@ -326,7 +351,7 @@ dsn_env = "GW_BUDGET_REDIS"
         );
         assert_eq!(policy.generation, Some(generation));
         assert!(view.enforces(generation));
-        assert!(view.names("acme/core"));
+        assert!(!view.ungoverned("acme/core"));
 
         // A later revision that touched something else restates this document
         // verbatim under its own id. That is the same policy, still enforced —
