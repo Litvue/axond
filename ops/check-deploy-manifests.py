@@ -12,6 +12,10 @@ Two classes of check live here:
 
 * internal consistency of one manifest set — every image pinned, every container
   bounded, the disruption budget survivable at the replica count it ships with;
+* consistency between a documented policy and the thing that enforces it — the
+  supported Postgres/Redis versions against the version the gateway refuses below
+  and the images CI actually exercises, and the recovery drill against the lane
+  that runs it;
 * consistency between a manifest and the process it runs — the termination grace
   period against axond's own `[shutdown]` defaults, and the container's memory
   limit against the `[admission]` ceilings in its own ConfigMap. Those are the
@@ -44,6 +48,12 @@ BASE = ROOT / "deploy/kubernetes/base"
 PRODUCTION = ROOT / "deploy/kubernetes/overlays/production"
 AUTOSCALING = ROOT / "deploy/kubernetes/components/autoscaling"
 KUBERNETES_DOC = ROOT / "docs/deployment/kubernetes.md"
+STATEFUL_DOC = ROOT / "docs/deployment/stateful-backends.md"
+RECOVERY_DOC = ROOT / "docs/operations/backup-and-recovery.md"
+CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
+SCHEMA_SOURCE = ROOT / "crates/gateway/src/backends/control_plane/schema.rs"
+REVOCATION_SOURCE = ROOT / "crates/gateway/src/revocation/redis.rs"
+DRILL = ROOT / "ops/restore-drill.sh"
 
 IMAGE_REPOSITORY = "ghcr.io/litvue/axond"
 # The digest the production overlay ships with. It is not a real image, and that
@@ -423,6 +433,108 @@ def check_namespaces(documents: list[Document], label: str) -> list[str]:
     ]
 
 
+def ci_service_images(workflow: dict[str, Any]) -> dict[str, str]:
+    """The backend images the stateful lane actually runs, keyed by service name."""
+    services = workflow["jobs"]["stateful-tests"]["services"]
+    return {name: service["image"] for name, service in services.items()}
+
+
+def documented_backends(page: str) -> dict[str, tuple[str, str]]:
+    """The supported-version table, as `{backend: (supported column, CI image)}`."""
+    rows: dict[str, tuple[str, str]] = {}
+    for line in page.splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) < 3 or cells[0] not in {"PostgreSQL", "Redis"}:
+            continue
+        rows[cells[0]] = (cells[1], cells[2].strip("`"))
+    return rows
+
+
+def enforced_postgres_floor(source: str) -> int:
+    """The major version the gateway refuses to run below, from its own constant."""
+    match = re.search(r"MINIMUM_SERVER_VERSION_NUM: i32 = ([0-9_]+);", source)
+    if match is None:
+        raise SystemExit(
+            "crates/gateway/src/backends/control_plane/schema.rs: MINIMUM_SERVER_VERSION_NUM is gone; "
+            "the supported-version gate reads it"
+        )
+    return int(match.group(1).replace("_", "")) // 10_000
+
+
+def check_supported_backends(
+    page: str, images: dict[str, str], floor: int, revocation_source: str
+) -> list[str]:
+    """The documented support window is the one that is enforced and exercised.
+
+    Three ways this table rots, each of which turns a support statement into a
+    guess: the floor drifts from the version the gateway refuses below, the
+    "exercised in CI" column keeps naming an image the workflow no longer runs, and
+    the reason for the Redis floor disappears from the code that needed it.
+    """
+    failures: list[str] = []
+    rows = documented_backends(page)
+    for backend, service in (("PostgreSQL", "postgres"), ("Redis", "redis")):
+        if backend not in rows:
+            failures.append(
+                f"docs/deployment/stateful-backends.md: no supported-version row for {backend}"
+            )
+            continue
+        supported, documented_image = rows[backend]
+        running = images.get(service)
+        if documented_image != running:
+            failures.append(
+                f"docs/deployment/stateful-backends.md: {backend} is documented as exercised on "
+                f"`{documented_image}`, but CI runs `{running}`"
+            )
+        documented_floor = supported.split(",")[0].strip()
+        if backend == "PostgreSQL" and documented_floor != str(floor):
+            failures.append(
+                f"docs/deployment/stateful-backends.md: PostgreSQL is documented from "
+                f"{documented_floor}, but the gateway refuses below {floor} "
+                "(MINIMUM_SERVER_VERSION_NUM)"
+            )
+        if backend == "Redis" and documented_floor == "6.2" and "PXAT" not in revocation_source:
+            failures.append(
+                "docs/deployment/stateful-backends.md: the Redis 6.2 floor is justified by the "
+                "`SET … PXAT` revocation write, which is no longer in "
+                "crates/gateway/src/revocation/redis.rs"
+            )
+    return failures
+
+
+def check_recovery_drill(workflow: dict[str, Any], page: str, drill: str) -> list[str]:
+    """The recovery objectives have an executable form, and CI runs it.
+
+    A recovery page is only as good as the last time somebody restored from it, so
+    the drill is required to exist, to be named by the page, to be a required lane
+    rather than an optional one, and to keep asserting the half that a broken
+    point-in-time recovery still passes: that the write after the target is *gone*.
+    """
+    failures: list[str] = []
+    jobs = workflow["jobs"]
+    lane = jobs.get("restore-drill")
+    if lane is None:
+        failures.append(".github/workflows/ci.yml: the restore-drill lane is missing")
+    elif not any("ops/restore-drill.sh" in str(step.get("run", "")) for step in lane["steps"]):
+        failures.append(".github/workflows/ci.yml: the restore-drill lane does not run the drill")
+    elif "restore-drill" not in jobs["CI-Success"]["needs"]:
+        failures.append(
+            ".github/workflows/ci.yml: CI-Success does not require restore-drill, so a failed "
+            "recovery would not block a merge"
+        )
+    for wanted in ("ops/restore-drill.sh", "RPO", "RTO"):
+        if wanted not in page:
+            failures.append(
+                f"docs/operations/backup-and-recovery.md: {wanted} is not documented"
+            )
+    if "the write after the target is not replayed" not in drill:
+        failures.append(
+            "ops/restore-drill.sh: the assertion that the post-target write is absent is gone; "
+            "without it a recovery that replayed the whole WAL passes the drill"
+        )
+    return failures
+
+
 def check_documented() -> list[str]:
     """The operator-facing page names the paths and the sentinel workflow."""
     page = KUBERNETES_DOC.read_text(encoding="utf-8")
@@ -582,6 +694,41 @@ def self_test() -> int:
     one(stray, "Service")["metadata"].pop("namespace")
     expect_failure("namespace placement", check_namespaces(stray, "overlays/production"))
 
+    workflow = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+    backends = STATEFUL_DOC.read_text(encoding="utf-8")
+    images = ci_service_images(workflow)
+    floor = enforced_postgres_floor(SCHEMA_SOURCE.read_text(encoding="utf-8"))
+    revocation = REVOCATION_SOURCE.read_text(encoding="utf-8")
+    recovery = RECOVERY_DOC.read_text(encoding="utf-8")
+    drill = DRILL.read_text(encoding="utf-8")
+
+    if check_supported_backends(backends, images, floor, revocation):
+        failures.append("self-test: the committed support window must pass the gate")
+    expect_failure(
+        "backend image drift",
+        check_supported_backends(backends, {**images, "postgres": "postgres:13-alpine"}, floor, revocation),
+    )
+    expect_failure(
+        "documented floor below what the gateway accepts",
+        check_supported_backends(backends, images, floor + 1, revocation),
+    )
+    expect_failure(
+        "Redis floor without its reason",
+        check_supported_backends(backends, images, floor, revocation.replace("PXAT", "EX")),
+    )
+
+    if check_recovery_drill(workflow, recovery, drill):
+        failures.append("self-test: the committed drill wiring must pass the gate")
+    unrequired = copy.deepcopy(workflow)
+    unrequired["jobs"]["CI-Success"]["needs"].remove("restore-drill")
+    expect_failure("optional drill lane", check_recovery_drill(unrequired, recovery, drill))
+    expect_failure(
+        "drill without its asymmetric assertion",
+        check_recovery_drill(
+            workflow, recovery, drill.replace("the write after the target is not replayed", "present")
+        ),
+    )
+
     for failure in failures:
         print(failure, file=sys.stderr)
     if failures:
@@ -598,6 +745,17 @@ def main(argv: list[str]) -> int:
         *gate(render(BASE), render(PRODUCTION), render(PRODUCTION, (AUTOSCALING,))),
         *check_documented(),
         *check_sentinel_refused(),
+        *check_supported_backends(
+            STATEFUL_DOC.read_text(encoding="utf-8"),
+            ci_service_images(yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))),
+            enforced_postgres_floor(SCHEMA_SOURCE.read_text(encoding="utf-8")),
+            REVOCATION_SOURCE.read_text(encoding="utf-8"),
+        ),
+        *check_recovery_drill(
+            yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8")),
+            RECOVERY_DOC.read_text(encoding="utf-8"),
+            DRILL.read_text(encoding="utf-8"),
+        ),
     ]
     for failure in failures:
         print(failure, file=sys.stderr)

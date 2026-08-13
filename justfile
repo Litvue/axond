@@ -33,6 +33,7 @@ docs-check:
     bash -n ops/publish-image-index.sh
     bash -n ops/verify-image-evidence.sh
     bash -n ops/pin-image-digest.sh
+    bash -n ops/restore-drill.sh
     bash ops/check-compose-platform.sh
     bash ops/check-installer-download.sh
     bash ops/check-index-promotion.sh
@@ -51,6 +52,13 @@ deploy-check:
     target/deploy-venv/bin/pip install --quiet --require-virtualenv --require-hashes -r ops/deploy-requirements.txt
     target/deploy-venv/bin/python ops/check-deploy-manifests.py --self-test
     target/deploy-venv/bin/python ops/check-deploy-manifests.py
+
+# Restore a logical dump and recover to a chosen point in time against the
+# supported Postgres, with `axond migrate status` as the acceptance test. Needs
+# Docker. About a minute; documented in
+# docs/operations/backup-and-recovery.md.
+restore-drill:
+    bash ops/restore-drill.sh
 
 # Refresh the manifest gate's lockfile, excluding releases newer than a week.
 deploy-lock:

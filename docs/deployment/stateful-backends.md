@@ -158,6 +158,32 @@ because an unset one is a boot failure whichever section it is in. See
 
 Use `sslmode=require` in production DSNs. Axond uses rustls and webpki roots.
 
+## Supported versions
+
+| Backend | Supported | Exercised in CI | Floor is enforced by |
+| --- | --- | --- | --- |
+| PostgreSQL | 14, 15, 16, 17 | `postgres:17.6-alpine` | The gateway: boot and `axond check preflight` read `server_version_num` and refuse an older server. |
+| Redis | 6.2, 7.x, 8.x | `redis:7.4.2-alpine` | Nothing at boot; an older server fails the first enforcement write instead. |
+
+The floors are the oldest servers the shipped statements can run on, not a
+preference. PostgreSQL 14 is where the journal's identity columns and
+`ON CONFLICT` against partial unique indexes arrive
+(`MINIMUM_SERVER_VERSION_NUM`). Redis 6.2 is where `SET … PXAT` arrives, which
+the revocation liveness write uses; on 6.0 that write is a command error, so a
+revocation backend on an older Redis fails closed at the first probe rather than
+silently. `ops/check-deploy-manifests.py` keeps this table, the enforced
+PostgreSQL floor, and the CI service images from drifting apart.
+
+Newer majors than the exercised ones are supported in the sense that nothing
+refuses them, and are not tested here; a deployment on one is on its own
+evidence. Upgrading a backend major is an operation on the backend, not on axond:
+the DDL is version-independent within the supported range, so a PostgreSQL major
+upgrade (`pg_upgrade` or dump and restore) needs no axond change and no
+migration. Run `axond check preflight` afterwards — it re-reads the server
+version and the schema, which is exactly the pair a major upgrade can move — and
+verify a restore into the new major with
+[the restore drill](../operations/backup-and-recovery.md#the-drill).
+
 ## Availability and recovery
 
 - Initial backend connectivity is validated before the listener binds.
@@ -168,6 +194,8 @@ Use `sslmode=require` in production DSNs. Axond uses rustls and webpki roots.
   alert on backend latency and unavailable denials.
 - Restore procedures must preserve schema versions and Redis layout markers,
   not only application rows/counters.
+- Recovery objectives, backup mechanisms, and the executable drill are in
+  [Backup, restore, and point-in-time recovery](../operations/backup-and-recovery.md).
 
 See [Configuration](../configuration.md),
 [Observability](../observability.md), and
