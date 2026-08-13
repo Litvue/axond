@@ -1086,6 +1086,18 @@ async fn publish(
 /// `lifecycle = 'deleted'`, which is a transition, not an erasure — physical
 /// erasure is separate compliance work with its own retention argument.
 ///
+/// A tenant the revision *omits* takes the same transition, because a revision is
+/// the whole desired state and the domain already treats an undeclared tenant as
+/// neither served nor administrable ([`Tenancy::is_served`] is `false` for a
+/// tenant it has no row for). Leaving the retained row at whatever it last said
+/// would leave `lifecycle` reading `active` for a tenant nothing serves, and that
+/// column exists precisely so "is this tenant served?" is answerable without
+/// decoding a body. It also settles the name: the domain frees an undeclared
+/// tenant's slug, and the exclusion constraint that enforces slug uniqueness
+/// ignores deleted rows, so the two agree about what may be reused. The
+/// reconciliation runs first, so a revision that reuses a dropped tenant's name
+/// does not collide with the row it is replacing.
+///
 /// Principals *are* deleted when a revision stops declaring them, because a
 /// revoked administrator whose grants linger is the whole failure this table
 /// exists to make visible. Their history is unaffected: attribution is copied
@@ -1100,6 +1112,20 @@ async fn project_tenancy(
     let directory = Directory::of(&candidate.state, &tenancy)
         .map_err(|error| ControlPlaneError::Invalid(error.into()))?;
     let revision = revision.to_string();
+
+    let declared_tenants: Vec<String> = tenancy
+        .tenants()
+        .map(|tenant| tenant.body.tenant().to_string())
+        .collect();
+    transaction
+        .execute(
+            "UPDATE axond_cp_tenant SET lifecycle = 'deleted', revision_id = $2, \
+             updated_at = now() \
+             WHERE NOT (tenant_id = ANY($1)) AND lifecycle <> 'deleted'",
+            &[&declared_tenants, &revision],
+        )
+        .await
+        .map_err(|error| unavailable("retire undeclared tenants", &error))?;
 
     for tenant in tenancy.tenants() {
         transaction
@@ -3371,14 +3397,18 @@ mod tests {
         );
     }
 
-    /// A projected name a retained row still holds is a refusal, not weather.
+    /// A retired tenant's name is free, and a retained *project* name is a
+    /// refusal rather than weather.
     ///
-    /// The failure is permanent by construction: the row holding the name is kept
-    /// on purpose, so every retry hits the same unique index. Reported as an
-    /// outage it would be an administrator retrying a publication that can never
-    /// succeed; reported as a refusal it names the taken name.
+    /// The two halves are the same rule read from both sides. A tenant a revision
+    /// stops declaring is retired, and the constraint that holds its name ignores
+    /// retired rows, so the domain and the database agree that the name is
+    /// reusable. A project has no lifecycle to retire into, so the row keeping its
+    /// name is kept on purpose and every retry hits the same index: that failure
+    /// is permanent by construction, and reported as an outage it would be an
+    /// administrator retrying a publication that can never succeed.
     #[tokio::test]
-    async fn reusing_a_retained_tenants_name_is_refused_rather_than_reported_as_an_outage() {
+    async fn a_retired_tenants_name_is_reusable_and_a_retained_projects_is_refused() {
         let Some((store, _, _)) = journal().await else {
             return;
         };
@@ -3387,22 +3417,24 @@ mod tests {
             .await
             .expect("the first tenant publishes");
 
-        // A different tenant, by id, claiming the name the first one still holds:
-        // the first tenant is no longer declared, but its row is retained because
-        // history points at it, and the name is retained with the row.
-        let mut reused = DesiredState::new();
-        reused
-            .insert(tenant(21, "acme"))
-            .expect("a state declaring one tenant is valid");
+        // The project side first, since it is the half that has no lifecycle to
+        // retire into: the row holding `(tenant, core)` is kept whether or not the
+        // revision still declares it, so a *different* project of that tenant
+        // taking the name is refused however often it is retried.
+        let mut reused_project = DesiredState::new();
+        reused_project
+            .insert(tenant(1, "acme"))
+            .and_then(|state| state.insert(project(&tenant_id(1), 5, "core")))
+            .expect("a tenant and one project of it is valid");
         let error = store
             .publish_revision(candidate_with_mutation(
                 ExpectedRevision::Exactly(first.id),
-                "reuse",
-                reused,
+                "project reuse",
+                reused_project,
                 77,
             ))
             .await
-            .expect_err("a name a projected row holds cannot be taken by another tenant");
+            .expect_err("a name a projected project row holds cannot be taken");
         assert_eq!(
             error.category(),
             FailureCategory::Conflict,
@@ -3416,21 +3448,44 @@ mod tests {
             matches!(error, ControlPlaneError::NameTaken { .. }),
             "{error}"
         );
-        assert!(error.to_string().contains("acme"), "{error}");
-
-        // And the refusal left nothing behind: the first tenant's row is untouched
-        // and the revision that would have renamed the deployment's tenancy was
-        // not published.
-        assert_eq!(
-            store
-                .column("SELECT tenant_id FROM axond_cp_tenant")
-                .await
-                .len(),
-            1
-        );
+        assert!(error.to_string().contains("core"), "{error}");
         assert_eq!(
             store.desired_revision().await.expect("head"),
-            Some(first.id)
+            Some(first.id),
+            "a refused publication is not a published one"
+        );
+
+        // The tenant side: a different tenant, by id, taking the name the first one
+        // used. The first tenant is no longer declared, so it is retired, and its
+        // name goes with the retirement even though its row stays for the history
+        // that points at it.
+        let mut reused = DesiredState::new();
+        reused
+            .insert(tenant(21, "acme"))
+            .expect("a state declaring one tenant is valid");
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(first.id),
+                "reuse",
+                reused,
+                79,
+            ))
+            .await
+            .expect("a retired tenant's name is not held against its successor");
+        assert_eq!(
+            store
+                .column(
+                    "SELECT lifecycle FROM axond_cp_tenant WHERE slug = 'acme' \
+                     ORDER BY tenant_id"
+                )
+                .await,
+            vec!["deleted", "active"],
+            "the name is held by the declared tenant, and kept by the retired row"
+        );
+        assert_eq!(
+            store.count("axond_cp_tenant").await,
+            2,
+            "the retired tenant's row is retained, not deleted"
         );
     }
 
@@ -3809,17 +3864,18 @@ mod tests {
         );
     }
 
-    /// Deletion is the only thing that releases a name, and releasing it is not
-    /// reversible by wishing: the slug index is partial over live rows, so a
-    /// deleted tenant's slug is free for the next tenant that asks — and the
-    /// deleted tenant cannot then be reactivated under it.
+    /// Retirement is what releases a name: the slug index is partial over live
+    /// rows, so a tenant that is deleted — declared so, or simply left out of the
+    /// revision — frees its name for the next tenant that asks.
     ///
     /// The three moves an operator actually makes, in order: delete, reuse,
-    /// attempt to restore. The last is a `NameTaken` naming the slug, which is
-    /// the runbook's answer — reactivate under another name, or delete the row
-    /// that took this one — rather than a silent rename of either tenant.
+    /// restore. The last one succeeds, and it is worth being explicit about why:
+    /// the revision that restores the first tenant does not declare the tenant
+    /// that took its name, so that tenant is retired in the same transaction and
+    /// the name is free again. Publishing complete desired state is the whole
+    /// contract, and this is what it costs when a name is recycled.
     #[tokio::test]
-    async fn a_deleted_tenants_slug_is_reusable_and_blocks_its_own_reactivation() {
+    async fn a_retired_tenants_slug_is_reusable_and_a_restore_retires_who_took_it() {
         let Some((store, _, _)) = journal().await else {
             return;
         };
@@ -3876,15 +3932,17 @@ mod tests {
             "both rows are retained; only one is live under the name"
         );
 
-        // And restoring the first tenant under the name it released is refused by
-        // name rather than reported as an outage or applied by renaming someone.
+        // And restoring the first tenant under the name it released is a revision
+        // that declares it and nothing else: the tenant holding the name is
+        // undeclared, so it is retired before the restore is projected, and the
+        // name is transferred rather than duplicated or refused.
         let mut restored = DesiredState::new();
         restored
             .insert(
                 tenant_body(1, "Acme").version_at(acme, ResourceVersionNumber::FIRST.next().next()),
             )
             .expect("a state declaring one tenant is valid");
-        let error = store
+        store
             .publish_revision(candidate_with_mutation(
                 ExpectedRevision::Exactly(head),
                 "restore",
@@ -3892,12 +3950,122 @@ mod tests {
                 98,
             ))
             .await
-            .expect_err("the slug now belongs to a live tenant");
-        assert!(
-            matches!(&error, ControlPlaneError::NameTaken { name, .. } if name == "acme"),
-            "{error}"
+            .expect("the revision that restores the tenant retires the one that took its name");
+        assert_eq!(
+            store
+                .column(
+                    "SELECT lifecycle FROM axond_cp_tenant WHERE slug = 'acme' \
+                     ORDER BY lifecycle"
+                )
+                .await,
+            vec!["active"],
+            "exactly one tenant holds the name, and it is the restored one"
         );
-        assert!(!error.retryable(), "{error}");
+        assert_eq!(
+            store
+                .column("SELECT count(*)::text FROM axond_cp_tenant WHERE lifecycle = 'deleted'")
+                .await,
+            vec!["1"],
+            "the tenant that held the name is retired, not erased"
+        );
+    }
+
+    /// A revision is the whole desired state, so the tenant it stops declaring is
+    /// retired rather than left reading `active`.
+    ///
+    /// The projected `lifecycle` is what a billing, retention, or admission reader
+    /// asks instead of decoding a body, and the domain serves an undeclared tenant
+    /// nothing. A retained row still claiming `active` would answer that question
+    /// with the opposite of the published truth. History is the reason the row
+    /// stays at all, so this also asserts the projects, mutations, and audit
+    /// events of the retired tenant survive the transition.
+    #[tokio::test]
+    async fn a_tenant_a_revision_stops_declaring_is_retired_and_keeps_its_history() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let both = store
+            .publish_revision(candidate(
+                ExpectedRevision::Empty,
+                "two tenants",
+                state_with_second_tenant(),
+            ))
+            .await
+            .expect("two tenants publish");
+        assert_eq!(
+            store
+                .column("SELECT lifecycle FROM axond_cp_tenant ORDER BY tenant_id")
+                .await,
+            vec!["active", "active"]
+        );
+
+        // The second tenant is simply absent from the next revision, which is how
+        // a complete desired state spells "this tenant is gone" without an
+        // explicit transition.
+        let dropped = store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(both.id),
+                "one tenant",
+                state(),
+                120,
+            ))
+            .await
+            .expect("a revision declaring one of them publishes");
+
+        assert_eq!(
+            store
+                .column("SELECT lifecycle FROM axond_cp_tenant ORDER BY tenant_id")
+                .await,
+            vec!["active", "deleted"],
+            "an undeclared tenant is still recorded as servable"
+        );
+        let published = store
+            .load_revision(dropped.id)
+            .await
+            .expect("the revision it just published hydrates");
+        let tenancy = Tenancy::of(&published.state()).expect("the published tenancy resolves");
+        assert!(
+            !tenancy.is_served(tenant_id(11)) && tenancy.tenant(tenant_id(11)).is_none(),
+            "the projection and the published snapshot disagree about who is served"
+        );
+        assert!(
+            tenancy.is_served(tenant_id(1)),
+            "retiring one tenant retired another"
+        );
+
+        // Retired, not erased: the rows history points at are all still here.
+        assert_eq!(
+            store
+                .column("SELECT slug FROM axond_cp_project ORDER BY slug")
+                .await,
+            vec!["core"],
+            "the surviving tenant's project is untouched"
+        );
+        assert!(
+            store.count("axond_cp_mutation").await >= 2
+                && store.count("axond_cp_audit_event").await >= 2,
+            "the retired tenant's history is retained"
+        );
+
+        // And declaring it again brings the row back to what that revision says,
+        // so retirement is a projection of the published state rather than a
+        // one-way door.
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(dropped.id),
+                "two tenants again",
+                state_with_second_tenant(),
+                124,
+            ))
+            .await
+            .expect("re-declaring the tenant publishes");
+        assert_eq!(
+            store
+                .column("SELECT lifecycle FROM axond_cp_tenant ORDER BY tenant_id")
+                .await,
+            vec!["active", "active"],
+            "a re-declared tenant is still retired"
+        );
     }
 
     /// The half of #144 that is a database property rather than a service one: a

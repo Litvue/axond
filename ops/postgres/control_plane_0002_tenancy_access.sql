@@ -46,6 +46,12 @@
 -- separate compliance job with its own retention argument, and a foreign key to
 -- a tenant that was erased would either fail or orphan the history that proves
 -- what was billed.
+--
+-- A revision is the whole desired state, so a tenant it omits is written here as
+-- `deleted` too: the domain serves an undeclared tenant nothing, and a retained
+-- row still reading `active` would answer the one question this column exists to
+-- answer with the opposite of the truth. The projection is therefore the
+-- published state and not a high-water mark of every tenant that ever existed.
 CREATE TABLE IF NOT EXISTS axond_cp_tenant (
     tenant_id     text        PRIMARY KEY CHECK (tenant_id ~ '^ten_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'),
     slug          text        NOT NULL CHECK (length(slug) BETWEEN 1 AND 63),

@@ -89,13 +89,22 @@ Two properties worth knowing before you plan capacity or retention:
   sets `axond.tenant_id` on its sessions for its own reasons starts seeing
   filtered rows the moment 0002 lands, silently and with no error: unset it there,
   or accept that the reader is now tenant-scoped.
-- **A retained name stays taken.** A tenant or project a later revision stops
-  declaring keeps its row and its name. Publishing a *different* tenant under a
+- **A tenant a revision omits is retired, not left active.** A revision is the
+  whole desired state, so a tenant it stops declaring keeps its row — with its
+  projects, mutations, and audit trail — and that row is written to `lifecycle =
+  "deleted"`. Nothing serves an undeclared tenant, and this is what keeps the
+  column readable as the serving answer. Two consequences worth planning for: a
+  partial configuration retires every tenant it leaves out, so publish complete
+  desired state; and re-declaring the tenant in a later revision brings the row
+  back to whatever that revision says, history intact.
+- **A retained project name stays taken.** A project a later revision stops
+  declaring keeps its row and its name. Publishing a *different* project under a
   retained name is refused rather than reported as a temporary failure: no retry
-  clears it, and the refusal names the conflict. Releasing a tenant's name means
-  publishing a revision that still declares that tenant, at `lifecycle =
-  "deleted"` and at the next version number of its *last published* version —
-  republishing a version number with different content is refused, so read the
+  clears it, and the refusal names the conflict. Releasing a *tenant's* name is
+  automatic once it is retired — the uniqueness constraint ignores deleted rows —
+  and doing it while keeping the tenant declared means publishing it at
+  `lifecycle = "deleted"` and at the next version number of its *last published*
+  version — republishing a version number with different content is refused, so read the
   current number out of the journal (`SELECT version FROM
   axond_cp_resource_version WHERE resource_id = …`) rather than assuming it. Two
   owners may also exchange names within one revision, and two principals may
