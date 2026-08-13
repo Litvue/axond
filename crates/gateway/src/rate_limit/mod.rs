@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::config::{BudgetConfig, RateLimitBackend, RateLimitConfig};
+use crate::policy::{Ceilings, PolicyHold};
 use crate::telemetry::metrics;
 
 /// The authenticated caller dimension used by inbound limits.
@@ -47,6 +48,12 @@ pub enum RateLimitError {
 /// An owned permit released synchronously when dropped.
 pub struct RateLimitPermit {
     release: Option<PermitRelease>,
+    /// The lease's claim on the policy generation that admitted it, dropped with
+    /// the permit — so a drain finishes exactly when the last lease it granted
+    /// is gone, including on cancellation paths (#150). Held for its `Drop`, which
+    /// is why nothing reads it.
+    #[allow(dead_code)]
+    hold: Option<PolicyHold>,
 }
 
 enum PermitRelease {
@@ -62,12 +69,14 @@ impl RateLimitPermit {
     pub(crate) fn no_limit() -> Self {
         Self {
             release: Some(PermitRelease::NoLimit),
+            hold: None,
         }
     }
 
     fn in_memory(state: Arc<InMemoryState>, key: RateLimitKey) -> Self {
         Self {
             release: Some(PermitRelease::InMemory { state, key }),
+            hold: None,
         }
     }
 }
@@ -213,6 +222,7 @@ pub async fn build(
     config: &RateLimitConfig,
     budget: &BudgetConfig,
     env: &HashMap<String, String>,
+    ceilings: Ceilings,
 ) -> Result<Box<dyn RateLimiter>, RateLimitBuildError> {
     match config.backend {
         RateLimitBackend::None => Ok(Box::new(NoLimit)),
@@ -241,6 +251,9 @@ pub async fn build(
                         "`{dsn_env}` is unset or empty in the environment"
                     ))
                 })?;
+            // Only the shared backend reads published limits: an in-memory
+            // limiter is per-replica, so a fleet-wide concurrency policy is
+            // refused on it at activation rather than approximated here.
             Ok(Box::new(
                 redis::RedisRateLimiter::connect(
                     url,
@@ -251,7 +264,8 @@ pub async fn build(
                     std::time::Duration::from_millis(config.connect_timeout_ms),
                     config.on_unavailable,
                 )
-                .await?,
+                .await?
+                .reading(ceilings),
             ))
         }
     }

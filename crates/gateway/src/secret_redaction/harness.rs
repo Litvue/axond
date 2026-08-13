@@ -183,7 +183,7 @@ impl CandidateCompiler for SecretResolvingCompiler {
         // its active credentials become the pools serving them, each naming the
         // exact version its material comes from.
         let mut config = RuntimeProjection
-            .project(&self.bootstrap, revision.state())
+            .project(&self.bootstrap, revision.state(), id)
             .map_err(projection)?;
         // All of the candidate's material or none of it, resolved by the shipped
         // materialization: a version it cannot unwrap is a refusal here, before

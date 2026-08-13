@@ -15,6 +15,8 @@ use tokio::sync::{Semaphore, SemaphorePermit, oneshot};
 
 use super::{PermitRelease, RateLimitError, RateLimitKey, RateLimitPermit, RateLimiter};
 use crate::config::StoreUnavailable;
+use crate::desired_state::policy::PolicyGeneration;
+use crate::policy::{ActivePolicy, Ceilings, ConcurrencyCaps, PolicyHold, Unenforceable, denied};
 use crate::redis_support::{RedisConnection as SharedConnection, RedisRecovery as SharedRecovery};
 use crate::telemetry::metrics;
 
@@ -135,15 +137,26 @@ pub(crate) struct RedisRelease {
     lease_ttl: Duration,
     retry_semaphore: &'static Semaphore,
     recovery: Arc<SharedRecovery>,
+    ceilings: Ceilings,
+    generation: Option<PolicyGeneration>,
 }
 
 impl RedisRelease {
+    /// A lease outlives the caller that asked for it: an acquire that overran
+    /// its caller's wait may have written the key, and the key is only gone once
+    /// this compensation lands. So the release counts a hold of its own against
+    /// the admitting generation — taken here rather than in the spawned task, so
+    /// there is no window between the caller's hold going away and this one
+    /// starting — and an operator watching the drain list sees the generation
+    /// stay busy until nothing it admitted is left in the store.
     pub(crate) fn spawn(self) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             tracing::warn!("rate-limit permit dropped without a Tokio runtime; lease will expire");
             return;
         };
+        let hold = PolicyHold::take(&self.ceilings, self.generation);
         handle.spawn(async move {
+            let _hold = hold;
             let release_budget = release_timeout(self.timeout);
             // This fixed margin covers each attempt's bounded connect and invoke
             // plus capped exponential backoff; the TTL cap makes later retries pointless.
@@ -335,8 +348,9 @@ fn reclaim_timed_out_acquire(
 
 pub struct RedisRateLimiter {
     key_prefix: String,
-    max_in_flight: usize,
-    lease_ttl: Duration,
+    /// Where the enforced limit and lease TTL are read, once per acquisition.
+    /// Bootstrap values until a control plane publishes over them (#150).
+    ceilings: Ceilings,
     timeout: Duration,
     on_unavailable: StoreUnavailable,
     connection: Arc<ArcSwap<SharedConnection>>,
@@ -392,8 +406,14 @@ impl RedisRateLimiter {
         let suspect_generation = recovery.suspect_generation.clone();
         Ok(Self {
             key_prefix,
-            max_in_flight,
-            lease_ttl,
+            ceilings: Ceilings::fixed(ActivePolicy {
+                budget: None,
+                concurrency: Some(ConcurrencyCaps {
+                    max_in_flight_per_subject: max_in_flight as u64,
+                    lease_ttl,
+                }),
+                generation: None,
+            }),
             timeout,
             on_unavailable,
             connection,
@@ -406,11 +426,27 @@ impl RedisRateLimiter {
         })
     }
 
+    /// Read the published limits instead of the bootstrap file's.
+    #[must_use]
+    pub fn reading(mut self, ceilings: Ceilings) -> Self {
+        self.ceilings = ceilings;
+        self
+    }
+
     fn key(&self, key: &RateLimitKey) -> String {
         lease_key(&self.key_prefix, key)
     }
 
-    fn release(&self, key: String, lease_id: String) -> RedisRelease {
+    /// The compensating release for a lease, carrying the TTL that lease was
+    /// granted under: the retry window is capped by it, and a publication that
+    /// shortens the TTL must not shorten the window of a lease already held.
+    fn release(
+        &self,
+        key: String,
+        lease_id: String,
+        lease_ttl: Duration,
+        generation: Option<PolicyGeneration>,
+    ) -> RedisRelease {
         RedisRelease {
             connection: self.connection.load_full().as_ref().clone(),
             client: self.client.clone(),
@@ -418,9 +454,11 @@ impl RedisRateLimiter {
             key,
             lease_id,
             timeout: self.timeout,
-            lease_ttl: self.lease_ttl,
+            lease_ttl,
             retry_semaphore: self.retry_semaphore,
             recovery: self.recovery.clone(),
+            ceilings: self.ceilings.clone(),
+            generation,
         }
     }
 
@@ -488,6 +526,31 @@ impl RateLimiter for RedisRateLimiter {
     }
 
     async fn acquire(&self, key: &RateLimitKey) -> Result<RateLimitPermit, RateLimitError> {
+        // The limits governing this acquisition, read once: a lease admitted here
+        // runs to completion on these terms even if a publication lands while it
+        // is held, and it is counted against the generation that stated them.
+        let active = self.ceilings.active(&key.namespace);
+        let Some(caps) = active.concurrency else {
+            // Sampled, not per request: the namespace is ungoverned until a
+            // publication governs it, so the log would otherwise grow with the
+            // traffic being denied rather than with the condition.
+            // Named for the responsibility, not for `self.name()`: the spend
+            // store is usually Redis too, and a namespace missing a cap and a
+            // ceiling is two problems, reported and counted apart.
+            if denied(
+                Unenforceable::Ungoverned,
+                crate::policy::ungoverned::RATE_LIMIT_REDIS,
+                &key.namespace,
+            ) {
+                tracing::warn!(
+                    store = crate::policy::ungoverned::RATE_LIMIT_REDIS,
+                    namespace = %key.namespace,
+                    "no policy governs this namespace, so its concurrency limit cannot be \
+                     enforced; denying every request for it until one is published"
+                );
+            }
+            return Err(RateLimitError::StoreUnavailable);
+        };
         let snapshot = self.connection.load_full();
         if self.suspect_generation.load(Ordering::Acquire) >= snapshot.generation {
             self.mark_connection_suspect(snapshot.generation);
@@ -502,15 +565,30 @@ impl RateLimiter for RedisRateLimiter {
         else {
             return self.unavailable("shared Redis invoke cap is exhausted");
         };
+        // Counted before the round-trip, and moved into the permit if one is
+        // granted: an operator waits on the drain list before a stop-the-fleet
+        // migration, so it may over-report a lease about to be denied but never
+        // miss one admitted while a publication landed. Every other path drops
+        // the guard.
+        let hold = PolicyHold::take(&self.ceilings, active.generation);
         let lease_id = next_id();
         let lease_key = self.key(key);
         let connection_generation = snapshot.generation;
-        let release = self.release(lease_key.clone(), lease_id.clone());
+        let release = self.release(
+            lease_key.clone(),
+            lease_id.clone(),
+            caps.lease_ttl,
+            active.generation,
+        );
         let abandoned_release = release.clone();
+        // The spawned invoke may write the key after its caller has given up, so
+        // the generation stays counted for as long as that invoke can still
+        // create a lease; the compensating release then takes over the count.
+        let invoke_hold = PolicyHold::take(&self.ceilings, active.generation);
         let (sender, mut receiver) = oneshot::channel();
         let acquire = self.acquire.clone();
-        let ttl = self.lease_ttl;
-        let max_in_flight = self.max_in_flight;
+        let ttl = caps.lease_ttl;
+        let max_in_flight = usize::try_from(caps.max_in_flight_per_subject).unwrap_or(usize::MAX);
         let invoke_lease_id = lease_id.clone();
         // The caller's timeout is a latency budget; the owned invoke gets the
         // longer liveness budget so ordinary slow Redis responses do not
@@ -518,6 +596,7 @@ impl RateLimiter for RedisRateLimiter {
         let invoke_timeout = invoke_timeout(self.timeout);
         let recovery = self.recovery.clone();
         tokio::spawn(async move {
+            let _invoke_hold = invoke_hold;
             // Swapping the manager only affects future requests. This task
             // keeps its snapshot and consumes the response even if its caller
             // stops waiting.
@@ -622,6 +701,7 @@ impl RateLimiter for RedisRateLimiter {
         match result {
             Ok(Ok(Ok(Ok((1, _))))) => Ok(RateLimitPermit {
                 release: Some(PermitRelease::Redis(Box::new(release))),
+                hold: Some(hold),
             }),
             Ok(Ok(Ok(Ok(_)))) => {
                 metrics::record_rate_limit_denial();
@@ -1856,6 +1936,63 @@ mod tests {
         drop(held_permits);
     }
 
+    /// An acquire can outrun the caller that asked for it, so the lease it wrote
+    /// is only gone once the compensating release lands. Until then the
+    /// generation that admitted it is still counted: an operator draining before
+    /// a stop-the-fleet migration is asking whether anything it admitted is
+    /// left, not merely whether anyone is still waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_compensating_release_keeps_its_generation_counted_until_the_lease_is_gone() {
+        use crate::desired_state::fixtures::tenant_id;
+        use crate::desired_state::policy::PolicyScope;
+        use crate::policy::PolicyRuntime;
+        use crate::policy::fixtures::{body, generation as policy_generation};
+        use crate::policy::view::tests::stateless_config;
+
+        let stub = RedisRetryStub::start().await;
+        let runtime = Arc::new(PolicyRuntime::bootstrap(&stateless_config()));
+        let limiter = RedisRateLimiter::connect(
+            &stub.url(),
+            format!("axond:test:{}", next_id()),
+            1,
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            StoreUnavailable::Deny,
+        )
+        .await
+        .expect("connect limiter")
+        .reading(Ceilings::published(&runtime));
+        let admitted = policy_generation(&body(PolicyScope::Tenant(tenant_id(1)), 1, 10), 1);
+
+        stub.stall_shared_release();
+        let release = limiter.release(
+            "rate-limit-key".into(),
+            "lease-id".into(),
+            Duration::from_secs(60),
+            Some(admitted),
+        );
+        release.spawn();
+        assert_eq!(
+            runtime.outstanding(admitted),
+            1,
+            "the hold is taken as the release is spawned, not once it is polled"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while runtime.outstanding(admitted) > 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the generation stayed counted after its lease was removed"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            stub.release_connection.load(Ordering::Acquire) > 0,
+            "the count was dropped before the lease was released"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stalled_shared_release_falls_through_to_fresh_retry() {
         let stub = RedisRetryStub::start().await;
@@ -1871,7 +2008,12 @@ mod tests {
         .await
         .expect("connect limiter");
         stub.stall_shared_release();
-        let release = limiter.release("rate-limit-key".into(), "lease-id".into());
+        let release = limiter.release(
+            "rate-limit-key".into(),
+            "lease-id".into(),
+            Duration::from_secs(60),
+            None,
+        );
         let started = tokio::time::Instant::now();
         release.spawn();
         let deadline = started + Duration::from_millis(1500);

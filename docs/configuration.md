@@ -857,6 +857,12 @@ cluster-safe key layout tagged by namespace rather than by
 $ axond budget migrate-redis --config axond.toml
 ```
 
+The namespaces are read from `[[namespace]]`. A stateful deployment declares
+none there — they belong to the control plane — so it names them on the command
+line instead, once per namespace served under this key prefix:
+`--namespace acme/core --namespace acme/edge`. Without a list the command
+refuses before it reads a single key.
+
 It carries accumulated spend forward — claimed out of each v1 counter and added
 to the v2 ones at most once, so an interrupted run loses nothing, a re-run adds
 nothing twice, and spend a stray v1 replica wrote *after* the first run is added

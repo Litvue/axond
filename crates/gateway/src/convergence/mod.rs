@@ -14,6 +14,7 @@
 //! | [`settings`] | how often to look, how long divergence may last, how to pace retries |
 //! | [`compile`] | how a hydrated revision becomes a whole runtime snapshot, and every way that fails |
 //! | [`credentials`] | how a revision's provider credentials become the pools a provider call leases from |
+//! | [`policy`] | which published document governs each projected namespace |
 //! | [`reconciler`] | the loop: observe, hydrate, compile, publish, report, back off |
 //! | [`status`] | what the replica reports: desired, loaded, active, lag, last refusal |
 //! | [`backoff`] | bounded exponential retry pacing |
@@ -45,21 +46,32 @@
 //! restore the signed [`lkg`] cache, which is authenticated before it is
 //! interpreted and re-verified through the domain's integrity checks after.
 //!
+//! **A published policy is admitted before it is served.** A candidate carries
+//! the limits [`policy`] attached to it, and the sink is asked
+//! ([`reconciler::SnapshotSink::admit`]) whether this replica's backends and its
+//! outstanding holds permit them *before* the snapshot is published
+//! ([`crate::policy::PolicyRuntime::plan`]). A refusal is an ordinary rejection
+//! with its own reason, and the replica keeps both the configuration and the
+//! policy it already had.
+//!
 //! # Not wired to `serve` yet
 //!
 //! A stateful replica boots and serves `/admin/v1`, but it refuses *inference*
-//! ([`crate::ops::inference_refusal`]), and deliberately. Two of the projections
-//! a snapshot needs exist — [`tenancy`], which makes a project a namespace, and
-//! [`credentials`], which makes an active provider credential the pool a call
-//! leases from — but a servable snapshot also needs the catalogue, pricing, and
-//! policy a revision carries, and it needs a caller to be bound to a projected
-//! namespace, which is #252's. Those are the seams left open; wiring `serve` is
-//! the remaining projections landing, not a second convergence design.
+//! ([`crate::ops::inference_refusal`]), and deliberately. Three of the
+//! projections a snapshot needs exist — [`tenancy`], which makes a project a
+//! namespace, [`credentials`], which makes an active provider credential the
+//! pool a call leases from, and [`policy`], which says which published document
+//! governs each projected namespace — but a servable snapshot also needs the
+//! catalogue and pricing a revision carries, so no production
+//! [`compile::RevisionProjection`] composes a whole servable config yet. Those
+//! are the seams left open; wiring `serve` is the remaining projections landing,
+//! not a second convergence design.
 
 pub mod backoff;
 pub mod compile;
 pub mod credentials;
 pub mod lkg;
+pub mod policy;
 pub mod reconciler;
 pub mod secrets;
 pub mod settings;
@@ -80,6 +92,8 @@ pub use compile::{
 pub use credentials::{CredentialProjection, RuntimeProjection};
 #[allow(unused_imports)]
 pub use lkg::{LastKnownGood, LastKnownGoodError};
+#[allow(unused_imports)]
+pub use policy::PolicyProjection;
 #[allow(unused_imports)]
 pub use reconciler::{BootstrapError, ChangeSignal, Outcome, Reconciler, SnapshotSink};
 #[allow(unused_imports)]
