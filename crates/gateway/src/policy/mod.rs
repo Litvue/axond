@@ -59,7 +59,10 @@ pub(crate) use ungoverned::{Unenforceable, denied};
 pub use view::{ActivePolicy, BudgetCaps, ConcurrencyCaps, PolicyView};
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use arc_swap::ArcSwap;
 
@@ -83,6 +86,22 @@ pub struct PolicyRuntime {
     /// generation with a non-zero count still has work running under the terms it
     /// granted.
     holds: Mutex<HashMap<PolicyGeneration, u64>>,
+    /// Holds that nothing will ever settle, and the deadline they are released
+    /// on — one entry per generation, not one per hold.
+    ///
+    /// A store outage produces one of these per failed reserve, so waiting each
+    /// one out on its own timer would be a task per request for a whole
+    /// reservation TTL, precisely when the deployment is already unhealthy. They
+    /// all wait out the same TTL, so they share one timer and the last one in
+    /// pushes the deadline out.
+    lingering: Mutex<HashMap<PolicyGeneration, Lingering>>,
+}
+
+/// Holds under one generation that are waiting out a store's reservation TTL.
+#[derive(Debug)]
+struct Lingering {
+    held: u64,
+    until: Instant,
 }
 
 impl PolicyRuntime {
@@ -97,6 +116,7 @@ impl PolicyRuntime {
             support: BackendSupport::of(config),
             view: ArcSwap::from_pointee(PolicyView::of(config)),
             holds: Mutex::new(HashMap::new()),
+            lingering: Mutex::new(HashMap::new()),
         }
     }
 
@@ -167,6 +187,66 @@ impl PolicyRuntime {
             if *count == 0 {
                 holds.remove(&generation);
             }
+        }
+    }
+
+    /// Keep a hold already entered under `generation` counted for `ttl`, then
+    /// release it, without holding up the caller.
+    ///
+    /// For the reserve whose answer was lost: nothing will settle it, so the only
+    /// honest release is the deadline the store itself reclaims the entry on. One
+    /// timer serves every such hold under a generation, and a later one extends
+    /// the shared deadline rather than adding a timer of its own — conservative
+    /// in the safe direction, since a hold released late only delays a drain.
+    pub fn linger(self: &Arc<Self>, generation: PolicyGeneration, ttl: Duration) {
+        let until = Instant::now() + ttl;
+        let mut lingering = self.lingering.lock().expect("not poisoned");
+        if let Some(waiting) = lingering.get_mut(&generation) {
+            waiting.held += 1;
+            waiting.until = waiting.until.max(until);
+            return;
+        }
+        lingering.insert(generation, Lingering { held: 1, until });
+        drop(lingering);
+
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // No runtime to outlive the caller on (a synchronous test, or
+            // shutdown): releasing now is all this thread can do, and it is what
+            // a process that is going away would do anyway.
+            self.release_lingering(generation);
+            return;
+        };
+        let runtime = Arc::clone(self);
+        handle.spawn(async move {
+            loop {
+                let until = {
+                    let lingering = runtime.lingering.lock().expect("not poisoned");
+                    match lingering.get(&generation) {
+                        Some(waiting) => waiting.until,
+                        None => return,
+                    }
+                };
+                if Instant::now() >= until {
+                    break;
+                }
+                tokio::time::sleep_until(until).await;
+            }
+            runtime.release_lingering(generation);
+        });
+    }
+
+    /// Exit every hold that was waiting out `generation`'s reservation TTL.
+    fn release_lingering(&self, generation: PolicyGeneration) {
+        let Some(waiting) = self
+            .lingering
+            .lock()
+            .expect("not poisoned")
+            .remove(&generation)
+        else {
+            return;
+        };
+        for _ in 0..waiting.held {
+            self.exit(Some(generation));
         }
     }
 
@@ -347,6 +427,40 @@ mod tests {
 
         runtime.exit(Some(held));
         assert!(runtime.draining().is_empty());
+    }
+
+    /// A store outage fails every request in flight, and each failure may have
+    /// left a reservation nothing can settle. They all wait out the same TTL, so
+    /// they wait on one timer: the count is exact, the later deadline wins, and
+    /// the number of tasks does not follow the request rate.
+    #[tokio::test(start_paused = true)]
+    async fn holds_lingering_under_one_generation_share_a_single_deadline() {
+        let runtime = std::sync::Arc::new(runtime());
+        let held = generation(&body(scope(), 1, 1_000), 1);
+        let ttl = Duration::from_secs(300);
+
+        for _ in 0..1_000 {
+            runtime.enter(Some(held));
+            runtime.linger(held, ttl);
+        }
+        assert_eq!(runtime.outstanding(held), 1_000);
+        assert_eq!(
+            runtime.lingering.lock().expect("not poisoned").len(),
+            1,
+            "a thousand failed reserves waited on a thousand timers"
+        );
+
+        // A later failure extends the shared deadline rather than releasing the
+        // earlier holds with it: at the first deadline nothing has expired yet.
+        tokio::time::sleep(ttl - Duration::from_secs(1)).await;
+        runtime.enter(Some(held));
+        runtime.linger(held, ttl);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(runtime.outstanding(held), 1_001);
+
+        tokio::time::sleep(ttl).await;
+        assert_eq!(runtime.outstanding(held), 0);
+        assert!(runtime.lingering.lock().expect("not poisoned").is_empty());
     }
 
     /// A namespace served under the bootstrap file has no generation, so it has

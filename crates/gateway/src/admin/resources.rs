@@ -709,7 +709,11 @@ impl AdminResourceRequest for PolicyRequest {
         let concurrency =
             ConcurrencyPolicy::new(self.max_in_flight_per_subject, self.lease_ttl_seconds)
                 .map_err(|error| {
-                    malformed::<Self>("max_in_flight_per_subject", &error.to_string())
+                    // Both settings share one bound too, and the request spells
+                    // them the way a document does.
+                    let field = ConcurrencyPolicy::unmet_bound(self.max_in_flight_per_subject)
+                        .document_field();
+                    malformed::<Self>(field, &error.to_string())
                 })?;
         let revocation = RevocationPolicy::new(self.minimum_token_epoch);
         let scope = match project {

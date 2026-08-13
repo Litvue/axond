@@ -984,9 +984,10 @@ async fn a_document_that_is_not_its_schema_is_refused_before_the_control_plane()
     );
 }
 
-/// The three budget settings share one lower bound, so a refusal that named the
-/// last one checked would send an administrator to edit a field that was right:
-/// the message names the setting they actually set to zero.
+/// The budget settings share one lower bound, and so do the concurrency ones,
+/// so a refusal that named the last one checked would send an administrator to
+/// edit a field that was right: the message names the setting they actually set
+/// to zero.
 #[tokio::test]
 async fn a_zero_budget_cap_is_refused_against_the_setting_the_caller_wrote() {
     let deployment = Deployment::new();
@@ -994,6 +995,8 @@ async fn a_zero_budget_cap_is_refused_against_the_setting_the_caller_wrote() {
         ("subject_limit_microdollars", json!(0)),
         ("namespace_limit_microdollars", json!(0)),
         ("reservation_ttl_seconds", json!(0)),
+        ("max_in_flight_per_subject", json!(0)),
+        ("lease_ttl_seconds", json!(0)),
     ];
     for (field, value) in cases {
         let mut document = policy_document();

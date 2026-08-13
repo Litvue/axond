@@ -221,7 +221,13 @@ laid out without one would leave ledgers accumulating against nothing.
 
 ## Revocation floors
 
-A document's `minimum_token_epoch` is a floor, and it only ever **raises** the
+A document's `minimum_token_epoch` is a **Unix timestamp in seconds**, not a
+counter: it is compared against a minted token's `iat` claim, exactly as
+`[[gateway_token_epoch]]` is in the bootstrap file. Revoking every token issued
+before now means publishing the current Unix time; publishing `3` revokes
+essentially nothing.
+
+It is a floor, and it only ever **raises** the
 token epochs a replica enforces — both the namespace-wide entry and any more
 specific per-subject entries in the bootstrap file. A stale file entry therefore
 cannot undercut a published revocation. Lowering a floor is refused, because it

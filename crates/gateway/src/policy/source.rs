@@ -68,6 +68,18 @@ impl Ceilings {
             runtime.exit(generation);
         }
     }
+
+    /// Keep an entered hold counted for `ttl`, then release it.
+    ///
+    /// Whether that is worth doing at all is the hold's business; the runtime's
+    /// business is doing it for every such hold under a generation on one timer
+    /// rather than one each.
+    fn linger(&self, generation: PolicyGeneration, ttl: Duration) {
+        match &self.0 {
+            Source::Published(runtime) => runtime.linger(generation, ttl),
+            Source::Fixed(_) => {}
+        }
+    }
 }
 
 /// An outstanding hold, counted against the generation that granted it for as
@@ -100,7 +112,8 @@ impl Ceilings {
 /// especially, where the request is admitted unenforced and looks like a
 /// success. So such a hold is *lingered* ([`PolicyHold::linger`]) for the
 /// reservation TTL the entry would have carried, which is exactly how long the
-/// store can keep it.
+/// store can keep it — on a timer shared by every hold lingering under that
+/// generation, because an outage produces one of them per request.
 #[derive(Debug)]
 pub struct PolicyHold {
     ceilings: Ceilings,
@@ -129,30 +142,18 @@ impl PolicyHold {
     ///
     /// For the admission whose outcome is unknown: nothing will settle it, so
     /// the only honest release is the deadline the store itself will reclaim the
-    /// entry on. The cost is one sleeping task per failed reserve for the length
-    /// of a reservation TTL — bounded by the outage, and cheaper than a drain
-    /// that reports done while the ledger disagrees. Only for a hold that names a
-    /// generation: a bootstrap admission has nothing to keep, and an outage would
-    /// otherwise spawn a task per request to account for nothing.
-    pub fn linger(self, ttl: Duration) {
-        // A bootstrap admission names no generation, so nothing drains it and a
-        // task sleeping out the reservation TTL would account for nothing — while
-        // an outage spawns one per failed request. Release it here instead.
-        if self.generation.is_none() {
+    /// entry on. The waiting is the runtime's
+    /// ([`PolicyRuntime::linger`](super::PolicyRuntime::linger)), which keeps one
+    /// timer per generation however many requests an outage fails.
+    pub fn linger(mut self, ttl: Duration) {
+        // A bootstrap admission names no generation, so nothing drains it and
+        // nothing has to wait: released here, on the spot.
+        let Some(generation) = self.generation else {
             return;
-        }
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                runtime.spawn(async move {
-                    tokio::time::sleep(ttl).await;
-                    drop(self);
-                });
-            }
-            // No runtime to outlive the caller on (a synchronous test, or
-            // shutdown): releasing now is all this thread can do, and it is what
-            // a process that is going away would do anyway.
-            Err(_) => drop(self),
-        }
+        };
+        // The count stays entered; the runtime exits it when the deadline passes.
+        self.kept = true;
+        self.ceilings.linger(generation, ttl);
     }
 }
 

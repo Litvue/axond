@@ -586,7 +586,41 @@ pub struct ConcurrencyPolicy {
     lease_ttl_seconds: u64,
 }
 
+/// The bound a [`ConcurrencyPolicy`] pair broke.
+///
+/// Both settings share one error, so the choice of which one to name lives here
+/// rather than being re-derived — and re-derived differently — at the document
+/// reader and the admin surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcurrencyBound {
+    /// How many admissions one `(scope, subject)` pair may hold at once.
+    MaxInFlight,
+    /// How long an abandoned lease stays live.
+    LeaseTtl,
+}
+
+impl ConcurrencyBound {
+    /// The name an `axond.policy.v1` document spells this bound with, which is
+    /// also the name the admin request spells it with.
+    pub const fn document_field(self) -> &'static str {
+        match self {
+            Self::MaxInFlight => MAX_IN_FLIGHT_FIELD,
+            Self::LeaseTtl => LEASE_TTL_FIELD,
+        }
+    }
+}
+
 impl ConcurrencyPolicy {
+    /// Which setting a refused pair broke, so a refusal names the one the
+    /// caller would edit rather than the first one checked.
+    pub const fn unmet_bound(max_in_flight_per_subject: u64) -> ConcurrencyBound {
+        if max_in_flight_per_subject == 0 {
+            ConcurrencyBound::MaxInFlight
+        } else {
+            ConcurrencyBound::LeaseTtl
+        }
+    }
+
     pub const fn new(
         max_in_flight_per_subject: u64,
         lease_ttl_seconds: u64,
@@ -619,6 +653,11 @@ impl ConcurrencyPolicy {
 }
 
 /// The mint epoch below which a token issued for this scope is refused.
+///
+/// The epoch is a Unix timestamp in seconds, compared against a minted token's
+/// `iat` claim just as a bootstrap `[[gateway_token_epoch]]` entry is — not an
+/// opaque counter, so `3` revokes nothing and the current Unix time revokes
+/// every token issued so far.
 ///
 /// Revocation states a floor rather than a list, so a document stays a fixed
 /// shape and a mass revocation is one advancing integer. Advancing it only ever
@@ -792,12 +831,10 @@ impl PolicyBody {
         let concurrency = ConcurrencyPolicy::new(max_in_flight, lease_ttl).map_err(|source| {
             // Two fields share one bound, so the refusal names the one that broke
             // it rather than the first one checked.
-            let field = if max_in_flight == 0 {
-                MAX_IN_FLIGHT_FIELD
-            } else {
-                LEASE_TTL_FIELD
-            };
-            bound(field, source)
+            bound(
+                ConcurrencyPolicy::unmet_bound(max_in_flight).document_field(),
+                source,
+            )
         })?;
         Ok(Self {
             scope,
