@@ -131,8 +131,8 @@ impl<'a> PinnedCatalog<'a> {
     /// Key `content`, which was parsed from the payload `snapshot` identifies.
     ///
     /// `snapshot` is the raw payload digest rather than the
-    /// [`CatalogContentId`](super::catalog::CatalogContentId) because that is
-    /// what an enablement pins: an operator approved the bytes they read.
+    /// [`CatalogContentId`] because that is what an enablement pins: an operator
+    /// approved the bytes they read.
     pub fn of(content: &'a CatalogContent, snapshot: Checksum) -> Result<Self, PinError> {
         let projection = ModelProjection::project(content)
             .map_err(|source| PinError::Unprojectable { source })?;
