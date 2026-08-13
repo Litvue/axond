@@ -78,6 +78,15 @@ const BACKEND: &str = "postgres";
 /// caused it, because the measurement a refusal is made on expires.
 const COUNT_REFRESH: Duration = Duration::from_secs(1);
 
+/// How long an appended row is left alone before the claim floor may pass it.
+///
+/// See [`ADVANCE_RESOLVED_THROUGH`]: it only has to exceed the longest an append
+/// transaction can hold an allocated `position` open, which
+/// [`PostgresJournalSettings::operation_timeout`] bounds. Five minutes is
+/// generous against that and cheap, because the only cost of a late floor is a
+/// claim scanning a few more rows for one tick.
+const FLOOR_SETTLE_MARGIN: Duration = Duration::from_secs(300);
+
 /// How the outbox connects, and what it is allowed to do at boot.
 #[derive(Debug, Clone)]
 pub struct PostgresJournalSettings {
@@ -237,20 +246,22 @@ impl PostgresJournal {
     }
 }
 
-/// How many events are stored: the gate's recent measurement, or one taken here.
+/// How many events are stored: the position span, less the gaps in it that the
+/// gate knows about, or a fresh bounded count when it does not.
 ///
-/// Two bounds, because this runs inside the append a request is waiting on and an
-/// unbounded `count(*)` gets slower exactly as the outbox falls behind, which is
-/// when appends can least afford it. A replica measures at most once per
-/// [`COUNT_REFRESH`] however full the outbox is, and a measurement stops at
-/// `max_events + 1` rows — the largest number the decision can distinguish, since
-/// anything above the limit is over it.
+/// Bounded twice over, because this runs inside the append a request is waiting
+/// on and an unbounded `count(*)` gets slower exactly as the outbox falls behind,
+/// which is when appends can least afford it. The span is two index probes on
+/// [`SPAN`]; a replica counts at most once per [`COUNT_REFRESH`] however full the
+/// outbox is; and a count stops at `max_events + 1` rows, the largest number the
+/// decision can distinguish, since anything above the limit is over it.
 async fn stored_events(
     tx: &Transaction<'_>,
     gate: &CapacityGate,
     max_events: u64,
 ) -> Result<u64, OpError> {
-    if let Some(estimate) = gate.estimate() {
+    let span = tx.query_one(SPAN, &[]).await?.get::<_, i64>(0).max(0) as u64;
+    if let Some(estimate) = gate.estimate(span, max_events) {
         return Ok(estimate);
     }
     let bound = i64::try_from(max_events.saturating_add(1)).unwrap_or(i64::MAX);
@@ -261,9 +272,14 @@ async fn stored_events(
         )
         .await?;
     let counted = row.get::<_, i64>(0).max(0) as u64;
-    gate.measured(counted);
+    gate.measured(span, counted, max_events);
     Ok(counted)
 }
+
+/// How many positions the outbox currently covers. `max`/`min` over the primary
+/// key, so it is two index probes whatever the backlog, and it moves with every
+/// replica's appends rather than only this one's.
+const SPAN: &str = "SELECT COALESCE(max(position) - min(position) + 1, 0) FROM axond_usage_outbox";
 
 #[async_trait]
 impl UsageJournal for PostgresJournal {
@@ -378,7 +394,6 @@ impl UsageJournal for PostgresJournal {
                         dropped,
                     );
                 }
-                gate.appended();
                 Ok(Appended::Accepted {
                     position: row.get::<_, i64>(0).max(0) as u64,
                 })
@@ -657,6 +672,11 @@ impl UsageJournal for PostgresJournal {
 
     async fn maintain(&self, now: SystemTime) -> Result<u64, JournalError> {
         let retain = self.settings.capacity.retain_acknowledged;
+        // Comfortably longer than an append can hold a `position` open, which is
+        // what makes raising the floor safe.
+        let settled = now
+            .checked_sub(FLOOR_SETTLE_MARGIN.max(self.settings.operation_timeout * 6))
+            .unwrap_or(now);
         let pruned = self
             .run("maintain", move |client| {
                 Box::pin(async move {
@@ -670,7 +690,9 @@ impl UsageJournal for PostgresJournal {
                             &[&cutoff],
                         )
                         .await?;
-                    client.execute(ADVANCE_RESOLVED_THROUGH, &[]).await?;
+                    client
+                        .execute(ADVANCE_RESOLVED_THROUGH, &[&settled])
+                        .await?;
                     Ok(pruned)
                 })
             })
@@ -809,19 +831,50 @@ impl Undeliverable {
 /// `GREATEST` makes it monotonic, and the `max(position)` fallback covers a
 /// consumer that has finished everything: with no unresolved row there is no
 /// position to sit below, and the floor is the end of the outbox.
+///
+/// # Why the floor also stops at a settled watermark
+///
+/// `position` is a `bigserial`, so it is allocated before the appending
+/// transaction commits and two concurrent appends can commit out of order: a
+/// pass that sees position 12 while 11 is still uncommitted would read 12 as the
+/// first unresolved position and put the floor on 11 — an event that is durable,
+/// never claimed again, therefore never acknowledged, therefore never pruned.
+/// Silent non-delivery, in the mode whose whole point is that nothing is lost.
+///
+/// So the floor may not pass `$1`, the highest position appended before the
+/// caller's settle margin. An append's transaction is bounded by
+/// `operation_timeout`, and a position below a row appended before the margin was
+/// allocated within one such bound of it, so by the time the margin has passed
+/// every lower position has committed or been rolled back. What the margin costs
+/// is latency in the floor, not correctness: the floor simply catches up on a
+/// later tick.
+///
+/// The watermark is the highest position appended before the margin — written as
+/// a descending walk of the primary key rather than `max(position) WHERE …`, so
+/// it reads only the rows appended inside the margin. Taking instead the *first*
+/// row inside the margin and stepping back from it would not be safe: a lower
+/// position could be inside the margin too, and an uncommitted one is invisible
+/// to this pass either way.
 const ADVANCE_RESOLVED_THROUGH: &str = "UPDATE axond_usage_outbox_consumer c
      SET resolved_through = GREATEST(
          c.resolved_through,
-         COALESCE(
-             (SELECT e.position - 1
-              FROM axond_usage_outbox e
-              LEFT JOIN axond_usage_outbox_delivery d
-                  ON d.position = e.position AND d.consumer = c.consumer
-              WHERE e.position > c.resolved_through
-                AND d.acknowledged_at IS NULL AND d.quarantined_at IS NULL
-              ORDER BY e.position
-              LIMIT 1),
-             (SELECT COALESCE(max(position), 0) FROM axond_usage_outbox)))";
+         LEAST(
+             COALESCE(
+                 (SELECT e.position - 1
+                  FROM axond_usage_outbox e
+                  LEFT JOIN axond_usage_outbox_delivery d
+                      ON d.position = e.position AND d.consumer = c.consumer
+                  WHERE e.position > c.resolved_through
+                    AND d.acknowledged_at IS NULL AND d.quarantined_at IS NULL
+                  ORDER BY e.position
+                  LIMIT 1),
+                 (SELECT COALESCE(max(position), 0) FROM axond_usage_outbox)),
+             COALESCE(
+                 (SELECT e.position FROM axond_usage_outbox e
+                  WHERE e.appended_at <= $1
+                  ORDER BY e.position DESC
+                  LIMIT 1),
+                 0)))";
 
 /// An event every registered consumer has finished with, and nobody has
 /// quarantined. The predicate retention and reclamation share, written once
@@ -1110,20 +1163,32 @@ impl Pool {
 /// append.
 ///
 /// An exact `count(*)` per append would make the request path pay for the whole
-/// backlog. The gate keeps the last exact count plus the appends since, and
-/// insists on a fresh exact one whenever the estimate is stale or close enough
-/// to the limit that the answer decides whether an event is refused — so the
-/// bound is enforced exactly where it bites and estimated only where it cannot
-/// matter.
+/// backlog, so the gate caches instead what the cheap part of the answer cannot
+/// give it. Every append reads the *position span* — `max(position) -
+/// min(position) + 1`, two index probes — which is shared state and therefore
+/// counts every replica's appends and prunes, not just this process's. What the
+/// span does not know is how many positions inside it are no longer occupied, and
+/// that number moves only when rows are deleted: retention, reclamation and
+/// drop-oldest, all of which run on the maintenance and worker paths rather than
+/// per append. So the gate caches the gaps and the request path subtracts them.
 struct CapacityGate {
     state: std::sync::Mutex<GateState>,
 }
 
 #[derive(Default)]
 struct GateState {
-    measured: u64,
-    appended_since: u64,
+    measured: Option<Measured>,
     at: Option<Instant>,
+}
+
+/// What a bounded count established about the span it was taken against.
+#[derive(Clone, Copy)]
+enum Measured {
+    /// Positions inside the span holding no row.
+    Gaps(u64),
+    /// The count stopped at its bound, so the outbox is over the limit and how
+    /// far over is not worth knowing.
+    Over,
 }
 
 impl CapacityGate {
@@ -1133,35 +1198,37 @@ impl CapacityGate {
         }
     }
 
-    /// A measurement no older than [`COUNT_REFRESH`], plus what this process has
-    /// appended since, or nothing when there is none that fresh.
+    /// How many rows `span` positions hold, from a gap measurement no older than
+    /// [`COUNT_REFRESH`] — or nothing when there is none that fresh.
     ///
-    /// This is what keeps the decision off the table on the request path: a
-    /// replica measures at most once per refresh window however full the outbox
-    /// is, rather than once per append. Between measurements the number moves
-    /// only by this process's own appends, and every deletion this process makes
-    /// invalidates it, so the staleness it can carry is another replica's
-    /// deletion within the window — which can only make it read *fuller* than
-    /// the outbox is. That is the safe direction for a limit whose job is to
-    /// refuse, and it lasts at most a window.
-    fn estimate(&self) -> Option<u64> {
+    /// This is exact for appends however many replicas make them, because they
+    /// all take positions from the same sequence and `span` is read fresh from
+    /// the outbox on every append. Deletions are what the cached part can lag:
+    /// this process invalidates on its own, and another replica's deletion leaves
+    /// the gaps understated for at most a window, which reads *fuller* than the
+    /// outbox is. That is the safe direction for a limit whose job is to refuse.
+    fn estimate(&self, span: u64, max_events: u64) -> Option<u64> {
         let state = self.state.lock().expect("capacity gate");
-        (state.at?.elapsed() < COUNT_REFRESH)
-            .then(|| state.measured.saturating_add(state.appended_since))
+        if state.at?.elapsed() >= COUNT_REFRESH {
+            return None;
+        }
+        Some(match state.measured? {
+            Measured::Gaps(gaps) => span.saturating_sub(gaps),
+            Measured::Over => max_events.saturating_add(1),
+        })
     }
 
-    fn measured(&self, count: u64) {
-        let mut state = self.state.lock().expect("capacity gate");
-        *state = GateState {
-            measured: count,
-            appended_since: 0,
+    /// Record what a bounded count of `counted` rows over `span` positions says.
+    fn measured(&self, span: u64, counted: u64, max_events: u64) {
+        let measured = if counted > max_events {
+            Measured::Over
+        } else {
+            Measured::Gaps(span.saturating_sub(counted))
+        };
+        *self.state.lock().expect("capacity gate") = GateState {
+            measured: Some(measured),
             at: Some(Instant::now()),
         };
-    }
-
-    fn appended(&self) {
-        let mut state = self.state.lock().expect("capacity gate");
-        state.appended_since = state.appended_since.saturating_add(1);
     }
 
     /// Forget the measurement: something deleted rows, so the next append has to
@@ -1942,8 +2009,11 @@ mod tests {
         let pending = event_for("GW_INBOUND_ACME_KEY");
         journal.append(&pending).await.expect("append");
 
-        // Nothing is pruned: every row is inside its retention window.
-        assert_eq!(journal.maintain(now).await.expect("maintain"), 0);
+        // Nothing is pruned: every row is inside its retention window. Run past
+        // the settle margin, because a floor may not pass a position that could
+        // still be in flight — which every row this test just wrote could be.
+        let settled = now + FLOOR_SETTLE_MARGIN + Duration::from_secs(1);
+        assert_eq!(journal.maintain(settled).await.expect("maintain"), 0);
         let admin = client(&dsn, Some("axond_outbox_floor")).await;
         let floor: i64 = admin
             .query_one(
@@ -1977,5 +2047,131 @@ mod tests {
             .expect("claim");
         assert_eq!(claimed.len(), 1, "{claimed:?}");
         assert_eq!(claimed[0].event.id(), pending.id());
+    }
+
+    /// `max_events` bounds the outbox, not one replica's share of it: the
+    /// admission decision reads the position span on every append, so it counts
+    /// what other replicas have appended and cannot be talked past by a cache
+    /// that only knows about this process.
+    #[tokio::test]
+    async fn the_event_limit_holds_across_replicas() {
+        const LIMIT: u64 = 6;
+        let Some((dsn, first)) =
+            outbox("replica_capacity", capacity(LIMIT, CapacityPolicy::Refuse)).await
+        else {
+            return;
+        };
+        let second = PostgresJournal::connect(
+            &dsn,
+            settings(
+                "axond_outbox_replica_capacity",
+                false,
+                capacity(LIMIT, CapacityPolicy::Refuse),
+            ),
+        )
+        .await
+        .expect("a second replica");
+
+        // Alternating, and within one refresh window, so each replica decides
+        // mostly from a cache the other replica's appends never touched.
+        let mut accepted = 0u64;
+        let mut refused = 0u64;
+        for turn in 0..LIMIT * 2 {
+            let journal: &PostgresJournal = if turn % 2 == 0 { &first } else { &second };
+            match journal.append(&event_for("GW_INBOUND_ACME_KEY")).await {
+                Ok(_) => accepted += 1,
+                Err(JournalError::AtCapacity { .. }) => refused += 1,
+                Err(error) => panic!("unexpected append failure: {error}"),
+            }
+        }
+        assert_eq!(accepted, LIMIT, "the two replicas together overfilled it");
+        assert_eq!(refused, LIMIT, "the rest were refused, not lost");
+
+        let admin = client(&dsn, Some("axond_outbox_replica_capacity")).await;
+        let stored: i64 = admin
+            .query_one("SELECT count(*) FROM axond_usage_outbox", &[])
+            .await
+            .expect("the stored count")
+            .get(0);
+        assert_eq!(stored as u64, LIMIT, "the outbox holds more than its bound");
+    }
+
+    /// `position` is allocated before an append commits, so a later position can
+    /// become visible while an earlier one is still in flight. A floor that took
+    /// the first *visible* unresolved position as its bound would step over the
+    /// earlier event, and because the floor only rises that event would never be
+    /// claimed, acknowledged, or pruned — durable and undelivered forever.
+    #[tokio::test]
+    async fn the_claim_floor_never_passes_an_append_that_has_not_committed() {
+        let Some((dsn, journal)) = outbox("floor_race", capacity(64, CapacityPolicy::Refuse)).await
+        else {
+            return;
+        };
+        let billing = consumer("billing");
+        let now = SystemTime::now();
+
+        // An append that has taken its position and not committed, held open the
+        // way a slow request would hold it.
+        let mut inflight = client(&dsn, Some("axond_outbox_floor_race")).await;
+        let held = inflight.transaction().await.expect("a held append");
+        let early = event_for("GW_INBOUND_ACME_KEY");
+        let record = serde_json::to_value(early.record()).expect("a record");
+        let position: i64 = held
+            .query_one(
+                "INSERT INTO axond_usage_outbox \
+                   (request_id, schema_version, namespace, subject, record, observed_at) \
+                 VALUES ($1, $2, $3, $4, $5::jsonb, $6) RETURNING position",
+                &[
+                    &early.idempotency_key().as_str(),
+                    &i32::try_from(early.record().schema_version).expect("a version"),
+                    &early.ordering_key().namespace,
+                    &early.ordering_key().subject,
+                    &record,
+                    &early.observed_at(),
+                ],
+            )
+            .await
+            .expect("the held append takes a position")
+            .get(0);
+
+        // A later append that commits first, and is delivered.
+        let later = event_for("GW_INBOUND_OTHER_KEY");
+        journal.append(&later).await.expect("append");
+        let claimed = journal
+            .claim(&billing, claim_at(8, Duration::from_secs(30), now))
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1, "{claimed:?}");
+        journal.ack(&claimed[0].id).await.expect("ack");
+
+        // Maintenance now sees only the later, resolved event, so the unfloored
+        // answer would be "everything through it is finished".
+        journal.maintain(now).await.expect("maintain");
+        let admin = client(&dsn, Some("axond_outbox_floor_race")).await;
+        let floor: i64 = admin
+            .query_one(
+                "SELECT resolved_through FROM axond_usage_outbox_consumer WHERE consumer = $1",
+                &[&billing.as_str()],
+            )
+            .await
+            .expect("the floor")
+            .get(0);
+        assert!(
+            floor < position,
+            "the floor ({floor}) passed a position ({position}) that had not committed"
+        );
+
+        // And the event delivers once it commits, which is the property the floor
+        // could have destroyed.
+        held.commit().await.expect("the held append commits");
+        let claimed = journal
+            .claim(&billing, claim_at(8, Duration::from_secs(30), now))
+            .await
+            .expect("claim");
+        assert_eq!(
+            claimed.iter().map(|d| d.event.id()).collect::<Vec<_>>(),
+            vec![early.id()],
+            "the late-committing event is still claimable"
+        );
     }
 }

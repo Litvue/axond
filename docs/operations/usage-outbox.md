@@ -120,6 +120,13 @@ reference](../configuration.md#usage_journal--billing-grade-usage-delivery-opt-i
   `max_delivery_attempts` bounds retries, and `retain_acknowledged_seconds`
   bounds retention. Nothing here grows without a limit you set.
 
+`max_events` bounds the outbox itself, not each replica's share of it: admission
+reads the outbox's position span on every append, which every replica's appends
+move, and subtracts the positions it knows are vacant. Only deletions — retention,
+reclamation, drop-oldest — are cached, for at most a second, and a stale one makes
+a replica read the outbox as *fuller* than it is. So the limit can refuse an
+append a second early after another replica prunes; it cannot be overshot.
+
 ## What enabling it changes about your sinks
 
 In billing-grade mode the outbox *is* the buffer, and the worker writes each
@@ -160,6 +167,14 @@ and it does not: each consumer row carries a `resolved_through` floor — the
 position below which everything is acknowledged, quarantined, or gone — and
 maintenance raises it after each retention pass. Both sides of the claim's
 selection are floored on it.
+
+The floor stops short of anything appended in the last five minutes. `position`
+comes from a sequence, so it is taken before the appending transaction commits and
+a later position can become visible while an earlier one is still in flight; a
+floor that stepped over that earlier event would leave it durable and never
+delivered. The margin is far longer than `operation_timeout_ms` can let an append
+run, so the only thing it costs is that the floor trails the backlog by one
+maintenance tick's worth of events.
 
 Measured on PostgreSQL 17 with 200,000 acknowledged events inside their retention
 window, 100 awaiting delivery across 64 ordering keys, and one consumer
