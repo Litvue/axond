@@ -17,7 +17,7 @@ decomposes into five slices. They landed, and will land, at different depths:
 
 `qualification/packet.toml` is that table as data — question, inputs, lanes,
 retained runs, and what each slice still owes; see
-[ADR 0040](../adr/0040-qualification-packet-and-evidence-records.md) for why the
+[ADR 0041](../adr/0041-qualification-packet-and-evidence-records.md) for why the
 packet and the record are shaped this way. And
 `crates/gateway/tests/qualification_packet.rs` checks it against the tree on
 every run: a path that does not exist, a status a slice has not earned, a
@@ -122,3 +122,7 @@ number is a regression rather than a different machine.
   reproducible from a committed manifest, and why only stable properties gate.
 - [ADR 0037](../adr/0037-recovery-qualification-harness.md) — why a scenario
   contract is committed before its driver.
+- [ADR 0040](../adr/0040-endurance-qualification-harness.md) — why the endurance
+  harness measures its own accumulators before it measures the gateway.
+- [ADR 0041](../adr/0041-qualification-packet-and-evidence-records.md) — the
+  packet and evidence-record schemas, and the ladder derived from them.
