@@ -323,7 +323,7 @@ impl Canonical for ProjectedModel<'_> {
         if let Some(neutral) = self.neutral {
             fields.push(("neutral".to_owned(), neutral.canonical()));
         }
-        CanonicalValue::Map(fields)
+        CanonicalValue::map(fields)
     }
 }
 
@@ -942,6 +942,30 @@ mod tests {
             projected.content_id().checksum(),
             "a projection names a view of a catalogue, not the catalogue"
         );
+    }
+
+    /// Every projected record is built in the order it encodes in, so a record
+    /// held in memory *equals* the same record read back out of storage rather
+    /// than merely checksumming the same — a consumer comparing a fresh
+    /// projection against a stored one would otherwise differ on field order
+    /// alone and have to fall back on comparing checksums.
+    #[test]
+    fn a_projected_record_equals_its_own_round_trip() {
+        let projected = content(CROSS_PROVIDER);
+        let projection = ModelProjection::project(&projected).expect("a projection");
+        let serializer = crate::desired_state::canonical::SerializerVersion::default();
+        for record in [
+            projection.models()[0].canonical(),
+            projection.callables()[0].canonical(),
+            projection.callables()[0].id().canonical(),
+        ] {
+            let bytes = record.to_canonical_bytes().expect("canonical bytes");
+            assert_eq!(
+                serializer.decode(&bytes).expect("decode"),
+                record,
+                "a record built here must be the record storage returns"
+            );
+        }
     }
 
     /// A rename is reported as a rename: the pair a caller has to act on, not a
