@@ -31,6 +31,11 @@ earlier revision remains loadable exactly as it was published.
 | `axond_cp_audit_event` | The audit trail, written in the publishing transaction |
 | `axond_cp_idempotency` | Per-caller retry records, which expire |
 | `axond_cp_head` | One row naming the desired revision |
+| `axond_cp_tenant` | Projected tenants: slug, lifecycle, and the revision that wrote the row |
+| `axond_cp_project` | Projected projects, owned by exactly one tenant |
+| `axond_cp_principal` | Projected principals: an OIDC `(issuer, subject)` human, or a workload and its key *digest* |
+| `axond_cp_principal_role` | The roles a principal holds |
+| `axond_cp_access_denial` | Administrative actions that were refused, with the reason |
 
 Two properties worth knowing before you plan capacity or retention:
 
@@ -40,6 +45,22 @@ Two properties worth knowing before you plan capacity or retention:
 - **Blobs are references, not payloads.** The journal stores kind, digest, and
   size. Payload bytes live in the blob store, and a revision is only usable when
   its digests resolve there.
+- **The last five tables are a projection, not a second source of truth.** The
+  published revision is what the gateway authorizes against; the transaction that
+  publishes it also writes these rows so the database can enforce ownership on its
+  own — a tenant-scoped row cannot name a tenant nothing declared, and a
+  principal cannot be scoped into another tenant's project. Migration 0002 also
+  adds row-level-security policies keyed on `axond.tenant_id`: a session that sets
+  it sees deployment-wide rows and that tenant's, and a session that does not set
+  it — the publisher — is unrestricted. Authorization decisions stay in the
+  service layer; the policies are defence in depth.
+- **Refusals are not revisions.** A denied administrative action publishes
+  nothing, so it is recorded in `axond_cp_access_denial` rather than in the audit
+  trail of a revision that does not exist. Denials are read per tenant, and the
+  caller is told only that the action was forbidden — the reason lives in the row.
+- **A lifecycle transition is an update.** Disabling or deleting a tenant changes
+  `axond_cp_tenant.lifecycle`; it never deletes the tenant, its projects, or its
+  history. Physical erasure is a separate compliance procedure.
 
 Secret material is never in the journal. A credential resource's body carries an
 opaque, exactly-versioned secret *reference* (`sct_…` plus a version) and the
@@ -154,6 +175,7 @@ own schema changes out of band:
 
 ```bash
 psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0001_initial.sql
+psql "$GW_CONTROL_PLANE_DSN" -f ops/postgres/control_plane_0002_tenancy_access.sql
 ```
 
 That path does not write the ledger row, so the journal is then reported as
