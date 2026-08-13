@@ -27,7 +27,7 @@ the manifest it names is a test failure.
 ## What the packet may not be read as
 
 - **Not a claim that Axond is production-qualified.** One of five slices has no
-  driver, one has a contract and no driver, two have no heavy run behind them,
+  driver at all, three have a driver with no retained heavy run behind them,
   and no slice has retained a run of a fleet. #156 stays open until every slice
   is `evidenced`; `closure.satisfied` in the packet is derived from the slices,
   so it cannot be set by hand.

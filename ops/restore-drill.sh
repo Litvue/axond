@@ -358,8 +358,17 @@ require "the_restored_head_checksum_matches" "$live_checksum" \
   "the state the restored journal hydrates is byte-identical to the backed-up state"
 
 # A restore that reads is half a restore: the journal has to accept the next
-# change against the head it came back with.
-after_restore="$(publish policies "${workdir}/policy.json" drill-after-restore "$live_head" || echo refused)"
+# change against the head it came back with. The document differs from the one
+# already published, so the probe measures writability rather than whatever the
+# journal decides to do with a candidate that changes nothing.
+cat >"${workdir}/policy-after-restore.json" <<EOF
+{"summary":"raise the cap after the restore","resource":{
+  "tenant":"${tenant}","slug":"drill-limits","epoch":2,
+  "subject_limit_microdollars":70000000,"namespace_limit_microdollars":700000000,
+  "reservation_ttl_seconds":300,"max_in_flight_per_subject":8,"lease_ttl_seconds":60}}
+EOF
+after_restore="$(publish policies "${workdir}/policy-after-restore.json" \
+  drill-after-restore "$live_head" || echo refused)"
 require "a_publication_against_the_restored_head_is_accepted" accepted \
   "$([[ "$after_restore" == refused ]] && echo refused || echo accepted)" \
   "the restored journal is writable, not just readable"

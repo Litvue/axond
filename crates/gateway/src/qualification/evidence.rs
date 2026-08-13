@@ -324,11 +324,16 @@ impl Recorder {
 
     /// Whether a check this stage recorded held — for the few places where the
     /// stage cannot carry on meaningfully once one has failed.
+    ///
+    /// A name nothing recorded did not hold: the names are free-form strings, so
+    /// a typo would otherwise read as a pass and carry the stage on.
     pub(crate) fn held(&self, check: &str) -> bool {
-        self.checks
+        let mut recorded = self
+            .checks
             .iter()
             .filter(|verdict| verdict.gate == check)
-            .all(|verdict| verdict.outcome != Outcome::Failed)
+            .peekable();
+        recorded.peek().is_some() && recorded.all(|verdict| verdict.outcome != Outcome::Failed)
     }
 
     pub(crate) fn finish(self) -> Artifact {
@@ -411,6 +416,10 @@ mod tests {
         recorder.require_that("the_publish_was_retryable", false, "it was not");
         assert!(recorder.held("active_revision_survived_the_cut"));
         assert!(!recorder.held("the_publish_was_retryable"));
+        assert!(
+            !recorder.held("a_check_nobody_recorded"),
+            "an unrecorded condition did not hold, so a mistyped name cannot read as a pass"
+        );
 
         let artifact = recorder.finish();
         let failures = artifact.failures();

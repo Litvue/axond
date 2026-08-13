@@ -80,7 +80,13 @@ def check(
         for secret in forbid
         if secret and secret in raw
     ]
-    artifact = json.loads(raw)
+    try:
+        artifact = json.loads(raw)
+    except json.JSONDecodeError as error:
+        # A stage killed part way through leaves a half-written file, which is
+        # exactly the case this checker exists to name rather than crash on.
+        problems.append(f"{key}: the artifact is not readable JSON ({error})")
+        return problems
 
     expected = {
         "schema_version": SCHEMA_VERSION,
@@ -142,7 +148,9 @@ def self_test() -> int:
         "outcome": "failed",
         "detail": "the restore landed on another head",
     }
-    cases: list[tuple[str, dict[str, Any] | None, list[str], bool]] = [
+    # A body given as a string is written verbatim, for the shapes that are not
+    # valid JSON in the first place.
+    cases: list[tuple[str, dict[str, Any] | str | None, list[str], bool]] = [
         ("a complete artifact", artifact(), [], True),
         ("a missing artifact", None, [], False),
         ("a future schema", {**artifact(), "schema_version": SCHEMA_VERSION + 1}, [], False),
@@ -156,6 +164,7 @@ def self_test() -> int:
         ("a failed check", {**artifact(), "checks": [failed]}, [], False),
         ("a failed gate", {**artifact(), "gates": [failed]}, [], False),
         ("an empty timeline", {**artifact(), "timeline": []}, [], False),
+        ("a truncated artifact", json.dumps(artifact())[:120], [], False),
         (
             "a leaked credential",
             {**artifact(), "observations": {"note": "the-drill-credential"}},
@@ -170,7 +179,8 @@ def self_test() -> int:
         for name, body, forbid, want_ok in cases:
             path.unlink(missing_ok=True)
             if body is not None:
-                path.write_text(json.dumps(body), encoding="utf-8")
+                raw = body if isinstance(body, str) else json.dumps(body)
+                path.write_text(raw, encoding="utf-8")
             problems = check(scenario, stage, Path(directory), runner, forbid)
             if bool(problems) == want_ok:
                 verb = "rejected" if problems else "accepted"
