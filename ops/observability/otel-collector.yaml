@@ -34,6 +34,13 @@ exporters:
     add_metric_suffixes: false
     resource_to_telemetry_conversion:
       enabled: false
+    # The default, stated because a rule depends on it:
+    # AxondStatusRefresherStalled detects a stalled refresher as the absence of
+    # axond_status_refreshes over ten minutes, and this is how long a series
+    # keeps being exported after its last sample. Above the rule's window the
+    # series never lapses and the rule silently stops firing, so the asset gate
+    # holds this below that window.
+    metric_expiration: 5m
 
 service:
   pipelines:

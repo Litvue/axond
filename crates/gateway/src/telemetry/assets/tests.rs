@@ -33,6 +33,7 @@ const DASHBOARDS: &[&str] = &[
 ];
 const RULES: &str = "ops/observability/alerts/axond-alerts.yml";
 const RUNBOOK: &str = "docs/operations/observability-runbook.md";
+const COLLECTOR: &str = "ops/observability/otel-collector.yaml";
 
 fn anchors() -> BTreeSet<String> {
     let anchors = runbook_anchors(&read(RUNBOOK));
@@ -83,6 +84,46 @@ fn every_documented_failure_mode_has_an_alert_and_every_alert_has_a_runbook() {
     let (failures, covered) = validate_rules(RULES, &read(RULES), &anchors);
     assert_eq!(failures, Vec::new());
     assert_eq!(uncovered_failure_modes(&anchors, &covered), Vec::new());
+}
+
+/// One shipped rule detects a stalled refresher as the *absence* of a series,
+/// and absence is the exporter's decision: the Prometheus exporter keeps
+/// exporting the last sample it saw for `metric_expiration`, so a gap only ever
+/// appears if that is shorter than the rule's lookback. The coupling is
+/// otherwise prose in two files that nothing reads together, and raising either
+/// number alone disables the rule *silently* — the failure mode it watches for
+/// is itself silence.
+#[test]
+fn the_shipped_pipeline_lets_the_stall_rule_see_a_gap() {
+    /// Minutes in a duration written as Prometheus and the collector both write
+    /// it. Anything else is a failure rather than a skip: an unparsed duration
+    /// is exactly the drift this checks for.
+    fn minutes(duration: &str, source: &str) -> u64 {
+        duration
+            .strip_suffix('m')
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("{source} states a duration in whole minutes: `{duration}`"))
+    }
+
+    let rules = read(RULES);
+    let lookback = rules
+        .split_once("absent_over_time(axond_status_refreshes[")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(window, _)| window)
+        .expect("AxondStatusRefresherStalled watches for the absence of the refresh counter");
+
+    let collector = read(COLLECTOR);
+    let expiration = collector
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("metric_expiration:"))
+        .map(str::trim)
+        .expect("the shipped pipeline states the expiration the rule depends on");
+
+    assert!(
+        minutes(expiration, COLLECTOR) < minutes(lookback, RULES),
+        "the exporter holds a series for {expiration} while the stall rule looks back {lookback}, \
+         so the series never lapses and the rule can never fire"
+    );
 }
 
 /// Cardinality, from the asset side: the only drill-downs offered are the four
