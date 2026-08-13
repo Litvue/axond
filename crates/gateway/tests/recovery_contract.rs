@@ -289,6 +289,13 @@ fn durable_inventory_owns_the_secret_catalogue_and_pricing_dependencies() {
     );
     assert_eq!(owners(146), expected(&["backup-restore/durable-inventory"]));
     assert_eq!(owners(147), expected(&["backup-restore/durable-inventory"]));
+    assert_eq!(
+        owners(158),
+        expected(&[
+            "cold-boot-no-cache/readiness",
+            "cold-boot-invalid-cache/readiness",
+        ])
+    );
 }
 
 /// A slice may leave the dependency map, but only by saying what became of it.
