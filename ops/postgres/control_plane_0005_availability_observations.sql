@@ -22,8 +22,10 @@
 -- than an optimisation: an availability record holds the look it is deciding on
 -- and the last look that found the target, so a discovery outage degrades to
 -- last-known-good instead of to a refusal. `slot` is which of those a row is,
--- and the primary key is what makes "one current look, one fallback" a database
--- fact rather than a hope.
+-- and the two partial unique indexes below are what make "one current look, one
+-- fallback" a database fact rather than a hope — partial rather than a primary
+-- key because a tenant-wide observation has no project and a key column cannot
+-- be null.
 --
 -- No provider detail is stored. A failed probe's `detail` can carry an upstream
 -- error body — a URL with a key in the query string, an account name, a quota
