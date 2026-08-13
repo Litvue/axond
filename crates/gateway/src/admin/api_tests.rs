@@ -1347,6 +1347,17 @@ async fn the_management_catalogue_reports_what_a_tenant_published() {
         view["pending"],
         json!(["offering-metadata", "availability"])
     );
+
+    let (status, filtered) = deployment
+        .get(&format!(
+            "/catalogue?tenant={}&state=enabled&wire_family=openai-chat&offering={}&billable=false",
+            fixtures::tenant_id(1),
+            fixtures::offering_id("gpt-4o")
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{filtered}");
+    assert_eq!(filtered["entries"].as_array().expect("entries").len(), 1);
+    assert_eq!(filtered["entries"][0]["slug"], "gpt-4o");
 }
 
 /// The scope is a request parameter, so it is checked against the grant like any
@@ -1398,12 +1409,26 @@ async fn a_catalogue_filter_this_build_cannot_read_is_refused() {
         format!("tenant={}&wire_family=telepathy", fixtures::tenant_id(1)),
         format!("tenant={}&offering=nonsense", fixtures::tenant_id(1)),
         format!("tenant={}&unknown=1", fixtures::tenant_id(1)),
+        format!(
+            "tenant={}&state=enabled&state=disabled",
+            fixtures::tenant_id(1)
+        ),
         "project=nothing".to_owned(),
     ] {
         let (status, body) = deployment.get(&format!("/catalogue?{query}")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
         assert_eq!(body["error"]["type"], "admin_request_invalid", "{query}");
     }
+
+    let oversized = format!(
+        "tenant={}&offering={}",
+        fixtures::tenant_id(1),
+        "x".repeat(super::handlers::CATALOGUE_MAX_QUERY_BYTES)
+    );
+    let (status, body) = deployment.get(&format!("/catalogue?{oversized}")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "admin_request_invalid");
+    assert!(!body.to_string().contains(&"x".repeat(64)));
 }
 
 // ---------------------------------------------------------------------------
