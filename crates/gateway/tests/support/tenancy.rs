@@ -298,8 +298,16 @@ fn config_toml(
         Durability::None => String::new(),
         Durability::Postgres {
             namespace_cap_microdollars,
-        } => format!(
-            r#"
+        } => {
+            // The per-subject cap is required by the config, but it must not be
+            // reachable: each tenant here has exactly one static subject, so a
+            // subject limit equal to the namespace one is exhausted at the same
+            // request, and a ledger keyed on the wrong one of the two would pass
+            // the isolation test anyway. Out of reach, the namespace cap is the
+            // only thing that can produce the 429 that test observes.
+            let subject_cap = namespace_cap_microdollars * 1_000;
+            format!(
+                r#"
 [[usage_sink]]
 kind = "postgres"
 dsn_env = "AXOND_ISOLATION_DSN"
@@ -310,13 +318,14 @@ flush_interval_ms = 50
 
 [budget]
 backend = "postgres"
-limit_microdollars = {namespace_cap_microdollars}
+limit_microdollars = {subject_cap}
 namespace_limit_microdollars = {namespace_cap_microdollars}
 dsn_env = "AXOND_ISOLATION_DSN"
 table = "{budget_table}"
 create_table = true
 "#
-        ),
+            )
+        }
     };
 
     format!(
