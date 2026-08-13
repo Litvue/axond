@@ -20,6 +20,7 @@
 //! | [`tenancy`] | the first two body schemas: what a tenant and a tenant-owned project are, who owns what, and where a tenant is in its life |
 //! | [`access`] | who may change it: the identity directory, the roles, and the authorization decision a mutation has to carry |
 //! | [`policy`] | the complete policy document of a tenant or a project, its generation, and how a change to it may be activated |
+//! | [`models`] | what a tenant may use and what a project calls it: typed model enablements and project-scoped aliases |
 //!
 //! # Three properties everything else rests on
 //!
@@ -45,9 +46,9 @@
 //!
 //! It is not wired into the request path. The runtime remains stateless: nothing
 //! here is constructed by `serve`, and no snapshot is compiled from a revision
-//! yet. It is also not a complete body model: [`tenancy`], [`access`], and
-//! [`policy`] are the only schemas the domain reads, and provider, catalogue, and
-//! pricing bodies remain owned by their own slices — [`access::Surface`] names
+//! yet. It is also not a complete body model: [`tenancy`], [`access`], [`policy`],
+//! and [`models`] are the only schemas the domain reads, and provider, catalogue,
+//! and pricing bodies remain owned by their own slices — [`access::Surface`] names
 //! those surfaces so they can be authorized against, which is not the same as
 //! authoring them. A policy document is a contract rather than an activation:
 //! nothing enforces one, and [`PolicyTransition`] states what enforcing a change
@@ -66,6 +67,7 @@ pub mod access;
 pub mod canonical;
 pub mod credentials;
 pub mod ids;
+pub mod models;
 pub mod mutation;
 pub mod policy;
 pub mod resource;
@@ -102,6 +104,13 @@ pub use credentials::{
 pub use ids::{
     AuditEventId, InvalidId, InvalidSlug, InvalidUuid7, MutationId, PrincipalId, ProjectId,
     ResourceId, RevisionId, SecretId, Slug, TenantId, Uuid7, Uuid7Generator,
+};
+#[allow(unused_imports)]
+pub use models::{
+    AliasTarget, ApprovedPrice, CatalogOffering, ForbiddenModelTransition, InvalidOfferingId,
+    LifecycleChange, MODEL_ALIAS_SCHEMA, MODEL_ENABLEMENT_SCHEMA, ModelAlias, ModelAliasBody,
+    ModelEnablement, ModelEnablementBody, ModelError, ModelInvariant, ModelLifecycle, ModelOwner,
+    Models, ObservedPrice, OfferingId, WireFamily,
 };
 #[allow(unused_imports)]
 pub use mutation::{
