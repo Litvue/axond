@@ -80,6 +80,10 @@ reference="${image}:${version}"
 # the registry's own descriptor digest for it are read here: hashing the body
 # locally would depend on how the tool and this shell handled trailing bytes,
 # and `ops/publish-image-index.sh` already takes the descriptor as the truth.
+command -v jq >/dev/null 2>&1 || {
+  echo "need jq to read the registry's manifest for ${reference}" >&2
+  exit 1
+}
 if command -v docker >/dev/null 2>&1 && docker buildx version >/dev/null 2>&1; then
   raw="$(docker buildx imagetools inspect --raw "$reference")"
   digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$reference" | jq -r '.digest // empty')"

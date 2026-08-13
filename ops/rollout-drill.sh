@@ -107,8 +107,17 @@ render "$overlay" |
 grep -q "image: ${image}$" "${workdir}/rendered.yaml" ||
   fail "the overlay's image is not the digest sentinel any more; update this drill"
 kube apply -f "${workdir}/rendered.yaml" >/dev/null
-kube -n axond rollout status deployment/axond --timeout=240s ||
-  fail "the initial rollout did not converge"
+# The whole overlay is applied, NetworkPolicies included, so the drill deploys
+# what an operator would rather than a subset. kindnet does not implement
+# NetworkPolicy, so they are inert here — a CNI that enforced them and did not
+# exempt kubelet probe traffic would fail readiness rather than scheduling, which
+# is why that is called out below instead of being read as a spread failure.
+kube -n axond rollout status deployment/axond --timeout=240s || {
+  kube -n axond get pods -o wide >&2 || true
+  fail "the initial rollout did not converge; if the Pods are Running but never Ready,
+this cluster's CNI enforces the overlay's default-deny NetworkPolicy against
+kubelet probes and needs its node CIDR allowed (see the policy's own comment)"
+}
 
 nodes="$(kube -n axond get pods -o jsonpath='{.items[*].spec.nodeName}' | tr ' ' '\n' |
   sort -u | wc -l)"

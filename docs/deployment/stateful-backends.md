@@ -162,7 +162,7 @@ Use `sslmode=require` in production DSNs. Axond uses rustls and webpki roots.
 
 | Backend | Supported | Exercised in CI | Floor is enforced by |
 | --- | --- | --- | --- |
-| PostgreSQL | 14, 15, 16, 17 | `postgres:17.6-alpine` | The gateway: boot and `axond check preflight` read `server_version_num` and refuse an older server. |
+| PostgreSQL | 14, 15, 16, 17 | `postgres:17.6-alpine` | The control-plane backend: boot and `axond check preflight` read `server_version_num` and refuse an older server. A usage sink, budget backend, or revocation table on Postgres is not version-checked. |
 | Redis | 6.2, 7.x, 8.x | `redis:7.4.2-alpine` | Nothing at boot; an older server fails the first enforcement write instead. |
 
 The floors are the oldest servers the shipped statements can run on, not a
@@ -173,6 +173,13 @@ the revocation liveness write uses; on 6.0 that write is a command error, so a
 revocation backend on an older Redis fails closed at the first probe rather than
 silently. `ops/check-deploy-manifests.py` keeps this table, the enforced
 PostgreSQL floor, and the CI service images from drifting apart.
+
+The version refusal is the control plane's alone, because that is the only store
+whose schema axond owns and migrates. The other Postgres-backed features run DDL
+from the same supported range but read no `server_version_num`, so on an older
+server they fail their statements rather than their connection — Redis's outcome,
+one step later. A deployment that uses them without the control plane is on a
+documented floor, not an enforced one, and should check the server itself.
 
 Newer majors than the exercised ones are supported in the sense that nothing
 refuses them, and are not tested here; a deployment on one is on its own
