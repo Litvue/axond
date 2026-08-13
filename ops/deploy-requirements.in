@@ -1,0 +1,5 @@
+# The one dependency of `ops/check-deploy-manifests.py`: it reads what Kustomize
+# renders, and a hand-rolled parser of a subset of YAML would make the gate's
+# claims depend on how much of the language it happened to implement.
+# Regenerate with `just deploy-lock`.
+pyyaml

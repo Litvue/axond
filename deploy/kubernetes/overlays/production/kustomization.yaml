@@ -1,0 +1,34 @@
+# The production overlay of `../../base`. Everything here is a production
+# posture the base deliberately leaves open: an image pinned by digest rather
+# than by tag, spreading across failure domains, a default-deny NetworkPolicy, a
+# disruption budget that keeps two replicas serving, and an endpoint-removal
+# window in front of the process drain.
+#
+# `kustomize build` renders this overlay as committed, but it is not applyable as
+# committed: the image digest is the all-zero sentinel below. Resolve it first —
+# `ops/pin-image-digest.sh` writes the digest of the released index, and
+# `ops/pin-image-digest.sh --check` fails while the sentinel is still in place,
+# so a rollout gate refuses this overlay rather than deploying a placeholder.
+#
+# Optional autoscaling is a component, not a default: append
+# `../../components/autoscaling` to `components` below once a measured
+# concurrency or request metric exists to scale on. See
+# `docs/deployment/kubernetes.md#production-overlay`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - networkpolicy.yaml
+components: []
+# Pinned by digest, never by tag: a tag can be moved to different bytes after a
+# review, and a digest names one image index. The index covers linux/amd64 and
+# linux/arm64, so one digest still schedules onto either architecture.
+images:
+  - name: ghcr.io/litvue/axond
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+patches:
+  - path: deployment.yaml
+  - path: pdb.yaml
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: axond

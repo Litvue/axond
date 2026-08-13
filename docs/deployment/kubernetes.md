@@ -34,6 +34,88 @@ curl --fail \
   http://127.0.0.1:8080/v1/models
 ```
 
+## Production overlay
+
+`deploy/kubernetes/base` is deliberately minimal: it is what you apply to
+evaluate axond in a cluster. `deploy/kubernetes/overlays/production` is the base
+plus the posture a production fleet needs, and nothing that is only useful for
+evaluation:
+
+- the image pinned by digest instead of by tag, and by an unresolvable sentinel
+  digest until you resolve it (below);
+- three replicas with `minAvailable: 2`, so exactly one voluntary disruption —
+  a node drain, a cluster upgrade, a descheduler — proceeds at a time and the
+  rolling update's `maxUnavailable: 0` stays honest;
+- topology spread across nodes (`DoNotSchedule`) and zones (`ScheduleAnyway`),
+  because a zone that cannot hold the fleet should cost you spread, not
+  scheduling;
+- two NetworkPolicies: a default-deny for both directions, and an allow-list
+  for ingress from the ingress controller, DNS, egress to public HTTPS with the
+  link-local and private ranges excluded, and commented rules for Postgres,
+  Redis, and an OpenTelemetry collector;
+- requests raised to `500m`/`512Mi` with memory request equal to limit, so the
+  Pod is Guaranteed for memory and cannot be evicted under node pressure while
+  holding buffered request bodies;
+- a five-second `preStop` sleep, with `terminationGracePeriodSeconds: 45`
+  covering it plus the process's own 25-second shutdown budget (see
+  [Rollouts and termination](#rollouts-and-termination)).
+
+```bash
+digest="$(ops/pin-image-digest.sh --print 0.3.21)"
+SIGNER_IDENTITY=... ops/verify-image-evidence.sh "ghcr.io/litvue/axond@${digest}"
+ops/pin-image-digest.sh 0.3.21
+kubectl apply -k deploy/kubernetes/overlays/production
+kubectl -n axond rollout status deployment/axond
+```
+
+### Resolving the image digest
+
+The committed overlay pins an all-zero digest, which no registry can serve. That
+is the intended state of the file in the repository: a tag can be repointed at
+different bytes after the review that approved it, and a real digest committed
+here is stale by the next release. So the digest is resolved at deploy time from
+the release you verified:
+
+```bash
+ops/pin-image-digest.sh --check          # fails while the sentinel is unresolved
+ops/pin-image-digest.sh --print 0.3.21   # print the index digest only
+ops/pin-image-digest.sh 0.3.21           # rewrite the overlay's digest
+```
+
+Resolution insists on the multi-architecture index, so a digest naming one
+architecture's child image — schedulable onto that architecture alone — is
+refused rather than pinned. The script resolves a reference and makes no claim
+about its evidence; run `ops/verify-image-evidence.sh` on the digest for the
+signature, SBOM, and provenance chain (see
+[releasing](../maintainers/releasing.md)).
+
+Run `ops/pin-image-digest.sh --check` in the job that applies the overlay. It is
+the check that separates "digest not yet resolved" from a rollout that pulls a
+placeholder.
+
+### Optional autoscaling
+
+`deploy/kubernetes/components/autoscaling` is a Kustomize component, not part of
+the overlay, because an HPA is a claim that request load and CPU move together
+for your traffic — measure that before adopting it. Append it to your own
+overlay:
+
+```yaml
+components:
+  - ../../components/autoscaling
+```
+
+It adds an HPA at 60% CPU utilization between 3 and 12 replicas, and removes
+`spec.replicas` from the Deployment so an apply does not fight the autoscaler for
+the field. `minReplicas` stays at the disruption budget's floor plus one. Scale-up
+doubles per minute; scale-down gives up one Pod every two minutes after ten
+minutes of stability, because a scale-down is a drain and each one spends the
+termination budget above.
+
+Autoscaling on CPU does not make `[admission]` ceilings fleet-wide — read
+[Scaling](#scaling) before enabling it, and treat
+`axond.admission.rejections` as the saturation signal that CPU may not show.
+
 ## Configuration and secrets
 
 The stable `axond-config` ConfigMap name and `[reload] watch = true` allow a
