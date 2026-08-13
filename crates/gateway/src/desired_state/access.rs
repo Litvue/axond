@@ -56,10 +56,10 @@ use ring::rand::{SecureRandom, SystemRandom};
 use super::canonical::{Canonical, CanonicalValue, Checksum};
 use super::ids::{AuditEventId, MutationId, PrincipalId, ProjectId, ResourceId, Slug, TenantId};
 use super::mutation::{Actor, AuditEvent, IdempotencyKey, Mutation, MutationKind};
+use super::record::{DISPLAY_NAME_FIELD, Record, SCHEMA_FIELD};
 use super::resource::{
     ResourceBody, ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber,
 };
-use super::record::{DISPLAY_NAME_FIELD, Record, SCHEMA_FIELD};
 use super::revision::DesiredState;
 use super::tenancy::{DisplayName, Tenancy, TenancyError};
 use crate::principals::constant_time_eq;
