@@ -1,4 +1,4 @@
-# 53. Request-path pricing: which rate a request is charged at, and what says so
+# 54. Request-path pricing: which rate a request is charged at, and what says so
 
 Date: 2026-08-13
 

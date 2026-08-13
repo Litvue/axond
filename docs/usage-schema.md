@@ -84,7 +84,7 @@ omitted when absent), and the OTLP sink emits it as an OTel log record with
   are nullable, and `catalog_version` keeps its type and its `0` for a row
   priced by configuration, which is what every row before this change was. A
   reader that groups by pricing treats `price_book IS NULL` as "configured
-  rates" ([ADR 0053](./adr/0053-request-path-pricing.md)).
+  rates" ([ADR 0054](./adr/0054-request-path-pricing.md)).
 - A price change is never retroactive. A new publication is a new price-book
   version written into new rows; settled rows are never rewritten, so what a
   request was charged stays answerable from the row that recorded it.
