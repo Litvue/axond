@@ -128,7 +128,12 @@ rather than taste:
   would stop an existing revision from hydrating on upgrade. Such a row is
   neither validated nor refused by these rules, which
   [revision convergence](../operations/revision-convergence.md#resource-body-schemas)
-  states as the one exception to the untyped-body rule.
+  states as the one exception to the untyped-body rule. The skip is a property of
+  reading a revision, so it applies wherever a revision is read — hydration and
+  publication alike. That is wider than the upgrade it exists for: the admin slice
+  that authors these bodies should refuse to *write* an untyped alias even though
+  reading one is tolerated, so the accommodation stays limited to rows that
+  already exist.
 - An **enablement** body with no `schema` field is refused as `incompatible`. No
   release ever wrote one, so there is no upgrade to accommodate, and skipping it
   would be an entitlement hole rather than a compatibility allowance: a row

@@ -1858,6 +1858,12 @@ impl Models {
 /// anything to resolve through. The rules above constrain what an alias *grants*,
 /// so a row that grants nothing needs none of them — where an *enablement* is
 /// itself the grant, which is why an untyped one is refused.
+///
+/// This is consulted wherever a revision is *read*, so it holds at publication as
+/// well as at hydration, which is wider than the upgrade it exists for. Refusing
+/// to *author* an untyped alias belongs to the slice that writes these bodies, so
+/// that the accommodation stays limited to rows already in the journal; see
+/// ADR 0040.
 fn predates_this_slice(resource: &ResourceVersion) -> bool {
     let ResourceBody::Inline(CanonicalValue::Map(fields)) = &resource.body else {
         return true;
