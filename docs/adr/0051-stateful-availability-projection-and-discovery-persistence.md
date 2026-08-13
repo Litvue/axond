@@ -1,4 +1,4 @@
-# 50. Stateful availability projection and discovery persistence
+# 51. Stateful availability projection and discovery persistence
 
 Date: 2026-08-12
 
@@ -98,13 +98,36 @@ reassembled per record and declared through the retention path, so a stored
 positive older than a conclusion the index has already reached is discredited
 rather than resurrecting a target a complete listing dropped, and a row naming
 another scope is refused and counted. A save replaces every row of the keys it
-mentions rather than upserting, so a retained look a later conclusion discredited
-stops existing durably.
+names rather than upserting, so a retained look a later conclusion discredited
+stops existing durably. A write therefore carries two halves — the looks held and
+the keys held *none* for — because a record whose looks were all discredited emits
+no row, and a row set alone cannot say that a key stopped having evidence.
 
 **Both halves are off the request path.** Evidence is loaded once at boot and
 written by whatever takes the looks; the projection runs inside compilation,
 which already resolves secrets and is the one place durable material enters the
 process. Inference reads neither.
+
+**Evidence reaches a reader without waiting for a publication.** Convergence
+compiles only when desired state changes, so a deployment that publishes nothing
+for a day would otherwise hold every look it took that day queued and invisible.
+A re-projection folds the queue into the revision already derived — no desired
+state is re-read and nothing is re-validated — and answers nothing at all before
+the first derivation, because dimensions no revision stated are not dimensions.
+
+**A reload keeps the looks and restates the verdicts.** A config file can change
+the providers and credentials a verdict stood on, so carrying the verdicts across
+a `SIGHUP` would let an edit keep serving a permit the new file never granted;
+dropping the index whole would make a reload the one way a replica forgets what
+it saw. The reloader carries the evidence under fail-closed dimensions and lets
+the next compilation restate them.
+
+**An administrative read reports the phase the next request would find.** The
+breaker stores the phase the last request left behind, so a target whose cooldown
+has elapsed still reads `open` until something attempts it — reporting that as
+`unavailable` would describe a target the replica would in fact probe. The
+cooldown is applied to the answer instead of to the breaker: reading moves
+nothing, and an operator looking at a target cannot spend its probe.
 
 **The read is scoped, redacted, and answered from memory.**
 `GET /admin/v1/availability?tenant=&project=` requires a `read_availability`
@@ -146,12 +169,23 @@ Postgres, or `SecretStore` read on an inference request.
   positive would come back and resurrect the target the listing removed.
 - **Upsert rows instead of replacing a key's set.** Leaves a discredited retained
   positive in the database for the next failed refresh to rest on.
+- **Let a read move a breaker past its elapsed cooldown.** It would make the
+  administrative surface a participant in request-path state, and an operator's
+  refresh would spend the probe a real request should have taken.
+- **Carry the derived dimensions across a config reload.** The cheapest way for a
+  removed credential to keep serving a target: the file that removed it is exactly
+  the file the verdicts were not derived against.
 
 ## Not decided here
 
 - No provider is polled and no probe is written: what *takes* a look, on what
   schedule, and with what budget is a separate slice, and a generation probe that
-  costs money is not enabled by default.
+  costs money is not enabled by default. That slice owns the only two callers this
+  one leaves unwired — the boot restore and the durable write — so in a shipped
+  binary the observations table stays empty and every target reads `unknown` until
+  something looks. The seams it plugs into are fixed here and covered by
+  DB-backed tests: `restore`, `reproject`, and a write that names both the looks
+  held and the keys cleared.
 - Admission and `/v1/models` are unchanged. Wiring availability into what a
   request may do fires the catalogue and model-entitlement trigger of the
   [security review checklist](../security/threat-model-review.md) again.

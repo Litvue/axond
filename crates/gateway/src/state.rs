@@ -586,15 +586,15 @@ impl ConfigSnapshot {
     /// nothing relevant changed — and either way the choice is visible at the call
     /// site.
     ///
-    /// The file reloader ([`crate::reload`]) makes neither choice today, so a
-    /// watched reload publishes a snapshot deriving nothing and an availability
-    /// read answers `deriving: false` until the next revision is compiled. That is
-    /// reachable only once something constructs an index in a shipped binary, which
-    /// is the discovery slice's own wiring: whichever side takes the looks owns
-    /// deciding whether a config change invalidates them, and the reloader cannot
-    /// answer that for it.
+    /// The file reloader ([`crate::reload`]) makes the second choice, narrowed:
+    /// it carries the outgoing looks under
+    /// [`AvailabilityIndex::carrying_evidence_only`] and lets the next
+    /// compilation restate every dimension. A reload can change the providers and
+    /// credentials a verdict was derived against, so keeping the verdicts would
+    /// let an edit keep serving a permit the new file never granted; dropping the
+    /// index whole would make a `SIGHUP` the one way this replica forgets a look
+    /// it took.
     #[must_use]
-    #[allow(dead_code)]
     pub fn with_availability(mut self, availability: Arc<AvailabilityIndex>) -> Self {
         self.availability = Some(availability);
         self
@@ -828,11 +828,17 @@ impl AppState {
 /// circuits that snapshot's own requests have been tripping. Loaded once, so an
 /// answer cannot describe one revision's targets with another revision's
 /// circuits.
+///
+/// The health is [`CircuitBreaker::observed`] rather than
+/// [`CircuitBreaker::snapshot`]: the question this read answers is what the
+/// replica would do with the next request, so a target whose cooldown has
+/// elapsed reports as impaired rather than as refused. Reading still moves
+/// nothing — an operator looking at a target cannot spend its probe.
 impl AvailabilityReader for AppState {
     fn read(&self) -> Option<(Arc<AvailabilityIndex>, RuntimeObservations)> {
         let snapshot = self.config();
         let index = snapshot.availability_handle()?;
-        let runtime = RuntimeObservations::of_circuits(snapshot.target_circuits.snapshot());
+        let runtime = RuntimeObservations::of_circuits(snapshot.target_circuits.observed());
         Some((index, runtime))
     }
 }

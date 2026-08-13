@@ -726,13 +726,17 @@ fn evidence_written_down_and_read_back_is_the_evidence_that_was_held() {
         .expect("the revision projects again");
 
     let written = evidence.persistable();
-    assert_eq!(written.len(), 2, "both slots are written down");
+    assert_eq!(written.rows().len(), 2, "both slots are written down");
     assert!(
-        written.iter().all(|row| row.observation.detail.is_none()),
+        written
+            .rows()
+            .iter()
+            .all(|row| row.observation.detail.is_none()),
         "a probe's own words do not cross the storage boundary"
     );
     assert_eq!(
         written
+            .rows()
             .iter()
             .map(|row| row.slot)
             .collect::<Vec<ObservationSlot>>(),
@@ -743,7 +747,7 @@ fn evidence_written_down_and_read_back_is_the_evidence_that_was_held() {
     // revision over it, and reaches the verdict the first one held.
     let restarted = AvailabilityEvidence::new(catalogue());
     assert_eq!(
-        restarted.restore(written),
+        restarted.restore(written.rows().to_vec()),
         0,
         "stored order is not disorder"
     );
@@ -781,7 +785,7 @@ fn restored_evidence_does_not_restore_the_authority_a_revision_withdrew() {
     let written = evidence.persistable();
 
     let restarted = AvailabilityEvidence::new(catalogue());
-    restarted.restore(written);
+    restarted.restore(written.rows().to_vec());
     // Restored, but not yet derived: the dimensions are the fail-closed
     // defaults, and a verdict read now refuses rather than reporting the
     // remembered positive.
@@ -825,7 +829,7 @@ fn restoring_a_stale_positive_cannot_resurrect_a_target_a_listing_dropped() {
         earlier
             .derive(&deployment.state, &resolved(40))
             .expect("the revision projects");
-        earlier.persistable()
+        earlier.persistable().rows().to_vec()
     };
 
     let running = AvailabilityEvidence::new(catalogue());
@@ -883,4 +887,93 @@ fn restoring_refuses_a_row_whose_evidence_names_another_scope() {
     assert!(record.discovery.is_none());
     assert!(record.last_known_good.is_none());
     assert_eq!(record.definitive_at, None);
+}
+
+/// The overlay finds this replica's own trouble only if it looks the target up
+/// under the string the request path files a circuit under. Both sides build
+/// that string with `FailoverTarget::qualified_model`, and this is what fails if
+/// either stops.
+#[test]
+fn a_targets_circuit_key_is_the_one_the_request_path_writes() {
+    let routed = crate::config::Target {
+        provider: PROVIDER.to_owned(),
+        model: MODEL.to_owned(),
+        price: gateway_core::ModelPrice {
+            input_microdollars_per_million: 1,
+            output_microdollars_per_million: 1,
+            reasoning_microdollars_per_million: None,
+            cache_read_microdollars_per_million: None,
+            cache_write_microdollars_per_million: None,
+        },
+    };
+    let written = crate::routes::target_key(&routed);
+    assert_eq!(written, RuntimeObservations::circuit_key(&target()));
+
+    // And read back through the overlay, so the agreement is exercised rather
+    // than only asserted: a tripped circuit lowers the verdict for the target
+    // whose key the request path wrote.
+    let deployment = Deployment::new().entitled().governed();
+    let evidence = AvailabilityEvidence::new(catalogue());
+    evidence.observe(DiscoveryObservation::new(
+        deployment.scope(),
+        target(),
+        DiscoveryResult::Present,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        at(90),
+    ));
+    let projected = evidence
+        .derive(&deployment.state, &resolved(40))
+        .expect("the revision projects");
+    let runtime = RuntimeObservations::of_circuits([(written, CircuitState::Open)]);
+    let verdict =
+        AvailabilityView::new(projected.index(), &runtime).evaluate(&deployment.key(), at(100));
+    assert_eq!(verdict.state, AvailabilityState::Unavailable);
+    assert_eq!(verdict.decided_by, DecidedBy::Runtime);
+}
+
+/// Convergence compiles only when desired state changes, so a deployment that
+/// publishes nothing all day must still be able to act on what it looked at. A
+/// re-projection folds the queue into the revision already derived — and answers
+/// nothing at all before there is one.
+#[test]
+fn a_look_taken_between_revisions_reaches_a_served_index() {
+    let deployment = Deployment::new().entitled().governed();
+    let evidence = AvailabilityEvidence::new(catalogue());
+
+    assert!(
+        evidence.reproject().is_none(),
+        "there is no revision to fold a look into yet"
+    );
+
+    evidence
+        .derive(&deployment.state, &resolved(40))
+        .expect("the revision projects");
+    assert_eq!(
+        evidence.index().evaluate(&deployment.key(), at(100)).reason,
+        AvailabilityReason::NoEvidence
+    );
+
+    // The discovery loop looks, and nothing publishes a revision afterwards.
+    evidence.observe(DiscoveryObservation::new(
+        deployment.scope(),
+        target(),
+        DiscoveryResult::Present,
+        DiscoveryCompleteness::Complete,
+        DiscoverySource::ProviderListing,
+        at(110),
+    ));
+    let projected = evidence
+        .reproject()
+        .expect("the revision it derived is still the one to fold into")
+        .expect("the same revision projects again");
+
+    let verdict = verdict(&projected, &deployment.key(), 120);
+    assert_eq!(verdict.state, AvailabilityState::Available);
+    assert_eq!(verdict.decided_by, DecidedBy::Discovery);
+    assert_eq!(
+        evidence.index().evaluate(&deployment.key(), at(120)).state,
+        AvailabilityState::Available,
+        "and the replica holds it, so the next snapshot carries it"
+    );
 }

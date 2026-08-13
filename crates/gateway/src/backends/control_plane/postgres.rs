@@ -45,7 +45,7 @@ use super::rows;
 use super::schema::{self, Baseline, MINIMUM_SERVER_VERSION_NUM, SchemaStatus};
 use super::{ControlPlaneError, ControlPlaneStore, StatusProbeAdmission};
 use crate::availability::store::{
-    self as availability_store, ObservationSlot, ObservationStore, StoredObservation,
+    self as availability_store, EvidenceWrite, ObservationSlot, ObservationStore, StoredObservation,
 };
 use crate::availability::{AvailabilityKey, DiscoveryObservation, ScopeRef, TargetRef};
 use crate::backends::{Capabilities, Capability};
@@ -1080,23 +1080,26 @@ impl ObservationStore for PostgresControlPlane {
         .await
     }
 
-    async fn save(&self, rows: &[StoredObservation]) -> Result<(), ControlPlaneError> {
-        if rows.is_empty() {
+    async fn save(&self, write: &EvidenceWrite) -> Result<(), ControlPlaneError> {
+        if write.is_empty() {
             return Ok(());
         }
-        let rows = rows.to_vec();
+        let rows = write.rows().to_vec();
+        let cleared = write.cleared().to_vec();
         self.run(None, move |client| {
             Box::pin(async move {
                 let transaction = client
                     .transaction()
                     .await
                     .map_err(|error| unavailable("begin an observation write", &error))?;
-                // Every key the caller mentions is replaced wholesale. An upsert
-                // alone would leave behind a retained look a later definitive
-                // conclusion discredited, and the next restart would believe it.
+                // Every key the write names is replaced wholesale, cleared keys
+                // included. An upsert alone would leave behind a retained look a
+                // later definitive conclusion discredited, and the next restart
+                // would believe it; a key whose looks were all discredited emits
+                // no row, so it is only reachable through the cleared half.
                 let mut replaced: BTreeSet<AvailabilityKey> = BTreeSet::new();
-                for row in &rows {
-                    if !replaced.insert(row.key.clone()) {
+                for key in rows.iter().map(|row| &row.key).chain(cleared.iter()) {
+                    if !replaced.insert(key.clone()) {
                         continue;
                     }
                     transaction
@@ -1105,10 +1108,10 @@ impl ObservationStore for PostgresControlPlane {
                              WHERE tenant_id = $1 AND project_id IS NOT DISTINCT FROM $2 \
                              AND provider = $3 AND model = $4",
                             &[
-                                &row.key.scope.tenant.to_string(),
-                                &row.key.scope.project.map(|project| project.to_string()),
-                                &row.key.target.provider.as_str(),
-                                &row.key.target.model.as_str(),
+                                &key.scope.tenant.to_string(),
+                                &key.scope.project.map(|project| project.to_string()),
+                                &key.target.provider.as_str(),
+                                &key.target.model.as_str(),
                             ],
                         )
                         .await
@@ -2204,6 +2207,7 @@ mod tests {
     use super::super::hydration::HydrationLimit;
     use super::*;
     use crate::availability::discovery::{DiscoveryCompleteness, DiscoveryResult, DiscoverySource};
+    use crate::availability::{AvailabilityIndex, AvailabilityRecord};
     use crate::backends::{BackendFailure, FailureCategory};
     use crate::desired_state::fixtures::{
         DESIRED_STATE_RESOURCES, candidate, human, principal_id, project, project_alias,
@@ -5771,7 +5775,7 @@ mod tests {
         )
         .expiring_at(instant(900));
         store
-            .save(&[
+            .save(&EvidenceWrite::of_rows(vec![
                 StoredObservation {
                     key: key.clone(),
                     slot: ObservationSlot::Current,
@@ -5784,7 +5788,7 @@ mod tests {
                     observation: retained.clone(),
                     definitive_at: Some(instant(100)),
                 },
-            ])
+            ]))
             .await
             .expect("evidence is written");
 
@@ -5845,12 +5849,12 @@ mod tests {
         )
         .expiring_at(taken + Duration::from_secs(600));
         store
-            .save(&[StoredObservation {
+            .save(&EvidenceWrite::of_rows(vec![StoredObservation {
                 key,
                 slot: ObservationSlot::Current,
                 observation: observation.clone(),
                 definitive_at: Some(observation.observed_at),
-            }])
+            }]))
             .await
             .expect("evidence is written");
 
@@ -5884,7 +5888,7 @@ mod tests {
             instant(100),
         );
         store
-            .save(&[
+            .save(&EvidenceWrite::of_rows(vec![
                 StoredObservation {
                     key: key.clone(),
                     slot: ObservationSlot::Current,
@@ -5897,7 +5901,7 @@ mod tests {
                     observation: positive,
                     definitive_at: Some(instant(100)),
                 },
-            ])
+            ]))
             .await
             .expect("write");
 
@@ -5908,12 +5912,12 @@ mod tests {
             instant(300),
         );
         store
-            .save(&[StoredObservation {
+            .save(&EvidenceWrite::of_rows(vec![StoredObservation {
                 key: key.clone(),
                 slot: ObservationSlot::Current,
                 observation: dropped.clone(),
                 definitive_at: Some(instant(300)),
-            }])
+            }]))
             .await
             .expect("write the conclusion");
 
@@ -5922,6 +5926,58 @@ mod tests {
         assert_eq!(read[0].slot, ObservationSlot::Current);
         assert!(read[0].observation.is_same_look(&dropped));
         assert_eq!(read[0].definitive_at, Some(instant(300)));
+    }
+
+    /// A key that stopped holding evidence carries no row to replace, so it is
+    /// named as cleared: otherwise the one case where stored evidence must
+    /// disappear is the one case a write cannot express, and every restart would
+    /// restore the look a listing removed.
+    #[tokio::test]
+    async fn a_key_that_holds_no_evidence_holds_none_in_storage_either() {
+        let Some((store, _dsn, _schema)) = journal().await else {
+            return;
+        };
+        store
+            .publish_revision(candidate(ExpectedRevision::Empty, "state", state()))
+            .await
+            .expect("a tenant exists to own evidence");
+
+        let scope = ScopeRef::tenant(tenant_id(1));
+        let key = AvailabilityKey::new(scope, observation_target());
+        store
+            .save(&EvidenceWrite::of_rows(vec![StoredObservation {
+                key: key.clone(),
+                slot: ObservationSlot::Current,
+                observation: look(
+                    scope,
+                    DiscoveryResult::Present,
+                    DiscoveryCompleteness::Complete,
+                    instant(100),
+                ),
+                definitive_at: Some(instant(100)),
+            }]))
+            .await
+            .expect("evidence is written");
+
+        store
+            .save(&EvidenceWrite::default().clearing([key.clone()]))
+            .await
+            .expect("the key is cleared");
+
+        assert!(
+            store.load(None).await.expect("read").is_empty(),
+            "a cleared key does not survive the process that cleared it"
+        );
+
+        // And an index that describes the key without holding a look asks for the
+        // same thing, so the writer does not have to remember which keys emptied.
+        let write = EvidenceWrite::of_index(
+            &AvailabilityIndex::builder()
+                .record(key.clone(), AvailabilityRecord::enabled())
+                .build(),
+        );
+        assert!(write.rows().is_empty());
+        assert_eq!(write.cleared(), &[key]);
     }
 
     /// Availability is entitlement, and entitlement is a tenant's: which models
@@ -5944,7 +6000,7 @@ mod tests {
         for tenant in [tenant_id(1), tenant_id(11)] {
             let scope = ScopeRef::tenant(tenant);
             store
-                .save(&[StoredObservation {
+                .save(&EvidenceWrite::of_rows(vec![StoredObservation {
                     key: AvailabilityKey::new(scope, observation_target()),
                     slot: ObservationSlot::Current,
                     observation: look(
@@ -5954,7 +6010,7 @@ mod tests {
                         instant(100),
                     ),
                     definitive_at: Some(instant(100)),
-                }])
+                }]))
                 .await
                 .expect("write");
         }

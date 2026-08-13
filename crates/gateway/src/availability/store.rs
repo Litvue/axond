@@ -108,6 +108,71 @@ impl StoredObservation {
     }
 }
 
+/// One write of a replica's evidence: the looks it holds, and the keys it holds
+/// none for.
+///
+/// Both halves, because a row set alone cannot say that a key *stopped* having
+/// evidence. A record whose looks were all discredited emits no row, and a write
+/// that only replaced the keys it mentions would leave the discredited rows in
+/// place for the next restart to believe — the evidence a complete listing
+/// removed would come back every time the process did.
+///
+/// [`of_index`](Self::of_index) derives both from one index, so the answer to
+/// "which keys were cleared" is a fact of the index rather than bookkeeping a
+/// caller has to keep: a key the replica knows about and holds no look for must
+/// not have a stored look.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvidenceWrite {
+    rows: Vec<StoredObservation>,
+    cleared: Vec<AvailabilityKey>,
+}
+
+impl EvidenceWrite {
+    /// Everything an index says about durable evidence: its looks, and the keys
+    /// it describes without any.
+    pub fn of_index(index: &AvailabilityIndex) -> Self {
+        Self {
+            rows: StoredObservation::of_index(index),
+            cleared: index
+                .records()
+                .filter(|(_, record)| !record.holds_evidence())
+                .map(|(key, _)| key.clone())
+                .collect(),
+        }
+    }
+
+    /// A write of rows alone, for a caller that is adding evidence and asserting
+    /// nothing about keys it did not mention.
+    pub fn of_rows(rows: Vec<StoredObservation>) -> Self {
+        Self {
+            rows,
+            cleared: Vec::new(),
+        }
+    }
+
+    /// Also clear these keys, whatever the store holds for them.
+    #[must_use]
+    pub fn clearing(mut self, keys: impl IntoIterator<Item = AvailabilityKey>) -> Self {
+        self.cleared.extend(keys);
+        self
+    }
+
+    pub fn rows(&self) -> &[StoredObservation] {
+        &self.rows
+    }
+
+    /// The keys whose stored evidence must not survive this write.
+    pub fn cleared(&self) -> &[AvailabilityKey] {
+        &self.cleared
+    }
+
+    /// Whether this write would change nothing, which a store may answer without
+    /// opening a transaction.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.cleared.is_empty()
+    }
+}
+
 /// Where discovery evidence is kept between restarts.
 ///
 /// Read once per boot and written by whatever takes the looks — never on the
@@ -128,19 +193,21 @@ pub trait ObservationStore: Send + Sync {
         scope: Option<ScopeRef>,
     ) -> Result<Vec<StoredObservation>, ControlPlaneError>;
 
-    /// Replace the stored evidence for every key the rows mention.
+    /// Replace the stored evidence for every key the write names — the keys its
+    /// rows mention, and the keys it clears.
     ///
     /// Per key rather than per row, so a record whose retained look was
     /// discredited stops having one: an upsert alone would leave the discredited
-    /// row behind for the next restart to believe.
+    /// row behind for the next restart to believe. A key whose looks were *all*
+    /// discredited emits no row at all, which is why the write carries
+    /// [`EvidenceWrite::cleared`] beside them — otherwise the one case where
+    /// stored evidence must disappear is the one case a row set cannot express.
     ///
-    /// A key both of whose slots were discredited emits no row at all, so the
-    /// writer that owns discovery must name such keys to clear them rather than
-    /// relying on [`StoredObservation::of_index`] alone. Nothing writes yet, and
-    /// the consequence of getting it wrong is bounded: a restart re-folds a look
-    /// through the same retention path, which discredits it again as soon as the
-    /// conclusion that discredited it is observed.
-    async fn save(&self, rows: &[StoredObservation]) -> Result<(), ControlPlaneError>;
+    /// Atomic across both halves: a write that deleted the cleared keys and then
+    /// failed to insert the rows would leave a replica remembering less than it
+    /// knows, and one that inserted first would leave it remembering something a
+    /// listing removed.
+    async fn save(&self, write: &EvidenceWrite) -> Result<(), ControlPlaneError>;
 }
 
 /// Rows reassembled into the records they were written from.

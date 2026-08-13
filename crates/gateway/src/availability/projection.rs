@@ -81,7 +81,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
-use gateway_core::CircuitState;
+use gateway_core::{CircuitState, FailoverTarget};
 
 use crate::backends::catalog::CatalogContent;
 use crate::convergence::ResolvedSecrets;
@@ -100,7 +100,7 @@ use super::dimensions::{
 use super::discovery::DiscoveryObservation;
 use super::index::{AvailabilityIndex, AvailabilityIndexBuilder, AvailabilityRecord};
 use super::refs::{AvailabilityKey, CredentialRef, ScopeRef, TargetRef};
-use super::store::{self, StoredObservation};
+use super::store::{self, EvidenceWrite, StoredObservation};
 use super::verdict::Availability;
 
 /// Why a revision could not be projected into availability at all.
@@ -330,9 +330,22 @@ impl RuntimeObservations {
 
     fn health(&self, target: &TargetRef) -> RuntimeHealth {
         self.health
-            .get(&target.to_string())
+            .get(&Self::circuit_key(target))
             .copied()
             .unwrap_or(RuntimeHealth::Unobserved)
+    }
+
+    /// The string the request path files this target's circuit under.
+    ///
+    /// Built with [`FailoverTarget::qualified_model`] — the same function
+    /// `routes::target_key` uses — rather than by formatting the two components
+    /// here, so the overlay cannot drift into looking health up under a spelling
+    /// nothing writes. The two vocabularies meet because a projected record only
+    /// exists where a connection's slug *is* the catalogue provider id; this pins
+    /// the remaining half, and `a_targets_circuit_key_is_the_one_the_request_path_writes`
+    /// fails the build if either side changes its mind.
+    pub(crate) fn circuit_key(target: &TargetRef) -> String {
+        FailoverTarget::new(target.provider.as_str(), target.model.as_str()).qualified_model()
     }
 }
 
@@ -576,6 +589,15 @@ pub struct AvailabilityEvidence {
     catalogue: Mutex<Arc<Catalogue>>,
     index: Mutex<Arc<AvailabilityIndex>>,
     pending: Mutex<Vec<DiscoveryObservation>>,
+    /// What the last derivation was told, so a later look can be folded in
+    /// without waiting for a revision that may never come.
+    ///
+    /// Kept here rather than reached for, because the alternative is worse than
+    /// a clone per publication: the reconciler compiles only when desired state
+    /// *changes*, so a steady-state deployment publishes nothing for hours, and a
+    /// discovery loop with no way to re-derive would hold evidence no reader can
+    /// see. Cloned off the request path, once per revision.
+    derived_from: Mutex<Option<(Arc<DesiredState>, CredentialReadiness)>>,
 }
 
 impl AvailabilityEvidence {
@@ -585,6 +607,7 @@ impl AvailabilityEvidence {
             catalogue: Mutex::new(Arc::new(catalogue)),
             index: Mutex::new(Arc::new(AvailabilityIndex::empty())),
             pending: Mutex::new(Vec::new()),
+            derived_from: Mutex::new(None),
         }
     }
 
@@ -598,7 +621,9 @@ impl AvailabilityEvidence {
     /// Record a discovery observation, to be folded into the next projection.
     ///
     /// Queued rather than applied: an index is immutable and a verdict is read
-    /// from a published one, so evidence enters at the same seam a revision does.
+    /// from a published one, so evidence enters at the same seam a revision does
+    /// — either the next [`derive`](Self::derive), or a [`reproject`](Self::reproject)
+    /// the caller asks for once it has finished a round of looking.
     pub fn observe(&self, observation: DiscoveryObservation) {
         self.lock(&self.pending).push(observation);
     }
@@ -627,12 +652,15 @@ impl AvailabilityEvidence {
         refused
     }
 
-    /// The rows that describe the evidence this replica holds.
+    /// The write that makes durable storage agree with the evidence this replica
+    /// holds.
     ///
     /// Written by whatever owns discovery, off the request path. Carries no
-    /// operator detail and no dimension a revision states.
-    pub fn persistable(&self) -> Vec<StoredObservation> {
-        StoredObservation::of_index(&self.index())
+    /// operator detail and no dimension a revision states, and names the keys it
+    /// holds *no* evidence for as well as those it does — a look a definitive
+    /// conclusion discredited must not outlive the process that discredited it.
+    pub fn persistable(&self) -> EvidenceWrite {
+        EvidenceWrite::of_index(&self.index())
     }
 
     /// Project `state` over the evidence held, publish the result, and return it.
@@ -662,7 +690,27 @@ impl AvailabilityEvidence {
             }
         };
         *self.lock(&self.index) = Arc::new(projected.index().clone());
+        *self.lock(&self.derived_from) = Some((Arc::new(state.clone()), readiness.clone()));
         Ok(projected)
+    }
+
+    /// Fold whatever has been observed since into the revision already derived.
+    ///
+    /// The seam a discovery loop needs, and the reason it exists: convergence
+    /// compiles only when desired state changes, so a deployment that publishes
+    /// nothing for a day would otherwise keep every look taken that day queued
+    /// and invisible. This applies them against the same revision the running
+    /// index was derived from — no desired state is re-read, nothing is
+    /// re-validated, and the caller publishes the returned index the same way
+    /// compilation does.
+    ///
+    /// `None` before the first [`derive`](Self::derive): there is no revision to
+    /// fold evidence into yet, and inventing one would mean answering with
+    /// dimensions no revision stated. The looks stay queued for the derivation
+    /// that does arrive.
+    pub fn reproject(&self) -> Option<Result<ProjectedAvailability, AvailabilityProjectionError>> {
+        let (state, readiness) = self.lock(&self.derived_from).clone()?;
+        Some(self.derive(&state, &readiness))
     }
 
     /// A poisoned lock is recovered rather than propagated: the guarded values

@@ -113,6 +113,6 @@ pub use refs::{
     AvailabilityKey, CredentialRef, InvalidToken, ModelRef, ProviderRef, ScopeRef, TargetRef, Token,
 };
 #[allow(unused_imports)]
-pub use store::{ObservationSlot, ObservationStore, StoredObservation};
+pub use store::{EvidenceWrite, ObservationSlot, ObservationStore, StoredObservation};
 #[allow(unused_imports)]
 pub use verdict::{Availability, AvailabilityReason, AvailabilityState, DecidedBy};

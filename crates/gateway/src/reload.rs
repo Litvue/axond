@@ -168,6 +168,22 @@ impl Reloader {
                     None => candidate,
                     Some(pricing) => candidate.with_pricing(pricing.clone()),
                 };
+                // Discovery evidence is carried the same way and for the same
+                // reason, minus the dimensions: a look this replica took is not
+                // in the file either, and dropping it on `SIGHUP` would make a
+                // reload the one way last-known-good state disappears without a
+                // revision saying so. What is *not* carried is what the outgoing
+                // revision said about entitlement, enablement, policy, and the
+                // catalogue — the file can change the providers and credentials
+                // those verdicts were derived against, so they come back as the
+                // fail-closed defaults and the next compilation restates them.
+                // A reload therefore costs freshness and never invents access.
+                let candidate = match current.availability_handle() {
+                    None => candidate,
+                    Some(availability) => {
+                        candidate.with_availability(Arc::new(availability.carrying_evidence_only()))
+                    }
+                };
                 let summary = ReloadSummary::between(&self.boot, &current, &candidate);
                 let generation = candidate.generation;
                 self.state.publish(candidate);
@@ -1727,6 +1743,90 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
         assert_eq!(
             listed_aliases(&state).await,
             vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
+        );
+    }
+
+    /// A look this replica took is not in the file either. A reload keeps the
+    /// evidence and drops the verdicts derived with it: the file can change the
+    /// providers and credentials those verdicts stood on, so the dimensions come
+    /// back fail-closed and the next projection restates them.
+    #[tokio::test]
+    async fn a_reload_keeps_the_looks_and_restates_the_verdicts() {
+        use crate::availability::{
+            AvailabilityIndex, AvailabilityKey, AvailabilityRecord, AvailabilityState,
+            CataloguePresence, DiscoveryCompleteness, DiscoveryObservation, DiscoveryResult,
+            DiscoverySource, Entitlement, ScopeRef, TargetRef,
+        };
+        use crate::desired_state::fixtures::tenant_id;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let looked_at = UNIX_EPOCH + Duration::from_secs(100);
+        let scope = ScopeRef::tenant(tenant_id(1));
+        let target = TargetRef::parse("openai", "gpt-4o").expect("a well-formed target");
+        let key = AvailabilityKey::new(scope, target.clone());
+        let available = AvailabilityRecord {
+            entitlement: Entitlement::Granted,
+            ..AvailabilityRecord::enabled()
+        };
+        let derived = AvailabilityIndex::builder()
+            .record(key.clone(), available)
+            .observe(DiscoveryObservation::new(
+                scope,
+                target,
+                DiscoveryResult::Present,
+                DiscoveryCompleteness::Complete,
+                DiscoverySource::ProviderListing,
+                looked_at,
+            ))
+            .build();
+        assert_eq!(
+            derived.evaluate(&key, looked_at).state,
+            AvailabilityState::Available,
+            "the outgoing snapshot served this target"
+        );
+
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        state.publish(
+            ConfigSnapshot::build(
+                Config::load(file.path()).expect("valid boot config"),
+                &inbound_env(),
+                7,
+            )
+            .expect("the boot config compiles")
+            .with_availability(Arc::new(derived)),
+        );
+
+        file.rewrite(&format!(
+            r#"{PLATFORM_ONLY}
+[[model]]
+name = "gpt-4o-mini"
+targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_microdollars_per_million = 150000, output_microdollars_per_million = 600000 }} }}]
+"#
+        ));
+        Reloader::new(file.path(), state.clone())
+            .reload_with_env(TRIGGER_WATCH, &inbound_env())
+            .expect("the candidate is valid");
+
+        let after = state.config();
+        let carried = after
+            .availability_handle()
+            .expect("a reload does not stop this replica from deriving a view");
+        let record = carried.record(&key).expect("the look survived the reload");
+        assert!(
+            record.discovery.is_some(),
+            "a `SIGHUP` is not how a replica forgets what it saw"
+        );
+        assert_eq!(
+            record.presence,
+            CataloguePresence::Absent,
+            "and not how it keeps a permit the new file never granted"
+        );
+        assert_eq!(
+            carried
+                .evaluate(&key, SystemTime::UNIX_EPOCH + Duration::from_secs(110))
+                .state,
+            AvailabilityState::Unavailable
         );
     }
 

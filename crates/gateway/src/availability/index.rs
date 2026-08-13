@@ -236,6 +236,20 @@ impl AvailabilityIndex {
         AvailabilityIndexBuilder::default()
     }
 
+    /// The same evidence under fail-closed dimensions: what survives an event
+    /// that may have invalidated every verdict but cannot have unseen a look.
+    ///
+    /// A config reload is that event ([`crate::reload`]). The file can change the
+    /// providers, targets, and credentials the dimensions were derived against,
+    /// so carrying them would let an edit keep serving a permit the new
+    /// configuration never granted; dropping the index whole would instead make
+    /// a `SIGHUP` the one way last-known-good state disappears without a revision
+    /// saying so. Keeping the looks and restating the dimensions costs freshness
+    /// until the next projection and cannot invent access.
+    pub fn carrying_evidence_only(&self) -> Self {
+        AvailabilityIndexBuilder::carrying_evidence(self).build()
+    }
+
     pub fn len(&self) -> usize {
         self.records.len()
     }
