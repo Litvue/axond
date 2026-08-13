@@ -1332,6 +1332,28 @@ async fn serve(
     // whose every target is unpriced cannot be served at all, so it must not
     // occupy admission capacity or spend a rate-limit round trip to find out.
     let prices = AliasPrices::resolve(&snapshot, model);
+    // Responses affinity pins every request to the first target. A later priced
+    // target therefore cannot make an unpriced pin chargeable, and must not be
+    // used to size a budget hold for work this route can never send there.
+    if wire.route.pins_affinity()
+        && let Some((target, refusal)) = model.targets.first().zip(prices.ineligible(0))
+    {
+        tracing::warn!(
+            model = %alias,
+            detail = %refusal.detail(),
+            "pinned target has no approved price"
+        );
+        if wire.route.is_continuation(&body) {
+            return Err(GatewayError::ContinuationAffinityUnavailable {
+                provider: target.provider.clone(),
+                model: target.model.clone(),
+            });
+        }
+        return Err(GatewayError::ModelNotPriced {
+            alias,
+            reason: refusal.reason().to_owned(),
+        });
+    }
     if let Some(refusal) = prices.refusal() {
         // The price book, its version, and its approval state answer the
         // operator's "approve what, where?" and are control-plane facts, so they
@@ -3208,7 +3230,10 @@ targets = [
             cfg.clone(),
             &env,
             UsageFanout::new(sinks),
-            Box::new(NoBudget),
+            // The only route under test is pinned to the unpriced first target.
+            // A zero budget proves the pricing refusal happens before a hold is
+            // estimated from the later target that this route cannot attempt.
+            Box::new(crate::budget::InMemoryBudget::new(0)),
         )
         .expect("credentials resolve");
         state.publish(
