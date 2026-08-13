@@ -360,6 +360,12 @@ fn cleanup_evidence_fails_when_the_upstream_is_released_late_or_not_at_all() {
         "an upstream still open once the caller is gone is a leak"
     );
     assert_eq!(
+        failed(&cleanup(20, 1), true),
+        ["upstream_cleanup"],
+        "the recorded count fails the row on its own, so it has to be sampled \
+         while the replica is still alive to hold anything open"
+    );
+    assert_eq!(
         fault::run::cleanup_verdicts(
             &Cleanup {
                 upstream_streams_opened: 0,

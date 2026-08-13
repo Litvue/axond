@@ -302,9 +302,12 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
     let upstream_requests = upstream.state.requests().len() as u64 - upstream_before;
     let cleanup_started = Instant::now();
     let cleaned = await_upstream_release(&upstream).await;
-    // Read before the process is stopped: a settle time that also contained the
-    // shutdown could not be used to spot a slow release.
+    // Both read before the process is stopped: a settle time that also contained
+    // the shutdown could not be used to spot a slow release, and a body count
+    // taken after it would be zero for a leaking row as surely as a clean one,
+    // since exiting closes whatever the replica was still holding.
     let settled_within_ms = cleanup_started.elapsed().as_millis();
+    let open_at_end = upstream.state.open_streams();
 
     gateway.terminate();
     let exit = gateway.await_exit(SHUTDOWN_TIMEOUT).await;
@@ -386,7 +389,7 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
         usage,
         cleanup: Cleanup {
             upstream_streams_opened: upstream.state.opened_streams(),
-            upstream_streams_open_at_end: upstream.state.open_streams(),
+            upstream_streams_open_at_end: open_at_end,
             settled_within_ms,
             process_exited_cleanly: exit.is_some_and(|status| status.success()),
         },
@@ -401,8 +404,7 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
         leakage,
         verdicts: Vec::new(),
     };
-    let cleaned_within = cleaned;
-    Outcome::Ran(Box::new(judge(row, result, cleaned_within)))
+    Outcome::Ran(Box::new(judge(row, result, cleaned)))
 }
 
 /// Everything the driver measured about one request.
