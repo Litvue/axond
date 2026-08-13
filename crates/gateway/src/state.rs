@@ -663,13 +663,16 @@ impl AppState {
         )
     }
 
-    /// The boot path: every process-level resource is already connected, usage
-    /// delivery included, so a deployment that cannot reach a datastore it asked
-    /// for has already failed before this is called.
+    /// Every process-level resource already connected, usage delivery included,
+    /// so a deployment that cannot reach a datastore it asked for has already
+    /// failed before this is called.
     ///
-    /// The policy runtime is this replica's own, for a caller whose stores were
-    /// not built against one; a stateful boot builds the stores against a runtime
-    /// and calls [`AppState::new_with_policy`] instead.
+    /// The policy runtime is this replica's own, which is what makes this a
+    /// caller-without-a-runtime constructor rather than the boot path: the
+    /// serving binary builds its stores *reading* a runtime and must hand that
+    /// same one to [`AppState::new_with_policy`], since a state publishing into
+    /// a runtime its stores do not read enforces nothing.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_resources(
         config: Config,
         env: &HashMap<String, String>,
