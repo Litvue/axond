@@ -756,6 +756,17 @@ fn a_replicas_dsn_carries_awkward_credentials_intact() {
         "127.0.0.1:6543",
     );
     assert_eq!(reach, stateful_endurance::durable::Reach::Gated);
+
+    // A database that insists on TLS is not a run this harness can reconcile:
+    // it counts rows over its own plaintext connection. It is declined before
+    // anything boots — see `durable::dsn` — rather than panicking part-way
+    // through one.
+    assert!(stateful_endurance::durable::requires_tls(
+        "postgres://user:pw@127.0.0.1:5432/postgres?sslmode=require"
+    ));
+    assert!(!stateful_endurance::durable::requires_tls(
+        "postgres://user:pw@127.0.0.1:5432/postgres"
+    ));
 }
 
 /// A gate is a fault, and a fault that misses its moment is evidence the run
@@ -777,6 +788,20 @@ async fn a_gate_cuts_what_it_joined_and_stops_when_it_is_dropped() {
         .find("if state.outage.load(Ordering::SeqCst) {")
         .expect("the connection reads the outage");
     assert!(subscribes < reads, "the cut is subscribed to first");
+
+    // And an accept error does not end the gate. A transient one cannot be
+    // provoked reliably, so the loop's shape is asserted where it is written:
+    // a `while let Ok(..)` here would close the listening socket on the first
+    // half-open client and leave the backend unreachable for the rest of the
+    // run, which reads as the deployment refusing everything.
+    assert!(
+        source.contains("match listener.accept().await {"),
+        "the accept loop handles its errors rather than ending on them"
+    );
+    assert!(
+        !source.contains("while let Ok((inbound, _)) = listener.accept().await"),
+        "one transient accept error would stop the gate forwarding"
+    );
 
     let backend = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

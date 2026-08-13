@@ -6,7 +6,7 @@ Tier 0 replica with no datastore and no control plane
 ([ADR 0040](../adr/0040-endurance-qualification-harness.md)); this page soaks a
 fleet whose catalogue, credential pool, tenant policy, provider, usage database,
 and processes all change while it is serving
-([ADR 0052](../adr/0052-stateful-endurance-qualification.md)) — the failures that
+([ADR 0053](../adr/0053-stateful-endurance-qualification.md)) — the failures that
 only appear when duration and change happen at once:
 
 - an accounting row lost to a restart, a rotation, or a database that went away
@@ -77,13 +77,19 @@ qualification without a datastore is not a smaller one.
 
 Point it at a database on this machine if you want the usage-backend outage
 evaluated. The replicas reach a loopback database through the fault gate, which
-is how it can be taken away mid-run; a DSN asking for TLS, or naming a host
-somewhere else — which under libpq's default `prefer` may still negotiate TLS —
-is handed to the replicas untouched, since a byte forwarder cannot stand in
-front of a handshake to another name and rewriting the address would hand those
-credentials to a plaintext hop. The artifact then records the backend as reached
-`direct` and the outage as not evaluated, rather than the run silently
-downgrading the connection it was given.
+is how it can be taken away mid-run. A DSN naming a host somewhere else is
+handed to them untouched instead: under libpq's default `prefer` it may still
+negotiate TLS, a byte forwarder cannot stand in front of a handshake to another
+name, and rewriting the address would hand a remote server's credentials to a
+plaintext hop on this machine. The artifact then records the backend as reached
+`direct` and the usage-backend outage as not evaluated, rather than the run
+silently downgrading the connection it was given.
+
+A DSN that *requires* TLS is not run at all: the harness reconciles by
+connecting to the database itself, in the clear, and a run whose durable side
+cannot be counted is not a shorter qualification. It is skipped with that
+reason, and — as with an absent DSN — `AXOND_TEST_REQUIRE_SERVICES=1` turns the
+skip into a failure so CI cannot report green for a run that never happened.
 
 ```bash
 export AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:5432/postgres

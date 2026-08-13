@@ -100,9 +100,23 @@ impl Gate {
 
         let serving = state.clone();
         let accepting = tokio::spawn(async move {
-            while let Ok((inbound, _)) = listener.accept().await {
-                let state = serving.clone();
-                tokio::spawn(async move { serve(inbound, state).await });
+            loop {
+                match listener.accept().await {
+                    Ok((inbound, _)) => {
+                        let state = serving.clone();
+                        tokio::spawn(async move { serve(inbound, state).await });
+                    }
+                    // An accept error is transient — a client that hung up
+                    // half-open, a descriptor table briefly full — and not the
+                    // end of the gate. A loop that stopped here would close the
+                    // listening socket and leave the backend unreachable for the
+                    // rest of the run, which reads on the artifact as the
+                    // deployment refusing every request rather than as the
+                    // harness having stopped forwarding.
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
             }
         });
 

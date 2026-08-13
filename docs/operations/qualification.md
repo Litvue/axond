@@ -146,7 +146,7 @@ and why no capacity profile claims it.
   contract is committed before its driver.
 - [ADR 0040](../adr/0040-endurance-qualification-harness.md) — why the endurance
   harness measures its own accumulators before it measures the gateway.
-- [ADR 0052](../adr/0052-stateful-endurance-qualification.md) — why the stateful
+- [ADR 0053](../adr/0053-stateful-endurance-qualification.md) — why the stateful
   soak attributes every excused error and lost row to something the deployment
   itself emitted.
 - [ADR 0045](../adr/0045-qualification-packet-and-evidence-records.md) — the

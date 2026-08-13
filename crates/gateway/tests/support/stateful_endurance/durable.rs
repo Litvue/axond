@@ -23,7 +23,36 @@ use serde::Serialize;
 /// absent configuration skips, and `AXOND_TEST_REQUIRE_SERVICES=1` turns the
 /// skip into a panic so CI cannot report green for a run that never happened.
 pub fn dsn() -> Option<String> {
-    crate::support::stateful::postgres_dsn()
+    let dsn = crate::support::stateful::postgres_dsn()?;
+    // The harness's own reconciliation connects without TLS, so a database that
+    // insists on it is one this run cannot count — and a qualification that
+    // cannot count the durable side is not a qualification. Said here, once,
+    // rather than as a panic inside the first query: the operator gets the
+    // reason instead of a connection error from the middle of a boot.
+    if requires_tls(&dsn) {
+        if std::env::var("AXOND_TEST_REQUIRE_SERVICES").as_deref() == Ok("1") {
+            panic!(
+                "AXOND_TEST_POSTGRES_DSN requires TLS, which the stateful endurance harness \
+                 cannot reconcile against; point it at a database it may connect to in the \
+                 clear rather than letting CI report green for a run that never happened"
+            );
+        }
+        eprintln!(
+            "stateful endurance: skipped — AXOND_TEST_POSTGRES_DSN requires TLS and the \
+             harness's own reconciliation connects without it"
+        );
+        return None;
+    }
+    Some(dsn)
+}
+
+/// Whether the DSN insists on an encrypted connection. Only `require` does:
+/// libpq's default `prefer` is satisfied by the plaintext connection the
+/// harness makes, and a server that refuses that is a server this run says so
+/// about rather than one it works around.
+pub fn requires_tls(dsn: &str) -> bool {
+    dsn.parse::<tokio_postgres::Config>()
+        .is_ok_and(|config| config.get_ssl_mode() == tokio_postgres::config::SslMode::Require)
 }
 
 /// One libpq keyword/value field, quoted so a credential is passed as it was
@@ -112,11 +141,13 @@ pub struct Durable {
 pub enum Reach {
     /// Through the gate, so the usage backend can be made to disappear.
     Gated,
-    /// Directly, because the DSN asks for TLS, or names a database that is not
-    /// on the loopback interface and so may negotiate it: a byte-forwarding
-    /// gate cannot stand in front of a TLS handshake to a different name, and
-    /// rewriting the DSN would hand the credentials to a plaintext forwarder.
-    /// The outage is then not evaluated rather than silently skipped.
+    /// Directly, because the DSN names a database that is not on the loopback
+    /// interface and so may negotiate TLS under the default `prefer`: a
+    /// byte-forwarding gate cannot stand in front of a handshake to a
+    /// different name, and rewriting the DSN would hand a remote server's
+    /// credentials to a plaintext forwarder on this machine. The outage is
+    /// then recorded as not evaluated rather than silently skipped. (A DSN
+    /// that *requires* TLS never gets this far: [`dsn`] declines the run.)
     Direct,
 }
 
