@@ -1290,6 +1290,56 @@ fn a_diff_shows_a_rewiring_that_nothing_else_about_the_resource_would_reveal() {
 }
 
 #[test]
+fn a_diff_shows_a_resource_changing_owner() {
+    // Nothing pins a resource's scope across revisions, so an alias re-parented
+    // from its tenant onto one of that tenant's projects is a legal publication
+    // whose slug, body and edges are all untouched. Without the previous scope
+    // the delta reads as a version bump, and "who owns this now" is the question
+    // a reviewer of a re-parenting is there to answer.
+    let tenant = fixtures::tenant_id(1);
+    let project = fixtures::project_id(2);
+    let base = fixtures::state();
+    let alias = base
+        .get(&fixtures::reference(ResourceKind::Alias, 4))
+        .expect("the fixture alias");
+
+    let mut moved = base.clone();
+    moved
+        .insert(
+            ResourceVersion::new(
+                alias.reference.at(alias.reference.version.next()),
+                ResourceScope::Project { tenant, project },
+                alias.slug.clone(),
+                alias.body.clone(),
+            )
+            .depending_on(alias.depends_on.iter().copied()),
+        )
+        .expect("a project of the alias's own tenant is a valid owner");
+
+    let diff = SemanticDiff::between(Some(&base), &moved).expect("a diff");
+    assert_eq!(diff.summary.updated, 1);
+    let delta = &diff.resources[0];
+    assert!(delta.moved);
+    assert!(!delta.renamed);
+    assert!(!delta.rewired);
+    assert_eq!(delta.slug, delta.previous_slug);
+    assert_eq!(delta.body, delta.previous_body);
+    assert_eq!(delta.depends_on, delta.previous_depends_on);
+    assert_eq!(delta.scope.kind, "project");
+    assert_eq!(
+        delta.scope.project.as_deref(),
+        Some(project.to_string()).as_deref()
+    );
+    let previous = delta.previous_scope.as_ref().expect("the owner it had");
+    assert_eq!(previous.kind, "tenant");
+    assert_eq!(previous.project, None);
+
+    // An update that leaves the scope alone does not claim a move.
+    let renamed = SemanticDiff::between(Some(&base), &fixtures::state()).expect("a diff");
+    assert!(renamed.resources.iter().all(|delta| !delta.moved));
+}
+
+#[test]
 fn a_diff_names_the_object_a_repointed_blob_body_now_addresses() {
     // Both snapshots stay declared, so no blob appears or disappears and the blob
     // section of the diff says nothing. The body view has to carry the digest, or

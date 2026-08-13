@@ -15,6 +15,11 @@
 //!   addresses when a resource is repointed between two blobs the revision keeps
 //!   declaring — a change no blob delta reports.
 //!
+//! Its identity is rendered on both sides for the same reason a rename is: a
+//! resource re-parented onto another tenant or project changes nothing else a
+//! reviewer sees, so the delta carries the previous scope and a derived `moved`
+//! alongside `renamed` and `rewired`.
+//!
 //! Its dependency edges are rendered in full, because they are references rather
 //! than material and because rewiring an alias onto a different credential
 //! version is otherwise invisible: same slug, same body, only a version number
@@ -142,6 +147,12 @@ pub struct ResourceDelta {
     /// The durable resource id, stable across renames and versions.
     pub resource: String,
     pub scope: ScopeView,
+    /// The owner the resource had. Nothing pins a resource's scope across
+    /// revisions — [`DesiredState::validate`] pins it against the resource *kind*
+    /// only — so a re-parenting between tenants or projects is a legal change
+    /// whose delta is otherwise a bare version bump.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_scope: Option<ScopeView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slug: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,6 +184,11 @@ pub struct ResourceDelta {
     /// same reason as [`renamed`](Self::renamed).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub rewired: bool,
+    /// Whether this change moved the resource to a different tenant or project,
+    /// derived for the same reason as [`renamed`](Self::renamed) — and the change
+    /// on this list a reviewer can least afford to read past.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub moved: bool,
 }
 
 /// A blob's appearance or disappearance. A blob is immutable content, so it is
@@ -323,6 +339,7 @@ fn added(resource: &ResourceVersion) -> Result<ResourceDelta, ValidationError> {
         kind: resource.reference.kind.as_str(),
         resource: resource.reference.id.to_string(),
         scope: ScopeView::of(&resource.scope),
+        previous_scope: None,
         slug: Some(resource.slug.as_str().to_owned()),
         previous_slug: None,
         version: Some(resource.reference.version.get()),
@@ -333,6 +350,7 @@ fn added(resource: &ResourceVersion) -> Result<ResourceDelta, ValidationError> {
         previous_depends_on: None,
         renamed: false,
         rewired: false,
+        moved: false,
     })
 }
 
@@ -342,6 +360,7 @@ fn removed(resource: &ResourceVersion) -> Result<ResourceDelta, ValidationError>
         kind: resource.reference.kind.as_str(),
         resource: resource.reference.id.to_string(),
         scope: ScopeView::of(&resource.scope),
+        previous_scope: None,
         slug: None,
         previous_slug: Some(resource.slug.as_str().to_owned()),
         version: None,
@@ -352,6 +371,7 @@ fn removed(resource: &ResourceVersion) -> Result<ResourceDelta, ValidationError>
         previous_depends_on: Some(references(resource)),
         renamed: false,
         rewired: false,
+        moved: false,
     })
 }
 
@@ -361,6 +381,7 @@ fn updated(old: &ResourceVersion, new: &ResourceVersion) -> Result<ResourceDelta
         kind: new.reference.kind.as_str(),
         resource: new.reference.id.to_string(),
         scope: ScopeView::of(&new.scope),
+        previous_scope: Some(ScopeView::of(&old.scope)),
         slug: Some(new.slug.as_str().to_owned()),
         previous_slug: Some(old.slug.as_str().to_owned()),
         version: Some(new.reference.version.get()),
@@ -371,5 +392,6 @@ fn updated(old: &ResourceVersion, new: &ResourceVersion) -> Result<ResourceDelta
         previous_depends_on: Some(references(old)),
         renamed: old.slug != new.slug,
         rewired: old.depends_on != new.depends_on,
+        moved: old.scope != new.scope,
     })
 }
