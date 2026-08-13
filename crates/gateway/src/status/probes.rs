@@ -14,13 +14,17 @@
 //! diagnostic without ever touching a network.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
-use super::registry::ComponentProbe;
+#[cfg(doc)]
+use super::registry::StatusRefresher;
+use super::registry::{ComponentProbe, StatusSettings};
 use super::{Component, ComponentObservation, StatusReason};
 use crate::backends::BackendFailure;
 use crate::backends::control_plane::ControlPlaneStore;
+use crate::backends::control_plane::postgres::ControlPlaneSettings;
 
 /// Observes the control plane a stateful replica administers against.
 ///
@@ -36,7 +40,54 @@ impl ControlPlaneProbe {
     pub fn new(store: Arc<dyn ControlPlaneStore>) -> Self {
         Self { store }
     }
+
+    /// The fastest pacing this probe can be given without reporting a working
+    /// control plane as unreachable.
+    ///
+    /// A probe cut off before the backend's own bounds have elapsed does not
+    /// observe a timeout, it *causes* one: [`StatusRefresher`] publishes
+    /// `unavailable`/`timeout` for a call the store would have completed, and
+    /// `AxondControlPlaneUnreachable` pages while administration against that
+    /// same control plane is succeeding. So the timeout is derived from the
+    /// store's configuration rather than chosen:
+    ///
+    /// * the store serialises every operation on one client, so a probe can
+    ///   first wait out an administrative operation already running
+    ///   (`operation_timeout` — a migration or a publish is entitled to all of
+    ///   it);
+    /// * a connection the outage dropped is then re-established
+    ///   (`connect_timeout`);
+    /// * and the health call itself is bounded by `operation_timeout` again.
+    ///
+    /// The refresh interval sits above that so a round cannot overlap the next,
+    /// and the staleness budget above *that* so a single slow round does not
+    /// coarsen every component to `stale`. A deployment that wants a faster
+    /// diagnostic lowers `[control_plane] operation_timeout_ms`, which is the
+    /// honest lever: status can only be as prompt as the backend it reports on.
+    pub fn pacing(settings: &ControlPlaneSettings) -> StatusSettings {
+        let probe_timeout = settings
+            .operation_timeout
+            .saturating_mul(2)
+            .saturating_add(settings.connect_timeout)
+            // A configuration with sub-second bounds still has to leave
+            // `refresh_interval` at the one-second floor `validate` requires.
+            .max(Duration::from_secs(2));
+        let refresh_interval = probe_timeout.saturating_add(settings.connect_timeout.max(SPACING));
+        StatusSettings {
+            probe_timeout,
+            refresh_interval,
+            // Three rounds: one slow round and one missed round are not a stale
+            // observation, and the rule that pages for a refresher which stopped
+            // entirely is `AxondStatusRefresherStalled`.
+            staleness_budget: refresh_interval.saturating_mul(3),
+            enabled: vec![Component::ControlPlane],
+        }
+    }
 }
+
+/// The gap between a round's ceiling and the next round, when the store's own
+/// connect bound is smaller than it.
+const SPACING: Duration = Duration::from_secs(1);
 
 #[async_trait]
 impl ComponentProbe for ControlPlaneProbe {
@@ -154,6 +205,58 @@ mod tests {
 
     fn failing(error: fn() -> ControlPlaneError) -> Health {
         Box::new(move || Err(error()))
+    }
+
+    /// The bug this guards is a page that is *caused* by the diagnostic: the
+    /// store serialises work on one client, so a probe can queue behind an
+    /// administrative operation entitled to the whole `operation_timeout`,
+    /// reconnect, and only then run — all of which the store considers healthy.
+    /// A round cut off first would publish `unavailable`/`timeout` and fire the
+    /// critical control-plane rule while administration is succeeding.
+    #[test]
+    fn the_probe_outlives_every_bound_the_store_is_allowed_to_take() {
+        let settings = ControlPlaneSettings {
+            connect_timeout: Duration::from_secs(5),
+            operation_timeout: Duration::from_secs(30),
+            ..ControlPlaneSettings::default()
+        };
+        let pacing = ControlPlaneProbe::pacing(&settings);
+        let queued_behind_an_operation = settings.operation_timeout;
+        let reconnect = settings.connect_timeout;
+        let own_call = settings.operation_timeout;
+        assert!(
+            pacing.probe_timeout >= queued_behind_an_operation + reconnect + own_call,
+            "{:?} cuts a call the store would have completed",
+            pacing.probe_timeout
+        );
+    }
+
+    /// Every derived pacing has to satisfy the registry's own invariants, or the
+    /// replica boots with a refresher whose rounds overlap or whose observations
+    /// are stale the moment they are published. Checked across the range an
+    /// operator can configure, including the sub-second bounds that would
+    /// otherwise fall under the one-second floor.
+    #[test]
+    fn the_derived_pacing_is_valid_for_every_configurable_bound() {
+        for (connect_ms, operation_ms) in [
+            (1_u64, 1_u64),
+            (100, 250),
+            (5_000, 30_000),
+            (60_000, 600_000),
+        ] {
+            let settings = ControlPlaneSettings {
+                connect_timeout: Duration::from_millis(connect_ms),
+                operation_timeout: Duration::from_millis(operation_ms),
+                ..ControlPlaneSettings::default()
+            };
+            let pacing = ControlPlaneProbe::pacing(&settings);
+            assert_eq!(
+                pacing.validate(),
+                Ok(()),
+                "connect {connect_ms}ms, operation {operation_ms}ms produced {pacing:?}"
+            );
+            assert_eq!(pacing.enabled, vec![Component::ControlPlane]);
+        }
     }
 
     #[tokio::test]

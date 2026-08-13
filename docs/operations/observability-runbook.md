@@ -21,6 +21,15 @@ points at a section of this page.
   produces none of the three; `GET /admin/v1/status` answers there with every
   component `disabled`. Every durable backend other than the control plane is
   `disabled` in both postures until the slice that owns it injects a probe.
+
+  The cadence is derived from `[control_plane]`, not fixed: a probe shares the
+  single administrative connection, so it may queue behind an operation entitled
+  to the whole `operation_timeout_ms`, reconnect within `connect_timeout_ms`,
+  and then run under `operation_timeout_ms` again. The round's ceiling is that
+  sum (65s at the defaults), refreshes are one connect bound apart (70s), and
+  observations are stale after three rounds (210s). A shorter
+  `operation_timeout_ms` buys a prompter diagnostic; nothing else does, because
+  cutting a round short reports an outage the store is not having.
 * **Revision convergence.** No reconciler is constructed either (the
   `convergence` module is contract-only until a projection from resource bodies
   to a servable config lands), so every `axond_revision_*` series — `lag`,

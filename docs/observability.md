@@ -69,7 +69,10 @@ A replica in `mode = "stateful"` observes **the control plane**, on the same
 connection its administrative surface was built on rather than a second pool of
 its own: a diagnostic that probed a path no administrative request takes is how
 status reports `ok` throughout an outage of the thing being asked about. That is
-the one live component today. Every other durable backend is still `disabled`
+the one live component today, observed on a cadence derived from that store's
+own `connect_timeout_ms`/`operation_timeout_ms` rather than a fixed one — a
+probe that gave up before the backend's own bounds elapsed would report an
+outage it had caused. Every other durable backend is still `disabled`
 until the slice that owns it injects a probe through the same seam
 (`ReplicaObservability::observing`), and neither the response shape nor the
 metric names change when it does:

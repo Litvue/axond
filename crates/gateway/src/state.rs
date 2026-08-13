@@ -45,7 +45,6 @@ use crate::rate_limit::NoLimit;
 use crate::rate_limit::RateLimiter;
 use crate::revocation::RevocationStore;
 use crate::shutdown::Lifecycle;
-use crate::status::Component;
 use crate::status::probes::ControlPlaneProbe;
 use crate::status::registry::{CachedStatusRegistry, StatusRefresher, StatusSettings};
 use crate::usage::UsageDelivery;
@@ -122,17 +121,18 @@ impl ReplicaObservability {
     /// lifetime: it has to stop with the process, and a task spawned out of a
     /// constructor would outlive the drain that is supposed to end it.
     ///
-    /// Enabling a component is what decides whether it is probed at all, so this
-    /// is also the list of what a status read can say something about — adding a
-    /// backend here without a probe would report it `unavailable`/`stale`
-    /// forever rather than `disabled`.
-    pub fn observing(control_plane: Arc<dyn ControlPlaneStore>) -> (Self, StatusRefresher) {
-        let settings = StatusSettings {
-            enabled: vec![Component::ControlPlane],
-            ..StatusSettings::default()
-        };
-        debug_assert!(settings.validate().is_ok(), "the shipped pacing is valid");
-        let status = Arc::new(CachedStatusRegistry::new(settings, Arc::new(SystemClock)));
+    /// `pacing` comes from the store's own timeouts
+    /// ([`ControlPlaneProbe::pacing`]) rather than from a default: it decides
+    /// which components are enabled — and so which are probed at all, since an
+    /// enabled component nobody probes ages into `unavailable` instead of
+    /// reporting `disabled` — and how long a round may take before the refresher
+    /// calls it a timeout.
+    pub fn observing(
+        control_plane: Arc<dyn ControlPlaneStore>,
+        pacing: StatusSettings,
+    ) -> (Self, StatusRefresher) {
+        debug_assert!(pacing.validate().is_ok(), "the derived pacing is valid");
+        let status = Arc::new(CachedStatusRegistry::new(pacing, Arc::new(SystemClock)));
         let refresher = StatusRefresher::new(
             Arc::clone(&status),
             vec![Arc::new(ControlPlaneProbe::new(control_plane))],

@@ -593,9 +593,17 @@ async fn serve() -> anyhow::Result<()> {
     // probe that consulted a dependency would multiply one outage by the fleet
     // size (ADR 0031).
     let (observability, status_refresher) = match admin.control_plane.as_ref() {
-        Some(store) => {
-            let (observability, refresher) = ReplicaObservability::observing(Arc::clone(store));
-            tracing::info!(component = "control_plane", "dependency status observed");
+        Some(observed) => {
+            let (observability, refresher) = ReplicaObservability::observing(
+                Arc::clone(&observed.store),
+                observed.pacing.clone(),
+            );
+            tracing::info!(
+                component = "control_plane",
+                refresh_interval_ms = observed.pacing.refresh_interval.as_millis() as u64,
+                probe_timeout_ms = observed.pacing.probe_timeout.as_millis() as u64,
+                "dependency status observed"
+            );
             (observability, Some(refresher))
         }
         None => (ReplicaObservability::stateless(), None),

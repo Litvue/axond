@@ -33,6 +33,8 @@ use crate::backends::control_plane::{ControlPlaneError, ControlPlaneStore};
 use crate::config::{AdminBreakglass, Config, KeyMaterialSource, Mode};
 use crate::desired_state::ResourceScope;
 use crate::key_material::{self, KeyMaterialError};
+use crate::status::probes::ControlPlaneProbe;
+use crate::status::registry::StatusSettings;
 
 /// Why an administrative surface could not be built.
 ///
@@ -99,10 +101,12 @@ pub async fn surface(config: &Config, env: &HashMap<String, String>) -> Result<S
                 .unwrap_or("dsn_env")
                 .to_owned(),
         })?;
-    let store: Arc<dyn ControlPlaneStore> = Arc::new(
-        PostgresControlPlane::connect(dsn, ControlPlaneSettings::from_config(control_plane))
-            .await?,
-    );
+    let settings = ControlPlaneSettings::from_config(control_plane);
+    // The diagnostic has to be paced against the bounds the store will actually
+    // take, so they are read here rather than re-derived from config elsewhere.
+    let pacing = ControlPlaneProbe::pacing(&settings);
+    let store: Arc<dyn ControlPlaneStore> =
+        Arc::new(PostgresControlPlane::connect(dsn, settings).await?);
     let api = AdminApi::new(
         Arc::new(AdminService::stateful(Arc::clone(&store))),
         Arc::new(authenticator),
@@ -111,7 +115,7 @@ pub async fn surface(config: &Config, env: &HashMap<String, String>) -> Result<S
     Ok(Surface {
         router: router::router(Arc::new(api)),
         mode: "stateful",
-        control_plane: Some(store),
+        control_plane: Some(ObservedControlPlane { store, pacing }),
     })
 }
 
@@ -122,7 +126,15 @@ pub struct Surface {
     pub mode: &'static str,
     /// The store administration was built on, or `None` in stateless mode where
     /// no store is opened at all.
-    pub control_plane: Option<Arc<dyn ControlPlaneStore>>,
+    pub control_plane: Option<ObservedControlPlane>,
+}
+
+/// A control plane the replica diagnostic may report on, with the pacing its
+/// own timeouts allow. The two travel together because probing the store at a
+/// cadence its bounds do not permit reports outages that are not happening.
+pub struct ObservedControlPlane {
+    pub store: Arc<dyn ControlPlaneStore>,
+    pub pacing: StatusSettings,
 }
 
 /// Authenticates the one configured breakglass credential.
