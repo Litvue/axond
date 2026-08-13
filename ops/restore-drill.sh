@@ -466,6 +466,9 @@ require "the_audit_trail_survives_the_restore" true \
 require "the_audit_trail_names_the_breakglass_actor" breakglass \
   "$(printf '%s' "$audit" | jq -r '.events[0].actor.kind')" \
   "the restored trail attributes the publication to the identity that made it"
+# Do not add `-q`: with `pipefail`, an early grep exit can SIGPIPE printf and
+# invert a matching scan into the clean branch. Draining to /dev/null keeps
+# the producer's status independent of the audit payload size.
 require "the_audit_trail_carries_no_secret_material" clean \
   "$(printf '%s' "$audit" | grep -F "$GW_DRILL_BREAKGLASS" >/dev/null && echo leaked || echo clean)" \
   "an audit read names the credential's env var, never its value"
@@ -639,6 +642,8 @@ observe audit_events_for_head "$(printf '%s' "$audit" | jq '.events | length')" 
 require "the_audit_trail_survives_the_recovery" true \
   "$(printf '%s' "$audit" | jq '(.events | length) > 0')" \
   "the trail for a revision on the safe side of the target came back with it"
+# Keep this scan non-quiet for the same pipefail/SIGPIPE reason as the restore
+# audit above.
 require "the_audit_trail_carries_no_secret_material" clean \
   "$(printf '%s' "$audit" | grep -F "$GW_DRILL_BREAKGLASS" >/dev/null && echo leaked || echo clean)" \
   "an audit read names the credential's env var, never its value"

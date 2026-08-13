@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -73,6 +74,49 @@ SCHEMA_VERSION = 2
 # says it does not retain the loss boundary, describes a boundary no reader can
 # check.
 GATE_EVIDENCE = {"max_data_loss_revisions": "revision_loss_boundary"}
+
+RESTORE_DRILL = ROOT / "ops/restore-drill.sh"
+
+
+def audit_scan_regression() -> list[str]:
+    """Prove the restore drill cannot invert a matching scan under pipefail."""
+    source = RESTORE_DRILL.read_text(encoding="utf-8")
+    drained = 'grep -F "$GW_DRILL_BREAKGLASS" >/dev/null'
+    complaints: list[str] = []
+    if 'grep -qF "$GW_DRILL_BREAKGLASS"' in source:
+        complaints.append("the audit scan still uses grep -qF and can false-clean")
+    if source.count(drained) != 2:
+        complaints.append(
+            f"the audit scan has {source.count(drained)} drained callsites, expected 2"
+        )
+
+    # A match at the beginning of a payload larger than the pipe buffer is the
+    # failure mode: grep -q exits early, printf receives SIGPIPE, and pipefail
+    # makes the `then` branch look like a clean scan. The production form drains
+    # the input before returning, so the same payload must report `leaked`.
+    probe = r"""
+set -o pipefail
+needle='drill-secret'
+payload="$(printf '%s\n' "$needle"; head -c 1048576 /dev/zero | tr '\0' x)"
+if printf '%s' "$payload" | grep -F "$needle" >/dev/null; then
+  printf 'leaked\n'
+else
+  printf 'clean\n'
+fi
+"""
+    result = subprocess.run(
+        ["bash", "-c", probe],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or result.stdout.strip() != "leaked":
+        complaints.append(
+            "a matching payload larger than the pipe buffer did not report leaked: "
+            f"status={result.returncode}, stdout={result.stdout.strip()!r}, "
+            f"stderr={result.stderr.strip()!r}"
+        )
+    return complaints
 
 
 def owed(runner: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
@@ -240,6 +284,7 @@ def self_test() -> int:
         complaints.append("an unset --forbid-env name: the checker accepted it")
     if resolve_forbidden(["AXOND_PRESENT_SECRET"]) != ["the-drill-credential"]:
         complaints.append("a set --forbid-env name: the checker did not resolve it")
+    complaints.extend(audit_scan_regression())
 
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / f"{scenario['id']}.{stage['id']}.json"
