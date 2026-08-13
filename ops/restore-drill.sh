@@ -81,6 +81,22 @@ fail() {
 }
 
 evidence="${root}/ops/recovery-evidence.py"
+# The recorders read the manifest, which needs a TOML reader: `tomllib` from
+# Python 3.11, or the `tomli` backport the deploy lockfile pins on the 3.10 ops
+# floor. Resolve one now rather than half way through a drill, and prefer the
+# venv `just ops-venv` builds when the ambient interpreter has neither.
+reads_toml() {
+  "$1" -c 'import importlib.util as u, sys
+sys.exit(0 if u.find_spec("tomllib") or u.find_spec("tomli") else 1)' >/dev/null 2>&1
+}
+python_bin="${AXOND_PYTHON:-python3}"
+if ! reads_toml "$python_bin"; then
+  if reads_toml "${root}/target/ops-venv/bin/python"; then
+    python_bin="${root}/target/ops-venv/bin/python"
+  else
+    fail "$python_bin has neither \`tomllib\` (Python 3.11+) nor the \`tomli\` backport; run \`just ops-venv\` or set AXOND_PYTHON"
+  fi
+fi
 # The stage currently recording. Set by `stage`, read by the recorders, so a
 # check reads as the condition it states rather than as plumbing.
 log=""
@@ -95,19 +111,19 @@ stage() {
   log="${workdir}/$(printf '%s' "$1" | tr / .).log"
   check_held=()
   step "Stage $1"
-  python3 "$evidence" start --log "$log" --stage "$1" \
+  "$python_bin" "$evidence" start --log "$log" --stage "$1" \
     --schema "$2" --schema-identity "$3"
 }
-mark() { python3 "$evidence" mark --log "$log" --event "$1" --detail "$2"; }
-observe() { python3 "$evidence" observe --log "$log" --key "$1" --value "$2" --type "${3:-text}"; }
+mark() { "$python_bin" "$evidence" mark --log "$log" --event "$1" --detail "$2"; }
+observe() { "$python_bin" "$evidence" observe --log "$log" --key "$1" --value "$2" --type "${3:-text}"; }
 gate() {
-  python3 "$evidence" gate --log "$log" --gate "$1" --observed "$2" --met "$3" --detail "$4"
+  "$python_bin" "$evidence" gate --log "$log" --gate "$1" --observed "$2" --met "$3" --detail "$4"
 }
-defer() { python3 "$evidence" defer --log "$log" --gate "$1" --why "$2"; }
+defer() { "$python_bin" "$evidence" defer --log "$log" --gate "$1" --why "$2"; }
 # A condition the stage requires: recorded either way, judged by `close`.
 require() {
   local check="$1" wanted="$2" got="$3" detail="$4"
-  python3 "$evidence" require --log "$log" --check "$check" \
+  "$python_bin" "$evidence" require --log "$log" --check "$check" \
     --expected "$wanted" --observed "$got" --detail "$detail"
   if [[ "$got" == "$wanted" ]]; then
     check_held["$check"]=held
@@ -130,7 +146,7 @@ verdict() { held "$@" && printf 'true' || printf 'false'; }
 # Writes the artifact, then fails the drill if the stage failed. In that order,
 # because an unexplained failure is the one an operator cannot act on.
 close() {
-  python3 "$evidence" finish --log "$log" || failed_stages+=("$(basename "$log" .log)")
+  "$python_bin" "$evidence" finish --log "$log" || failed_stages+=("$(basename "$log" .log)")
 }
 failed_stages=()
 # When this run began, so the checker can reject an artifact a previous run left
@@ -649,7 +665,7 @@ close
 # ---------------------------------------------------------------------------
 step "Checking the lane retained evidence for every stage it owes"
 check_evidence() {
-  python3 "${root}/ops/check-recovery-evidence.py" --runner restore-drill \
+  "$python_bin" "${root}/ops/check-recovery-evidence.py" --runner restore-drill \
     --since-unix-ms "$drill_started_ms" \
     --forbid-env GW_DRILL_BREAKGLASS --forbid-env GW_DRILL_KEK
 }

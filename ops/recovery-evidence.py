@@ -36,11 +36,21 @@ from pathlib import Path
 from typing import Any
 
 # `tomllib` is standard from 3.11; on the repository's 3.10 ops floor the
-# deploy lockfile supplies `tomli`, the backport it was extracted from.
+# hash-pinned deploy lockfile supplies `tomli`, the backport it was extracted
+# from. Say so, because a bare ModuleNotFoundError names neither the floor nor
+# the lockfile that fixes it.
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - exercised only on Python 3.10
-    import tomli as tomllib
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:  # pragma: no cover - a floor without the backport
+        raise SystemExit(
+            f"this needs a TOML reader: {sys.executable} is "
+            f"{sys.version_info.major}.{sys.version_info.minor}, which has no "
+            "`tomllib` (3.11+), and the `tomli` backport is not installed. "
+            "`just ops-venv` provisions it from ops/deploy-requirements.txt."
+        ) from None
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "qualification/recovery/manifest.toml"

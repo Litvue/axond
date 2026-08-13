@@ -41,9 +41,17 @@ test:
 docs:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
 
+# The Python the ops gates run on: a venv built from the same hash-pinned
+# lockfile `deploy-check` uses, so a gate's result does not depend on whether the
+# machine's python is 3.11 (which has `tomllib`) or the documented 3.10 floor
+# (where the lockfile's `tomli` stands in for it).
+ops-venv:
+    python3 -m venv target/ops-venv
+    target/ops-venv/bin/pip install --quiet --require-virtualenv --require-hashes -r ops/deploy-requirements.txt
+
 # Validate documentation links, release markers, route coverage, the release
 # artifact matrix, and Compose variants.
-docs-check:
+docs-check: ops-venv
     python3 ops/check-docs.py --self-test
     python3 ops/check-docs.py
     python3 ops/check-release-config.py --self-test
@@ -53,7 +61,7 @@ docs-check:
     bash -n ops/verify-image-evidence.sh
     bash -n ops/pin-image-digest.sh
     bash -n ops/restore-drill.sh
-    python3 ops/check-recovery-evidence.py --self-test
+    target/ops-venv/bin/python ops/check-recovery-evidence.py --self-test
     bash -n ops/rollout-drill.sh
     bash ops/check-compose-platform.sh
     bash ops/check-installer-download.sh
@@ -78,8 +86,8 @@ deploy-check:
 # supported Postgres, with `axond migrate status` as the acceptance test. Needs
 # Docker. About a minute; documented in
 # docs/operations/backup-and-recovery.md.
-restore-drill:
-    bash ops/restore-drill.sh
+restore-drill: ops-venv
+    AXOND_PYTHON="$PWD/target/ops-venv/bin/python" bash ops/restore-drill.sh
 
 # Roll the production overlay out on a real three-worker kind cluster, then prove
 # the same rollout deadlocks once the per-node skew stops being counted per
