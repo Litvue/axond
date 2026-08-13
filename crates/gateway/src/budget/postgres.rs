@@ -31,7 +31,7 @@ use super::{
     Admission, BudgetError, BudgetKey, BudgetStore, Denial, ExceededScope, Reservation,
     SharedSettings,
 };
-use crate::policy::BudgetCaps;
+use crate::policy::{BudgetCaps, PolicyHold};
 use crate::telemetry::metrics;
 use crate::usage::validate_table_name;
 
@@ -620,6 +620,10 @@ impl BudgetStore for PostgresBudget {
             estimate_microdollars: estimated_microdollars,
             generation: governing.generation,
         };
+        // Counted before the transaction, so a publication landing mid-admission
+        // cannot see an empty drain list while this request is being admitted
+        // under the generation it is replacing. A denial drops the guard.
+        let hold = PolicyHold::take(&self.settings.ceilings, reservation.generation);
         match self
             .run(async |client| {
                 self.try_hold(client, key, &reservation, governing.caps)
@@ -628,7 +632,8 @@ impl BudgetStore for PostgresBudget {
             .await
         {
             Ok(None) => {
-                self.settings.ceilings.enter(reservation.generation);
+                // Settlement releases it from here on.
+                hold.kept();
                 Admission::Allowed(reservation)
             }
             Ok(Some(scope)) => {

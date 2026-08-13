@@ -532,6 +532,12 @@ impl RateLimiter for RedisRateLimiter {
         else {
             return self.unavailable("shared Redis invoke cap is exhausted");
         };
+        // Counted before the round-trip, and moved into the permit if one is
+        // granted: an operator waits on the drain list before a stop-the-fleet
+        // migration, so it may over-report a lease about to be denied but never
+        // miss one admitted while a publication landed. Every other path drops
+        // the guard.
+        let hold = PolicyHold::take(&self.ceilings, active.generation);
         let lease_id = next_id();
         let lease_key = self.key(key);
         let connection_generation = snapshot.generation;
@@ -652,7 +658,7 @@ impl RateLimiter for RedisRateLimiter {
         match result {
             Ok(Ok(Ok(Ok((1, _))))) => Ok(RateLimitPermit {
                 release: Some(PermitRelease::Redis(Box::new(release))),
-                hold: Some(PolicyHold::take(&self.ceilings, active.generation)),
+                hold: Some(hold),
             }),
             Ok(Ok(Ok(Ok(_)))) => {
                 metrics::record_rate_limit_denial();

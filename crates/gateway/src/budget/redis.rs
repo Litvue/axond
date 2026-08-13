@@ -50,6 +50,7 @@ use super::{
     Admission, BudgetError, BudgetKey, BudgetStore, Denial, ExceededScope, Reservation,
     SharedSettings,
 };
+use crate::policy::PolicyHold;
 use crate::telemetry::metrics;
 
 const BACKEND: &str = "redis";
@@ -820,6 +821,10 @@ impl BudgetStore for RedisBudget {
             estimate_microdollars: estimated_microdollars,
             generation: governing.generation,
         };
+        // Counted before the round-trip, so a publication landing mid-admission
+        // cannot see an empty drain list while this request is being admitted
+        // under the generation it is replacing. A denial drops the guard.
+        let hold = PolicyHold::take(&self.settings.ceilings, reservation.generation);
         let ttl_ms = caps.reservation_ttl.as_millis() as u64;
         let mut invocation = self.script(&self.reserve, key);
         invocation.arg(now_ms()).arg(ttl_ms);
@@ -834,7 +839,8 @@ impl BudgetStore for RedisBudget {
             .await;
         match admitted {
             Ok(1) => {
-                self.settings.ceilings.enter(reservation.generation);
+                // Settlement releases it from here on.
+                hold.kept();
                 Admission::Allowed(reservation)
             }
             Ok(2) => exceeded(key, ExceededScope::Namespace),

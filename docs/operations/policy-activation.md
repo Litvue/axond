@@ -128,6 +128,11 @@ A drain is bounded by *work*, not by a timer. A long-lived stream keeps its
 generation alive, and during a drain two generations are enforced at once — by
 design.
 
+The count is taken *before* the store call that admits, and released if that
+call denies, so it can briefly name a request that is about to be turned away
+but never misses one that was admitted. Zero therefore means what a migration
+needs it to mean: nothing is running under the superseded document.
+
 ## Rolling back
 
 **Roll back by publishing the old values forward: a new document, a higher epoch,

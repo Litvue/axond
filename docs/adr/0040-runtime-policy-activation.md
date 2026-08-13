@@ -68,8 +68,12 @@ is something an operator published.
 
 Every reservation and every shared concurrency lease is stamped with the
 generation active when it was admitted, and the runtime counts outstanding holds
-per generation: entered only after the backend admitted, exited exactly once at
-settlement, release, or drop. Two consequences follow structurally rather than by
+per generation: entered before the store call that admits, released if it denies,
+and otherwise exited exactly once at settlement, release, or drop. The count is
+deliberately conservative — a publication landing mid-admission may see a hold
+for a request about to be turned away, but never misses one that succeeded, so
+"no hold names the superseded generation" is the statement a stop-the-fleet
+migration can be gated on. Two consequences follow structurally rather than by
 convention:
 
 - Terms are not rewritten under a running request. A lease releases on the TTL it

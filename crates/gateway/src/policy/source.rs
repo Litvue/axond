@@ -74,12 +74,19 @@ impl Ceilings {
 ///
 /// A rate-limit lease is released by dropping its permit, on every path — including
 /// a cancelled request — so its drain accounting is a drop guard rather than an
-/// explicit call the request path could miss. Budget reservations settle
-/// explicitly and use [`Ceilings::enter`]/[`Ceilings::exit`] instead.
+/// explicit call the request path could miss.
+///
+/// A store takes one *before* the round-trip that admits, not after: an operator
+/// treats an empty drain list as proof that nothing is still running under the
+/// replaced document, so the count has to over-report an admission that is about
+/// to be denied rather than miss one that succeeded while a publication landed.
+/// A budget reservation settles explicitly, so its store calls [`PolicyHold::kept`]
+/// once admitted and pairs the count with [`Ceilings::exit`] at settlement.
 #[derive(Debug)]
 pub struct PolicyHold {
     ceilings: Ceilings,
     generation: Option<PolicyGeneration>,
+    kept: bool,
 }
 
 impl PolicyHold {
@@ -89,13 +96,22 @@ impl PolicyHold {
         Self {
             ceilings: ceilings.clone(),
             generation,
+            kept: false,
         }
+    }
+
+    /// Hand the count off to an explicit settlement path: the generation stays
+    /// counted after this guard goes away.
+    pub fn kept(mut self) {
+        self.kept = true;
     }
 }
 
 impl Drop for PolicyHold {
     fn drop(&mut self) {
-        self.ceilings.exit(self.generation);
+        if !self.kept {
+            self.ceilings.exit(self.generation);
+        }
     }
 }
 
@@ -127,6 +143,27 @@ mod tests {
         let held = generation(&body(PolicyScope::Tenant(tenant_id(1)), 1, 10), 1);
 
         ceilings.enter(Some(held));
+        assert_eq!(runtime.outstanding(held), 1);
+        ceilings.exit(Some(held));
+        assert_eq!(runtime.outstanding(held), 0);
+    }
+
+    #[test]
+    fn a_hold_taken_before_a_store_call_survives_only_the_admission_that_keeps_it() {
+        let runtime = Arc::new(PolicyRuntime::bootstrap(&stateless_config()));
+        let ceilings = Ceilings::published(&runtime);
+        let held = generation(&body(PolicyScope::Tenant(tenant_id(1)), 1, 10), 1);
+
+        // A store takes the hold before the round-trip; a denial drops it.
+        let denied = PolicyHold::take(&ceilings, Some(held));
+        assert_eq!(runtime.outstanding(held), 1);
+        drop(denied);
+        assert_eq!(runtime.outstanding(held), 0);
+
+        // An admission that settles explicitly keeps the count and releases it
+        // at settlement, so exactly one exit answers the one entry.
+        let admitted = PolicyHold::take(&ceilings, Some(held));
+        admitted.kept();
         assert_eq!(runtime.outstanding(held), 1);
         ceilings.exit(Some(held));
         assert_eq!(runtime.outstanding(held), 0);
