@@ -211,27 +211,27 @@ fleet become wrong at once. The component answers each:
   is. Restore the strategy *and* roll the template in the same edit — the drill
   below asserts that pair, and that the strategy alone is not enough.
 
-- **Administrative access.** A second Service, `axond-admin`, with
-  `publishNotReadyAddresses: true`. The `axond` Service selects Ready endpoints
-  and therefore has none, which is what you want for inference — an ingress must
-  not route callers to a replica that refuses them — and is exactly wrong for
-  the surface you administer the control plane through. Reach it directly:
+- **Administrative access.** The default stateful component deliberately creates
+  no `axond-admin` Service. A ClusterIP is not a security boundary when a
+  cluster's CNI ignores NetworkPolicy, and `/admin/v1` shares the listener with
+  inference. Reach one replica through an operator-controlled Pod port-forward:
+  The `axond` Service selects Ready endpoints and therefore has none. That is
+  correct for inference, and direct Pod forwarding keeps the administrative
+  surface out of the cluster-wide Service namespace.
 
   ```bash
-  kubectl -n axond port-forward service/axond-admin 8080:8080
+  kubectl -n axond get pods -l app.kubernetes.io/name=axond
+  kubectl -n axond port-forward pod/<running-axond-pod> 8080:8080
   curl -fsS -H "Authorization: Bearer ${GW_ADMIN_BREAKGLASS}" \
     http://127.0.0.1:8080/admin/v1/tenants
   ```
 
-  A port-forward works because its traffic originates on the node rather than
-  from a Pod. Nothing else reaches the Service by default, and that is the
-  boundary rather than an omission: `/admin/v1` and inference share one listener
-  on 8080, so a caller policy admits to those Pods reaches the administrative
-  surface whichever Service it resolved. The production overlay admits the
-  ingress controller's namespace to 8080 because that is how inference callers
-  arrive; on this fleet inference is refused, so that allowance would hand the
-  public ingress path the admin surface and nothing else. The component's
-  `admin-boundary.yaml` therefore *replaces* it:
+  A port-forward is a kubelet-mediated operator action rather than a
+  cluster-wide network endpoint, so this remains fail-closed even when the CNI
+  does not implement NetworkPolicy. The production overlay's ingress allowance
+  is also replaced by `admin-boundary.yaml`; because inference is refused on
+  this fleet, inheriting that allowance would expose `/admin/v1` to the public
+  ingress path.
 
   ```yaml
   ingress:
@@ -244,18 +244,16 @@ fleet become wrong at once. The component answers each:
           port: 8080
   ```
 
-  Widen it deliberately, one client at a time: label the Pods of the CI job or
-  operator tool `axond.dev/admin-client: "true"`, or add a `namespaceSelector`
-  beside that `podSelector` for a namespace you control. To publish it, front
-  `/admin/v1` with an ingress that requires operator identity and label that
-  controller — do not restore the inference ingress rule, whose callers are
-  authenticated by nothing the gateway sees. The only authentication in front of
-  the surface itself today is the break-glass credential in `axond-secrets`.
+  If a Service is required, apply
+  `deploy/kubernetes/components/stateful/admin-service.yaml` only as an explicit
+  opt-in alongside a CNI-enforced, operator-authenticated boundary. Do not add it
+  to the default component or restore the inference ingress rule. The only
+  authentication in front of the surface itself today is the break-glass
+  credential in `axond-secrets`.
 
-  The manifest gate holds all three edges: `axond-admin` stays `ClusterIP`, no
-  Ingress in this overlay routes to it, and no NetworkPolicy on the gateway Pods
-  admits a whole namespace to their port — so the boundary cannot be widened by
-  an edit no reviewer reads.
+  The manifest gate requires the default stateful render to contain no
+  `axond-admin` Service and no ingress route to it, so a CNI implementation detail
+  cannot silently widen the administrative surface.
 
 - **Node drains.** `unhealthyPodEvictionPolicy: AlwaysAllow` on the disruption
   budget. The default (`IfHealthyBudget`) evicts an unready Pod only while the
@@ -332,7 +330,8 @@ just stateful-deploy-drill        # ops/stateful-deploy-drill.sh on a three-work
 ```
 
 The drill migrates once, asserts three Running and zero Ready replicas, probes
-`/healthz`, `/readyz`, inference, and `/admin/v1` through the admin Service, then
+`/healthz`, `/readyz`, inference, and `/admin/v1` through an operator Pod
+port-forward, then
 requires a `RollingUpdate` to stall and the default disruption budget to refuse
 the eviction that `AlwaysAllow` permits. Run it when you change the strategy,
 the Services, the budget, or the migration Job.

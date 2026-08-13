@@ -365,6 +365,13 @@ while kill -0 "$stateful_pid" 2>/dev/null; do
   sleep 0.1
 done
 wait "$stateful_pid" || stateful_status=$?
+# The process may have exited between the last liveness sample and `wait`.
+# Take one post-mortem refusal sample as well; otherwise the loop's lifetime
+# would become the evidence and a short-lived listener could be missed simply
+# because the failed boot ended before the next iteration.
+if (exec 3<>"/dev/tcp/127.0.0.1/${stateful_port}") 2>/dev/null; then
+  stateful_bound=yes
+fi
 [[ "$stateful_status" != 0 ]] ||
   failure "a stateful process started with no control plane reachable and its control-plane, KEK, and breakglass references unset; it must fail loudly rather than serve an empty snapshot"
 [[ "$stateful_status" != 124 ]] ||

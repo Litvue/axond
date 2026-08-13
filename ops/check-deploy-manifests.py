@@ -807,33 +807,17 @@ def check_stateful(documents: list[Document]) -> list[str]:
         )
 
     services = {service["metadata"]["name"]: service for service in of_kind(documents, "Service")}
-    admin = services.get("axond-admin")
-    if admin is None:
+    # The default stateful component must not publish `/admin/v1` through a
+    # Service. NetworkPolicy is not a security boundary on clusters whose CNI
+    # ignores it, so even a ClusterIP would make the break-glass surface
+    # reachable by every Pod. Operators use direct Pod port-forwarding; an
+    # administrative Service is an explicit opt-in outside this component.
+    if "axond-admin" in services:
         failures.append(
-            f"{label}: there is no axond-admin Service, so /admin/v1 is unreachable — the "
-            "inference Service has no endpoints while no replica is Ready"
+            f"{label}: the default stateful overlay publishes axond-admin; a Service cannot "
+            "secure /admin/v1 when the cluster CNI ignores NetworkPolicy — use Pod "
+            "port-forwarding or an independently enforced operator boundary"
         )
-    else:
-        if not admin["spec"].get("publishNotReadyAddresses"):
-            failures.append(
-                f"{label}: the axond-admin Service does not publish not-ready addresses, which "
-                "is the only thing that gives it endpoints on this fleet"
-            )
-        if admin["spec"].get("selector") != SELECTOR:
-            failures.append(f"{label}: the axond-admin Service does not select the axond Pods")
-        # `/admin/v1` shares one listener with inference, so this Service grants
-        # no reachability the NetworkPolicy has not already granted — and must
-        # not be the thing that grants some. A type that allocates a node port
-        # or a cloud load balancer publishes the administrative surface of a
-        # fleet whose only credential is the break-glass secret, outside the
-        # policy that is supposed to decide who reaches it.
-        if admin["spec"].get("type") not in (None, "ClusterIP"):
-            failures.append(
-                f"{label}: the axond-admin Service is {admin['spec']['type']!r}; a surface "
-                "authenticated only by the break-glass credential must not be published off the "
-                "cluster by its own Service — front it with an ingress that requires operator "
-                "identity instead"
-            )
     # The inference ingress path is the boundary that matters here. `/admin/v1`
     # shares one listener with inference, and on this fleet inference is refused
     # — so the overlay's allowance for the ingress controller's namespace, which
@@ -1150,17 +1134,19 @@ def self_test() -> int:
     one(blocked, "PodDisruptionBudget")["spec"].pop("unhealthyPodEvictionPolicy")
     expect_failure("a budget that blocks every drain", check_stateful(blocked))
 
-    unreachable_admin = copy.deepcopy(stateful)
-    for service in of_kind(unreachable_admin, "Service"):
-        if service["metadata"]["name"] == "axond-admin":
-            service["spec"].pop("publishNotReadyAddresses")
-    expect_failure("an admin Service with no endpoints", check_stateful(unreachable_admin))
-
     published_admin = copy.deepcopy(stateful)
-    for service in of_kind(published_admin, "Service"):
-        if service["metadata"]["name"] == "axond-admin":
-            service["spec"]["type"] = "LoadBalancer"
-    expect_failure("an admin Service published off the cluster", check_stateful(published_admin))
+    published_admin.append(
+        {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "axond-admin", "namespace": "axond"},
+            "spec": {"type": "ClusterIP", "selector": dict(SELECTOR)},
+        }
+    )
+    expect_failure(
+        "the default stateful overlay publishes an admin Service",
+        check_stateful(published_admin),
+    )
 
     ingressed_admin = copy.deepcopy(stateful)
     ingressed_admin.append(

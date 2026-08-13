@@ -12,9 +12,10 @@
 #   1. `axond migrate apply` runs once as a Job, before any replica, and a rerun
 #      against the migrated database is a no-op rather than a second migration;
 #   2. replicas are Running and never Ready, so the `axond` Service has no
-#      endpoints and `axond-admin` — `publishNotReadyAddresses: true` — has all of
-#      them; `/admin/v1` answers through it while `/v1/chat/completions` answers
-#      `503 inference_unavailable`;
+#      endpoints; the default component publishes no admin Service because a
+#      CNI that ignores NetworkPolicy would make it cluster-wide. An operator
+#      port-forwards directly to a selected Pod, where `/admin/v1` answers while
+#      `/v1/chat/completions` answers `503 inference_unavailable`;
 #   3. an upgrade completes with `strategy: Recreate`, and the counterfactual —
 #      the base's `RollingUpdate` with `maxUnavailable: 0` — hangs, because it
 #      waits for an availability this fleet never reports;
@@ -270,18 +271,17 @@ inference_endpoints="$(kube -n axond get endpointslices -l kubernetes.io/service
 [[ "$inference_endpoints" == 0 ]] ||
   fail "the inference Service has ${inference_endpoints} ready endpoint(s); a replica \
 refusing inference must not be routed to"
-admin_endpoints="$(kube -n axond get endpointslices -l kubernetes.io/service-name=axond-admin \
-  -o jsonpath='{range .items[*].endpoints[*]}{.targetRef.name}{"\n"}{end}' | grep -c . || true)"
-[[ "$admin_endpoints" == 3 ]] ||
-  fail "the admin Service publishes ${admin_endpoints} endpoint(s), not the three \
-not-ready replicas it exists to reach"
-ok "axond: no endpoints; axond-admin: three not-ready endpoints"
+admin_pod="$(kube -n axond get pods -l app.kubernetes.io/name=axond \
+  -o jsonpath='{.items[0].metadata.name}')"
+[[ -n "$admin_pod" ]] || fail "no Running axond Pod is available for the operator port-forward"
+ok "axond: no inference endpoints; direct operator access uses Pod ${admin_pod}"
 
-step "Probing the surfaces through the admin Service"
-# Port-forwarded rather than probed from a Pod: the overlay's default-deny
-# NetworkPolicy is applied here as an operator would apply it, and a probe Pod
-# would be asserting the CNI's behaviour instead of the gateway's.
-kube -n axond port-forward service/axond-admin 18443:8080 >"${workdir}/forward.log" 2>&1 &
+step "Probing the surfaces through an operator Pod port-forward"
+# The default component intentionally has no admin Service. Port-forwarding is
+# a kubelet-mediated operator action and remains available even when the CNI
+# does not implement NetworkPolicy; a cluster-wide Service would not be safe in
+# that case.
+kube -n axond port-forward "pod/${admin_pod}" 18443:8080 >"${workdir}/forward.log" 2>&1 &
 port_forward=$!
 for _ in $(seq 1 30); do
   curl -sf -o /dev/null "http://127.0.0.1:18443/healthz" && break
@@ -290,7 +290,7 @@ done
 
 probe() { curl -s -o "${workdir}/body" -w '%{http_code}' "$@"; }
 [[ "$(probe http://127.0.0.1:18443/healthz)" == 200 ]] ||
-  fail "liveness did not answer 200 through the admin Service"
+  fail "liveness did not answer 200 through the operator Pod port-forward"
 [[ "$(probe http://127.0.0.1:18443/readyz)" == 503 ]] ||
   fail "readiness answered something other than 503 on an unconverged replica"
 ok "/healthz 200, /readyz 503"

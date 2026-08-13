@@ -1,4 +1,8 @@
-# `/admin/v1` on Pods that are deliberately not Ready.
+# Optional administrative Service for `/admin/v1` on Pods that are deliberately
+# not Ready. This file is intentionally not included by the default stateful
+# component: a Service cannot enforce an operator boundary when the cluster's
+# CNI ignores NetworkPolicy. Apply it only with an independently enforced,
+# operator-authenticated boundary; otherwise use direct Pod port-forwarding.
 #
 # The base's `axond` Service keeps its ordinary semantics — endpoints only for
 # Ready Pods — so it stays empty while inference is refused, and an ingress in
