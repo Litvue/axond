@@ -348,6 +348,19 @@ installer step drops that pin or moves off it. Adopting cosign 3 is a deliberate
 migration: the published verification instructions, the operator-facing docs, and
 that check move in the same change, not in a dependency bump.
 
+Reading the YAML only proves the pin is written down, not that the installer
+still honours it — whether a major-4 installer still accepts `cosign-release` and
+still resolves 2.x assets is an upstream question. The `Cosign signing format`
+CI lane answers it on every change: it installs cosign through the same pinned
+installer step the release uses, then
+[`ops/check-cosign-format.sh`](../../ops/check-cosign-format.sh) asserts the
+installed version is the pinned one and signs a throwaway image and index in a
+local registry, requiring the signature to appear under the `sha256-<digest>.sig`
+tag operators resolve. Signing there is key-based because a pull request has no
+OIDC identity; the storage format under test is the same either way.
+`ops/check-release-config.py` keeps that lane's installer step identical to the
+release lanes', so a bump cannot move the release and leave the evidence behind.
+
 Everything in that lane is offline except the label check
 ([`ops/dependabot-labels.sh`](../../ops/dependabot-labels.sh)), which needs an
 authenticated `gh` and reports that it skipped when there is none. It also skips

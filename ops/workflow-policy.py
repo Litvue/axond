@@ -117,10 +117,12 @@ def check_permissions(text: str, relative: str) -> list[str]:
 
 
 def check_cosign_verify(text: str, relative: str) -> list[str]:
-    """Every `cosign verify` restricts the certificate identity and its issuer.
+    """Every `cosign verify` restricts who the signature must come from.
 
-    Without both flags the command accepts any Fulcio certificate, so it proves
-    only that *someone* signed the artifact.
+    Keyless verification without both certificate flags accepts any Fulcio
+    certificate, so it proves only that *someone* signed the artifact. `--key`
+    is the other way to say the same thing — the signature must verify against
+    one named public key — and the certificate flags do not apply to it.
     """
     failures: list[str] = []
     lines = text.splitlines()
@@ -130,6 +132,8 @@ def check_cosign_verify(text: str, relative: str) -> list[str]:
             continue
         # The flags live on the continuation lines of the same command.
         block = "\n".join(lines[index : index + 16])
+        if re.search(r"--key[= ]", block):
+            continue
         if "--certificate-identity-regexp" not in block or "--certificate-oidc-issuer" not in block:
             failures.append(
                 f"{relative}:{index + 1}: `cosign verify` must pass "
@@ -278,6 +282,13 @@ def self_test() -> list[str]:
             "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
             "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0\n",
             "one reviewed pin per action",
+        ),
+        (
+            "cosign verify bound to a named public key instead",
+            SELF_TEST_PERMISSIONS
+            + "jobs:\n  a:\n    steps:\n"
+            "      - run: cosign verify --key k.pub ghcr.io/o/r@sha256:x\n",
+            "",
         ),
         (
             "cosign verify without an identity restriction",

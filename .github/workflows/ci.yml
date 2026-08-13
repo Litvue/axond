@@ -484,6 +484,27 @@ jobs:
       - name: Boot the container and probe /healthz
         run: bash ops/docker-smoke.sh axond-ci-smoke
 
+  # `release-please.yml` asks a major-4 installer for a 2.x cosign binary, and
+  # whether that still works is an upstream question no linter can answer. This
+  # installs cosign exactly as the release does and signs a throwaway image and
+  # index with it, asserting the signature lands where docs/installation.md
+  # tells operators to look. The release cannot catch this itself: it verifies
+  # its own output with the binary that produced it.
+  cosign-format:
+    name: Cosign signing format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Kept identical to the release lanes by ops/check-release-config.py, so
+      # the binary under test is the binary that signs.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.5.2
+      - name: Sign and verify against the published signature format
+        run: |
+          shellcheck ops/check-cosign-format.sh
+          bash ops/check-cosign-format.sh
+
   quickstart-smoke:
     name: Compose quickstart smoke
     runs-on: ubuntu-latest
@@ -514,6 +535,7 @@ jobs:
       - static-binary
       - binary-smoke
       - docker-smoke
+      - cosign-format
       - quickstart-smoke
     runs-on: ubuntu-latest
     steps:
@@ -535,4 +557,5 @@ jobs:
           test "${{ needs.static-binary.result }}" = success
           test "${{ needs.binary-smoke.result }}" = success
           test "${{ needs.docker-smoke.result }}" = success
+          test "${{ needs.cosign-format.result }}" = success
           test "${{ needs.quickstart-smoke.result }}" = success

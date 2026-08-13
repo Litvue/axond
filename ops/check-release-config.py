@@ -484,6 +484,53 @@ def check_cosign_pin(text: str) -> list[str]:
     return failures
 
 
+def check_cosign_format_lane(text: str, ci: str) -> list[str]:
+    """The lane that exercises cosign must install the binary the release signs with.
+
+    `check_cosign_pin` only reads YAML, and the pin's risk is an upstream one:
+    whether that installer still accepts `cosign-release` and still resolves 2.x
+    assets. `ops/check-cosign-format.sh` answers it by signing with the real
+    binary, which is evidence about the release only while the CI lane and the
+    release lanes install the same thing — otherwise a bump moves the release and
+    leaves the test proving something about a version nobody ships.
+    """
+    release = {
+        (
+            re.search(r"uses: (sigstore/cosign-installer@\S+)", step).group(1),
+            re.search(r"cosign-release:\s*(\S+)", step).group(1),
+        )
+        for step in cosign_installer_steps(text)
+        if re.search(r"cosign-release:\s*(\S+)", step)
+    }
+    tested = {
+        (
+            re.search(r"uses: (sigstore/cosign-installer@\S+)", step).group(1),
+            re.search(r"cosign-release:\s*(\S+)", step).group(1),
+        )
+        for step in cosign_installer_steps(ci)
+        if re.search(r"cosign-release:\s*(\S+)", step)
+    }
+    failures: list[str] = []
+    if "ops/check-cosign-format.sh" not in ci:
+        failures.append(
+            "ci.yml: no lane runs ops/check-cosign-format.sh, so nothing proves the "
+            "installer still delivers the pinned cosign or that it writes the "
+            "signature format docs/installation.md documents"
+        )
+    if not tested:
+        failures.append(
+            "ci.yml: no cosign-installer step pins `cosign-release`, so the signing "
+            "format is exercised with a different binary than the release uses"
+        )
+    elif tested != release:
+        failures.append(
+            f"ci.yml installs cosign as {sorted(tested)} while release-please.yml "
+            f"signs with {sorted(release)}; the compatibility lane must install what "
+            "the release installs or it proves nothing about the release"
+        )
+    return failures
+
+
 def check_compose_platform(notes: list[str]) -> list[str]:
     """The quickstart's platform default must match what its pinned tag can serve.
 
@@ -735,6 +782,23 @@ def self_test() -> int:
     assert len(cosign_installer_steps(both)) == 2
     assert len(check_cosign_pin(both)) == 1
 
+    # The lane that signs for real must install what the release installs: a
+    # bump applied to one side only leaves the evidence describing a version
+    # nobody ships.
+    lane = (
+        "jobs:\n  cosign-format:\n    steps:\n"
+        "      - uses: sigstore/cosign-installer@abc # v4.1.2\n"
+        "        with:\n          cosign-release: v2.5.2\n"
+        "      - run: bash ops/check-cosign-format.sh\n"
+    )
+    assert check_cosign_format_lane(signed, lane) == []
+    assert check_cosign_format_lane(signed, lane.replace("v2.5.2", "v2.4.0")) != []
+    assert check_cosign_format_lane(signed, lane.replace("@abc", "@def")) != []
+    assert check_cosign_format_lane(
+        signed, lane.replace("      - run: bash ops/check-cosign-format.sh\n", "")
+    ) != []
+    assert check_cosign_format_lane(signed, "jobs:\n  fmt:\n    steps: []\n") != []
+
     # The committed constant is deliberately not asserted here: it legitimately
     # moves if the quickstart is ever pinned back onto a newer amd64-only release,
     # and a tree where it disagrees with the pinned tag is already reported by
@@ -763,6 +827,11 @@ def main(argv: list[str]) -> int:
     failures.extend(check_image_gates(text))
     failures.extend(check_release_success(text))
     failures.extend(check_cosign_pin(text))
+    failures.extend(
+        check_cosign_format_lane(
+            text, (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        )
+    )
     failures.extend(check_compose_platform(notes))
     failures.extend(check_platform_transition_guidance())
     failures.extend(check_no_latest_tag(text))
