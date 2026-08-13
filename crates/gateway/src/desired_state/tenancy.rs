@@ -240,6 +240,12 @@ pub enum TenancyError {
         first: ResourceRef,
         detail: String,
     },
+    #[error("{reference} and {first} are both authenticated by the key {digest}")]
+    DuplicateKey {
+        reference: ResourceRef,
+        first: ResourceRef,
+        digest: String,
+    },
     #[error("{reference} belongs to {project}, which this revision does not declare")]
     UnknownProject {
         reference: ResourceRef,
@@ -323,6 +329,7 @@ impl TenancyError {
             | Self::RoleScope { .. }
             | Self::FieldNotForKind { .. }
             | Self::DuplicatePrincipal { .. }
+            | Self::DuplicateKey { .. }
             | Self::UnknownProject { .. }
             | Self::IdentityScope { .. } => false,
         }
@@ -356,6 +363,7 @@ impl TenancyError {
             | Self::RoleScope { reference, .. }
             | Self::FieldNotForKind { reference, .. }
             | Self::DuplicatePrincipal { reference, .. }
+            | Self::DuplicateKey { reference, .. }
             | Self::IdentityScope { reference, .. }
             | Self::UnknownProject { reference, .. } => *reference,
         }

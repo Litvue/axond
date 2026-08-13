@@ -58,9 +58,33 @@ CREATE TABLE IF NOT EXISTS axond_cp_tenant (
 -- deleted tenant releases its slug: keeping it reserved forever turns a deletion
 -- into a permanent namespace claim, and the id — not the slug — is what history
 -- points at.
-CREATE UNIQUE INDEX IF NOT EXISTS axond_cp_tenant_slug_idx
-    ON axond_cp_tenant (slug)
-    WHERE lifecycle <> 'deleted';
+--
+-- Deferrable, and an EXCLUDE constraint rather than a partial unique index
+-- because only a constraint can be deferred. Uniqueness is a property of the
+-- revision, not of the order its rows happen to be written in: two tenants that
+-- trade names in one revision pass through an intermediate state where both hold
+-- the same one, and an immediately-checked index would refuse a revision the
+-- domain accepts, permanently, depending on which id sorted first. The projection
+-- restores immediate checking once every row is written (`SET CONSTRAINTS ALL
+-- IMMEDIATE`), so the refusal still arrives inside the projection rather than at
+-- commit, where it could not be attributed.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        -- By the table, not by the name alone: a constraint name is unique per
+        -- table, not per database, and a deployment that shares its database with
+        -- another schema would otherwise skip creating this one.
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'axond_cp_tenant'::regclass
+          AND conname = 'axond_cp_tenant_slug_unique'
+    ) THEN
+        ALTER TABLE axond_cp_tenant
+            ADD CONSTRAINT axond_cp_tenant_slug_unique
+            EXCLUDE (slug WITH =) WHERE (lifecycle <> 'deleted')
+            DEFERRABLE INITIALLY DEFERRED;
+    END IF;
+END
+$$;
 
 -- Projects: the routing and accounting boundary beneath a tenant, and what a
 -- stateless deployment calls a namespace. `UNIQUE (tenant_id, project_id)` is
@@ -75,7 +99,11 @@ CREATE TABLE IF NOT EXISTS axond_cp_project (
     revision_id  text        NOT NULL,
     updated_at   timestamptz NOT NULL DEFAULT now(),
     UNIQUE (tenant_id, project_id),
-    UNIQUE (tenant_id, slug)
+    -- Deferred for the same reason as a tenant's name: two projects of one tenant
+    -- may trade slugs in a single revision, and which one is written first is an
+    -- id ordering rather than a decision.
+    CONSTRAINT axond_cp_project_slug_unique UNIQUE (tenant_id, slug)
+        DEFERRABLE INITIALLY DEFERRED
 );
 
 -- The identity directory: who may administer this deployment, and where.
@@ -205,10 +233,32 @@ ALTER TABLE axond_cp_audit_event
     ADD COLUMN IF NOT EXISTS actor_tenant_id text NULL,
     ADD COLUMN IF NOT EXISTS actor_principal_id text NULL;
 
-ALTER TABLE axond_cp_mutation
-    DROP CONSTRAINT IF EXISTS axond_cp_mutation_actor_kind_check;
-ALTER TABLE axond_cp_mutation
-    DROP CONSTRAINT IF EXISTS axond_cp_mutation_actor_attribution;
+-- 0001 wrote its `actor_kind` vocabulary as an inline column check, so the
+-- constraint holding the old three-value list is named by PostgreSQL rather than
+-- by us. Dropping a guessed name with `IF EXISTS` would succeed silently against
+-- a database whose name differs and then reject `actor_kind = 'workload'` at the
+-- first workload-attributed mutation, so the old checks are found by what they
+-- constrain instead of by what they are called.
+DO $$
+DECLARE
+    stale record;
+BEGIN
+    FOR stale IN
+        SELECT conrelid::regclass AS table_name, conname
+        FROM pg_constraint
+        WHERE conrelid IN ('axond_cp_mutation'::regclass, 'axond_cp_audit_event'::regclass)
+          AND contype = 'c'
+          AND pg_get_constraintdef(oid) LIKE '%actor_kind%'
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %s DROP CONSTRAINT %I',
+            stale.table_name,
+            stale.conname
+        );
+    END LOOP;
+END
+$$;
+
 ALTER TABLE axond_cp_mutation
     ADD CONSTRAINT axond_cp_mutation_actor_attribution CHECK (
         (actor_kind = 'human' AND actor_issuer IS NOT NULL AND actor_subject IS NOT NULL AND actor_component IS NULL AND actor_tenant_id IS NULL AND actor_principal_id IS NULL)
@@ -217,10 +267,6 @@ ALTER TABLE axond_cp_mutation
         OR (actor_kind = 'system' AND actor_component IS NOT NULL AND actor_issuer IS NULL AND actor_subject IS NULL AND actor_tenant_id IS NULL AND actor_principal_id IS NULL)
     );
 
-ALTER TABLE axond_cp_audit_event
-    DROP CONSTRAINT IF EXISTS axond_cp_audit_event_actor_kind_check;
-ALTER TABLE axond_cp_audit_event
-    DROP CONSTRAINT IF EXISTS axond_cp_audit_event_actor_attribution;
 ALTER TABLE axond_cp_audit_event
     ADD CONSTRAINT axond_cp_audit_event_actor_attribution CHECK (
         (actor_kind = 'human' AND actor_issuer IS NOT NULL AND actor_subject IS NOT NULL AND actor_component IS NULL AND actor_tenant_id IS NULL AND actor_principal_id IS NULL)

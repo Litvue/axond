@@ -891,6 +891,10 @@ pub struct Directory {
     /// `(issuer, subject)` to principal, so a sign-in resolves without a scan and
     /// two rows for one person are refused at resolution time.
     humans: BTreeMap<(String, String), PrincipalId>,
+    /// Key digest to workload, for the same reason: one key authenticates at most
+    /// one identity, so which roles it carries is a declaration rather than a
+    /// consequence of id ordering.
+    keys: BTreeMap<Checksum, PrincipalId>,
 }
 
 impl Directory {
@@ -969,6 +973,26 @@ impl Directory {
                     });
                 }
                 directory.humans.insert(key, principal.body.principal());
+            }
+            // The same rule for a minted key: two workloads sharing a digest would
+            // make `authenticate_workload` return whichever id sorts first, so a
+            // key would carry a scope and a role set nobody granted it. SQL holds
+            // a unique index on the digest; refusing it here means the revision is
+            // invalid rather than unpublishable, and the refusal names the digest
+            // rather than a name that did not clash.
+            if let Credential::MintedKey {
+                digest: Some(digest),
+            } = principal.body.credential()
+            {
+                if let Some(first) = directory.keys.get(digest) {
+                    let first = directory.principals[first].reference;
+                    return Err(TenancyError::DuplicateKey {
+                        reference,
+                        first,
+                        digest: digest.to_string(),
+                    });
+                }
+                directory.keys.insert(*digest, principal.body.principal());
             }
             directory
                 .principals
@@ -1852,6 +1876,30 @@ mod tests {
         assert!(matches!(
             Directory::of(&state, &tenancy),
             Err(TenancyError::DuplicatePrincipal { .. })
+        ));
+    }
+
+    /// And one key authenticates one workload. Without this the key would resolve
+    /// to whichever principal sorted first, carrying a scope and a role set nobody
+    /// granted it — and the refusal would come only from SQL, at publication.
+    #[test]
+    fn one_key_is_one_workload() {
+        let mut state = state_with_directory();
+        // The digest principal 32 already carries, at a different id and with a
+        // role that principal was not granted.
+        state
+            .insert(workload(
+                36,
+                "second-runner",
+                ResourceScope::Tenant(tenant_id(1)),
+                &[Role::TenantAdmin],
+                Some(&workload_key(0xd0)),
+            ))
+            .expect("insertion is not validation");
+        let tenancy = Tenancy::of(&state).expect("valid tenancy");
+        assert!(matches!(
+            Directory::of(&state, &tenancy),
+            Err(TenancyError::DuplicateKey { .. })
         ));
     }
 

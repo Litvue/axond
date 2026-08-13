@@ -1127,6 +1127,17 @@ async fn project_tenancy(
             })?;
     }
 
+    // The two name constraints are deferred, so that a revision in which two
+    // tenants or two projects trade names is judged on the state it declares
+    // rather than on the order its rows were written in. Checking them here rather
+    // than leaving them to commit is what keeps a violation attributable: at
+    // commit the error would arrive with no operation to name, and after the
+    // publication had otherwise succeeded.
+    transaction
+        .execute("SET CONSTRAINTS ALL IMMEDIATE", &[])
+        .await
+        .map_err(|error| projection_failure("settle owner names", "name", "", &error))?;
+
     let declared: Vec<String> = directory
         .principals()
         .map(|principal| principal.body.principal().to_string())
@@ -1426,13 +1437,29 @@ fn projection_failure(
     slug: &str,
     error: &tokio_postgres::Error,
 ) -> ControlPlaneError {
-    if is_unique_violation(error) {
+    if let Some(db) = error.as_db_error().filter(|db| is_collision(db)) {
+        // Which constraint was violated, rather than an assumption about which one
+        // it was: a projected row can collide over a name, an OIDC subject, or a
+        // key digest, and a row whose identity clashes is not a name to rename.
+        // A caller that named no slug — the directory, projected as a set — is told
+        // what collided instead of being told its empty name is taken.
+        if slug.is_empty() {
+            return denied(format!(
+                "projecting the {noun}s of this revision collides with a row this deployment \
+                 already holds{}: {}{}; the colliding row is retained until a revision deletes \
+                 it, so no retry clears this",
+                db.constraint()
+                    .map_or_else(String::new, |name| format!(" ({name})")),
+                db.message(),
+                // The detail names the colliding value, which the message does not.
+                db.detail()
+                    .map_or_else(String::new, |detail| format!(" — {detail}")),
+            ));
+        }
         return ControlPlaneError::NameTaken {
             noun,
             name: slug.to_owned(),
-            holder: error
-                .as_db_error()
-                .and_then(|db| db.constraint().map(ToOwned::to_owned)),
+            holder: db.constraint().map(ToOwned::to_owned),
         };
     }
     unavailable(operation, error)
@@ -1442,6 +1469,16 @@ fn is_unique_violation(error: &tokio_postgres::Error) -> bool {
     error
         .as_db_error()
         .is_some_and(|db| db.code() == &SqlState::UNIQUE_VIOLATION)
+}
+
+/// Whether a failure is a row this deployment already holds refusing to be
+/// duplicated — a unique index, or the deferred exclusion constraint that carries
+/// tenant names.
+fn is_collision(db: &tokio_postgres::error::DbError) -> bool {
+    matches!(
+        *db.code(),
+        SqlState::UNIQUE_VIOLATION | SqlState::EXCLUSION_VIOLATION
+    )
 }
 
 fn audit_event(row: &Row) -> Result<AuditEvent, IntegrityError> {
@@ -1535,10 +1572,11 @@ mod tests {
     use super::*;
     use crate::backends::{BackendFailure, FailureCategory};
     use crate::desired_state::fixtures::{
-        DESIRED_STATE_RESOURCES, candidate, project_alias, project_id, reference, state,
-        state_a_pre_tenancy_build_published, state_with_directory, state_with_renamed_alias,
-        state_with_revoked_workload, state_with_second_tenant, state_with_two_blobs, tenant,
-        tenant_body, tenant_id, two_tenant_directory_state, workload_key,
+        DESIRED_STATE_RESOURCES, candidate, principal_id, project, project_alias, project_body,
+        project_id, reference, state, state_a_pre_tenancy_build_published, state_with_directory,
+        state_with_renamed_alias, state_with_revoked_workload, state_with_second_tenant,
+        state_with_two_blobs, tenant, tenant_body, tenant_id, two_tenant_directory_state,
+        workload_key,
     };
     use crate::desired_state::{
         Actor, AuditEventId, Checksum, DesiredState, ExpectedRevision, MutationId, PrincipalId,
@@ -3356,6 +3394,97 @@ mod tests {
         assert_eq!(
             store.desired_revision().await.expect("head"),
             Some(first.id)
+        );
+    }
+
+    /// A workload's change is recordable: the vocabulary 0001 wrote as an inline
+    /// column check admitted three actor kinds, and this publishes the fourth
+    /// through the journal's own writer rather than asserting on the schema.
+    #[tokio::test]
+    async fn a_revision_a_workload_published_is_attributed_to_its_principal() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let actor = Actor::Workload {
+            tenant: tenant_id(1),
+            principal: principal_id(32),
+        };
+        let mut candidate = candidate(ExpectedRevision::Empty, "by-workload", state());
+        candidate.mutation.actor = actor.clone();
+        candidate.audit.actor = actor.clone();
+        let published = store
+            .publish_revision(candidate)
+            .await
+            .expect("a workload's revision publishes");
+
+        let trail = store.audit_trail(published.id).await.expect("audit trail");
+        assert_eq!(trail.len(), 1);
+        assert_eq!(trail[0].actor, actor);
+        assert_eq!(
+            store
+                .column("SELECT actor_principal_id FROM axond_cp_mutation")
+                .await,
+            vec![principal_id(32).to_string()],
+            "the mutation carries the workload it was made by"
+        );
+    }
+
+    /// Two tenants — and two projects of one tenant — trading names in a single
+    /// revision, which is valid desired state and must not depend on the order the
+    /// projection happens to write its rows in.
+    #[tokio::test]
+    async fn two_owners_may_trade_names_in_one_revision() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let slug = |slug: &str| Slug::parse(slug).expect("a slug");
+        let mut before = state();
+        before
+            .insert(tenant(11, "globex"))
+            .and_then(|state| state.insert(project(&tenant_id(1), 3, "edge")))
+            .expect("two tenants and two projects of one of them are valid");
+        let first = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "named", before.clone()))
+            .await
+            .expect("the original names publish");
+
+        // Each of the four rows takes the name another of them is giving up.
+        let second = ResourceVersionNumber::FIRST.next();
+        let mut swapped = before;
+        swapped
+            .supersede(tenant_body(1, "Acme").version_at(slug("globex"), second))
+            .and_then(|state| {
+                state.supersede(tenant_body(11, "Globex").version_at(slug("acme"), second))
+            })
+            .and_then(|state| {
+                state.supersede(project_body(2, 1, "Core").version_at(slug("edge"), second))
+            })
+            .and_then(|state| {
+                state.supersede(project_body(3, 1, "Edge").version_at(slug("core"), second))
+            })
+            .expect("a state in which names are exchanged is valid");
+        store
+            .publish_revision(candidate_with_mutation(
+                ExpectedRevision::Exactly(first.id),
+                "swap",
+                swapped,
+                90,
+            ))
+            .await
+            .expect("names that are exchanged rather than duplicated must publish");
+
+        assert_eq!(
+            store
+                .column("SELECT slug FROM axond_cp_tenant ORDER BY tenant_id")
+                .await,
+            vec!["globex", "acme"],
+            "each tenant holds the name the other gave up"
+        );
+        assert_eq!(
+            store
+                .column("SELECT slug FROM axond_cp_project ORDER BY project_id")
+                .await,
+            vec!["edge", "core"]
         );
     }
 
