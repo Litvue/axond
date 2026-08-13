@@ -787,7 +787,14 @@ async fn control_plane_outage_journal_outage() {
         "a caller is told to retry rather than to change the request",
     );
 
+    recorder.require(
+        "the_refusal_is_categorised_unavailable",
+        "unavailable",
+        category,
+        "the refused publish carries the category an operator retries on, not a request fault",
+    );
     let refused_retryably = recorder.held("the_refused_publish_is_retryable")
+        && recorder.held("the_refusal_is_categorised_unavailable")
         && recorder.held("the_rejection_names_the_unavailable_journal");
     recorder.gate(
         "admin_writes",
