@@ -215,7 +215,7 @@ impl Reloader {
         current: &ConfigSnapshot,
         generation: u64,
     ) -> Result<ConfigSnapshot, ReloadError> {
-        let config = Config::load(&self.path)?;
+        let mut config = Config::load(&self.path)?;
         if config.mode != self.boot.mode {
             return Err(ReloadError::Config(ConfigError::Invalid(format!(
                 "`mode` is a bootstrap property: this process booted in `{}` mode and a reload \
@@ -224,6 +224,7 @@ impl Reloader {
                 config.mode.as_str()
             ))));
         }
+        carry_policy_forward(&mut config, &current.config);
         Ok(ConfigSnapshot::build_with(
             config,
             env,
@@ -234,6 +235,39 @@ impl Reloader {
 
     fn watch_settings(&self) -> Reload {
         self.state.config().config.reload.clone()
+    }
+}
+
+/// Carry the published policy a revision attached to each namespace onto a
+/// reload candidate.
+///
+/// The same reason approved pricing is carried: a published document is not in
+/// the file — [`Namespace::policy`](crate::config::Namespace::policy) is never
+/// read from TOML — so a candidate built from the file alone states that every
+/// namespace is governed by nothing. Publishing that would drop the caps a
+/// revision published *and* the revocation floor folded into the snapshot's
+/// token epochs, so a `SIGHUP` would silently un-revoke tokens an operator
+/// revoked fleet-wide. Which document governs a namespace is convergence's
+/// business; editing the file is not a publication, and this only refuses to
+/// lose one.
+fn carry_policy_forward(candidate: &mut Config, current: &Config) {
+    let published: HashMap<&str, &crate::config::NamespacePolicy> = current
+        .namespace
+        .iter()
+        .filter_map(|namespace| {
+            namespace
+                .policy
+                .as_ref()
+                .map(|policy| (namespace.id.as_str(), policy))
+        })
+        .collect();
+    if published.is_empty() {
+        return;
+    }
+    for namespace in &mut candidate.namespace {
+        if let Some(policy) = published.get(namespace.id.as_str()) {
+            namespace.policy = Some(**policy);
+        }
     }
 }
 
@@ -1676,6 +1710,68 @@ targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_micro
         assert_eq!(
             listed_aliases(&state).await,
             vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
+        );
+    }
+
+    /// A published document is not in the file either, and the revocation floor
+    /// it states is folded into the snapshot's token epochs. A `SIGHUP` must not
+    /// be the way tokens an operator revoked fleet-wide start working again.
+    #[tokio::test]
+    async fn a_reload_does_not_ungovern_a_converged_snapshot() {
+        use crate::config::NamespacePolicy;
+        use crate::desired_state::fixtures::{revision_id, tenant_id};
+        use crate::desired_state::policy::{
+            BudgetPolicy, ConcurrencyPolicy, PolicyBody, PolicyEpoch, PolicyScope, RevocationPolicy,
+        };
+
+        let file = ConfigFile::new(PLATFORM_ONLY);
+        let state = state_from(&file);
+        let body = PolicyBody::new(
+            PolicyScope::Tenant(tenant_id(1)),
+            PolicyEpoch::FIRST,
+            BudgetPolicy::new(9_000_000, Some(50_000_000), 900).expect("a valid budget"),
+            ConcurrencyPolicy::new(64, 600).expect("a valid concurrency policy"),
+            RevocationPolicy::new(1_700_000_000),
+        );
+        let policy = NamespacePolicy {
+            body,
+            generation: body.generation(revision_id(1)),
+        };
+        let mut config = Config::load(file.path()).expect("valid boot config");
+        for namespace in &mut config.namespace {
+            namespace.policy = Some(policy);
+        }
+        let converged =
+            ConfigSnapshot::build(config, &inbound_env(), 7).expect("the boot config compiles");
+        assert_eq!(
+            converged.gateway_token_epoch("platform", "someone"),
+            Some(1_700_000_000)
+        );
+        state.publish(converged);
+
+        // A real edit, so the candidate is published rather than skipped.
+        file.rewrite(&format!(
+            r#"{PLATFORM_ONLY}
+[[model]]
+name = "gpt-4o-mini"
+targets = [{{ provider = "openai", model = "gpt-4o-mini", price = {{ input_microdollars_per_million = 150000, output_microdollars_per_million = 600000 }} }}]
+"#
+        ));
+        Reloader::new(file.path(), state.clone())
+            .reload_with_env(TRIGGER_WATCH, &inbound_env())
+            .expect("the candidate is valid");
+
+        let after = state.config();
+        assert_eq!(after.generation, 8);
+        assert_eq!(
+            after.config.namespace[0].policy,
+            Some(policy),
+            "the file cannot state a document, so a reload must carry the published one"
+        );
+        assert_eq!(
+            after.gateway_token_epoch("platform", "someone"),
+            Some(1_700_000_000),
+            "a reload un-revoked tokens the published floor was revoking"
         );
     }
 
