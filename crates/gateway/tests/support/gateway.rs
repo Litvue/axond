@@ -11,6 +11,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -140,6 +141,9 @@ pub struct Axond {
     pub config: String,
     child: Child,
     output: Arc<Mutex<Output>>,
+    /// The threads draining the child's pipes into `output`, kept so a failed
+    /// boot can wait for them before quoting what the child said.
+    readers: Vec<JoinHandle<()>>,
 }
 
 impl Axond {
@@ -233,6 +237,7 @@ impl Axond {
             .expect("the axond binary starts");
 
         let output = Arc::new(Mutex::new(Output::default()));
+        let mut readers = Vec::new();
         for stream in [
             child
                 .stdout
@@ -249,11 +254,11 @@ impl Axond {
         .flatten()
         {
             let sink = output.clone();
-            std::thread::spawn(move || {
+            readers.push(std::thread::spawn(move || {
                 for line in BufReader::new(stream).lines().map_while(Result::ok) {
                     sink.lock().expect("output lock").ingest(line);
                 }
-            });
+            }));
         }
 
         let mut gateway = Self {
@@ -262,11 +267,12 @@ impl Axond {
             config,
             child,
             output,
+            readers,
         };
         if gateway.await_ready().await {
             Ok(gateway)
         } else {
-            Err(gateway.output())
+            Err(gateway.final_output())
         }
     }
 
@@ -351,6 +357,20 @@ impl Axond {
     /// for assertions over the raw text: its most recent lines.
     pub fn output(&self) -> String {
         self.output.lock().expect("output lock").rendered()
+    }
+
+    /// [`Self::output`], but complete. The pipes are drained by detached
+    /// threads, so a child that has already exited may still have its last and
+    /// most interesting line in flight; ending the child closes the pipes, which
+    /// ends the readers, and joining them settles the record. For the abandoned
+    /// boot whose output is about to become a failure message.
+    fn final_output(&mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+        self.output()
     }
 
     /// The usage records the process has emitted on its stdout sink — the
