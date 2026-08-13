@@ -39,8 +39,8 @@ use super::service::DesiredStateEdit;
 use crate::desired_state::{
     AliasTarget, BlobKind, BlobRef, BudgetBound, BudgetPolicy, CatalogOffering, Checksum,
     ConcurrencyPolicy, DesiredState, DisplayName, InvalidDisplayName, InvalidId, InvalidSlug,
-    ModelAliasBody, ModelEnablementBody, ModelLifecycle, ModelOwner, ObservedPrice, OfferingId,
-    PolicyBody, PolicyEpoch, PolicyScope, ProjectBody, ProjectId, ProviderBody,
+    InvalidUuid7, ModelAliasBody, ModelEnablementBody, ModelLifecycle, ModelOwner, ObservedPrice,
+    OfferingId, PolicyBody, PolicyEpoch, PolicyScope, ProjectBody, ProjectId, ProviderBody,
     ProviderCredentialBody, ResourceBody, ResourceId, ResourceKind, ResourceRef, ResourceScope,
     ResourceVersion, ResourceVersionNumber, RevocationPolicy, SecretId, SecretLifecycle,
     SecretOwner, SecretRef, SecretVersion, Slug, Surface, TenantBody, TenantId, TenantLifecycle,
@@ -338,9 +338,9 @@ impl AdminResourceRequest for CredentialRequest {
                 "secret",
                 &format!("is not a `{}`-prefixed secret id", SecretId::PREFIX),
             ),
-            InvalidId::Uuid(_) => malformed::<Self>(
+            InvalidId::Uuid(uuid) => malformed::<Self>(
                 "secret",
-                "names a secret id whose uuid is not a hyphenated version 7 uuid",
+                &format!("names a secret id whose uuid {}", uuid_detail(&uuid)),
             ),
         })?;
         // An omitted version is *unstated*, not "the first": for a credential
@@ -923,9 +923,33 @@ fn malformed_id<R: AdminResourceRequest>(
 ) -> AdminError {
     let detail = match error {
         InvalidId::Prefix { .. } => format!("is not a `{prefix}`-prefixed id"),
-        InvalidId::Uuid(_) => "has a malformed hyphenated version 7 uuid".to_owned(),
+        InvalidId::Uuid(uuid) => format!("has a uuid that {}", uuid_detail(&uuid)),
     };
     malformed::<R>(field, &detail)
+}
+
+/// Why a uuid was refused, said without repeating the text that arrived.
+///
+/// A prefixed reference whose prefix is right and whose uuid is not is a
+/// different mistake from a value of the wrong kind entirely, and an
+/// administrator cannot tell a typo from a mispaste if both refusals blame the
+/// prefix.
+pub(super) fn uuid_detail(error: &InvalidUuid7) -> String {
+    match error {
+        InvalidUuid7::Shape(_) => "is not a hyphenated 8-4-4-4-12 uuid".to_owned(),
+        InvalidUuid7::Digit(_) => {
+            "contains a character that is not a lowercase hex digit".to_owned()
+        }
+        InvalidUuid7::Version { version } => {
+            format!("is version {version}, but only version 7 is accepted")
+        }
+        InvalidUuid7::Variant { variant } => {
+            format!("has variant bits {variant:#04b}, but only the RFC 9562 variant is accepted")
+        }
+        InvalidUuid7::Timestamp { .. } | InvalidUuid7::Sequence { .. } => {
+            "is not a version 7 uuid".to_owned()
+        }
+    }
 }
 
 fn checksum<R: AdminResourceRequest>(
@@ -1001,12 +1025,68 @@ mod tests {
         const MALFORMED_REFERENCE: &str = "sct_not-a-hyphenated-uuid";
         let mut malformed_uuid = credential();
         malformed_uuid.secret = MALFORMED_REFERENCE.to_owned();
-        let uuid_detail = refusal(malformed_uuid);
+        let detail = refusal(malformed_uuid);
         assert_eq!(
-            uuid_detail,
-            "`secret`: names a secret id whose uuid is not a hyphenated version 7 uuid"
+            detail,
+            "`secret`: names a secret id whose uuid is not a hyphenated 8-4-4-4-12 uuid"
         );
-        assert!(!uuid_detail.contains(MALFORMED_REFERENCE));
+        assert!(!detail.contains(MALFORMED_REFERENCE));
+    }
+
+    /// A right-prefix reference is refused for the reason it actually failed —
+    /// an administrator cannot tell a typo in the identifier from a value of the
+    /// wrong kind if every failure blames the prefix — and no reason repeats the
+    /// text that arrived.
+    #[test]
+    fn a_malformed_uuid_is_refused_for_the_reason_it_failed() {
+        const GOOD: &str = "0189f8c1-2a3b-7c4d-8e5f-6a7b8c9d0e1f";
+        assert!(
+            SecretId::parse(&format!("{}{GOOD}", SecretId::PREFIX)).is_ok(),
+            "the case base must be a uuid the parser accepts"
+        );
+        let version4 = GOOD.replacen("-7c4d-", "-4c4d-", 1);
+        let cases = [
+            ("0189f8c1", "is not a hyphenated 8-4-4-4-12 uuid"),
+            (
+                &GOOD.replace('-', "_") as &str,
+                "is not a hyphenated 8-4-4-4-12 uuid",
+            ),
+            (
+                &GOOD.to_uppercase(),
+                "contains a character that is not a lowercase hex digit",
+            ),
+            (&version4, "is version 4, but only version 7 is accepted"),
+        ];
+
+        for (uuid, reason) in cases {
+            let mut request = credential();
+            request.secret = format!("{}{uuid}", SecretId::PREFIX);
+            let detail = refusal(request);
+            assert_eq!(
+                detail,
+                format!("`secret`: names a secret id whose uuid {reason}"),
+            );
+            assert!(!detail.contains(uuid), "{uuid} was echoed: {detail}");
+        }
+    }
+
+    /// The same distinction on the other identifier fields, which share one
+    /// non-echoing renderer.
+    #[test]
+    fn identifier_fields_distinguish_a_wrong_prefix_from_a_malformed_uuid() {
+        let mut wrong_prefix = credential();
+        wrong_prefix.provider = format!("prv_{}", fixtures::resource_id(10).uuid());
+        assert_eq!(
+            refusal(wrong_prefix),
+            "`provider`: is not a `res_`-prefixed id"
+        );
+
+        let mut malformed_uuid = credential();
+        malformed_uuid.tenant = format!("{}not-a-uuid", TenantId::PREFIX);
+        assert_eq!(
+            refusal(malformed_uuid),
+            "`tenant`: has a uuid that is not a hyphenated 8-4-4-4-12 uuid"
+        );
     }
 
     #[test]

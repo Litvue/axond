@@ -281,7 +281,7 @@ async fn no_administrative_response_discloses_the_material_a_credential_names() 
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
     assert!(
-        refusal.contains("hyphenated version 7 uuid"),
+        refusal.contains("hyphenated 8-4-4-4-12 uuid"),
         "a right-prefix refusal should identify the malformed identifier: {refusal}"
     );
     assert!(
