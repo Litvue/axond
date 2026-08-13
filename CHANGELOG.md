@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.20](https://github.com/Litvue/axond/compare/v0.3.19...v0.3.20) (2026-08-13)
+
+
+### Features
+
+* **credentials:** type provider credentials and the secret lifecycle contract ([#243](https://github.com/Litvue/axond/issues/243)) ([4388c30](https://github.com/Litvue/axond/commit/4388c30714c5896f1b1f23bc2400f63c7ef67b9d))
+
 ## [0.3.19](https://github.com/Litvue/axond/compare/v0.3.18...v0.3.19) (2026-08-13)
 
 
