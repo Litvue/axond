@@ -76,7 +76,9 @@
 //!   conclusive answer cannot overturn it in either direction — an older negative
 //!   does not discredit a later positive, and an older positive does not resurrect
 //!   a target a later complete listing dropped. Two looks bearing the same instant
-//!   resolve the same way whichever lands first: the negative holds;
+//!   resolve the same way whichever lands first: the negative holds, and an
+//!   inconclusive look sharing a conclusion's instant does not soften it either —
+//!   only a *later* look lowers certainty;
 //! - nothing ever infers a positive from a non-definitive look. Certainty only
 //!   rises when definitive evidence arrives, which is what
 //!   [`AvailabilityState::certainty`] makes testable.
@@ -396,69 +398,59 @@ impl AvailabilityIndexBuilder {
     /// Declare the single-valued dimensions for a key, replacing any already
     /// declared and keeping the discovery evidence held for it.
     ///
-    /// A declaration describes derived state rather than a fresh look, so its
-    /// evidence is judged against the conclusion the *index* has already reached and
-    /// not against the one the declaration carries itself: a record read out of one
-    /// index survives being declared into another, while a look predating what this
-    /// key has concluded is refused and counted in [`superseded`](Self::superseded)
-    /// exactly as [`observe`](Self::observe) would refuse it. A declared complete
-    /// listing that does not carry the target still discredits the retained positive.
+    /// Any evidence the declaration carries goes through the same retention and
+    /// ordering path as an observed look ([`observe`](Self::observe)) — a declared
+    /// definitive positive is retained for an outage, a declared complete listing that
+    /// dropped the target discredits the retained positive, and a look older than the
+    /// one held is refused and counted in [`superseded`](Self::superseded).
+    ///
+    /// It is judged against the conclusion the *index* has already reached, never
+    /// against the one the declaration carries itself, so a record read out of one
+    /// index survives being declared into another; a slot that already holds the
+    /// declared look is left untouched, so an ordinary refresh that redeclares what it
+    /// read reports no out-of-order arrivals.
     #[must_use]
     pub fn record(mut self, key: AvailabilityKey, record: AvailabilityRecord) -> Self {
         let entry = self.records.entry(key).or_default();
-        let concluded = entry.definitive_at;
-        let (mut last_known_good, retained_refused) = Self::declared(
-            concluded,
-            record.last_known_good.clone(),
-            entry.last_known_good.clone(),
-        );
-        let (discovery, current_refused) =
-            Self::declared(concluded, record.discovery.clone(), entry.discovery.clone());
-        // A complete listing that no longer carries the target discredits a retained
-        // positive it does not predate, however the two arrived.
-        if let (Some(retained), Some(current)) = (&last_known_good, &discovery)
-            && current.is_definitive()
-            && !current.is_positive()
-            && current.observed_at >= retained.observed_at
-        {
-            last_known_good = None;
-        }
-        // The watermark only ever advances, so no redeclaration can forget that this
-        // key once reached a conclusive answer.
-        let definitive_at = [
-            concluded,
-            record.definitive_at,
-            discovery
-                .as_ref()
-                .filter(|held| held.is_definitive())
-                .map(|held| held.observed_at),
-            last_known_good.as_ref().map(|held| held.observed_at),
-        ]
-        .into_iter()
-        .flatten()
-        .max();
+        let declared_conclusion = record.definitive_at;
+        let retained = record.last_known_good.clone();
+        let current = record.discovery.clone();
+        // The dimensions are replaced; the evidence and the conclusion are not, so
+        // that what the declaration carries can be judged against what the index has
+        // already concluded rather than against itself.
         *entry = AvailabilityRecord {
-            discovery,
-            last_known_good,
-            definitive_at,
+            discovery: entry.discovery.clone(),
+            last_known_good: entry.last_known_good.clone(),
+            definitive_at: entry.definitive_at,
             ..record
         };
-        self.superseded += usize::from(retained_refused) + usize::from(current_refused);
-        self
-    }
-
-    /// Which look belongs in a slot after a declaration, and whether the declared
-    /// one was refused for predating what this key has already concluded.
-    fn declared(
-        concluded: Option<SystemTime>,
-        declared: Option<DiscoveryObservation>,
-        held: Option<DiscoveryObservation>,
-    ) -> (Option<DiscoveryObservation>, bool) {
-        match declared {
-            Some(look) if !Self::overturns(concluded, &look) => (held, true),
-            Some(look) => (Some(look), false),
-            None => (held, false),
+        // Retained first, then current: a record carries the look it fell back to
+        // alongside a newer current one, so applying them in that order is what an
+        // index that saw them in that order would have done. A look a slot already
+        // holds is left alone — a refresh that redeclares what it read discarded
+        // nothing, so it is not an out-of-order arrival.
+        if let Some(retained) = retained
+            && entry.last_known_good.as_ref() != Some(&retained)
+            && !Self::retain(entry, &retained)
+        {
+            self.superseded += 1;
         }
+        if let Some(current) = current
+            && entry.discovery.as_ref() != Some(&current)
+            && !Self::admit(entry, current)
+        {
+            self.superseded += 1;
+        }
+        // Folded in only now, and only upwards: a declaration cannot forget a
+        // conclusion, and cannot use its own conclusion to refuse its own evidence.
+        if let Some(declared) = declared_conclusion {
+            entry.definitive_at = Some(
+                entry
+                    .definitive_at
+                    .map_or(declared, |held| held.max(declared)),
+            );
+        }
+        self
     }
 
     /// Record a discovery observation.
@@ -523,14 +515,18 @@ impl AvailabilityIndexBuilder {
     /// fallback an outage needs.
     fn overturns(concluded: Option<SystemTime>, observation: &DiscoveryObservation) -> bool {
         concluded.is_none_or(|held| {
-            if observation.is_positive() {
-                // Strictly newer, so a positive and a complete negative bearing the
-                // same instant resolve the same way whichever lands first: the
-                // negative holds, because two answers about one instant are not
-                // evidence a target is reachable.
-                observation.observed_at > held
-            } else {
+            if observation.is_definitive() && !observation.is_positive() {
+                // A complete listing that dropped the target is the only look that
+                // overturns a conclusion bearing the same instant, so a positive and a
+                // negative about one instant resolve the same way whichever lands
+                // first: the negative holds, because two answers about one instant are
+                // not evidence a target is reachable.
                 observation.observed_at >= held
+            } else {
+                // Strictly newer for everything else, so neither an older positive nor
+                // an inconclusive look sharing the instant of a conclusion can soften
+                // it: certainty only ever falls to a *later* look.
+                observation.observed_at > held
             }
         })
     }

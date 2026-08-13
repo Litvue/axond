@@ -104,11 +104,16 @@ counts, while one that predates a conclusive answer overturns nothing in either
 direction: an older negative does not discredit a later positive, and an older
 positive does not resurrect a target a later complete listing dropped. Two looks
 bearing the same instant resolve the same way whichever lands first — the negative
-holds, because two answers about one instant are not evidence of reachability. The
-Declared evidence goes through the same gate: a projection
-handing the builder a look cannot do what an observed one is refused, so a complete
-listing which dropped the target discredits the retained positive, and a look
-predating a conclusive answer is neither adopted nor retained.
+holds, because two answers about one instant are not evidence of reachability — and
+only a strictly *later* look lowers certainty, so an inconclusive probe sharing the
+instant of a complete listing cannot soften a denial into a routable `unknown`.
+Declared evidence goes through the same retention and ordering path as an observed
+look: a projection handing the builder a whole record has its listing retained for
+the outage that follows, has a complete listing which dropped the target discredit
+the retained positive, and cannot adopt a look older than the one already held.
+Declared evidence is judged against the conclusion the *index* has reached rather
+than the one the record carries itself, so a record read out of one index survives
+being declared into another and an ordinary refresh reports nothing out of order.
 
 **Uncertainty is routable only where a scope chose it.** `unknown` and `stale` are
 not refusals, but routability is a property of the whole verdict:

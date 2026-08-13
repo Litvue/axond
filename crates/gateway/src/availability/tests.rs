@@ -465,6 +465,104 @@ fn a_record_round_trips_through_a_fresh_builder_with_its_evidence_intact() {
     );
 }
 
+/// Evidence handed over as a whole record is retained like an observed look, or a
+/// hand-over would quietly cost the fallback the next outage needs.
+#[test]
+fn a_declared_listing_is_retained_for_the_outage_that_follows_it() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let index = AvailabilityIndex::builder()
+        .record(
+            key(scope, "gpt-4o"),
+            AvailabilityRecord {
+                discovery: Some(present(scope, "gpt-4o", 500, None)),
+                ..permitting()
+            },
+        )
+        .observe(outage(scope, "gpt-4o", 600))
+        .build();
+
+    let verdict = index.evaluate(&key(scope, "gpt-4o"), at(700));
+    assert_eq!(verdict.state, AvailabilityState::Available);
+    assert!(
+        verdict.last_known_good,
+        "the declared listing is what the outage falls back onto"
+    );
+}
+
+/// A refresh that reads an index into a builder and redeclares what it read has not
+/// received anything out of order, so the counter must stay quiet.
+#[test]
+fn redeclaring_what_a_refresh_just_read_reports_no_out_of_order_arrivals() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let index = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(present(scope, "gpt-4o", 100, None))
+        .observe(outage(scope, "gpt-4o", 200))
+        .build();
+    let carried = index
+        .record(&key(scope, "gpt-4o"))
+        .expect("the key is held")
+        .clone();
+
+    let builder =
+        AvailabilityIndexBuilder::from_index(&index).record(key(scope, "gpt-4o"), carried.clone());
+    assert_eq!(builder.superseded(), 0);
+    assert_eq!(
+        builder.build().record(&key(scope, "gpt-4o")),
+        Some(&carried)
+    );
+}
+
+/// The current slot holds the newest look whichever call carries it, so a
+/// declaration cannot rewind it to an older one either.
+#[test]
+fn an_older_declared_look_does_not_rewind_the_current_slot() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let builder = AvailabilityIndex::builder()
+        .observe(outage(scope, "gpt-4o", 600))
+        .record(
+            key(scope, "gpt-4o"),
+            AvailabilityRecord {
+                discovery: Some(outage(scope, "gpt-4o", 100)),
+                ..permitting()
+            },
+        );
+    assert_eq!(builder.superseded(), 1);
+
+    let index = builder.build();
+    let held = index
+        .record(&key(scope, "gpt-4o"))
+        .expect("the key is held")
+        .discovery
+        .as_ref()
+        .expect("a look is held");
+    assert_eq!(held.observed_at, at(600));
+}
+
+/// The mirror of the two-definitive-looks tie-break: certainty falls to a later
+/// look, never to one merely sharing the instant a conclusion was reached, or an
+/// inconclusive probe racing a complete listing would soften a denial into a
+/// routable unknown.
+#[test]
+fn an_inconclusive_look_sharing_an_absence_instant_does_not_soften_it() {
+    let scope = ScopeRef::tenant(tenant(1));
+    let builder = AvailabilityIndex::builder()
+        .record(key(scope, "gpt-4o"), permitting())
+        .observe(absent(scope, "gpt-4o", 500))
+        .observe(outage(scope, "gpt-4o", 500));
+    assert_eq!(builder.superseded(), 1);
+
+    let verdict = builder.build().evaluate(&key(scope, "gpt-4o"), at(600));
+    assert_eq!(
+        (verdict.state, verdict.reason),
+        (
+            AvailabilityState::Denied,
+            AvailabilityReason::DiscoveryAbsent
+        )
+    );
+    assert!(!verdict.permits_attempt());
+}
+
 /// A policy denial outranks a positive listing, and a catalogue absence outranks
 /// the denial: the ladder is ordered, not a set of independent vetoes.
 #[test]
