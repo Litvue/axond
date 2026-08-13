@@ -66,7 +66,11 @@ request that adds or bumps a dependency of any `crates/` member has to refresh i
 just fuzz-lock   # cargo fetch in fuzz/, recording the change and nothing else
 ```
 
-The lane checks this first and says so, rather than leaving a bare `--locked`
+The lane also lints the seam (`just fuzz-seam-clippy`), because
+`crates/gateway/src/fuzz_seam.rs` is `#![cfg(fuzzing)]`: the root clippy builds it
+as an empty library, and this workspace's clippy skips `axond` as a path
+dependency, so nothing else here has it under `-D warnings`. And it checks the
+lockfile first and says so, rather than leaving a bare `--locked`
 error to interpret. Releases are handled for you: `release-please.yml` syncs both
 lockfiles when the workspace version changes, for whichever of the gateway crates
 this lockfile actually records.

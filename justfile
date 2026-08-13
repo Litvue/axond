@@ -5,7 +5,7 @@ default:
 
 # Format, lint (warnings = errors), test, fuzz smoke, docs, supply-chain, and
 # release packaging — the CI gates.
-check: fmt-check clippy test fuzz-smoke docs deny publish-dry-run msrv api-compat workflow-policy
+check: fmt-check clippy fuzz-seam-clippy test fuzz-smoke docs deny publish-dry-run msrv api-compat workflow-policy
 
 # `fuzz/` is a separate workspace, so `--all` and `--workspace` do not reach it.
 fmt:
@@ -21,6 +21,14 @@ clippy:
     # Matches the required lane: `--no-default-features` leaves out libfuzzer-sys
     # and its C++ build, which need nightly. `just fuzz-targets-clippy` covers them.
     cd fuzz && cargo clippy --all-targets --no-default-features --locked -- -D warnings
+
+# The seam itself. `crates/gateway/src/fuzz_seam.rs` is `#![cfg(fuzzing)]`, so the
+# root clippy above builds it as an empty library and lints nothing in it — the
+# same is true of the `#[cfg(fuzzing)]` items it reaches in `mint` and `routes`,
+# and the fuzz workspace does not lint `axond` because it is a path dependency
+# rather than a primary package. Turning the cfg on is what reaches them.
+fuzz-seam-clippy:
+    RUSTFLAGS="--cfg fuzzing" cargo clippy -p axond --lib --all-features --locked -- -D warnings
 
 # What the scheduled fuzz lane lints: the coverage-guided targets, which need the
 # nightly toolchain `cargo fuzz` builds them with.

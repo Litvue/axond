@@ -169,6 +169,16 @@ jobs:
       - name: Clippy
         working-directory: fuzz
         run: cargo clippy --all-targets --no-default-features --locked -- -D warnings
+      # And the seam in `crates/gateway`, which neither of the clippy lanes above
+      # reaches: `fuzz_seam.rs` is `#![cfg(fuzzing)]`, so the root lane builds it
+      # as an empty library, and the fuzz workspace does not lint `axond` because
+      # it is a path dependency rather than a primary package. Turning the cfg on
+      # is what puts the seam and the `#[cfg(fuzzing)]` items it reaches in `mint`
+      # and `routes` under the same `-D warnings` as the rest of the repository.
+      - name: Clippy the fuzzing seam
+        run: cargo clippy -p axond --lib --all-features --locked -- -D warnings
+        env:
+          RUSTFLAGS: --cfg fuzzing
       # `--no-default-features` drops libfuzzer-sys: the replay is the part that
       # must run without nightly or a sanitizer runtime.
       - name: Replay the committed fuzz corpora

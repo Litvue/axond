@@ -71,7 +71,11 @@ removes it, because there is no API to compare and no library in the crates.io
 baseline to compare against; and the seam must declare the same modules as
 `main.rs`, which `tests/fuzz_seam.rs` holds
 (`the_fuzz_seam_declares_every_module_the_binary_does`) so drift fails a test
-rather than silently fuzzing a different crate than the one shipped.
+rather than silently fuzzing a different crate than the one shipped. A cfg also
+hides the seam from every lint lane — the root clippy compiles it as an empty
+library and the fuzz workspace skips `axond` as a path dependency — so the `Fuzz
+smoke` lane lints it with the cfg on (`just fuzz-seam-clippy`), and the seam is
+held to the same `-D warnings` as the code it drives.
 
 The seam exposes a small typed `Rejection` rather than the gateway's own error
 types, so internal error refactoring does not ripple into the fuzz project.
