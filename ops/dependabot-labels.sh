@@ -18,8 +18,14 @@ UPSTREAM=Litvue/axond
 REPOSITORY="${GITHUB_REPOSITORY:-$UPSTREAM}"
 
 # Whether this checkout is the one whose Dependabot configuration is at stake.
+# Folded, because GitHub owner and repository names are case-insensitive and this
+# repository spells its own both ways: a casing difference must not turn the check
+# into a silent skip. `tr` rather than `${var,,}`, for bash 3.2.
 is_upstream() {
-    [[ $1 == "$UPSTREAM" ]]
+    local given upstream
+    given="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    upstream="$(printf '%s' "$UPSTREAM" | tr '[:upper:]' '[:lower:]')"
+    [[ $given == "$upstream" ]]
 }
 
 # The labels are the `- value` entries indented under a `labels:` key. Anything
@@ -60,7 +66,7 @@ collect_labels() {
 # Each case is a way this check could pass while verifying nothing: a neighbouring
 # key read as a label, a config that moved, or a shape the parser cannot see.
 self_test() {
-    local work status problems=0
+    local work status spelling problems=0
     work="$(mktemp -d)"
     trap 'rm -rf "$work"' RETURN
 
@@ -108,10 +114,12 @@ YAML
 
     # A fork runs this same required lane, and must not fail on a label that only
     # matters where Dependabot runs.
-    if ! is_upstream "$UPSTREAM"; then
-        echo "self-test: $UPSTREAM was not recognised as the upstream repository" >&2
-        problems=1
-    fi
+    for spelling in "$UPSTREAM" "litvue/axond" "LITVUE/AXOND"; do
+        if ! is_upstream "$spelling"; then
+            echo "self-test: $spelling was not recognised as the upstream repository" >&2
+            problems=1
+        fi
+    done
     if is_upstream "contributor/axond"; then
         echo "self-test: a fork was treated as the upstream repository" >&2
         problems=1
