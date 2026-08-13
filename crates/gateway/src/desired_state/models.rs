@@ -115,7 +115,7 @@
 //! a tenancy or credential one; what a refusal *means* stays here, in
 //! [`ModelError::is_incompatible`].
 //!
-//! The operator-facing statement of all of this is `docs/adr/0037-model-enablement-and-alias-contracts.md`,
+//! The operator-facing statement of all of this is `docs/adr/0038-model-enablement-and-alias-contracts.md`,
 //! with the schema table and the untyped-alias exception in
 //! `docs/operations/revision-convergence.md`.
 
@@ -514,7 +514,7 @@ impl fmt::Display for ModelOwner {
 /// deliberately inert: nothing bills against it, no conversion turns it into an
 /// [`ApprovedPrice`], and [`ModelEnablementBody::billable_price`] does not look at
 /// it. A catalogue refresh may change what an upstream publishes at any time
-/// without human action (ADR 0037), so treating an observed rate as an effective
+/// without human action (ADR 0038), so treating an observed rate as an effective
 /// one would let an upstream edit change what a deployment charges.
 ///
 /// Integers, in micro-dollars, because desired state has no floating-point
@@ -1851,6 +1851,13 @@ impl Models {
 /// a damaged alias skip the scope, target, reach, and wire-family rules with
 /// nothing reported, which for an entitlement body is worse than refusing the
 /// revision.
+///
+/// A body that is not an inline record at all is the exemption rather than a
+/// refusal, and that is deliberate: it carries no targets, no scope, and no wire
+/// family, so it grants nothing, and it never enters [`Models::aliases`] for
+/// anything to resolve through. The rules above constrain what an alias *grants*,
+/// so a row that grants nothing needs none of them — where an *enablement* is
+/// itself the grant, which is why an untyped one is refused.
 fn predates_this_slice(resource: &ResourceVersion) -> bool {
     let ResourceBody::Inline(CanonicalValue::Map(fields)) = &resource.body else {
         return true;
@@ -1863,7 +1870,7 @@ fn predates_this_slice(resource: &ResourceVersion) -> bool {
 ///
 /// The pin resolves structurally, so a storage path that reconstructs a catalogue
 /// resource must keep its blob kind and digest intact rather than rematerializing
-/// the body inline; see ADR 0037. An unresolvable pin is invalid rather than skew
+/// the body inline; see ADR 0038. An unresolvable pin is invalid rather than skew
 /// on purpose: a revision whose enablements have lost the catalogue they were
 /// approved against must not converge.
 fn check_snapshot_pin(

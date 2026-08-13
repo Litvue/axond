@@ -160,7 +160,7 @@ Five rules hold for every body schema, present and future:
   that quietly skips the alias rules. A
   model *enablement* has no such history, so an untyped enablement is
   `incompatible` like every other untyped body
-  ([ADR 0037](../adr/0037-model-enablement-and-alias-contracts.md)).
+  ([ADR 0038](../adr/0038-model-enablement-and-alias-contracts.md)).
 - **A body that declares a schema this build reads, and then is not one, is
   damage.** Past the identifier the field set is known, so a `v1` body missing a
   `v1` field, or carrying one whose type changed, is reported as `corrupt` and not
@@ -168,9 +168,13 @@ Five rules hold for every body schema, present and future:
   is pointed at storage rather than away from it. (A *display name* this build will
   not take is the exception, and is `incompatible`: validation rules can tighten
   within one schema — this build refuses an invisible byte-order mark an earlier
-  one accepted.) A body that is not an inline record, or that sits under a kind it
-  does not match, is damage for the same reason: every release that has written a
-  tenancy body wrote an inline record, so no skew produces a scalar or a blob there.
+  one accepted.) A tenancy, credential, policy, or model *enablement* body that is
+  not an inline record, or that sits under a kind it does not match, is damage for
+  the same reason: every release that has written one wrote an inline record, so no
+  skew produces a scalar or a blob there. An **alias** row is the exception again
+  and for the same reason as above: a body that is not an inline record carries no
+  targets, no scope, and no wire family, so it grants nothing and is skipped rather
+  than refused, the way an untyped one is.
 - **A change to a field's presence or meaning is a new identifier.** `v1` bodies
   never change shape, so a checksum computed by one release is computed the same
   way by every release that accepts it. Adding a field, renaming one, or changing
@@ -335,7 +339,7 @@ An enablement body names an offering by an **opaque derived identity**
 published, and pins the **catalogue snapshot** it was approved against; the
 resource depends on the blob declaring that snapshot, so a revision cannot pin a
 snapshot it does not carry ([ADR
-0037](../adr/0037-model-enablement-and-alias-contracts.md)). The pin must resolve
+0038](../adr/0038-model-enablement-and-alias-contracts.md)). The pin must resolve
 to a `CatalogModel` dependency whose body is a blob of kind `CatalogSnapshot`
 with a matching digest — an unresolvable pin is an **invalid** revision, not a
 compatibility skew, and a revision whose enablements have lost the catalogue they
