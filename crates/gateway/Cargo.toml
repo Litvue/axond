@@ -25,6 +25,29 @@ include = ["src/**/*.rs", "src/**/*.json", "sql/*.sql"]
 name = "axond"
 path = "src/main.rs"
 
+# A second target over the same module sources, so the out-of-tree `fuzz/`
+# project has something to link against (see `src/fuzz_seam.rs`). It is empty
+# unless built under `--cfg fuzzing`, which only `fuzz/` sets, so a default
+# build, `--all-features`, and the published crate expose no library API at all.
+# A cfg rather than a Cargo feature for exactly that reason: a feature would be
+# reachable by any dependant, and `--all-features` would compile it here.
+# No tests of its own — the crate's tests run from the binary target.
+#
+# The name deliberately differs from the binary's: Cargo documents only one
+# target of a given crate name, so a library named `axond` alongside the `axond`
+# binary silently takes the binary's place in `cargo doc`, and every module under
+# `src/` stops being rustdoc-linted. `ops/check-docs.py` pins that apart.
+[lib]
+name = "axond_fuzz_seam"
+path = "src/fuzz_seam.rs"
+test = false
+doctest = false
+
+[lints.rust]
+# `fuzzing` is set by the out-of-tree `fuzz/` project and by `cargo fuzz`, never
+# here, so declare it rather than letting every build warn about it.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
 [dependencies]
 gateway-core.workspace = true
 gateway-transport.workspace = true

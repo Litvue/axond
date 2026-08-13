@@ -163,6 +163,64 @@ jobs:
           path: target/faults/**/*.json
           if-no-files-found: warn
 
+  # The pull-request half of the fuzzing program (`fuzz/`, issue #212). The
+  # coverage-guided runs are scheduled in `fuzz.yml` because they are unbounded;
+  # what every change gets is this: the committed corpora and their fixed
+  # derivations replayed through the same target bodies, on the pinned stable
+  # toolchain, under panic, time, and allocation bounds. Required, so a parser
+  # that starts panicking on a known input cannot merge.
+  fuzz-smoke:
+    name: Fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz
+          cache-targets: false
+      # A gateway dependency added or bumped outside a release leaves this
+      # workspace's lock stale, and every `--locked` step below then fails on a
+      # lockfile error that names no remedy. Failing here instead names one.
+      - name: Check that fuzz/Cargo.lock records the gateway graph
+        working-directory: fuzz
+        run: |
+          cargo fetch --locked || {
+            echo "::error file=fuzz/Cargo.lock::fuzz/Cargo.lock does not match the"\
+              "gateway crates' dependencies; run \`just fuzz-lock\` and commit it"
+            exit 1
+          }
+      # The root `fmt` and `clippy` lanes cannot reach a separate workspace, so
+      # the fuzz code would otherwise be the only Rust here without either gate.
+      - name: Format
+        working-directory: fuzz
+        run: cargo fmt --all -- --check
+      # `--no-default-features` here too: with the default feature on, this would
+      # compile libFuzzer's C++ sources and the `#![no_main]` targets on stable,
+      # coupling a required lane to a dependency the replay does not need. The
+      # coverage-guided targets are linted on nightly in `fuzz.yml`.
+      - name: Clippy
+        working-directory: fuzz
+        run: cargo clippy --all-targets --no-default-features --locked -- -D warnings
+      # And the seam in `crates/gateway`, which neither of the clippy lanes above
+      # reaches: `fuzz_seam.rs` is `#![cfg(fuzzing)]`, so the root lane builds it
+      # as an empty library, and the fuzz workspace does not lint `axond` because
+      # it is a path dependency rather than a primary package. Turning the cfg on
+      # is what puts the seam and the `#[cfg(fuzzing)]` items it reaches in `mint`
+      # and `routes` under the same `-D warnings` as the rest of the repository.
+      - name: Clippy the fuzzing seam
+        run: cargo clippy -p axond --lib --all-features --locked -- -D warnings
+        env:
+          RUSTFLAGS: --cfg fuzzing
+      # `--no-default-features` drops libfuzzer-sys: the replay is the part that
+      # must run without nightly or a sanitizer runtime.
+      - name: Replay the committed fuzz corpora
+        working-directory: fuzz
+        run: cargo run --no-default-features --locked --bin fuzz-smoke
+
   stateful-tests:
     name: Stateful tests
     runs-on: ubuntu-latest
@@ -670,6 +728,7 @@ jobs:
       - api-compat
       - build
       - tests
+      - fuzz-smoke
       - stateful-tests
       - sdk-compat
       - sdk-compat-ts
@@ -694,6 +753,7 @@ jobs:
           test "${{ needs.api-compat.result }}" = success
           test "${{ needs.build.result }}" = success
           test "${{ needs.tests.result }}" = success
+          test "${{ needs.fuzz-smoke.result }}" = success
           test "${{ needs.stateful-tests.result }}" = success
           test "${{ needs.sdk-compat.result }}" = success
           test "${{ needs.sdk-compat-ts.result }}" = success

@@ -1,0 +1,12 @@
+mode = "stateful"
+
+[control_plane]
+dsn_env = "GW_CONTROL_PLANE_DSN"
+
+[secret_store]
+dsn_env = "GW_SECRET_STORE_DSN"
+kek_env = "GW_SECRET_STORE_KEK"
+
+[[admin_breakglass]]
+env = "GW_ADMIN_BREAKGLASS"
+id = "bootstrap"

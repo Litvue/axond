@@ -1,0 +1,78 @@
+[package]
+name = "axond-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0 OR MIT"
+
+# Deliberately its own workspace: the fuzz targets need a nightly compiler and a
+# sanitizer runtime, and `axond` is depended on with a feature no other consumer
+# may turn on. Keeping it out of the root workspace means `cargo build`,
+# `cargo test`, `cargo deny`, and the packaging lanes at the repository root are
+# unaffected by anything in here.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+# `.cargo/config.toml` passes `--cfg fuzzing` to every crate this workspace
+# builds, this package included, so declare the name here as `crates/gateway`
+# does: a toolchain that starts linting command-line cfgs must not turn the
+# required lane's `-D warnings` into a failure about the flag itself.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+[features]
+# libFuzzer needs nightly and a sanitizer runtime, so the coverage-guided
+# targets are the default (that is what `cargo fuzz` builds) and the seed-replay
+# smoke runs with `--no-default-features` on the pinned stable toolchain.
+default = ["libfuzzer"]
+libfuzzer = ["dep:libfuzzer-sys"]
+
+[dependencies]
+arbitrary = { version = "1.4.2", features = ["derive"] }
+# The seam this links against only exists under `--cfg fuzzing`, which
+# `.cargo/config.toml` sets for this workspace and `cargo fuzz` sets on its own.
+axond = { path = "../crates/gateway" }
+libfuzzer-sys = { version = "0.4.10", optional = true }
+
+# The deterministic seed-replay smoke: bounded, stable-only, and the lane CI
+# requires on every pull request.
+[[bin]]
+name = "fuzz-smoke"
+path = "src/bin/smoke.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+required-features = ["libfuzzer"]
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "token_verify"
+path = "fuzz_targets/token_verify.rs"
+required-features = ["libfuzzer"]
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "credentials_query"
+path = "fuzz_targets/credentials_query.rs"
+required-features = ["libfuzzer"]
+test = false
+doc = false
+bench = false
+
+# Fuzzing wants optimized code with debug assertions and overflow checks on: a
+# release profile that silently wraps an arithmetic bug is a missed finding.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true

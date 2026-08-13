@@ -3,18 +3,37 @@
 default:
     @just --list
 
-# Format, lint (warnings = errors), test, docs, supply-chain, and release
-# packaging — the CI gates.
-check: fmt-check clippy test docs deny publish-dry-run msrv api-compat workflow-policy deploy-check
+# Format, lint (warnings = errors), test, fuzz smoke, docs, supply-chain, and
+# release packaging — the CI gates.
+check: fmt-check clippy fuzz-seam-clippy test fuzz-smoke docs deny publish-dry-run msrv api-compat workflow-policy deploy-check
 
+# `fuzz/` is a separate workspace, so `--all` and `--workspace` do not reach it.
 fmt:
     cargo fmt --all
+    cd fuzz && cargo fmt --all
 
 fmt-check:
     cargo fmt --all -- --check
+    cd fuzz && cargo fmt --all -- --check
 
 clippy:
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+    # Matches the required lane: `--no-default-features` leaves out libfuzzer-sys
+    # and its C++ build, which need nightly. `just fuzz-targets-clippy` covers them.
+    cd fuzz && cargo clippy --all-targets --no-default-features --locked -- -D warnings
+
+# The seam itself. `crates/gateway/src/fuzz_seam.rs` is `#![cfg(fuzzing)]`, so the
+# root clippy above builds it as an empty library and lints nothing in it — the
+# same is true of the `#[cfg(fuzzing)]` items it reaches in `mint` and `routes`,
+# and the fuzz workspace does not lint `axond` because it is a path dependency
+# rather than a primary package. Turning the cfg on is what reaches them.
+fuzz-seam-clippy:
+    RUSTFLAGS="--cfg fuzzing" cargo clippy -p axond --lib --all-features --locked -- -D warnings
+
+# What the scheduled fuzz lane lints: the coverage-guided targets, which need the
+# nightly toolchain `cargo fuzz` builds them with.
+fuzz-targets-clippy:
+    cd fuzz && RUSTUP_TOOLCHAIN=nightly cargo clippy --all-targets --locked -- -D warnings
 
 test:
     cargo test --workspace --all-features --locked
@@ -135,6 +154,34 @@ compat-ts-pins:
 # Refresh the hash-pinned provider-SDK lockfile, excluding releases newer than a week.
 compat-lock:
     uv pip compile --generate-hashes --universal --python-version 3.10 --exclude-newer "$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"))')" -o tests/compat/requirements.txt tests/compat/requirements.in
+
+# The bounded, deterministic fuzz replay CI requires on every pull request:
+# every committed seed and its fixed derivations, on stable, under panic, time,
+# and allocation bounds. See fuzz/README.md.
+fuzz-smoke:
+    cd fuzz && cargo run --no-default-features --locked --bin fuzz-smoke
+
+# Refresh fuzz/Cargo.lock after changing a dependency of the gateway crates. The
+# fuzz workspace locks its own graph, and it reaches `axond` through a path
+# dependency, so a new or bumped gateway dependency leaves it stale and the
+# required `--locked` replay refuses to run. `fetch` records the addition without
+# upgrading anything else.
+fuzz-lock:
+    cd fuzz && cargo fetch
+
+# A bounded coverage-guided run of one target, starting from the committed seeds.
+# Needs a nightly toolchain and cargo-fuzz; the unbounded runs are scheduled in
+# .github/workflows/fuzz.yml.
+fuzz target seconds="60":
+    mkdir -p fuzz/corpus/{{target}}
+    cp -n fuzz/seeds/{{target}}/* fuzz/corpus/{{target}}/ || true
+    cd fuzz && cargo +nightly fuzz run {{target}} corpus/{{target}} -- -max_total_time={{seconds}} -max_len=65536 -rss_limit_mb=2048 -malloc_limit_mb=1024 -timeout=25
+
+# Every fuzz target in turn, the way the scheduled lane runs them.
+fuzz-all seconds="60":
+    just fuzz config_toml {{seconds}}
+    just fuzz token_verify {{seconds}}
+    just fuzz credentials_query {{seconds}}
 
 # The heavy SSE soak: hundreds of concurrent streams with cancels and drops.
 # The short subset runs in `just test`; this is the long one.

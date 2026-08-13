@@ -1,0 +1,7 @@
+# `max_request_bytes` past TOML's signed 64-bit integer range: the document is
+# refused by the parser itself, before any field is deserialized or validated.
+[server]
+bind = "0.0.0.0:8080"
+
+[admission]
+max_request_bytes = 18446744073709551615

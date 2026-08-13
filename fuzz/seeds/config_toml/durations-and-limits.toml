@@ -1,0 +1,40 @@
+# Extreme but in-range durations and ceilings on an otherwise loadable document,
+# so validation is what decides the outcome rather than the TOML parser or a
+# misspelled key. `integer-out-of-toml-range.toml` covers the parser's own limit.
+[transport]
+connect_timeout_ms = 0
+response_header_timeout_ms = 9223372036854775807
+buffered_body_timeout_ms = 1
+stream_idle_timeout_ms = 9223372036854775807
+max_response_bytes = 9223372036854775807
+
+[admission]
+max_request_bytes = 9223372036854775807
+max_in_flight = 0
+max_in_flight_streams = 9223372036854775807
+
+[reload]
+watch = true
+poll_interval_ms = 0
+
+[shutdown]
+drain_grace_ms = 9223372036854775807
+deadline_ms = 0
+flush_timeout_ms = 9223372036854775807
+
+[[namespace]]
+id = "fuzz"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "fuzz"
+
+[[model]]
+name = "gpt-4o"
+targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 } }]

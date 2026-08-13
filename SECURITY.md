@@ -104,7 +104,10 @@ to be.
    not finished; the
    [threat-model review triggers](./docs/security/threat-model-review.md) name the
    existing tests for each area, so a fix extends one of them rather than
-   inventing coverage.
+   inventing coverage. When the finding is a parser — configuration, a minted
+   token, a query string — that coverage is a seed in the
+   [fuzz corpora](./docs/security/fuzzing.md), so the required smoke replays the
+   exact input from then on.
 3. A release from `main` through the ordinary
    [release runbook](./docs/maintainers/releasing.md) — a security fix is not a
    different pipeline, so it inherits the same required CI, signed artifacts, and
@@ -130,7 +133,8 @@ deploying rather than reporting: the
 [deployment security model](./docs/security/deployment-model.md) for trust
 boundaries, the [production checklist](./docs/deployment/production-checklist.md)
 before going live, the [minted-token guide](./docs/minted-token-guide.md) for
-scoped credentials and revocation, and the
+scoped credentials and revocation, [fuzzing](./docs/security/fuzzing.md) for what
+the config, token, and query parsers are continuously tested against, and the
 [security review](./docs/security-review-2026-08-05.md) for the reviewed
 baseline.
 

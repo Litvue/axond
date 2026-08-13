@@ -241,6 +241,47 @@ pub(crate) fn mint_token_at(
     request: MintRequest<'_>,
     issued_at: Option<u64>,
 ) -> Result<MintedToken> {
+    let scope = request
+        .scope
+        .as_ref()
+        .map(|values| values.iter().map(ToString::to_string).collect());
+    mint_token_with_scope_claim(request, issued_at, scope)
+}
+
+/// Mint with the `scope` claim written verbatim, so a fuzz target can present a
+/// capability name the gateway does not define and let the verifier decide.
+/// Minting cannot express that, because [`MintRequest`] takes parsed
+/// [`Capability`] values.
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_mint_token_with_raw_scope(
+    request: MintRequest<'_>,
+    issued_at: Option<u64>,
+    scope: Option<Vec<String>>,
+) -> Result<MintedToken> {
+    mint_token_with_scope_claim(request, issued_at, scope)
+}
+
+/// Sign an arbitrary claim object, so a fuzz target can present claim *shapes*
+/// minting cannot express — a missing `jti`, an `exp` before its `iat`, a
+/// `scope` that is a string rather than an array — and reach the check that
+/// rejects each one.
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_sign_claims(
+    header: &Header,
+    claims: &serde_json::Value,
+    algorithm: MintAlgorithm,
+    key_material: &str,
+    kid: &str,
+) -> Result<String> {
+    let encoding_key = encoding_key(algorithm, key_material, kid)?;
+    Ok(format!("axt1.{}", encode(header, claims, &encoding_key)?))
+}
+
+fn mint_token_with_scope_claim(
+    request: MintRequest<'_>,
+    issued_at: Option<u64>,
+    scope_claim: Option<Vec<String>>,
+) -> Result<MintedToken> {
     let MintRequest {
         kid,
         algorithm,
@@ -251,12 +292,16 @@ pub(crate) fn mint_token_at(
         ttl,
         aliases,
         max_request_microdollars,
-        scope,
+        scope: _,
     } = request;
     let encoding_key = encoding_key(algorithm, key_material, kid)?;
     let iat = issued_at.unwrap_or(unix_now()?);
     let claims = MintClaims {
-        exp: iat + ttl.as_secs(),
+        // Saturating: a clock far enough ahead, or a TTL near `u64::MAX`, must
+        // produce a token the verifier refuses for its lifetime rather than an
+        // arithmetic panic. The callers bound both, so this only ever bites when
+        // one of them stops doing so.
+        exp: iat.saturating_add(ttl.as_secs()),
         iat,
         aud: audience.to_owned(),
         jti: random_jti()?,
@@ -264,7 +309,7 @@ pub(crate) fn mint_token_at(
         sub: subject.to_owned(),
         aliases,
         max_request_microdollars,
-        scope: scope.map(|values| values.into_iter().map(|value| value.to_string()).collect()),
+        scope: scope_claim,
     };
     let mut header = Header::new(algorithm.jwt());
     header.kid = Some(kid.to_owned());
@@ -866,6 +911,31 @@ max_ttl = "15m"
             .unwrap_err()
             .to_string();
         assert!(error.contains("policy ceiling"));
+    }
+
+    // Found by the `token_verify` fuzz target: an `iat` near the end of the
+    // epoch used to overflow while computing `exp`, which is an abort in a
+    // release build with overflow checks and a wrong `exp` without them. The
+    // token it produces now is one the verifier refuses on its lifetime.
+    #[test]
+    fn mint_saturates_rather_than_overflowing_an_extreme_issue_time() {
+        let minted = mint_token_at(
+            MintRequest {
+                kid: "hs-kid",
+                algorithm: MintAlgorithm::Hs256,
+                key_material: "01234567890123456789012345678901",
+                namespace: "acme",
+                subject: "caller",
+                audience: "configured-audience",
+                ttl: Duration::from_secs(600),
+                aliases: None,
+                max_request_microdollars: None,
+                scope: None,
+            },
+            Some(u64::MAX),
+        )
+        .unwrap();
+        assert_eq!(minted.exp, u64::MAX);
     }
 
     #[test]

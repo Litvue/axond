@@ -1,0 +1,16 @@
+[[namespace]]
+id = "fuzz"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "fuzz"
+
+[[model]]
+name = "gpt-4o"
+targets = [{ provider = "openai", model = "gpt-4o", price = { input_microdollars_per_million = 2500000, output_microdollars_per_million = 10000000 } }]

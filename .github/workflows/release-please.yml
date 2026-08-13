@@ -155,6 +155,10 @@ jobs:
       # pushing a commit built on a stale checkout. A force push is deliberately
       # avoided: the goal is to include release-please's regenerated content,
       # not overwrite it.
+      # Both lockfiles: `fuzz/` is a separate workspace whose lock records the
+      # released version through its path dependency on `axond`, so a release that
+      # only synced the root lock would leave the required `Fuzz smoke` lane
+      # failing `--locked` on every pull request until someone refreshed it by hand.
       - name: Sync Cargo.lock onto the release branch
         if: ${{ !cancelled() && steps.sync-toolchain.outcome == 'success' }}
         env:
@@ -167,11 +171,17 @@ jobs:
             git fetch --force origin "$RELEASE_BRANCH"
             git reset --hard FETCH_HEAD
             cargo update --workspace
-            if git diff --quiet Cargo.lock; then
-              echo "Cargo.lock is already in sync with $RELEASE_BRANCH"
+            # The same command `just fuzz-lock` runs, rather than a list of
+            # `--package` specs: it records the released version through the path
+            # dependency without upgrading anything else, names no crate that could
+            # leave the fuzz graph, and is exercised by every contributor and by the
+            # `Fuzz smoke` lane's staleness check rather than only at release time.
+            cargo fetch --manifest-path fuzz/Cargo.toml
+            if git diff --quiet Cargo.lock fuzz/Cargo.lock; then
+              echo "both lockfiles are already in sync with $RELEASE_BRANCH"
               exit 0
             fi
-            git commit -m "chore: sync Cargo.lock for release" -- Cargo.lock
+            git commit -m "chore: sync Cargo.lock for release" -- Cargo.lock fuzz/Cargo.lock
             if git push origin "HEAD:$RELEASE_BRANCH"; then
               exit 0
             fi

@@ -750,6 +750,19 @@ fn decode_query_component(value: &str) -> Result<String, GatewayError> {
         .map_err(|_| GatewayError::BadRequest("invalid query string encoding".into()))
 }
 
+/// The credential-query parser, reachable from the fuzz seam only.
+///
+/// Query parsing is a request-path detail, so it stays private to this module.
+/// `--cfg fuzzing` is set by the out-of-tree `fuzz/` project alone, so no
+/// ordinary build — or `--all-features` — compiles this wrapper, and it cannot be
+/// switched on by a dependant.
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_parse_credential_query(
+    raw_query: Option<&str>,
+) -> Result<Option<String>, GatewayError> {
+    parse_credential_query(raw_query)
+}
+
 fn hex_digit(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),

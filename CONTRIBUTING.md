@@ -20,12 +20,13 @@ That pin is newer than the project's minimum supported Rust version, which is
 on that floor the way CI does.
 
 ```bash
-just check      # fmt --check, clippy -D warnings, tests, docs, supply chain,
-                # packaging, MSRV, public-API compatibility, and workflow
-                # policy — the CI gates
+just check      # fmt --check, clippy -D warnings, tests, the fuzz smoke, docs,
+                # supply chain, packaging, MSRV, public-API compatibility, and
+                # workflow policy — the CI gates
 just run        # run against ./axond.toml
 just compat     # run the Python SDK compatibility lane
 just compat-ts  # run the TypeScript SDK compatibility lane
+just fuzz-smoke # replay the committed fuzz corpora (see fuzz/README.md)
 just msrv       # build on the declared minimum supported Rust version
 just api-compat # semver-check the published library crates against crates.io
 just workflow-policy
@@ -67,6 +68,17 @@ The same claim is made through the vendors' Node SDKs by
 toolchain, and the Node runtime exactly and type-checks the calls before running
 them. `ops/compat-ts-pins.py` (`just compat-ts-pins`) enforces those pins; how to
 bump an SDK is in [that lane's README](./tests/compat-ts/README.md).
+
+Touching a parser that reads untrusted input — configuration, minted tokens, or
+a query string? [`fuzz/`](./fuzz/README.md) is a separate Cargo workspace, so the
+root checks skip it; `just fuzz-smoke` runs the required pull-request replay on
+stable, and `just fuzz <target>` runs a bounded coverage-guided run once
+[`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) and a nightly toolchain
+are installed. A reproducer belongs in `fuzz/seeds/<target>/` in the same PR as
+the fix. Because that workspace locks its own graph and depends on `axond` by
+path, adding or bumping a dependency of any `crates/` member leaves
+`fuzz/Cargo.lock` stale: run `just fuzz-lock` and commit it, which the `Fuzz
+smoke` lane asks for by name before it replays anything.
 
 Changing anything public in `gateway-core` or `gateway-transport`? Run the
 compatibility gate, which compares the crates against the versions on crates.io

@@ -28,6 +28,7 @@ def markdown_files() -> list[Path]:
     files.extend((ROOT / "docs").rglob("*.md"))
     files.extend((ROOT / "crates").rglob("README.md"))
     files.extend((ROOT / "tests").rglob("README.md"))
+    files.append(ROOT / "fuzz/README.md")
     # Only committed documentation is ours to check; an installed dependency
     # tree (the TypeScript compatibility lane's `node_modules`) is not.
     return sorted(
@@ -456,6 +457,17 @@ def self_test() -> int:
         assert len(empty_record) == 1, empty_record
         assert "does not start with" in empty_record[0], empty_record
 
+    package = '[package]\nname = "axond"\n\n[[bin]]\nname = "axond"\n'
+    distinct = f'{package}\n[lib]\nname = "axond_fuzz_seam"\n'
+    assert documented_target_failures("m", distinct) == []
+    assert documented_target_failures("m", package) == []
+    # The clash, spelled out and — the easier one to reintroduce — defaulted to
+    # the package name by leaving `[lib] name` off entirely.
+    for clashing in (f'{package}\n[lib]\nname = "axond"\n', f"{package}\n[lib]\n"):
+        shadowed = documented_target_failures("m", clashing)
+        assert len(shadowed) == 1, shadowed
+        assert "after a binary of the same crate" in shadowed[0], shadowed
+
     # Fragments: the slug rules a cross-link relies on, and the rename it breaks.
     page = (
         "# Releasing\n\n"
@@ -586,6 +598,61 @@ def check_review_trigger_tests() -> list[str]:
             "docs/security/threat-model-review.md: only "
             f"{len(named)} named tests remain; the triggers are meant to name the "
             "existing floor for each area"
+        )
+    return failures
+
+
+def documented_target_failures(relative: str, text: str) -> list[str]:
+    """The library-versus-binary name clash in one manifest, if it has one."""
+    library = re.search(r"^\[lib\]$(.*?)(?=^\[|\Z)", text, re.M | re.S)
+    if not library:
+        return []
+    named = re.search(r'^name = "([^"]+)"', library.group(1), re.M)
+    if named:
+        name = named.group(1)
+    else:
+        # An omitted `[lib] name` defaults to the package name, which for a
+        # package whose binary is named after it *is* the clash. Resolve it the
+        # way Cargo does rather than skipping the manifest.
+        package = re.search(r"^\[package\]$(.*?)(?=^\[|\Z)", text, re.M | re.S)
+        packaged = (
+            re.search(r'^name = "([^"]+)"', package.group(1), re.M) if package else None
+        )
+        if not packaged:
+            return [f"{relative}: neither `[package]` nor `[lib]` names the library"]
+        name = packaged.group(1)
+    binaries = [
+        match.group(1)
+        for match in re.finditer(
+            r"^\[\[bin\]\]$.*?^name = \"([^\"]+)\"", text, re.M | re.S
+        )
+    ]
+    if name not in binaries:
+        return []
+    return [
+        f"{relative}: the library is named {name!r} after a binary of the same "
+        "crate, so `cargo doc` documents only one of them and the other's modules "
+        "are no longer rustdoc-linted"
+    ]
+
+
+def check_documented_targets() -> list[str]:
+    """No crate names a library after one of its own binaries.
+
+    `cargo doc` documents one target per crate name, so a library sharing a
+    binary's name quietly takes its place: `target/doc/axond/` becomes the
+    library's, every module under the binary stops being rustdoc-linted, and the
+    `Documentation` lane keeps passing with `RUSTDOCFLAGS=-D warnings` covering
+    nothing. Marking the library `doc = false` does not help — it removes the
+    whole crate from the documentation instead. Only distinct names keep both.
+    """
+    failures: list[str] = []
+    for manifest in sorted((ROOT / "crates").glob("*/Cargo.toml")):
+        failures.extend(
+            documented_target_failures(
+                str(manifest.relative_to(ROOT)),
+                manifest.read_text(encoding="utf-8"),
+            )
         )
     return failures
 
@@ -765,6 +832,7 @@ def main(argv: list[str]) -> int:
     failures.extend(check_release_script_triggers())
     failures.extend(check_review_trigger_tests())
     failures.extend(check_front_door_size())
+    failures.extend(check_documented_targets())
     failures.extend(check_adr_numbering())
     failures.extend(check_capacity_envelope())
     if failures:

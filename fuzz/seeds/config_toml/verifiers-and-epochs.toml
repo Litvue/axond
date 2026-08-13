@@ -1,0 +1,21 @@
+[[namespace]]
+id = "fuzz"
+default = true
+
+[[gateway_key]]
+env = "AXOND_KEY"
+namespace = "fuzz"
+
+[gateway_token]
+audience = "fuzz.axond.invalid"
+
+[[gateway_verifier]]
+kid = "fuzz-hs256"
+alg = "HS256"
+env = "AXOND_FUZZ_HS256"
+namespaces = ["fuzz"]
+max_ttl = "15m"
+
+[[gateway_token_epoch]]
+namespace = "fuzz"
+min_iat = "2026-01-01T00:00:00Z"

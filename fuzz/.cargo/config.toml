@@ -1,0 +1,17 @@
+# `--cfg fuzzing` is what compiles the private seam in `axond`
+# (`crates/gateway/src/fuzz_seam.rs`). `cargo fuzz` sets it itself; this makes
+# the plain `cargo run --bin fuzz-smoke` build — the stable pull-request lane —
+# set it too. It is scoped to this directory, so no build at the repository root
+# ever sees it.
+#
+# Cargo has no per-crate rustflags, so this reaches every dependency too — the
+# same graph-wide flag `cargo fuzz` sets. That matters because a crate is allowed
+# to *change behaviour* under `cfg(fuzzing)`, and a stubbed verifier would make
+# `token_verify` assert on nothing. Audited across `fuzz/Cargo.lock`: nothing on
+# the signing or verification path (`jsonwebtoken`, `ring`, `hmac`, `sha2`,
+# `ed25519-dalek`, `base64`, `serde_json`) mentions the cfg at all, and the only
+# crate in the graph that uses it — `quinn-proto`, which no target reaches —
+# widens item visibility without altering behaviour. A dependency bump that
+# brought in a fuzzing-conditional verifier would have to be re-checked here.
+[build]
+rustflags = ["--cfg", "fuzzing"]

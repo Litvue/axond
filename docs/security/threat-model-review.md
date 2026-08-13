@@ -77,8 +77,12 @@ belongs in it, not beside it. Scope narrowing is held by
 separation by `static_minting_key_mints_but_minted_token_cannot_mint`. Issuance
 policy lives in `mint.rs`: `mint_rejects_ttl_above_policy_ceiling`,
 `mint_rejects_namespace_not_permitted_by_matching_verifier`,
-`mint_rejects_unknown_scope_capability`, and
-`mint_with_different_kid_is_rejected_by_verifier`. Revocation must stay
+`mint_rejects_unknown_scope_capability`,
+`mint_with_different_kid_is_rejected_by_verifier`, and
+`mint_saturates_rather_than_overflowing_an_extreme_issue_time` for claim
+arithmetic. Verification is also fuzzed continuously — see
+[fuzzing](./fuzzing.md) — so a claim check that a malformed token can panic past
+fails the required smoke lane. Revocation must stay
 distinguishable per its typed error —
 `an_epoch_rejected_token_returns_a_distinct_401_error_code`,
 `denylisted_minted_token_returns_token_revoked`, and
@@ -460,8 +464,10 @@ lane drives both installers in dry-run with `AXOND_REQUIRE_ATTESTATION` — incl
 a deliberately wrong `AXOND_REPOSITORY` and an invalid setting that must fail —
 and `ops/check-installer-download.sh` holds the installer's failure diagnostics
 apart, so a transport failure is never reported as a missing release asset —
-`dependency-policy` runs `cargo deny` with no ignore entries, and `api-compat`
-and `msrv` hold the published surface and the floor. Keep the installer
+`dependency-policy` runs `cargo deny` with no ignore entries, `api-compat`
+and `msrv` hold the published surface and the floor, and `fuzz-smoke` replays the
+committed [fuzz corpora](./fuzzing.md) through the parsers reached before
+authentication. Keep the installer
 verification paths covered: an installer that can be made to skip attestation
 verification is a supply-chain regression.
 
