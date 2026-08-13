@@ -1154,6 +1154,11 @@ mod tests {
                 other => panic!("unexpected admission: {other:?}"),
             }
 
+            // A bootstrap admission names no generation, so it is released here
+            // rather than by a task that would sleep out the TTL to account for
+            // nothing — which during an outage is one task per failed request.
+            PolicyHold::take(&ceilings, None).linger(reservation_ttl);
+
             tokio::time::sleep(reservation_ttl - Duration::from_secs(1)).await;
             assert_eq!(
                 runtime.outstanding(held),

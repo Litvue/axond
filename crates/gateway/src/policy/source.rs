@@ -131,8 +131,16 @@ impl PolicyHold {
     /// the only honest release is the deadline the store itself will reclaim the
     /// entry on. The cost is one sleeping task per failed reserve for the length
     /// of a reservation TTL — bounded by the outage, and cheaper than a drain
-    /// that reports done while the ledger disagrees.
+    /// that reports done while the ledger disagrees. Only for a hold that names a
+    /// generation: a bootstrap admission has nothing to keep, and an outage would
+    /// otherwise spawn a task per request to account for nothing.
     pub fn linger(self, ttl: Duration) {
+        // A bootstrap admission names no generation, so nothing drains it and a
+        // task sleeping out the reservation TTL would account for nothing — while
+        // an outage spawns one per failed request. Release it here instead.
+        if self.generation.is_none() {
+            return;
+        }
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
                 runtime.spawn(async move {
