@@ -2099,6 +2099,7 @@ mod tests {
     #[test]
     fn status_probe_reservation_is_visible_to_a_concurrent_operation() {
         let count = Arc::new(AtomicUsize::new(0));
+        count.fetch_add(1, Ordering::AcqRel);
         let probe = StatusProbeAdmission::new(Duration::from_secs(65), Arc::clone(&count));
         let start = Arc::new(std::sync::Barrier::new(2));
         let observed = Arc::new(AtomicUsize::new(0));
@@ -2107,6 +2108,7 @@ mod tests {
         let worker_observed = Arc::clone(&observed);
         let worker = std::thread::spawn(move || {
             worker_start.wait();
+            worker_count.fetch_add(1, Ordering::AcqRel);
             let _admin = StatusProbeAdmission::pending(worker_count.clone());
             worker_observed.store(worker_count.load(Ordering::Acquire), Ordering::Release);
         });
