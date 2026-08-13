@@ -1,4 +1,4 @@
-# 38. Runtime policy activation, generations, and hold protection
+# 39. Runtime policy activation, generations, and hold protection
 
 Date: 2026-08-13
 
