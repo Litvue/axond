@@ -94,7 +94,7 @@ here without a scenario, or a scenario without a row, fails the suite.
 | IG-07 | Control-plane loss leaves last-known-good serving | Bounded backoff, staleness reporting, and cold boot from the signed last-known-good cache | IG-03 | `control_plane_loss_keeps_the_last_known_good_snapshot_serving` | blocked |
 | IG-08 | Bounded, observable runtime | Readiness reflects convergence rather than process liveness; `/status` reports desired, loaded, active, and lag | IG-03, #238 | `readiness_and_status_report_convergence` | blocked |
 | IG-09 | Every request records the effective price version | The compiled snapshot carries the approved price-book identity into each usage record | IG-03, #249 | `every_usage_record_names_the_price_version` | blocked |
-| IG-10 | Tenant catalogue views isolated and explained | The tenant-facing catalogue is projected from the snapshot and explains effective availability | #255, #247 | `a_tenant_catalogue_is_isolated_and_explains_itself` | blocked |
+| IG-10 | Tenant catalogue views isolated and explained | The tenant-facing catalogue is projected from the snapshot and explains effective availability | IG-03, #255, #247 | `a_tenant_catalogue_is_isolated_and_explains_itself` | blocked |
 | IG-11 | Published capacity and failure-recovery evidence | Stateful profiles in the qualification harness: convergence under load, control-plane outage, rolling upgrade | IG-01 … IG-08, #156 | `stateful_qualification_profiles_are_published` | blocked |
 
 ## The first gate that can become executable
