@@ -6,7 +6,7 @@ Tier 0 replica with no datastore and no control plane
 ([ADR 0040](../adr/0040-endurance-qualification-harness.md)); this page soaks a
 fleet whose catalogue, credential pool, tenant policy, provider, usage database,
 and processes all change while it is serving
-([ADR 0050](../adr/0050-stateful-endurance-qualification.md)) — the failures that
+([ADR 0052](../adr/0052-stateful-endurance-qualification.md)) — the failures that
 only appear when duration and change happen at once:
 
 - an accounting row lost to a restart, a rotation, or a database that went away

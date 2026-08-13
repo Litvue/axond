@@ -1,4 +1,4 @@
-# 50. Stateful endurance: soaking a deployment, not a process
+# 52. Stateful endurance: soaking a deployment, not a process
 
 Date: 2026-08-13
 
