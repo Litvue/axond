@@ -41,6 +41,7 @@
 //! minimal so those slices can extend them without a rewrite.
 
 pub mod catalog;
+pub mod catalog_projection;
 pub mod control_plane;
 pub mod models_dev;
 pub mod secrets;

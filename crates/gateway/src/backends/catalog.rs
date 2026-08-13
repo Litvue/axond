@@ -50,6 +50,16 @@
 //! The observed-rate denomination, the three identities and their validator
 //! semantics, and the bundled offline seed are recorded in
 //! [ADR 0043](https://github.com/Litvue/axond/blob/main/docs/adr/0043-catalogue-source-imports.md).
+//!
+//! # One filing, one projection of it
+//!
+//! Content here is filed under the model an offering is an offering *of*, which
+//! answers "who offers this model?". What a caller may *send* is a provider and
+//! that provider's own published id, and a provider may publish one model under
+//! several of those, so [`super::catalog_projection`] keys the same offerings by
+//! [`CallableId`](super::catalog_projection::CallableId) and classifies diffs
+//! over the ids a request uses. Nothing in this module changes for it: the
+//! projection borrows, adds no state, and is not a second place facts live.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
