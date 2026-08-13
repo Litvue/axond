@@ -135,9 +135,12 @@ ledger row for DDL it did not run:
   it. Three statement forms are confirmable: `CREATE TABLE` and `CREATE INDEX` by
   the relation being present, and `INSERT ... ON CONFLICT DO NOTHING` by the target
   table not being empty (idempotent by construction, which is what makes a row
-  usable as evidence). Nothing confirmed is a refusal (nothing was applied: drop the
-  ledger and `apply`); a partly-confirmed migration is a refusal naming what is
-  missing (neither applied nor unapplied is true). Every probe is qualified to
+  usable as evidence) — each naming its object unqualified, so an unnamed
+  `CREATE INDEX ON t (c)` or a schema-qualified `other.t` is unconfirmable too
+  rather than probed for under a name that is not one. Nothing confirmed is a
+  refusal (nothing was applied: drop the ledger and `apply`); a partly-confirmed
+  migration is a refusal naming what is missing (neither applied nor unapplied
+  is true). Every probe is qualified to
   `current_schema()` — the schema an `apply` would create these objects in — rather
   than resolved down the DSN's `search_path`, so a second install's journal in
   `public` is not read as evidence about this one.

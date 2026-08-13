@@ -313,8 +313,11 @@ path is not evidence about this one). What it does instead of recording:
 - **A shipped migration containing a statement adoption cannot confirm.** Adoption
   confirms three statement forms: `CREATE TABLE` and `CREATE INDEX` by the object
   being present, and `INSERT ... ON CONFLICT DO NOTHING` by the target table not
-  being empty. Anything else — an `ALTER`, a backfill, a `DROP`, a non-idempotent
-  `INSERT` — is both what no catalogue can report on and what a rerun would damage,
+  being empty — each of them naming its object unqualified, since the probe asks
+  about the configured schema. An unnamed `CREATE INDEX ON t (c)` or a
+  schema-qualified `other.t` is unconfirmable for the same reason as the rest.
+  Anything else — an `ALTER`, a backfill, a `DROP`, a non-idempotent `INSERT` —
+  is both what no catalogue can report on and what a rerun would damage,
   and one such statement makes its whole migration unadoptable. A *second* seed into
   a table the shipped history already seeds counts as one of those, whether it is in
   another migration or in the same file: one row proves at most one of the inserts,

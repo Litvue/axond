@@ -166,8 +166,21 @@ fn statement_kind(statement: &'static str) -> Option<Statement> {
             .get(position)
             .is_some_and(|word| word.eq_ignore_ascii_case(expected))
     };
-    /// Past `IF NOT EXISTS` and `CONCURRENTLY`, to the object's own name.
-    fn name(words: &[&'static str], mut at: usize) -> Option<&'static str> {
+    /// Past `IF NOT EXISTS` and `CONCURRENTLY`, to the object's own name — or
+    /// `None` for a form this parse cannot name the object of.
+    ///
+    /// Two of those exist and both would otherwise yield a name that is not one.
+    /// `CREATE INDEX ON t (c)` is legal and unnamed, which reads as an index
+    /// called `ON`; `CREATE TABLE other.t` names a schema, and the probe asks
+    /// about `current_schema()` only, so `other` is a table it would look for in
+    /// the wrong place. Both are unconfirmable rather than merely absent, so the
+    /// migration is unadoptable and says so, instead of the refusal naming an
+    /// object no operator can go and find.
+    fn name(
+        statement: &'static str,
+        words: &[&'static str],
+        mut at: usize,
+    ) -> Option<&'static str> {
         for skipped in ["CONCURRENTLY", "IF", "NOT", "EXISTS"] {
             if words
                 .get(at)
@@ -176,16 +189,28 @@ fn statement_kind(statement: &'static str) -> Option<Statement> {
                 at += 1;
             }
         }
-        words.get(at).copied()
+        let name = words.get(at).copied()?;
+        if name.eq_ignore_ascii_case("ON") {
+            return None;
+        }
+        // The words point into the statement, so what surrounds one is readable
+        // from the offsets: a `.` on either side makes this a qualified name.
+        let from = name.as_ptr() as usize - statement.as_ptr() as usize;
+        let bytes = statement.as_bytes();
+        let before = from.checked_sub(1).map(|at| bytes[at]);
+        if before == Some(b'.') || bytes.get(from + name.len()) == Some(&b'.') {
+            return None;
+        }
+        Some(name)
     }
     if keyword(0, "CREATE") && keyword(1, "TABLE") {
-        return name(&words, 2).map(Statement::Table);
+        return name(statement, &words, 2).map(Statement::Table);
     }
     if keyword(0, "CREATE") && keyword(1, "INDEX") {
-        return name(&words, 2).map(Statement::Index);
+        return name(statement, &words, 2).map(Statement::Index);
     }
     if keyword(0, "CREATE") && keyword(1, "UNIQUE") && keyword(2, "INDEX") {
-        return name(&words, 3).map(Statement::Index);
+        return name(statement, &words, 3).map(Statement::Index);
     }
     if keyword(0, "INSERT") && keyword(1, "INTO") {
         // Only the idempotent form: a plain `INSERT` cannot be told apart from
@@ -193,9 +218,7 @@ fn statement_kind(statement: &'static str) -> Option<Statement> {
         let idempotent = words.windows(2).any(|pair| {
             pair[0].eq_ignore_ascii_case("DO") && pair[1].eq_ignore_ascii_case("NOTHING")
         });
-        return words
-            .get(2)
-            .copied()
+        return name(statement, &words, 2)
             .filter(|_| idempotent)
             .map(Statement::Seed);
     }
@@ -1284,6 +1307,30 @@ mod tests {
                   CREATE TABLE IF NOT EXISTS first (id integer);\n",
         };
         assert_eq!(MIXED.relations(), vec!["first", "second"]);
+
+        // Two legal forms whose object this parse cannot name: an unnamed index,
+        // and a name qualified with a schema of its own. Read positionally they
+        // would be an index called `ON` and a table called `other` — objects the
+        // probe would look for, never find, and name in a refusal that sends an
+        // operator after something that does not exist. Unconfirmable instead, so
+        // the migration is unadoptable and the refusal says why.
+        for sql in [
+            "CREATE INDEX ON second (id);\n",
+            "CREATE UNIQUE INDEX CONCURRENTLY ON second (id);\n",
+            "CREATE TABLE other.third (id integer);\n",
+            "INSERT INTO other.third (id) VALUES (1) ON CONFLICT (id) DO NOTHING;\n",
+        ] {
+            let unnameable = Migration {
+                version: 8,
+                name: "unnameable",
+                sql,
+            };
+            assert_eq!(
+                evidence(&unnameable),
+                None,
+                "an object this parse cannot name is unconfirmable, not absent: {sql}"
+            );
+        }
     }
 
     /// A migration that creates no table — an `ALTER`-only or backfill migration,
