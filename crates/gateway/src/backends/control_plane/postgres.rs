@@ -3330,8 +3330,16 @@ mod tests {
             .expect_err("a name a projected row holds cannot be taken by another tenant");
         assert_eq!(
             error.category(),
-            FailureCategory::Denied,
-            "a permanent conflict must not be reported as retryable: {error}"
+            FailureCategory::Conflict,
+            "a taken name is a conflict the caller resolves by renaming: {error}"
+        );
+        assert!(
+            !error.retryable(),
+            "replaying the same name can never succeed: {error}"
+        );
+        assert!(
+            matches!(error, ControlPlaneError::NameTaken { .. }),
+            "{error}"
         );
         assert!(error.to_string().contains("acme"), "{error}");
 
