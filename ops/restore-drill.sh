@@ -65,7 +65,9 @@ workdir="$(mktemp -d)"
 replicas=()
 cleanup() {
   for pid in "${replicas[@]:-}"; do
-    [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
+    if [[ -n "$pid" ]]; then
+      kill "$pid" >/dev/null 2>&1 || true
+    fi
   done
   docker rm --force --volumes "$container" >/dev/null 2>&1 || true
   rm -rf "$workdir"
