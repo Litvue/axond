@@ -68,8 +68,12 @@ cosign generate-key-pair --output-key-prefix "$work/canary" >/dev/null
 key="$work/canary.key"
 pub="$work/canary.pub"
 
-printf 'FROM scratch\nCOPY canary.txt /canary.txt\n' > "$work/Dockerfile"
-printf 'cosign format canary\n' > "$work/canary.txt"
+# The build context is its own directory so the private key is never among the
+# files handed to the builder, whatever a later Dockerfile here copies.
+context="$work/context"
+mkdir "$context"
+printf 'FROM scratch\nCOPY canary.txt /canary.txt\n' > "$context/Dockerfile"
+printf 'cosign format canary\n' > "$context/canary.txt"
 
 # Any tag the registry rejects would fail the push rather than the assertion, so
 # the reference is fixed and the digest is read back from the registry.
@@ -107,7 +111,7 @@ digest_of() {
 
 for platform in amd64 arm64; do
   docker buildx build --provenance=false --sbom=false "--platform=linux/${platform}" \
-    --tag "${image}:${platform}" --push "$work" >/dev/null
+    --tag "${image}:${platform}" --push "$context" >/dev/null
 done
 arch_digest="$(digest_of amd64)"
 other_digest="$(digest_of arm64)"
