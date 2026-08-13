@@ -331,15 +331,21 @@ pub struct LossLedger {
     /// Distinct `request_id`s among them. One terminated request is one event,
     /// so a repeat is the same event recorded twice.
     pub usage_records_distinct: u64,
+    /// Caller requests the balancer served, by its own identity for each. A
+    /// caller request retried onto a second replica is *one* of these, which is
+    /// what makes it the unit usage is accounted by.
+    pub caller_requests: u64,
+    /// The reconciliation, replica by replica.
+    pub per_replica: Vec<ReplicaUsage>,
     /// Records that belong to a caller request some *other* replica went on to
     /// answer: a replica abandoned mid-drain settles the work it had started and
     /// still answers `503`, and the balancer retries the caller elsewhere.
-    /// Discounted from the observed count before loss is measured, so a
-    /// duplicate can never fill the hole a lost record leaves.
     pub usage_records_retry_duplicates: u64,
-    /// Expected minus what is attributable to a caller request.
+    /// Summed over replicas, so a duplicate on one cannot offset a loss on
+    /// another.
     pub usage_records_missing: u64,
-    /// Attributable records beyond what the run expected: double accounting.
+    /// Records beyond what the caller requests on that replica — and the
+    /// refusals it is entitled to hold a partial record for — explain.
     pub usage_records_surplus: u64,
     /// Refusals the balancer retried elsewhere: the ceiling on how many
     /// duplicates the run can explain.
@@ -348,6 +354,26 @@ pub struct LossLedger {
     /// Upstream bodies still open once every caller is gone: a leak survives a
     /// rollout as easily as it survives a soak.
     pub upstream_streams_open_at_end: i64,
+}
+
+/// One replica's side of the usage reconciliation. Kept per replica because a
+/// caller request is attempted on a specific replica: the one that answered it
+/// owes exactly one record, and only the one that refused it mid-drain may hold
+/// a partial one.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplicaUsage {
+    pub replica: String,
+    /// Caller requests this replica answered, plus the ones the harness pinned
+    /// directly to it. One record owed each.
+    pub caller_requests_answered: u64,
+    pub usage_records: u64,
+    /// Caller requests it refused with `503` while draining and the balancer
+    /// placed elsewhere: the ceiling on the records it may hold beyond what it
+    /// answered.
+    pub caller_requests_refused_while_draining: u64,
+    pub retry_duplicates: u64,
+    pub missing: u64,
+    pub unexplained_surplus: u64,
 }
 
 /// The per-phase envelope, recorded and never asserted: a fleet mid-rollout is

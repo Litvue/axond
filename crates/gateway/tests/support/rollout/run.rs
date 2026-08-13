@@ -39,12 +39,12 @@ use crate::support::capacity::result::{BinaryMeta, ConfigMeta, Percentiles, Verd
 use crate::support::gateway::{self, GATEWAY_KEY, alias};
 
 use super::fleet::{Drained, Fleet, NEXT, NEXT_ONLY_ALIAS, PREVIOUS, Revision, pinned};
-use super::ingress::{Forward, Ingress, REPLICA_HEADER, REVISION_HEADER};
+use super::ingress::{CallerRequest, Forward, Ingress, REPLICA_HEADER, REVISION_HEADER};
 use super::manifest::{RESULT_SCHEMA_VERSION, Scale, Scenario, ShutdownBounds, Tier};
 use super::result::{
     CapacityEnvelope, CommandRecord, DrainRecord, Environment, Event, Fence, InFlight, LossLedger,
-    MigrationEvidence, MixedVersion, PatchRollback, PhaseTraffic, ReplicaRecord, RevisionMeta,
-    RollbackEvidence, RolloutResult, RunMeta, ScenarioEcho, StreamCut,
+    MigrationEvidence, MixedVersion, PatchRollback, PhaseTraffic, ReplicaRecord, ReplicaUsage,
+    RevisionMeta, RollbackEvidence, RolloutResult, RunMeta, ScenarioEcho, StreamCut,
 };
 
 /// How often the balancer re-probes readiness. Fast enough that the measured
@@ -184,11 +184,10 @@ struct Harness {
     /// goes, so the denominator of the loss ledger is derived from what was
     /// offered rather than from what turned up.
     expected_usage: u64,
-    /// How many of those records the run expects to be cancellations: one per
-    /// drain, for the stream the shutdown deadline cuts. Any *further*
-    /// cancellation is a request some replica began and never answered a caller
-    /// with, which is what a retried refusal leaves behind.
-    expected_cancelled: u64,
+    /// Records expected from requests the harness pinned past the balancer,
+    /// under the replica it pinned them to. The balancer's caller ledger cannot
+    /// know about these, and usage is reconciled per replica.
+    pinned_expectations: BTreeMap<String, u64>,
     mixed_probe: Option<MixedVersion>,
     /// How long each replica took from being booted to carrying traffic. Kept
     /// per replica because the offset the balancer records is an offset from the
@@ -211,7 +210,7 @@ impl Harness {
             timeline: Timeline::new(started),
             traffic: Vec::new(),
             expected_usage: 0,
-            expected_cancelled: 0,
+            pinned_expectations: BTreeMap::new(),
             mixed_probe: None,
             admissions: BTreeMap::new(),
         }
@@ -368,8 +367,8 @@ impl Harness {
     /// capability only the incoming revision has is asked of one replica of each
     /// revision, at the moment both are in rotation.
     async fn mixed_version(&mut self) -> MixedVersion {
-        let previous = self.pinned_url(PREVIOUS);
-        let next = self.pinned_url(NEXT);
+        let (_, previous) = self.pinned_replica(PREVIOUS);
+        let (next_id, next) = self.pinned_replica(NEXT);
         let on_next = self
             .capability(&next)
             .await
@@ -383,6 +382,7 @@ impl Harness {
         // no usage record to expect.
         if (200..300).contains(&on_next) {
             self.expected_usage += 1;
+            *self.pinned_expectations.entry(next_id).or_default() += 1;
         }
         let phase = self
             .traffic
@@ -421,14 +421,16 @@ impl Harness {
             .map(|response| response.status().as_u16())
     }
 
-    fn pinned_url(&self, revision: &str) -> String {
-        self.fleet
+    /// A live replica at `revision`, as the pair a pinned request needs: the id
+    /// its records will be accounted under, and the address to send to.
+    fn pinned_replica(&self, revision: &str) -> (String, String) {
+        let replica = self
+            .fleet
             .replicas()
             .iter()
             .find(|replica| replica.revision.label == revision)
-            .unwrap_or_else(|| panic!("a {revision}-revision replica is serving"))
-            .base_url()
-            .to_owned()
+            .unwrap_or_else(|| panic!("a {revision}-revision replica is serving"));
+        (replica.id.clone(), replica.base_url().to_owned())
     }
 
     /// Take one replica out of the rollout: a buffered request and a stream are
@@ -445,7 +447,7 @@ impl Harness {
         // both will settle a usage record however the drain ends them. The
         // stream is the one the deadline cuts, so its record is a cancellation.
         self.expected_usage += 2;
-        self.expected_cancelled += 1;
+        *self.pinned_expectations.entry(id.to_owned()).or_default() += 2;
 
         let forwards_before = self.ingress.state.forwards().len();
         let traffic = tokio::spawn(offer(
@@ -960,28 +962,35 @@ fn ledger(harness: &Harness, expected: u64, records: &[Value]) -> LossLedger {
         .iter()
         .filter_map(|record| record["request_id"].as_str())
         .collect();
-    let refusals_retried: u64 = harness
-        .ingress
-        .state
-        .members()
+
+    // Usage is reconciled per replica, against the caller requests the balancer
+    // attempted on it. A caller request is one identity however many replicas
+    // it touched: the replica that answered it owes exactly one record, and a
+    // replica that refused it mid-drain may hold one for the work it had
+    // already begun. Because the comparison is made replica by replica, a
+    // duplicate one replica wrote cannot fill the hole another replica's lost
+    // record left — which a fleet-wide count of records would let it do.
+    let callers = harness.ingress.state.callers();
+    let per_replica = reconcile(
+        &callers,
+        &harness.pinned_expectations,
+        &harness
+            .fleet
+            .usage_records_by_replica()
+            .into_iter()
+            .map(|(id, rows)| (id, rows.len() as u64))
+            .collect(),
+    );
+    let duplicates = per_replica.iter().map(|row| row.retry_duplicates).sum();
+    let refusals_retried = per_replica
         .iter()
-        .map(|member| member.refusals())
+        .map(|row| row.caller_requests_refused_while_draining)
         .sum();
-    // A caller request the balancer had to retry can leave two records: the
-    // refusing replica settles one for the work it had already started (a
-    // cancellation) and the replica that answered settles another. Those
-    // duplicates are taken off the observed count *before* it is compared with
-    // what the run expected, so a duplicate can never fill the hole a genuinely
-    // lost record leaves.
-    let cancelled = by_status
-        .get("client_cancelled")
-        .copied()
-        .unwrap_or_default();
-    let duplicates = cancelled
-        .saturating_sub(harness.expected_cancelled)
-        .min(refusals_retried);
-    let attributed = observed.saturating_sub(duplicates);
     LossLedger {
+        caller_requests: callers.len() as u64,
+        usage_records_missing: per_replica.iter().map(|row| row.missing).sum(),
+        usage_records_surplus: per_replica.iter().map(|row| row.unexplained_surplus).sum(),
+        per_replica,
         offered: harness.traffic.iter().map(|phase| phase.offered).sum(),
         answered: harness.traffic.iter().map(|phase| phase.answered).sum(),
         errors: harness.traffic.iter().map(|phase| phase.errors).sum(),
@@ -992,11 +1001,213 @@ fn ledger(harness: &Harness, expected: u64, records: &[Value]) -> LossLedger {
         usage_records_observed: observed,
         usage_records_distinct: distinct.len() as u64,
         usage_records_retry_duplicates: duplicates,
-        usage_records_missing: expected.saturating_sub(attributed),
-        usage_records_surplus: attributed.saturating_sub(expected),
         refusals_retried,
         usage_by_status: by_status,
         upstream_streams_open_at_end: harness.fleet.upstream.state.open_streams(),
+    }
+}
+
+/// Reconcile usage replica by replica: what each replica owes for the caller
+/// requests it answered against what it actually wrote.
+///
+/// A caller request is one identity however many replicas it was attempted on,
+/// so the replica that answered owes exactly one record for it. A replica that
+/// refused it mid-drain may also hold one — it settles the work it had already
+/// begun — and that is the only thing that entitles a replica to a record
+/// beyond what it answered. Doing this per replica is the point: a fleet-wide
+/// count lets a duplicate one replica wrote stand in for the record another
+/// replica lost, and then a loss of one and a duplicate of one reads as a clean
+/// run.
+fn reconcile(
+    callers: &[CallerRequest],
+    pinned: &BTreeMap<String, u64>,
+    records: &BTreeMap<String, u64>,
+) -> Vec<ReplicaUsage> {
+    let mut answered: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut refused: BTreeMap<&str, u64> = BTreeMap::new();
+    for caller in callers {
+        if let Some(attempt) = caller.answered_by() {
+            *answered.entry(attempt.replica.as_str()).or_default() += 1;
+        }
+        for replica in caller.draining_refusals() {
+            *refused.entry(replica).or_default() += 1;
+        }
+    }
+    let ids: BTreeSet<&str> = answered
+        .keys()
+        .copied()
+        .chain(pinned.keys().map(String::as_str))
+        .chain(records.keys().map(String::as_str))
+        .collect();
+    ids.into_iter()
+        .map(|id| {
+            let owed = answered.get(id).copied().unwrap_or_default()
+                + pinned.get(id).copied().unwrap_or_default();
+            let wrote = records.get(id).copied().unwrap_or_default();
+            let refused_here = refused.get(id).copied().unwrap_or_default();
+            let over = wrote.saturating_sub(owed);
+            ReplicaUsage {
+                replica: id.to_owned(),
+                caller_requests_answered: owed,
+                usage_records: wrote,
+                caller_requests_refused_while_draining: refused_here,
+                retry_duplicates: over.min(refused_here),
+                missing: owed.saturating_sub(wrote),
+                unexplained_surplus: over.saturating_sub(refused_here),
+            }
+        })
+        .collect()
+}
+
+/// The usage reconciliation, exercised on hand-built ledgers: these are the
+/// cases that decide whether a lost record can hide behind a retry, and they are
+/// too rare in a live run to be left to one.
+///
+/// Plain `#[test]`s: this is an integration test crate, where `cfg(test)` is
+/// never set and a `cfg(test)` module would be compiled out.
+mod usage_accounting {
+    use super::super::ingress::Attempt;
+    use super::*;
+
+    fn caller(id: u64, attempts: Vec<Attempt>) -> CallerRequest {
+        CallerRequest { id, attempts }
+    }
+
+    fn refused(replica: &str) -> Attempt {
+        Attempt {
+            replica: replica.to_owned(),
+            status: Some(503),
+            refused_while_draining: true,
+        }
+    }
+
+    fn answered(replica: &str) -> Attempt {
+        Attempt {
+            replica: replica.to_owned(),
+            status: Some(200),
+            refused_while_draining: false,
+        }
+    }
+
+    fn dropped(replica: &str) -> Attempt {
+        Attempt {
+            replica: replica.to_owned(),
+            status: None,
+            refused_while_draining: false,
+        }
+    }
+
+    fn records(rows: [(&str, u64); 2]) -> BTreeMap<String, u64> {
+        rows.into_iter()
+            .map(|(id, count)| (id.to_owned(), count))
+            .collect()
+    }
+
+    fn row<'a>(ledger: &'a [ReplicaUsage], replica: &str) -> &'a ReplicaUsage {
+        ledger
+            .iter()
+            .find(|row| row.replica == replica)
+            .expect("the replica is in the ledger")
+    }
+
+    /// One caller request, two replicas: the draining one refused it and the
+    /// other answered. Only the answering replica owes a record, and the record
+    /// the refusing one kept for the work it had begun is a duplicate of that
+    /// caller request rather than a second answered caller.
+    #[test]
+    fn a_refusal_retried_elsewhere_is_one_caller_request_not_two() {
+        let ledger = reconcile(
+            &[caller(0, vec![refused("previous-0"), answered("next-0")])],
+            &BTreeMap::new(),
+            &records([("previous-0", 1), ("next-0", 1)]),
+        );
+
+        assert_eq!(row(&ledger, "next-0").caller_requests_answered, 1);
+        assert_eq!(row(&ledger, "previous-0").caller_requests_answered, 0);
+        assert_eq!(row(&ledger, "previous-0").retry_duplicates, 1);
+        assert!(ledger.iter().all(|row| row.missing == 0));
+        assert!(ledger.iter().all(|row| row.unexplained_surplus == 0));
+    }
+
+    /// Two records for one caller request on the replica that answered it, with
+    /// no refusal to explain either: double accounting, and the surplus says so.
+    #[test]
+    fn a_duplicate_record_for_one_caller_request_is_surplus() {
+        let ledger = reconcile(
+            &[caller(0, vec![answered("next-0")])],
+            &BTreeMap::new(),
+            &records([("next-0", 2), ("previous-0", 0)]),
+        );
+
+        assert_eq!(row(&ledger, "next-0").unexplained_surplus, 1);
+        assert_eq!(row(&ledger, "next-0").retry_duplicates, 0);
+    }
+
+    /// The case a fleet-wide count gets wrong. One caller request was refused
+    /// and retried, so a duplicate exists and is explained; a second caller
+    /// request was answered by a different replica that lost its record. The
+    /// totals match — two callers, two records — and the loss is still reported,
+    /// because the comparison is made replica by replica.
+    #[test]
+    fn a_duplicate_on_one_replica_cannot_mask_a_loss_on_another() {
+        let ledger = reconcile(
+            &[
+                caller(0, vec![refused("previous-0"), answered("next-0")]),
+                caller(1, vec![answered("previous-1")]),
+            ],
+            &BTreeMap::new(),
+            &[("previous-0", 1), ("next-0", 1), ("previous-1", 0)]
+                .into_iter()
+                .map(|(id, count)| (id.to_owned(), count))
+                .collect(),
+        );
+
+        let owed: u64 = ledger.iter().map(|row| row.caller_requests_answered).sum();
+        let wrote: u64 = ledger.iter().map(|row| row.usage_records).sum();
+        assert_eq!(
+            owed, wrote,
+            "the fleet-wide totals agree, which is the trap"
+        );
+        assert_eq!(row(&ledger, "previous-1").missing, 1);
+        assert_eq!(row(&ledger, "previous-0").retry_duplicates, 1);
+    }
+
+    /// A replica that dropped the connection never reached its request path, so
+    /// it is owed nothing and entitled to nothing: a transport failure is not a
+    /// draining refusal, and cannot be spent explaining a record.
+    #[test]
+    fn a_transport_failure_is_not_a_draining_refusal() {
+        let ledger = reconcile(
+            &[caller(0, vec![dropped("previous-0"), answered("next-0")])],
+            &BTreeMap::new(),
+            &records([("previous-0", 1), ("next-0", 1)]),
+        );
+
+        assert_eq!(
+            row(&ledger, "previous-0").caller_requests_refused_while_draining,
+            0
+        );
+        assert_eq!(row(&ledger, "previous-0").retry_duplicates, 0);
+        assert_eq!(
+            row(&ledger, "previous-0").unexplained_surplus,
+            1,
+            "a record from a replica that never answered is unexplained"
+        );
+    }
+
+    /// Requests the harness pinned to a replica bypass the balancer, so they
+    /// have no caller identity of their own and are owed against that replica
+    /// directly.
+    #[test]
+    fn pinned_requests_are_owed_by_the_replica_they_were_sent_to() {
+        let ledger = reconcile(
+            &[],
+            &[("previous-0".to_owned(), 2)].into_iter().collect(),
+            &records([("previous-0", 1), ("next-0", 0)]),
+        );
+
+        assert_eq!(row(&ledger, "previous-0").caller_requests_answered, 2);
+        assert_eq!(row(&ledger, "previous-0").missing, 1);
     }
 }
 
@@ -1018,7 +1229,10 @@ fn envelope(traffic: &[PhaseTraffic]) -> CapacityEnvelope {
         (rps, p95)
     };
     let (steady, steady_p95) = mean(|phase| phase.phase.starts_with("steady"));
-    let (degraded, degraded_p95) = mean(|phase| phase.phase.starts_with("drain"));
+    // `contains`, not `starts_with`: the rollback's drain is a replica short of
+    // the fleet too, and leaving `rollback-drain` out would average the cost of
+    // a rollout over two of the three windows that have it.
+    let (degraded, degraded_p95) = mean(|phase| phase.phase.contains("drain"));
     CapacityEnvelope {
         steady_answered_rps: steady,
         degraded_answered_rps: degraded,

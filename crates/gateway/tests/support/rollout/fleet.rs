@@ -19,6 +19,7 @@
 //! lost. They are taken from the process' stdout the moment it exits and kept
 //! with the fleet, so the loss ledger covers replicas that no longer exist.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -224,6 +225,22 @@ impl Fleet {
                 self.retired
                     .iter()
                     .flat_map(|retired| retired.usage_records.clone()),
+            )
+            .collect()
+    }
+
+    /// The same records, kept under the replica that wrote them. Usage is
+    /// reconciled per replica, because a caller request is attempted on a
+    /// specific replica: a surplus one replica wrote for a refusal must not be
+    /// allowed to fill the hole another replica's lost record left.
+    pub fn usage_records_by_replica(&self) -> BTreeMap<String, Vec<Value>> {
+        self.replicas
+            .iter()
+            .map(|replica| (replica.id.clone(), replica.process.usage_records()))
+            .chain(
+                self.retired
+                    .iter()
+                    .map(|retired| (retired.id.clone(), retired.usage_records.clone())),
             )
             .collect()
     }

@@ -54,8 +54,18 @@ without buffering them, retries a typed `draining` refusal onto another member,
 and answers `503` when no member will take the request. It stamps the replica and
 revision it chose onto every response, which is what makes "who served this
 request" a recorded fact rather than an inference. Because it holds its own
-readiness view, `forwards_after_withdrawal` is a number that *can* be non-zero —
-so a run asserting it is zero has asserted something.
+readiness view, the routing rule has a witness other than the driver.
+`forwards_after_withdrawal` is zero by construction — selection reads readiness
+and withdrawal under one lock, so a request chosen from a ready member cannot
+land in it — and is recorded as the invariant it is. What a run actually asserts
+is `dispatches_after_withdrawal`: the dispatch instants the balancer logged,
+recompared after the fact with the withdrawal instant it recorded. That number
+can be non-zero, and it is the one the zero gate is decided on: the dispatch
+instant is taken when the request is actually handed to the replica, not when it
+was selected, so a withdrawal that lands in between is caught rather than
+defined away. A unit test produces exactly that race — it holds a request at
+that seam, withdraws the member, and lets it go — so the gate is known to be
+capable of failing rather than merely asserted to be.
 
 **The subjects are real processes at two revisions.** A revision is the (binary,
 config) pair a process was started from. The incoming revision serves an alias
@@ -102,7 +112,9 @@ and a chronological timeline of every rollout event.
 
 **Only environment-independent properties are hard failures.** The gates are:
 nothing routed to a withdrawn replica, every offered request answered, no `503`,
-one usage record per request with none lost, readiness removed within its bound,
+one usage record per caller request with none lost — reconciled replica by
+replica, so a duplicate one replica wrote cannot stand in for the record another
+lost — readiness removed within its bound,
 a replacement admitted within its bound, termination inside
 `drain_grace_ms + deadline_ms + flush_timeout_ms`, the mixed-version window
 genuinely mixed, the pinned buffered request completed, the pinned stream cut

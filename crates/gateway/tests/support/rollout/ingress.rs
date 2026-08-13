@@ -71,6 +71,7 @@ pub struct Member {
     /// drain is judged on is the dispatch, not the answer.
     dispatches: Mutex<Vec<Duration>>,
     refusals: AtomicU64,
+    draining_refusals: AtomicU64,
 }
 
 impl Member {
@@ -84,6 +85,7 @@ impl Member {
             forwards_after_withdrawal: AtomicU64::new(0),
             dispatches: Mutex::new(Vec::new()),
             refusals: AtomicU64::new(0),
+            draining_refusals: AtomicU64::new(0),
         }
     }
 
@@ -127,6 +129,11 @@ impl Member {
             .count() as u64
     }
 
+    /// Stamp a dispatch: the instant the balancer actually handed the request
+    /// to this member, which is the event a drain is judged on. Deliberately
+    /// *not* the instant it was selected — a balancer whose selection is stale
+    /// by the time it forwards has still put a caller on a drained replica, and
+    /// that is exactly what the gate exists to catch.
     fn dispatched(&self, at: Duration) {
         self.dispatches.lock().expect("ingress lock").push(at);
     }
@@ -135,6 +142,13 @@ impl Member {
     /// connection) and the ingress retried elsewhere.
     pub fn refusals(&self) -> u64 {
         self.refusals.load(Ordering::SeqCst)
+    }
+
+    /// Of those, the ones the member answered `503` to rather than dropping.
+    /// Only these can have reached the request path, so only these can have
+    /// left a usage record behind for a caller request another member answered.
+    pub fn draining_refusals(&self) -> u64 {
+        self.draining_refusals.load(Ordering::SeqCst)
     }
 
     fn observe(&self, ready: bool, elapsed: Duration) {
@@ -163,15 +177,101 @@ pub struct Forward {
     pub retries: u32,
 }
 
+/// One attempt inside a caller request: the replica the balancer handed it to,
+/// and how that ended. A refusal the replica *answered* is the only kind that
+/// can have reached its request path, and therefore the only kind that can
+/// leave a usage record behind for a caller request another replica went on to
+/// answer.
+#[derive(Debug, Clone, Serialize)]
+pub struct Attempt {
+    pub replica: String,
+    pub status: Option<u16>,
+    pub refused_while_draining: bool,
+}
+
+/// One caller request, by the identity the balancer gave it. This — not the
+/// `request_id` a replica mints per event — is what usage is accounted by: a
+/// caller request that two replicas both wrote a record for is one caller
+/// request with a duplicate, not two answered callers.
+#[derive(Debug, Clone, Serialize)]
+pub struct CallerRequest {
+    pub id: u64,
+    pub attempts: Vec<Attempt>,
+}
+
+impl CallerRequest {
+    /// The replica that answered, whatever the status.
+    pub fn answered_by(&self) -> Option<&Attempt> {
+        self.attempts
+            .last()
+            .filter(|attempt| attempt.status.is_some_and(|status| status != 503))
+    }
+
+    /// The replicas that refused it mid-drain and may therefore hold a record
+    /// for work they had already begun.
+    pub fn draining_refusals(&self) -> impl Iterator<Item = &str> {
+        self.attempts
+            .iter()
+            .filter(|attempt| attempt.refused_while_draining)
+            .map(|attempt| attempt.replica.as_str())
+    }
+}
+
 pub struct IngressState {
     members: RwLock<Vec<Arc<Member>>>,
     cursor: AtomicUsize,
     forwards: Mutex<Vec<Forward>>,
+    /// Every caller request the balancer has seen, by its own identity.
+    callers: Mutex<Vec<CallerRequest>>,
+    next_caller: AtomicU64,
     /// Requests the balancer could not place at all: no member was ready. The
     /// caller-visible availability gap of a rollout.
     unavailable: AtomicU64,
+    /// A door between selection and forwarding, opened only by the test that
+    /// has to produce the race for real: hold a request there, withdraw the
+    /// member it was placed on, and let it go.
+    pause: Mutex<Option<Arc<Pause>>>,
     client: reqwest::Client,
     started: Instant,
+}
+
+/// The seam that makes the withdrawal race reproducible rather than hoped for.
+pub struct Pause {
+    reached: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+impl Pause {
+    fn new() -> Self {
+        Self {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    /// Called by the balancer: announce arrival and wait to be let go.
+    async fn hold(&self) {
+        self.reached.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .expect("the pause is open")
+            .forget();
+    }
+
+    /// Called by the test: wait until a request is held at the seam.
+    pub async fn await_arrival(&self) {
+        self.reached
+            .acquire()
+            .await
+            .expect("the pause is open")
+            .forget();
+    }
+
+    /// Called by the test: let one held request continue.
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
 }
 
 impl IngressState {
@@ -191,6 +291,21 @@ impl IngressState {
         self.unavailable.load(Ordering::SeqCst)
     }
 
+    pub fn callers(&self) -> Vec<CallerRequest> {
+        self.callers.lock().expect("ingress lock").clone()
+    }
+
+    /// Hold requests between selection and forwarding until they are released.
+    pub fn pause_before_forwarding(&self) -> Arc<Pause> {
+        let pause = Arc::new(Pause::new());
+        *self.pause.lock().expect("ingress lock") = Some(pause.clone());
+        pause
+    }
+
+    fn record_caller(&self, caller: CallerRequest) {
+        self.callers.lock().expect("ingress lock").push(caller);
+    }
+
     fn elapsed(&self) -> Duration {
         self.started.elapsed()
     }
@@ -198,8 +313,10 @@ impl IngressState {
     /// The next ready member, round-robin, skipping `exclude` — the members that
     /// already refused this request. Also reports whether that member had
     /// already been withdrawn when it was chosen: read under the same lock as
-    /// its readiness, so a withdrawal recorded a moment later cannot be blamed
-    /// on a request the balancer was entitled to place.
+    /// its readiness, so this selection-time invariant is decided on one
+    /// consistent view. The dispatch instant is *not* stamped here: it is taken
+    /// when the request is actually forwarded, so a withdrawal that lands
+    /// between the two is caught rather than defined away.
     fn pick(&self, exclude: &[String]) -> Option<(Arc<Member>, bool)> {
         let members = self.members();
         if members.is_empty() {
@@ -232,7 +349,10 @@ impl Ingress {
             members: RwLock::new(Vec::new()),
             cursor: AtomicUsize::new(0),
             forwards: Mutex::new(Vec::new()),
+            callers: Mutex::new(Vec::new()),
+            next_caller: AtomicU64::new(0),
             unavailable: AtomicU64::new(0),
+            pause: Mutex::new(None),
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .build()
@@ -358,6 +478,10 @@ async fn proxy(State(state): State<Arc<IngressState>>, request: Request) -> Resp
         .path_and_query()
         .map_or_else(|| parts.uri.path().to_owned(), ToString::to_string);
 
+    let mut caller = CallerRequest {
+        id: state.next_caller.fetch_add(1, Ordering::SeqCst),
+        attempts: Vec::new(),
+    };
     let mut refused = Vec::new();
     // One attempt per member: a request is only ever retried onto a member that
     // has not already refused it, so a fleet-wide refusal is reported rather
@@ -368,12 +492,16 @@ async fn proxy(State(state): State<Arc<IngressState>>, request: Request) -> Resp
             break;
         };
         member.forwards.fetch_add(1, Ordering::SeqCst);
-        member.dispatched(state.elapsed());
         if withdrawn {
             member
                 .forwards_after_withdrawal
                 .fetch_add(1, Ordering::SeqCst);
         }
+        let held = state.pause.lock().expect("ingress lock").clone();
+        if let Some(pause) = held {
+            pause.hold().await;
+        }
+        member.dispatched(state.elapsed());
         let sent = state
             .client
             .request(parts.method.clone(), format!("{}{path}", member.base_url))
@@ -388,6 +516,12 @@ async fn proxy(State(state): State<Arc<IngressState>>, request: Request) -> Resp
             // member that is still serving.
             Ok(response) if response.status() == StatusCode::SERVICE_UNAVAILABLE => {
                 member.refusals.fetch_add(1, Ordering::SeqCst);
+                member.draining_refusals.fetch_add(1, Ordering::SeqCst);
+                caller.attempts.push(Attempt {
+                    replica: member.id.clone(),
+                    status: Some(503),
+                    refused_while_draining: true,
+                });
                 refused.push(member.id.clone());
             }
             Ok(response) => {
@@ -399,6 +533,12 @@ async fn proxy(State(state): State<Arc<IngressState>>, request: Request) -> Resp
                     at_ms: state.elapsed().as_millis(),
                     retries,
                 });
+                caller.attempts.push(Attempt {
+                    replica: member.id.clone(),
+                    status: Some(status.as_u16()),
+                    refused_while_draining: false,
+                });
+                state.record_caller(caller);
                 return relayed(&member, status, response);
             }
             // No answer at all: the member is gone. Take it out of rotation
@@ -406,11 +546,17 @@ async fn proxy(State(state): State<Arc<IngressState>>, request: Request) -> Resp
             Err(_) => {
                 member.refusals.fetch_add(1, Ordering::SeqCst);
                 member.observe(false, state.elapsed());
+                caller.attempts.push(Attempt {
+                    replica: member.id.clone(),
+                    status: None,
+                    refused_while_draining: false,
+                });
                 refused.push(member.id.clone());
             }
         }
     }
 
+    state.record_caller(caller);
     state.unavailable.fetch_add(1, Ordering::SeqCst);
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -532,5 +678,97 @@ mod withdrawal_rules {
             member.dispatches_after(member.withdrawn_at().expect("the drain is dated")),
             2
         );
+    }
+
+    /// The race itself, produced rather than argued about: a request is held
+    /// between selection and forwarding, the member it was placed on is
+    /// withdrawn while it waits, and it is then let go. Selection was entitled
+    /// to it — the member was ready when it was chosen — so the selection-time
+    /// invariant stays zero, and the dispatch witness is what catches it. If
+    /// the harness stamped the dispatch at selection instead, this would read
+    /// as a clean run and the zero gate could never fail.
+    #[tokio::test]
+    async fn a_withdrawal_between_selection_and_forwarding_fails_the_gate() {
+        let replica = stub_replica().await;
+        // A probe interval longer than the test: readiness here is driven by
+        // hand, so the outcome does not depend on when a poll happens to land.
+        let ingress = Ingress::start(Duration::from_secs(3600), Instant::now()).await;
+        let member = ingress.add("previous-0", "previous", &replica);
+        member.observe(true, Duration::from_millis(10));
+
+        let pause = ingress.state.pause_before_forwarding();
+        let url = ingress.url("/healthz");
+        let call = tokio::spawn(async move { reqwest::get(url).await.map(|r| r.status()) });
+
+        pause.await_arrival().await;
+        member.observe(false, ingress.state.elapsed());
+        pause.release();
+        let status = call
+            .await
+            .expect("the caller task finishes")
+            .expect("the held request completes");
+
+        assert!(status.is_success(), "the held request was still served");
+        assert_eq!(
+            member.forwards_after_withdrawal(),
+            0,
+            "selection read a ready member, so the selection-time invariant holds"
+        );
+        let withdrawn_at = member.withdrawn_at().expect("the withdrawal is dated");
+        assert_eq!(
+            member.dispatches_after(withdrawn_at),
+            1,
+            "the request nonetheless landed on a withdrawn member, and the \
+             witness the gate is decided on says so"
+        );
+    }
+
+    /// Re-admission clears the mark, and a request forwarded afterwards is not
+    /// charged to the drain that preceded it: a replica put back into rotation
+    /// is a replica the balancer may use again.
+    #[tokio::test]
+    async fn a_re_admitted_member_carries_no_withdrawal_mark() {
+        let replica = stub_replica().await;
+        let ingress = Ingress::start(Duration::from_secs(3600), Instant::now()).await;
+        let member = ingress.add("previous-0", "previous", &replica);
+        // Dated from the balancer's own clock, so the dispatch that follows is
+        // unambiguously later than the flap.
+        member.observe(true, ingress.state.elapsed());
+        member.observe(false, ingress.state.elapsed());
+        member.observe(true, ingress.state.elapsed());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let status = reqwest::get(ingress.url("/healthz"))
+            .await
+            .expect("the re-admitted member serves")
+            .status();
+
+        assert!(status.is_success());
+        assert_eq!(
+            member.forwards_after_withdrawal(),
+            0,
+            "the mark was cleared when the member came back"
+        );
+        assert_eq!(
+            member.dispatches_after(member.withdrawn_at().expect("the earlier drain is dated")),
+            1,
+            "the dispatch is later than that drain, which is why the mark \
+             being cleared is what keeps the gate honest"
+        );
+    }
+
+    /// A replica that answers everything, standing in for a real one: these
+    /// tests are about the balancer's bookkeeping, not the gateway's.
+    async fn stub_replica() -> String {
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .expect("the stub binds");
+        let addr = listener.local_addr().expect("the stub has an address");
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(|| async { "ok" });
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
     }
 }
