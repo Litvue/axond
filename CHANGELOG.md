@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.24](https://github.com/Litvue/axond/compare/v0.3.23...v0.3.24) (2026-08-13)
+
+
+### Tests
+
+* **security:** stateful secret-redaction and lifecycle regression suite ([#223](https://github.com/Litvue/axond/issues/223)) ([#265](https://github.com/Litvue/axond/issues/265)) ([04703e3](https://github.com/Litvue/axond/commit/04703e3350d0cfa020899ebac7e498479d8a760c))
+
+
+### Continuous Integration
+
+* bump the github-actions group with 9 updates ([#258](https://github.com/Litvue/axond/issues/258)) ([ac48335](https://github.com/Litvue/axond/commit/ac48335bebec5b5b8b3298dd5cb3dd735f4bf42d))
+
 ## [0.3.23](https://github.com/Litvue/axond/compare/v0.3.22...v0.3.23) (2026-08-13)
 
 
