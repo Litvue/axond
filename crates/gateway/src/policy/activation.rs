@@ -894,6 +894,9 @@ mod tests {
                 scope: scope(),
                 namespace: "acme/core".to_owned(),
             },
+            ActivationRefusal::Ungoverned {
+                namespace: "acme/core".to_owned(),
+            },
         ];
         for refusal in refusals {
             let reason = refusal.reason();

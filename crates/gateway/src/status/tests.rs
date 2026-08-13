@@ -692,6 +692,7 @@ fn backend_and_revision_failures_map_to_bounded_codes() {
         ("migration", StatusReason::PolicyRejected),
         ("refused", StatusReason::PolicyRejected),
         ("withdrawn", StatusReason::PolicyRejected),
+        ("ungoverned", StatusReason::PolicyRejected),
         ("invalid", StatusReason::ValidationRejected),
         ("not_found", StatusReason::NotConfigured),
         ("denied", StatusReason::PermissionDenied),

@@ -193,6 +193,7 @@ pub const REVISION_REASONS: &[&str] = &[
     "migration",
     "refused",
     "withdrawn",
+    "ungoverned",
 ];
 
 /// The reason label for a store failure. Exhaustive, so a new
