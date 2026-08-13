@@ -389,6 +389,9 @@ fn validation_rule(error: &ValidationError) -> (&'static str, Option<ResourceRef
         // #253's policy records validate by their own rules, and name the
         // resource they are about without quoting its body.
         ValidationError::Policy(policy) => ("policy", Some(policy.reference())),
+        // #205's enablement and alias records validate by their own rules, and
+        // every refusal names the one row it is about.
+        ValidationError::Model(model) => ("model", Some(model.reference())),
         ValidationError::AuditMutationMismatch { .. } => ("audit_mutation_mismatch", None),
         ValidationError::Canonical(_) => ("not_canonical", None),
     }
