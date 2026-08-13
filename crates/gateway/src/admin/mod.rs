@@ -11,7 +11,7 @@
 //! One path under the prefix is deliberately not this surface:
 //! `GET /admin/v1/status` is the replica diagnostic, registered on the inference
 //! router and authenticated with a gateway credential carrying
-//! [`Capability::Status`](crate::capabilities::Capability::Status). It reads
+//! [`Capability::Status`](crate::principals::Capability::Status). It reads
 //! this process's cached component states and never the control plane, which is
 //! why it answers in both modes and why an inference credential is the right one
 //! for it. It borrows only this module's method contract: a wrong method on it
