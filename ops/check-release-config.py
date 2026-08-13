@@ -744,8 +744,10 @@ def check_platform_transition_guidance() -> list[str]:
     # The quoted note carries the instruction, so a reworded check must not leave
     # the runbook quoting advice the check no longer gives. The pinned tag is the
     # one part that legitimately differs: the runbook quotes the release that first
-    # published an index, while a live run names whatever tag is pinned today.
-    quoted_tail = fallback_obsolete_note("").split("publishes a", 1)[1]
+    # published an index, while a live run names whatever tag is pinned today. It
+    # is cut out through a sentinel rather than a phrase from the note, so nothing
+    # here breaks when the note itself is reworded — which is when this must work.
+    quoted_tail = fallback_obsolete_note("\x00").split("\x00", 1)[1]
     if quoted_tail not in runbook:
         failures.append(
             "docs/maintainers/releasing.md: the quoted release-configuration note "
