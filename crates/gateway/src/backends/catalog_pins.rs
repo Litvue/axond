@@ -206,8 +206,18 @@ impl<'a> PinnedCatalog<'a> {
 
     /// The offerings among `enablements` this catalogue no longer publishes.
     ///
-    /// Pins naming another snapshot are not reported: this catalogue has nothing
-    /// to say about whether a snapshot it is not still lists them.
+    /// Independent of which snapshot a pin names, so this agrees with
+    /// [`RefreshImpact`](super::catalog_refresh::RefreshImpact): an enablement
+    /// whose offering vanished upstream is worth reporting whether or not its
+    /// operator has moved the pin to the current snapshot, and an operator who
+    /// was told otherwise would hear about the withdrawal only once they
+    /// republished against the catalogue that had already dropped it.
+    ///
+    /// The distinction between the two states lives in [`Self::resolve`], which
+    /// answers [`Resolution::OtherSnapshot`] rather than
+    /// [`Resolution::Withdrawn`] for a pin to content this catalogue is not: a
+    /// request may not be routed through a snapshot nobody approved, even when
+    /// this one still publishes the offering.
     pub fn withdrawn_from<'b>(
         &self,
         enablements: impl IntoIterator<Item = &'b ModelEnablementBody>,
@@ -215,8 +225,8 @@ impl<'a> PinnedCatalog<'a> {
         enablements
             .into_iter()
             .map(ModelEnablementBody::offering)
-            .filter(|pin| matches!(self.resolve(*pin), Resolution::Withdrawn))
             .map(|pin| pin.offering)
+            .filter(|offering| !self.offerings.contains_key(offering))
             .collect()
     }
 }
@@ -393,21 +403,35 @@ mod tests {
         assert_eq!(withdrawn.len(), 1);
     }
 
-    /// A pin naming a snapshot this catalogue is not says nothing about whether
-    /// that snapshot still lists it.
+    /// Withdrawal observation does not depend on an operator having moved their
+    /// pin: an unmoved pin is exactly the one whose offering nobody has looked
+    /// at since the upstream dropped it, and the refresh report says so too.
     #[test]
-    fn an_offering_pinned_elsewhere_is_not_reported_as_withdrawn() {
+    fn an_offering_pinned_elsewhere_is_still_reported_as_withdrawn() {
         let (content, snapshot) = imported(IDENTITY);
         let pinned = PinnedCatalog::of(&content, snapshot).expect("the catalogue is keyable");
-        let elsewhere = [enablement(
-            3,
-            pin(
-                "openai",
-                "openai/gone",
-                Checksum::of(b"an older catalogue payload"),
-            ),
-        )];
+        let older = Checksum::of(b"an older catalogue payload");
+        let enablements = [
+            enablement(3, pin("openai", "openai/gone", older)),
+            enablement(4, pin("openai", "openai/gpt-5.5", older)),
+        ];
 
-        assert!(pinned.withdrawn_from(&elsewhere).is_empty());
+        let withdrawn = pinned.withdrawn_from(&enablements);
+        let impact = RefreshImpact::of(&enablements, &content, snapshot);
+        assert_eq!(withdrawn, impact.withdrawn);
+        assert_eq!(
+            withdrawn,
+            [OfferingId::of("openai", "openai/gone").expect("derivable")]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            "the offering this catalogue dropped, and only it"
+        );
+        assert_eq!(impact.pins_unmoved, 2);
+        // And the two states stay distinct where it matters: neither pin may be
+        // routed through this catalogue, withdrawn or not.
+        assert_eq!(
+            pinned.resolve(pin("openai", "openai/gpt-5.5", older)),
+            Resolution::OtherSnapshot { pinned: older }
+        );
     }
 }

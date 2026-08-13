@@ -220,8 +220,9 @@ different payload digest is `OtherSnapshot` rather than resolved through the
 active catalogue, and a provider publishing one model under several callable ids
 is `Ambiguous` rather than guessed, because choosing between them is an
 enablement decision. It is a projection — no store, no client, no request-path
-I/O — and its withdrawal answer is tested to agree with `RefreshImpact`, so the
-operator report and the resolver derive identity once.
+I/O — and its withdrawal answer is tested to agree with `RefreshImpact` for
+unmoved pins as well as current ones, so the operator report and the resolver
+derive identity once and report the same withdrawals.
 
 ## The desired-state domain the control plane stores
 

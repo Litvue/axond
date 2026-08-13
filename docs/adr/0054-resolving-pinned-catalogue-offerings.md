@@ -6,6 +6,10 @@ Date: 2026-08-13
 
 Accepted
 
+Numbered 54 because 53 is taken by request-path pricing (#147, PR #318), which
+was written first and is unrelated to this decision; the sequence is contiguous
+once that lands, and no other open change claims either number.
+
 Extends [ADR 0047](./0047-callable-offering-identity.md), which keys an imported
 catalogue by `CallableId`, and [ADR 0043](./0043-catalogue-source-imports.md),
 which identifies a snapshot. This decision covers only how the two keys are held
@@ -59,6 +63,15 @@ returns every candidate and refuses to make it.
 
 **A pin the snapshot does not publish is `Resolution::Withdrawn`** — an
 observation about the catalogue, never a withdrawal of the enablement.
+
+Withdrawal *observation* is deliberately independent of the pin: an enablement
+still pinned to an older payload is exactly the one nobody has looked at since
+the upstream dropped its offering, so `PinnedCatalog::withdrawn_from` reports it
+like `RefreshImpact` does rather than staying silent until an operator
+republishes. Routing stays pinned all the same — `resolve` answers
+`OtherSnapshot` for such a pin whether or not the offering is still published —
+so the two states are distinguished where a request is served, not where an
+operator is told.
 
 **Identity derivation is total or the map is refused.** Construction derives
 every offering identity once, so a lookup is a search rather than a
