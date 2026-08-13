@@ -129,7 +129,7 @@ record, or a state read.
 | `/admin/v1/audit/{revision}` | `GET` | One revision's actor, summary, and recorded changes. |
 | `/admin/v1/convergence` | `GET` | What this replica has loaded and activated, from its own cached status — never a control-plane read. |
 | `/admin/v1/availability` | `GET` | What this replica derives about one scope's models. `?tenant=` is required, `?project=` optional; answered from the snapshot it is serving and its own circuits — never a control-plane read. |
-| `/admin/v1/catalogue` | `GET` | One tenant's management catalogue: what it has enabled, the names that route to it, and why a model is not routable. `?tenant=` is required. |
+| `/admin/v1/catalogue` | `GET` | One tenant's management catalogue: what it has enabled, its first-class aliases and ordered targets, and why a model is not routable. `?tenant=` is required. |
 | `/admin/v1/tenants` | `POST` | A tenant and its lifecycle. |
 | `/admin/v1/projects` | `POST` | A project (namespace) inside a tenant. |
 | `/admin/v1/providers` | `POST` | A provider connection: wire family and endpoint. |
@@ -190,6 +190,19 @@ and the response names the same gap in `pending`:
 {
   "revision": "rev_...",
   "scope": { "kind": "tenant", "tenant": "..." },
+  "aliases": [
+    {
+      "alias": "res_...",
+      "version": 1,
+      "slug": "default",
+      "scope": { "kind": "project", "tenant": "...", "project": "..." },
+      "wire_family": "openai-chat",
+      "state": "enabled",
+      "targets": [
+        { "enablement": "res_...", "version": 1 }
+      ]
+    }
+  ],
   "entries": [
     {
       "offering": "...",
@@ -217,6 +230,13 @@ default this entry reports), `unpriced` (no approved price, so no request can be
 billed) or `unaliased` (no enabled alias names it). `routable` is the absence of
 all of them; a read of a project reports the tenant default beside the override
 that shadows it, so an operator can see both without a second request.
+
+`aliases` is the alias resource projection, separate from the `aliases` name list
+on each offering entry. It preserves the durable alias id and version, its
+project scope and wire family, and the ordered enablement targets. The target
+references are not provider-local model ids: resolving those requires the pinned
+catalogue snapshot, and remains named in `pending` until that metadata reader is
+attached.
 
 ## Conditional reads
 

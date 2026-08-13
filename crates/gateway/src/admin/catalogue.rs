@@ -1,5 +1,6 @@
 //! The tenant-scoped management catalogue: what one tenant may enable, what it
-//! has enabled, and what still stands between an enablement and a routable name.
+//! has enabled, which aliases name those enablements, and what still stands
+//! between an enablement and a routable name.
 //!
 //! The read a tenant administrator needs before publishing anything. `/v1/models`
 //! answers "what can this key invoke right now" from an immutable snapshot, and
@@ -244,6 +245,37 @@ pub struct CatalogueEntry {
     pub unavailable: Vec<UnavailableReason>,
 }
 
+/// A model alias as the management catalogue shows it.
+///
+/// Alias names and concrete enablements are different resources. Keeping the
+/// alias as a first-class projection means an administrator can reconcile an
+/// alias without reverse-engineering the offering rows, and can preserve the
+/// target priority the request path will eventually use. Targets remain
+/// enablement references here; resolving them to provider-local model ids is a
+/// separate pinned-catalogue concern and is intentionally still represented by
+/// [`PendingFact::OfferingMetadata`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CatalogueAlias {
+    /// The durable alias resource identity.
+    pub alias: String,
+    pub version: u64,
+    /// The caller-facing name of this alias in the owning project.
+    pub slug: String,
+    pub scope: ScopeView,
+    pub wire_family: &'static str,
+    pub state: &'static str,
+    /// Ordered enablement references. The order is the failover priority and is
+    /// therefore part of the response contract rather than a set.
+    pub targets: Vec<CatalogueAliasTarget>,
+}
+
+/// One ordered target of a [`CatalogueAlias`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CatalogueAliasTarget {
+    pub enablement: String,
+    pub version: u64,
+}
+
 /// One tenant's management catalogue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CatalogueView {
@@ -253,6 +285,10 @@ pub struct CatalogueView {
     pub revision: Option<String>,
     pub scope: ScopeView,
     pub entries: Vec<CatalogueEntry>,
+    /// Aliases in the requested tenant/project scope, in deterministic resource
+    /// order. A tenant-wide read includes aliases owned by that tenant's
+    /// projects; a project read narrows this to that project.
+    pub aliases: Vec<CatalogueAlias>,
     /// Facts this build could not consult. Always projected, including when
     /// empty, so a client can tell an old build from a complete answer.
     pub pending: Vec<PendingFact>,
@@ -312,10 +348,32 @@ impl CatalogueView {
                 unavailable,
             });
         }
+        let aliases = models
+            .aliases()
+            .filter(|alias| in_scope(request, alias))
+            .map(|alias| CatalogueAlias {
+                alias: alias.reference.id.to_string(),
+                version: alias.reference.version.get(),
+                slug: alias.slug.as_str().to_owned(),
+                scope: ScopeView::of(&alias.body.scope()),
+                wire_family: alias.body.wire_family().as_str(),
+                state: alias.body.state().as_str(),
+                targets: alias
+                    .body
+                    .targets()
+                    .iter()
+                    .map(|target| CatalogueAliasTarget {
+                        enablement: target.enablement.to_string(),
+                        version: target.version.get(),
+                    })
+                    .collect(),
+            })
+            .collect();
         Ok(Self {
             revision: Some(revision.id().to_string()),
             scope: ScopeView::of(&request.scope()),
             entries,
+            aliases,
             pending: PendingFact::ALL.to_vec(),
         })
     }
@@ -325,6 +383,7 @@ impl CatalogueView {
             revision,
             scope: ScopeView::of(&request.scope()),
             entries: Vec::new(),
+            aliases: Vec::new(),
             pending: PendingFact::ALL.to_vec(),
         }
     }
@@ -628,6 +687,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_read_projects_aliases_as_first_class_ordered_resources() {
+        let view = read(tenant_id(1), None);
+        assert_eq!(view.aliases.len(), 1);
+
+        let alias = &view.aliases[0];
+        assert_eq!(
+            alias.alias,
+            crate::desired_state::fixtures::resource_id(33).to_string()
+        );
+        assert_eq!(alias.version, 1);
+        assert_eq!(alias.slug, "fast");
+        assert_eq!(alias.scope.kind, "project");
+        assert_eq!(
+            alias.scope.tenant.as_deref(),
+            Some(tenant_id(1).to_string().as_str())
+        );
+        assert_eq!(
+            alias.scope.project.as_deref(),
+            Some(project_id(2).to_string().as_str())
+        );
+        assert_eq!(alias.wire_family, WireFamily::OpenaiChat.as_str());
+        assert_eq!(alias.state, ModelLifecycle::Enabled.as_str());
+        assert_eq!(
+            alias.targets,
+            vec![CatalogueAliasTarget {
+                enablement: crate::desired_state::fixtures::resource_id(30).to_string(),
+                version: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_project_read_only_projects_aliases_owned_by_that_project() {
+        let view = read(tenant_id(1), Some(project_id(2)));
+        assert_eq!(view.aliases.len(), 1);
+        assert_eq!(view.aliases[0].slug, "fast");
+
+        let other = read(tenant_id(1), Some(project_id(4)));
+        assert!(other.aliases.is_empty());
+    }
+
     /// The pinned coordinates are projected verbatim, because they are the whole
     /// correlation key a caller has until the catalogue slice can resolve them
     /// into provider metadata.
@@ -662,6 +763,7 @@ mod tests {
         let view = CatalogueView::of(None, &request).expect("an empty control plane is readable");
         assert!(view.revision.is_none());
         assert!(view.entries.is_empty());
+        assert!(view.aliases.is_empty());
         assert_eq!(view.scope.kind, "tenant");
         assert_eq!(view.pending, PendingFact::ALL.to_vec());
 
