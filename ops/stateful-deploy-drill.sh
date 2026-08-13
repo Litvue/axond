@@ -158,7 +158,7 @@ kube -n axond rollout status deployment/postgres --timeout=180s >/dev/null ||
 # cluster this script deletes; nothing here is read from the environment.
 kube -n axond create secret generic axond-secrets \
   --from-literal=GW_CONTROL_PLANE_DSN='postgres://postgres:stateful-drill@postgres.axond.svc:5432/postgres' \
-  --from-literal=GW_SECRET_STORE_KEK='c3RhdGVmdWwtZHJpbGwta2VrLTMyLWJ5dGVzLWxvbmchIQ==' \
+  --from-literal=GW_SECRET_STORE_KEK='c3RhdGVmdWwtZHJpbGwta2VrLTMyLWJ5dGVzLWxvbmc=' \
   --from-literal=GW_ADMIN_BREAKGLASS='stateful-drill-breakglass-credential' \
   --dry-run=client -o yaml | kube apply -f - >/dev/null
 ok "postgres.axond.svc:5432 and the axond-secrets references"
@@ -201,8 +201,35 @@ step "Replicas boot, serve /admin/v1, and stay unready"
 kube -n axond wait --for=jsonpath='{.status.phase}'=Running pod \
   -l app.kubernetes.io/name=axond --timeout=180s >/dev/null ||
   fail "the replicas never reached Running: $(kube -n axond get pods -o wide 2>&1)"
-# Long enough for a Ready condition to have appeared if one were coming: the
-# readiness probe runs every 5s.
+# `Running` and not Ready is also what a crash-looping replica reports, and one
+# that cannot read its schema crash-loops exactly that way — so the container
+# has to be up, not merely scheduled, or this step would pass on a fleet that
+# never served anything.
+#
+# Polled rather than sampled: the Job and the Deployment are applied together,
+# so the replicas legitimately crash-loop until the schema lands, and kubelet's
+# backoff reaches five minutes. A single reading would fail a healthy fleet that
+# is merely still in a backoff it is about to leave for good.
+running_containers() {
+  kube -n axond get pods -l app.kubernetes.io/name=axond \
+    -o jsonpath='{range .items[*]}{.status.containerStatuses[*].state.running.startedAt}{"\n"}{end}' |
+    grep -c . || true
+}
+serving=0
+for _ in $(seq 1 90); do
+  serving="$(running_containers)"
+  [[ "$serving" == 3 ]] && break
+  sleep 5
+done
+[[ "$serving" == 3 ]] ||
+  fail "only ${serving} of three replicas have a running container after waiting out \
+kubelet's backoff; a Pod stuck in CrashLoopBackOff reports Running and not Ready too: \
+$(kube -n axond get pods -o wide 2>&1)"
+running="$(kube -n axond get pods -l app.kubernetes.io/name=axond \
+  --field-selector=status.phase=Running -o name | wc -l)"
+[[ "$running" == 3 ]] || fail "expected three Running replicas, got ${running}"
+# Only once the fleet is up is a Ready condition worth reading: the readiness
+# probe runs every 5s, so one would have appeared by now if it were coming.
 sleep 20
 ready="$(kube -n axond get pods -l app.kubernetes.io/name=axond \
   -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' |
@@ -210,19 +237,6 @@ ready="$(kube -n axond get pods -l app.kubernetes.io/name=axond \
 [[ "$ready" == 0 ]] ||
   fail "${ready} replica(s) reported Ready; a replica that refuses inference must not, \
 and this overlay's Recreate/AlwaysAllow/admin-Service decisions exist because none does"
-running="$(kube -n axond get pods -l app.kubernetes.io/name=axond \
-  --field-selector=status.phase=Running -o name | wc -l)"
-[[ "$running" == 3 ]] || fail "expected three Running replicas, got ${running}"
-# `Running` and not Ready is also what a crash-looping replica reports, and one
-# that cannot read its schema crash-loops exactly that way — so the container
-# has to be up, not merely scheduled, or this step would pass on a fleet that
-# never served anything.
-serving="$(kube -n axond get pods -l app.kubernetes.io/name=axond \
-  -o jsonpath='{range .items[*]}{.status.containerStatuses[*].state.running.startedAt}{"\n"}{end}' |
-  grep -c . || true)"
-[[ "$serving" == 3 ]] ||
-  fail "only ${serving} of three replicas have a running container; a Pod stuck in \
-CrashLoopBackOff reports Running and not Ready too: $(kube -n axond get pods -o wide 2>&1)"
 # Restarts before the Job completed are expected — the two are applied together
 # — so what has to hold is that they stopped: a replica on a migrated schema
 # refuses inference in place rather than exiting.

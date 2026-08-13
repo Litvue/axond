@@ -433,8 +433,13 @@ def check_service_port(documents: list[Document], label: str) -> list[str]:
                 f"mounted config binds {bind_port}"
             )
     # Every Service, not one: the stateful overlay publishes the administrative
-    # surface on a second Service, and it reaches the same listener.
-    for service in of_kind(documents, "Service"):
+    # surface on a second Service, and it reaches the same listener. Emptiness is
+    # its own failure, because `of_kind` reports nothing where `one` raised: a
+    # manifest set that publishes no Service at all reaches no caller.
+    services = of_kind(documents, "Service")
+    if not services:
+        failures.append(f"{label}: no Service publishes the port the gateway binds")
+    for service in services:
         for port in service.get("spec", {}).get("ports", []):
             if port.get("port") != bind_port:
                 failures.append(
@@ -1035,6 +1040,13 @@ def self_test() -> int:
         or not document["metadata"]["name"].startswith("axond-migrate")
     ]
     expect_failure("a migration Pod no NetworkPolicy selects", check_stateful(unpoliced))
+
+    unpublished = copy.deepcopy(stateful)
+    unpublished[:] = [document for document in unpublished if document.get("kind") != "Service"]
+    expect_failure(
+        "a manifest set that publishes no Service",
+        check_service_port(unpublished, "overlays/production-stateful"),
+    )
 
     tagged = copy.deepcopy(production)
     containers(one(tagged, "Deployment"))[0]["image"] = f"{IMAGE_REPOSITORY}:latest"
