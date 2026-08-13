@@ -78,11 +78,6 @@ const BACKEND: &str = "postgres";
 /// caused it, because the measurement a refusal is made on expires.
 const COUNT_REFRESH: Duration = Duration::from_secs(1);
 
-/// How close to [`Capacity::max_events`] the estimate may get before an append
-/// measures instead. Between this fraction and the limit the number decides
-/// whether an event is refused, so it has to be measured rather than inferred.
-const COUNT_EXACT_FRACTION: u64 = 90;
-
 /// How the outbox connects, and what it is allowed to do at boot.
 #[derive(Debug, Clone)]
 pub struct PostgresJournalSettings {
@@ -242,22 +237,20 @@ impl PostgresJournal {
     }
 }
 
-/// How many events are stored, measured exactly when the answer is about to
-/// matter and never by walking more of the table than the limit it is compared
-/// against.
+/// How many events are stored: the gate's recent measurement, or one taken here.
 ///
-/// The count is bounded at `max_events + 1`, because that is the largest number
-/// the capacity decision can distinguish: anything above it is "over the limit"
-/// by the same amount as far as every caller is concerned. Bounding it is what
-/// keeps a backlog from making the request path pay for its own size — an
+/// Two bounds, because this runs inside the append a request is waiting on and an
 /// unbounded `count(*)` gets slower exactly as the outbox falls behind, which is
-/// when appends can least afford it.
+/// when appends can least afford it. A replica measures at most once per
+/// [`COUNT_REFRESH`] however full the outbox is, and a measurement stops at
+/// `max_events + 1` rows — the largest number the decision can distinguish, since
+/// anything above the limit is over it.
 async fn stored_events(
     tx: &Transaction<'_>,
     gate: &CapacityGate,
     max_events: u64,
 ) -> Result<u64, OpError> {
-    if let Some(estimate) = gate.estimate(max_events) {
+    if let Some(estimate) = gate.estimate() {
         return Ok(estimate);
     }
     let bound = i64::try_from(max_events.saturating_add(1)).unwrap_or(i64::MAX);
@@ -1140,28 +1133,21 @@ impl CapacityGate {
         }
     }
 
-    /// The estimate, when it is fresh and the limit is not the thing it is being
-    /// asked to decide.
+    /// A measurement no older than [`COUNT_REFRESH`], plus what this process has
+    /// appended since, or nothing when there is none that fresh.
     ///
-    /// Two answers are cheap and safe. Comfortably below the limit, an append
-    /// cannot be the one that crosses it. At or above the limit, the outbox is
-    /// full and the only way it stops being full is a deletion, and every
-    /// deletion this process makes invalidates the measurement — so a full
-    /// outbox refuses on a measurement at most [`COUNT_REFRESH`] old instead of
-    /// measuring once per request, which is what turned a backlog into an
-    /// outage.
-    fn estimate(&self, max_events: u64) -> Option<u64> {
+    /// This is what keeps the decision off the table on the request path: a
+    /// replica measures at most once per refresh window however full the outbox
+    /// is, rather than once per append. Between measurements the number moves
+    /// only by this process's own appends, and every deletion this process makes
+    /// invalidates it, so the staleness it can carry is another replica's
+    /// deletion within the window — which can only make it read *fuller* than
+    /// the outbox is. That is the safe direction for a limit whose job is to
+    /// refuse, and it lasts at most a window.
+    fn estimate(&self) -> Option<u64> {
         let state = self.state.lock().expect("capacity gate");
-        let at = state.at?;
-        if at.elapsed() >= COUNT_REFRESH {
-            return None;
-        }
-        let estimate = state.measured.saturating_add(state.appended_since);
-        if estimate >= max_events {
-            return Some(estimate);
-        }
-        let exact_above = max_events.saturating_mul(COUNT_EXACT_FRACTION) / 100;
-        (estimate.saturating_add(1) < exact_above.max(1)).then_some(estimate)
+        (state.at?.elapsed() < COUNT_REFRESH)
+            .then(|| state.measured.saturating_add(state.appended_since))
     }
 
     fn measured(&self, count: u64) {
