@@ -1,4 +1,4 @@
-# 43. Stated recovery objectives, a supported backend window, and a deny-by-default production posture
+# 44. Stated recovery objectives, a supported backend window, and a deny-by-default production posture
 
 Date: 2026-08-13
 
