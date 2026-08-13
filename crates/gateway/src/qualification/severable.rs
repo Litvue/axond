@@ -31,7 +31,19 @@ pub(crate) struct SeverableLink {
     port: u16,
     upstream: SocketAddr,
     accepting: Mutex<Option<JoinHandle<()>>>,
-    forwarding: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// The forwarders to drop on a cut, and whether the link is currently cut.
+    /// Held together under one lock: the accept task registers a forwarder it
+    /// has already spawned, so without a flag read under the same lock a
+    /// connection accepted at the instant of the cut would be registered into a
+    /// vector [`Self::sever`] had already drained, and would keep proxying to
+    /// the real database for the whole outage window.
+    forwarding: Arc<Mutex<Forwarding>>,
+}
+
+#[derive(Default)]
+struct Forwarding {
+    severed: bool,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 impl SeverableLink {
@@ -43,7 +55,7 @@ impl SeverableLink {
             port,
             upstream,
             accepting: Mutex::new(None),
-            forwarding: Arc::new(Mutex::new(Vec::new())),
+            forwarding: Arc::new(Mutex::new(Forwarding::default())),
         };
         link.spawn(listener);
         Ok(link)
@@ -60,8 +72,10 @@ impl SeverableLink {
         if let Some(accepting) = self.accepting.lock().expect("not poisoned").take() {
             accepting.abort();
         }
-        for forwarding in std::mem::take(&mut *self.forwarding.lock().expect("not poisoned")) {
-            forwarding.abort();
+        let mut forwarding = self.forwarding.lock().expect("not poisoned");
+        forwarding.severed = true;
+        for task in std::mem::take(&mut forwarding.tasks) {
+            task.abort();
         }
     }
 
@@ -75,6 +89,7 @@ impl SeverableLink {
         for _ in 0..50 {
             match TcpListener::bind(("127.0.0.1", self.port)).await {
                 Ok(listener) => {
+                    self.forwarding.lock().expect("not poisoned").severed = false;
                     self.spawn(listener);
                     return Ok(());
                 }
@@ -92,16 +107,26 @@ impl SeverableLink {
         let forwarding = Arc::clone(&self.forwarding);
         let accepting = tokio::spawn(async move {
             while let Ok((mut inbound, _)) = listener.accept().await {
+                // Checked inside the forwarder as well as at registration: the
+                // cut can land after the spawn and before the connect, and a
+                // connection that escaped it would make an outage stage observe
+                // a database that never went away.
+                let cut = Arc::clone(&forwarding);
                 let forwarding_task = tokio::spawn(async move {
                     let Ok(mut outbound) = TcpStream::connect(upstream).await else {
                         return;
                     };
+                    if cut.lock().expect("not poisoned").severed {
+                        return;
+                    }
                     let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
                 });
-                forwarding
-                    .lock()
-                    .expect("not poisoned")
-                    .push(forwarding_task);
+                let mut registry = forwarding.lock().expect("not poisoned");
+                if registry.severed {
+                    forwarding_task.abort();
+                } else {
+                    registry.tasks.push(forwarding_task);
+                }
             }
         });
         *self.accepting.lock().expect("not poisoned") = Some(accepting);
@@ -166,7 +191,105 @@ pub(crate) async fn upstream(dsn: &str) -> Option<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
     use super::*;
+
+    /// A connection accepted at the instant of the cut must not survive it.
+    ///
+    /// The forwarder is spawned before its handle is registered, so a cut in
+    /// between could once leave a live proxy running for the whole outage
+    /// window — an outage stage observing a database that never went away. The
+    /// severed flag is read under the registration lock and again inside the
+    /// forwarder, so the connection is dropped whichever side of the race it
+    /// lands on.
+    #[tokio::test]
+    async fn a_connection_accepted_at_the_cut_does_not_outlive_it() {
+        let echo = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("an upstream to forward to");
+        let upstream_addr = echo.local_addr().expect("bound");
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 64];
+                    while let Ok(read) = inbound.read(&mut buffer).await {
+                        if read == 0 || inbound.write_all(&buffer[..read]).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let link = SeverableLink::open(upstream_addr)
+            .await
+            .expect("a link to the echo upstream");
+        // Racing the cut against the accept: whichever wins, no byte may cross
+        // the link afterwards.
+        let mut client = TcpStream::connect(("127.0.0.1", link.port()))
+            .await
+            .expect("the link accepts while it is up");
+        link.sever();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if client.write_all(b"ping").await.is_err() {
+                        return true;
+                    }
+                    let mut buffer = [0_u8; 4];
+                    match client.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return true,
+                        Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false),
+            "a severed link cannot keep carrying traffic to the upstream"
+        );
+    }
+
+    /// The same guarantee when the cut lands *during* a burst of connects,
+    /// which is the ordering the registration race needed: a forwarder spawned
+    /// before the drain and registered after it.
+    #[tokio::test]
+    async fn connections_racing_the_cut_do_not_outlive_it() {
+        let echo = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("an upstream to forward to");
+        let upstream_addr = echo.local_addr().expect("bound");
+        tokio::spawn(async move { while echo.accept().await.is_ok() {} });
+
+        let link = Arc::new(
+            SeverableLink::open(upstream_addr)
+                .await
+                .expect("a link to the upstream"),
+        );
+        let port = link.port();
+        let dialing = tokio::spawn(async move {
+            let mut connected = Vec::new();
+            for _ in 0..64 {
+                if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)).await {
+                    connected.push(stream);
+                }
+            }
+            connected
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        link.sever();
+        let _connected = dialing.await.expect("the dialer finishes");
+
+        assert!(
+            link.forwarding
+                .lock()
+                .expect("not poisoned")
+                .tasks
+                .is_empty(),
+            "no forwarder may be registered once the link is severed"
+        );
+    }
 
     /// The rewrite keeps the credentials and the database, because a link that
     /// silently dropped either would connect somewhere else and qualify it.

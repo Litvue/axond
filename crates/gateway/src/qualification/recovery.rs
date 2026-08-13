@@ -285,24 +285,27 @@ impl Deployment {
     /// contributor configured that way should get no recovery evidence rather
     /// than five failures about the harness. Both checks run before anything is
     /// created, so a skip leaves no schema behind.
+    ///
+    /// Under `AXOND_TEST_REQUIRE_SERVICES=1` the same shapes panic instead:
+    /// that variable is CI's statement that a green run must mean the stages
+    /// ran, and a DSN this harness cannot use is a configuration failure there,
+    /// not a contributor's local setup.
     async fn open() -> Option<Self> {
         let operator_dsn = crate::test_services::postgres_dsn()?;
+        let required = crate::test_services::required();
         let Some(upstream) = severable::upstream(&operator_dsn).await else {
-            eprintln!(
-                "recovery qualification skipped: the configured DSN does not name one \
-                 reachable TCP host, so there is no single link to cut"
+            return unusable_dsn(
+                required,
+                "it does not resolve to exactly one TCP host, so there is no single link to cut",
             );
-            return None;
         };
         // Resolved before the schema exists: a DSN the link cannot be spliced
         // into is a skip, not a half-built deployment.
-        let redirected = severable::redirect(&operator_dsn, 0);
-        if redirected.is_none() {
-            eprintln!(
-                "recovery qualification skipped: the configured DSN is not a `postgres://` URL \
-                 this harness can redirect through a severable link"
+        if severable::redirect(&operator_dsn, 0).is_none() {
+            return unusable_dsn(
+                required,
+                "it is not a `postgres://` URL this harness can redirect through a severable link",
             );
-            return None;
         }
         let schema = format!(
             "recovery_{}",
@@ -572,6 +575,21 @@ async fn publish(
     store
         .publish_revision(fixtures::candidate(expected, key, state))
         .await
+}
+
+/// A configured DSN the harness cannot splice a link into: a skip locally, a
+/// failure where CI promised the stages would run.
+///
+/// `required` is `AXOND_TEST_REQUIRE_SERVICES=1`, taken as an argument so the
+/// decision is testable without mutating the environment of a parallel suite.
+fn unusable_dsn(required: bool, reason: &str) -> Option<Deployment> {
+    assert!(
+        !required,
+        "AXOND_TEST_REQUIRE_SERVICES=1 promises the recovery stages ran, but \
+         AXOND_TEST_POSTGRES_DSN cannot be qualified: {reason}"
+    );
+    eprintln!("recovery qualification skipped: {reason}");
+    None
 }
 
 fn cache(name: &str) -> LastKnownGood {
@@ -1461,6 +1479,22 @@ fn editing_a_non_numeric_gate_changes_the_verdict() {
     assert!(
         !gate.admin_writes_met(AdminWrites::Unavailable, true),
         "a stage observing an unavailable write must fail a manifest that demands acceptance"
+    );
+}
+
+/// A DSN this harness cannot cut is a skip locally and a failure in CI.
+///
+/// `AXOND_TEST_REQUIRE_SERVICES=1` is the promise that a green run means the
+/// stages ran, so silently skipping under it would let a DNS hiccup or a DSN
+/// shape change turn five recovery checks into no-ops behind a green tick —
+/// with `if-no-files-found: warn` on the upload, nothing else would notice.
+#[test]
+fn an_unusable_dsn_skips_locally_and_fails_where_services_are_required() {
+    assert!(unusable_dsn(false, "a Unix socket has no link to cut").is_none());
+    let required = std::panic::catch_unwind(|| unusable_dsn(true, "a Unix socket has no link"));
+    assert!(
+        required.is_err(),
+        "a run that promised the services must fail rather than skip"
     );
 }
 
