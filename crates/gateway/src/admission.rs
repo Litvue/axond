@@ -46,6 +46,100 @@ pub const RESOURCE_REQUEST: &str = "request";
 pub const RESOURCE_STREAM: &str = "stream";
 pub const RESOURCE_TENANT: &str = "tenant";
 pub const RESOURCE_QUEUE: &str = "queue";
+pub const RESOURCE_DIAGNOSTIC: &str = "diagnostic";
+/// The ceiling on *authenticating* a diagnostic, which is a different ceiling
+/// with a different size: one read that reaches its handler holds one of each,
+/// so publishing both under one label would report every reader twice against a
+/// denominator that is neither bound.
+pub const RESOURCE_DIAGNOSTIC_AUTH: &str = "diagnostic_auth";
+
+/// Concurrent diagnostic reads one replica will answer.
+///
+/// Not configurable, and deliberately far below any served-traffic ceiling: a
+/// diagnostic answers from memory in microseconds, so this is a bound on abuse
+/// rather than a capacity dial. It is separate from `max_in_flight` so that a
+/// replica saturated by served traffic can still be asked what is wrong with
+/// it, and so that polling the diagnostic cannot consume the capacity served
+/// traffic needs.
+pub const MAX_IN_FLIGHT_DIAGNOSTICS: usize = 8;
+
+/// Concurrent diagnostic *authentications* one replica will attempt.
+///
+/// Authenticating is the expensive half of a status read — a signature
+/// verification, and a revocation-store round trip for a minted token — and it
+/// happens before a caller has proved anything, so it cannot be bounded by the
+/// ceiling above without letting an anonymous flood hold that ceiling closed
+/// against the operators it exists for. Hence two ceilings: a wide one here
+/// covering the unauthenticated work, and the narrow one above covering the
+/// answer.
+///
+/// Wide on purpose. It is sized so that filling it takes a flood rather than a
+/// few slow credentials — the eight authenticated readers the inner ceiling
+/// allows, plus room for the verification of callers who turn out not to be
+/// any of them — while still being a number rather than the process's memory.
+/// Refusing here costs no I/O, so the refusal is cheap even when the flood is
+/// not.
+///
+/// Partitioned rather than pooled, by what the credential costs and by whether
+/// one was presented at all: see [`MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS`]. No
+/// semaphore holds this number — it is the sum the shares add up to, which is
+/// why only the tests reach for it.
+#[cfg(test)]
+pub const MAX_AUTHENTICATING_DIAGNOSTICS: usize = MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS
+    + MAX_AUTHENTICATING_DIAGNOSTIC_KEYS
+    + MAX_AUTHENTICATING_DIAGNOSTIC_ANONYMOUS;
+
+/// How much of that ceiling a credential whose verification does *I/O* may hold.
+///
+/// A minted token costs a revocation-store round trip; a static key costs a
+/// constant-time comparison in memory. Pooled, the slow half decides the fast
+/// half's fate: a revocation store that is slow rather than down parks every
+/// permit in the pool on a token verification, and the operator's static key — the one
+/// credential that reads status *through* a revocation outage, which is the
+/// runbook's whole triage instruction — is refused behind them.
+///
+/// So the pool is partitioned by what the credential will cost, which is legible
+/// from its shape before any of it is spent. Tokens may fill this much of it and
+/// no more; the rest is reachable only by callers who present something else
+/// ([`MAX_AUTHENTICATING_DIAGNOSTIC_KEYS`]) or nothing at all
+/// ([`MAX_AUTHENTICATING_DIAGNOSTIC_ANONYMOUS`]), so a slow store cannot close
+/// the route on the credential that outlives it.
+pub const MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS: usize = 48;
+
+/// Held out for callers that present a credential resolving in memory.
+///
+/// A flood of *garbage* lands here too — a credential of no known shape is
+/// refused without I/O, so it cannot be told from a static key before it is
+/// checked — but these permits are held for the length of a comparison in
+/// memory rather than for a store's timeout, so the partition drains at that
+/// speed no matter who is flooding it. What it excludes is precisely the work
+/// that can block, and the callers who present nothing at all.
+pub const MAX_AUTHENTICATING_DIAGNOSTIC_KEYS: usize = 16;
+
+/// What a caller presenting no credential at all may hold.
+///
+/// Anonymous is a shape like any other, and the cheapest one: there is nothing
+/// to verify, so the permit is held only long enough to answer `401`. It gets a
+/// partition rather than sharing the one above because a flood needs no
+/// credential to mount — the operator's static key would otherwise queue behind
+/// callers who presented nothing — and it is small because nothing legitimate
+/// arrives here: every request that belongs on this route carries a credential.
+pub const MAX_AUTHENTICATING_DIAGNOSTIC_ANONYMOUS: usize = 8;
+
+/// What authenticating this credential will cost, as far as it can be known
+/// before it is spent: the credential's shape, and nothing about who presented
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticCredential {
+    /// A `axt1.` minted token: signature verification plus a revocation-store
+    /// lookup, so it can block on a backend.
+    Minted,
+    /// A credential of some other shape: resolved from memory, so it cannot
+    /// block on a backend however wrong it turns out to be.
+    Local,
+    /// No credential at all: nothing to verify, and nothing that can be served.
+    Anonymous,
+}
 
 /// Largest ceiling a semaphore-backed bound may carry. Config validation refuses
 /// anything larger, so an absurd number is a typed boot error rather than an
@@ -80,9 +174,33 @@ pub enum AdmissionRejection {
     QueueFull,
     #[error("admission queue wait expired")]
     QueueTimeout,
+    #[error("concurrent diagnostic limit exceeded")]
+    Diagnostics,
+    /// Refused before the credential was checked, by the ceiling on
+    /// *authenticating* diagnostics rather than on answering them. Same code as
+    /// [`Self::Diagnostics`] — a caller has no action that distinguishes them,
+    /// and the difference is not a caller's business — but its own resource, so
+    /// the operator splitting refusals sees which ceiling refused.
+    #[error("concurrent diagnostic authentication limit exceeded")]
+    DiagnosticsAuthenticating,
 }
 
 impl AdmissionRejection {
+    /// Every rejection this replica can record, so the metric catalogue can
+    /// assert it declares each one rather than discovering the drift in a
+    /// dashboard that a new refusal silently falls outside of.
+    #[cfg(test)]
+    pub const ALL: [Self; 8] = [
+        Self::Tenant,
+        Self::TenantCapacity,
+        Self::Streams,
+        Self::Global,
+        Self::QueueFull,
+        Self::QueueTimeout,
+        Self::Diagnostics,
+        Self::DiagnosticsAuthenticating,
+    ];
+
     /// The stable machine-readable error type a caller matches on.
     pub fn code(self) -> &'static str {
         match self {
@@ -92,6 +210,9 @@ impl AdmissionRejection {
             Self::Global => "gateway_overloaded",
             Self::QueueFull => "admission_queue_full",
             Self::QueueTimeout => "admission_queue_timeout",
+            Self::Diagnostics | Self::DiagnosticsAuthenticating => {
+                "diagnostic_concurrency_exceeded"
+            }
         }
     }
 
@@ -108,20 +229,26 @@ impl AdmissionRejection {
     /// cannot predict, so it advertises nothing.
     pub fn retry_after_seconds(self) -> Option<u64> {
         match self {
-            Self::Tenant | Self::Streams | Self::Global | Self::QueueFull | Self::QueueTimeout => {
-                Some(1)
-            }
+            Self::Tenant
+            | Self::Streams
+            | Self::Global
+            | Self::QueueFull
+            | Self::QueueTimeout
+            | Self::Diagnostics
+            | Self::DiagnosticsAuthenticating => Some(1),
             Self::TenantCapacity => None,
         }
     }
 
     /// The bounded metric dimension for this rejection.
-    fn scope(self) -> &'static str {
+    pub(crate) fn scope(self) -> &'static str {
         match self {
             Self::Tenant | Self::TenantCapacity => RESOURCE_TENANT,
             Self::Streams => RESOURCE_STREAM,
             Self::Global => RESOURCE_REQUEST,
             Self::QueueFull | Self::QueueTimeout => RESOURCE_QUEUE,
+            Self::Diagnostics => RESOURCE_DIAGNOSTIC,
+            Self::DiagnosticsAuthenticating => RESOURCE_DIAGNOSTIC_AUTH,
         }
     }
 }
@@ -173,6 +300,12 @@ pub struct AdmissionControl {
     global: Option<Arc<Semaphore>>,
     streams: Option<Arc<Semaphore>>,
     queue: Option<Arc<Semaphore>>,
+    diagnostics: Arc<Semaphore>,
+    /// The two partitions of the pre-authentication ceiling, keyed by what the
+    /// credential's verification will cost.
+    authenticating_tokens: Arc<Semaphore>,
+    authenticating_keys: Arc<Semaphore>,
+    authenticating_anonymous: Arc<Semaphore>,
     tenants: Arc<TenantTable>,
 }
 
@@ -184,6 +317,12 @@ impl AdmissionControl {
                 .max_in_flight_streams
                 .map(|n| Arc::new(Semaphore::new(n))),
             queue: limits.queue_capacity.map(|n| Arc::new(Semaphore::new(n))),
+            diagnostics: Arc::new(Semaphore::new(MAX_IN_FLIGHT_DIAGNOSTICS)),
+            authenticating_tokens: Arc::new(Semaphore::new(MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS)),
+            authenticating_keys: Arc::new(Semaphore::new(MAX_AUTHENTICATING_DIAGNOSTIC_KEYS)),
+            authenticating_anonymous: Arc::new(Semaphore::new(
+                MAX_AUTHENTICATING_DIAGNOSTIC_ANONYMOUS,
+            )),
             tenants: Arc::new(TenantTable {
                 limit: limits.max_in_flight_per_tenant,
                 max_tenants: limits.max_tenants,
@@ -236,6 +375,59 @@ impl AdmissionControl {
         Ok(permit)
     }
 
+    /// Admit one diagnostic read, or shed it.
+    ///
+    /// Never waits and never queues: a diagnostic that has to queue has stopped
+    /// being a diagnostic. Takes no tenant, global, or stream slot, so a caller
+    /// polling it cannot displace served traffic — and served traffic at its own
+    /// ceiling cannot make the replica unanswerable.
+    pub fn admit_diagnostic(&self) -> Result<DiagnosticPermit, AdmissionRejection> {
+        let permit = Arc::clone(&self.diagnostics)
+            .try_acquire_owned()
+            .map_err(|_| reject(AdmissionRejection::Diagnostics))?;
+        metrics::record_admission_acquired(RESOURCE_DIAGNOSTIC);
+        Ok(DiagnosticPermit {
+            resource: RESOURCE_DIAGNOSTIC,
+            _permit: Some(permit),
+        })
+    }
+
+    /// Admit one diagnostic *authentication*, or shed it before any of the work
+    /// authenticating costs is done.
+    ///
+    /// The permit is held across authentication and given back the moment the
+    /// credential is settled — before the handler runs, not when the response
+    /// ends — so what it bounds is exactly concurrent signature verification and
+    /// revocation lookups on a route that admission does not cover, and a share
+    /// drains at the speed of the check rather than of the answer. Refused with the same
+    /// [`AdmissionRejection::Diagnostics`] as the inner ceiling: both mean "this
+    /// replica is answering as many status reads as it will", and a caller has
+    /// no action that distinguishes them.
+    ///
+    /// The partition comes from the credential's shape rather than its holder,
+    /// because nothing about the holder is known yet — see
+    /// [`MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS`] for why a shared pool would let
+    /// a slow revocation store decide whether an operator's static key is
+    /// admitted.
+    pub fn admit_diagnostic_authentication(
+        &self,
+        credential: DiagnosticCredential,
+    ) -> Result<DiagnosticPermit, AdmissionRejection> {
+        let partition = match credential {
+            DiagnosticCredential::Minted => &self.authenticating_tokens,
+            DiagnosticCredential::Local => &self.authenticating_keys,
+            DiagnosticCredential::Anonymous => &self.authenticating_anonymous,
+        };
+        let permit = Arc::clone(partition)
+            .try_acquire_owned()
+            .map_err(|_| reject(AdmissionRejection::DiagnosticsAuthenticating))?;
+        metrics::record_admission_acquired(RESOURCE_DIAGNOSTIC_AUTH);
+        Ok(DiagnosticPermit {
+            resource: RESOURCE_DIAGNOSTIC_AUTH,
+            _permit: Some(permit),
+        })
+    }
+
     /// The global ceiling, with the bounded queue behind it. Without a queue
     /// (the default) saturation is refused immediately, which is the bounded
     /// behavior: a caller learns now rather than after an unbounded wait.
@@ -268,6 +460,23 @@ impl AdmissionControl {
 fn reject(rejection: AdmissionRejection) -> AdmissionRejection {
     metrics::record_admission_rejection(rejection.scope(), rejection.code());
     rejection
+}
+
+/// The diagnostic slot one in-flight diagnostic read holds, released on every
+/// exit path by `Drop` exactly as a served request's permit is.
+pub struct DiagnosticPermit {
+    /// The ceiling this permit came from, so it is released on the dimension it
+    /// was acquired on rather than on whichever one is named at the drop site.
+    resource: &'static str,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for DiagnosticPermit {
+    fn drop(&mut self) {
+        if self._permit.take().is_some() {
+            metrics::record_admission_released(self.resource);
+        }
+    }
 }
 
 /// A request waiting for the global ceiling. Exists to keep the queue gauge and

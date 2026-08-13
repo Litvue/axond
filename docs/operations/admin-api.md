@@ -33,6 +33,23 @@ backend: the mode is the answer to the question that was asked, where a `404`
 would be indistinguishable from an older build and a `401` would invite a caller
 to find a credential that cannot exist.
 
+### One path under the prefix is not this surface
+
+`GET /admin/v1/status` is the replica diagnostic
+([the observability runbook](observability-runbook.md)), not an administrative
+route: it reads this process's cached component states, never the control plane,
+and it answers in both modes. It therefore takes a *gateway* credential with the
+`status` capability rather than a breakglass one, and it is the one path under
+the prefix that a stateless deployment does not refuse.
+
+That matters if you place the prefix behind a network boundary. A deployment
+that firewalls `/admin/v1/*` to an administrative network, or fronts it with a
+proxy that enforces breakglass authentication, will make the diagnostic
+unreachable or reject the credential it expects — so route `/admin/v1/status`
+with the inference listener and the rest of the prefix with the administrative
+one. The method contract is uniform either way: a wrong method on it answers
+`405 admin_method_not_allowed`, like every other path under the prefix.
+
 ## Authentication
 
 `/admin/v1` has its own authentication layer and its own credentials. An

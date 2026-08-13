@@ -52,7 +52,7 @@ use serde_json::{Value, json};
 use tracing::{Instrument, debug, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::admission::{AdmissionPermit, RequestKind};
+use crate::admission::{AdmissionPermit, DiagnosticCredential, RequestKind};
 use crate::aliases::AliasScope;
 use crate::budget::{Admission, BudgetKey, Denial, Reservation};
 use crate::config::{Model, Provider, ProviderKind, ProviderWire, Target};
@@ -63,6 +63,7 @@ use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerific
 use crate::rate_limit::{RateLimitKey, RateLimitPermit};
 use crate::shutdown::Phase;
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
+use crate::status::{StatusResponse, StatusScope};
 use crate::streaming::{self, Framing, StreamContext};
 use crate::telemetry;
 use crate::usage::identity::EventIdentity;
@@ -70,26 +71,90 @@ use crate::usage::{Status, UsageRecord};
 
 pub fn router(state: AppState) -> Router {
     let minting_enabled = state.config().gateway_minting.is_some();
+    mount(route_specs(minting_enabled), state)
+}
+
+/// The replica diagnostics alone, for a process that serves no inference.
+///
+/// An unconverged replica is exactly the one an operator most needs to ask about
+/// — it is refusing inference and its convergence is the reason — so the
+/// diagnostic is mounted beside [`unconverged_router`] rather than being lost
+/// with the inference surface it happens to be declared next to.
+pub fn diagnostic_router(state: AppState) -> Router {
+    let specs = route_specs(state.config().gateway_minting.is_some())
+        .into_iter()
+        .filter(|spec| spec.auth == AuthPosture::Diagnostic)
+        .collect();
+    mount(specs, state)
+}
+
+fn mount(specs: Vec<RouteSpec>, state: AppState) -> Router {
     // The inbound body bound is declared rather than inherited: axum's own
     // default would otherwise be the process's real memory ceiling per request.
     let max_request_bytes = state.0.admission.limits().max_request_bytes;
-    route_specs(minting_enabled)
+    specs
         .into_iter()
         .fold(Router::new(), |router, spec| {
             let route = (spec.router)().layer(DefaultBodyLimit::max(max_request_bytes));
-            let route = match spec.auth {
-                AuthPosture::LivenessProbe => route,
-                // Admission is the outermost layer, so a request arriving after
-                // the drain window is refused before it touches authentication,
-                // budgets, or an upstream. The probes deliberately stay outside
-                // it: a draining replica is still alive, and killing it early
-                // would cut the very requests the drain exists to finish.
-                AuthPosture::Authenticated => route
-                    .layer(from_fn_with_state(
-                        (state.clone(), spec.capability),
-                        authenticate_middleware,
-                    ))
-                    .layer(from_fn_with_state(state.clone(), admission_middleware)),
+            // A diagnostic takes no served-traffic slot, but it is not free
+            // either: its own small ceiling bounds how many status reads run at
+            // once, without letting served traffic at *its* ceiling make the
+            // replica unanswerable. Applied before authentication and therefore
+            // *inside* it, so a slot is spent only once a caller has proved it
+            // may ask and an anonymous flood cannot hold the ceiling closed
+            // against the operators it is for.
+            let route = if spec.auth.takes_a_diagnostic_slot() {
+                route.layer(from_fn_with_state(state.clone(), diagnostic_middleware))
+            } else {
+                route
+            };
+            let route = if spec.auth.requires_a_credential() {
+                route.layer(from_fn_with_state(
+                    (state.clone(), spec.capability),
+                    authenticate_middleware,
+                ))
+            } else {
+                route
+            };
+            // And a second, wider ceiling outside authentication, because the
+            // one above cannot bound the work of authenticating. Only the
+            // diagnostic needs it: every other authenticated route has
+            // admission out here doing the same job.
+            let route = if spec.auth.takes_a_diagnostic_slot() {
+                route.layer(from_fn_with_state(
+                    state.clone(),
+                    diagnostic_authentication_middleware,
+                ))
+            } else {
+                route
+            };
+            // Admission is the outermost layer, so a request arriving after the
+            // drain window is refused before it touches authentication, budgets,
+            // or an upstream. The probes and the status diagnostic deliberately
+            // stay outside it: a draining replica is still alive, killing its
+            // probes early would cut the very requests the drain exists to
+            // finish, and a diagnostic refused by admission could neither be read
+            // during the shutdown nor report that it is happening.
+            let route = if spec.auth.takes_an_admission_slot() {
+                route.layer(from_fn_with_state(state.clone(), admission_middleware))
+            } else {
+                route
+            };
+            // A path under the administrative prefix takes that prefix's method
+            // contract with it: it shadows the nested surface's own
+            // `method_not_allowed_fallback`, so without this a `POST` here
+            // would be the single `/admin/v1` path answering axum's
+            // empty-bodied 405 instead of a declared code
+            // (`crate::admin::router::mount`). Registered outside every layer
+            // above, because `MethodRouter::layer` wraps the fallback too and a
+            // wrong method is answerable without an identity — the neighbouring
+            // administrative paths answer it before authentication, and
+            // answering `401` to a protocol mistake would send a caller looking
+            // for a credential that would not have helped.
+            let route = if spec.path.starts_with("/admin/v1") {
+                route.fallback(|| async { crate::admin::AdminError::MethodNotAllowed })
+            } else {
+                route
             };
             router.route(spec.path, route)
         })
@@ -104,7 +169,8 @@ pub fn router(state: AppState) -> Router {
 /// `200` — the process is healthy and is administrable — while readiness stays
 /// `503` and every inference path answers `reason` in the gateway's own error
 /// envelope. Nothing here holds an [`AppState`]: there is no configuration to
-/// hold, which is the whole point.
+/// hold, which is the whole point. The replica diagnostic does hold one, so it
+/// is mounted alongside by [`diagnostic_router`] rather than from here.
 pub fn unconverged_router(reason: &'static str) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -123,12 +189,33 @@ pub fn unconverged_router(reason: &'static str) -> Router {
         })
 }
 
-/// Whether a route is one of the two unauthenticated liveness probes or must
-/// pass inbound authentication before its handler can run.
+/// Whether a route is one of the two unauthenticated liveness probes, or must
+/// pass inbound authentication before its handler can run — and if so, whether
+/// it is served work or asked about the replica serving it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AuthPosture {
     LivenessProbe,
     Authenticated,
+    Diagnostic,
+}
+
+impl AuthPosture {
+    /// Whether the posture requires a credential. Both authenticated postures
+    /// do, which is what keeps the sweep test's floor closed over all of them.
+    fn requires_a_credential(self) -> bool {
+        !matches!(self, Self::LivenessProbe)
+    }
+
+    /// Whether a request to the route is work the replica is being asked to do,
+    /// rather than a question about the replica doing it.
+    fn takes_an_admission_slot(self) -> bool {
+        matches!(self, Self::Authenticated)
+    }
+
+    /// Whether the route is bounded by the separate diagnostic ceiling.
+    fn takes_a_diagnostic_slot(self) -> bool {
+        matches!(self, Self::Diagnostic)
+    }
 }
 
 /// A route's complete registration: adding a route requires declaring its
@@ -167,6 +254,12 @@ fn route_specs(minting_enabled: bool) -> Vec<RouteSpec> {
             auth: AuthPosture::Authenticated,
             capability: Some(Capability::Credentials),
             router: || get(list_credentials),
+        },
+        RouteSpec {
+            path: "/admin/v1/status",
+            auth: AuthPosture::Diagnostic,
+            capability: Some(Capability::Status),
+            router: || get(replica_status),
         },
         RouteSpec {
             path: "/v1/chat/completions",
@@ -382,6 +475,85 @@ fn caller_can_mint_capability(
         })
 }
 
+/// Bound concurrent diagnostic reads.
+///
+/// A diagnostic answers from memory, so the ceiling is small, fixed, and held
+/// only for the handler: there is no body to stream and nothing to settle. It
+/// is deliberately *not* the served-traffic gate. Sharing `max_in_flight` would
+/// let a saturated replica refuse the question "why are you saturated", and
+/// taking a per-subject rate-limit permit would put the rate-limit store on the
+/// path of a read whose whole purpose is to be answerable while that store is
+/// down — the outage the fail-closed limiter turns into a denial.
+async fn diagnostic_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, GatewayError> {
+    let _permit = state.0.admission.admit_diagnostic()?;
+    Ok(next.run(request).await)
+}
+
+/// Bound the work of *authenticating* a diagnostic read.
+///
+/// The ceiling above is inside authentication, so it bounds the answer rather
+/// than the signature verification and revocation lookup that precede it. This
+/// one is outside, and is wide enough that only a flood reaches it: the two
+/// together mean neither an anonymous flood can close the route to operators
+/// nor a credentialled one can spend the replica's CPU and revocation store
+/// without limit.
+///
+/// Which partition of it a request may take is decided here, from the shape of
+/// the credential alone — the only thing known before the credential is spent.
+/// A token's verification can block on the revocation store, so tokens are held
+/// to their own share and cannot fill the share that resolves in memory: the
+/// operator's static key is the credential the runbook sends through a
+/// revocation outage, and a store that is slow rather than down must not be
+/// able to refuse it. Callers presenting nothing at all are held to a third
+/// share for the same reason — a flood needs no credential to mount.
+async fn diagnostic_authentication_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, GatewayError> {
+    let credential = presented_credential(request.headers()).map_or(
+        DiagnosticCredential::Anonymous,
+        |credential| {
+            state
+                .config()
+                .diagnostic_credential(&Presented { credential })
+        },
+    );
+    let permit = state
+        .0
+        .admission
+        .admit_diagnostic_authentication(credential)?;
+    let mut request = request;
+    request
+        .extensions_mut()
+        .insert(AuthenticatingPermit(Arc::new(permit)));
+    Ok(next.run(request).await)
+}
+
+/// The pre-authentication permit, carried on the request so that
+/// [`authenticate_middleware`] can give it back the moment the credential is
+/// settled.
+///
+/// Holding it to the end of the response would make the share drain at the speed
+/// of *answering*, not of authenticating, which is the opposite of what it is
+/// for: sixteen slow readers would then close the in-memory share against the
+/// static key, and the inner ceiling already bounds the answering.
+#[derive(Clone)]
+struct AuthenticatingPermit(Arc<crate::admission::DiagnosticPermit>);
+
+impl AuthenticatingPermit {
+    /// Give the permit back. Dropping the extension would do it too, but only
+    /// once the request itself is dropped, which is the timing this exists to
+    /// avoid.
+    fn release(self) {
+        drop(self.0);
+    }
+}
+
 /// Reserve a slot for a request and hold it until the response body is fully
 /// delivered, so an open SSE stream counts as in-flight for as long as it runs.
 async fn admission_middleware(
@@ -454,6 +626,34 @@ async fn readyz(State(state): State<AppState>) -> (StatusCode, &'static str) {
         Phase::Serving => (StatusCode::OK, "ready"),
         Phase::Draining | Phase::Closing => (StatusCode::SERVICE_UNAVAILABLE, "draining"),
     }
+}
+
+/// This replica's own dependency status, projected into what the caller is
+/// entitled to see (ADR 0031).
+///
+/// Three properties are structural rather than checked here. The read is a
+/// *cache* read — [`crate::status::registry::CachedStatusRegistry::view`] is
+/// synchronous, so this handler cannot probe a backend however it is edited. The
+/// scope comes from the caller's authority rather than from a query parameter, so
+/// a tenant cannot ask for the operator's view. And the response type has no
+/// free-text field, so the probe detail behind a coarse reason code cannot be
+/// projected into it.
+///
+/// Unlike the two probes this reports a dependency, and unlike them it is
+/// authenticated: an orchestrator polling `/readyz` must never learn that the
+/// budget store is down, because removing healthy replicas from service is how a
+/// dependency outage becomes a fleet outage.
+async fn replica_status(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<Arc<ConfigSnapshot>>,
+    Extension(caller): Extension<InboundKey>,
+) -> Json<StatusResponse> {
+    let scope = StatusScope::for_operator_authority(caller_holds_direct_operator_authority(
+        &caller, &snapshot,
+    ));
+    let view = state.status().view();
+    let revision = state.revision_report();
+    Json(view.project(scope, state.lifecycle().phase(), revision.as_ref()))
 }
 
 /// Replica-local Tier 0 credential status. Presence is expressed by each
@@ -601,23 +801,30 @@ async fn list_models(
     Ok(Json(json!({ "object": "list", "data": data })))
 }
 
-/// Resolve the caller's namespace + subject from the inbound key. Every request
-/// must present a configured gateway key: authentication fails closed, and a
-/// snapshot with no key never reaches a request (ADR 0013).
+/// The credential a request presents, before anything is known about whether it
+/// is one.
 ///
-/// The key travels as `Authorization: Bearer` or, because that is what an
-/// Anthropic SDK pointed at the gateway sends, as `x-api-key`. Both name the
-/// same gateway key; the scheme is the client's, not a second credential space.
-async fn authenticate(
-    snapshot: &ConfigSnapshot,
-    headers: &HeaderMap,
-) -> Result<InboundKey, GatewayError> {
-    let credential = headers
+/// It travels as `Authorization: Bearer` or, because that is what an Anthropic
+/// SDK pointed at the gateway sends, as `x-api-key`. Both name the same gateway
+/// key; the scheme is the client's, not a second credential space. Shared with
+/// the diagnostic pre-authentication ceiling, which has to partition on the same
+/// string authentication will later resolve.
+fn presented_credential(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
-        .ok_or(GatewayError::Unauthorized)?;
+}
+
+/// Resolve the caller's namespace + subject from the inbound key. Every request
+/// must present a configured gateway key: authentication fails closed, and a
+/// snapshot with no key never reaches a request (ADR 0013).
+async fn authenticate(
+    snapshot: &ConfigSnapshot,
+    headers: &HeaderMap,
+) -> Result<InboundKey, GatewayError> {
+    let credential = presented_credential(headers).ok_or(GatewayError::Unauthorized)?;
     let presented = Presented { credential };
     let store = snapshot.principal_store_name(&presented);
     let principal = match snapshot.resolve_principal(&presented).await {
@@ -697,6 +904,11 @@ async fn authenticate_middleware(
             "token scope denied route"
         );
         return Err(GatewayError::ScopeInsufficient(capability));
+    }
+    // Authentication is over, whatever it cost, so the permit that bounded it
+    // goes back before the handler runs rather than after.
+    if let Some(permit) = request.extensions_mut().remove::<AuthenticatingPermit>() {
+        permit.release();
     }
     request.extensions_mut().insert(snapshot);
     request.extensions_mut().insert(caller);
@@ -2340,8 +2552,14 @@ mod tests {
     use crate::aliases::AliasScope;
     use crate::budget::NoBudget;
     use crate::config::Config;
+    use crate::convergence::status::testing::ManualClock;
+    use crate::convergence::{Rejection, RevisionStatus, SnapshotSource};
+    use crate::desired_state::fixtures::revision_id;
     use crate::principals::PrincipalAuthority;
     use crate::rate_limit::{InMemoryRateLimiter, NoLimit, RateLimitKey, RateLimiter};
+    use crate::state::ReplicaObservability;
+    use crate::status::registry::{CachedStatusRegistry, StatusRefresher, StatusSettings};
+    use crate::status::{Component, ComponentObservation, ComponentState, StatusReason};
     use crate::usage::identity::RequestId;
     use crate::usage::{StdoutSink, UsageFanout, UsageSink};
     use axum::body::Body;
@@ -3686,7 +3904,7 @@ max_ttl = "15m"
 
         for spec in route_specs(true)
             .into_iter()
-            .filter(|spec| spec.auth == AuthPosture::Authenticated)
+            .filter(|spec| spec.auth.requires_a_credential())
         {
             let mut rejected = false;
             for method in [axum::http::Method::GET, axum::http::Method::POST] {
@@ -6348,5 +6566,1072 @@ targets = [{{ provider = "p", model = "upstream-model", price = {{ input_microdo
         assert_eq!(records.len(), 3);
         assert_eq!(records[2].target_provider, "pa");
         assert_eq!(records[2].attempts, 1);
+    }
+
+    // ----------------------------------------------------------------
+    // `/admin/v1/status`: authorization, redaction, and revision visibility.
+    //
+    // The route reports on dependencies, which makes it the one surface where a
+    // leak is a leak of the operator's infrastructure rather than of a request.
+    // Four properties are asserted, all fail-closed: an unauthenticated caller
+    // learns nothing, a token without the capability learns nothing, a tenant
+    // sees its own request path with coarsened reasons, and no scope sees a
+    // secret, a DSN, a raw backend error, or a revision id.
+
+    /// The status deployment: an operator's scope-less key in the default
+    /// namespace, a tenant's key in another namespace, and a verifier for minted
+    /// tokens.
+    const STATUS_CONFIG: &str = r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[namespace]]
+id = "tenant"
+
+[[gateway_key]]
+env = "AXOND_OPERATOR_KEY"
+namespace = "platform"
+
+[[gateway_key]]
+env = "AXOND_TENANT_KEY"
+namespace = "tenant"
+
+[gateway_token]
+audience = "test-audience"
+
+[[gateway_verifier]]
+kid = "scope-test-kid"
+alg = "HS256"
+env = "JWT_SECRET"
+namespaces = ["platform"]
+max_ttl = "15m"
+"#;
+
+    const OPERATOR_KEY: &str = "operator-secret";
+    const TENANT_KEY: &str = "tenant-secret";
+
+    /// What a probe of a broken Postgres would carry into the registry: a DSN
+    /// with a password, and the backend's own error text. Published through the
+    /// same `publish` the refresher uses, so the redaction under test is the
+    /// shipped path rather than a test-only one.
+    const LEAKY_DETAIL: &str = "connection to postgres://axond:s3cr3t-password@db.internal:5432/axond failed: FATAL: password authentication failed";
+
+    fn status_state(observability: ReplicaObservability) -> AppState {
+        status_state_with_revocation(observability, Box::new(crate::revocation::NoDenylist))
+    }
+
+    /// A replica whose served-traffic ceiling is small enough for a test to
+    /// exhaust, so "saturated" is a real state rather than a simulated one.
+    fn saturable_status_state(observability: ReplicaObservability) -> AppState {
+        let config = Config::from_toml_str(&format!(
+            "{STATUS_CONFIG}\n[admission]\nmax_in_flight = 1\n"
+        ))
+        .expect("status config");
+        let env = HashMap::from([
+            ("AXOND_OPERATOR_KEY".to_owned(), OPERATOR_KEY.to_owned()),
+            ("AXOND_TENANT_KEY".to_owned(), TENANT_KEY.to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        AppState::new_with_observability(
+            config,
+            &env,
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+            Box::new(NoLimit),
+            Box::new(crate::revocation::NoDenylist),
+            observability,
+        )
+        .expect("status state")
+    }
+
+    fn status_state_with_revocation(
+        observability: ReplicaObservability,
+        revocation: Box<dyn crate::revocation::RevocationStore>,
+    ) -> AppState {
+        let config = Config::from_toml_str(STATUS_CONFIG).expect("status config");
+        let env = HashMap::from([
+            ("AXOND_OPERATOR_KEY".to_owned(), OPERATOR_KEY.to_owned()),
+            ("AXOND_TENANT_KEY".to_owned(), TENANT_KEY.to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        AppState::new_with_observability(
+            config,
+            &env,
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+            Box::new(NoLimit),
+            revocation,
+            observability,
+        )
+        .expect("status state")
+    }
+
+    /// A stateful replica's registry: every component enabled, with the
+    /// control plane refusing the replica's own credentials and the budget store
+    /// unreachable. One is operator-only and one is on the tenant's request path,
+    /// which is what makes the two scopes distinguishable.
+    fn observed_registry() -> Arc<CachedStatusRegistry> {
+        let registry = Arc::new(CachedStatusRegistry::new(
+            StatusSettings {
+                enabled: Component::ALL.to_vec(),
+                ..StatusSettings::default()
+            },
+            Arc::new(crate::convergence::SystemClock),
+        ));
+        registry.publish(ComponentObservation::unavailable(
+            Component::ControlPlane,
+            StatusReason::AuthenticationRejected,
+            LEAKY_DETAIL.to_owned(),
+        ));
+        registry.publish(ComponentObservation::unavailable(
+            Component::BudgetStore,
+            StatusReason::Unreachable,
+            LEAKY_DETAIL.to_owned(),
+        ));
+        registry.publish(ComponentObservation {
+            component: Component::Catalogue,
+            state: ComponentState::Ok,
+            reason: None,
+            detail: None,
+        });
+        registry
+    }
+
+    async fn status_response(state: AppState, credential: Option<&str>) -> (StatusCode, Value) {
+        let mut request = Request::get("/admin/v1/status");
+        if let Some(credential) = credential {
+            request = request.header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {credential}"),
+            );
+        }
+        let response = router(state)
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    fn component_reason(body: &Value, component: &str) -> Option<String> {
+        body["components"]
+            .as_array()
+            .expect("components")
+            .iter()
+            .find(|entry| entry["component"] == component)
+            .map(|entry| entry["reason"].as_str().unwrap_or_default().to_owned())
+    }
+
+    /// Fail-closed: dependency status is not a public health endpoint. An
+    /// unauthenticated poller gets `401` and no component list, because "which of
+    /// the operator's backends is down" is reconnaissance.
+    #[tokio::test]
+    async fn status_refuses_an_unauthenticated_caller() {
+        let (status, body) = status_response(
+            status_state(ReplicaObservability {
+                status: observed_registry(),
+                revision: None,
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.get("components").is_none(), "{body}");
+    }
+
+    /// `status` is not granted to a scope-less minted token, so a token minted
+    /// for inference cannot read dependency status by pointing at the route.
+    #[tokio::test]
+    async fn status_refuses_a_token_without_the_capability() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let token = scoped_token_for("test-audience", Some(vec!["chat", "models"]));
+        let (status, body) = status_response(state, Some(&token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["type"], "token_scope_insufficient");
+        assert!(body.get("components").is_none(), "{body}");
+    }
+
+    /// The operator's own authority — a scope-less static key in the default
+    /// namespace — is what deployment scope is derived from, never a request
+    /// parameter.
+    #[tokio::test]
+    async fn status_gives_the_operator_the_deployment_view() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let (status, body) = status_response(state, Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["scope"], "deployment");
+        assert_eq!(body["observed"], "replica");
+        assert_eq!(body["phase"], "serving");
+        assert_eq!(
+            body["components"].as_array().expect("components").len(),
+            Component::ALL.len()
+        );
+        // Exact reasons, including the operator-only ones.
+        assert_eq!(
+            component_reason(&body, "control_plane").as_deref(),
+            Some("authentication_rejected")
+        );
+        assert_eq!(
+            component_reason(&body, "budget_store").as_deref(),
+            Some("unreachable")
+        );
+    }
+
+    /// A tenant sees its own request path, with the operator's internals removed
+    /// and the reasons behind them coarsened: it learns *that* a dependency is
+    /// impaired, not that the operator's control-plane credential was rejected.
+    #[tokio::test]
+    async fn status_gives_a_tenant_only_its_own_request_path() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let (status, body) = status_response(state, Some(TENANT_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["scope"], "namespace");
+        let components: Vec<&str> = body["components"]
+            .as_array()
+            .expect("components")
+            .iter()
+            .map(|entry| entry["component"].as_str().expect("a component name"))
+            .collect();
+        assert!(!components.contains(&"control_plane"), "{body}");
+        assert!(!components.contains(&"secret_store"), "{body}");
+        assert!(!components.contains(&"usage_sink"), "{body}");
+        assert!(components.contains(&"budget_store"), "{body}");
+        // On the tenant's request path, but the reason is coarsened.
+        assert_eq!(
+            component_reason(&body, "budget_store").as_deref(),
+            Some("unavailable")
+        );
+    }
+
+    /// A minted token is not the operator however it is scoped: authority, not
+    /// namespace, is what deployment scope turns on. A `status`-scoped token in
+    /// the *default* namespace still gets the namespace view.
+    #[tokio::test]
+    async fn a_minted_status_token_is_not_the_operator() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let token = scoped_token_for("test-audience", Some(vec!["status"]));
+        let (status, body) = status_response(state, Some(&token)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["scope"], "namespace");
+        assert!(body.get("revision").is_none(), "{body}");
+    }
+
+    /// The handler probes nothing, but authentication is not free for a *minted*
+    /// caller: a token carries a `jti`, and checking it against the revocation
+    /// store is a backend call that fails closed. So a revocation-store outage
+    /// takes the minted view of status with it, while the operator's static key —
+    /// which has no `jti` to check — keeps answering. That is the reason the
+    /// runbook says to triage with an operator key rather than a minted one.
+    #[tokio::test]
+    async fn a_revocation_outage_leaves_only_the_operator_key_reading_status() {
+        let unavailable = || {
+            status_state_with_revocation(
+                ReplicaObservability {
+                    status: observed_registry(),
+                    revision: None,
+                },
+                Box::new(FakeRevocation {
+                    mode: FakeRevocationMode::Unavailable,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+            )
+        };
+
+        let (status, body) = status_response(unavailable(), Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["scope"], "deployment", "{body}");
+
+        let token = scoped_token_for("test-audience", Some(vec!["status"]));
+        let (status, body) = status_response(unavailable(), Some(&token)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["type"], "revocation_unavailable", "{body}");
+    }
+
+    /// The redaction assertion, made against the serialized bytes rather than
+    /// against fields: a probe published a DSN, a password, and a backend error,
+    /// and none of it appears in either scope's response.
+    #[tokio::test]
+    async fn status_never_serializes_a_secret_a_dsn_or_a_backend_error() {
+        for credential in [OPERATOR_KEY, TENANT_KEY] {
+            let state = status_state(ReplicaObservability {
+                status: observed_registry(),
+                revision: Some(lagging_replica().1),
+            });
+            let (status, body) = status_response(state, Some(credential)).await;
+            assert_eq!(status, StatusCode::OK);
+            let serialized = body.to_string();
+            for leaked in [
+                "s3cr3t-password",
+                "postgres://",
+                "db.internal",
+                "password authentication failed",
+                "FATAL",
+                LEAKY_DETAIL,
+            ] {
+                assert!(
+                    !serialized.contains(leaked),
+                    "`{leaked}` reached a {credential} response: {serialized}"
+                );
+            }
+            // Revision *identifiers* are absent in every scope, including the
+            // operator's, because they are unbounded over a deployment's life.
+            for revision in [revision_id(7), revision_id(8)] {
+                assert!(!serialized.contains(&revision.to_string()), "{serialized}");
+            }
+        }
+    }
+
+    /// The response carries only bounded values, which is the cardinality
+    /// property the metric labels depend on: every component name, state, and
+    /// reason in it comes from a closed vocabulary the catalogue also names.
+    #[tokio::test]
+    async fn status_reports_only_bounded_vocabulary_values() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let (_, body) = status_response(state, Some(OPERATOR_KEY)).await;
+        let states: Vec<&str> = ComponentState::ALL
+            .iter()
+            .map(|state| state.as_str())
+            .collect();
+        let reasons: Vec<&str> = StatusReason::ALL
+            .iter()
+            .map(|reason| reason.code())
+            .collect();
+        for entry in body["components"].as_array().expect("components") {
+            let component = entry["component"].as_str().expect("a component");
+            assert!(
+                crate::status::COMPONENTS.contains(&component),
+                "`{component}` is outside the catalogued vocabulary"
+            );
+            assert!(states.contains(&entry["state"].as_str().expect("a state")));
+            if let Some(reason) = entry["reason"].as_str() {
+                assert!(
+                    reasons.contains(&reason),
+                    "`{reason}` is not a status reason"
+                );
+            }
+            assert!(entry["observed_age_ms"].is_u64(), "{entry}");
+        }
+    }
+
+    /// What a released binary answers today. `main.rs` builds its state through
+    /// `new_with_rate_limiter`, which injects
+    /// [`ReplicaObservability::stateless`], so no component is observed and no
+    /// revision is tracked: every component is `disabled` with reason
+    /// `not_configured`. This is the boundary the shipped dependency panels and
+    /// their three alerts wait on, and it is documented as such in the
+    /// observability runbook — a slice that injects a refresher should turn this
+    /// test into its own opposite.
+    #[tokio::test]
+    async fn the_production_constructor_observes_nothing_yet() {
+        let config = Config::from_toml_str(STATUS_CONFIG).expect("status config");
+        let env = HashMap::from([
+            ("AXOND_OPERATOR_KEY".to_owned(), OPERATOR_KEY.to_owned()),
+            ("AXOND_TENANT_KEY".to_owned(), TENANT_KEY.to_owned()),
+            (
+                "JWT_SECRET".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+        ]);
+        let sinks: Vec<Box<dyn UsageSink>> = vec![Box::new(StdoutSink)];
+        let state = AppState::new_with_rate_limiter(
+            config,
+            &env,
+            UsageFanout::new(sinks),
+            Box::new(NoBudget),
+            Box::new(NoLimit),
+            Box::new(crate::revocation::NoDenylist),
+        )
+        .expect("state");
+        assert!(state.revision_report().is_none());
+
+        let (status, body) = status_response(state, Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["revision"].is_null(), "{body}");
+        for entry in body["components"].as_array().expect("components") {
+            assert_eq!(entry["state"], "disabled", "{entry}");
+            assert_eq!(entry["reason"], "not_configured", "{entry}");
+        }
+    }
+
+    /// Status is a diagnostic, not work. Once admission closes, a served route
+    /// answers `503 draining` — but the runbook sends an operator here to
+    /// diagnose a replica stuck in exactly that phase, and a route refused by
+    /// admission could never report `closing` at all. So it authenticates
+    /// outside admission, and takes no in-flight slot the shutdown deadline
+    /// would then wait on.
+    #[tokio::test]
+    async fn status_still_answers_once_admission_has_closed() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let lifecycle = Arc::clone(state.lifecycle());
+        lifecycle.close();
+
+        let served = router(state.clone())
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_KEY}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let (status, body) = status_response(state, Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["phase"], "closing", "{body}");
+        assert_eq!(lifecycle.in_flight(), 0, "a diagnostic held the drain open");
+    }
+
+    /// Exempt from the served-traffic gate is not exempt from every bound: the
+    /// diagnostic has a small ceiling of its own, so a credential holder cannot
+    /// poll it at unbounded concurrency. Held at the gate rather than the route
+    /// because a status read completes too fast to keep eight of them in flight
+    /// from a test.
+    #[tokio::test]
+    async fn diagnostic_reads_are_bounded_and_do_not_share_the_served_ceiling() {
+        let state = saturable_status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let admission = &state.0.admission;
+
+        let held: Vec<_> = (0..crate::admission::MAX_IN_FLIGHT_DIAGNOSTICS)
+            .map(|_| admission.admit_diagnostic().expect("under the ceiling"))
+            .collect();
+        assert_eq!(
+            admission.admit_diagnostic().err(),
+            Some(crate::admission::AdmissionRejection::Diagnostics),
+            "the diagnostic ceiling admitted past itself"
+        );
+        // Refused rather than queued, and refused as `503` with retry guidance
+        // rather than as a caller error, because the process is full.
+        let refused = GatewayError::Overloaded(crate::admission::AdmissionRejection::Diagnostics)
+            .into_response();
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(held);
+        drop(admission.admit_diagnostic().expect("a slot was released"));
+
+        // Served traffic at its own ceiling leaves the diagnostic answerable:
+        // "why is this replica saturated" must not be refused by the saturation
+        // it is asking about.
+        let _saturated = admission
+            .admit("tenant-a", crate::admission::RequestKind::Buffered)
+            .await
+            .expect("the only served slot");
+        assert_eq!(
+            admission
+                .admit("tenant-b", crate::admission::RequestKind::Buffered)
+                .await
+                .err(),
+            Some(crate::admission::AdmissionRejection::Global),
+            "the served ceiling never engaged"
+        );
+        let (status, body) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// The ceiling is inside authentication, so a slot is spent only by a caller
+    /// that proved it may ask. Otherwise anyone reachable on the port could hold
+    /// all eight closed against the operators the route exists for — and hold
+    /// them for the length of a revocation-store round trip, during the very
+    /// outage the runbook sends operators here to triage.
+    #[tokio::test]
+    async fn an_unauthenticated_caller_cannot_spend_a_diagnostic_slot() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let held: Vec<_> = (0..crate::admission::MAX_IN_FLIGHT_DIAGNOSTICS)
+            .map(|_| {
+                state
+                    .0
+                    .admission
+                    .admit_diagnostic()
+                    .expect("under the ceiling")
+            })
+            .collect();
+
+        let (status, body) = status_response(state.clone(), None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an anonymous caller queued behind the ceiling: {body}"
+        );
+        let (status, _) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the ceiling did not apply to the caller it is for"
+        );
+        drop(held);
+        let (status, _) = status_response(state, Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// The inner ceiling being inside authentication leaves authentication
+    /// itself — a signature check, and a revocation lookup for a minted token —
+    /// outside every bound, on the one authenticated route admission does not
+    /// cover. The wider outer ceiling closes that: a flood of credentials that
+    /// turn out to be worthless is refused before the replica spends anything
+    /// verifying them, and the refusal is the same typed one.
+    #[tokio::test]
+    async fn a_flood_of_invalid_credentials_is_bounded_before_it_is_verified() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let mut held = Vec::new();
+        for (credential, capacity) in [
+            (
+                DiagnosticCredential::Minted,
+                crate::admission::MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS,
+            ),
+            (
+                DiagnosticCredential::Local,
+                crate::admission::MAX_AUTHENTICATING_DIAGNOSTIC_KEYS,
+            ),
+            (
+                DiagnosticCredential::Anonymous,
+                crate::admission::MAX_AUTHENTICATING_DIAGNOSTIC_ANONYMOUS,
+            ),
+        ] {
+            for _ in 0..capacity {
+                held.push(
+                    state
+                        .0
+                        .admission
+                        .admit_diagnostic_authentication(credential)
+                        .expect("under the ceiling"),
+                );
+            }
+        }
+        assert_eq!(held.len(), crate::admission::MAX_AUTHENTICATING_DIAGNOSTICS);
+
+        // The credential is never reached, so an invalid one and the operator's
+        // own are refused alike: the bound is on the verification, not the
+        // verdict.
+        for credential in [None, Some("not-a-key"), Some(OPERATOR_KEY)] {
+            let (status, body) = status_response(state.clone(), credential).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication ran outside the ceiling: {body}"
+            );
+            assert_eq!(body["error"]["type"], "diagnostic_concurrency_exceeded");
+        }
+        // The inner ceiling is untouched by that flood: it is spent on answers,
+        // not on attempts.
+        let answering: Vec<_> = (0..crate::admission::MAX_IN_FLIGHT_DIAGNOSTICS)
+            .map(|_| {
+                state
+                    .0
+                    .admission
+                    .admit_diagnostic()
+                    .expect("the flood did not spend an answering slot")
+            })
+            .collect();
+        assert_eq!(answering.len(), crate::admission::MAX_IN_FLIGHT_DIAGNOSTICS);
+        drop(answering);
+
+        drop(held);
+        let (status, _) = status_response(state, Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// The pre-authentication ceiling is partitioned rather than pooled,
+    /// because its shares cost different things: a minted token is a
+    /// revocation-store round trip, a static key a comparison in memory, an
+    /// anonymous caller nothing at all. Pooled, a store that is *slow* rather
+    /// than down would park every permit in token verifications and refuse the
+    /// operator's static key — the credential the runbook sends through exactly
+    /// that outage — and a flood needing no credential at all would do the same
+    /// for free.
+    #[tokio::test]
+    async fn a_token_flood_cannot_close_the_route_to_a_static_key() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let flood: Vec<_> = (0..crate::admission::MAX_AUTHENTICATING_DIAGNOSTIC_TOKENS)
+            .map(|_| {
+                state
+                    .0
+                    .admission
+                    .admit_diagnostic_authentication(DiagnosticCredential::Minted)
+                    .expect("under the token share")
+            })
+            .collect();
+
+        // And its refusals are counted where its capacity is held, so the
+        // runbook's split of `axond_admission_rejections` distinguishes a
+        // credential flood from busy readers rather than reporting both as the
+        // answering ceiling.
+        assert_eq!(
+            state
+                .0
+                .admission
+                .admit_diagnostic_authentication(DiagnosticCredential::Minted)
+                .err(),
+            Some(crate::admission::AdmissionRejection::DiagnosticsAuthenticating)
+        );
+
+        // Another token waits behind the flood rather than behind the store.
+        let (status, body) = status_response(state.clone(), Some("axt1.another-one")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["type"], "diagnostic_concurrency_exceeded");
+
+        // The operator is not behind it: nothing about that credential can reach
+        // the store the flood is parked on.
+        let (status, body) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a token flood held the route closed against a static key: {body}"
+        );
+        // Including a *wrong* static key, which costs the same comparison and so
+        // shares the same share of the ceiling.
+        let (status, _) = status_response(state.clone(), Some("not-a-key")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Nor can a flood that presents nothing at all, which needs no
+        // credential to mount and so would otherwise be the cheapest way to
+        // hold the route shut.
+        let anonymous: Vec<_> = (0..crate::admission::MAX_AUTHENTICATING_DIAGNOSTIC_ANONYMOUS)
+            .map(|_| {
+                state
+                    .0
+                    .admission
+                    .admit_diagnostic_authentication(DiagnosticCredential::Anonymous)
+                    .expect("under the anonymous share")
+            })
+            .collect();
+        let (status, body) = status_response(state.clone(), None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let (status, body) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a credential-less flood held the route closed against a static key: {body}"
+        );
+
+        drop(anonymous);
+        drop(flood);
+    }
+
+    /// The outer permit bounds *authenticating*, so it is given back where
+    /// authentication ends — `authenticate_middleware` takes it off the request
+    /// before the handler runs — rather than where the response does. Otherwise
+    /// a share would drain at the speed of answering, and a slow reader rather
+    /// than an expensive credential would be what closed the route.
+    #[tokio::test]
+    async fn an_answered_read_does_not_keep_its_authentication_permit() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        // One request per permit in the in-memory share, answered in sequence:
+        // if the permit outlived authentication these would exhaust it, since
+        // nothing here waits for a previous one to be released.
+        for _ in 0..crate::admission::MAX_AUTHENTICATING_DIAGNOSTIC_KEYS + 1 {
+            let (status, body) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        // Every one of them is back, not merely most of them.
+        let held: Vec<_> = (0..crate::admission::MAX_AUTHENTICATING_DIAGNOSTIC_KEYS)
+            .map(|_| {
+                state
+                    .0
+                    .admission
+                    .admit_diagnostic_authentication(DiagnosticCredential::Local)
+                    .expect("the answered reads returned every permit they took")
+            })
+            .collect();
+        drop(held);
+    }
+
+    /// `main` merges this router with the administrative surface, which nests
+    /// the whole `/admin/v1` prefix and refuses it wholesale in stateless mode.
+    /// The status diagnostic lives under that prefix without being part of that
+    /// surface: it reports on the replica rather than administering durable
+    /// state, so it must survive the merge in either mode while every
+    /// administrative path keeps answering `stateful_mode_required`.
+    #[tokio::test]
+    async fn the_status_diagnostic_survives_the_administrative_merge() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let app = router(state).merge(crate::admin::router::refusing_router());
+        let answer = |path: String| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::get(path)
+                            .header(
+                                axum::http::header::AUTHORIZATION,
+                                format!("Bearer {OPERATOR_KEY}"),
+                            )
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                (status, String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
+
+        let (status, body) = answer("/admin/v1/status".to_owned()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the administrative refusal swallowed the diagnostic: {body}"
+        );
+        assert!(body.contains("\"object\":\"status\""), "{body}");
+
+        let (status, body) = answer(format!("{}/tenants", crate::admin::ADMIN_PREFIX)).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("stateful_mode_required"), "{body}");
+    }
+
+    /// Registering a path under the administrative prefix means shadowing that
+    /// surface's method fallback on it, so the one diagnostic living there has
+    /// to carry the prefix's contract itself: a client branching on
+    /// `AdminError::CODES` must never meet axum's empty-bodied 405.
+    /// Both deployment postures, because both nest the prefix and both would
+    /// otherwise answer this one path differently from every other one under it.
+    #[tokio::test]
+    async fn a_wrong_method_on_the_status_path_is_still_a_declared_refusal() {
+        for (posture, surface) in [
+            ("stateless", crate::admin::router::refusing_router()),
+            ("stateful", stateful_admin_surface()),
+        ] {
+            let state = status_state(ReplicaObservability {
+                status: observed_registry(),
+                revision: None,
+            });
+            let app = router(state).merge(surface);
+            // With a credential and without one alike: a wrong method is a
+            // protocol mistake, and every neighbouring administrative path
+            // answers it before authentication, so answering `401` here would
+            // send a caller looking for a credential that would not have
+            // helped.
+            for credential in [Some(format!("Bearer {OPERATOR_KEY}")), None] {
+                let case = format!(
+                    "{posture}/{}",
+                    credential.as_ref().map_or("anonymous", |_| "operator")
+                );
+                let mut request = Request::post("/admin/v1/status");
+                if let Some(credential) = credential {
+                    request = request.header(axum::http::header::AUTHORIZATION, credential);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{case}");
+                // RFC 9110 requires it on a 405, and axum sets it from the
+                // method router rather than from the fallback body.
+                assert!(
+                    response.headers().contains_key(axum::http::header::ALLOW),
+                    "{case}"
+                );
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let body: Value = serde_json::from_slice(&bytes)
+                    .unwrap_or_else(|_| panic!("{case}: a typed envelope, not an empty body"));
+                assert_eq!(body["error"]["type"], "admin_method_not_allowed", "{case}");
+            }
+        }
+    }
+
+    /// The administrative surface a stateful replica actually mounts, over an
+    /// in-memory control plane: the merge is only worth testing against the real
+    /// route table and its two fallbacks.
+    fn stateful_admin_surface() -> Router {
+        crate::admin::router::router(Arc::new(crate::admin::router::AdminApi::new(
+            Arc::new(crate::admin::service::AdminService::stateful(Arc::new(
+                crate::desired_state::oracle::InMemoryControlPlane::new(),
+            ))),
+            Arc::new(crate::admin::fakes::FakeAdminAuthenticator::new()),
+            Arc::new(crate::admin::fakes::FakeAdminAuthorizer::permissive()),
+        )))
+    }
+
+    /// A replica that refuses inference because it cannot compile a revision is
+    /// the one an operator most needs to interrogate, and the runbook sends them
+    /// to this route for exactly that incident. It serves no inference surface,
+    /// so the diagnostic is mounted beside the refusal — without the refusal's
+    /// fallback swallowing it, and while every other path still refuses.
+    #[tokio::test]
+    async fn the_status_diagnostic_answers_on_a_replica_that_refuses_inference() {
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: None,
+        });
+        let app = unconverged_router("no snapshot yet").merge(diagnostic_router(state));
+        let answer = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::get(path)
+                            .header(
+                                axum::http::header::AUTHORIZATION,
+                                format!("Bearer {OPERATOR_KEY}"),
+                            )
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                (status, String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
+
+        let (status, body) = answer("/admin/v1/status").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the inference refusal swallowed the diagnostic: {body}"
+        );
+        assert!(body.contains("\"object\":\"status\""), "{body}");
+
+        let (status, body) = answer("/v1/models").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("inference_unavailable"), "{body}");
+
+        // The shape `main` actually builds in stateful mode: the refusal, the
+        // diagnostic, and the *real* administrative surface over the same
+        // prefix. Overlapping prefixes panic in axum when they collide, so
+        // composing it at all is half the assertion.
+        let stateful = unconverged_router("no snapshot yet")
+            .merge(diagnostic_router(status_state(ReplicaObservability {
+                status: observed_registry(),
+                revision: None,
+            })))
+            .merge(stateful_admin_surface());
+        let response = stateful
+            .oneshot(
+                Request::get("/admin/v1/status")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_KEY}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the administrative surface shadowed the diagnostic"
+        );
+
+        // And it is still the authenticated projection, not an open one.
+        let response = unconverged_router("no snapshot yet")
+            .merge(diagnostic_router(status_state(ReplicaObservability {
+                status: observed_registry(),
+                revision: None,
+            })))
+            .oneshot(
+                Request::get("/admin/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A status read is a cache read: the handler returns the last observation
+    /// and never probes, so a dependency outage cannot be turned into a status
+    /// outage — or into load on a struggling backend — by polling this route.
+    #[tokio::test]
+    async fn status_reads_the_cache_without_probing() {
+        let registry = observed_registry();
+        let probe = Arc::new(CountingProbe {
+            observations: Arc::new(AtomicUsize::new(0)),
+        });
+        let state = status_state(ReplicaObservability {
+            status: Arc::clone(&registry),
+            revision: None,
+        });
+        for _ in 0..5 {
+            let (status, _) = status_response(state.clone(), Some(OPERATOR_KEY)).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        assert_eq!(
+            probe.observations.load(Ordering::SeqCst),
+            0,
+            "serving status observed a component"
+        );
+        // The refresher is the only caller that can: it observes once per round.
+        StatusRefresher::new(Arc::clone(&registry), vec![probe.clone()])
+            .refresh_once()
+            .await;
+        assert_eq!(probe.observations.load(Ordering::SeqCst), 1);
+    }
+
+    /// A probe that records being called. Reachable only from the refresher,
+    /// which is what the test above turns into an assertion.
+    struct CountingProbe {
+        observations: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::status::registry::ComponentProbe for CountingProbe {
+        fn component(&self) -> Component {
+            Component::BudgetStore
+        }
+
+        async fn observe(&self) -> ComponentObservation {
+            self.observations.fetch_add(1, Ordering::SeqCst);
+            ComponentObservation {
+                component: Component::BudgetStore,
+                state: ComponentState::Ok,
+                reason: None,
+                detail: None,
+            }
+        }
+    }
+
+    /// A replica that converged on the revision the control plane wants.
+    fn converged_replica() -> Arc<RevisionStatus> {
+        let clock = ManualClock::new();
+        let status = Arc::new(RevisionStatus::new(Box::new(clock.clone())));
+        let desired = revision_id(7);
+        status.observe_desired(Some(desired));
+        status.record_published(
+            desired,
+            9,
+            SnapshotSource::ControlPlane,
+            Duration::from_millis(120),
+        );
+        status.observe_desired(Some(desired));
+        status
+    }
+
+    /// A replica still serving an older snapshot, with the clock moved on so the
+    /// lag is an exact number rather than a race.
+    fn lagging_replica() -> (ManualClock, Arc<RevisionStatus>) {
+        let clock = ManualClock::new();
+        let status = Arc::new(RevisionStatus::new(Box::new(clock.clone())));
+        let old = revision_id(7);
+        status.observe_desired(Some(old));
+        status.record_published(
+            old,
+            9,
+            SnapshotSource::ControlPlane,
+            Duration::from_millis(120),
+        );
+        // The control plane publishes a newer revision this replica refuses.
+        status.observe_desired(Some(revision_id(8)));
+        status.record_rejection(
+            Rejection {
+                revision: Some(revision_id(8)),
+                reason: "secret",
+                detail: LEAKY_DETAIL.to_owned(),
+            },
+            3,
+        );
+        clock.advance(Duration::from_secs(90));
+        (clock, status)
+    }
+
+    /// The fleet-convergence fixture: two replicas of the same deployment, one
+    /// converged and one ninety seconds behind, each answering `/admin/v1/status`
+    /// for itself.
+    ///
+    /// This is what makes a split fleet visible at all — a replica reports its
+    /// own convergence and nothing else, so "the fleet disagrees" is a comparison
+    /// an operator (or the shipped `AxondFleetRevisionSplit` rule) makes across
+    /// replicas, not a claim any one replica makes.
+    #[tokio::test]
+    async fn two_replicas_report_their_own_revision_lag() {
+        let converged = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: Some(converged_replica()),
+        });
+        let (_clock, lagging_status) = lagging_replica();
+        let lagging = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: Some(lagging_status),
+        });
+
+        let (status, healthy) = status_response(converged, Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(healthy["revision"]["converged"], true);
+        assert_eq!(healthy["revision"]["lag_ms"], 0);
+        assert_eq!(healthy["revision"]["consecutive_failures"], 0);
+        assert_eq!(healthy["revision"]["source"], "control-plane");
+
+        let (status, behind) = status_response(lagging, Some(OPERATOR_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(behind["revision"]["converged"], false);
+        assert_eq!(behind["revision"]["lag_ms"], 90_000);
+        assert_eq!(behind["revision"]["consecutive_failures"], 3);
+        // The refusal reaches the response as a code, not as the rejection's own
+        // detail, which named a secret.
+        assert_eq!(behind["revision"]["reason"], "secret_unresolved");
+        assert_eq!(behind["revision"]["generation"], 9);
+
+        // Same deployment, same route, different answers: the lag is per replica.
+        assert_ne!(healthy["revision"], behind["revision"]);
+    }
+
+    /// A tenant never learns what the fleet is converging on, in either state:
+    /// convergence is the operator's business, and `lag_ms` plus a generation is
+    /// enough to fingerprint a rollout.
+    #[tokio::test]
+    async fn a_tenant_sees_no_revision_summary_however_far_behind_the_replica_is() {
+        let (_clock, lagging_status) = lagging_replica();
+        let state = status_state(ReplicaObservability {
+            status: observed_registry(),
+            revision: Some(lagging_status),
+        });
+        let (status, body) = status_response(state, Some(TENANT_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("revision").is_none(), "{body}");
     }
 }

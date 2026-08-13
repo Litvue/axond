@@ -59,6 +59,9 @@ and operate it.
 
 - [Observability and runbook](./observability.md) — traces, metrics, logs,
   usage records, alerts, boot failures, and reloads.
+- [Observability runbook](./operations/observability-runbook.md) — first
+  response per failure mode, bounded drill-downs, and the shipped dashboards and
+  alert rules.
 - [Troubleshooting](./operations/troubleshooting.md) — symptom and typed-error
   decision tree.
 - [Upgrades and rollback](./operations/upgrades.md) — compatibility policy,
