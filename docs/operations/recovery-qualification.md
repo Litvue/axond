@@ -67,7 +67,10 @@ with the machine the run happened on:
 
 - **`max_serving_error_fraction`** — of the requests offered during the window,
   the fraction that may fail. Zero in every committed scenario: a control-plane
-  outage degrades change, not serving.
+  outage degrades change, not serving. A scenario whose readiness gate is
+  `refuses` offers no inference traffic at all — it carries no `serving_behavior`
+  evidence — so its zero is vacuous rather than a promise that a replica which
+  refused readiness still answers.
 - **`max_convergence_lag_seconds`** — how long after the control plane returns a
   replica may still be behind desired state.
 - **`max_data_loss_revisions`** — revisions committed before the recovery target

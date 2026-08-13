@@ -23,7 +23,7 @@ mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use support::recovery::{self, BLOCKING_ISSUES, Capability, Evidence, Status};
+use support::recovery::{self, BLOCKING_ISSUES, Capability, Evidence, Readiness, Status};
 
 #[test]
 fn every_scenario_the_issue_names_is_committed_exactly_once() {
@@ -85,6 +85,26 @@ fn every_scenario_carries_a_gate_that_can_fail() {
         assert!(
             !scenario.description.trim().is_empty(),
             "{id}: a scenario without a description is not reproducible by a reader"
+        );
+    }
+}
+
+/// `max_serving_error_fraction` bounds the requests a scenario offers, so a
+/// scenario that refuses readiness offers none and its zero is vacuous. Keeping
+/// `serving_behavior` off those scenarios is what says so: a driver that starts
+/// measuring served traffic against a replica which never became ready has to
+/// declare the evidence, and this fails when it does.
+#[test]
+fn a_scenario_that_refuses_readiness_claims_no_serving_evidence() {
+    for scenario in &recovery::load().scenarios {
+        if scenario.gate.readiness != Readiness::Refuses {
+            continue;
+        }
+        assert!(
+            !scenario.evidence.contains(&Evidence::ServingBehavior),
+            "{}: a scenario that refuses readiness serves nothing, so its zero \
+             serving-error ceiling is vacuous rather than a serving guarantee",
+            scenario.id
         );
     }
 }

@@ -24,6 +24,13 @@
 # administrative authentication ever admitted an unauthenticated caller.
 # Wall-clock restore duration, outage duration, and lag *samples* are recorded
 # and never asserted — a shared runner cannot bound them without flaking.
+#
+# `max_serving_error_fraction` bounds the errors among requests a scenario
+# actually offers; it is not a promise that a scenario serves at all. A scenario
+# whose `readiness` is `refuses` offers no inference traffic — it omits the
+# `serving_behavior` evidence class — so its zero is vacuous rather than a
+# serving guarantee, and a driver must not read it as licence to expect answers
+# from a replica that refused to become ready.
 
 schema_version = 1
 
