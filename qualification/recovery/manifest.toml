@@ -265,7 +265,7 @@ The link is restored under the replica that survived the outage and the one that
 booted from cache: administrative writes are accepted again, both converge to \
 the head revision without intervention, and lag returns to zero inside the \
 declared bound."""
-evidence = ["outage_timeline", "revisions", "convergence_lag"]
+evidence = ["outage_timeline", "revisions", "convergence_lag", "revision_loss_boundary"]
 
 [[scenario.stage]]
 id = "serving"
@@ -366,7 +366,7 @@ wrote: the revision chain, its checksums, the tenancy and access projections, \
 the credential references, and the audit rows all come back, a replica booted \
 on the restored journal reads the same head, and a publication against that \
 head is accepted."""
-evidence = ["outage_timeline", "revisions", "restore_duration"]
+evidence = ["outage_timeline", "revisions", "restore_duration", "revision_loss_boundary"]
 
 [[scenario.stage]]
 id = "administration"
@@ -445,7 +445,7 @@ committed before the target is present in the promoted cluster, the revision \
 published after it is absent, the head is the pre-target revision, and a \
 replica booted on the recovered database reads that head and accepts a \
 publication against it."""
-evidence = ["outage_timeline", "revisions", "restore_duration"]
+evidence = ["outage_timeline", "revisions", "restore_duration", "revision_loss_boundary"]
 
 [[scenario.stage]]
 id = "administration"

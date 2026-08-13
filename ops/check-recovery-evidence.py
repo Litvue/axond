@@ -67,6 +67,13 @@ MANIFEST = ROOT / "qualification/recovery/manifest.toml"
 # `crates/gateway/src/qualification/evidence.rs`.
 SCHEMA_VERSION = 2
 
+# A gate that is judged has to be backed by the evidence class that measures it,
+# the way `readiness` is tied to `serving_behavior` in the contract tests. A
+# stage that gates on how much durable state a recovery lost, while the contract
+# says it does not retain the loss boundary, describes a boundary no reader can
+# check.
+GATE_EVIDENCE = {"max_data_loss_revisions": "revision_loss_boundary"}
+
 
 def owed(runner: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     manifest = tomllib.loads(MANIFEST.read_text(encoding="utf-8"))
@@ -131,6 +138,15 @@ def check(
         f"observed {entry['observed']} ({entry['detail']})"
         for entry in verdicts
         if entry.get("outcome") == "failed"
+    )
+    problems.extend(
+        f"{key}: the artifact judges {entry['gate']} while the contract grants the stage "
+        f"no {GATE_EVIDENCE[entry['gate']]} evidence, so it gates on a boundary it does "
+        "not retain"
+        for entry in artifact.get("gates", [])
+        if entry.get("outcome") != "not_evaluated"
+        and entry.get("gate") in GATE_EVIDENCE
+        and GATE_EVIDENCE[entry["gate"]] not in stage["evidence"]
     )
     started = artifact.get("run", {}).get("started_at_unix_ms", 0)
     if since_unix_ms and started < since_unix_ms:
@@ -204,9 +220,40 @@ def self_test() -> int:
         ),
     ]
 
+    # The pairing case needs a stage the contract does *not* grant the loss
+    # boundary to, judging the gate that measures it.
+    unbacked = {
+        **stage,
+        "evidence": [c for c in stage["evidence"] if c != "revision_loss_boundary"],
+    }
+
     complaints: list[str] = []
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / f"{scenario['id']}.{stage['id']}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    **artifact(),
+                    "evidence": unbacked["evidence"],
+                    "gates": [
+                        {
+                            "gate": "max_data_loss_revisions",
+                            "bound": "0",
+                            "observed": "0",
+                            "outcome": "met",
+                            "detail": "nothing was lost",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        if not check(scenario, unbacked, Path(directory), runner, []):
+            complaints.append(
+                "a gate judged without the evidence class that measures it: "
+                "the checker accepted it"
+            )
+        path.unlink(missing_ok=True)
         for name, body, forbid, want_ok in cases:
             path.unlink(missing_ok=True)
             if body is not None:
@@ -234,7 +281,7 @@ def self_test() -> int:
         for complaint in complaints:
             print(f"  {complaint}", file=sys.stderr)
         return 1
-    print(f"the evidence checker catches {len(cases)} ways an artifact can lie")
+    print(f"the evidence checker catches {len(cases) + 1} ways an artifact can lie")
     return 0
 
 

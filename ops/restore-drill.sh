@@ -176,6 +176,7 @@ fi
 [[ -x "$axond_bin" ]] || fail "no axond binary at ${axond_bin}"
 
 command -v docker >/dev/null 2>&1 || fail "docker is required"
+command -v curl >/dev/null 2>&1 || fail "curl is required to probe the drill's replicas"
 command -v jq >/dev/null 2>&1 || fail "jq is required"
 command -v openssl >/dev/null 2>&1 || fail "openssl is required for this run's secrets"
 

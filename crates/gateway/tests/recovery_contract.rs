@@ -250,6 +250,44 @@ fn the_dependency_map_is_complete_in_both_directions() {
     );
 }
 
+/// A slice may leave the dependency map, but only by saying what became of it.
+/// Deleting the last claim on a slice is indistinguishable from deleting the
+/// stage that needed it, so a retirement is recorded, cannot also be a live
+/// blocker, cannot still be named by a stage, and has to be accounted for in
+/// the operator contract with the issue that still tracks the rest of it.
+#[test]
+fn a_retired_blocker_says_what_became_of_the_slice() {
+    let manifest = recovery::load();
+    let live: BTreeSet<u32> = BLOCKING_ISSUES.into_iter().collect();
+    let contract = recovery::contract_text();
+
+    for (issue, became) in recovery::RETIRED_BLOCKERS {
+        assert!(
+            !live.contains(&issue),
+            "#{issue} is both retired and a live blocker"
+        );
+        assert!(
+            became.len() > 80,
+            "#{issue}: a retirement needs a reason a reader can act on, not {became:?}"
+        );
+        for scenario in &manifest.scenarios {
+            for stage in &scenario.stages {
+                assert!(
+                    stage.blocked_on.iter().all(|d| d.issue != issue),
+                    "{}/{}: waits on retired slice #{issue}",
+                    scenario.id,
+                    stage.id
+                );
+            }
+        }
+        assert!(
+            contract.contains(&format!("#{issue}")),
+            "{} does not say what became of retired slice #{issue}",
+            recovery::CONTRACT_RELATIVE
+        );
+    }
+}
+
 /// The honesty gate at the scenario level: a scenario is executable exactly
 /// when every stage of it is, so a scenario cannot be reported as qualified
 /// while the half that offers traffic is still waiting on a slice.

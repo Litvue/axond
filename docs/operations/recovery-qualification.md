@@ -186,6 +186,7 @@ Nine evidence classes, and the committed scenarios have to cover all of them:
 | `cold_start` | What a replica booting *into* the window did: restored from cache, refused readiness, or served. |
 | `restore_duration` | Wall-clock restore time. Recorded, never asserted. |
 | `data_loss_boundary` | What durable state did not survive, named rather than counted. |
+| `revision_loss_boundary` | Which revisions a recovery kept and which it left behind, which is what `max_data_loss_revisions` counts. |
 | `fail_open_closed` | Which dependency failed open and which failed closed, per scenario. |
 | `audit_auth` | Administrative authentication and audit outcomes across the window. |
 
@@ -256,6 +257,15 @@ usage records are the blocked `usage-boundary` stage.
 
 The manifest carries the same map per scenario, so landing a slice tells you
 which scenarios it unblocks.
+
+### Slices this harness stopped waiting on
+
+| Slice | Why no stage waits on it, and where the rest of it lives |
+| --- | --- |
+| #159 | The part a recovery scenario needed — a database running with WAL archiving, and the evidence published as an artifact — is here: `ops/restore-drill.sh` runs that lane, and `ops/check-recovery-evidence.py` fails it when an executable stage leaves no artifact. The rest of #159 — disclosure, fuzzing, SDK compatibility — blocks no recovery stage, so it stays tracked on #159 itself rather than on a stage invented to wait on it. |
+
+`RETIRED_BLOCKERS` in the contract test holds the same claim, so a slice can
+only leave the map by saying what became of it.
 
 ## Related
 

@@ -39,14 +39,24 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 3;
 /// that no stage names is a dependency nobody is waiting for, and a dependency
 /// nobody is waiting for is a sign the stage that needed it was dropped.
 ///
-/// #159 was on this list for the hardened lane a recovery scenario needs — a
-/// database running with WAL archiving, and the evidence published as an
-/// artifact. That lane exists: `ops/restore-drill.sh` runs it, and
-/// `ops/check-recovery-evidence.py` fails the lane when an executable stage
-/// leaves no artifact. The rest of #159 — disclosure, fuzzing, SDK
-/// compatibility — blocks no stage here, and keeping it listed would have
-/// meant inventing a stage to wait on it.
+/// A slice this harness stopped waiting on is recorded in `RETIRED_BLOCKERS`
+/// rather than deleted, so dropping one stays a reviewable statement.
 pub const BLOCKING_ISSUES: [u32; 9] = [144, 145, 146, 147, 148, 149, 150, 155, 158];
+
+/// Slices #219 once waited on, why it no longer does, and where the rest of
+/// each slice is tracked. Retiring a blocker silently is how a stage that
+/// needed it disappears with it, so the claim is written down and checked: a
+/// retired slice may not also be a blocker, no stage may name it, and the
+/// operator contract has to say what became of it.
+pub const RETIRED_BLOCKERS: [(u32, &str); 1] = [(
+    159,
+    "the hardened lane a recovery scenario needs \u{2014} a database running with WAL \
+     archiving, and the evidence published as an artifact \u{2014} exists: \
+     `ops/restore-drill.sh` runs it, and `ops/check-recovery-evidence.py` fails the \
+     lane when an executable stage leaves no artifact. The rest of #159 \u{2014} \
+     disclosure, fuzzing, SDK compatibility \u{2014} blocks no recovery stage here, \
+     and stays tracked on #159 itself rather than on a stage invented to wait on it",
+)];
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -207,6 +217,9 @@ pub enum Evidence {
     RestoreDuration,
     /// What durable state did not survive, named rather than counted.
     DataLossBoundary,
+    /// Which revisions a recovery kept and which it left behind: the journal's
+    /// own loss boundary, which is what `max_data_loss_revisions` counts.
+    RevisionLossBoundary,
     /// Which dependencies failed open and which failed closed.
     FailOpenClosed,
     /// Administrative authentication and audit outcomes across the window.
@@ -214,7 +227,7 @@ pub enum Evidence {
 }
 
 impl Evidence {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::OutageTimeline,
         Self::ServingBehavior,
         Self::Revisions,
@@ -222,6 +235,7 @@ impl Evidence {
         Self::ColdStart,
         Self::RestoreDuration,
         Self::DataLossBoundary,
+        Self::RevisionLossBoundary,
         Self::FailOpenClosed,
         Self::AuditAuth,
     ];
@@ -235,6 +249,7 @@ impl Evidence {
             Self::ColdStart => "cold_start",
             Self::RestoreDuration => "restore_duration",
             Self::DataLossBoundary => "data_loss_boundary",
+            Self::RevisionLossBoundary => "revision_loss_boundary",
             Self::FailOpenClosed => "fail_open_closed",
             Self::AuditAuth => "audit_auth",
         }
