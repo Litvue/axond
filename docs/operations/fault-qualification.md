@@ -49,13 +49,18 @@ Each row writes `target/faults/<family>/<row>.json`, carrying:
 | `cleanup` | Upstream responses opened and still open when the caller was gone, how long the release took, and whether the process exited cleanly on `SIGTERM`. A stalled buffered attempt is counted as well as a stream, so a header- or body-bound row proves the abandoned response was released rather than reporting a zero nothing ever contributed to. The release time is read before the process is stopped and gated on a ceiling, so a body freed only by shutdown fails the row. |
 | `usage` | Records settled by the measured request, their statuses, the cost, and whether the record carries a request id. A record is the measured request's when the identity it carries was minted after that request was sent — a backend row's priming request and outage probe are recognised and excluded by their own identities, however late their records land, rather than being waited out. |
 | `telemetry` | Exports received by a real OTLP collector, the instruments and spans observed, and any the row named and did not get. |
-| `leakage` | Every surface scanned — caller response, usage records, process output, OTLP payloads — with byte counts and any finding. |
+| `leakage` | Every surface scanned — caller response, usage records, process output, OTLP payloads — with byte counts and any finding. The records surface is every record the process wrote, not only the measured request's: a priming request's record would be as much of a leak as the measured one's. The process output is read once its pipes have reached EOF, so a line a shutdown flush emitted is scanned rather than missed. |
 | `verdicts` | Every check, with expected and observed, so a passing row is auditable and a failing row is diagnosable from the artifact alone. |
 
 The leakage scan looks for the provider base URL and endpoint, the upstream
 credentials, the inbound gateway key, and the datastore DSN and its authority.
 The needle *values* never enter the artifact: a finding names the surface and a
 label.
+
+A Postgres row's run-scoped table name is derived by the harness and checked
+against a bare-identifier boundary both where it is derived and where it is
+spliced into the row's `DROP TABLE`, since an identifier cannot be bound as a
+statement parameter.
 
 Milliseconds are asserted only as ceilings (`deadline_ms`). Everything a row
 fails on is a property that does not move with the machine.

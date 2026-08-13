@@ -327,6 +327,34 @@ fn a_postgres_rows_table_leaves_room_for_the_identifiers_derived_from_it() {
             table.len() + "_namespace_fence".len() < 64,
             "`{table}` is too long for the store's derived identifiers"
         );
+        assert!(
+            fault::run::is_bare_identifier(&table),
+            "`{table}` reaches DDL by interpolation, so it has to be a bare identifier"
+        );
+    }
+}
+
+/// The boundary that keeps the harness's DDL safe: an identifier cannot be
+/// bound as a parameter, so what may be spliced into a statement is decided
+/// here rather than assumed of whatever derived the name.
+#[test]
+fn only_a_bare_identifier_may_be_spliced_into_a_statement() {
+    assert!(fault::run::is_bare_identifier("axond_fq1234_budget"));
+    for rejected in [
+        "",
+        "1_leading_digit",
+        "_leading_underscore",
+        "Mixed_Case",
+        "with space",
+        "with-dash",
+        "quoted\"name",
+        "budget; drop table axond_usage",
+        "budget--comment",
+    ] {
+        assert!(
+            !fault::run::is_bare_identifier(rejected),
+            "`{rejected}` must not be usable as an identifier"
+        );
     }
 }
 

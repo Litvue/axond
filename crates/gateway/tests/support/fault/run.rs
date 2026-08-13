@@ -86,6 +86,9 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 /// Extra delay the latency rows inject into every datastore read.
 const LATENCY_SETTLE: Duration = Duration::from_millis(200);
+/// How long the child's stdout and stderr readers are given to reach EOF once
+/// it has exited.
+const OUTPUT_SETTLE: Duration = Duration::from_secs(10);
 
 /// How long the upstream may take to be released once the caller is gone.
 /// Recorded and gated: a release that happens only at process shutdown is a
@@ -311,8 +314,13 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
 
     gateway.terminate();
     let exit = gateway.await_exit(SHUTDOWN_TIMEOUT).await;
-    // The exporters flush on shutdown; the last export lands just after the
-    // process is gone.
+    // An exited child is reaped before the pipe it wrote to has been drained, so
+    // the readers are joined rather than waited out: the lines a shutdown flush
+    // emits are the ones the usage, operator-reason, and leakage evidence is
+    // read from, and a row that missed one would fail rather than pass.
+    gateway.settle_output(OUTPUT_SETTLE).await;
+    // The exporters flush over the network on the way out, so the last export
+    // lands at the collector just after the process is gone.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     if service == Some(Service::Postgres)
@@ -324,7 +332,8 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
     // The process is gone and its sink is drained, so this is every record the
     // row could ever have settled: a row expecting none is judged against the
     // whole of it rather than against however long the harness waited.
-    let settled = Settled::of(&gateway.usage_records(), started_at);
+    let drained = gateway.usage_records();
+    let settled = Settled::of(&drained, started_at);
     let records = settled.measured;
 
     let output = gateway.output();
@@ -342,7 +351,10 @@ pub async fn run(row: &Row, manifest_text: &str) -> Outcome {
         backend.as_ref(),
         &observed.body_text,
         &output,
-        &records,
+        // Every record the process wrote, not only the measured request's: a
+        // priming request's record is as much of a leak as this one's, and the
+        // scan is what the row's secrecy claim rests on.
+        &drained,
         &collector,
     );
 
@@ -801,7 +813,24 @@ pub fn budget_table(row: &str) -> String {
         table.len() + "_namespace_fence".len() < 64,
         "`{table}` leaves no room for the store's derived identifiers"
     );
+    assert!(
+        is_bare_identifier(&table),
+        "`{table}` is not a bare identifier"
+    );
     table
+}
+
+/// Whether a name may be interpolated into a statement as an identifier. An
+/// identifier cannot be bound as a parameter, so the DDL this harness runs is
+/// built by interpolation; this is the boundary that makes that safe, and it is
+/// asserted where the name is derived *and* where it is spliced, so a name from
+/// a wider source later — a manifest key, say — cannot reach a statement.
+pub fn is_bare_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 fn budget_table_root() -> String {
@@ -812,6 +841,13 @@ fn budget_table_root() -> String {
 /// database as it found it. Connected directly rather than through the fault
 /// proxy, which by then may be holding an outage open.
 async fn drop_budget_table(dsn: &str, table: &str) {
+    // Checked at the splice, not only where it was derived: the value is what
+    // makes the interpolation below safe, and a statement that trusts its caller
+    // for that has no boundary at all.
+    assert!(
+        is_bare_identifier(table),
+        "a table name interpolated into DDL must be a bare identifier"
+    );
     let Ok((client, connection)) = tokio_postgres::connect(dsn, tokio_postgres::NoTls).await else {
         return;
     };
