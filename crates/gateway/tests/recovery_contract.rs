@@ -89,23 +89,29 @@ fn every_scenario_carries_a_gate_that_can_fail() {
     }
 }
 
-/// `max_serving_error_fraction` bounds the requests a scenario offers, so a
-/// scenario that refuses readiness offers none and its zero is vacuous. Keeping
-/// `serving_behavior` off those scenarios is what says so: a driver that starts
-/// measuring served traffic against a replica which never became ready has to
-/// declare the evidence, and this fails when it does.
+/// `max_serving_error_fraction` bounds the requests a scenario offers, so the
+/// ceiling and the `serving_behavior` evidence have to travel together in both
+/// directions: a refusing scenario offers no traffic and must not claim serving
+/// evidence, and a serving scenario must retain it, or its ceiling is satisfied
+/// by a run that never sent a request.
 #[test]
-fn a_scenario_that_refuses_readiness_claims_no_serving_evidence() {
+fn the_serving_gate_and_the_serving_evidence_agree() {
     for scenario in &recovery::load().scenarios {
-        if scenario.gate.readiness != Readiness::Refuses {
-            continue;
+        let retains_serving = scenario.evidence.contains(&Evidence::ServingBehavior);
+        match scenario.gate.readiness {
+            Readiness::Refuses => assert!(
+                !retains_serving,
+                "{}: a scenario that refuses readiness serves nothing, so its zero \
+                 serving-error ceiling is vacuous rather than a serving guarantee",
+                scenario.id
+            ),
+            Readiness::Serves => assert!(
+                retains_serving,
+                "{}: a serving scenario must retain serving_behavior, or its \
+                 serving-error ceiling passes without a request being offered",
+                scenario.id
+            ),
         }
-        assert!(
-            !scenario.evidence.contains(&Evidence::ServingBehavior),
-            "{}: a scenario that refuses readiness serves nothing, so its zero \
-             serving-error ceiling is vacuous rather than a serving guarantee",
-            scenario.id
-        );
     }
 }
 

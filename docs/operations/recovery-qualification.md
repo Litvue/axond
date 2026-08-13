@@ -70,7 +70,9 @@ with the machine the run happened on:
   outage degrades change, not serving. A scenario whose readiness gate is
   `refuses` offers no inference traffic at all — it carries no `serving_behavior`
   evidence — so its zero is vacuous rather than a promise that a replica which
-  refused readiness still answers.
+  refused readiness still answers. Conversely a scenario whose readiness gate is
+  `serves` must retain `serving_behavior`, so the ceiling is measured against
+  offered requests instead of passing by default.
 - **`max_convergence_lag_seconds`** — how long after the control plane returns a
   replica may still be behind desired state.
 - **`max_data_loss_revisions`** — revisions committed before the recovery target

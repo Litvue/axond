@@ -30,7 +30,10 @@
 # whose `readiness` is `refuses` offers no inference traffic — it omits the
 # `serving_behavior` evidence class — so its zero is vacuous rather than a
 # serving guarantee, and a driver must not read it as licence to expect answers
-# from a replica that refused to become ready.
+# from a replica that refused to become ready. The converse holds too: a
+# scenario whose `readiness` is `serves` must retain `serving_behavior`, so the
+# ceiling is evaluated against requests that were actually offered rather than
+# passing by default.
 
 schema_version = 1
 
@@ -257,6 +260,7 @@ evidence = [
     "revisions",
     "restore_duration",
     "data_loss_boundary",
+    "serving_behavior",
     "convergence_lag",
     "audit_auth",
 ]
