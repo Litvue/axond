@@ -103,7 +103,12 @@ pub(super) fn serializer(text: &str) -> Result<SerializerVersion, IntegrityError
 macro_rules! id_column {
     ($name:ident, $type:ty) => {
         pub(super) fn $name(text: &str) -> Result<$type, IntegrityError> {
-            <$type>::parse(text).map_err(|error| unreadable(error.to_string()))
+            <$type>::parse(text).map_err(|error| {
+                unreadable(format!(
+                    "stored `{}` id is invalid: {error}",
+                    stringify!($name)
+                ))
+            })
         }
     };
 }
@@ -148,10 +153,16 @@ pub(super) fn scope(
     project: Option<&str>,
 ) -> Result<ResourceScope, IntegrityError> {
     let tenant = tenant
-        .map(|text| TenantId::parse(text).map_err(|error| unreadable(error.to_string())))
+        .map(|text| {
+            TenantId::parse(text)
+                .map_err(|error| unreadable(format!("stored scope tenant id is invalid: {error}")))
+        })
         .transpose()?;
     let project = project
-        .map(|text| ProjectId::parse(text).map_err(|error| unreadable(error.to_string())))
+        .map(|text| {
+            ProjectId::parse(text)
+                .map_err(|error| unreadable(format!("stored scope project id is invalid: {error}")))
+        })
         .transpose()?;
     match (kind, tenant, project) {
         ("deployment", None, None) => Ok(ResourceScope::Deployment),
@@ -569,6 +580,14 @@ mod tests {
         );
         assert!(revision_id(&RevisionId::new(uuid(5)).to_string()).is_ok());
         assert!(resource_id("res_not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn stored_id_refusals_name_the_column_without_echoing_the_value() {
+        let error = resource_id("provider-material").expect_err("the row is corrupt");
+        let text = error.to_string();
+        assert!(text.contains("stored `resource_id` id is invalid"));
+        assert!(!text.contains("provider-material"));
     }
 
     #[test]

@@ -53,7 +53,9 @@ unchanged by it. This page is the evidence for them under stateful mode.
   hex digits — and never by repeating what arrived. A closed-set field
   (`wire_family`, a lifecycle, a state) is refused with the set *this build*
   accepts, which is the actionable context and is composed entirely of the
-  build's own constants.
+  build's own constants. Provider endpoint validation follows the same rule:
+  the refusal names the required absolute-origin form without copying the
+  configured endpoint into an operator log.
 - **The convergence read is swept against a real projection.** The
   administrative fixture attaches a replica convergence status and records the
   revision it published, so `/convergence` answers with revision identity,
