@@ -149,7 +149,9 @@ every probe — an abandoned probe publishes a synthetic `timeout` observation t
   reports is now as old as the stall, including the `ok` components. (A replica
   that never wired a refresher emits no status instruments at all, and the rule's
   second arm keeps it silent there rather than paging for a stall that never
-  happened.)
+  happened.) The rule reads a *gap* in the series, so it depends on the exporter
+  letting the series lapse: see [the name translation these assets
+  assume](#the-name-translation-these-assets-assume).
 - **probes keep failing.** Refreshes are recorded with
   `axond_status_outcome="failed"`, the state is honest, and the dependency — not
   the replica — is the thing to fix.
@@ -461,6 +463,16 @@ which makes the translation exactly:
 | `axond.request.count` | `axond_request_count` |
 | `axond.request.duration` (histogram) | `axond_request_duration_bucket`, `_sum`, `_count` |
 | `axond.namespace` (label) | `axond_namespace` |
+
+One exporter setting beyond the naming matters to a single rule.
+`AxondStatusRefresherStalled` detects a stalled refresher as the *absence* of
+`axond_status_refreshes` over ten minutes, and the Prometheus exporter keeps
+exporting the last sample it saw for `metric_expiration` — five minutes by
+default, which [the shipped
+pipeline](../../ops/observability/otel-collector.yaml) leaves alone. Raise that
+key above the rule's ten-minute window and the series never lapses, which
+silently disables the rule rather than making it noisy. Widen the window with it
+if you raise it.
 
 Dots become underscores and nothing else is appended: no `_total` on counters and
 no unit suffix. With the exporter's default `add_metric_suffixes: true` you get
