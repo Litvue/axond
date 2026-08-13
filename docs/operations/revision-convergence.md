@@ -434,7 +434,9 @@ and gateway-key bindings all have to be checked against a separator no
 
 What projection does *not* touch is everything the local file owns: listener,
 transport bounds, admission, telemetry, datastore connectivity, and — until their
-own slices land — providers, credentials, models, and prices. The bootstrap's
+own slices land — providers, models, and prices. Provider *credentials* it does
+touch: see [Which pool a credential
+authenticates](#which-pool-a-credential-authenticates). The bootstrap's
 default namespace stays the default, and a projected project starts with no
 platform fallback: it borrows no other namespace's credentials.
 
@@ -452,6 +454,66 @@ refusal is a design boundary rather than an outage.
 A stateless deployment is unaffected by all of this. Tenants and projects are
 published, never declared in `axond.toml`, and a stateless config's namespace ids
 are exactly the ids the file wrote.
+
+### Which pool a credential authenticates
+
+A published credential is a reference; a compiled snapshot is where it becomes a
+key a provider call presents. Compiling a candidate resolves every version its
+credentials pin, and each **active** credential becomes one entry in the pool of
+`(namespace, provider)`:
+
+- **which namespace** — a project's credential serves that project's namespace. A
+  *tenant's* credential is a default for every namespace of that tenant, and a
+  project's own credential for the same provider replaces it there rather than
+  being tried after it. A credential whose owner has no projected namespace (a
+  tenant with no projects, a suspended one) is logged by reference and skipped: it
+  is not a reason to refuse the revision.
+- **which provider** — the provider resource's slug has to match a `[[provider]]`
+  the file declares, because endpoints and wire families are still file-owned. A
+  credential for a provider the deployment cannot dial refuses the candidate with
+  reason `projection`, rather than publishing a namespace with no key.
+- **staged is not serving.** Staged material resolves — that is how you prove it
+  before traffic reaches it — but only `active` material is pooled. `disabled`,
+  `revoked`, and `tombstoned` credentials are absent from the next snapshot's
+  pools.
+- **a pool entry names a version, never a value.** Pool status, usage records,
+  logs, and metrics carry the credential's slug; the material is held as a
+  reference-counted, zeroizing lease that nothing renders.
+
+#### Rotating a key without a redeploy
+
+Nothing below restarts a replica, and nothing below is on the request path.
+
+1. Store the new material as a new version of the secret and publish it as a
+   *second* credential resource beside the serving one, `staged`.
+2. Watch `revision.active` reach that revision on every replica. A replica that
+   cannot unwrap the new version refuses the candidate and keeps serving its last
+   known good snapshot, with reason `secret` — fix the store, do not roll back.
+3. Publish one revision that moves the new credential to `active` and the old one
+   to `disabled` (reversible) or `revoked` (not). The next snapshot's pool holds
+   the new key.
+4. Requests already in flight — buffered or streaming — finish on the snapshot
+   they started on, so they keep using the *old* key. The old material stays
+   unwrapped for exactly as long as some snapshot still references it, and is
+   zeroized when the last one is dropped.
+5. Rolling back is publishing the previous revision: it pinned the previous
+   version, so the material comes back with the manifest — unless the old version
+   was `revoked`, which never returns to service, or `tombstoned`, whose bytes are
+   gone. Roll back with `disabled` if you want the option; use `revoked` when the
+   key is compromised.
+
+A replica that boots cold while the secret store is unreachable **refuses to
+start**, even from a valid signed last-known-good cache: a cache holds references,
+not material, and starting without keys would serve nothing. A replica already
+running keeps serving.
+
+#### Stateless deployments are unchanged
+
+A `[[credential]]` in `axond.toml` still names an `env` var and still reads its
+material from the boot environment, with the same boot-time refusal when the var
+is unset or empty. Projected and file-declared credentials share one pool
+implementation and one leasing path, and an entry names exactly one source of
+material: an env var, or a secret version. Neither ever names both.
 
 ## When a replica will not converge
 

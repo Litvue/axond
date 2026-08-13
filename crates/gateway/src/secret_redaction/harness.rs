@@ -11,14 +11,20 @@
 //! it, so every retention, rotation, and zeroization property asserted here is
 //! asserted about the shipped seam.
 //!
-//! What the harness still supplies is the *pool wiring*: turning a resolved
-//! version into the credential a provider call is authenticated with still runs
-//! through [`ConfigSnapshot::build_with`]'s environment, because the projection
-//! that emits `[[credential]]` entries from typed credential bodies is not on
-//! `main` yet. So this compiler names each resolved version with an env-var name
-//! and hands the material over under it, then gives the same [`ResolvedSecrets`]
-//! to the snapshot. When that projection lands, this seam is the only thing that
-//! should have to change.
+//! The pool wiring is production code too: [`RuntimeProjection`] emits the
+//! `[[credential]]` entries a provider call leases from, each naming the exact
+//! secret version it is authenticated with, and the snapshot fills them from the
+//! same [`ResolvedSecrets`] it retains. So a request that reaches the fake
+//! provider with the sentinel key proves the shipped path carried it there.
+//!
+//! Two things the harness still supplies, both owed by other slices and neither
+//! touching material:
+//!
+//! - **an alias's targets**, because projecting a catalogue is its own slice;
+//! - **which namespace an inbound key binds to**, because binding a caller to a
+//!   projected namespace is the principal slice's (#252). A projected project is
+//!   reached by a qualified id no `axond.toml` can declare, so the harness
+//!   rebinds the bootstrap key to it rather than inventing an identity model.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -36,18 +42,21 @@ use tokio::sync::{Semaphore, mpsc};
 use super::sweep::LeakSweep;
 use crate::backends::control_plane::ControlPlaneStore;
 use crate::backends::fakes::InMemorySecrets;
-use crate::backends::secrets::{SecretMaterial, SecretResolver as _};
+use crate::backends::secrets::{SecretMaterial, SecretResolver as _, SecretStore};
 use crate::budget::NoBudget;
 use crate::config::{Config, Model, Target};
-use crate::convergence::compile::{CandidateCompiler, CompileError, ProjectionError};
+use crate::convergence::compile::{CandidateCompiler, CompileError, RevisionProjection};
+use crate::convergence::credentials::RuntimeProjection;
 use crate::convergence::secrets::{MaterialLedger, SecretMaterialization};
 use crate::convergence::status::testing::ManualClock;
 use crate::convergence::{BackoffPolicy, ConvergenceSettings, Outcome, Reconciler};
-use crate::desired_state::credentials::{Credentials, ProviderCredentialBody};
+use crate::desired_state::credentials::ProviderCredentialBody;
+use crate::desired_state::models::WireFamily;
 use crate::desired_state::oracle::InMemoryControlPlane;
+use crate::desired_state::providers::ProviderBody;
 use crate::desired_state::{
-    CanonicalValue, DesiredState, ExpectedRevision, LoadedRevision, ResourceBody, ResourceId,
-    ResourceKind, ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber, RevisionId,
+    CanonicalValue, DesiredState, ExpectedRevision, LoadedRevision, ResourceBody, ResourceKind,
+    ResourceRef, ResourceScope, ResourceVersion, ResourceVersionNumber, RevisionId,
     SecretLifecycle, SecretOwner, SecretRef, Slug, fixtures,
 };
 use crate::state::{AppState, ConfigSnapshot};
@@ -114,18 +123,9 @@ pub(crate) fn bootstrap_env() -> HashMap<String, String> {
     )])
 }
 
-/// The env-var name a resolved credential is handed to `ConfigSnapshot::build`
-/// under. A name, never a value — which is the reason it is safe to log.
-///
-/// Keyed by resource id rather than slug: slugs are unique within a scope, not
-/// across them, and two credentials colliding on this name would silently
-/// authenticate one tenant with another tenant's material.
-fn env_name(id: ResourceId) -> String {
-    format!(
-        "AXOND_RESOLVED_{}",
-        id.to_string().to_uppercase().replace(['-', '.'], "_")
-    )
-}
+/// The namespace the fixture tenant's project is projected as: what a request
+/// names to reach the credential this suite resolves.
+pub(crate) const SERVING_NAMESPACE: &str = "acme/core";
 
 /// A compiler that resolves each revision's credential references through a
 /// secret store, then builds a whole snapshot from the result.
@@ -139,7 +139,7 @@ pub(crate) struct SecretResolvingCompiler {
 }
 
 impl SecretResolvingCompiler {
-    pub(crate) fn new(bootstrap: Config, secrets: Arc<InMemorySecrets>) -> Self {
+    pub(crate) fn new(bootstrap: Config, secrets: Arc<dyn SecretStore>) -> Self {
         Self {
             bootstrap,
             env: bootstrap_env(),
@@ -177,14 +177,12 @@ impl CandidateCompiler for SecretResolvingCompiler {
             revision: id,
             source,
         };
-        let mut config = self.bootstrap.clone();
-        let mut env = self.env.clone();
-        let credentials = Credentials::of(revision.state()).map_err(|error| {
-            projection(ProjectionError::Body {
-                reference: error.reference(),
-                detail: error.to_string(),
-            })
-        })?;
+        // The shipped projection: the revision's projects become namespaces and
+        // its active credentials become the pools serving them, each naming the
+        // exact version its material comes from.
+        let mut config = RuntimeProjection
+            .project(&self.bootstrap, revision.state())
+            .map_err(projection)?;
         // All of the candidate's material or none of it, resolved by the shipped
         // materialization: a version it cannot unwrap is a refusal here, before
         // anything is published.
@@ -193,24 +191,20 @@ impl CandidateCompiler for SecretResolvingCompiler {
             .resolve(revision.state())
             .await
             .map_err(projection)?;
-        for credential in credentials.all() {
-            if !credential.body.permits_resolution() {
-                continue;
-            }
-            let reference = credential.body.secret();
-            let material = resolved
-                .get(reference)
-                .expect("a resolvable credential's version is in the resolved set");
-            self.resolutions.fetch_add(1, Ordering::Relaxed);
-            let name = env_name(credential.reference.id);
-            config.credential.push(crate::config::Credential {
-                namespace: "platform".to_owned(),
-                provider: self.provider.to_owned(),
-                env: name.clone(),
-                id: Some(credential.slug.as_str().to_owned()),
-                weight: 1,
-            });
-            env.insert(name, material.expose().to_owned());
+        self.resolutions
+            .fetch_add(resolved.len(), Ordering::Relaxed);
+        // Owed by #252: a projected namespace is reached by a qualified id, and
+        // nothing yet binds an inbound caller to one, so the suite's key is bound
+        // to the namespace the fixture project projects as.
+        assert!(
+            config
+                .namespace
+                .iter()
+                .any(|namespace| namespace.id == SERVING_NAMESPACE),
+            "the fixture project must project as {SERVING_NAMESPACE}"
+        );
+        for key in &mut config.gateway_key {
+            key.namespace = SERVING_NAMESPACE.to_owned();
         }
         for resource in revision.state().resources() {
             if resource.reference.kind != ResourceKind::Alias {
@@ -240,7 +234,7 @@ impl CandidateCompiler for SecretResolvingCompiler {
         // The snapshot takes the resolved set, so the material stays alive for
         // exactly as long as this snapshot can be serving a request and is
         // zeroized when the last holder drops it.
-        ConfigSnapshot::build_with(config, &env, generation, resolved).map_err(|source| {
+        ConfigSnapshot::build_with(config, &self.env, generation, resolved).map_err(|source| {
             CompileError::Snapshot {
                 revision: id,
                 source,
@@ -395,6 +389,10 @@ pub(crate) fn first() -> SecretRef {
 /// what an administrator edited, and the *secret* version is which material it
 /// points at. A rotation moves both, and a test that conflated them could not
 /// tell a republished body from a new key.
+///
+/// Active, because these tests are about material that *serves*: staged material
+/// resolves so a candidate can be compiled against it, and is deliberately not
+/// projected onto a pool until it is activated.
 pub(crate) fn credential(secret: SecretRef, version: ResourceVersionNumber) -> ResourceVersion {
     ProviderCredentialBody::staged(
         fixtures::resource_id(3),
@@ -403,10 +401,33 @@ pub(crate) fn credential(secret: SecretRef, version: ResourceVersionNumber) -> R
         fixtures::display_name("Primary"),
         secret,
     )
+    .transitioned(SecretLifecycle::Active)
+    .expect("staged material may be activated")
     .version_at(Slug::parse("primary").expect("fixture slug"), version)
 }
 
+/// The provider connection the credential authenticates to, owned by the tenant
+/// so every project of it reaches the same connection.
+///
+/// Its endpoint is not what the request is sent to: provider endpoints are still
+/// bootstrap-owned, and the projection only needs the connection to exist to know
+/// which `[[provider]]` a credential's pool belongs to.
+pub(crate) fn provider_connection() -> ResourceVersion {
+    ProviderBody::for_tenant(
+        fixtures::provider_id(3),
+        fixtures::tenant_id(1),
+        fixtures::display_name("OpenAI"),
+        WireFamily::OpenaiChat,
+        "https://api.openai.com/v1",
+    )
+    .version(Slug::parse("openai").expect("fixture slug"))
+}
+
 /// A revision serving one alias through one credential.
+///
+/// The tenant has one project, because a project is what becomes a namespace: a
+/// credential is projected onto the pools of the namespaces its owner serves, and
+/// a tenant with no project serves none.
 pub(crate) fn state_pinning(secret: SecretRef, version: ResourceVersionNumber) -> DesiredState {
     let credential = credential(secret, version);
     // The alias moves with the credential it depends on: a resource version is
@@ -425,6 +446,8 @@ pub(crate) fn state_pinning(secret: SecretRef, version: ResourceVersionNumber) -
     let mut state = DesiredState::new();
     state
         .insert(fixtures::tenant(1, "acme"))
+        .and_then(|state| state.insert(fixtures::project(&fixtures::tenant_id(1), 2, "core")))
+        .and_then(|state| state.insert(provider_connection()))
         .and_then(|state| state.insert(credential))
         .and_then(|state| state.insert(alias))
         .expect("a valid revision");
@@ -433,15 +456,20 @@ pub(crate) fn state_pinning(secret: SecretRef, version: ResourceVersionNumber) -
 
 /// One replica: a control plane, a secret store, the compiler that joins them,
 /// and the state the reconciler publishes into.
-pub(crate) struct Replica {
+///
+/// Generic in its secret store so the same replica can be driven against the
+/// fake and against PostgreSQL: every property here is a property of the
+/// composition, and a store-specific one would be asserted in the store's own
+/// tests instead.
+pub(crate) struct Replica<S = InMemorySecrets> {
     pub(crate) store: Arc<InMemoryControlPlane>,
-    pub(crate) secrets: Arc<InMemorySecrets>,
+    pub(crate) secrets: Arc<S>,
     pub(crate) compiler: Arc<SecretResolvingCompiler>,
     pub(crate) state: AppState,
     pub(crate) reconciler: Arc<Reconciler>,
 }
 
-impl Replica {
+impl Replica<InMemorySecrets> {
     pub(crate) fn new(provider: &FakeProvider) -> Self {
         Self::with_sinks(provider, Vec::new())
     }
@@ -449,11 +477,21 @@ impl Replica {
     /// A replica whose usage fan-out is the caller's, so a test can read the
     /// records a served request produced.
     pub(crate) fn with_sinks(provider: &FakeProvider, sinks: Vec<Box<dyn UsageSink>>) -> Self {
+        Self::backed_by(provider, Arc::new(InMemorySecrets::new()), sinks)
+    }
+}
+
+impl<S: SecretStore + 'static> Replica<S> {
+    /// A replica resolving its material out of `secrets`.
+    pub(crate) fn backed_by(
+        provider: &FakeProvider,
+        secrets: Arc<S>,
+        sinks: Vec<Box<dyn UsageSink>>,
+    ) -> Self {
         let store = Arc::new(InMemoryControlPlane::new());
-        let secrets = Arc::new(InMemorySecrets::new());
         let compiler = Arc::new(SecretResolvingCompiler::new(
             bootstrap(&provider.base_url),
-            Arc::clone(&secrets),
+            Arc::clone(&secrets) as Arc<dyn SecretStore>,
         ));
         let state = AppState::new(
             bootstrap(&provider.base_url),

@@ -262,7 +262,10 @@ impl ConfigSnapshot {
         secrets: ResolvedSecrets,
     ) -> Result<Self, SnapshotError> {
         let gateway_token_epochs = configured_token_epochs(&config);
-        let credentials = Credentials::from_env(&config, env)?;
+        // The one place both kinds of provider credential become one pool: env
+        // references from the boot environment, projected ones from the material
+        // this candidate resolved. Neither reaches a store from here.
+        let credentials = Credentials::resolve(&config, env, &secrets)?;
         let target_circuits = CircuitBreaker::new(
             config.failover.failure_threshold,
             Duration::from_secs(config.failover.cooldown_seconds),

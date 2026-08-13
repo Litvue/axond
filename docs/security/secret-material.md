@@ -51,6 +51,7 @@ reconciler, the real publication seam, the real router, and — for durable stat
 | `lifecycle` | One-time disclosure, rotation overlapping an in-flight request, last-known-good retention on a failed resolution, destruction of retired material, and that the stateless environment-variable path still serves and still redacts. |
 | `request_path` | One served request's response, logs, spans, and usage record; a transport failure's error surfaces; a rejected caller's refusal; and the status projection of an unresolved secret. |
 | `journal` | Every row of every table in the control-plane schema, rendered as text, plus manifests, hydrated revisions, audit trails, and idempotency replays and conflicts. |
+| `stateful` | The zero-redeploy sequence against the *production* secret store: stage, activate, serve, rotate, roll back to the previous version, and a revoked version refusing a candidate while the last known good keeps serving — plus a sweep of every stored row and a cross-owner read that never reaches a pool. |
 
 Two properties of the suite are worth stating, because a redaction test that
 lacks either is theatre:
@@ -67,7 +68,8 @@ lacks either is theatre:
 
 ## Running it
 
-The journal tests need Postgres. Locally they skip when no DSN is configured:
+The `journal` and `stateful` tests need Postgres. Locally they skip when no DSN
+is configured:
 
 ```sh
 AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:5432/postgres \
