@@ -118,13 +118,14 @@ deployment, not a restore.
 
 A published resource carries a **body**: a record whose meaning is fixed by an
 explicit schema identifier stored inside it, alongside the resource's identity,
-scope, and slug. Three schemas exist today:
+scope, and slug. Four schemas exist today:
 
 | Schema | Resource | Fields |
 | --- | --- | --- |
 | `axond.tenant.v1` | a deployment tenant | `schema`, `tenant_id`, `display_name` |
 | `axond.project.v1` | a tenant-owned project | `schema`, `project_id`, `tenant_id`, `display_name` |
 | `axond.provider-credential.v1` | a tenant's or project's credential for one provider | `schema`, `credential_id`, `tenant_id`, `project_id` (a project's only), `provider_id`, `display_name`, `secret_id`, `secret_version`, `lifecycle` |
+| `axond.policy.v1` | the policy of a tenant or a project | `schema`, `tenant_id`, `project_id` (project documents only), `epoch`, `budget_limit_microdollars`, `namespace_budget_limit_microdollars` (optional), `reservation_ttl_seconds`, `max_in_flight_per_subject`, `lease_ttl_seconds`, `minimum_token_epoch` |
 
 Five rules hold for every body schema, present and future:
 
@@ -239,6 +240,80 @@ a `lifecycle` identifier this build does not know is the same refusal, so a newe
 release may add a state without older replicas reporting damage. The second class
 cannot be produced by publishing through the gateway — the same rules run before a
 revision is stored — so a stored revision that hits one was written out of band.
+
+### Policy documents
+
+A policy document is the **complete** policy of one tenant or one project: what it
+may spend, how much it may have in flight, and the token epoch below which a token
+is refused. It is scoped to what it governs and written under that object's
+identity, so "the policy of project `core`" is one durable resource whose
+successive versions are successive revisions of the same document ([ADR
+0036](../adr/0036-typed-policy-documents-generations-and-transitions.md)).
+
+- **Nothing is merged, across revisions or across scopes.** Reading policy takes
+  one whole document or none of it. A field absent from a newer document is not
+  inherited from an older one, and a project's document does not inherit its
+  tenant's field by field: what governs a scope is the document published *for* it
+  if there is one, otherwise its tenant's document, selected whole. An absent
+  optional field is therefore a complete statement — "this scope has no scope-wide
+  cap" — rather than an omission to be filled in. A scope with no document at all
+  has no published policy, and the bootstrap file's limits stand.
+- **A generation is a scope and an `epoch`, plus the revision that published it.**
+  The epoch is advanced by the operator when a document's content changes; the
+  revision id says which publication carried it. No part identifies a generation
+  alone: two publications can carry one epoch (a restored backup, a forked control
+  plane), a revision id says which publication but not whether the change was
+  material, and an epoch counts within its own scope rather than across scopes. A
+  generation therefore also carries a digest of the document's content, which is
+  what separates those two cases.
+- **A document restated by a later revision is the same policy, not a fork.** A
+  revision is whole desired state, so every revision republishes every policy
+  document it carries: changing an unrelated resource hands out a generation with a
+  new revision id for a document whose epoch and content never moved. That is the
+  ordinary case and it is adoptable — a replica follows the fleet onto the revision
+  now serving it, and a writer holding either publication is admitted, because both
+  enforce one policy. The same epoch stating *different* content is the fork, and
+  stays refused.
+- **A change the epoch does not carry is refused.** Publishing different content
+  under the same epoch, or moving the epoch backwards, is refused rather than
+  applied — otherwise two documents would claim one generation and no replica could
+  tell a stale writer from a current one.
+- **A change is classified by what activating it would require.** `live` (safe on
+  the next request: looser limits, longer TTLs, a higher token floor, or a
+  republication that changes nothing), `drain` (safe once what was admitted under
+  the old document has finished: tighter caps, lower ceilings, shorter TTLs),
+  `migration-required` (enforcement changes shape rather than its numbers: turning a
+  scope-wide cap on or off changes the keys a shared ledger composes), and `refused`
+  (a document for another scope, an epoch that does not carry its change, or a token
+  floor lowered so that revoked tokens would work again). A publication is as
+  disruptive as its worst field.
+- **Stale writers fail closed.** A writer is admitted only when it holds the policy
+  the fence is enforcing — the active epoch and the active content, whichever
+  revision carried it. An older epoch, an epoch this replica has not adopted, the
+  same epoch stating different content, and any generation of another scope all
+  deny; refusing anything but the enforced policy is what makes an unknown
+  generation deny instead of enforcing something nobody serves. Adoption is
+  monotonic in what is enforced: onto a higher epoch of the same scope, or onto the
+  active document as a later revision restates it, never onto a different document.
+- **What bootstrap owns stays in `axond.toml`.** Which backend enforces a limit,
+  the DSN it connects with, the table or key prefix it lays state out under, and the
+  stance to take when that store is unreachable (`on_unavailable`) are not policy
+  and are not publishable: a document that could flip an unavailable store to
+  `allow` would turn a policy publication into a way to switch enforcement off.
+  Naming one of those fields in a policy body is its own refusal, reported as damage
+  rather than as a release skew, because no future schema adds them.
+- **A value below a bound is a skew; a value outside the range is damage.** Bounds
+  are rules rather than shape, and rules tighten within one schema identifier — the
+  same exception a display name is in tenancy — so a stored counter below a minimum
+  this build enforces is `incompatible` and storage is intact: run a build that
+  reads it, or republish the document. A value that could never have been written —
+  negative, or past what these fields count in — is `corrupt`, as is a body that
+  contradicts its own identity or scope.
+
+Nothing enforces a document yet: no request path reads one, and no store writes
+one. This is the contract a later activation slice binds to, and the
+classification above states what activating a change would require of a fleet
+rather than performing it.
 
 ### How a project becomes a namespace
 

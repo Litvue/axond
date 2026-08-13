@@ -14,6 +14,9 @@ use super::ids::{
 use super::mutation::{
     Actor, AuditEvent, ExpectedRevision, IdempotencyKey, Mutation, MutationKind,
 };
+use super::policy::{
+    BudgetPolicy, ConcurrencyPolicy, PolicyBody, PolicyEpoch, PolicyScope, RevocationPolicy,
+};
 use super::resource::{
     BlobKind, BlobRef, ResourceBody, ResourceKind, ResourceRef, ResourceScope, ResourceVersion,
     ResourceVersionNumber,
@@ -151,6 +154,56 @@ pub(crate) fn credential_body(tenant: &TenantId, seed: u64, slug: &str) -> Provi
         display_name(&capitalize(slug)),
         secret_ref(seed),
     )
+}
+
+/// The policy every policy fixture starts from: one cap, no scope-wide cap, and
+/// bounded holds. Varying one field of it is how a transition test states exactly
+/// what changed.
+pub(crate) fn policy_body(scope: PolicyScope, epoch: u64) -> PolicyBody {
+    PolicyBody::new(
+        scope,
+        PolicyEpoch::new(epoch).expect("fixture epoch"),
+        BudgetPolicy::new(1_000_000, None, 60).expect("fixture budget policy"),
+        ConcurrencyPolicy::new(8, 30).expect("fixture concurrency policy"),
+        RevocationPolicy::new(1),
+    )
+}
+
+pub(crate) fn tenant_policy_body(tenant: u64, epoch: u64) -> PolicyBody {
+    policy_body(PolicyScope::Tenant(tenant_id(tenant)), epoch)
+}
+
+pub(crate) fn project_policy_body(tenant: u64, project: u64, epoch: u64) -> PolicyBody {
+    policy_body(
+        PolicyScope::Project {
+            tenant: tenant_id(tenant),
+            project: project_id(project),
+        },
+        epoch,
+    )
+}
+
+/// A tenant's policy document, at the scope it governs.
+pub(crate) fn tenant_policy(tenant: u64, epoch: u64) -> ResourceVersion {
+    tenant_policy_body(tenant, epoch).version(Slug::parse("limits").expect("fixture slug"))
+}
+
+/// A project's own policy document, which overrides its tenant's as a whole.
+pub(crate) fn project_policy(tenant: u64, project: u64, epoch: u64) -> ResourceVersion {
+    project_policy_body(tenant, project, epoch)
+        .version(Slug::parse("limits").expect("fixture slug"))
+}
+
+/// [`state`] plus a tenant policy and its project's own policy: the shape an
+/// effective-policy test needs, where one scope has a document of its own and
+/// another falls back to its tenant's.
+pub(crate) fn state_with_policy() -> DesiredState {
+    let mut state = state();
+    state
+        .insert(tenant_policy(1, 1))
+        .and_then(|state| state.insert(project_policy(1, 2, 1)))
+        .expect("a policy document per scope is a distinct reference");
+    state
 }
 
 pub(crate) fn credential(tenant: &TenantId, seed: u64, slug: &str) -> ResourceVersion {

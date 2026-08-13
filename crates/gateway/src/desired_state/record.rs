@@ -39,6 +39,14 @@ pub(super) trait BodyError: Sized {
     fn schema(reference: ResourceRef, expected: &'static str, found: String) -> Self;
     fn missing_field(reference: ResourceRef, field: &'static str) -> Self;
     fn unknown_field(reference: ResourceRef, schema: &'static str, field: String) -> Self;
+    /// A field a schema *reserves*: one this build knows and refuses to read from
+    /// a body, rather than one it does not know.
+    ///
+    /// Defaults to [`unknown_field`](Self::unknown_field), because a schema that
+    /// reserves nothing cannot reach it.
+    fn reserved_field(reference: ResourceRef, schema: &'static str, field: String) -> Self {
+        Self::unknown_field(reference, schema, field)
+    }
     fn field_type(reference: ResourceRef, field: &'static str) -> Self;
     fn malformed_id(reference: ResourceRef, field: &'static str, source: InvalidId) -> Self;
     fn malformed_display_name(
@@ -65,6 +73,19 @@ impl<'a, E: BodyError> Record<'a, E> {
         schema: &'static str,
         known: &[&str],
     ) -> Result<Self, E> {
+        Self::open_reserving(resource, kind, schema, known, &[])
+    }
+
+    /// Open a record whose schema also *reserves* field names: names this build
+    /// knows and refuses, which are refused as themselves rather than as fields
+    /// this build does not know.
+    pub(super) fn open_reserving(
+        resource: &'a ResourceVersion,
+        kind: ResourceKind,
+        schema: &'static str,
+        known: &[&str],
+        reserved: &[&str],
+    ) -> Result<Self, E> {
         let reference = resource.reference;
         if reference.kind != kind {
             return Err(E::kind(reference, kind, reference.kind));
@@ -83,6 +104,14 @@ impl<'a, E: BodyError> Record<'a, E> {
         let declared = record.string(SCHEMA_FIELD)?;
         if declared != schema {
             return Err(E::schema(reference, schema, declared.to_owned()));
+        }
+        // A reserved name is refused before the unknown-field rule, so the
+        // boundary it marks is reported as itself rather than as a version skew.
+        if let Some((field, _)) = fields
+            .iter()
+            .find(|(field, _)| reserved.contains(&field.as_str()))
+        {
+            return Err(E::reserved_field(reference, schema, field.clone()));
         }
         if let Some((field, _)) = fields
             .iter()
@@ -130,6 +159,20 @@ impl<'a, E: BodyError> Record<'a, E> {
                 u64::try_from(*value).map_err(|_| E::field_type(self.reference, field))
             }
             _ => Err(E::field_type(self.reference, field)),
+        }
+    }
+
+    /// An integer field a schema defines but a body need not carry.
+    ///
+    /// Absence and a wrong type stay distinct, for the reason
+    /// [`optional_string`](Self::optional_string) keeps them so.
+    pub(super) fn optional_integer(&self, field: &'static str) -> Result<Option<u64>, E> {
+        match self.fields.iter().find(|(name, _)| name == field) {
+            None => Ok(None),
+            Some((_, CanonicalValue::Integer(value))) => u64::try_from(*value)
+                .map(Some)
+                .map_err(|_| E::field_type(self.reference, field)),
+            Some(_) => Err(E::field_type(self.reference, field)),
         }
     }
 
