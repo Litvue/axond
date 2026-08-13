@@ -290,10 +290,25 @@ step "Upgrading as shipped: every replica has to reach the new template"
 # readily as on a stalled one. `updatedReplicas` is what distinguishes them —
 # how many Pods the new template actually reached — and it is what the runbook
 # tells an operator to watch (docs/deployment/kubernetes.md#stateful-mode).
+#
+# The status is written asynchronously, so a poll that lands between a patch and
+# the controller's first write still describes the previous template — 3/3 on a
+# fleet that has not started upgrading. `observedGeneration` is what separates
+# the two; without it the Recreate assertion passes vacuously and the
+# RollingUpdate counterfactual fails a cluster that stalled exactly as intended.
 updated_replicas() {
-  local updated total
+  local generation observed updated total
+  # Read one field per call: an absent `.status.updatedReplicas` renders as
+  # nothing, so a single space-separated template would silently shift the
+  # remaining values into the wrong variables.
+  generation="$(kube -n axond get deployment axond -o jsonpath='{.metadata.generation}')"
+  observed="$(kube -n axond get deployment axond -o jsonpath='{.status.observedGeneration}')"
   updated="$(kube -n axond get deployment axond -o jsonpath='{.status.updatedReplicas}')"
   total="$(kube -n axond get deployment axond -o jsonpath='{.status.replicas}')"
+  if ((${observed:-0} < ${generation:-0})); then
+    printf 'stale'
+    return
+  fi
   printf '%s/%s' "${updated:-0}" "${total:-0}"
 }
 await_updated() {

@@ -253,6 +253,19 @@ kubectl wait --for=condition=complete job/axond-migrate -n axond --timeout=5m
 kubectl scale deployment/axond -n axond --replicas=3
 ```
 
+That convergence is the replicas' and not the Job's. A Job that exhausts its
+backoff — a control-plane database that never answered, most often on a first
+install — is `Failed` permanently, and the fleet then crash-loops forever while
+looking exactly like one waiting out a slow migration. Check the Job before
+concluding a stuck install is transient, and recover it by re-running it once
+the database answers:
+
+```bash
+kubectl get job axond-migrate -n axond   # BackoffLimitExceeded ⇒ it will not retry
+kubectl delete job axond-migrate -n axond
+kubectl apply -k deploy/kubernetes/overlays/production-stateful
+```
+
 `axond migrate status` — the same binary, read-only — is what tells a
 crash-looping replica apart from one refusing inference: the first reports a
 schema behind the binary, the second reports it current.

@@ -28,13 +28,24 @@
 # `kubectl logs job/axond-migrate -n axond` is the record of what it applied, and
 # `axond migrate status` — the same binary, read-only — is what a rehearsal or a
 # post-restore check runs instead.
+#
+# The self-healing above is the replicas', not this Job's: a Job that exhausts
+# its backoff is `Failed` for good, and a fleet waiting on it crash-loops
+# forever while looking exactly like one waiting out a slow migration. A
+# database that is not yet reachable on a first install is the way that happens,
+# so `kubectl get job axond-migrate -n axond` is the first thing a stuck install
+# checks, and `BackoffLimitExceeded` is recovered by deleting and re-applying —
+# the same two commands as the upgrade above, once the database answers.
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: axond-migrate
   namespace: axond
 spec:
-  backoffLimit: 3
+  # Six attempts spread over ~10 minutes of exponential backoff: enough that a
+  # control plane still starting beside this Job is waited out rather than
+  # declared failed, and `apply` is idempotent so a retry costs nothing.
+  backoffLimit: 6
   # Kept long enough to read the logs of a completed migration, short enough that
   # a stale Job is not what the next upgrade collides with.
   ttlSecondsAfterFinished: 86400
