@@ -262,6 +262,10 @@ pub struct Restart {
     /// restart the load finished before is a restart nothing was measured
     /// across, so `unavailable = 0` would be satisfied by an idle deployment.
     pub offered_after_last_replacement: u64,
+    /// How much longer than its requested duration the run offered load, so
+    /// the restart had a workload behind it. Zero on a run whose schedule left
+    /// the room by itself, which is every run of the soak tier.
+    pub extended_for_load_ms: u64,
 }
 
 /// Whether a tenant ever reached past its own boundary.

@@ -194,7 +194,7 @@ pub async fn run_with(
 
     let started_at = SystemTime::now();
     let started = Instant::now();
-    let deadline = started + duration;
+    let deadline = Deadline::new(started, duration);
     let mut workers = Vec::with_capacity(scale.concurrency);
     for _ in 0..scale.concurrency {
         workers.push(tokio::spawn(worker(
@@ -205,7 +205,7 @@ pub async fn run_with(
             next.clone(),
             tx.clone(),
             stop_flag.clone(),
-            deadline,
+            deadline.clone(),
             Duration::from_millis(scale.think_time_ms),
             started,
         )));
@@ -217,7 +217,7 @@ pub async fn run_with(
         slo,
         duration,
         started,
-        deadline,
+        deadline: deadline.clone(),
         fleet: &mut fleet,
         upstream_gate: &upstream_gate,
         usage_gate: &usage_gate,
@@ -420,11 +420,11 @@ async fn worker(
     next: Arc<AtomicUsize>,
     tx: UnboundedSender<Attempt>,
     stop: Arc<AtomicBool>,
-    deadline: Instant,
+    deadline: Deadline,
     think: Duration,
     started: Instant,
 ) {
-    while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
+    while !deadline.passed() && !stop.load(Ordering::Relaxed) {
         let index = next.fetch_add(1, Ordering::Relaxed);
         let planned = plan::planned(index, &tenants, &endings);
         let target = {
@@ -649,7 +649,7 @@ struct Supervisor<'a> {
     slo: Slo,
     duration: Duration,
     started: Instant,
-    deadline: Instant,
+    deadline: Deadline,
     fleet: &'a mut Fleet,
     upstream_gate: &'a Gate,
     usage_gate: &'a Gate,
@@ -681,7 +681,7 @@ impl Supervisor<'_> {
         let mut last_readiness = Instant::now();
         let mut last_probe = Instant::now();
 
-        while Instant::now() < self.deadline {
+        while !self.deadline.passed() {
             tokio::time::sleep(TICK).await;
             let now = self.started.elapsed();
 
@@ -1002,6 +1002,23 @@ impl Supervisor<'_> {
                 return;
             }
         }
+        // A restart is only measured by the load that follows it, and on a short
+        // tier the restart can finish close enough to the end that almost none
+        // does. The run offers for a little longer rather than publishing an
+        // artifact whose restart nothing was asked of — the extension is on the
+        // artifact, so a reader can see the run was stretched and by how much.
+        let extended = self.deadline.keep_offering_for(POST_RESTART_LOAD);
+        if !extended.is_zero() {
+            self.state.restart.extended_for_load_ms = extended.as_millis() as u64;
+            self.state.note(
+                self.started.elapsed(),
+                "run-extended",
+                &format!(
+                    "offering {}ms longer so the restart is measured under load",
+                    extended.as_millis()
+                ),
+            );
+        }
     }
 
     fn take_out_of_rotation(&mut self, id: &str) {
@@ -1043,6 +1060,46 @@ impl Supervisor<'_> {
 /// How long a retiring replica has to exit. Its own config advertises an eight
 /// second deadline, and this leaves room for the signal and the wait.
 const RETIRE_BOUND_MS: u64 = 15_000;
+
+/// How much load must follow the last replacement. A restart the workload
+/// finished before proves nothing — `unavailable = 0` is satisfied by a
+/// deployment nobody is asking for anything — and a restart that runs long
+/// enough to eat the tail of a short tier would otherwise turn that missing
+/// evidence into a failing assertion rather than into measurement.
+const POST_RESTART_LOAD: Duration = Duration::from_secs(10);
+
+/// When the run stops offering, shared by the workers and the supervising
+/// loop so the two cannot disagree about it — and movable, because the
+/// rolling restart has to be followed by load for the restart to have been
+/// measured at all. It only ever moves later, and only by the shortfall.
+#[derive(Clone)]
+pub struct Deadline {
+    started: Instant,
+    ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Deadline {
+    pub fn new(started: Instant, duration: Duration) -> Self {
+        Self {
+            started,
+            ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                duration.as_millis() as u64
+            )),
+        }
+    }
+
+    pub fn passed(&self) -> bool {
+        self.started.elapsed().as_millis() as u64 >= self.ms.load(Ordering::Relaxed)
+    }
+
+    /// Move the end out so at least `tail` of offering is left, and answer with
+    /// how much it moved by. Zero when the run already had the room.
+    pub fn keep_offering_for(&self, tail: Duration) -> Duration {
+        let wanted = self.started.elapsed().as_millis() as u64 + tail.as_millis() as u64;
+        let was = self.ms.fetch_max(wanted, Ordering::Relaxed);
+        Duration::from_millis(wanted.saturating_sub(was))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // What the driver keeps
@@ -1282,6 +1339,7 @@ impl State {
                 all_exits_clean: true,
                 flushed_on_exit: 0,
                 offered_after_last_replacement: 0,
+                extended_for_load_ms: 0,
             },
             offered_at_last_replacement: 0,
             replacement_never_ready: false,

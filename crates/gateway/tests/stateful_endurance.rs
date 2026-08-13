@@ -166,6 +166,40 @@ fn assert_qualifies(result: &StatefulEnduranceResult) {
     );
 }
 
+/// A restart is measured by the load that follows it, and on the short tier it
+/// can finish close enough to the end that almost none does — which would make
+/// the post-restart load assertion a coin toss rather than a finding. The run
+/// offers for longer instead, and says by how much.
+#[tokio::test]
+async fn a_restart_that_lands_late_is_still_measured_under_load() {
+    use stateful_endurance::run::Deadline;
+
+    let started = std::time::Instant::now();
+    let deadline = Deadline::new(started, std::time::Duration::from_millis(60));
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    assert!(deadline.passed(), "the run's own duration has elapsed");
+
+    // A restart finishing here would have no load behind it, so the end moves.
+    let extended = deadline.keep_offering_for(std::time::Duration::from_millis(200));
+    assert!(!extended.is_zero(), "the run was stretched to make room");
+    assert!(!deadline.passed(), "and is offering again");
+
+    // A run with the room already keeps its own end: the soak's restart lands
+    // hours before it, and an artifact whose duration wandered is not the run
+    // the manifest described.
+    let roomy = Deadline::new(
+        std::time::Instant::now(),
+        std::time::Duration::from_secs(3600),
+    );
+    assert!(
+        roomy
+            .keep_offering_for(std::time::Duration::from_secs(10))
+            .is_zero(),
+        "a run with the room is not extended"
+    );
+    assert!(!roomy.passed());
+}
+
 /// The committed manifest has to describe a run that can qualify anything, and
 /// a manifest that quietly lost one of those properties would still produce an
 /// artifact that looked like evidence.
