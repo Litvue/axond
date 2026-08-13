@@ -112,9 +112,11 @@ runs, or the gate is blocked.
 # The scenarios that need no datastore.
 cargo test -p axond --all-features --test stateful_integration
 
-# Including the control-plane scenarios, against a throwaway PostgreSQL.
-docker run --rm -d -p 5432:5432 -e POSTGRES_PASSWORD=axond-ci --name axond-cp postgres:17.6-alpine
-AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:5432/postgres \
+# Including the control-plane scenarios, against the throwaway PostgreSQL
+# CONTRIBUTING.md pins — on 55432, so it cannot be confused with a local one.
+docker run -d --name axond-test-postgres -e POSTGRES_PASSWORD=axond-ci \
+  -p 55432:5432 postgres:17.6-alpine
+AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:55432/postgres \
   cargo test -p axond --all-features --test stateful_integration
 ```
 
