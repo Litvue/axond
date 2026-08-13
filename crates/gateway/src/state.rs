@@ -51,8 +51,7 @@ use crate::shutdown::Lifecycle;
 use crate::status::Component;
 use crate::status::probes::{BackendProbe, CatalogProbe, ControlPlaneProbe};
 use crate::status::registry::{
-    CachedStatusRegistry, ComponentProbe, ObservationPlan, StatusRefresher, StatusSettings,
-};
+    CachedStatusRegistry, ObservationPlan, StatusRefresher, StatusSettings,
 };
 use crate::usage::UsageDelivery;
 #[cfg(test)]
