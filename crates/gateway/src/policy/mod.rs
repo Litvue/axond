@@ -244,6 +244,25 @@ pub(crate) mod fixtures {
         )
     }
 
+    /// A body an earlier build stored with a cap of zero, which
+    /// [`BudgetPolicy::new`] refuses to build and
+    /// [`BudgetPolicy::stored`] reads back.
+    pub(crate) fn stored_zero_cap(
+        scope: PolicyScope,
+        epoch: u64,
+        subject_limit: u64,
+        namespace_limit: Option<u64>,
+    ) -> PolicyBody {
+        PolicyBody::new(
+            scope,
+            PolicyEpoch::new(epoch).expect("a positive epoch"),
+            BudgetPolicy::stored(subject_limit, namespace_limit, 300)
+                .expect("a stored cap of zero reads back"),
+            ConcurrencyPolicy::new(8, 60).expect("a positive concurrency policy"),
+            RevocationPolicy::new(0),
+        )
+    }
+
     pub(crate) fn generation(body: &PolicyBody, revision: u64) -> PolicyGeneration {
         body.generation(revision_id(revision))
     }

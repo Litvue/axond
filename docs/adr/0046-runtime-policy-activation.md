@@ -64,7 +64,10 @@ cannot answer "what is the cap here" denies rather than admitting: an unenforced
 cap and an infinite one are indistinguishable to a caller, and only one of them
 is something an operator published. A publication is not allowed to create that
 state — a candidate serving a namespace no document governs is refused before it
-is installed — so the denial belongs to a bootstrap gap, not to a revision. In
+is installed, wherever a store would in fact deny it, which is wherever a shared
+spend or lease store is configured; a deployment enforcing no caps at all reads
+none on the request path and converges normally — so the denial belongs to a
+bootstrap gap, not to a revision. In
 stateful mode the bootstrap file cannot declare a namespace at all, so "governed
 by a published document" is the only way a namespace is served. The condition
 belongs to the view rather than to the request, so it is counted per denial on
@@ -74,14 +77,25 @@ explained in the log once per condition, backend and namespace, and at most once
 a minute thereafter: a bootstrap gap under production traffic must not turn the
 log into the outage.
 
-A cap of zero is not how a scope is closed. It is refused where the document is
-read, on both the subject and the scope-wide cap, exactly as the bootstrap file
-refuses one: it denies every request for the scope, which is a state the section
-does not express — its whole content is "spending here is finite, and this is
-the bound". Allowing it would make a fat-fingered document indistinguishable
-from a deliberate fleet-wide freeze, and would give the two layers different
-answers to the same question. Stopping a scope is tenancy's job: withdraw the
-projection, revoke the credentials.
+A cap of zero is not how a scope is closed. Authoring one is refused, on both
+the subject and the scope-wide cap, exactly as the bootstrap file refuses one:
+it denies every request for the scope, which is a state the section does not
+express — its whole content is "spending here is finite, and this is the bound".
+Allowing it would make a fat-fingered document indistinguishable from a
+deliberate fleet-wide freeze, and would give the two layers different answers to
+the same question. Stopping a scope is tenancy's job: withdraw the projection,
+revoke the credentials.
+
+A document an *earlier* build already stored with a zero cap is a different
+question, and it is answered at activation rather than at read. Refusing to read
+it would take the whole revision out of service and report it as build skew —
+and because an administrative mutation builds its candidate from the head
+revision, the corrected document could not be published in band either. So the
+stored value hydrates, the candidate is refused before anything is enforced with
+`invalid_policy` naming the field, and the replica keeps the last policy it
+activated. The read-time bound stays only where no build ever accepted the value
+(a zero reservation TTL, lease TTL, or concurrency ceiling), which is genuine
+release skew.
 
 ### A hold carries the generation that granted it
 

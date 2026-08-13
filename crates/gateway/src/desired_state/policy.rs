@@ -448,6 +448,18 @@ pub enum BudgetBound {
     ReservationTtl,
 }
 
+impl BudgetBound {
+    /// The name a stored `axond.policy.v1` document spells this bound with, so a
+    /// refusal an operator reads names the field they would edit.
+    pub const fn document_field(self) -> &'static str {
+        match self {
+            Self::SubjectLimit => BUDGET_LIMIT_FIELD,
+            Self::NamespaceLimit => NAMESPACE_BUDGET_LIMIT_FIELD,
+            Self::ReservationTtl => RESERVATION_TTL_FIELD,
+        }
+    }
+}
+
 impl BudgetPolicy {
     /// A cap of zero is refused, on either scope, exactly as the bootstrap file
     /// refuses one ([`Config::validate_budget`](crate::config::Config)): it
@@ -482,6 +494,51 @@ impl BudgetPolicy {
             namespace_limit_microdollars,
             reservation_ttl_seconds,
         })
+    }
+
+    /// Read a triple a *stored* revision carries, which is a weaker rule than
+    /// the one an author is held to.
+    ///
+    /// A bound can tighten inside a stable schema, and this one did: a build
+    /// before this one accepted a zero cap through the admin API and wrote it
+    /// into a revision. Refusing to read that row would take the whole revision
+    /// out of service — and, since an administrative mutation builds its
+    /// candidate from the head revision, would leave no in-band way to correct
+    /// the number. So a stored zero cap reads back, is reported by
+    /// [`unenforceable_cap`](Self::unenforceable_cap), and is refused at
+    /// activation with the field named, while the replica keeps the policy it
+    /// already had. A zero reservation TTL is not in that position — no build
+    /// ever accepted one — so it stays a read refusal.
+    pub const fn stored(
+        subject_limit_microdollars: u64,
+        namespace_limit_microdollars: Option<u64>,
+        reservation_ttl_seconds: u64,
+    ) -> Result<Self, InvalidPolicy> {
+        if reservation_ttl_seconds == 0 {
+            return Err(InvalidPolicy::TooSmall {
+                value: reservation_ttl_seconds,
+                min: 1,
+            });
+        }
+        Ok(Self {
+            subject_limit_microdollars,
+            namespace_limit_microdollars,
+            reservation_ttl_seconds,
+        })
+    }
+
+    /// The cap this document states as zero, if it states one.
+    ///
+    /// Only a document [`stored`](Self::stored) by an earlier build can be in
+    /// this state; [`new`](Self::new) refuses to build one.
+    pub const fn unenforceable_cap(&self) -> Option<BudgetBound> {
+        if self.subject_limit_microdollars == 0 {
+            Some(BudgetBound::SubjectLimit)
+        } else if let Some(0) = self.namespace_limit_microdollars {
+            Some(BudgetBound::NamespaceLimit)
+        } else {
+            None
+        }
     }
 
     /// Which of the three bounds a rejected triple broke. Every caller of
@@ -725,18 +782,11 @@ impl PolicyBody {
         let subject_limit = record.integer(BUDGET_LIMIT_FIELD)?;
         let namespace_limit = record.optional_integer(NAMESPACE_BUDGET_LIMIT_FIELD)?;
         let reservation_ttl = record.integer(RESERVATION_TTL_FIELD)?;
-        let budget = BudgetPolicy::new(subject_limit, namespace_limit, reservation_ttl).map_err(
-            |source| {
-                // Three fields share one bound, so the refusal names the one that
-                // broke it rather than the last one passed.
-                let field = match BudgetPolicy::unmet_bound(subject_limit, namespace_limit) {
-                    BudgetBound::SubjectLimit => BUDGET_LIMIT_FIELD,
-                    BudgetBound::NamespaceLimit => NAMESPACE_BUDGET_LIMIT_FIELD,
-                    BudgetBound::ReservationTtl => RESERVATION_TTL_FIELD,
-                };
-                bound(field, source)
-            },
-        )?;
+        // `stored`, not `new`: a zero cap an earlier build wrote reads back and
+        // is refused at activation, so one bad number does not take the whole
+        // revision — and the correction that would replace it — out of service.
+        let budget = BudgetPolicy::stored(subject_limit, namespace_limit, reservation_ttl)
+            .map_err(|source| bound(RESERVATION_TTL_FIELD, source))?;
         let max_in_flight = record.integer(MAX_IN_FLIGHT_FIELD)?;
         let lease_ttl = record.integer(LEASE_TTL_FIELD)?;
         let concurrency = ConcurrencyPolicy::new(max_in_flight, lease_ttl).map_err(|source| {
@@ -1941,34 +1991,21 @@ mod tests {
                 source: InvalidPolicy::TooSmall { value: 0, min: 1 },
             })
         );
-        // A published cap of zero is refused where the operator can still fix it
-        // — reading the document — rather than activated into a scope that then
-        // 429s every request, and the refusal names the field that broke the
-        // bound rather than the last one the constructor was passed.
-        assert_eq!(
-            PolicyBody::read(&edited(|fields| {
-                set(fields, BUDGET_LIMIT_FIELD, CanonicalValue::integer(0u32));
-            })),
-            Err(PolicyError::FieldRange {
-                reference,
-                field: BUDGET_LIMIT_FIELD,
-                source: InvalidPolicy::TooSmall { value: 0, min: 1 },
-            })
-        );
-        assert_eq!(
-            PolicyBody::read(&edited(|fields| {
-                set(
-                    fields,
-                    NAMESPACE_BUDGET_LIMIT_FIELD,
-                    CanonicalValue::integer(0u32),
-                );
-            })),
-            Err(PolicyError::FieldRange {
-                reference,
-                field: NAMESPACE_BUDGET_LIMIT_FIELD,
-                source: InvalidPolicy::TooSmall { value: 0, min: 1 },
-            })
-        );
+        // A cap of zero is the one bound this build tightened over documents an
+        // earlier one stored, so it reads back rather than taking the revision
+        // out of service, and names itself for the refusal that follows at
+        // activation.
+        for (field, bound) in [
+            (BUDGET_LIMIT_FIELD, BudgetBound::SubjectLimit),
+            (NAMESPACE_BUDGET_LIMIT_FIELD, BudgetBound::NamespaceLimit),
+        ] {
+            let stored = PolicyBody::read(&edited(|fields| {
+                set(fields, field, CanonicalValue::integer(0u32));
+            }))
+            .expect("a stored zero cap still hydrates");
+            assert_eq!(stored.budget().unenforceable_cap(), Some(bound));
+            assert_eq!(bound.document_field(), field);
+        }
         assert!(matches!(
             PolicyBody::read(&edited(|fields| {
                 set(

@@ -368,9 +368,8 @@ impl StatusReason {
             // The ways a published policy is refused before it is enforced. One
             // code, because the operator's next move is the same in every case:
             // read the refusal, which names it, in the log.
-            "unsupported" | "migration" | "refused" | "withdrawn" | "ungoverned" => {
-                Self::PolicyRejected
-            }
+            "unsupported" | "migration" | "refused" | "withdrawn" | "ungoverned"
+            | "invalid_policy" => Self::PolicyRejected,
             "not_found" => Self::NotConfigured,
             "denied" => Self::PermissionDenied,
             _ => Self::Unknown,

@@ -74,6 +74,16 @@ impl BackendSupport {
         matches!(self.rate_limit, RateLimitBackend::Redis)
     }
 
+    /// Whether any store this process booted with would turn a request away for
+    /// want of a published cap.
+    ///
+    /// With neither a shared spend store nor a shared lease store, nothing on
+    /// the request path reads a cap at all: `NoBudget` and `NoLimit` admit, so
+    /// an ungoverned namespace is served rather than denied.
+    const fn denies_without_a_document(self) -> bool {
+        self.shares_spend() || self.shares_concurrency()
+    }
+
     /// Whether the budget store's layout carries a scope-wide cap.
     pub const fn namespace_scope(self) -> bool {
         self.namespace_scope
@@ -118,6 +128,22 @@ pub enum ActivationRefusal {
          floor before projecting the namespace, or remove it"
     )]
     Ungoverned { namespace: String },
+    /// A cap a stored document states as zero.
+    ///
+    /// An earlier build accepted one through the admin API, so the document
+    /// still reads back — refusing to read it would take the revision, and the
+    /// correction that would replace it, out of service. It is refused here
+    /// instead, naming the field: a cap of zero denies every request for the
+    /// scope, which is a closed scope wearing a bound rather than a bound.
+    #[error(
+        "{scope} states `{field}` as zero, which denies every request for the scope rather than \
+         capping it. Republish the document with a cap of at least 1, or close the scope through \
+         tenancy (withdraw the projection, revoke its credentials)"
+    )]
+    InvalidCap {
+        scope: PolicyScope,
+        field: &'static str,
+    },
 }
 
 impl ActivationRefusal {
@@ -129,6 +155,7 @@ impl ActivationRefusal {
             Self::Refused { .. } => "refused",
             Self::Withdrawn { .. } => "withdrawn",
             Self::Ungoverned { .. } => "ungoverned",
+            Self::InvalidCap { .. } => "invalid_policy",
         }
     }
 
@@ -140,7 +167,8 @@ impl ActivationRefusal {
             Self::Unsupported { scope, .. }
             | Self::Migration { scope, .. }
             | Self::Refused { scope, .. }
-            | Self::Withdrawn { scope, .. } => Some(*scope),
+            | Self::Withdrawn { scope, .. }
+            | Self::InvalidCap { scope, .. } => Some(*scope),
             Self::Ungoverned { .. } => None,
         }
     }
@@ -228,6 +256,15 @@ pub(super) fn plan(
 ) -> Result<Activation, ActivationRefusal> {
     let mut activation = Activation::default();
     for (scope, published) in candidate.published() {
+        // Before anything is compared: a document an earlier build stored with a
+        // zero cap reads back, and this is where it stops. The candidate is
+        // dropped whole, so the replica keeps enforcing the policy it had.
+        if let Some(bound) = published.body.budget().unenforceable_cap() {
+            return Err(ActivationRefusal::InvalidCap {
+                scope: *scope,
+                field: bound.document_field(),
+            });
+        }
         supportable(
             *scope,
             published.body.budget().namespace_limit_microdollars(),
@@ -335,7 +372,16 @@ pub(super) fn plan(
     // nothing to enforce, denying every request to it, and no later publication
     // undoes the requests denied in between; refusing keeps the last known good
     // policy, and the namespaces it governs, serving.
-    if let Some(namespace) = candidate.unenforceable().next() {
+    //
+    // Only where a store would actually deny it: a deployment whose budget and
+    // rate-limit backends are both `none` reads no cap on the request path, so
+    // an ungoverned namespace there is served, not denied, and refusing its
+    // publications would leave it unable to converge on anything at all.
+    if let Some(namespace) = candidate
+        .unenforceable()
+        .next()
+        .filter(|_| support.denies_without_a_document())
+    {
         return Err(ActivationRefusal::Ungoverned {
             namespace: namespace.to_owned(),
         });
@@ -489,7 +535,7 @@ mod tests {
     use super::*;
     use crate::config::NamespacePolicy;
     use crate::desired_state::fixtures::tenant_id;
-    use crate::policy::fixtures::{body, detailed, generation};
+    use crate::policy::fixtures::{body, detailed, generation, stored_zero_cap};
     use crate::policy::view::tests::{governed, stateful_config, stateless_config};
 
     fn scope() -> PolicyScope {
@@ -590,6 +636,41 @@ mod tests {
             refusal.to_string().contains("claims the epoch"),
             "the fence's reading is included: {refusal}"
         );
+    }
+
+    /// The compatibility rule for a cap an earlier build stored as zero: the
+    /// document reads back, so the revision — and the corrected document that
+    /// would replace it — still hydrates, and the refusal happens here, where
+    /// the replica keeps the policy it was already enforcing.
+    #[test]
+    fn a_stored_cap_of_zero_is_refused_at_activation_and_leaves_the_last_good_policy() {
+        let good = body(scope(), 1, 1_000);
+        let active = view(&good, 1);
+        for (zero, field) in [
+            (
+                stored_zero_cap(scope(), 2, 0, None),
+                "budget_limit_microdollars",
+            ),
+            (
+                stored_zero_cap(scope(), 2, 1_000, Some(0)),
+                "namespace_budget_limit_microdollars",
+            ),
+        ] {
+            let refusal = plan(&active, &view(&zero, 2), shared())
+                .expect_err("a cap of zero is not a cap this replica starts enforcing");
+            assert_eq!(refusal.reason(), "invalid_policy");
+            assert_eq!(refusal.scope(), Some(scope()));
+            assert!(
+                refusal.to_string().contains(field),
+                "the refusal names the field an operator edits: {refusal}"
+            );
+        }
+        // The correction publishes as an ordinary transition, so the refusal
+        // above wedged nothing.
+        let corrected = body(scope(), 2, 900);
+        let activation =
+            plan(&active, &view(&corrected, 2), shared()).expect("the corrected cap activates");
+        assert_eq!(activation.draining().len(), 1);
     }
 
     #[test]
@@ -785,6 +866,30 @@ mod tests {
 
         plan(&empty(), &view(&document, 1), shared())
             .expect("the same candidate without the ungoverned namespace activates");
+
+        // The refusal exists to keep a namespace from being served with every
+        // request denied, so it applies where a store would deny one. A
+        // deployment that enforces no caps at all reads none on the request
+        // path, and refusing its publications would leave it unable to converge
+        // on anything.
+        let mut unenforcing = stateful_config();
+        unenforcing.budget.backend = BudgetBackend::None;
+        unenforcing.budget.dsn_env = None;
+        plan(
+            &empty(),
+            &PolicyView::of(&candidate),
+            BackendSupport::of(&unenforcing),
+        )
+        .expect_err("a document still needs a store that can enforce it");
+        candidate
+            .namespace
+            .retain(|namespace| namespace.id != "acme/core" || namespace.policy.is_none());
+        plan(
+            &empty(),
+            &PolicyView::of(&candidate),
+            BackendSupport::of(&unenforcing),
+        )
+        .expect("a deployment that enforces no caps converges on a revision with no document");
     }
 
     /// The floor an operator raised to revoke tokens is not lowered by changing
