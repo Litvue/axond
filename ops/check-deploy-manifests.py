@@ -37,11 +37,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+# `tomllib` is standard from 3.11; on the repository's 3.10 floor the lockfile
+# supplies the backport it was extracted from.
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised only on Python 3.10
+    import tomli as tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 BASE = ROOT / "deploy/kubernetes/base"

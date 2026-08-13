@@ -76,11 +76,16 @@ version="${1:-$(workspace_version)}"
 reference="${image}:${version}"
 
 # `docker buildx imagetools inspect` reads the registry without pulling, and
-# `crane` does the same where buildx is not installed.
+# `crane` does the same where buildx is not installed. Both the index body and
+# the registry's own descriptor digest for it are read here: hashing the body
+# locally would depend on how the tool and this shell handled trailing bytes,
+# and `ops/publish-image-index.sh` already takes the descriptor as the truth.
 if command -v docker >/dev/null 2>&1 && docker buildx version >/dev/null 2>&1; then
   raw="$(docker buildx imagetools inspect --raw "$reference")"
+  digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$reference" | jq -r '.digest // empty')"
 elif command -v crane >/dev/null 2>&1; then
   raw="$(crane manifest "$reference")"
+  digest="$(crane digest "$reference")"
 else
   echo "need docker buildx or crane to read ${reference} from the registry" >&2
   exit 1
@@ -107,10 +112,10 @@ for platform in "${required_platforms[@]}"; do
   }
 done
 
-# The index digest is the digest of the raw bytes just read, so it is computed
-# here rather than taken from a second registry call that could answer for a
-# different index.
-digest="sha256:$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)"
+[[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+  echo "the registry did not report a usable digest for ${reference}: ${digest:-none}" >&2
+  exit 1
+}
 
 if [[ "$mode" == print ]]; then
   echo "$digest"
