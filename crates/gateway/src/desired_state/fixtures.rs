@@ -7,8 +7,9 @@
 use std::time::{Duration, SystemTime};
 
 use super::canonical::CanonicalValue;
+use super::credentials::ProviderCredentialBody;
 use super::ids::{
-    AuditEventId, MutationId, ProjectId, ResourceId, RevisionId, Slug, TenantId, Uuid7,
+    AuditEventId, MutationId, ProjectId, ResourceId, RevisionId, SecretId, Slug, TenantId, Uuid7,
 };
 use super::mutation::{
     Actor, AuditEvent, ExpectedRevision, IdempotencyKey, Mutation, MutationKind,
@@ -18,6 +19,7 @@ use super::resource::{
     ResourceVersionNumber,
 };
 use super::revision::{DesiredState, RevisionCandidate};
+use super::secrets::{SecretOwner, SecretRef, SecretVersion};
 use super::tenancy::{DisplayName, ProjectBody, TenantBody};
 
 /// How many resource versions [`state`] contains.
@@ -41,6 +43,32 @@ pub(crate) fn project_id(seed: u64) -> ProjectId {
 
 pub(crate) fn revision_id(seed: u64) -> RevisionId {
     RevisionId::new(uuid(seed))
+}
+
+pub(crate) fn secret_id(seed: u64) -> SecretId {
+    SecretId::new(uuid(seed))
+}
+
+/// The first version of the secret seeded by `seed`.
+pub(crate) fn secret_ref(seed: u64) -> SecretRef {
+    SecretRef::first(secret_id(seed))
+}
+
+pub(crate) fn secret_ref_at(seed: u64, version: u64) -> SecretRef {
+    SecretRef::new(
+        secret_id(seed),
+        SecretVersion::new(version).expect("fixture secret version"),
+    )
+}
+
+/// The provider a credential seeded by `seed` authenticates to.
+///
+/// Offset far from the seeds the fixtures use for resources, so a provider id is
+/// deliberately *not* declared by [`state`]: a credential naming a provider row
+/// this revision does not carry is valid desired state, which is the case the
+/// fixtures exercise by default.
+pub(crate) fn provider_id(seed: u64) -> ResourceId {
+    resource_id(900 + seed)
 }
 
 pub(crate) fn reference(kind: ResourceKind, seed: u64) -> ResourceRef {
@@ -110,12 +138,69 @@ fn capitalize(slug: &str) -> String {
     }
 }
 
+/// The typed body of the credential `credential` builds: a tenant's credential
+/// pointing at the first version of the secret seeded by `seed`.
+///
+/// No material anywhere, in a fixture least of all: what the body carries is an
+/// opaque reference, so a test that prints a fixture prints an id.
+pub(crate) fn credential_body(tenant: &TenantId, seed: u64, slug: &str) -> ProviderCredentialBody {
+    ProviderCredentialBody::staged(
+        resource_id(seed),
+        SecretOwner::tenant(*tenant),
+        provider_id(seed),
+        display_name(&capitalize(slug)),
+        secret_ref(seed),
+    )
+}
+
 pub(crate) fn credential(tenant: &TenantId, seed: u64, slug: &str) -> ResourceVersion {
+    credential_body(tenant, seed, slug).version(Slug::parse(slug).expect("fixture slug"))
+}
+
+/// A credential owned by one of a tenant's projects rather than by the tenant.
+pub(crate) fn project_credential(
+    tenant: &TenantId,
+    project: &ProjectId,
+    seed: u64,
+    slug: &str,
+) -> ResourceVersion {
+    ProviderCredentialBody::staged(
+        resource_id(seed),
+        SecretOwner::project(*tenant, *project),
+        provider_id(seed),
+        display_name(&capitalize(slug)),
+        secret_ref(seed),
+    )
+    .version(Slug::parse(slug).expect("fixture slug"))
+}
+
+/// The credential `credential` builds, as a build predating typed credential
+/// bodies wrote it: same envelope, an untyped body carrying no schema.
+pub(crate) fn legacy_credential(tenant: &TenantId, seed: u64, slug: &str) -> ResourceVersion {
     ResourceVersion::new(
         reference(ResourceKind::ProviderCredential, seed),
         ResourceScope::Tenant(*tenant),
         Slug::parse(slug).expect("fixture slug"),
         inline("secret_ref", slug),
+    )
+}
+
+/// The provider resource a credential seeded with `seed` authenticates to,
+/// declared at `scope`.
+///
+/// The scope is the caller's because that is the whole point of the cases this
+/// serves: reachable at the owner's own scope or its tenant's, foreign anywhere
+/// else.
+pub(crate) fn provider(seed: u64, scope: ResourceScope, slug: &str) -> ResourceVersion {
+    ResourceVersion::new(
+        ResourceRef::new(
+            ResourceKind::Provider,
+            provider_id(seed),
+            ResourceVersionNumber::FIRST,
+        ),
+        scope,
+        Slug::parse(slug).expect("fixture slug"),
+        inline("wire_family", "openai-chat"),
     )
 }
 

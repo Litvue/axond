@@ -125,6 +125,45 @@ holder's derived `Debug` inherits the redaction. The only way to the bytes is
 `SecretMaterial::expose`, which is greppable in review. This is the rule
 stateless mode already applies to `env`-referenced key material.
 
+A reference is a *domain* type, not a store type:
+`desired_state::secrets::SecretRef` is what a credential body carries and what
+the store is asked about, so there is no second reference shape to keep in step.
+Three properties of it are enforced by types rather than by review
+([ADR 0034](../adr/0034-typed-provider-credentials-and-secret-lifecycle.md)):
+
+- **Opaque and exact.** `SecretId` (`sct_…`) is deliberately not a `ResourceId`,
+  so a credential's id and the id of its material are not interchangeable in a
+  call or in text, and every reference carries a one-based `SecretVersion`.
+  Rotation mints `SecretRef::rotated`; it never rewrites a version, and a store
+  refuses a rotation whose next version is already stored. A credential resource
+  names one version, so an admin surface that must not interrupt service stages
+  the new version under a second credential and withdraws the old one after the
+  cut-over; `ProviderCredentialBody::rotated` alone *is* the cut-over.
+- **Owned.** Every `SecretResolver`/`SecretStore` method takes a `SecretOwner`
+  (tenant, optionally project), derived from the resource's scope by
+  `SecretOwner::from_scope`, so scoping is an argument rather than a check a
+  caller may forget. Ownership is exact, not hierarchical, and a store must not
+  disclose the existence of another owner's reference.
+- **Stateful in a total, deterministic way.** `SecretLifecycle::transition_to`
+  returns a permitted move, an idempotent `Unchanged`, or `ForbiddenTransition`
+  for every ordered pair of `staged`/`active`/`disabled`/`revoked`/`tombstoned`.
+  Only `staged` and `active` resolve; `revoked` never returns to service; a
+  tombstone destroys the bytes.
+
+The trait is split so that resolving cannot mint: `SecretResolver` has `resolve`
+and `exists`, and `SecretStore: SecretResolver` adds `stage`, `rotate`,
+`transition`, and `describe`. `exists` answers ownership and lifecycle rather than
+whether a row is present — withdrawn material answers `false`, so a
+pre-publication check cannot approve a version that will never authorize
+anything, and `describe` is where a caller asks *why*. It is not a cheap
+`resolve`: unwrappability is only provable by unwrapping, so material a rotated or
+lost KEK has made unreadable still answers `true`, and compiling a candidate
+revision is what proves material. The only implementation today is the in-memory
+fake in `backends::fakes`, which states the contract executably and is not a
+selectable backend. Provider-credential bodies and the publication rules that
+cross-check them live in `desired_state::credentials`; nothing there calls a
+store.
+
 ## Catalogue metadata is not activation
 
 `CatalogSource::refresh` may store new or changed model metadata without human
@@ -151,6 +190,8 @@ shared by a second store or a test double.
 | `resource` | what a resource is: a generic envelope, versioned references, content-addressed blobs |
 | `mutation` | who changed it, under what expectation, and what the audit trail records |
 | `revision` | the complete state, the candidate proposing it, the manifest recording it, and the integrity checks a replica verifies |
+| `secrets` | what a secret reference is: an opaque exactly-versioned handle, its owner, and its lifecycle |
+| `credentials` | what a provider credential is: a typed body pointing at material it never holds, and the rules that cross-check a revision's credentials |
 
 Three properties the rest depends on:
 
