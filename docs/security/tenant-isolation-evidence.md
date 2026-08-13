@@ -18,8 +18,11 @@ a green test for an absent mechanism is worse than a missing one.
 | --- | --- | --- |
 | Domain | A resource carries its scope, so a reference across a tenant boundary is refusable without reading a body | `desired_state::resource`, `desired_state::revision` |
 | Domain (credentials) | A credential's secret and provider must be reachable from its own owner's scope | `desired_state::credentials` |
+| Service | A grant is a role at a scope, and scope containment is one-directional, so a tenant-scoped administrator's request against another tenant is a refusal with a recorded reason and an opaque answer | `desired_state::access`, `admin::service`, `tenant_isolation::control_plane` |
 | Storage | Hydration re-checks every stored dependency edge with a join, so a row written around the domain is still refused | `backends::control_plane::hydration`, `backends::control_plane::postgres` |
-| Projection | A project becomes a *tenant-qualified* runtime namespace (`acme/core`), so two tenants' identically named projects cannot collapse into one | `convergence::tenancy`, `config::validate_namespace_ids` |
+| Database | Row-level security keyed on `axond.tenant_id`, so a session pinned to one tenant cannot read or write another's rows even with the service layer bypassed | `sql/control_plane_0002_tenancy_access.sql`, `tenant_isolation::database` |
+| Catalogues | Credential, model, and policy lookups resolve within the asking tenant's own scopes, including when two tenants enable the same offering | `tenant_isolation::catalogue` |
+| Projection | A project becomes a *tenant-qualified* runtime namespace (`acme/core`), so two tenants' identically named projects cannot collapse into one | `convergence::tenancy`, `config::validate_namespace_ids`, `tenant_isolation::projection` |
 | Runtime | Catalogue, credential selection, and accounting are keyed on the caller's namespace | `crates/gateway/tests/tenant_isolation.rs` |
 
 ## Runtime: the stateful isolation suite
@@ -50,6 +53,55 @@ before it ever served, which
 checks — so concurrent runs share a database without sharing rows and a
 long-lived one does not accumulate them.
 
+## Database, service, and projections: the stateful control-plane suite
+
+[`crates/gateway/src/tenant_isolation/`](../../crates/gateway/src/tenant_isolation/mod.rs)
+is the half a black-box suite cannot see. Every scenario publishes two tenants
+who own a project, principals, credentials, aliases, policy, and a model
+enablement of the same offering into a real PostgreSQL journal on a schema of its
+own, and then asks a question of one layer.
+
+Each is stated in both directions: the negative assertion names the other
+tenant's *exact* identifiers, and the same scenario asserts the positive — the
+unpinned publisher reads what the pinned session could not, the deployment-scoped
+grant reads the projection the tenant-scoped one was refused, and the other
+tenant's durable rows are compared before and after a refused write. An absence
+that holds because the fixture never created the row is a test that cannot fail.
+
+| Property | Layer | Test |
+| --- | --- | --- |
+| A session pinned to one tenant reads nothing of the other's, swept over every table and every stored resource body | Database (RLS) | `nothing_a_pinned_session_can_read_names_the_other_tenant` |
+| The same session cannot insert rows owned by another tenant, and its updates and deletes against another tenant's rows match nothing | Database (RLS) | `a_pinned_session_cannot_write_another_tenants_rows` |
+| A tenant-scoped administrator cannot publish into another tenant, or publish a candidate that reaches a foreign credential; the refusal is recorded per tenant and nothing durable moves | Service | `a_tenant_scoped_administrator_cannot_publish_into_another_tenant` |
+| A cross-tenant reference is refused as a validation failure that names the caller's own resource, keeping what it reached for to the operator detail | Domain/service | `a_cross_tenant_reference_names_the_caller_and_not_what_it_reached_for` |
+| Deployment-wide desired state, history, and audit reads require deployment authority, and the refusal names nothing of the deployment | Service | `a_tenant_scoped_administrator_reads_no_deployment_wide_projection` |
+| A rehearsal is authorized like the mutation it rehearses, so a dry run is not a cheaper way across the boundary | Service | `a_rehearsed_cross_tenant_mutation_is_refused_like_a_real_one` |
+| A tenant's credentials are its own, and a secret resolves as the owner the revision gives it rather than as whoever asked | Catalogues | `a_tenants_credentials_are_never_another_tenants` |
+| Two tenants enabling the same offering hold two enablements, and each project's aliases resolve to its own tenant's | Catalogues | `the_same_offering_enabled_twice_is_two_tenants_models` |
+| Policy fallback climbs to the *named* tenant, so naming another tenant's project does not carry that tenant's budget across | Catalogues | `a_tenants_policy_governs_only_its_own_scopes` |
+| Each project projects to its own tenant-qualified namespace, carrying its durable identity, with platform fallback off | Projection | `each_tenants_project_is_its_own_namespace_and_borrows_nothing` |
+| Adding a tenant changes nothing about an existing tenant's namespace | Projection | `a_neighbour_changes_nothing_about_a_tenants_own_namespace` |
+
+Every scenario requires PostgreSQL and returns early without a DSN, which in CI
+would be a hole: `AXOND_TEST_REQUIRE_SERVICES=1` turns a missing DSN into a
+panic, so the stateful lane cannot report green having run none of them.
+
+One current behaviour is asserted rather than assumed, because it reads like a
+leak and is not one: a *tenant declaration* is stored in the journal as a
+deployment-scoped row (`tenant_id IS NULL`), which migration 0002's policies
+admit for a pinned session, so the raw journal does name the other tenant's id
+and slug. Nothing tenant-owned — projects, principals, credentials, secrets,
+policy — is visible, and enumerating tenants through an administrative read is
+refused a layer above by `a_tenant_scoped_administrator_reads_no_deployment_wide_projection`.
+That is where the property lives; the test says so instead of hiding it.
+
+The same asymmetry holds for writes, and is asserted the same way: the policies
+that admit an ownerless row on the way in admit a pinned session *appending* one,
+so `a_pinned_session_cannot_write_another_tenants_rows` writes a deployment-scoped
+resource version and then shows it buys nothing — a version is desired state only
+once a revision carries it, the publication chain admits no pinned session at
+all, and no ownership row appears for the forgery.
+
 ## Not covered yet, and why
 
 These are the parts of [#225] that cannot be written against the current
@@ -57,18 +109,17 @@ runtime. Each names the change that unblocks it.
 
 | Assertion | Blocked on | Why |
 | --- | --- | --- |
-| A principal of one tenant is refused a project, credential, or alias of another at the service layer | [#144] — durable principals, roles, and `Directory::authorize` | There is no principal in the runtime today: an inbound caller is a gateway key bound to a namespace in the config, so there is nothing to authorize *as*, and no denial to record |
-| A cross-tenant read is refused by the database itself, not only by the query that asked | [#144] — row-level security keyed on `axond.tenant_id` | The shipped control-plane schema has ownership constraints and the hydration join, but no RLS policy, so "the DB refuses it" cannot be asserted without asserting the absence of a policy that is not there |
-| No cross-tenant visibility through the admin surface | [#143] — the `/admin/v1` resource handlers | [#200]'s protocol and service boundary has landed, but it is contract-only: the route table is empty and `serve` mounts nothing, so the runtime still answers on the inference surface alone and there is no administrative read to scope |
-| Tenancy isolation holds over *durable* projects and credentials rather than configured namespaces | The convergence slice that wires desired state into `serve` | `desired_state` and `convergence` are contract-only: no revision is loaded on the request path, so the runtime's namespaces are the ones its config declares. The projection that makes a project a tenant-qualified namespace is tested where it lives (`convergence::tenancy`), and the runtime suite above exercises the same *shape* of namespace id, which is what keeps the two from drifting before they are joined |
+| A *tenant-scoped human* administrator is refused another tenant's resources over an authenticated `/admin/v1` request | [#143] — tenant-scoped admin authentication on the served surface | The stateful runtime authenticates a deployment-scoped breakglass credential, and the projections `/admin/v1` serves are of the whole deployment by construction. The scenarios above therefore decide authorization at the grant seam a tenant-scoped authenticator will hand the service — which is the same seam the request path will use — rather than fabricating an authenticated HTTP flow that no deployment can currently make |
+| Tenancy isolation holds over *durable* projects and credentials on the request path rather than configured namespaces | The convergence slice that wires desired state into `serve` | No revision is loaded on the request path, so a served namespace is one the config declared. The two ends are pinned instead: the projection from durable state is asserted here, and the runtime suite asserts the same *shape* of namespace id it produces, which is what keeps them from drifting before they are joined |
+| A cross-tenant alias is refused indistinguishably from a model that does not exist | A runtime error-contract decision, not a test | Today an alias belonging to another tenant is refused `502 no_credential` while an unknown model is a 404-class `model_not_found`, so status alone is an alias-existence oracle across tenants. No identifier, credential, or key of the other tenant is disclosed and nothing is dispatched upstream; changing which refusal is returned is the security owner's call and is tracked on [#225] |
 
 When each lands, the corresponding row moves into the table above with the test
 that proves it. The suite is structured for that: the harness in
 [`crates/gateway/tests/support/tenancy.rs`](../../crates/gateway/tests/support/tenancy.rs)
-describes the deployment rather than any one case, so a new assertion is a test
-against the tenants already booted.
+describes the deployment rather than any one case, and
+[`crates/gateway/src/tenant_isolation/harness.rs`](../../crates/gateway/src/tenant_isolation/harness.rs)
+describes the two tenants' durable state and the sessions that read it, so a new
+assertion is a test against tenants that already exist.
 
 [#143]: https://github.com/Litvue/axond/issues/143
-[#144]: https://github.com/Litvue/axond/issues/144
-[#200]: https://github.com/Litvue/axond/issues/200
 [#225]: https://github.com/Litvue/axond/issues/225
