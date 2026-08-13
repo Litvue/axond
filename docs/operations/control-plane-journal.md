@@ -301,6 +301,16 @@ psql "$GW_CONTROL_PLANE_DSN" -c "SELECT conrelid::regclass, conname, convalidate
   FROM pg_constraint WHERE contype = 'f' AND NOT convalidated ORDER BY conname"
 ```
 
+One consequence for the mixed-version window the *Upgrade* order below describes:
+an old binary publishing against a 0004 schema does not record the owners history
+names, so a publication whose journal rows name a tenant its revision does not
+declare is refused by these keys rather than stored. The refusal says so — a
+foreign-key violation on a journal write is reported as a refusal naming the
+constraint, not as a retryable outage, because no retry clears it — and the remedy
+is to roll the publisher forward or publish a revision that declares the tenant.
+Only a publisher writes journal rows, so a replica still on the old binary is
+unaffected.
+
 Republishing history still works, including a rollback to a pre-tenancy revision:
 before it writes journal rows, the publishing transaction records an owner for
 every tenant those rows name and the revision does not declare, at `lifecycle =

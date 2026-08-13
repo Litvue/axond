@@ -1348,8 +1348,6 @@ async fn project_tenancy(
             })?;
     }
 
-    record_referenced_tenants(transaction, &revision, candidate).await?;
-
     let declared: Vec<String> = directory
         .principals()
         .map(|principal| principal.body.principal().to_string())
@@ -1443,6 +1441,15 @@ async fn project_tenancy(
         .execute("SET CONSTRAINTS ALL IMMEDIATE", &[])
         .await
         .map_err(|error| projection_failure("settle names and identities", "name", "", &error))?;
+
+    // Last, and after that settle on purpose. This step records owner rows for
+    // tenants only history names, and every ownership key above is deferred: doing
+    // it earlier would put a row there for a tenant an *identity* names and the
+    // revision does not declare, and the principal key — the database's own,
+    // independent refusal of an administrator placed in an undeclared tenant —
+    // would then find its owner already present. It is checked first, against the
+    // tenants the revision declares, and only then is history's owner recorded.
+    record_referenced_tenants(transaction, &revision, candidate).await?;
     Ok(())
 }
 
@@ -1471,6 +1478,11 @@ async fn project_tenancy(
 /// declared, here or by an earlier revision: an existing row is never rewritten by
 /// this step, so a rollback to a pre-tenancy revision still retires nothing and a
 /// live tenant is never demoted by history mentioning it.
+///
+/// Called last, once the deferred ownership keys have been settled, so that the one
+/// row this could otherwise have made writable — a principal scoped into a tenant
+/// the revision does not declare — is still refused by the database on its own
+/// rather than only by [`Directory::of`].
 async fn record_referenced_tenants(
     transaction: &Transaction<'_>,
     revision: &str,
@@ -1580,7 +1592,7 @@ async fn insert_resource_version(
             &parameters,
         )
         .await
-        .map_err(|error| unavailable("write resource version", &error))?;
+        .map_err(|error| journal_write_failure("write resource version", &error))?;
 
     for dependency in &resource.depends_on {
         transaction
@@ -1645,7 +1657,7 @@ async fn insert_mutation(
                     mutation.id
                 ))
             } else {
-                unavailable("write mutation", &error)
+                journal_write_failure("write mutation", &error)
             }
         })?;
     Ok(())
@@ -1691,10 +1703,55 @@ async fn insert_audit_event(
                     audit.id
                 ))
             } else {
-                unavailable("write audit event", &error)
+                journal_write_failure("write audit event", &error)
             }
         })?;
     Ok(())
+}
+
+/// Classify a journal write, so an ownership key it cannot satisfy is not reported
+/// as weather either.
+///
+/// 0004 gave the journal tables foreign keys, which makes a violation there
+/// possible for the first time — and permanent. A binary that predates
+/// [`record_referenced_tenants`] publishing against a 0004 schema is how it
+/// happens: its revision names a tenant it does not declare, no owner row is
+/// recorded, and the key refuses the row. Reported as an outage that is a caller
+/// retrying forever against a state no retry reaches; reported as a refusal it says
+/// which rule refused it, and the remedy — a binary that records the owner, or a
+/// revision that declares the tenant — is an operator decision rather than a wait.
+fn journal_write_failure(operation: &str, error: &tokio_postgres::Error) -> ControlPlaneError {
+    let Some(db) = error
+        .as_db_error()
+        .filter(|db| *db.code() == SqlState::FOREIGN_KEY_VIOLATION)
+    else {
+        return unavailable(operation, error);
+    };
+    // The constraint, and nothing else: PostgreSQL's detail quotes the key it
+    // refused, which on these tables is a tenant identifier.
+    tracing::warn!(
+        constraint = db.constraint().unwrap_or("unnamed"),
+        detail = db.detail().unwrap_or(""),
+        message = db.message(),
+        "a journal row named a tenant this deployment has no row for"
+    );
+    denied(journal_ownership_refusal(db.constraint()))
+}
+
+/// The text of that refusal, from the constraint name alone.
+///
+/// A separate function because it is what a test can assert cannot disclose: it
+/// cannot see the message or the detail, so no future edit can splice the refused
+/// tenant identifier into a caller-visible error.
+fn journal_ownership_refusal(constraint: Option<&str>) -> String {
+    match constraint {
+        Some(constraint) => format!(
+            "the journal row names a tenant this deployment has no row for \
+             (constraint `{constraint}`); publish a revision that declares it, or \
+             upgrade the publisher that records the owners history names"
+        ),
+        None => "the journal row names a tenant this deployment has no row for".to_owned(),
+    }
 }
 
 /// Classify a projection write, so a constraint the projection cannot satisfy is
@@ -1923,11 +1980,11 @@ mod tests {
     use super::*;
     use crate::backends::{BackendFailure, FailureCategory};
     use crate::desired_state::fixtures::{
-        DESIRED_STATE_RESOURCES, candidate, principal_id, project, project_alias, project_body,
-        project_id, reference, state, state_a_pre_tenancy_build_published, state_with_directory,
-        state_with_renamed_alias, state_with_revoked_workload, state_with_second_tenant,
-        state_with_two_blobs, tenant, tenant_body, tenant_id, two_tenant_directory_state,
-        workload_key,
+        DESIRED_STATE_RESOURCES, candidate, human, principal_id, project, project_alias,
+        project_body, project_id, reference, state, state_a_pre_tenancy_build_published,
+        state_with_directory, state_with_renamed_alias, state_with_revoked_workload,
+        state_with_second_tenant, state_with_two_blobs, tenant, tenant_body, tenant_id,
+        two_tenant_directory_state, workload_key,
     };
     use crate::desired_state::{
         Actor, AuditEventId, Checksum, DesiredState, DisplayName, ExpectedRevision, IdentityBody,
@@ -4741,6 +4798,47 @@ mod tests {
         );
     }
 
+    /// Recording history's owners must not make an *administrator* in an undeclared
+    /// tenant storable.
+    ///
+    /// The owner rows exist for the journal, and the principal table has an
+    /// ownership key of its own that refuses a principal scoped into a tenant no
+    /// revision declares — the database-held half of the isolation property. Record
+    /// the owners before the principals and that key finds its row already there,
+    /// leaving only the service-layer check. So the recording runs last, and this
+    /// pins it: the publication is refused, and nothing of it is stored.
+    #[tokio::test]
+    async fn recording_historys_owners_does_not_make_an_undeclared_tenants_admin_storable() {
+        let Some((store, _, _)) = journal().await else {
+            return;
+        };
+        let undeclared = tenant_id(1);
+        let mut state = state_a_pre_tenancy_build_published();
+        state
+            .insert(human(
+                41,
+                "ghost-admin",
+                ResourceScope::Tenant(undeclared),
+                &[Role::TenantAdmin],
+            ))
+            .expect("an identity in an undeclared tenant is well-formed desired state");
+        let refusal = store
+            .publish_revision(candidate(ExpectedRevision::Empty, "ghost admin", state))
+            .await
+            .expect_err("an administrator in a tenant no revision declares is refused");
+        assert!(
+            matches!(refusal, ControlPlaneError::Invalid(_)),
+            "and refused as damaged state rather than as an outage: {refusal:?}"
+        );
+        assert!(
+            store
+                .column("SELECT tenant_id FROM axond_cp_tenant")
+                .await
+                .is_empty(),
+            "a refused publication stores nothing, owner rows included"
+        );
+    }
+
     /// A refusal names the rule, and never the row it collided with.
     ///
     /// The identity constraints carry sign-ins and key digests, and PostgreSQL's
@@ -4781,6 +4879,32 @@ mod tests {
             )
             .contains("contradicts an ownership row"),
             "an ownership contradiction is described as one"
+        );
+    }
+
+    /// A journal row refused by 0004's ownership key is a refusal, not weather —
+    /// nothing clears it by waiting — and it names the key rather than the tenant
+    /// the key refused.
+    #[test]
+    fn a_journal_ownership_refusal_names_the_key_and_not_the_tenant_it_refused() {
+        let message = journal_ownership_refusal(Some("axond_cp_mutation_actor_tenant_fkey"));
+        assert!(
+            message.contains("axond_cp_mutation_actor_tenant_fkey"),
+            "the refusal names the rule it broke: {message}"
+        );
+        assert!(
+            message.contains("publish a revision that declares it"),
+            "and the remedy an operator has: {message}"
+        );
+        for leaked in ["Key (", "=(", "tenant_id)=", "sha256:"] {
+            assert!(
+                !message.contains(leaked),
+                "the refusal could carry the key it refused ({leaked}): {message}"
+            );
+        }
+        assert!(
+            !journal_ownership_refusal(None).is_empty(),
+            "an unnamed constraint still says what happened"
         );
     }
 
