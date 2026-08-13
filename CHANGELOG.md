@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.35](https://github.com/Litvue/axond/compare/v0.3.34...v0.3.35) (2026-08-13)
+
+
+### Tests
+
+* **recovery:** retain loaded revision evidence ([34cd6e9](https://github.com/Litvue/axond/commit/34cd6e917043bc589d3526c0f33207ec48264243))
+* **recovery:** retain loaded revision evidence ([1061006](https://github.com/Litvue/axond/commit/106100694f036a0660d6b569f7b6ed64a4e71e2f))
+
 ## [0.3.34](https://github.com/Litvue/axond/compare/v0.3.33...v0.3.34) (2026-08-13)
 
 
