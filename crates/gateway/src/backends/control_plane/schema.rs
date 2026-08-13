@@ -724,6 +724,21 @@ pub(super) async fn baseline(
 /// half-applied one, a hole, a version nothing can confirm — is decided by a
 /// function that can be examined directly.
 fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baseline {
+    // A seed is confirmed by its target not being empty, which is one answer for
+    // the whole table: two migrations seeding the same one would each be confirmed
+    // by whichever row is there, so a database that only ever had the first applied
+    // would have the second recorded and `apply` would never write its row. The
+    // second seed into a table is therefore evidence of nothing, and treated like
+    // any other statement adoption cannot confirm.
+    let seeded: Vec<&'static str> = migrations
+        .iter()
+        .filter_map(evidence)
+        .flatten()
+        .filter_map(|item| match item {
+            Evidence::Seed(name) => Some(name),
+            Evidence::Relation(_) => None,
+        })
+        .collect();
     let mut adoptable: Vec<i32> = Vec::new();
     let mut absent: Option<i32> = None;
     for migration in migrations {
@@ -753,6 +768,24 @@ fn reconcile(migrations: &[Migration], confirmed: &HashSet<Evidence>) -> Baselin
                 ),
             };
         };
+        if let Some(shared) = declared.iter().find_map(|item| match item {
+            Evidence::Seed(name) if seeded.iter().filter(|target| *target == name).count() > 1 => {
+                Some(*name)
+            }
+            _ => None,
+        }) {
+            return Baseline::Inconsistent {
+                message: format!(
+                    "v{} `{}` seeds `{shared}`, which another shipped migration also seeds, so a \
+                     row in it proves neither of them: whether this version ran is not something \
+                     adoption can confirm. No baseline is adoptable while both ship: state the \
+                     history with `INSERT INTO {MIGRATION_TABLE} (version, name, checksum)` if you \
+                     own the change that applied it, or drop the empty ledger and apply from zero \
+                     if nothing was.",
+                    migration.version, migration.name,
+                ),
+            };
+        }
         // Named by what is actually wrong with each one: a table that is not there
         // and a table that is there without its seed row are different repairs, and
         // an operator told "`axond_cp_head` is not present" about a table that
@@ -1283,6 +1316,51 @@ mod tests {
         assert!(
             message.contains("not a prefix"),
             "the refusal has to say why the objects describe no baseline: {message}"
+        );
+    }
+
+    /// A seed is confirmed by its target having a row, which is one answer for the
+    /// whole table. Two migrations seeding the same table would both read as
+    /// applied off whichever row is there, so a database that only ever had the
+    /// first would have the second recorded and `apply` would never write its row —
+    /// the fail-open direction, and the one this refuses.
+    #[test]
+    fn a_second_seed_into_an_already_seeded_table_blocks_adoption() {
+        const V1: Migration = Migration {
+            version: 1,
+            name: "first",
+            sql: "CREATE TABLE IF NOT EXISTS one (id integer);\n\
+                  INSERT INTO one (id) VALUES (1) ON CONFLICT (id) DO NOTHING;\n",
+        };
+        const V2: Migration = Migration {
+            version: 2,
+            name: "second seed",
+            sql: "INSERT INTO one (id) VALUES (2) ON CONFLICT (id) DO NOTHING;\n",
+        };
+        let one = Evidence::Relation("one");
+        let seeded = Evidence::Seed("one");
+
+        // Including the state where the table has a row: that row is v1's, and
+        // nothing here can tell whether v2's is beside it.
+        for confirmed in [
+            HashSet::from([one, seeded]),
+            HashSet::from([one]),
+            HashSet::new(),
+        ] {
+            let Baseline::Inconsistent { message } = reconcile(&[V1, V2], &confirmed) else {
+                panic!("a seed no row can be attributed to has no adoptable baseline");
+            };
+            assert!(
+                message.contains("which another shipped migration also seeds"),
+                "the refusal has to say why a row in it proves nothing: {message}"
+            );
+        }
+
+        // One migration seeding it is still evidence, so the refusal above is the
+        // second seed's doing rather than a withdrawal of seed evidence.
+        assert_eq!(
+            reconcile(&[V1], &HashSet::from([one, seeded])),
+            Baseline::Applied { versions: vec![1] }
         );
     }
 }
