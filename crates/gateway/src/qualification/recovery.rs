@@ -787,14 +787,14 @@ async fn control_plane_outage_journal_outage() {
         "a caller is told to retry rather than to change the request",
     );
 
+    let refused_retryably = recorder.held("the_refused_publish_is_retryable")
+        && recorder.held("the_rejection_names_the_unavailable_journal");
     recorder.gate(
         "admin_writes",
         spec.gate.admin_writes.bound(),
         category,
-        spec.gate.admin_writes_met(
-            AdminWrites::Unavailable,
-            BackendFailure::retryable(&refusal) && category == "unavailable",
-        ),
+        spec.gate
+            .admin_writes_met(AdminWrites::Unavailable, refused_retryably),
         "the publish was refused with a retryable category and wrote nothing",
     );
     recorder.deferred(
@@ -941,15 +941,14 @@ async fn cold_boot_valid_cache_cold_boot() {
         "a snapshot with no aliases is an empty configuration wearing a revision id",
     );
 
+    let restored_from_the_cache = recorder.held("the_snapshot_came_from_the_cache")
+        && recorder.held("the_active_revision_is_the_cached_one");
     recorder.gate(
         "readiness",
         spec.gate.readiness.bound(),
         "restored from last-known-good",
-        spec.gate.readiness_met(
-            Readiness::Serves,
-            report.source == Some(SnapshotSource::LastKnownGood)
-                && report.active == Some(baseline.id),
-        ),
+        spec.gate
+            .readiness_met(Readiness::Serves, restored_from_the_cache),
         "the booting replica reached a servable snapshot without the journal, from the cache the \
          previous replica exported",
     );
@@ -1055,14 +1054,14 @@ async fn cold_boot_no_cache_cold_boot() {
         "a replica that never converged claims no active revision",
     );
 
+    let refused_and_published_nothing = recorder.held("the_refusal_names_the_unreachable_journal")
+        && recorder.held("the_snapshot_generation_does_not_move");
     recorder.gate(
         "readiness",
         spec.gate.readiness.bound(),
         "refused: control plane unreachable, no cache",
-        spec.gate.readiness_met(
-            Readiness::Refuses,
-            refused_for_the_journal && booting.generation() == generation_before,
-        ),
+        spec.gate
+            .readiness_met(Readiness::Refuses, refused_and_published_nothing),
         "boot refused and published nothing, so no empty configuration reached the snapshot",
     );
     recorder.deferred(
@@ -1496,18 +1495,22 @@ async fn recovery_convergence_journal_recovery() {
         "both replicas converged to the head revision without intervention within the bound once \
          the journal returned",
     );
+    let publish_recovered = recorder.held("the_publish_is_accepted_after_the_recovery");
     recorder.gate(
         "admin_writes",
         spec.gate.admin_writes.bound(),
         "accepted",
-        spec.gate.admin_writes_met(AdminWrites::Accepted, true),
+        spec.gate
+            .admin_writes_met(AdminWrites::Accepted, publish_recovered),
         "the publish refused during the outage succeeded against the recovered journal",
     );
+    let nothing_was_lost = recorder.held("no_revision_is_lost_across_the_outage")
+        && recorder.held("the_audit_trail_survives_the_outage");
     recorder.gate(
         "max_data_loss_revisions",
         spec.gate.max_data_loss_revisions.to_string(),
         "0",
-        surviving == 4,
+        nothing_was_lost,
         "every revision the journal accepted before, during, and after the outage is readable, \
          and the head's audit trail came back with it",
     );

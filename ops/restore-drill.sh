@@ -549,7 +549,7 @@ mark "replica-booted" "a replica booted on the promoted cluster and opened /admi
 # for has to become a failed check in this stage's artifact, not an abort before
 # the artifact exists.
 recovered_head="$(head_revision || echo unreadable)"
-recovered_revisions="$(revision_count || echo unreadable)"
+recovered_revisions="$(revision_count || echo -1)"
 observe recovered_head_revision "$recovered_head"
 observe revisions_after_recovery "$recovered_revisions" count
 require "the_recovered_head_is_the_pre_target_revision" "$pre_target_head" "$recovered_head" \
