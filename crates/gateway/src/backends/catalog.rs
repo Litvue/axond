@@ -2190,6 +2190,13 @@ impl LastKnownGoodCatalog {
     /// stated none, the compiled-in seed — leaves nothing to ask conditionally
     /// with, so an answer of "not modified" to the unconditional request that
     /// follows confirms nothing.
+    ///
+    /// The validators such an answer states are discarded along with it, rather
+    /// than kept for the next request: their only provenance is the answer being
+    /// refused. Recording one would make the following request conditional on a
+    /// token an intermediary can keep matching, leaving the catalogue on content
+    /// it never received with every signal reading confirmed. A full response
+    /// establishes validators legitimately, and this state ends at the first one.
     fn can_confirm_unchanged(&self) -> bool {
         self.validators()
             .is_some_and(|validators| !validators.is_empty())
