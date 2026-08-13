@@ -902,6 +902,20 @@ mod tests {
             // Not a superuser: this database cannot host the case.
             return;
         }
+        // The premise, asserted rather than assumed: this role cannot read the
+        // adopted tables at all. A relation probe still answers for it, because it
+        // asks `pg_class` — which no grant governs — whether the object exists.
+        for table in ["axond_cp_blob", "axond_cp_head"] {
+            let granted: bool = client
+                .query_one(
+                    "SELECT has_table_privilege($1, $2, 'SELECT')",
+                    &[&role, &format!("{}.{table}", fixture.schema)],
+                )
+                .await
+                .expect("ask what the role may read")
+                .get(0);
+            assert!(!granted, "{table} must not be readable by {role}");
+        }
         let Some((scheme, rest)) = fixture.dsn.split_once("://") else {
             panic!("a DSN with a scheme");
         };
