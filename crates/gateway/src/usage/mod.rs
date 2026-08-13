@@ -388,6 +388,40 @@ pub enum Buffering {
     WriteThrough,
 }
 
+/// The per-sink batching keys a journal takes over, in the order an operator
+/// reads them in `axond.toml`.
+///
+/// Enabling the journal replaces the sink's own queue with a durable one, so
+/// these three stop describing anything: the queue is the outbox (bounded by
+/// `[usage_journal] max_events`), the batch is a claim (`claim_batch`), and the
+/// flush cadence is the poll interval (`poll_interval_ms`). They are named at
+/// boot rather than silently ignored, because a deployment that tuned them is
+/// entitled to know they no longer apply.
+const JOURNAL_OWNED_BATCH_KEYS: [&str; 3] = ["buffer_capacity", "max_batch", "flush_interval_ms"];
+
+/// Which of [`JOURNAL_OWNED_BATCH_KEYS`] a sink actually set, and only for the
+/// kinds that ever batched: a stdout or OTLP sink never had a queue to lose.
+fn journal_owned_batch_keys(configs: &[UsageSinkConfig]) -> Vec<&'static str> {
+    let mut named = Vec::new();
+    for config in configs {
+        if config.kind != UsageSinkKind::Postgres {
+            continue;
+        }
+        let defaults = UsageSinkConfig::default();
+        let set = [
+            config.buffer_capacity != defaults.buffer_capacity,
+            config.max_batch_explicit,
+            config.flush_interval_ms != defaults.flush_interval_ms,
+        ];
+        for (key, was_set) in JOURNAL_OWNED_BATCH_KEYS.iter().zip(set) {
+            if was_set && !named.contains(key) {
+                named.push(*key);
+            }
+        }
+    }
+    named
+}
+
 /// How usage leaves the request path, in whichever mode the deployment chose.
 ///
 /// The two modes are deliberately one type rather than two call sites in
@@ -604,6 +638,18 @@ pub async fn build_runtime(
         .map_err(|error| UsageSinkError::invalid("journal", error.to_string()))?;
     // Write-through, because the worker acknowledges on what the sink returns: a
     // batching sink would have it acknowledge a row that does not exist yet.
+    let owned = journal_owned_batch_keys(sinks);
+    if !owned.is_empty() {
+        tracing::warn!(
+            journal = store.name(),
+            keys = owned.join(", "),
+            claim_batch = journal.claim_batch,
+            poll_interval_ms = journal.poll_interval_ms,
+            "the usage journal owns sink batching; these `[[usage_sink]]` keys no \
+             longer apply and `[usage_journal]` claim_batch/poll_interval_ms \
+             replace them"
+        );
+    }
     let sinks = build_sinks(sinks, env, Buffering::WriteThrough).await?;
     let worker = DeliveryWorker::new(
         Arc::clone(&store),
@@ -861,5 +907,54 @@ mod tests {
             .err()
             .expect("missing dsn must fail at boot");
         assert!(matches!(err, UsageSinkError::Invalid { .. }), "{err:?}");
+    }
+
+    /// Enabling the journal moves buffering into the outbox, so the sink's own
+    /// batching keys stop applying. A deployment that set them is told which ones,
+    /// because the alternative is settings that silently mean nothing.
+    #[test]
+    fn a_journal_names_the_sink_batching_keys_it_takes_over() {
+        let tuned = UsageSinkConfig {
+            kind: UsageSinkKind::Postgres,
+            buffer_capacity: 42,
+            flush_interval_ms: 250,
+            ..UsageSinkConfig::default()
+        };
+        assert_eq!(
+            journal_owned_batch_keys(&[tuned]),
+            vec!["buffer_capacity", "flush_interval_ms"]
+        );
+        // Untouched defaults are not worth a warning, and a sink that never
+        // batched has nothing to hand over.
+        assert!(
+            journal_owned_batch_keys(&[
+                UsageSinkConfig {
+                    kind: UsageSinkKind::Postgres,
+                    ..UsageSinkConfig::default()
+                },
+                UsageSinkConfig {
+                    kind: UsageSinkKind::Stdout,
+                    buffer_capacity: 7,
+                    ..UsageSinkConfig::default()
+                },
+            ])
+            .is_empty()
+        );
+    }
+
+    /// The other half of that contract: a write-through sink is the destination
+    /// itself, so the worker's acknowledgement speaks for a row the destination
+    /// actually accepted rather than for a queue slot.
+    #[tokio::test]
+    async fn write_through_sinks_are_not_wrapped_in_a_queue() {
+        let sinks = build_sinks(&[], &HashMap::new(), Buffering::WriteThrough)
+            .await
+            .expect("defaults");
+        let report = UsageFanout::new(sinks).flush(Duration::from_secs(5)).await;
+        assert_eq!(
+            report.sinks,
+            vec![("stdout", FlushOutcome::Flushed { records: 0 })],
+            "a write-through sink has no buffer to flush"
+        );
     }
 }

@@ -693,9 +693,9 @@ migrations, and backup/restore ownership.
 | `dsn_env` | string | — | `postgres` | *Name* of the env var holding the connection string. Required and non-empty for `postgres`. `sslmode=require` in the DSN turns on TLS (rustls + webpki roots). |
 | `table` | string | `axond_usage` | `postgres` | Destination table; `schema.table` allowed. Validated as an identifier, so it cannot carry SQL. |
 | `create_table` | bool | `false` | `postgres` | Apply the shipped DDL at boot. Off because most deployments give the gateway's role no DDL rights. |
-| `buffer_capacity` | integer | `10000` | `postgres` | Records buffered before the fan-out drops. Must be ≥ 1. |
-| `max_batch` | integer | `500` | `postgres` | Records accumulated before a flush. Must be ≥ 1 and no greater than `buffer_capacity`; the sink splits large batches across statements as needed. |
-| `flush_interval_ms` | integer | `1000` | `postgres` | How long a partial batch waits. Must be ≥ 1. |
+| `buffer_capacity` | integer | `10000` | `postgres` | Records buffered before the fan-out drops. Must be ≥ 1. Not used when the journal is enabled. |
+| `max_batch` | integer | `500` | `postgres` | Records accumulated before a flush. Must be ≥ 1 and no greater than `buffer_capacity`; the sink splits large batches across statements as needed. Not used when the journal is enabled. |
+| `flush_interval_ms` | integer | `1000` | `postgres` | How long a partial batch waits. Must be ≥ 1. Not used when the journal is enabled. |
 
 `max_batch` was previously capped by the INSERT parameter budget, which moved
 whenever a column was added; it is now bounded by `buffer_capacity` instead, so
@@ -736,6 +736,15 @@ In billing-grade mode the sinks are written through synchronously by the worker
 instead of buffering, since the worker acknowledges on their answer. At least one
 sink is therefore required, and `kind = "otlp"` is rejected: the OTel batch
 processor confirms nothing, so there would be no answer to acknowledge on.
+
+That moves buffering out of the sink and into the outbox, so a sink's
+`buffer_capacity`, `max_batch`, and `flush_interval_ms` stop applying —
+`claim_batch` and `poll_interval_ms` below replace them, and a replica that had
+set them is told at boot which ones no longer do anything. `usage.records_written`
+is then emitted by the delivery worker for records a destination accepted, and
+`usage.records_dropped` no longer counts a failed write, because a failed write is
+retried from the outbox rather than lost. The full contract is in [the operator
+guide](./operations/usage-outbox.md#what-enabling-it-changes-about-your-sinks).
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |

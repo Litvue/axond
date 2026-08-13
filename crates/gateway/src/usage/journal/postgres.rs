@@ -17,13 +17,19 @@
 //! mid-delivery leaves a lease that expires rather than a lock nobody can
 //! release.
 //!
-//! # Ordering, and the one query that enforces it
+//! # Ordering, and the two statements that enforce it
 //!
 //! A claim takes, per [`OrderingKey`](super::OrderingKey), only that key's *lowest* unresolved
-//! position, and only when nothing else holds a live lease on it. Two workers
-//! claiming concurrently therefore cannot both be delivering the same caller's
-//! events: the candidate rows are locked `FOR UPDATE SKIP LOCKED`, so the loser
-//! of a race skips the key instead of overtaking it.
+//! position, and only when nothing else holds a live lease on it. The selection
+//! locks its candidate events `FOR UPDATE SKIP LOCKED`, so a concurrent claimant
+//! skips a key rather than overtaking it — but the selection alone cannot decide
+//! ownership, because the lease it reads lives on the delivery row and its
+//! snapshot may predate a lease another claimant has since committed. The
+//! ownership decision is therefore the upsert of the delivery row, whose
+//! `ON CONFLICT DO UPDATE … WHERE` re-checks the lease against the current row
+//! under its lock: the loser updates nothing and leaves the key alone. Two
+//! workers claiming concurrently therefore cannot both be delivering the same
+//! caller's event.
 //!
 //! # What this build will not deliver
 //!
@@ -44,6 +50,7 @@
 //! worker's claim. Each connection reconnects on failure and re-applies its
 //! `search_path`, so a reconnect cannot silently land on another schema's outbox.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -66,13 +73,14 @@ const SCHEMA_DDL: &str = include_str!("../../../sql/usage_outbox_v1.sql");
 
 const BACKEND: &str = "postgres";
 
-/// How long an exact `count(*)` is trusted before the capacity gate takes
-/// another one.
+/// How long a measured count is trusted before the capacity gate takes another
+/// one. It is also what bounds how long a refusal can outlive the backlog that
+/// caused it, because the measurement a refusal is made on expires.
 const COUNT_REFRESH: Duration = Duration::from_secs(1);
 
-/// How close to [`Capacity::max_events`] the estimate may get before every
-/// append pays for an exact count. Above this fraction the number has to be
-/// right, because it is about to decide whether an event is refused.
+/// How close to [`Capacity::max_events`] the estimate may get before an append
+/// measures instead. Between this fraction and the limit the number decides
+/// whether an event is refused, so it has to be measured rather than inferred.
 const COUNT_EXACT_FRACTION: u64 = 90;
 
 /// How the outbox connects, and what it is allowed to do at boot.
@@ -234,7 +242,16 @@ impl PostgresJournal {
     }
 }
 
-/// How many events are stored, exactly when the answer is about to matter.
+/// How many events are stored, measured exactly when the answer is about to
+/// matter and never by walking more of the table than the limit it is compared
+/// against.
+///
+/// The count is bounded at `max_events + 1`, because that is the largest number
+/// the capacity decision can distinguish: anything above it is "over the limit"
+/// by the same amount as far as every caller is concerned. Bounding it is what
+/// keeps a backlog from making the request path pay for its own size — an
+/// unbounded `count(*)` gets slower exactly as the outbox falls behind, which is
+/// when appends can least afford it.
 async fn stored_events(
     tx: &Transaction<'_>,
     gate: &CapacityGate,
@@ -243,8 +260,12 @@ async fn stored_events(
     if let Some(estimate) = gate.estimate(max_events) {
         return Ok(estimate);
     }
+    let bound = i64::try_from(max_events.saturating_add(1)).unwrap_or(i64::MAX);
     let row = tx
-        .query_one("SELECT count(*) FROM axond_usage_outbox", &[])
+        .query_one(
+            "SELECT count(*) FROM (SELECT 1 FROM axond_usage_outbox LIMIT $1) bounded",
+            &[&bound],
+        )
         .await?;
     let counted = row.get::<_, i64>(0).max(0) as u64;
     gate.measured(counted);
@@ -321,13 +342,15 @@ impl UsageJournal for PostgresJournal {
                         dropped = drop_oldest(&tx, stored - capacity.max_events + 1).await?;
                         stored -= dropped;
                     }
-                    if reclaimed > 0 {
+                    if reclaimed > 0 || dropped > 0 {
                         gate.invalidate();
                     }
                     if stored >= capacity.max_events {
                         // Everything left is either undelivered or somebody's
-                        // quarantined evidence, so there is no room to make.
-                        gate.invalidate();
+                        // quarantined evidence, so there is no room to make. The
+                        // measurement is kept: the next append refuses on it
+                        // rather than measuring a backlog that is still there,
+                        // and it expires on its own inside a second.
                         return Err(OpError::Journal(JournalError::AtCapacity {
                             pending: stored,
                             capacity,
@@ -398,6 +421,19 @@ impl UsageJournal for PostgresJournal {
                     &[&name],
                 )
                 .await?;
+                // The floor the selection starts from, so a claim walks the
+                // backlog rather than the retained history behind it. Read here
+                // and raised by maintenance: raising it from the claim would take
+                // the consumer row's lock and serialize every replica's claims
+                // against each other.
+                let floor: i64 = tx
+                    .query_one(
+                        "SELECT resolved_through FROM axond_usage_outbox_consumer \
+                         WHERE consumer = $1",
+                        &[&name],
+                    )
+                    .await?
+                    .get(0);
 
                 let mut claimed: Vec<Delivery> = Vec::with_capacity(claim.max_events);
                 // What this claim would report, held until the commit that makes
@@ -405,7 +441,7 @@ impl UsageJournal for PostgresJournal {
                 // error, and a retried pass must not count its first pass's
                 // quarantines twice.
                 let mut condemnations: Vec<PoisonReason> = Vec::new();
-                let mut undeliverable: Vec<&'static str> = Vec::new();
+                let mut undeliverable = Undeliverable::default();
                 // A pass that only condemned rows advanced the head of those
                 // ordering keys without filling the batch, so the selection runs
                 // again: the caller's next event is deliverable now, and a claim
@@ -418,6 +454,13 @@ impl UsageJournal for PostgresJournal {
                     // Per ordering key, that key's lowest unresolved position — and
                     // only when no live lease holds it. `SKIP LOCKED` makes a
                     // concurrent claimant skip the key rather than overtake it.
+                    //
+                    // Both sides are floored on the consumer's resolved prefix, so
+                    // neither walks the acknowledged history the retention window
+                    // keeps. On the delivery side the floor is redundant — its
+                    // position equals a joined event's — but stating it on the join
+                    // is what lets that side be an index range too, because the
+                    // planner will not infer it through an outer join.
                     let candidates = tx
                         .query(
                             "WITH open AS (
@@ -427,7 +470,9 @@ impl UsageJournal for PostgresJournal {
                              FROM axond_usage_outbox e
                              LEFT JOIN axond_usage_outbox_delivery d
                                  ON d.position = e.position AND d.consumer = $1
-                             WHERE d.acknowledged_at IS NULL AND d.quarantined_at IS NULL
+                                AND d.position > $4
+                             WHERE e.position > $4
+                               AND d.acknowledged_at IS NULL AND d.quarantined_at IS NULL
                          ),
                          head AS (
                              SELECT DISTINCT ON (namespace, subject)
@@ -443,7 +488,7 @@ impl UsageJournal for PostgresJournal {
                          ORDER BY h.position
                          LIMIT $3
                          FOR UPDATE OF e SKIP LOCKED",
-                            &[&name, &claim.now, &remaining],
+                            &[&name, &claim.now, &remaining, &floor],
                         )
                         .await?;
                     if candidates.is_empty() {
@@ -459,7 +504,7 @@ impl UsageJournal for PostgresJournal {
                         // attempt, no verdict, no lease. Its own version's replica
                         // will deliver it.
                         if stored_version > readable {
-                            undeliverable.push("schema_ahead");
+                            undeliverable.schema_ahead(position);
                             continue;
                         }
                         if attempt > max_attempts {
@@ -487,7 +532,7 @@ impl UsageJournal for PostgresJournal {
                                     reason = %reason,
                                     "usage outbox row could not be decoded; quarantining it"
                                 );
-                                undeliverable.push("corrupt");
+                                undeliverable.corrupt();
                                 condemn(&tx, position, &name, PoisonReason::Malformed, attempt)
                                     .await?;
                                 condemnations.push(PoisonReason::Malformed);
@@ -495,15 +540,37 @@ impl UsageJournal for PostgresJournal {
                                 continue;
                             }
                         };
-                        tx.execute(
-                            "INSERT INTO axond_usage_outbox_delivery
+                        // The claim itself, and the only step that decides who
+                        // owns the delivery. `ON CONFLICT DO UPDATE` takes the
+                        // row lock and re-evaluates its `WHERE` against the
+                        // *current* row rather than this transaction's snapshot,
+                        // so a claimant that selected the event before a
+                        // concurrent claimant committed its lease updates zero
+                        // rows and moves on. Locking the event row alone could
+                        // not do this: the lease lives on the delivery row, and
+                        // the snapshot the `LEFT JOIN` read it through may predate
+                        // it.
+                        let taken = tx
+                            .execute(
+                                "INSERT INTO axond_usage_outbox_delivery
                              (position, consumer, attempts, lease_expires_at)
                          VALUES ($1, $2, $3, $4)
                          ON CONFLICT (position, consumer) DO UPDATE
-                             SET attempts = $3, lease_expires_at = $4",
-                            &[&position, &name, &attempt, &lease_expires_at],
-                        )
-                        .await?;
+                             SET attempts = $3, lease_expires_at = $4
+                             WHERE axond_usage_outbox_delivery.acknowledged_at IS NULL
+                               AND axond_usage_outbox_delivery.quarantined_at IS NULL
+                               AND (axond_usage_outbox_delivery.lease_expires_at IS NULL
+                                    OR axond_usage_outbox_delivery.lease_expires_at <= $5)",
+                                &[&position, &name, &attempt, &lease_expires_at, &claim.now],
+                            )
+                            .await?;
+                        if taken == 0 {
+                            // Somebody else holds this key's head, or resolved it
+                            // while this claim was selecting. Not an error, and
+                            // not a condemnation: the next claim sees whatever
+                            // they leave behind.
+                            continue;
+                        }
                         claimed.push(Delivery {
                             id: DeliveryId {
                                 consumer: consumer.clone(),
@@ -529,7 +596,7 @@ impl UsageJournal for PostgresJournal {
                         reason.as_str(),
                     );
                 }
-                for reason in undeliverable {
+                for reason in undeliverable.reasons {
                     crate::telemetry::metrics::record_usage_journal_undeliverable(BACKEND, reason);
                 }
                 Ok(claimed)
@@ -610,6 +677,7 @@ impl UsageJournal for PostgresJournal {
                             &[&cutoff],
                         )
                         .await?;
+                    client.execute(ADVANCE_RESOLVED_THROUGH, &[]).await?;
                     Ok(pruned)
                 })
             })
@@ -704,6 +772,63 @@ impl PostgresJournal {
         .await
     }
 }
+
+/// What one claim found it could not deliver, counted the way an operator reads
+/// it: once per row, not once per look.
+///
+/// A schema-ahead row is left untouched on purpose, so it is still the head of
+/// its ordering key on the claim's next selection pass — and a claim makes
+/// another pass whenever it condemned something. Reporting it per pass would
+/// turn one row a newer replica wrote into a burst on the undeliverable counter,
+/// which is exactly the signal a rolling upgrade is being watched on. Corruption
+/// needs no such guard: a corrupt row is quarantined in the same pass, so it
+/// cannot be selected twice.
+#[derive(Default)]
+struct Undeliverable {
+    reasons: Vec<&'static str>,
+    ahead: HashSet<i64>,
+}
+
+impl Undeliverable {
+    fn schema_ahead(&mut self, position: i64) {
+        if self.ahead.insert(position) {
+            self.reasons.push("schema_ahead");
+        }
+    }
+
+    fn corrupt(&mut self) {
+        self.reasons.push("corrupt");
+    }
+}
+
+/// Raise every consumer's resolved prefix to just below its first unresolved
+/// event.
+///
+/// This is what makes a claim's cost the backlog rather than the retained
+/// history: acknowledged events stay for `retain_acknowledged`, and a selection
+/// with no floor walks all of them on every poll. The scan here is the mirror
+/// image — it starts at the old floor, follows `position` in index order, and
+/// stops at the first row this consumer has not finished with (`ORDER BY … LIMIT
+/// 1`), so the rows it examines are the ones it is about to skip forever. Run
+/// once per maintenance tick rather than per claim, because the update takes the
+/// consumer row's lock and replicas claim concurrently.
+///
+/// `GREATEST` makes it monotonic, and the `max(position)` fallback covers a
+/// consumer that has finished everything: with no unresolved row there is no
+/// position to sit below, and the floor is the end of the outbox.
+const ADVANCE_RESOLVED_THROUGH: &str = "UPDATE axond_usage_outbox_consumer c
+     SET resolved_through = GREATEST(
+         c.resolved_through,
+         COALESCE(
+             (SELECT e.position - 1
+              FROM axond_usage_outbox e
+              LEFT JOIN axond_usage_outbox_delivery d
+                  ON d.position = e.position AND d.consumer = c.consumer
+              WHERE e.position > c.resolved_through
+                AND d.acknowledged_at IS NULL AND d.quarantined_at IS NULL
+              ORDER BY e.position
+              LIMIT 1),
+             (SELECT COALESCE(max(position), 0) FROM axond_usage_outbox)))";
 
 /// An event every registered consumer has finished with, and nobody has
 /// quarantined. The predicate retention and reclamation share, written once
@@ -1015,8 +1140,16 @@ impl CapacityGate {
         }
     }
 
-    /// The estimate, when it is both fresh and far enough from the limit to be
-    /// trusted.
+    /// The estimate, when it is fresh and the limit is not the thing it is being
+    /// asked to decide.
+    ///
+    /// Two answers are cheap and safe. Comfortably below the limit, an append
+    /// cannot be the one that crosses it. At or above the limit, the outbox is
+    /// full and the only way it stops being full is a deletion, and every
+    /// deletion this process makes invalidates the measurement — so a full
+    /// outbox refuses on a measurement at most [`COUNT_REFRESH`] old instead of
+    /// measuring once per request, which is what turned a backlog into an
+    /// outage.
     fn estimate(&self, max_events: u64) -> Option<u64> {
         let state = self.state.lock().expect("capacity gate");
         let at = state.at?;
@@ -1024,6 +1157,9 @@ impl CapacityGate {
             return None;
         }
         let estimate = state.measured.saturating_add(state.appended_since);
+        if estimate >= max_events {
+            return Some(estimate);
+        }
         let exact_above = max_events.saturating_mul(COUNT_EXACT_FRACTION) / 100;
         (estimate.saturating_add(1) < exact_above.max(1)).then_some(estimate)
     }
@@ -1666,5 +1802,194 @@ mod tests {
         // The age is what says how far behind a bill is; a depth alone does not.
         let age = stats.oldest_pending_age.expect("an age");
         assert!(age >= Duration::from_secs(100), "{age:?}");
+    }
+
+    /// One row a newer replica wrote is one undeliverable event, however many
+    /// times a claim's selection passes look at it.
+    #[test]
+    fn a_schema_ahead_row_is_reported_once_per_claim() {
+        let mut undeliverable = Undeliverable::default();
+        undeliverable.schema_ahead(7);
+        undeliverable.schema_ahead(7);
+        undeliverable.schema_ahead(9);
+        undeliverable.corrupt();
+        assert_eq!(
+            undeliverable.reasons,
+            vec!["schema_ahead", "schema_ahead", "corrupt"],
+            "one report per row, and corruption is never re-selected"
+        );
+    }
+
+    /// The capacity decision near the limit, which is where it is both load-bearing
+    /// and expensive: a full outbox must keep refusing without measuring itself
+    /// again on every request, and must accept again once there is room.
+    #[tokio::test]
+    async fn a_full_outbox_refuses_from_a_bounded_measurement_and_recovers() {
+        let Some((dsn, journal)) = outbox("near_full", capacity(2, CapacityPolicy::Refuse)).await
+        else {
+            return;
+        };
+        journal
+            .append(&event_for("GW_INBOUND_ACME_KEY"))
+            .await
+            .expect("append");
+        // The append that fills it: the last one below the limit still succeeds,
+        // which is the near-full case the exact measurement exists for.
+        journal
+            .append(&event_for("GW_INBOUND_ACME_KEY"))
+            .await
+            .expect("the outbox is full only after this one");
+        for _ in 0..3 {
+            let error = journal
+                .append(&event_for("GW_INBOUND_ACME_KEY"))
+                .await
+                .expect_err("a full billing-grade outbox refuses");
+            assert!(
+                matches!(error, JournalError::AtCapacity { pending, .. } if pending >= 2),
+                "{error:?}"
+            );
+        }
+
+        // Room appears without this process making it — another replica's
+        // retention, or an operator. The measurement a refusal was made on expires,
+        // so the next append measures again and accepts.
+        client(&dsn, Some("axond_outbox_near_full"))
+            .await
+            .execute(
+                "DELETE FROM axond_usage_outbox WHERE position = \
+                 (SELECT min(position) FROM axond_usage_outbox)",
+                &[],
+            )
+            .await
+            .expect("make room");
+        tokio::time::sleep(COUNT_REFRESH + Duration::from_millis(50)).await;
+        assert!(
+            journal
+                .append(&event_for("GW_INBOUND_ACME_KEY"))
+                .await
+                .expect("an outbox with room accepts")
+                .is_new()
+        );
+    }
+
+    /// Two replicas of one consumer, claiming at the same instant. The delivery
+    /// lease is the only thing that decides ownership, so the two must partition
+    /// the events rather than both deliver one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_replicas_cannot_claim_the_same_event() {
+        let Some((dsn, first)) = outbox("concurrent", capacity(64, CapacityPolicy::Refuse)).await
+        else {
+            return;
+        };
+        // A second journal on its own connections, which is what a second replica
+        // is: same schema, same consumer, no shared state in this process.
+        let second = PostgresJournal::connect(
+            &dsn,
+            settings(
+                "axond_outbox_concurrent",
+                false,
+                capacity(64, CapacityPolicy::Refuse),
+            ),
+        )
+        .await
+        .expect("a second replica");
+        let billing = consumer("billing");
+        let mut in_flight = 0u64;
+        // Repeated, because the window this closes is small: the loser has to have
+        // selected the event before the winner committed its lease.
+        for _ in 0..8 {
+            // Distinct ordering keys, so a claim may take both: one key at a time is
+            // the ordering guarantee, and with a single key it would hide the race.
+            for key in ["GW_INBOUND_ACME_KEY", "GW_INBOUND_OTHER_KEY"] {
+                first.append(&event_for(key)).await.expect("append");
+            }
+            let now = SystemTime::now();
+            let (left, right) = tokio::join!(
+                first.claim(&billing, claim_at(8, Duration::from_secs(30), now)),
+                second.claim(&billing, claim_at(8, Duration::from_secs(30), now)),
+            );
+            let mut delivered: Vec<_> = left
+                .expect("claim")
+                .into_iter()
+                .chain(right.expect("claim"))
+                .map(|delivery| delivery.event.id())
+                .collect();
+            let claimed = delivered.len();
+            delivered.sort();
+            delivered.dedup();
+            assert_eq!(
+                delivered.len(),
+                claimed,
+                "an event was handed to both replicas at once"
+            );
+            in_flight += claimed as u64;
+            // And what the two of them together took is what the outbox thinks is
+            // leased: a lease neither of them owns would show up here.
+            let stats = first.stats(&billing).await.expect("stats");
+            assert_eq!(stats.in_flight, in_flight, "{stats:?}");
+        }
+    }
+
+    /// The floor a claim starts from. Acknowledged events stay for the retention
+    /// window, and a claim must not walk them again on every poll.
+    #[tokio::test]
+    async fn maintenance_moves_the_claim_floor_past_the_acknowledged_prefix() {
+        let Some((dsn, journal)) = outbox("floor", capacity(64, CapacityPolicy::Refuse)).await
+        else {
+            return;
+        };
+        let billing = consumer("billing");
+        let now = SystemTime::now();
+        // A retained acknowledged prefix: claimed, acknowledged, and still stored,
+        // because the retention window has not passed.
+        for _ in 0..4 {
+            journal
+                .append(&event_for("GW_INBOUND_ACME_KEY"))
+                .await
+                .expect("append");
+            let claimed = journal
+                .claim(&billing, claim_at(1, Duration::from_secs(30), now))
+                .await
+                .expect("claim");
+            journal.ack(&claimed[0].id).await.expect("ack");
+        }
+        let pending = event_for("GW_INBOUND_ACME_KEY");
+        journal.append(&pending).await.expect("append");
+
+        // Nothing is pruned: every row is inside its retention window.
+        assert_eq!(journal.maintain(now).await.expect("maintain"), 0);
+        let admin = client(&dsn, Some("axond_outbox_floor")).await;
+        let floor: i64 = admin
+            .query_one(
+                "SELECT resolved_through FROM axond_usage_outbox_consumer WHERE consumer = $1",
+                &[&billing.as_str()],
+            )
+            .await
+            .expect("the floor")
+            .get(0);
+        let first_open: i64 = admin
+            .query_one(
+                "SELECT min(e.position) FROM axond_usage_outbox e \
+                 LEFT JOIN axond_usage_outbox_delivery d \
+                     ON d.position = e.position AND d.consumer = $1 \
+                 WHERE d.acknowledged_at IS NULL AND d.quarantined_at IS NULL",
+                &[&billing.as_str()],
+            )
+            .await
+            .expect("the first unresolved position")
+            .get(0);
+        assert_eq!(
+            floor,
+            first_open - 1,
+            "the floor sits just below the oldest event still to deliver"
+        );
+        // And the event past the floor is still delivered, which is the half of
+        // this that a floor could break.
+        let claimed = journal
+            .claim(&billing, claim_at(8, Duration::from_secs(30), now))
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1, "{claimed:?}");
+        assert_eq!(claimed[0].event.id(), pending.id());
     }
 }

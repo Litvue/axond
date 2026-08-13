@@ -120,6 +120,64 @@ reference](../configuration.md#usage_journal--billing-grade-usage-delivery-opt-i
   `max_delivery_attempts` bounds retries, and `retain_acknowledged_seconds`
   bounds retention. Nothing here grows without a limit you set.
 
+## What enabling it changes about your sinks
+
+In billing-grade mode the outbox *is* the buffer, and the worker writes each
+claimed batch through to the sinks synchronously. This is not an implementation
+detail: a delivery may only be acknowledged once a destination has accepted the
+records, and a queue that accepted a record on the destination's behalf would let
+the outbox forget an event no one has stored.
+
+So, per `[[usage_sink]]`:
+
+| Key | In telemetry-grade mode | With the journal enabled |
+| --- | --- | --- |
+| `buffer_capacity` | The sink's in-process queue | **Not used.** The outbox holds the backlog, bounded by `max_events` |
+| `max_batch` | Records per write | **Not used.** Replaced by `[usage_journal] claim_batch` |
+| `flush_interval_ms` | How long a partial batch waits | **Not used.** Replaced by `[usage_journal] poll_interval_ms` |
+
+A replica that has explicitly set any of them logs which ones stopped applying,
+rather than leaving a tuned number that means nothing:
+
+```text
+WARN the usage journal owns sink batching; these `[[usage_sink]]` keys no longer
+     apply and `[usage_journal]` claim_batch/poll_interval_ms replace them
+     keys="buffer_capacity, flush_interval_ms" claim_batch=256
+```
+
+The two shared sink metrics keep their meaning but change what they can count:
+`usage.records_written` still counts records a destination accepted, now emitted
+by the delivery worker; `usage.records_dropped` no longer counts a failed write,
+because a failed write is a journaled event that will be retried rather than a
+lost one. In billing-grade mode the loss and backlog signals are the journal's
+own: `axond.usage.journal.lost`, `.quarantined`, and `.depth`.
+
+## The cost of a claim
+
+Acknowledged events stay for `retain_acknowledged_seconds`, so the retained
+history is normally much larger than the backlog. A claim must not pay for it,
+and it does not: each consumer row carries a `resolved_through` floor — the
+position below which everything is acknowledged, quarantined, or gone — and
+maintenance raises it after each retention pass. Both sides of the claim's
+selection are floored on it.
+
+Measured on PostgreSQL 17 with 200,000 acknowledged events inside their retention
+window, 100 awaiting delivery across 64 ordering keys, and one consumer
+(`EXPLAIN (ANALYZE, BUFFERS)` of the claim selection):
+
+| Selection | Time | Buffers |
+| --- | --- | --- |
+| No floor | 70.9 ms | 4,086 — sequential scans of both tables |
+| Floored (this is what runs) | 9.3 ms | 1,532 — the event side is a 100-row index range |
+
+What remains proportional to the retained history is one scan of the *delivery*
+rows for that consumer, which the planner still prefers over an index range while
+that table is small and cached. It is bounded by your retention window, so keep
+`retain_acknowledged_seconds` to what reconciliation actually needs — 24 hours by
+default — rather than raising it to keep an archive. `axond.usage.journal.depth`
+is the backlog, not the retained rows; the table size is what to watch for
+retention.
+
 ## When a request is refused
 
 `503 usage_not_durable` means exactly one thing: the request was served upstream
@@ -200,6 +258,14 @@ The outbox row carries the `schema_version` it was written at.
   never edited in place: a row-shape change ships as a new
   `ops/postgres/usage_outbox_v<N>.sql`, applied before the writers that emit it,
   exactly like the usage table ([ADR 0009](../adr/0009-durable-usage-sinks.md)).
+- **The DDL is idempotent.** Re-applying `usage_outbox_v1.sql` to a schema that
+  already has it is a no-op, which is what makes the setup step safe to script.
+  One caveat for anyone who applied a pre-release copy of it: `CREATE TABLE IF
+  NOT EXISTS` will not add `axond_usage_outbox_consumer.resolved_through` to a
+  table that already exists, so add it once by hand — `ALTER TABLE
+  axond_usage_outbox_consumer ADD COLUMN IF NOT EXISTS resolved_through bigint
+  NOT NULL DEFAULT 0` — before starting the gateway. A released version is only
+  ever superseded by a new `usage_outbox_v<N>.sql`.
 - **Drain before you downgrade.** Rolling back to a build that predates a row
   version leaves those rows undeliverable — reported as
   `axond.usage.journal.undeliverable{axond.journal.reason="schema_ahead"}` rather than silently

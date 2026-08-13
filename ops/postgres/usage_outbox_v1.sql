@@ -53,9 +53,16 @@ CREATE INDEX IF NOT EXISTS axond_usage_outbox_observed_at_idx
 -- A consumer exists once it has claimed. Nothing else registers one, because
 -- retention waits on every registered consumer: a row created by a stray
 -- acknowledgement would hold the outbox open forever.
+--
+-- `resolved_through` is the resolved prefix: every position at or below it is
+-- acknowledged, quarantined, or gone as far as this consumer is concerned. It is
+-- what keeps a claim off the retained history — acknowledged events stay for the
+-- retention window, and without a floor every claim would walk them again — and
+-- it is only ever raised, by maintenance, after checking the rows past it.
 CREATE TABLE IF NOT EXISTS axond_usage_outbox_consumer (
-    consumer      text PRIMARY KEY,
-    registered_at timestamptz NOT NULL DEFAULT now()
+    consumer         text PRIMARY KEY,
+    registered_at    timestamptz NOT NULL DEFAULT now(),
+    resolved_through bigint      NOT NULL DEFAULT 0
 );
 
 -- Per-consumer delivery state. `lease_expires_at` is what makes recovery

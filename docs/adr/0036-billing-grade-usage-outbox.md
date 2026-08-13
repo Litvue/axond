@@ -90,6 +90,27 @@ The parts of that decision worth stating as boundaries:
   quarantined with a reason and stays on disk for an operator. A row written by a
   *newer* build is skipped untouched — no attempt spent, no verdict — so a
   rolling upgrade's older replicas leave it for the replicas that can read it.
+- **Ownership of an attempt is decided by the delivery row, not by the
+  selection.** Selecting a candidate under `FOR UPDATE SKIP LOCKED` is not enough
+  to own it: the lease lives in a per-consumer delivery row, and a claimant that
+  selected before another replica committed a lease would see a stale one. The
+  lease write is therefore conditional on the state it was chosen from, and a
+  claimant that loses that write drops the candidate instead of delivering it. Two
+  replicas of one consumer partition the work; they never both hold an event.
+- **The outbox is the buffer, so the sinks are written through.** Enabling the
+  journal takes buffering away from `[[usage_sink]]` — an in-process queue that
+  accepted a record on a destination's behalf would let a delivery be
+  acknowledged, and the event forgotten, before anything stored it. The
+  consequence is a changed contract on existing keys rather than a silent one: the
+  sink's `buffer_capacity` / `max_batch` / `flush_interval_ms` are replaced by
+  `claim_batch` / `poll_interval_ms`, a replica that set them is told at boot, and
+  `records_dropped` stops being a loss signal in this mode because a failed write
+  is retried from the outbox.
+- **A claim's cost is the backlog, not the retained history.** Acknowledged events
+  stay for `retain_acknowledged_seconds`, which normally makes them the bulk of
+  the table, so each consumer carries a `resolved_through` floor that maintenance
+  raises and every claim selects above. Without it the steady-state cost of
+  delivering one event would grow with the retention window.
 - **Shutdown is bounded and honest.** The worker stops claiming, spends the
   remaining shutdown budget on what is deliverable, and reports the rest as
   *undelivered durable work* rather than as lost usage — because it is still in
