@@ -16,6 +16,12 @@
 
 mod admission;
 mod aliases;
+// Derived availability and discovery evaluation (#206). Contract only: no
+// provider is polled, no observation is persisted, and no request is enforced
+// against a verdict, so `serve` constructs no index and every snapshot carries
+// the empty one.
+#[allow(dead_code)]
+mod availability;
 // Contracts only: the durable implementations land in #141/#142, so nothing
 // here is constructed by `serve` yet and the runtime stays stateless.
 #[allow(dead_code)]
