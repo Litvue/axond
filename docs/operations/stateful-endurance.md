@@ -171,7 +171,9 @@ Hard failures, asserted at both tiers:
   load finished before is one an idle deployment would survive. A restart that
   ran long enough to reach the end of a short tier anyway does not turn that
   into a coin toss — the run offers for a little longer instead, and says so on
-  `restart.extended_for_load_ms`;
+  `restart.extended_for_load_ms`. If the fleet is still unready when the run
+  ends, its open readiness interval is closed against the run's elapsed time
+  before settlement, so the artifact cannot omit the final gap;
 - **every declared fault recovered** within `max_recovery_ms`, measured from the
   moment the fault is lifted to the first request that settles a usage record
   afterwards. A window with no such request never recovered, and fails;

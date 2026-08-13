@@ -144,6 +144,25 @@ fn assert_qualifies(result: &StatefulEnduranceResult) {
         "nothing reached the durable sink: {}",
         result.summary()
     );
+    assert!(
+        result.telemetry.readiness_probes > 0,
+        "the run recorded no readiness probes, so its readiness verdict is not evidence: {:#?}",
+        result.telemetry
+    );
+    assert!(
+        result.telemetry.readiness_failures <= result.telemetry.readiness_probes,
+        "readiness failures exceed the number of readiness probes: {:#?}",
+        result.telemetry
+    );
+    let readiness_verdict = result
+        .verdicts
+        .iter()
+        .find(|verdict| verdict.threshold == "readiness_gap_ms")
+        .expect("the artifact carries a readiness gap verdict");
+    assert_eq!(
+        readiness_verdict.value, result.telemetry.worst_readiness_gap_ms as f64,
+        "the readiness verdict must preserve the telemetry measured through the end of the run"
+    );
     assert_eq!(
         result.revisions.len(),
         3,

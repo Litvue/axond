@@ -2338,11 +2338,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_open_readiness_gap_is_counted_when_the_run_ends_unready() {
-        assert_eq!(
-            readiness_gap_ms(Duration::from_millis(100), Duration::from_millis(850)),
-            750
+    fn state_finalizes_an_open_readiness_gap_at_run_end() {
+        let run_dir = std::env::temp_dir().join(format!(
+            "axond-stateful-endurance-readiness-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the test clock is after the epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&run_dir).expect("the readiness test directory is writable");
+
+        let (manifest, _) = crate::support::stateful_endurance::manifest::load();
+        let profile = &manifest.profiles[0];
+        let mut state = State::new(
+            &run_dir,
+            "readiness-gap",
+            profile.smoke,
+            profile.schedule,
+            Duration::from_millis(profile.smoke.duration_ms),
+            Injected::EveryDeclaredFault,
+            &[],
         );
+
+        state.observe_readiness(false, Duration::from_millis(100));
+        assert_eq!(state.telemetry.worst_readiness_gap_ms, 0);
+
+        // This is the path run_with takes after the supervisor ends while the
+        // fleet is still unready. It must count the interval even without a
+        // false-to-true readiness transition to close it.
+        state.close_readiness_gap(Duration::from_millis(850));
+        assert_eq!(state.telemetry.worst_readiness_gap_ms, 750);
+        assert!(state.unready_since.is_none());
+
+        // Finalization is idempotent: the normal recovery path must not count
+        // the same interval again if it observes the closed state later.
+        state.close_readiness_gap(Duration::from_millis(1_000));
+        assert_eq!(state.telemetry.worst_readiness_gap_ms, 750);
+
+        drop(state);
+        std::fs::remove_dir_all(&run_dir).expect("the readiness test directory is removable");
     }
 
     #[test]
