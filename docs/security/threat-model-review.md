@@ -340,7 +340,7 @@ admission owes this trigger again on its own merits.
 
 The projection, its durable evidence, and the scoped read that fill that contract
 are
-[ADR 0048](../adr/0048-stateful-availability-projection-and-discovery-persistence.md):
+[ADR 0049](../adr/0049-stateful-availability-projection-and-discovery-persistence.md):
 five authorities read from five places, entitlement as resolved credential
 readiness, catalogue version kept apart from availability, replica-local health
 overlaid rather than stored, and evidence persisted without the probe's own words
