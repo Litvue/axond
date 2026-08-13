@@ -77,6 +77,12 @@ pub struct Slice {
     /// The workflow that runs the heavy tier, if one exists.
     #[serde(default)]
     pub heavy_lane: Option<String>,
+    /// What the slice's own manifest calls its heavy tier — `heavy` for
+    /// capacity, `long` for endurance. A record from any other tier is a
+    /// correctness run, so the rung above `harnessed` is defined against this
+    /// name rather than against a shared one.
+    #[serde(default)]
+    pub heavy_tier: Option<String>,
     /// Retained runs, as committed evidence records.
     #[serde(default)]
     pub retained: Vec<String>,
@@ -351,6 +357,31 @@ pub fn load() -> Packet {
         "unsupported qualification packet schema"
     );
     packet
+}
+
+/// A slice's own manifest, read for the two things the packet checks a record
+/// against: the workloads it declares, and the digest of the bytes on disk.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SliceManifest {
+    #[serde(rename = "profile")]
+    pub profiles: Vec<SliceManifestProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SliceManifestProfile {
+    pub id: String,
+}
+
+/// Load whichever manifest a slice names, with the digest a run of it records
+/// — so a record taken before an edit to that manifest stops matching it.
+pub fn load_slice_manifest(relative: &str) -> (SliceManifest, String) {
+    let path = workspace_root().join(relative);
+    let bytes =
+        std::fs::read(&path).unwrap_or_else(|e| panic!("{} is unreadable: {e}", path.display()));
+    let manifest: SliceManifest = Figment::from(Toml::file(&path))
+        .extract()
+        .unwrap_or_else(|e| panic!("{} declares no readable workloads: {e}", path.display()));
+    (manifest, super::capacity::manifest::sha256_hex(&bytes))
 }
 
 /// Load one retained evidence record, by its path relative to the workspace.

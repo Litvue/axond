@@ -37,6 +37,7 @@ adr = "docs/adr/0033-capacity-qualification-harness.md"
 # heavy tier wants a runner to itself.
 reduced_lane = "cargo test --workspace"
 heavy_lane = ".github/workflows/capacity.yml"
+heavy_tier = "heavy"
 retained = [
   "qualification/capacity/evidence/reduced-local.toml",
   "qualification/capacity/evidence/heavy-local.toml",
@@ -58,6 +59,7 @@ contract = "docs/operations/endurance.md"
 adr = "docs/adr/0033-capacity-qualification-harness.md"
 reduced_lane = "cargo test --workspace"
 heavy_lane = ".github/workflows/endurance.yml"
+heavy_tier = "soak"
 retained = []
 outstanding = """
 The 12–24 hour tier has never been dispatched, so the drift thresholds that \

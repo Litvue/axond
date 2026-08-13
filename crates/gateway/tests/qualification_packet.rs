@@ -167,6 +167,18 @@ fn a_slice_cannot_claim_a_rung_it_has_not_reached() {
                     !slice.retained.is_empty(),
                     "{id}: evidence is a retained run, not a status"
                 );
+                let heavy = slice
+                    .heavy_tier
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("{id}: a slice with runs names its heavy tier"));
+                assert!(
+                    slice
+                        .retained
+                        .iter()
+                        .any(|relative| packet::load_record(relative).tier == heavy),
+                    "{id}: it is evidenced by its short tier alone, which is a \
+                     correctness run rather than a measurement of what a replica does"
+                );
             }
         }
 
@@ -178,107 +190,110 @@ fn a_slice_cannot_claim_a_rung_it_has_not_reached() {
     }
 }
 
-/// A retained record has to be reproducible from the repository: the manifest
-/// it ran is the manifest its slice commits, every profile in that manifest is
-/// in the record, the run was judged rather than merely measured, and it came
-/// off a clean tree.
+/// Every retained record, whichever slice retains it, has to be reproducible
+/// from the repository: the manifest it ran is the manifest its slice commits
+/// and still hashes to what the run saw, every workload in that manifest is in
+/// the record, the run was judged rather than merely measured, and it came off
+/// a clean tree.
 #[test]
 fn retained_evidence_is_reproducible_from_the_committed_inputs() {
     let packet = packet::load();
-    let capacity = packet.slice(SliceId::Capacity);
-    let (manifest, manifest_text) = support::capacity::manifest::load();
-    let manifest_sha256 = support::capacity::manifest::sha256_hex(manifest_text.as_bytes());
-    let profiles: BTreeSet<String> = manifest
-        .profiles
-        .iter()
-        .map(|profile| profile.id.clone())
-        .collect();
+    let mut checked = 0;
 
-    for relative in &capacity.retained {
-        let record = packet::load_record(relative);
-        assert_eq!(
-            record.slice_id,
-            SliceId::Capacity,
-            "{relative}: retained by the capacity slice but recorded against another"
-        );
-        assert_eq!(
-            Some(record.inputs.manifest.as_str()),
-            capacity.manifest.as_deref(),
-            "{relative}: the run read a manifest the slice does not commit"
-        );
-        assert_eq!(
-            record.inputs.manifest_sha256, manifest_sha256,
-            "{relative}: the manifest has changed since the run, so the record \
-             describes a workload the repository no longer defines \u{2014} re-run the \
-             tier and rewrite it"
-        );
-        assert!(
-            !record.source.git_dirty,
-            "{relative}: a run off a modified tree cannot be reproduced from a commit"
-        );
-        assert!(
-            !record.source.git_commit.is_empty() && !record.binary.sha256.is_empty(),
-            "{relative}: a record without a commit and a binary digest is anonymous"
-        );
-
-        let recorded: BTreeSet<String> = record
+    for slice in &packet.slices {
+        if slice.retained.is_empty() {
+            continue;
+        }
+        let slice_manifest = slice.manifest.as_deref().unwrap_or_else(|| {
+            panic!(
+                "{}: a record of a run against no committed manifest",
+                slice.id.as_str()
+            )
+        });
+        let (manifest, manifest_sha256) = packet::load_slice_manifest(slice_manifest);
+        let profiles: BTreeSet<String> = manifest
             .profiles
             .iter()
             .map(|profile| profile.id.clone())
             .collect();
-        assert_eq!(
-            recorded, profiles,
-            "{relative}: the record and the manifest disagree about the profiles"
-        );
 
-        for profile in &record.profiles {
-            let id = &profile.id;
+        for relative in &slice.retained {
+            checked += 1;
+            let record = packet::load_record(relative);
+            assert_eq!(
+                record.slice_id,
+                slice.id,
+                "{relative}: retained by the {} slice but recorded against another",
+                slice.id.as_str()
+            );
+            assert_eq!(
+                record.inputs.manifest.as_str(),
+                slice_manifest,
+                "{relative}: the run read a manifest the slice does not commit"
+            );
+            assert_eq!(
+                record.inputs.manifest_sha256, manifest_sha256,
+                "{relative}: the manifest has changed since the run, so the record \
+                 describes a workload the repository no longer defines \u{2014} re-run \
+                 the tier and rewrite it"
+            );
             assert!(
-                profile.verdicts > 0,
-                "{relative}: {id} was measured against no threshold"
+                !record.source.git_dirty,
+                "{relative}: a run off a modified tree cannot be reproduced from a commit"
             );
             assert!(
-                profile.passed,
-                "{relative}: {id} is retained as evidence of a run that failed its gates"
+                !record.source.git_commit.is_empty() && !record.binary.sha256.is_empty(),
+                "{relative}: a record without a commit and a binary digest is anonymous"
             );
-            assert!(
-                profile.elapsed_ms > 0 && !profile.config_sha256.is_empty(),
-                "{relative}: {id} records neither how long it ran nor what it booted"
-            );
+
+            let recorded: BTreeSet<String> = record
+                .profiles
+                .iter()
+                .map(|profile| profile.id.clone())
+                .collect();
             assert_eq!(
-                profile.offered, profile.requests,
-                "{relative}: {id} offered fewer requests than the manifest asks for"
+                recorded, profiles,
+                "{relative}: the record and the manifest disagree about the profiles"
             );
-            assert_eq!(
-                profile.accepted + profile.rejected + profile.errors,
-                profile.offered,
-                "{relative}: {id} loses requests between offered and accounted for"
-            );
-            assert_eq!(
-                profile.missing_usage_records, 0,
-                "{relative}: {id} lost usage rows"
-            );
-            assert_eq!(
-                profile.leaked_upstream_streams, 0,
-                "{relative}: {id} left an upstream stream open"
-            );
+
+            for profile in &record.profiles {
+                let id = &profile.id;
+                assert!(
+                    profile.verdicts > 0,
+                    "{relative}: {id} was measured against no threshold"
+                );
+                assert!(
+                    profile.passed,
+                    "{relative}: {id} is retained as evidence of a run that failed its gates"
+                );
+                assert!(
+                    profile.elapsed_ms > 0 && !profile.config_sha256.is_empty(),
+                    "{relative}: {id} records neither how long it ran nor what it booted"
+                );
+                assert_eq!(
+                    profile.offered, profile.requests,
+                    "{relative}: {id} offered fewer requests than the manifest asks for"
+                );
+                assert_eq!(
+                    profile.accepted + profile.rejected + profile.errors,
+                    profile.offered,
+                    "{relative}: {id} loses requests between offered and accounted for"
+                );
+                assert_eq!(
+                    profile.missing_usage_records, 0,
+                    "{relative}: {id} lost usage rows"
+                );
+                assert_eq!(
+                    profile.leaked_upstream_streams, 0,
+                    "{relative}: {id} left an upstream stream open"
+                );
+            }
         }
     }
 
-    let tiers: BTreeSet<&str> = capacity
-        .retained
-        .iter()
-        .map(|relative| packet::load_record(relative).tier)
-        .map(|tier| match tier.as_str() {
-            "reduced" => "reduced",
-            "heavy" => "heavy",
-            other => panic!("unknown capacity tier {other}"),
-        })
-        .collect();
     assert!(
-        tiers.contains("heavy"),
-        "the capacity slice is evidenced by its reduced tier alone, which is a \
-         correctness run rather than a capacity one"
+        checked > 0,
+        "the packet retains no evidence at all, so nothing here checked anything"
     );
 }
 

@@ -16,7 +16,9 @@ decomposes into five slices. They landed, and will land, at different depths:
 | `rollout` | [#220](https://github.com/Litvue/axond/issues/220) | `unbuilt` | Nothing multi-replica. Single-replica drain is covered by `crates/gateway/tests/shutdown.rs`. |
 
 `qualification/packet.toml` is that table as data — question, inputs, lanes,
-retained runs, and what each slice still owes — and
+retained runs, and what each slice still owes; see
+[ADR 0040](../adr/0040-qualification-packet-and-evidence-records.md) for why the
+packet and the record are shaped this way. And
 `crates/gateway/tests/qualification_packet.rs` checks it against the tree on
 every run: a path that does not exist, a status a slice has not earned, a
 scenario no slice covers, or a retained record that cannot be reproduced from
@@ -44,7 +46,7 @@ than from what it says:
 | `unbuilt` | The question is written down. Nothing runs. |
 | `declared` | A committed manifest and contract page, kept honest by a `contract_test`, with no driver behind them. A contract test measures nothing, which is why it is not one. |
 | `harnessed` | A driver a lane runs, with no retained run of its heavy tier. |
-| `evidenced` | A driver, and at least one retained run in the repository — including a heavy-tier one, because a reduced run is a correctness check, not a capacity measurement. |
+| `evidenced` | A driver, and at least one retained run in the repository — including one from the tier the slice's own manifest calls heavy (`heavy` for capacity, `soak` for endurance), because a short run is a correctness check, not a measurement of what a replica does. |
 
 ## Retained evidence
 
