@@ -728,7 +728,7 @@ With `backend = "postgres"`, every settled usage event is appended to a durable
 outbox **before the request is answered**, and a bounded delivery worker replays
 it into the configured `[[usage_sink]]`s until they acknowledge it — at-least-once,
 replayed after a restart, deduplicated by the consumer on `request_id`
-([ADR 0038](./adr/0038-billing-grade-usage-outbox.md)). The operator guide is
+([ADR 0040](./adr/0040-billing-grade-usage-outbox.md)). The operator guide is
 [`docs/operations/usage-outbox.md`](./operations/usage-outbox.md); read it before
 enabling this, because it adds a failure mode to the request path.
 
